@@ -38,6 +38,9 @@ export type TGroupRoles = {
 export type TGroupInvite = {
   groupId: string
   relay?: string
+  name?: string
+  about?: string
+  fileSharing?: boolean
   token?: string
   event: Event
 }
@@ -45,4 +48,13 @@ export type TGroupInvite = {
 export type TGroupListEntry = {
   groupId: string
   relay?: string
+}
+
+export type TJoinRequest = {
+  groupId: string
+  pubkey: string
+  created_at: number
+  content?: string
+  inviteCode?: string
+  event: Event
 }

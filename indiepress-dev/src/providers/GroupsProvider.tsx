@@ -4,6 +4,7 @@ import {
   parseGroupAdminsEvent,
   parseGroupIdentifier,
   parseGroupInviteEvent,
+  parseGroupJoinRequestEvent,
   parseGroupListEvent,
   parseGroupMembersEvent,
   parseGroupMetadataEvent,
@@ -24,7 +25,8 @@ import {
   TGroupInvite,
   TGroupListEntry,
   TGroupMembershipStatus,
-  TGroupMetadata
+  TGroupMetadata,
+  TJoinRequest
 } from '@/types/groups'
 import client from '@/services/client.service'
 import localStorageService from '@/services/local-storage.service'
@@ -38,13 +40,16 @@ import * as nip19 from '@nostr/tools/nip19'
 type TGroupsContext = {
   discoveryGroups: TGroupMetadata[]
   invites: TGroupInvite[]
+  joinRequests: Record<string, TJoinRequest[]>
   favoriteGroups: string[]
   myGroupList: TGroupListEntry[]
   isLoadingDiscovery: boolean
   discoveryError: string | null
   invitesError: string | null
+  joinRequestsError: string | null
   refreshDiscovery: () => Promise<void>
   refreshInvites: () => Promise<void>
+  loadJoinRequests: (groupId: string, relay?: string) => Promise<void>
   resolveRelayUrl: (relay?: string) => string | undefined
   toggleFavorite: (groupKey: string) => void
   saveMyGroupList: (entries: TGroupListEntry[], options?: TPublishOptions) => Promise<void>
@@ -63,6 +68,8 @@ type TGroupsContext = {
   sendInvites: (groupId: string, invitees: string[], relay?: string) => Promise<void>
   updateMetadata: (groupId: string, data: Partial<{ name: string; about: string; picture: string; isPublic: boolean; isOpen: boolean }>, relay?: string) => Promise<void>
   grantAdmin: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
+  approveJoinRequest: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
+  rejectJoinRequest: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
   addUser: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
   removeUser: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
   deleteGroup: (groupId: string, relay?: string) => Promise<void>
@@ -94,13 +101,16 @@ export const useGroups = () => {
     return {
       discoveryGroups: [],
       invites: [],
+       joinRequests: {},
       favoriteGroups: [],
       myGroupList: [],
       isLoadingDiscovery: false,
       discoveryError: null,
       invitesError: null,
+      joinRequestsError: null,
       refreshDiscovery: async () => {},
       refreshInvites: async () => {},
+      loadJoinRequests: async () => {},
       resolveRelayUrl: (r?: string) => r,
       toggleFavorite: () => {},
       saveMyGroupList: async () => {},
@@ -115,6 +125,8 @@ export const useGroups = () => {
       sendInvites: async () => {},
       updateMetadata: async () => {},
       grantAdmin: async () => {},
+      approveJoinRequest: async () => {},
+      rejectJoinRequest: async () => {},
       addUser: async () => {},
       removeUser: async () => {},
       deleteGroup: async () => {},
@@ -136,17 +148,34 @@ const toGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${gro
 
 export function GroupsProvider({ children }: { children: ReactNode }) {
   const { pubkey, publish, relayList, nip04Decrypt, nip04Encrypt } = useNostr()
-  const { relays: workerRelays, joinFlows, createRelay } = useWorkerBridge()
+  const { relays: workerRelays, joinFlows, createRelay, sendToWorker } = useWorkerBridge()
   const [discoveryGroups, setDiscoveryGroups] = useState<TGroupMetadata[]>([])
   const [invites, setInvites] = useState<TGroupInvite[]>([])
+  const [joinRequests, setJoinRequests] = useState<Record<string, TJoinRequest[]>>({})
   const [favoriteGroups, setFavoriteGroups] = useState<string[]>([])
   const [myGroupList, setMyGroupList] = useState<TGroupListEntry[]>([])
   const [isLoadingDiscovery, setIsLoadingDiscovery] = useState(false)
   const [discoveryError, setDiscoveryError] = useState<string | null>(null)
   const [invitesError, setInvitesError] = useState<string | null>(null)
+  const [joinRequestsError, setJoinRequestsError] = useState<string | null>(null)
   const [discoveryRelays, setDiscoveryRelays] = useState<string[]>(() => {
     const stored = localStorageService.getGroupDiscoveryRelays()
     return stored.length ? stored : defaultDiscoveryRelays
+  })
+  const [rejectedJoinRequests, setRejectedJoinRequests] = useState<Record<string, Set<string>>>(() => {
+    if (typeof window === 'undefined') return {}
+    try {
+      const raw = window.localStorage.getItem('hypertuna_join_rejections')
+      if (!raw) return {}
+      const parsed = JSON.parse(raw) as Record<string, string[]>
+      const asSets: Record<string, Set<string>> = {}
+      Object.entries(parsed).forEach(([k, v]) => {
+        asSets[k] = new Set(v)
+      })
+      return asSets
+    } catch (_err) {
+      return {}
+    }
   })
 
   const workerRelayUrlMap = useMemo(() => {
@@ -193,6 +222,19 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     setFavoriteGroups(localStorageService.getFavoriteGroups(pubkey))
   }, [pubkey])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const serialized: Record<string, string[]> = {}
+    Object.entries(rejectedJoinRequests).forEach(([k, v]) => {
+      serialized[k] = Array.from(v)
+    })
+    try {
+      window.localStorage.setItem('hypertuna_join_rejections', JSON.stringify(serialized))
+    } catch (_err) {
+      // best effort
+    }
+  }, [rejectedJoinRequests])
 
   const refreshDiscovery = useCallback(async () => {
     setIsLoadingDiscovery(true)
@@ -276,6 +318,63 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       setInvitesError((error as Error).message)
     }
   }, [discoveryRelays, nip04Decrypt, pubkey])
+
+  const loadJoinRequests = useCallback(
+    async (groupId: string, relay?: string) => {
+      if (!groupId) return
+      setJoinRequestsError(null)
+      const groupKey = toGroupKey(groupId, relay)
+      try {
+        const resolved = relay ? resolveRelayUrl(relay) : undefined
+        const relayUrls = resolved ? [resolved] : discoveryRelays
+
+        const [joinEvents, membershipEvents] = await Promise.all([
+          client.fetchEvents(relayUrls, {
+            kinds: [9021],
+            '#h': [groupId],
+            limit: 200
+          }),
+          client
+            .fetchEvents(relayUrls, {
+              kinds: [9000, 9001],
+              '#h': [groupId],
+              limit: 200
+            })
+            .catch(() => [])
+        ])
+
+        // Compute membership from 9000/9001 sets
+        const memberAdds = new Map<string, number>()
+        const memberRemoves = new Map<string, number>()
+        membershipEvents.forEach((evt) => {
+          evt.tags
+            .filter((t) => t[0] === 'p' && t[1])
+            .forEach((t) => {
+              const pk = t[1]
+              if (evt.kind === 9000) {
+                memberAdds.set(pk, evt.created_at)
+              } else if (evt.kind === 9001) {
+                memberRemoves.set(pk, evt.created_at)
+              }
+            })
+        })
+        const currentMembers = new Set<string>()
+        memberAdds.forEach((ts, pk) => {
+          const removedAt = memberRemoves.get(pk)
+          if (!removedAt || removedAt < ts) currentMembers.add(pk)
+        })
+
+        const rejected = rejectedJoinRequests[groupKey] || new Set<string>()
+        const parsed = joinEvents
+          .map(parseGroupJoinRequestEvent)
+          .filter((jr) => !currentMembers.has(jr.pubkey) && !rejected.has(jr.pubkey))
+        setJoinRequests((prev) => ({ ...prev, [groupKey]: parsed }))
+      } catch (error) {
+        setJoinRequestsError((error as Error).message)
+      }
+    },
+    [discoveryRelays, rejectedJoinRequests, resolveRelayUrl]
+  )
 
   const loadMyGroupList = useCallback(async () => {
     if (!pubkey) {
@@ -779,24 +878,226 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       const resolved = relay ? resolveRelayUrl(relay) : null
       const relayUrls = resolved ? [resolved] : defaultDiscoveryRelays
+      const meta =
+        discoveryGroups.find(
+          (g) => g.id === groupId && (!relay || !g.relay || g.relay === relay || g.relay === resolved)
+        ) || null
+      const relayEntry = (() => {
+        const candidates = new Set([groupId, groupId.replace(':', '/'), groupId.replace('/', ':')])
+        return workerRelays.find(
+          (r) =>
+            (r.publicIdentifier && candidates.has(r.publicIdentifier)) ||
+            (r.relayKey && candidates.has(r.relayKey))
+        )
+      })()
+
       await Promise.all(
         invitees.map(async (invitee) => {
           const token = randomString(24)
-          const encrypted = await nip04Encrypt(invitee, token)
-          const draftEvent: TDraftEvent = {
-            kind: 9009,
+          const encryptedPayload = await nip04Encrypt(
+            invitee,
+            JSON.stringify({
+              relayUrl: getBaseRelayUrl(resolved || relay || '') || resolved || relay || null,
+              token,
+              relayKey: relayEntry?.relayKey || null,
+              isPublic: meta?.isPublic !== false,
+              name: meta?.name,
+              about: meta?.about,
+              fileSharing: meta?.isOpen !== false
+            })
+          )
+          const inviteTags: string[][] = [
+            ['h', groupId],
+            ['p', invitee],
+            ['i', 'hypertuna']
+          ]
+          if (meta?.name) inviteTags.push(['name', meta.name])
+          if (meta?.about) inviteTags.push(['about', meta.about])
+          inviteTags.push([meta?.isOpen === false ? 'file-sharing-off' : 'file-sharing-on'])
+
+          // Add 9000 put-user so membership/auth is consistent with legacy flow
+          const putUser: TDraftEvent = {
+            kind: 9000,
             created_at: Math.floor(Date.now() / 1000),
             tags: [
               ['h', groupId],
-              ['p', invitee]
+              ['p', invitee, 'member', token]
             ],
-            content: encrypted
+            content: ''
+          }
+          await publish(putUser, { specifiedRelayUrls: relayUrls })
+
+          const draftEvent: TDraftEvent = {
+            kind: 9009,
+            created_at: Math.floor(Date.now() / 1000),
+            tags: inviteTags,
+            content: encryptedPayload
           }
           await publish(draftEvent, { specifiedRelayUrls: relayUrls })
+
+          try {
+            if (sendToWorker) {
+              const memberTs = Date.now()
+              await sendToWorker({
+                type: 'update-auth-data',
+                data: {
+                  relayKey: relayEntry?.relayKey,
+                  publicIdentifier: groupId,
+                  pubkey: invitee,
+                  token
+                }
+              })
+              await sendToWorker({
+                type: 'update-members',
+                data: {
+                  relayKey: relayEntry?.relayKey,
+                  publicIdentifier: groupId,
+                  member_adds: [{ pubkey: invitee, ts: memberTs }]
+                }
+              })
+            }
+          } catch (_err) {
+            // best effort
+          }
         })
       )
     },
-    [nip04Encrypt, pubkey, publish, resolveRelayUrl]
+    [discoveryGroups, nip04Encrypt, pubkey, publish, resolveRelayUrl, sendToWorker, workerRelays]
+  )
+
+  const approveJoinRequest = useCallback(
+    async (groupId: string, targetPubkey: string, relay?: string) => {
+      if (!pubkey) throw new Error('Not logged in')
+      const groupKey = toGroupKey(groupId, relay)
+      const token = randomString(24)
+      const resolved = relay ? resolveRelayUrl(relay) : undefined
+      const relayUrls = resolved ? [resolved] : discoveryRelays
+      const timestamp = Math.floor(Date.now() / 1000)
+
+      // Build put-user (9000) with token
+      const putUser: TDraftEvent = {
+        kind: 9000,
+        created_at: timestamp,
+        tags: [
+          ['h', groupId],
+          ['p', targetPubkey, 'member', token]
+        ],
+        content: ''
+      }
+      await publish(putUser, { specifiedRelayUrls: relayUrls })
+
+      // Resolve metadata for invite tags/payload
+      let meta =
+        discoveryGroups.find(
+          (g) => g.id === groupId && (!relay || !g.relay || g.relay === relay || g.relay === resolved)
+        ) || null
+      if (!meta) {
+        try {
+          const detail = await fetchGroupDetail(groupId, relay, { preferRelay: true })
+          meta = detail?.metadata || null
+        } catch (_err) {
+          // ignore
+        }
+      }
+
+      const baseRelayUrl = resolved ? getBaseRelayUrl(resolved) : undefined
+      const relayEntry = (() => {
+        const candidates = new Set([groupId, groupId.replace(':', '/'), groupId.replace('/', ':')])
+        return workerRelays.find(
+          (r) =>
+            (r.publicIdentifier && candidates.has(r.publicIdentifier)) ||
+            (r.relayKey && candidates.has(r.relayKey))
+        )
+      })()
+
+      const payload = {
+        relayUrl: baseRelayUrl || resolved || relay || null,
+        token,
+        relayKey: relayEntry?.relayKey || null,
+        isPublic: meta?.isPublic !== false,
+        name: meta?.name,
+        about: meta?.about,
+        fileSharing: meta?.isOpen !== false
+      }
+
+      // Build encrypted invite (9009)
+      const tags: string[][] = [
+        ['h', groupId],
+        ['p', targetPubkey],
+        ['i', 'hypertuna']
+      ]
+      if (meta?.name) tags.push(['name', meta.name])
+      if (meta?.about) tags.push(['about', meta.about])
+      tags.push([payload.fileSharing === false ? 'file-sharing-off' : 'file-sharing-on'])
+
+      const encryptedPayload = await nip04Encrypt(targetPubkey, JSON.stringify(payload))
+      const inviteEvent: TDraftEvent = {
+        kind: 9009,
+        created_at: timestamp,
+        tags,
+        content: encryptedPayload
+      }
+      await publish(inviteEvent, { specifiedRelayUrls: relayUrls })
+
+      // Notify worker about auth/membership so relay profile is synced
+      try {
+        if (sendToWorker) {
+          const memberTs = Date.now()
+          await sendToWorker({
+            type: 'update-auth-data',
+            data: {
+              relayKey: relayEntry?.relayKey,
+              publicIdentifier: groupId,
+              pubkey: targetPubkey,
+              token
+            }
+          })
+          await sendToWorker({
+            type: 'update-members',
+            data: {
+              relayKey: relayEntry?.relayKey,
+              publicIdentifier: groupId,
+              member_adds: [{ pubkey: targetPubkey, ts: memberTs }]
+            }
+          })
+        }
+      } catch (_err) {
+        // best effort; worker may not be available in web mode
+      }
+
+      setJoinRequests((prev) => {
+        const next = { ...prev }
+        next[groupKey] = (prev[groupKey] || []).filter((req) => req.pubkey !== targetPubkey)
+        return next
+      })
+      setRejectedJoinRequests((prev) => {
+        const next = { ...prev }
+        const set = new Set(next[groupKey] || [])
+        set.delete(targetPubkey)
+        next[groupKey] = set
+        return next
+      })
+    },
+    [discoveryGroups, discoveryRelays, fetchGroupDetail, publish, pubkey, resolveRelayUrl, sendToWorker, workerRelays]
+  )
+
+  const rejectJoinRequest = useCallback(
+    async (groupId: string, targetPubkey: string, relay?: string) => {
+      const groupKey = toGroupKey(groupId, relay)
+      setJoinRequests((prev) => {
+        const next = { ...prev }
+        next[groupKey] = (prev[groupKey] || []).filter((req) => req.pubkey !== targetPubkey)
+        return next
+      })
+      setRejectedJoinRequests((prev) => {
+        const next = { ...prev }
+        const set = new Set(next[groupKey] || [])
+        set.add(targetPubkey)
+        next[groupKey] = set
+        return next
+      })
+    },
+    []
   )
 
   const updateMetadata = useCallback(
@@ -977,13 +1278,16 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     () => ({
       discoveryGroups,
       invites,
+      joinRequests,
       favoriteGroups,
       myGroupList,
       isLoadingDiscovery,
       discoveryError,
       invitesError,
+      joinRequestsError,
       refreshDiscovery,
       refreshInvites,
+      loadJoinRequests,
       resolveRelayUrl,
       toggleFavorite,
       saveMyGroupList,
@@ -993,6 +1297,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       sendInvites,
       updateMetadata,
       grantAdmin,
+      approveJoinRequest,
+      rejectJoinRequest,
       addUser,
       removeUser,
       deleteGroup,
@@ -1088,12 +1394,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       discoveryGroups,
       favoriteGroups,
       invites,
+      joinRequests,
       myGroupList,
       isLoadingDiscovery,
       discoveryError,
       invitesError,
+      joinRequestsError,
       refreshDiscovery,
       refreshInvites,
+      loadJoinRequests,
       saveMyGroupList,
       sendJoinRequest,
       sendLeaveRequest,
@@ -1101,6 +1410,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       sendInvites,
       updateMetadata,
       grantAdmin,
+      approveJoinRequest,
+      rejectJoinRequest,
       addUser,
       removeUser,
       deleteGroup,

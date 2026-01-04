@@ -19,7 +19,8 @@ import {
   EllipsisVertical,
   Pin,
   BellOff,
-  TriangleAlert
+  TriangleAlert,
+  X
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import UserAvatar from '@/components/UserAvatar'
@@ -58,6 +59,8 @@ import { SimpleUserAvatar } from '@/components/UserAvatar'
 import { SimpleUsername } from '@/components/Username'
 import { generateImageByPubkey } from '@/lib/pubkey'
 import React from 'react'
+import { TJoinRequest } from '@/types/groups'
+import { registerJoinWorkflowSimulator } from '@/devtools/joinWorkflowSimulator'
 
 type MemberActionsMenuProps = {
   targetPubkey: string
@@ -289,6 +292,51 @@ const MemoizedMemberRow = React.memo(
     prev.t === next.t
 )
 
+type JoinRequestRowProps = {
+  request: TJoinRequest
+  onApprove: (pubkey: string) => void
+  onReject: (pubkey: string) => void
+  approving?: boolean
+  rejecting?: boolean
+  t: (key: string, opts?: any) => string
+}
+
+function JoinRequestRow({ request, onApprove, onReject, approving, rejecting, t }: JoinRequestRowProps) {
+  return (
+    <div className="flex items-center gap-3 px-4 py-3 rounded-lg border border-transparent hover:border-border hover:bg-accent/30">
+      <UserAvatar userId={request.pubkey} className="shrink-0" />
+      <div className="min-w-0 flex-1">
+        <Username userId={request.pubkey} className="font-semibold truncate max-w-full w-fit" />
+        <Nip05 pubkey={request.pubkey} />
+        {request.content && (
+          <div className="text-xs text-muted-foreground line-clamp-2 mt-1">{request.content}</div>
+        )}
+      </div>
+      <div className="flex items-center gap-2 flex-shrink-0">
+        <Button
+          size="sm"
+          variant="secondary"
+          onClick={() => onReject(request.pubkey)}
+          disabled={rejecting || approving}
+          className="rounded-full"
+        >
+          <X className="w-4 h-4 mr-1" />
+          {rejecting ? t('Rejecting...') : t('Reject')}
+        </Button>
+        <Button
+          size="sm"
+          onClick={() => onApprove(request.pubkey)}
+          disabled={approving || rejecting}
+          className="rounded-full"
+        >
+          <Check className="w-4 h-4 mr-1" />
+          {approving ? t('Approving...') : t('Approve')}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 type TGroupPageProps = {
   index?: number
   id?: string
@@ -308,6 +356,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     toggleFavorite,
     invites,
     sendInvites,
+    joinRequests,
+    joinRequestsError,
+    loadJoinRequests,
+    approveJoinRequest,
+    rejectJoinRequest,
     updateMetadata,
     grantAdmin,
     removeUser,
@@ -317,7 +370,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const { pubkey, profile: nostrProfile } = useNostr()
   const { joinFlows, startJoinFlow, relays, sendToWorker } = useWorkerBridge()
   const [isLoading, setIsLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState<'notes' | 'members'>('notes')
+  const [activeTab, setActiveTab] = useState<'notes' | 'members' | 'requests'>('notes')
   const [error, setError] = useState<string | null>(null)
   const [groupRelay, setGroupRelay] = useState<string | undefined>(relay)
   const [groupId, setGroupId] = useState<string | undefined>(id)
@@ -332,6 +385,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const [inviteSearch, setInviteSearch] = useState('')
   const [selectedInvitees, setSelectedInvitees] = useState<string[]>([])
   const [reportTarget, setReportTarget] = useState<string | null>(null)
+  const [joinRequestAction, setJoinRequestAction] = useState<{ pubkey: string; action: 'approve' | 'reject' } | null>(null)
   const { profiles: inviteProfiles, isFetching: isSearchingInvites } = useSearchProfiles(inviteSearch, 8)
   const { mutePrivately, mutePublicly } = useMuteList()
   const reportEvent = useMemo(() => {
@@ -510,6 +564,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     () => makeGroupKey(groupId || '', effectiveGroupRelay),
     [groupId, effectiveGroupRelay]
   )
+  const pendingJoinRequests = useMemo(
+    () => (groupKey && joinRequests[groupKey] ? joinRequests[groupKey] : []),
+    [groupKey, joinRequests]
+  )
+  const joinRequestCount = pendingJoinRequests.length
   const isFavorite = favoriteGroups.includes(groupKey)
 
   const inviteToken = useMemo(() => {
@@ -742,6 +801,34 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const isAdmin =
     !!pubkey && !!effectiveDetail?.admins?.some((admin) => admin.pubkey === pubkey)
 
+  useEffect(() => {
+    if (!groupId || !isAdmin) return
+    loadJoinRequests(groupId, effectiveGroupRelay)
+  }, [effectiveGroupRelay, groupId, isAdmin, loadJoinRequests])
+
+  useEffect(() => {
+    if (!groupId) return
+    registerJoinWorkflowSimulator({
+      groupId,
+      relay: effectiveGroupRelay,
+      startJoinFlow,
+      sendJoinRequest,
+      approveJoinRequest,
+      rejectJoinRequest,
+      sendInvites,
+      loadJoinRequests
+    })
+  }, [
+    approveJoinRequest,
+    effectiveGroupRelay,
+    groupId,
+    loadJoinRequests,
+    rejectJoinRequest,
+    sendInvites,
+    sendJoinRequest,
+    startJoinFlow
+  ])
+
   const relayKeyForGroup = useMemo(() => {
     if (!groupId || !relays?.length) return undefined
     const candidates = new Set<string>()
@@ -853,6 +940,42 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     [mutePublicly]
   )
 
+  const handleApproveJoinRequest = React.useCallback(
+    async (targetPubkey: string) => {
+      if (!groupId) return
+      setJoinRequestAction({ pubkey: targetPubkey, action: 'approve' })
+      try {
+        await approveJoinRequest(groupId, targetPubkey, effectiveGroupRelay)
+        toast.success(t('Join request approved'))
+        await loadJoinRequests(groupId, effectiveGroupRelay)
+      } catch (err) {
+        toast.error(t('Failed to approve join request'))
+        setError((err as Error).message)
+      } finally {
+        setJoinRequestAction(null)
+      }
+    },
+    [approveJoinRequest, effectiveGroupRelay, groupId, loadJoinRequests, t]
+  )
+
+  const handleRejectJoinRequest = React.useCallback(
+    async (targetPubkey: string) => {
+      if (!groupId) return
+      setJoinRequestAction({ pubkey: targetPubkey, action: 'reject' })
+      try {
+        await rejectJoinRequest(groupId, targetPubkey, effectiveGroupRelay)
+        toast.success(t('Join request rejected'))
+        await loadJoinRequests(groupId, effectiveGroupRelay)
+      } catch (err) {
+        toast.error(t('Failed to reject join request'))
+        setError((err as Error).message)
+      } finally {
+        setJoinRequestAction(null)
+      }
+    },
+    [effectiveGroupRelay, groupId, loadJoinRequests, rejectJoinRequest, t]
+  )
+
   const handleRemoveMember = React.useCallback(
     async (targetPubkey: string) => {
       if (!groupId || !isAdmin) return
@@ -942,6 +1065,22 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       pubkey,
       t
     ]
+  )
+
+  const joinRequestRows = useMemo(
+    () =>
+      pendingJoinRequests.map((req) => (
+        <JoinRequestRow
+          key={req.event.id}
+          request={req}
+          approving={joinRequestAction?.pubkey === req.pubkey && joinRequestAction.action === 'approve'}
+          rejecting={joinRequestAction?.pubkey === req.pubkey && joinRequestAction.action === 'reject'}
+          onApprove={handleApproveJoinRequest}
+          onReject={handleRejectJoinRequest}
+          t={t}
+        />
+      )),
+    [handleApproveJoinRequest, handleRejectJoinRequest, joinRequestAction, pendingJoinRequests, t]
   )
 
   const content = (
@@ -1114,6 +1253,15 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                   {t('Members')}
                   {effectiveDetail.members ? ` (${effectiveDetail.members.length})` : ''}
                 </TabsTrigger>
+                {isAdmin && (
+                  <TabsTrigger
+                    value="requests"
+                    className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-4 py-3"
+                  >
+                    {t('Join Requests')}
+                    {joinRequestCount ? ` (${joinRequestCount})` : ''}
+                  </TabsTrigger>
+                )}
               </TabsList>
             </div>
             <TabsContent value="notes" className="mt-0">
@@ -1149,6 +1297,35 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                 <div className="space-y-2">{memberRows}</div>
               </div>
             </TabsContent>
+            {isAdmin && (
+              <TabsContent value="requests" className="mt-0">
+                <div className="space-y-4">
+                  <div className="px-4 py-3 border-b flex items-center justify-between gap-2">
+                    <div className="text-sm font-medium">
+                      {t('Pending join requests')}
+                      {joinRequestCount ? ` (${joinRequestCount})` : ''}
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => groupId && loadJoinRequests(groupId, effectiveGroupRelay)}
+                    >
+                      {t('Refresh')}
+                    </Button>
+                  </div>
+                  {joinRequestsError && (
+                    <div className="text-red-500 px-4 text-sm">{joinRequestsError}</div>
+                  )}
+                  {joinRequestRows.length === 0 && !joinRequestsError ? (
+                    <div className="text-sm text-muted-foreground px-4 py-3">
+                      {t('No pending requests')}
+                    </div>
+                  ) : (
+                    <div className="space-y-2">{joinRequestRows}</div>
+                  )}
+                </div>
+              </TabsContent>
+            )}
           </Tabs>
         </div>
       )}

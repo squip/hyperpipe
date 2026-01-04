@@ -1,5 +1,14 @@
 import { Event } from '@nostr/tools/wasm'
-import { TGroupAdmin, TGroupIdentifier, TGroupInvite, TGroupListEntry, TGroupMetadata, TGroupMembershipStatus, TGroupRoles } from '@/types/groups'
+import {
+  TGroupAdmin,
+  TGroupIdentifier,
+  TGroupInvite,
+  TGroupListEntry,
+  TGroupMetadata,
+  TGroupMembershipStatus,
+  TGroupRoles,
+  TJoinRequest
+} from '@/types/groups'
 
 export function parseGroupIdentifier(rawId: string): TGroupIdentifier {
   if (rawId.includes("'")) {
@@ -59,11 +68,30 @@ export function parseGroupRolesEvent(event: Event): TGroupRoles {
 
 export function parseGroupInviteEvent(event: Event, relay?: string): TGroupInvite {
   const groupId = event.tags.find((t) => t[0] === 'h')?.[1] || ''
+  const name = event.tags.find((t) => t[0] === 'name')?.[1]
+  const about = event.tags.find((t) => t[0] === 'about')?.[1]
+  const fileSharingOn = event.tags.some((t) => t[0] === 'file-sharing-on')
   return {
     groupId,
     relay,
+    name,
+    about,
+    fileSharing: fileSharingOn,
     // Token is encrypted in content per requirements; decrypted elsewhere
     token: undefined,
+    event
+  }
+}
+
+export function parseGroupJoinRequestEvent(event: Event): TJoinRequest {
+  const groupId = event.tags.find((t) => t[0] === 'h')?.[1] || ''
+  const inviteCode = event.tags.find((t) => t[0] === 'code')?.[1]
+  return {
+    groupId,
+    pubkey: event.pubkey,
+    created_at: event.created_at,
+    content: event.content || '',
+    inviteCode,
     event
   }
 }
