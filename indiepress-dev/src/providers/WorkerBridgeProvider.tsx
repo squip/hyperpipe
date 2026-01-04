@@ -774,6 +774,11 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           case 'public-gateway-token-error':
             setLastError(msg.error || 'Failed to issue public gateway token')
             break
+          case 'members-updated':
+          case 'auth-data-removed':
+          case 'auth-data-updated':
+            electronIpc.sendToWorker({ type: 'get-relays' }).catch(() => {})
+            break
           case 'join-auth-progress': {
             const identifier = msg?.data?.publicIdentifier
             const progress: JoinAuthProgress | null =

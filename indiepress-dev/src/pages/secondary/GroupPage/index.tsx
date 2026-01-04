@@ -27,6 +27,7 @@ import Username from '@/components/Username'
 import NormalFeed from '@/components/NormalFeed'
 import { BIG_RELAY_URLS } from '@/constants'
 import { parseGroupIdentifier } from '@/lib/groups'
+import relayMembershipService from '@/services/relay-membership.service'
 import { Input } from '@/components/ui/input'
 import { toast } from 'sonner'
 import { useNostr } from '@/providers/NostrProvider'
@@ -61,22 +62,26 @@ import React from 'react'
 type MemberActionsMenuProps = {
   targetPubkey: string
   showGrantAdmin: boolean
+  showRemove?: boolean
   actionsDisabled?: boolean
   onGrantAdmin: (pubkey: string) => void
   onReportUser: (pubkey: string) => void
   onMutePrivately: (pubkey: string) => void
   onMutePublicly: (pubkey: string) => void
+  onRemove?: (pubkey: string) => void
   t: (key: string, opts?: any) => string
 }
 
 function MemberActionsMenu({
   targetPubkey,
   showGrantAdmin,
+  showRemove,
   actionsDisabled,
   onGrantAdmin,
   onReportUser,
   onMutePrivately,
   onMutePublicly,
+  onRemove,
   t
 }: MemberActionsMenuProps) {
   const [open, setOpen] = React.useState(false)
@@ -132,6 +137,19 @@ function MemberActionsMenu({
           <BellOff className="w-4 h-4" />
           {t('Mute user publicly')}
         </DropdownMenuItem>
+        {showRemove && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              onClick={() => onRemove?.(targetPubkey)}
+              className="relative flex cursor-pointer select-none items-center gap-2 px-2 py-1.5 text-sm rounded-md text-destructive focus:text-destructive"
+              disabled={actionsDisabled}
+            >
+              <LogOut className="w-4 h-4" />
+              {t('Remove member')}
+            </DropdownMenuItem>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -148,6 +166,7 @@ type MemberRowProps = {
   onReportUser: (pubkey: string) => void
   onMutePrivately: (pubkey: string) => void
   onMutePublicly: (pubkey: string) => void
+  onRemove?: (pubkey: string) => void
   t: (key: string, opts?: any) => string
 }
 
@@ -162,6 +181,7 @@ function MemberRowComponent({
   onReportUser,
   onMutePrivately,
   onMutePublicly,
+  onRemove,
   t
 }: MemberRowProps) {
   React.useEffect(() => {
@@ -217,11 +237,13 @@ function MemberRowComponent({
               <MemberActionsMenu
                 targetPubkey={memberPubkey}
                 showGrantAdmin={showGrantAdmin}
+                showRemove={showGrantAdmin}
                 actionsDisabled={actionsDisabled}
                 onGrantAdmin={onGrantAdmin}
                 onReportUser={onReportUser}
                 onMutePrivately={onMutePrivately}
                 onMutePublicly={onMutePublicly}
+                onRemove={onRemove}
                 t={t}
               />
             )}
@@ -234,11 +256,13 @@ function MemberRowComponent({
             <MemberActionsMenu
               targetPubkey={memberPubkey}
               showGrantAdmin={false}
+              showRemove={false}
               actionsDisabled
               onGrantAdmin={onGrantAdmin}
               onReportUser={onReportUser}
               onMutePrivately={onMutePrivately}
               onMutePublicly={onMutePublicly}
+              onRemove={onRemove}
               t={t}
             />
           </>
@@ -261,6 +285,7 @@ const MemoizedMemberRow = React.memo(
     prev.onReportUser === next.onReportUser &&
     prev.onMutePrivately === next.onMutePrivately &&
     prev.onMutePublicly === next.onMutePublicly &&
+    prev.onRemove === next.onRemove &&
     prev.t === next.t
 )
 
@@ -285,11 +310,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     sendInvites,
     updateMetadata,
     grantAdmin,
+    removeUser,
     resolveRelayUrl,
     myGroupList
   } = useGroups()
   const { pubkey, profile: nostrProfile } = useNostr()
-  const { joinFlows, startJoinFlow } = useWorkerBridge()
+  const { joinFlows, startJoinFlow, relays, sendToWorker } = useWorkerBridge()
   const [isLoading, setIsLoading] = useState(true)
   const [activeTab, setActiveTab] = useState<'notes' | 'members'>('notes')
   const [error, setError] = useState<string | null>(null)
@@ -716,6 +742,20 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const isAdmin =
     !!pubkey && !!effectiveDetail?.admins?.some((admin) => admin.pubkey === pubkey)
 
+  const relayKeyForGroup = useMemo(() => {
+    if (!groupId || !relays?.length) return undefined
+    const candidates = new Set<string>()
+    candidates.add(groupId)
+    candidates.add(groupId.replace(':', '/'))
+    candidates.add(groupId.replace('/', ':'))
+    const match = relays.find(
+      (r) =>
+        (r.publicIdentifier && candidates.has(r.publicIdentifier)) ||
+        (r.relayKey && candidates.has(r.relayKey))
+    )
+    return match?.relayKey
+  }, [groupId, relays])
+
   const groupDisplayName =
     effectiveDetail?.metadata?.name || fallbackMeta?.name || groupId || t('Group')
   const groupPicture = effectiveDetail?.metadata?.picture || fallbackMeta?.picture
@@ -813,6 +853,64 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     [mutePublicly]
   )
 
+  const handleRemoveMember = React.useCallback(
+    async (targetPubkey: string) => {
+      if (!groupId || !isAdmin) return
+      try {
+        await removeUser(groupId, targetPubkey, effectiveGroupRelay)
+        const ts = Date.now()
+        const relayKey = relayKeyForGroup
+        const identifier = relayKey || groupId
+        if (sendToWorker && identifier) {
+          sendToWorker({
+            type: 'update-members',
+            data: {
+              relayKey,
+              publicIdentifier: groupId,
+              member_removes: [{ pubkey: targetPubkey, ts }]
+            }
+          }).catch(() => {})
+          sendToWorker({
+            type: 'remove-auth-data',
+            data: {
+              relayKey,
+              publicIdentifier: groupId,
+              pubkey: targetPubkey
+            }
+          }).catch(() => {})
+        }
+        try {
+          const relayUrlKey = resolvedGroupRelay || effectiveGroupRelay || groupId
+          await relayMembershipService.removeMember(relayUrlKey, targetPubkey)
+        } catch (_err) {
+          // cache update best-effort
+        }
+        setDetail((prev) => {
+          if (!prev) return prev
+          const nextMembers = (prev.members || []).filter((m) => m !== targetPubkey)
+          const nextStatus =
+            targetPubkey === pubkey ? ('removed' as const) : prev.membershipStatus
+          return { ...prev, members: nextMembers, membershipStatus: nextStatus }
+        })
+        toast.success(t('Member removed'))
+      } catch (err) {
+        toast.error(t('Failed to remove member'))
+        setError((err as Error).message)
+      }
+    },
+    [
+      effectiveGroupRelay,
+      groupId,
+      isAdmin,
+      pubkey,
+      relayKeyForGroup,
+      removeUser,
+      resolvedGroupRelay,
+      sendToWorker,
+      t
+    ]
+  )
+
   const memberRows = useMemo(
     () =>
       filteredMembers.map((member) => (
@@ -828,12 +926,14 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           onReportUser={handleReportUser}
           onMutePrivately={handleMutePrivately}
           onMutePublicly={handleMutePublicly}
+          onRemove={handleRemoveMember}
           t={t}
         />
       )),
     [
       filteredMembers,
       handleGrantAdmin,
+      handleRemoveMember,
       handleMutePrivately,
       handleMutePublicly,
       handleReportUser,
