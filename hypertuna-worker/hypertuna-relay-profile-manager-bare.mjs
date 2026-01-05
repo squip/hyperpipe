@@ -33,6 +33,11 @@ function getStorageDir(userKey = null) {
     // If we have a userKey from config, use user-specific directory
     if (userKey || global.userConfig?.userKey) {
         const key = userKey || global.userConfig.userKey;
+        const normalizedBase = baseDir.replace(/\\+/g, '/');
+        const suffix = `/users/${key}`;
+        if (normalizedBase.endsWith(suffix)) {
+            return baseDir;
+        }
         return join(baseDir, 'users', key);
     }
     

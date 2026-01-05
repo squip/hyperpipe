@@ -247,6 +247,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
   const nostr = useNostr()
   const pubkeyHex = nostr.pubkey
   const nsecHex = nostr.nsecHex
+  const userKey = useMemo(() => (pubkeyHex ? pubkeyHex.toLowerCase() : null), [pubkeyHex])
   const identityReady = isHex64(pubkeyHex) && isHex64(nsecHex)
 
   const [autostartEnabled, setAutostartEnabledState] = useState(readAutostartEnabled)
@@ -295,7 +296,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
 
   const restartAttemptRef = useRef(0)
   const restartTimeoutRef = useRef<number | null>(null)
-  const lastIdentityRef = useRef<{ pubkeyHex: string | null; nsecHex: string | null } | null>(null)
+  const lastIdentityRef = useRef<{ pubkeyHex: string | null; nsecHex: string | null; userKey: string | null } | null>(null)
   const warmSessionIdsRef = useRef(new Set<string>())
   const inFlightStartRef = useRef(false)
   const autostartEnabledRef = useRef(autostartEnabled)
@@ -410,6 +411,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     if (!isHex64(pubkeyHex) || !isHex64(nsecHex)) {
       throw new Error('Hypertuna worker requires a local nsec/ncryptsec account in Electron.')
     }
+    if (!userKey) {
+      throw new Error('Hypertuna worker requires a userKey for per-account isolation.')
+    }
     let nostr_npub: string | null = null
     try {
       nostr_npub = nip19.npubEncode(pubkeyHex.toLowerCase())
@@ -419,9 +423,10 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     return {
       nostr_pubkey_hex: pubkeyHex.toLowerCase(),
       nostr_nsec_hex: nsecHex.toLowerCase(),
-      nostr_npub: nostr_npub || undefined
+      nostr_npub: nostr_npub || undefined,
+      userKey
     }
-  }, [pubkeyHex, nsecHex])
+  }, [pubkeyHex, nsecHex, userKey])
 
   const startWorkerInternal = useCallback(
     async ({ resetRestartAttempts }: { resetRestartAttempts: boolean }) => {
@@ -960,7 +965,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       return
     }
 
-    const next = { pubkeyHex: pubkeyHex ?? null, nsecHex: nsecHex ?? null }
+    const next = { pubkeyHex: pubkeyHex ?? null, nsecHex: nsecHex ?? null, userKey }
     const prev = lastIdentityRef.current
     lastIdentityRef.current = next
 
@@ -968,7 +973,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     const nextReady = identityReady
     const identityChanged = !!(
       prev &&
-      (prev.pubkeyHex !== next.pubkeyHex || prev.nsecHex !== next.nsecHex)
+      (prev.pubkeyHex !== next.pubkeyHex || prev.nsecHex !== next.nsecHex || prev.userKey !== next.userKey)
     )
 
     const workerIsActive =

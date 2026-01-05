@@ -37,6 +37,9 @@ import { useWorkerBridge } from './WorkerBridgeProvider'
 import type { TPublishOptions } from '@/types'
 import * as nip19 from '@nostr/tools/nip19'
 
+// Prevent repeated bootstrap publishes per group/relay when admin snapshots are missing.
+const adminRecoveryAttempts = new Set<string>()
+
 type TGroupsContext = {
   discoveryGroups: TGroupMetadata[]
   invites: TGroupInvite[]
@@ -180,6 +183,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
   const workerRelayUrlMap = useMemo(() => {
     const map = new Map<string, string>()
+
     const withAuth = (url?: string, token?: string) => {
       if (!url) return url
       try {
@@ -193,17 +197,38 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         return url
       }
     }
+
+    const addKey = (key?: string, value?: string) => {
+      if (!key || !value) return
+      map.set(key, value)
+    }
+
+    const addUrlVariants = (targetUrl?: string, valueUrl?: string) => {
+      if (!targetUrl || !valueUrl) return
+      const base = getBaseRelayUrl(targetUrl)
+      addKey(targetUrl, valueUrl)
+      addKey(base, valueUrl)
+      try {
+        const parsed = new URL(base)
+        const hostPath = `${parsed.host}${parsed.pathname}`
+        const pathOnly = parsed.pathname.replace(/^\/+/, '')
+        addKey(hostPath, valueUrl)
+        addKey(pathOnly, valueUrl)
+      } catch (_err) {
+        // non-URL strings: attempt a lightweight path-only fallback
+        const pathOnly = base.replace(/^[a-z]+:\/\/[^/]+\/?/, '')
+        addKey(pathOnly, valueUrl)
+      }
+    }
+
     workerRelays.forEach((r) => {
       const token = r.userAuthToken || (r as any)?.authToken
       const authUrl = withAuth(r.connectionUrl, token)
-      if (r.relayKey && authUrl) map.set(r.relayKey, authUrl)
+      addUrlVariants(authUrl, authUrl)
+      if (r.relayKey && authUrl) addKey(r.relayKey, authUrl)
       if (r.publicIdentifier && authUrl) {
-        map.set(r.publicIdentifier, authUrl)
-        map.set(r.publicIdentifier.replace(':', '/'), authUrl)
-      }
-      if (authUrl) {
-        const base = getBaseRelayUrl(authUrl)
-        if (base) map.set(base, authUrl)
+        addKey(r.publicIdentifier, authUrl)
+        addKey(r.publicIdentifier.replace(':', '/'), authUrl)
       }
     })
     console.info('[GroupsProvider] workerRelays', workerRelays)
@@ -214,13 +239,40 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const resolveRelayUrl = useCallback(
     (relay?: string) => {
       if (!relay) return relay
-      return workerRelayUrlMap.get(relay) || relay
+      const direct = workerRelayUrlMap.get(relay)
+      if (direct) return direct
+
+      const base = getBaseRelayUrl(relay)
+      const baseHit = workerRelayUrlMap.get(base)
+      if (baseHit) return baseHit
+
+      try {
+        const parsed = new URL(base)
+        const hostPath = `${parsed.host}${parsed.pathname}`
+        const pathOnly = parsed.pathname.replace(/^\/+/, '')
+        const hostHit = workerRelayUrlMap.get(hostPath)
+        if (hostHit) return hostHit
+        const pathHit = workerRelayUrlMap.get(pathOnly)
+        if (pathHit) return pathHit
+      } catch (_err) {
+        const pathOnly = base.replace(/^[a-z]+:\/\/[^/]+\/?/, '')
+        const pathHit = workerRelayUrlMap.get(pathOnly)
+        if (pathHit) return pathHit
+      }
+
+      return relay
     },
     [workerRelayUrlMap]
   )
 
   useEffect(() => {
     setFavoriteGroups(localStorageService.getFavoriteGroups(pubkey))
+  }, [pubkey])
+
+  useEffect(() => {
+    // Clear per-account volatile state on account switch
+    setJoinRequests({})
+    setRejectedJoinRequests({})
   }, [pubkey])
 
   useEffect(() => {
@@ -619,7 +671,35 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       }
 
       const metadata = metadataEvt ? parseGroupMetadataEvent(metadataEvt, relay) : null
-      const admins = adminsEvt ? parseGroupAdminsEvent(adminsEvt) : []
+      let admins = adminsEvt ? parseGroupAdminsEvent(adminsEvt) : []
+
+      const shouldInjectCreatorAdmin = isCreator && pubkey && admins.length === 0
+      if (shouldInjectCreatorAdmin) {
+        const relayForBootstrap = resolved || targetRelay || null
+        const recoveryKey = `${relayForBootstrap || 'unknown-relay'}|${groupId}`
+        console.warn('[GroupsProvider] creator detected but no admin snapshot; injecting self', {
+          groupId,
+          relay: relayForBootstrap,
+          recoveryAttempted: adminRecoveryAttempts.has(recoveryKey)
+        })
+        admins = [{ pubkey, roles: ['admin'] }]
+
+        if (relayForBootstrap && !adminRecoveryAttempts.has(recoveryKey)) {
+          adminRecoveryAttempts.add(recoveryKey)
+          try {
+            const { adminListEvent, memberListEvent } = buildHypertunaAdminBootstrapDraftEvents({
+              publicIdentifier: groupId,
+              adminPubkeyHex: pubkey,
+              name: metadata?.name || groupId
+            })
+            // Best-effort republish to the group relay so subsequent fetches have a 39001 snapshot.
+            publish(adminListEvent, { specifiedRelayUrls: [relayForBootstrap] }).catch(() => {})
+            publish(memberListEvent, { specifiedRelayUrls: [relayForBootstrap] }).catch(() => {})
+          } catch (err) {
+            console.warn('[GroupsProvider] failed to bootstrap admin/member snapshot', { groupId, err })
+          }
+        }
+      }
 
       console.info('[GroupsProvider] membership derivation', {
         groupId,

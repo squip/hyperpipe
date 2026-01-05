@@ -60,7 +60,7 @@ import { SimpleUsername } from '@/components/Username'
 import { generateImageByPubkey } from '@/lib/pubkey'
 import React from 'react'
 import { TJoinRequest } from '@/types/groups'
-import { registerJoinWorkflowSimulator } from '@/devtools/joinWorkflowSimulator'
+// import { registerJoinWorkflowSimulator } from '@/devtools/joinWorkflowSimulator'
 
 type MemberActionsMenuProps = {
   targetPubkey: string
@@ -799,35 +799,40 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const isOpenGroup = effectiveDetail?.metadata?.isOpen !== false
 
   const isAdmin =
-    !!pubkey && !!effectiveDetail?.admins?.some((admin) => admin.pubkey === pubkey)
+    !!pubkey &&
+    (isCreator || !!effectiveDetail?.admins?.some((admin) => admin.pubkey === pubkey))
 
   useEffect(() => {
     if (!groupId || !isAdmin) return
     loadJoinRequests(groupId, effectiveGroupRelay)
   }, [effectiveGroupRelay, groupId, isAdmin, loadJoinRequests])
 
-  useEffect(() => {
-    if (!groupId) return
-    registerJoinWorkflowSimulator({
-      groupId,
-      relay: effectiveGroupRelay,
-      startJoinFlow,
-      sendJoinRequest,
-      approveJoinRequest,
-      rejectJoinRequest,
-      sendInvites,
-      loadJoinRequests
-    })
-  }, [
-    approveJoinRequest,
-    effectiveGroupRelay,
-    groupId,
-    loadJoinRequests,
-    rejectJoinRequest,
-    sendInvites,
-    sendJoinRequest,
-    startJoinFlow
-  ])
+  /*
+   * Dev-only JoinSimulator disabled to avoid automatic registration in app builds.
+   * Re-enable by uncommenting and restoring the import from @/devtools/joinWorkflowSimulator.
+   */
+  // useEffect(() => {
+  //   if (!groupId) return
+  //   registerJoinWorkflowSimulator({
+  //     groupId,
+  //     relay: effectiveGroupRelay,
+  //     startJoinFlow,
+  //     sendJoinRequest,
+  //     approveJoinRequest,
+  //     rejectJoinRequest,
+  //     sendInvites,
+  //     loadJoinRequests
+  //   })
+  // }, [
+  //   approveJoinRequest,
+  //   effectiveGroupRelay,
+  //   groupId,
+  //   loadJoinRequests,
+  //   rejectJoinRequest,
+  //   sendInvites,
+  //   sendJoinRequest,
+  //   startJoinFlow
+  // ])
 
   const relayKeyForGroup = useMemo(() => {
     if (!groupId || !relays?.length) return undefined

@@ -65,10 +65,14 @@ import BlindPeeringManager from './blind-peering-manager.mjs'
 const pearRuntime = globalThis?.Pear
 const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd()
 const defaultStorageDir = process.env.STORAGE_DIR || pearRuntime?.config?.storage || join(process.cwd(), 'data')
+const userKey = process.env.USER_KEY || null
 const BLIND_PEERING_METADATA_FILENAME = 'blind-peering-metadata.json'
 const BLIND_PEER_REHYDRATION_TIMEOUT_MS = 45000
 
-global.userConfig = global.userConfig || { storage: defaultStorageDir }
+global.userConfig = {
+  storage: defaultStorageDir,
+  userKey: userKey || null
+}
 
 const relayMirrorSubscriptions = new Map()
 let lastBlindPeerFingerprint = null
@@ -782,6 +786,9 @@ function startDriveWatcher () {
 
 
 function getUserKey(config) {
+    if (config?.userKey && typeof config.userKey === 'string') {
+      return config.userKey
+    }
     // If storage path contains /users/, extract the key
     if (config.storage && config.storage.includes('/users/')) {
       const match = config.storage.match(/\/users\/([a-f0-9]{64})/);
@@ -925,14 +932,14 @@ async function loadOrCreateConfig(customDir = null) {
 
   const gatewaySettings = await loadGatewaySettings()
   const cachedGatewaySettings = getCachedGatewaySettings()
-  const defaultGatewayUrl = gatewaySettings.gatewayUrl || cachedGatewaySettings.gatewayUrl
-  const defaultProxyHost = gatewaySettings.proxyHost || cachedGatewaySettings.proxyHost
+  const defaultGatewayUrl = gatewaySettings.gatewayUrl || cachedGatewaySettings.gatewayUrl || 'http://127.0.0.1:1945'
+  const defaultProxyHost = gatewaySettings.proxyHost || cachedGatewaySettings.proxyHost || '127.0.0.1:8443'
 
   const defaultConfig = {
     port: 1945,
     gatewayUrl: defaultGatewayUrl,
     proxy_server_address: defaultProxyHost,
-    proxy_websocket_protocol: gatewaySettings.proxyWebsocketProtocol || cachedGatewaySettings.proxyWebsocketProtocol,
+    proxy_websocket_protocol: gatewaySettings.proxyWebsocketProtocol || cachedGatewaySettings.proxyWebsocketProtocol || 'ws',
     registerWithGateway: true,
     registerInterval: 300000,
     relays: [],

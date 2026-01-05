@@ -10,6 +10,7 @@ let gatewayStatusCache = null;
 let gatewayLogsCache = [];
 let publicGatewayConfigCache = null;
 let publicGatewayStatusCache = null;
+let currentWorkerUserKey = null;
 
 function isHex64(value) {
   return typeof value === 'string' && /^[a-fA-F0-9]{64}$/.test(value);
@@ -29,6 +30,9 @@ function normalizeWorkerConfigPayload(payload) {
   if (!normalized.nostr_nsec_hex && normalized.nostrNsecHex) {
     normalized.nostr_nsec_hex = normalized.nostrNsecHex;
   }
+  if (!normalized.userKey && normalized.user_key) {
+    normalized.userKey = normalized.user_key;
+  }
 
   return normalized;
 }
@@ -37,6 +41,9 @@ function validateWorkerConfigPayload(payload) {
   if (!payload) return null;
   if (!isHex64(payload.nostr_pubkey_hex) || !isHex64(payload.nostr_nsec_hex)) {
     return 'Invalid worker config: expected nostr_pubkey_hex and nostr_nsec_hex (64-char hex)';
+  }
+  if (!payload.userKey || typeof payload.userKey !== 'string') {
+    return 'Invalid worker config: userKey is required for per-account isolation';
   }
   return null;
 }
@@ -150,15 +157,22 @@ async function startWorkerProcess(workerConfig = null) {
     return { success: false, error: validationError };
   }
 
+  const nextUserKey = normalizedConfig?.userKey || null;
+
   if (workerProcess) {
-    if (normalizedConfig) {
+    // If the running worker belongs to a different user, restart it for the new account.
+    if (nextUserKey && currentWorkerUserKey && nextUserKey !== currentWorkerUserKey) {
+      await stopWorkerProcess();
+    } else if (normalizedConfig) {
       const configResult = sendWorkerConfigToProcess(workerProcess, normalizedConfig);
       if (!configResult.success) {
         return { success: false, error: configResult.error || 'Failed to send config to running worker' };
       }
+      currentWorkerUserKey = nextUserKey;
       return { success: true, alreadyRunning: true, configSent: true };
+    } else {
+      return { success: true, alreadyRunning: true, configSent: false };
     }
-    return { success: true, alreadyRunning: true, configSent: false };
   }
 
   const workerRoot = path.join(__dirname, '..', 'hypertuna-worker');
@@ -173,16 +187,19 @@ async function startWorkerProcess(workerConfig = null) {
   try {
     await ensureStorageDir();
 
+    // IMPORTANT: STORAGE_DIR is the base; worker will scope by USER_KEY to avoid double-nesting.
     workerProcess = spawn(process.execPath, [workerEntry], {
       cwd: workerRoot,
       env: {
         ...process.env,
         ELECTRON_RUN_AS_NODE: '1',
         APP_DIR: workerRoot,
-        STORAGE_DIR: storagePath
+        STORAGE_DIR: storagePath,
+        USER_KEY: nextUserKey
       },
       stdio: ['pipe', 'pipe', 'pipe', 'ipc']
     });
+    currentWorkerUserKey = nextUserKey;
 
     pendingWorkerMessages = [];
     gatewayStatusCache = null;
@@ -291,6 +308,11 @@ async function stopWorkerProcess() {
     workerProcess.kill();
     workerProcess = null;
     pendingWorkerMessages = [];
+    currentWorkerUserKey = null;
+    gatewayStatusCache = null;
+    gatewayLogsCache = [];
+    publicGatewayConfigCache = null;
+    publicGatewayStatusCache = null;
     return { success: true };
   } catch (error) {
     console.error('[Main] Failed to stop worker', error);

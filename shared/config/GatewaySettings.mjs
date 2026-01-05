@@ -1,7 +1,7 @@
 const DEFAULT_SETTINGS = Object.freeze({
   gatewayUrl: 'https://hypertuna.com',
-  proxyHost: 'hypertuna.com',
-  proxyWebsocketProtocol: 'wss'
+  proxyHost: '127.0.0.1:8443',
+  proxyWebsocketProtocol: 'ws'
 });
 
 const LOCAL_STORAGE_KEY = 'hypertuna_gateway_settings';
