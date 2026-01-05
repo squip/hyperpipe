@@ -15,6 +15,7 @@ import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { SimpleUserAvatar } from '@/components/UserAvatar'
 import { useNostr } from '@/providers/NostrProvider'
+import { toast } from 'sonner'
 
 type TTab = 'discover' | 'my' | 'invites'
 
@@ -148,12 +149,16 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     refreshInvites,
     isLoadingDiscovery,
     discoveryError,
-    invitesError
+    invitesError,
+    resolveRelayUrl
   } = useGroups()
+  const { startJoinFlow, sendToWorker } = useWorkerBridge()
+  const { pubkey } = useNostr()
   const [tab, setTab] = useState<TTab>('discover')
   const [search, setSearch] = useState('')
   const { push } = useSecondaryPage()
   const [showCreate, setShowCreate] = useState(false)
+  const [joiningInviteId, setJoiningInviteId] = useState<string | null>(null)
 
   const inviteGroupIds = useMemo(() => new Set(invites.map((inv) => inv.groupId)), [invites])
   const filteredDiscovery = discoveryGroups.filter((g) => {
@@ -242,6 +247,41 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     )
   }
 
+  const handleUseInvite = async (inv: (typeof invites)[number]) => {
+    if (!inv) return
+    if (joiningInviteId) return
+    const relayUrl = inv.relayUrl ?? (inv.relay ? resolveRelayUrl(inv.relay) : null) ?? inv.relay ?? null
+    const relayKey = inv.relayKey ?? null
+    setJoiningInviteId(inv.event.id)
+    try {
+      if (sendToWorker && pubkey && inv.token) {
+        sendToWorker({
+          type: 'update-auth-data',
+          data: {
+            relayKey,
+            publicIdentifier: inv.groupId,
+            pubkey,
+            token: inv.token
+          }
+        }).catch(() => {})
+      }
+
+      await startJoinFlow(inv.groupId, {
+        fileSharing: inv.fileSharing !== false,
+        token: inv.token,
+        relayKey,
+        relayUrl
+      })
+
+      push(toGroup(inv.groupId, relayUrl || inv.relay))
+    } catch (err) {
+      console.error('Failed to start join flow from invite', err)
+      toast.error(t('Failed to start join flow'))
+    } finally {
+      setJoiningInviteId(null)
+    }
+  }
+
   const renderInvites = () => {
     return (
       <div className="space-y-3">
@@ -268,11 +308,10 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
               </div>
               <Button
                 size="sm"
-                onClick={() => {
-                  push(toGroup(inv.groupId, inv.relay))
-                }}
+                disabled={joiningInviteId === inv.event.id}
+                onClick={() => handleUseInvite(inv)}
               >
-                {t('Use invite')}
+                {joiningInviteId === inv.event.id ? t('Joining…') : t('Use invite')}
               </Button>
             </CardContent>
           </Card>

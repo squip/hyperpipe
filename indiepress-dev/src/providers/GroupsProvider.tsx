@@ -357,8 +357,25 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           const invite = parseGroupInviteEvent(evt)
           if (!evt.content) return invite
           try {
-            const token = await nip04Decrypt(evt.pubkey, evt.content)
-            return { ...invite, token }
+            const decrypted = await nip04Decrypt(evt.pubkey, evt.content)
+            let token: string | undefined
+            let relayUrl: string | null | undefined
+            let relayKey: string | null | undefined
+            let fileSharing: boolean | undefined
+            try {
+              const payload = JSON.parse(decrypted)
+              if (payload && typeof payload === 'object') {
+                token = typeof payload.token === 'string' ? payload.token : undefined
+                relayUrl = typeof payload.relayUrl === 'string' ? payload.relayUrl : null
+                relayKey = typeof payload.relayKey === 'string' ? payload.relayKey : null
+                if (typeof payload.fileSharing === 'boolean') {
+                  fileSharing = payload.fileSharing
+                }
+              }
+            } catch {
+              token = decrypted
+            }
+            return { ...invite, token, relayUrl, relayKey, fileSharing }
           } catch (_err) {
             return invite
           }
@@ -957,7 +974,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       if (!invitees.length) return
 
       const resolved = relay ? resolveRelayUrl(relay) : null
-      const relayUrls = resolved ? [resolved] : defaultDiscoveryRelays
+      // Send invites to both the group relay (if provided) and discovery relays so non-members can see them.
+      const relayUrls = Array.from(new Set([...(resolved ? [resolved] : []), ...defaultDiscoveryRelays]))
       const meta =
         discoveryGroups.find(
           (g) => g.id === groupId && (!relay || !g.relay || g.relay === relay || g.relay === resolved)

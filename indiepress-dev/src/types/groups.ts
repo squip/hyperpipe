@@ -41,6 +41,8 @@ export type TGroupInvite = {
   name?: string
   about?: string
   fileSharing?: boolean
+  relayUrl?: string | null
+  relayKey?: string | null
   token?: string
   event: Event
 }

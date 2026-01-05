@@ -665,8 +665,24 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const handleJoin = async () => {
     if (!groupId) return
     try {
-      if (isElectron() && isHypertunaGroup && detail?.metadata?.isOpen !== false) {
-        await startJoinFlow(groupId, { fileSharing: true })
+      const relayUrlForJoin = resolvedGroupRelay || effectiveGroupRelay || null
+      const relayKey = relayKeyForGroup || null
+      const shouldUseWorkerJoin = isElectron() && isHypertunaGroup
+
+      if (shouldUseWorkerJoin && inviteToken && sendToWorker && pubkey) {
+        sendToWorker({
+          type: 'update-auth-data',
+          data: { relayKey, publicIdentifier: groupId, pubkey, token: inviteToken }
+        }).catch(() => {})
+      }
+
+      if (shouldUseWorkerJoin) {
+        await startJoinFlow(groupId, {
+          fileSharing: isOpenGroup,
+          token: inviteToken,
+          relayKey,
+          relayUrl: relayUrlForJoin
+        })
         return
       }
 

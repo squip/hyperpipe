@@ -160,7 +160,10 @@ type WorkerBridgeContextValue = {
   restartWorker: () => Promise<void>
   sendToWorker: (message: unknown) => Promise<void>
   createRelay: (data: RelayCreateRequest) => Promise<RelayCreatedPayload>
-  startJoinFlow: (publicIdentifier: string, opts?: { fileSharing?: boolean }) => Promise<void>
+  startJoinFlow: (
+    publicIdentifier: string,
+    opts?: { fileSharing?: boolean; token?: string; relayKey?: string | null; relayUrl?: string | null }
+  ) => Promise<void>
   clearJoinFlow: (publicIdentifier: string) => void
 }
 
@@ -466,7 +469,10 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
   }, [])
 
   const startJoinFlowInternal = useCallback(
-    async (publicIdentifier: string, opts?: { fileSharing?: boolean }) => {
+    async (
+      publicIdentifier: string,
+      opts?: { fileSharing?: boolean; token?: string; relayKey?: string | null; relayUrl?: string | null }
+    ) => {
       if (!isElectron()) throw new Error('Electron IPC unavailable')
       const identifier = String(publicIdentifier || '').trim()
       if (!identifier || !identifier.includes(':')) {
@@ -512,7 +518,13 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         void err
       }
 
-      const data: any = { publicIdentifier: identifier, fileSharing }
+      const data: any = {
+        publicIdentifier: identifier,
+        fileSharing,
+        token: opts?.token,
+        relayKey: opts?.relayKey || undefined,
+        relayUrl: opts?.relayUrl || undefined
+      }
       if (hostPeers && hostPeers.length) data.hostPeers = hostPeers
 
       await electronIpc.sendToWorker({ type: 'start-join-flow', data })
@@ -1184,7 +1196,10 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       createRelay: async (data: RelayCreateRequest) => {
         return await createRelayInternal(data)
       },
-      startJoinFlow: async (publicIdentifier: string, opts?: { fileSharing?: boolean }) => {
+      startJoinFlow: async (
+        publicIdentifier: string,
+        opts?: { fileSharing?: boolean; token?: string; relayKey?: string | null; relayUrl?: string | null }
+      ) => {
         await startJoinFlowInternal(publicIdentifier, opts)
       },
       clearJoinFlow
