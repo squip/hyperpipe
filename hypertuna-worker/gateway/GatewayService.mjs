@@ -25,8 +25,10 @@ import {
   registerVirtualRelay,
   unregisterVirtualRelay
 } from '../hypertuna-relay-manager-adapter.mjs';
+import { activeRelays as relayManagerMap } from '../hypertuna-relay-manager-adapter.mjs';
 import { getRelayAuthStore } from '../relay-auth-store.mjs';
 import { updatePublicGatewaySettings } from '../../shared/config/PublicGatewaySettings.mjs';
+import HypercoreId from 'hypercore-id-encoding';
 
 const MAX_LOG_ENTRIES = 500;
 const DEFAULT_PORT = 8443;
@@ -1098,38 +1100,49 @@ export class GatewayService extends EventEmitter {
 
     const now = Date.now();
 
+    const relayCores = this.#collectRelayCoreMetadata(relayKey);
+    if (relayCores?.length) {
+      this.log('debug', `[PublicGateway] Collected relay core metadata for registration relay=${relayKey}`, {
+        cores: relayCores.length
+      });
+    } else {
+      this.log('debug', `[PublicGateway] No relay core metadata found for relay=${relayKey}`);
+    }
+
     if (!peers.length) {
       try {
         await this.publicGatewayRegistrar.unregisterRelay(relayKey);
-      this.publicGatewayRelayState.set(relayKey, {
-        relayKey,
-        status: 'offline',
-        peerCount: 0,
-        lastSyncedAt: now,
-        message: 'No peers connected',
-        metadata: metadataCopy,
-        peers: [],
-        blindPeer: this.blindPeerSummary || null,
-        localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
-          ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
-          : null,
-        requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
-      });
+        this.publicGatewayRelayState.set(relayKey, {
+          relayKey,
+          status: 'offline',
+          peerCount: 0,
+          lastSyncedAt: now,
+          message: 'No peers connected',
+          metadata: metadataCopy,
+          peers: [],
+          blindPeer: this.blindPeerSummary || null,
+          relayCores: relayCores || [],
+          localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
+            ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
+            : null,
+          requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
+        });
       } catch (error) {
         this.publicGatewayRelayState.set(relayKey, {
           relayKey,
           status: 'error',
           peerCount: 0,
           lastSyncedAt: now,
-        message: error.message,
-        metadata: metadataCopy,
-        peers: [],
-        blindPeer: this.blindPeerSummary || null,
-        localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
-          ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
-          : null,
-        requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
-      });
+          message: error.message,
+          metadata: metadataCopy,
+          peers: [],
+          blindPeer: this.blindPeerSummary || null,
+          relayCores: relayCores || [],
+          localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
+            ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
+            : null,
+          requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
+        });
         this.log('warn', `[PublicGateway] Failed to unregister relay ${relayKey}: ${error.message}`);
       }
       this.#clearRelayToken(relayKey);
@@ -1141,6 +1154,9 @@ export class GatewayService extends EventEmitter {
       peers,
       metadata: metadataCopy
     };
+    if (relayCores?.length) {
+      payload.relayCores = relayCores;
+    }
 
     try {
       const registrationResult = await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
@@ -1219,6 +1235,7 @@ export class GatewayService extends EventEmitter {
         peers,
         blindPeer: registrationResult.blindPeer || this.blindPeerSummary || null,
         token: tokenInfo?.token || null,
+        relayCores: relayCores || [],
         expiresAt: tokenInfo?.expiresAt || null,
         ttlSeconds: tokenInfo?.ttlSeconds || null,
         connectionUrl: tokenInfo?.connectionUrl || null,
@@ -1252,7 +1269,8 @@ export class GatewayService extends EventEmitter {
         message: error.message,
         metadata: metadataCopy,
         peers,
-        blindPeer: this.blindPeerSummary || null
+        blindPeer: this.blindPeerSummary || null,
+        relayCores: relayCores || []
       });
       this.log('warn', `[PublicGateway] Failed to sync relay ${relayKey}: ${error.message}`);
       this.#scheduleRelayTokenRetry(relayKey);
@@ -2014,6 +2032,71 @@ export class GatewayService extends EventEmitter {
       hyperbeeLastFallbackAt: this.hyperbeeQueryStats?.lastFallbackAt || null,
       hyperbeeLastFallbackReason: this.hyperbeeQueryStats?.lastFallbackReason || null
     };
+  }
+
+  #collectRelayCoreMetadata(relayKey) {
+    if (!relayKey || !relayManagerMap?.get) return [];
+    const relayManager = relayManagerMap.get(relayKey);
+    const autobase = relayManager?.relay || null;
+    if (!autobase) return [];
+
+    const seen = new Set();
+    const cores = [];
+
+    const normalizeKey = (candidate) => {
+      if (!candidate) return null;
+      const coreLike = candidate.core || candidate;
+      const key = coreLike?.key || coreLike?.discoveryKey || null;
+      if (!key) return null;
+      if (typeof key === 'string') {
+        try {
+          return HypercoreId.decode(key);
+        } catch (_) {
+          if (/^[0-9a-fA-F]{64}$/.test(key)) {
+            return Buffer.from(key, 'hex');
+          }
+          return null;
+        }
+      }
+      if (Buffer.isBuffer(key)) return key;
+      if (key instanceof Uint8Array) return Buffer.from(key);
+      return null;
+    };
+
+    const addCore = (candidate, role = null) => {
+      const keyBuf = normalizeKey(candidate);
+      if (!keyBuf || keyBuf.length !== 32) return;
+      let encoded = null;
+      try {
+        encoded = HypercoreId.encode(keyBuf);
+      } catch (_) {
+        encoded = Buffer.from(keyBuf).toString('hex');
+      }
+      if (!encoded || seen.has(encoded)) return;
+      seen.add(encoded);
+      cores.push(role ? { key: encoded, role } : { key: encoded });
+    };
+
+    const addArray = (arr, prefix) => {
+      if (!Array.isArray(arr)) return;
+      arr.forEach((entry, index) => addCore(entry?.core || entry, prefix ? `${prefix}-${index}` : null));
+    };
+
+    addCore(autobase, 'autobase');
+    addCore(autobase?.core, 'autobase-core');
+    addCore(autobase?.local || autobase?.local?.core, 'autobase-local');
+    addCore(autobase?.localInput || autobase?.localInput?.core, 'autobase-local');
+    addCore(autobase?.localWriter || autobase?.localWriter?.core, 'autobase-local');
+    addCore(autobase?.defaultWriter || autobase?.defaultWriter?.core, 'autobase-writer');
+    addCore(autobase?.view || autobase?.view?.core, 'autobase-view');
+    addArray(autobase?.activeWriters, 'autobase-writer');
+    addArray(autobase?.writers, 'autobase-writer');
+    addArray(Array.isArray(autobase?.inputs) ? autobase.inputs : (autobase?.inputs ? Array.from(autobase.inputs) : []), 'autobase-writer');
+    if (autobase?.writer && typeof autobase.writer === 'object') {
+      addCore(autobase.writer.core || autobase.writer, 'autobase-writer');
+    }
+
+    return cores;
   }
 
   getStatus() {

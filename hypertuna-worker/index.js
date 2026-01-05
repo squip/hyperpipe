@@ -2142,6 +2142,36 @@ async function handleMessageObject(message) {
             .map((key) => String(key || '').trim().toLowerCase())
             .filter(Boolean)
 
+          // Blind-peer fallback: if no host peers but mirror info provided, hydrate mirrors and trust the mirror key.
+          if ((!hostPeers || hostPeers.length === 0) && data.blindPeer && data.blindPeer.publicKey) {
+            try {
+              const manager = await ensureBlindPeeringManager()
+              if (manager) {
+                manager.markTrustedMirrors([data.blindPeer.publicKey])
+                const relayIdentifier = data.relayKey || publicIdentifier
+                const coreRefs = Array.isArray(data.cores)
+                  ? data.cores
+                      .map((c) => (c && c.key ? String(c.key) : null))
+                      .filter(Boolean)
+                  : []
+                manager.ensureRelayMirror({
+                  relayKey: relayIdentifier,
+                  publicIdentifier,
+                  coreRefs
+                })
+                await manager.refreshFromBlindPeers('join-flow')
+                await manager.rehydrateMirrors({ reason: 'join-flow', timeoutMs: 30000 })
+                hostPeers = [String(data.blindPeer.publicKey).toLowerCase()]
+                console.log('[Worker] Using blind-peer mirror as host peer for join flow', {
+                  relayIdentifier,
+                  coreRefsCount: coreRefs.length
+                })
+              }
+            } catch (err) {
+              console.warn('[Worker] Blind-peer fallback failed', err?.message || err)
+            }
+          }
+
           if (!hostPeers.length) {
             const status = getGatewayStatus()
             const peerRelayMap = status?.peerRelayMap

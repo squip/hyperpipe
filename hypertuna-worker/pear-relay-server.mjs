@@ -43,6 +43,7 @@ import {
   saveRelayProfile,
   calculateAuthorizedUsers
 } from './hypertuna-relay-profile-manager-bare.mjs';
+import HypercoreId from 'hypercore-id-encoding';
 
 import { getFile, getPfpFile } from './hyperdrive-manager.mjs';
 import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/GatewaySettings.mjs';
@@ -385,17 +386,36 @@ function ensurePeerJoinHandle(publicKey) {
     throw new Error('Hyperswarm swarm not initialized');
   }
 
-  const normalized = publicKey.toLowerCase();
+  const decodePeerKey = (key) => {
+    if (!key) return null;
+    const trimmed = String(key).trim();
+    if (!trimmed) return null;
+    // Hex path
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+      return Buffer.from(trimmed, 'hex');
+    }
+    // hypercore-id/base32 path
+    try {
+      const decoded = HypercoreId.decode(trimmed);
+      if (decoded && decoded.length === 32) {
+        return Buffer.from(decoded);
+      }
+    } catch (_) {
+      // ignore
+    }
+    return null;
+  };
+
+  const keyBuffer = decodePeerKey(publicKey);
+  if (!keyBuffer || keyBuffer.length !== 32) {
+    throw new Error(`Invalid peer public key: ${publicKey}`);
+  }
+
+  const normalized = keyBuffer.toString('hex');
   if (peerJoinHandles.has(normalized)) {
     return peerJoinHandles.get(normalized);
   }
 
-  let keyBuffer;
-  try {
-    keyBuffer = Buffer.from(normalized, 'hex');
-  } catch (error) {
-    throw new Error(`Invalid peer public key: ${publicKey}`);
-  }
   const handle = swarm.joinPeer(keyBuffer);
   peerJoinHandles.set(normalized, handle);
   return handle;
@@ -420,7 +440,26 @@ function parseJsonBody(body) {
 }
 
 async function waitForPeerProtocol(publicKey, timeoutMs = 20000) {
-  const normalized = publicKey.toLowerCase();
+  const decodePeerKey = (key) => {
+    if (!key) return null;
+    const trimmed = String(key).trim();
+    if (!trimmed) return null;
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+      return Buffer.from(trimmed, 'hex');
+    }
+    try {
+      const decoded = HypercoreId.decode(trimmed);
+      if (decoded && decoded.length === 32) {
+        return Buffer.from(decoded);
+      }
+    } catch (_) {
+      // ignore
+    }
+    return null;
+  };
+
+  const keyBuffer = decodePeerKey(publicKey);
+  const normalized = keyBuffer ? keyBuffer.toString('hex') : String(publicKey || '').trim().toLowerCase();
   const existing = connectedPeers.get(normalized);
   if (existing?.protocol && existing.protocol.channel && !existing.protocol.channel.closed) {
     return existing.protocol;
@@ -2523,7 +2562,15 @@ async function createGroupJoinRequest(publicIdentifier, privateKey) {
 }
 
 export async function startJoinAuthentication(options) {
-  const { publicIdentifier, fileSharing = true, hostPeers: hostPeerList = [] } = options;
+  const {
+    publicIdentifier,
+    fileSharing = true,
+    hostPeers: hostPeerList = [],
+    blindPeer = null,
+    token: inviteToken = null,
+    relayKey: inviteRelayKey = null,
+    relayUrl: inviteRelayUrl = null
+  } = options;
   const userNsec = config.nostr_nsec_hex;
   const userPubkey = NostrUtils.getPublicKey(userNsec);
   if (config.nostr_pubkey_hex && userPubkey !== config.nostr_pubkey_hex) {
@@ -2566,13 +2613,15 @@ export async function startJoinAuthentication(options) {
     const joinEvent = await createGroupJoinRequest(publicIdentifier, userNsec);
     console.log(`[RelayServer] Created join event ID: ${joinEvent.id.substring(0, 8)}...`);
     
-    const hostPeers = Array.isArray(hostPeerList)
-      ? hostPeerList.map((key) => String(key || '').trim().toLowerCase()).filter(Boolean)
-      : [];
+  const hostPeers = Array.isArray(hostPeerList)
+    ? hostPeerList.map((key) => String(key || '').trim().toLowerCase()).filter(Boolean)
+    : [];
 
-    if (!hostPeers.length) {
-      throw new Error('No hosting peers discovered for this relay');
-    }
+  const blindPeerKey = blindPeer?.publicKey ? String(blindPeer.publicKey).trim().toLowerCase() : null;
+
+  if (!hostPeers.length && !inviteToken) {
+    throw new Error('No hosting peers discovered for this relay');
+  }
 
     let challengePayload = null;
     let relayPubkey = null;
@@ -2581,6 +2630,10 @@ export async function startJoinAuthentication(options) {
     let lastJoinError = null;
 
     for (const hostPeerKey of hostPeers) {
+      if (blindPeerKey && hostPeerKey === blindPeerKey) {
+        console.log('[RelayServer] Skipping direct join attempt for blind-peer host', hostPeerKey.substring(0, 8));
+        continue;
+      }
       try {
         console.log(`[RelayServer] Attempting direct join via peer ${hostPeerKey.substring(0, 8)}...`);
         const protocol = await waitForPeerProtocol(hostPeerKey, 20000);
@@ -2613,6 +2666,56 @@ export async function startJoinAuthentication(options) {
     }
 
     if (!challengePayload || !relayPubkey || !joinProtocol) {
+      // Offline/blind-peer fallback: if we have an invite token and relay info, finalize locally without a host handshake.
+      if (inviteToken && (inviteRelayKey || publicIdentifier)) {
+        const resolvedRelayKey = inviteRelayKey || (publicIdentifier ? await getRelayKeyFromPublicIdentifier(publicIdentifier) : null);
+        const fallbackRelayKey = resolvedRelayKey || publicIdentifier;
+        console.log('[RelayServer] Falling back to invite token path (no direct host)', {
+          relayKey: fallbackRelayKey,
+          publicIdentifier
+        });
+
+        await joinRelayManager({ relayKey: fallbackRelayKey, config, fileSharing, publicIdentifier, authToken: inviteToken });
+        await applyPendingAuthUpdates(updateRelayAuthToken, fallbackRelayKey, publicIdentifier);
+
+        let joinedProfile = await getRelayProfileByKey(fallbackRelayKey);
+        if (joinedProfile && !joinedProfile.public_identifier) {
+          joinedProfile.public_identifier = publicIdentifier;
+          await saveRelayProfile(joinedProfile);
+        }
+
+        await updateRelayAuthToken(fallbackRelayKey, userPubkey, inviteToken);
+
+        if (inviteRelayUrl && global.sendMessage) {
+          global.sendMessage({
+            type: 'relay-initialized',
+            relayKey: fallbackRelayKey,
+            publicIdentifier,
+            gatewayUrl: inviteRelayUrl,
+            connectionUrl: inviteRelayUrl,
+            alreadyActive: true,
+            requiresAuth: true,
+            userAuthToken: inviteToken,
+            timestamp: new Date().toISOString()
+          });
+        }
+
+        if (global.sendMessage) {
+          global.sendMessage({
+            type: 'join-auth-success',
+            data: {
+              publicIdentifier,
+              relayKey: fallbackRelayKey,
+              authToken: inviteToken,
+              relayUrl: inviteRelayUrl || null,
+              hostPeer: blindPeerKey || null,
+              mode: 'blind-peer-offline'
+            }
+          });
+        }
+        return;
+      }
+
       throw lastJoinError || new Error('Failed to contact relay host');
     }
 

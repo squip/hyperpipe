@@ -339,6 +339,15 @@ class PublicGatewayService {
   #setupHttpServer() {
     const app = this.app;
     app.disable('x-powered-by');
+    app.use((req, res, next) => {
+      res.header('Access-Control-Allow-Origin', '*');
+      res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+      res.header('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || '*');
+      if (req.method === 'OPTIONS') {
+        return res.sendStatus(204);
+      }
+      return next();
+    });
     app.use(helmet({
       crossOriginResourcePolicy: { policy: 'cross-origin' }
     }));
@@ -432,6 +441,7 @@ class PublicGatewayService {
 
     app.post('/api/relays', (req, res) => this.#handleRelayRegistration(req, res));
     app.delete('/api/relays/:relayKey', (req, res) => this.#handleRelayDeletion(req, res));
+    app.get('/api/relays/:relayKey/mirror', (req, res) => this.#handleRelayMirrorMetadata(req, res));
 
     app.post('/api/relay-tokens/issue', (req, res) => this.#handleTokenIssue(req, res));
     app.post('/api/relay-tokens/refresh', (req, res) => this.#handleTokenRefresh(req, res));
@@ -2746,10 +2756,20 @@ class PublicGatewayService {
     };
     metadata.peerStates = peerStates;
 
+    const relayCores = Array.isArray(relayPayload?.relayCores)
+      ? relayPayload.relayCores
+          .filter((entry) => entry && typeof entry === 'object' && entry.key)
+          .map((entry) => ({
+            key: entry.key,
+            role: typeof entry.role === 'string' ? entry.role : null
+          }))
+      : (existing?.relayCores || null);
+
     const record = {
       relayKey,
       peers: Array.from(peers),
       metadata,
+      relayCores,
       registeredAt: existing?.registeredAt || now,
       updatedAt: now
     };
@@ -2889,13 +2909,23 @@ class PublicGatewayService {
       return res.status(400).json({ error: 'relayKey is required' });
     }
 
+    const relayCoreMetadata = Array.isArray(registration.relayCores)
+      ? registration.relayCores
+          .filter((entry) => entry && typeof entry === 'object' && entry.key)
+          .map((entry) => ({
+            key: entry.key,
+            role: typeof entry.role === 'string' ? entry.role : null
+          }))
+      : null;
+
     const valid = verifySignature(registration, signature, this.sharedSecret);
     if (!valid) {
       return res.status(401).json({ error: 'Invalid signature' });
     }
 
     try {
-      await this.registrationStore.upsertRelay(registration.relayKey, registration);
+      const upsertPayload = relayCoreMetadata ? { ...registration, relayCores: relayCoreMetadata } : registration;
+      await this.registrationStore.upsertRelay(registration.relayKey, upsertPayload);
       this.logger.info?.('Relay registration accepted', { relayKey: registration.relayKey });
       const hyperbeeInfo = this.#getRelayHostInfo();
       return res.json({
@@ -2935,6 +2965,40 @@ class PublicGatewayService {
     } catch (error) {
       this.logger.error?.('Failed to unregister relay', { relayKey, error: error.message });
       return res.status(500).json({ error: 'Failed to unregister relay' });
+    }
+  }
+
+  async #handleRelayMirrorMetadata(req, res) {
+    const relayKey = req.params?.relayKey;
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+    try {
+      const record = await this.registrationStore.getRelay(relayKey);
+      if (!record) {
+        return res.status(404).json({ error: 'relay-not-found' });
+      }
+      const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
+      const cores = Array.isArray(record.relayCores) ? record.relayCores : [];
+      const payload = {
+        relayKey,
+        publicIdentifier: record.metadata?.identifier || relayKey,
+        cores,
+        blindPeer: blindPeerInfo && blindPeerInfo.enabled
+          ? {
+              publicKey: blindPeerInfo.publicKey || null,
+              encryptionKey: blindPeerInfo.encryptionKey || null,
+              maxBytes: blindPeerInfo.maxBytes ?? null
+            }
+          : { enabled: false }
+      };
+      return res.json(payload);
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Failed to fetch relay mirror metadata', {
+        relayKey,
+        err: error?.message || error
+      });
+      return res.status(500).json({ error: 'relay-mirror-metadata-unavailable' });
     }
   }
 
