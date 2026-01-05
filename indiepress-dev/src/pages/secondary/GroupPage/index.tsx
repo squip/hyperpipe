@@ -571,13 +571,13 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const joinRequestCount = pendingJoinRequests.length
   const isFavorite = favoriteGroups.includes(groupKey)
 
-  const inviteToken = useMemo(() => {
-    const match = invites.find(
+  const inviteData = useMemo(() => {
+    return invites.find(
       (inv) =>
         inv.groupId === groupId && (!effectiveGroupRelay || !inv.relay || inv.relay === effectiveGroupRelay)
     )
-    return match?.token
   }, [invites, groupId, effectiveGroupRelay])
+  const inviteToken = inviteData?.token
 
   const joinFlow = useMemo(() => {
     const id = groupId || ''
@@ -681,7 +681,9 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           fileSharing: isOpenGroup,
           token: inviteToken,
           relayKey,
-          relayUrl: relayUrlForJoin
+          relayUrl: relayUrlForJoin,
+          blindPeer: inviteData?.blindPeer,
+          cores: inviteData?.cores
         })
         return
       }

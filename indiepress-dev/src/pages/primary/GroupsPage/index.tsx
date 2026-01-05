@@ -270,7 +270,9 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         fileSharing: inv.fileSharing !== false,
         token: inv.token,
         relayKey,
-        relayUrl
+        relayUrl,
+        blindPeer: inv.blindPeer,
+        cores: inv.cores
       })
 
       push(toGroup(inv.groupId, relayUrl || inv.relay))

@@ -162,7 +162,19 @@ type WorkerBridgeContextValue = {
   createRelay: (data: RelayCreateRequest) => Promise<RelayCreatedPayload>
   startJoinFlow: (
     publicIdentifier: string,
-    opts?: { fileSharing?: boolean; token?: string; relayKey?: string | null; relayUrl?: string | null }
+    opts?: {
+      fileSharing?: boolean
+      token?: string
+      relayKey?: string | null
+      relayUrl?: string | null
+      blindPeer?: {
+        publicKey?: string | null
+        encryptionKey?: string | null
+        replicationTopic?: string | null
+        maxBytes?: number | null
+      } | null
+      cores?: { key: string; role?: string | null }[]
+    }
   ) => Promise<void>
   clearJoinFlow: (publicIdentifier: string) => void
 }
@@ -471,7 +483,19 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
   const startJoinFlowInternal = useCallback(
     async (
       publicIdentifier: string,
-      opts?: { fileSharing?: boolean; token?: string; relayKey?: string | null; relayUrl?: string | null }
+      opts?: {
+        fileSharing?: boolean
+        token?: string
+        relayKey?: string | null
+        relayUrl?: string | null
+        blindPeer?: {
+          publicKey?: string | null
+          encryptionKey?: string | null
+          replicationTopic?: string | null
+          maxBytes?: number | null
+        } | null
+        cores?: { key: string; role?: string | null }[]
+      }
     ) => {
       if (!isElectron()) throw new Error('Electron IPC unavailable')
       const identifier = String(publicIdentifier || '').trim()
@@ -523,7 +547,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         fileSharing,
         token: opts?.token,
         relayKey: opts?.relayKey || undefined,
-        relayUrl: opts?.relayUrl || undefined
+        relayUrl: opts?.relayUrl || undefined,
+        blindPeer: opts?.blindPeer,
+        cores: opts?.cores
       }
       if (hostPeers && hostPeers.length) data.hostPeers = hostPeers
 
@@ -1198,8 +1224,20 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       },
       startJoinFlow: async (
         publicIdentifier: string,
-        opts?: { fileSharing?: boolean; token?: string; relayKey?: string | null; relayUrl?: string | null }
-      ) => {
+      opts?: {
+        fileSharing?: boolean
+        token?: string
+        relayKey?: string | null
+        relayUrl?: string | null
+        blindPeer?: {
+          publicKey?: string | null
+          encryptionKey?: string | null
+          replicationTopic?: string | null
+          maxBytes?: number | null
+        } | null
+        cores?: { key: string; role?: string | null }[]
+      }
+    ) => {
         await startJoinFlowInternal(publicIdentifier, opts)
       },
       clearJoinFlow

@@ -43,6 +43,13 @@ export type TGroupInvite = {
   fileSharing?: boolean
   relayUrl?: string | null
   relayKey?: string | null
+  blindPeer?: {
+    publicKey?: string | null
+    encryptionKey?: string | null
+    replicationTopic?: string | null
+    maxBytes?: number | null
+  } | null
+  cores?: { key: string; role?: string | null }[]
   token?: string
   event: Event
 }

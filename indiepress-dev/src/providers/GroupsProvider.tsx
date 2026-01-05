@@ -39,6 +39,7 @@ import * as nip19 from '@nostr/tools/nip19'
 
 // Prevent repeated bootstrap publishes per group/relay when admin snapshots are missing.
 const adminRecoveryAttempts = new Set<string>()
+const DEFAULT_PUBLIC_GATEWAY_BASE = 'https://hypertuna.com'
 
 type TGroupsContext = {
   discoveryGroups: TGroupMetadata[]
@@ -362,6 +363,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let relayUrl: string | null | undefined
             let relayKey: string | null | undefined
             let fileSharing: boolean | undefined
+            let blindPeer: TGroupInvite['blindPeer'] | null | undefined
+            let cores: TGroupInvite['cores'] | undefined
             try {
               const payload = JSON.parse(decrypted)
               if (payload && typeof payload === 'object') {
@@ -371,11 +374,27 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 if (typeof payload.fileSharing === 'boolean') {
                   fileSharing = payload.fileSharing
                 }
+                if (payload.blindPeer && typeof payload.blindPeer === 'object') {
+                  blindPeer = {
+                    publicKey: payload.blindPeer.publicKey ?? payload.blindPeer.public_key ?? null,
+                    encryptionKey: payload.blindPeer.encryptionKey ?? payload.blindPeer.encryption_key ?? null,
+                    replicationTopic: payload.blindPeer.replicationTopic ?? payload.blindPeer.replication_topic ?? null,
+                    maxBytes: typeof payload.blindPeer.maxBytes === 'number' ? payload.blindPeer.maxBytes : null
+                }
               }
+              if (Array.isArray(payload.cores)) {
+                cores = payload.cores
+                  .filter((c: any) => c && typeof c === 'object' && c.key)
+                  .map((c: any) => ({
+                    key: String(c.key),
+                    role: typeof c.role === 'string' ? c.role : null
+                  }))
+              }
+            }
             } catch {
               token = decrypted
             }
-            return { ...invite, token, relayUrl, relayKey, fileSharing }
+            return { ...invite, token, relayUrl, relayKey, fileSharing, blindPeer, cores }
           } catch (_err) {
             return invite
           }
@@ -989,6 +1008,65 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         )
       })()
 
+      let mirrorMetadata: { blindPeer?: any; cores?: { key: string; role?: string | null }[] } | null = null
+      const fetchMirrorMetadata = async () => {
+        const relayIdentifier = relayEntry?.relayKey || groupId
+        const origins: string[] = [DEFAULT_PUBLIC_GATEWAY_BASE]
+
+        if (resolved) {
+          try {
+            const baseUrl = new URL(resolved)
+            baseUrl.protocol = baseUrl.protocol === 'wss:' ? 'https:' : 'http:'
+            const hostOrigin = baseUrl.origin
+            if (!origins.includes(hostOrigin)) {
+              origins.push(hostOrigin)
+            }
+          } catch (_err) {
+            // fall back to default only
+          }
+        }
+
+        for (const origin of origins) {
+          try {
+            const resp = await fetch(`${origin}/api/relays/${encodeURIComponent(relayIdentifier)}/mirror`)
+            if (!resp.ok) {
+              console.warn('[GroupsProvider] Mirror metadata request failed', {
+                origin,
+                status: resp.status,
+                statusText: resp.statusText
+              })
+              continue
+            }
+            const data = await resp.json()
+            const cores = Array.isArray(data?.cores)
+              ? data.cores
+                  .filter((c: any) => c && typeof c === 'object' && c.key)
+                  .map((c: any) => ({
+                    key: String(c.key),
+                    role: typeof c.role === 'string' ? c.role : null
+                  }))
+              : undefined
+            const blindPeer = data?.blindPeer && typeof data.blindPeer === 'object'
+              ? {
+                  publicKey: data.blindPeer.publicKey ?? null,
+                  encryptionKey: data.blindPeer.encryptionKey ?? null,
+                  replicationTopic: data.blindPeer.replicationTopic ?? null,
+                  maxBytes: typeof data.blindPeer.maxBytes === 'number' ? data.blindPeer.maxBytes : null
+                }
+              : undefined
+            mirrorMetadata = { blindPeer, cores }
+            return
+          } catch (err) {
+            console.warn('[GroupsProvider] Failed to fetch relay mirror metadata', {
+              origin,
+              err: err instanceof Error ? err.message : err
+            })
+          }
+        }
+      }
+
+      await fetchMirrorMetadata()
+
       await Promise.all(
         invitees.map(async (invitee) => {
           const token = randomString(24)
@@ -1001,7 +1079,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               isPublic: meta?.isPublic !== false,
               name: meta?.name,
               about: meta?.about,
-              fileSharing: meta?.isOpen !== false
+              fileSharing: meta?.isOpen !== false,
+              blindPeer: mirrorMetadata?.blindPeer,
+              cores: mirrorMetadata?.cores
             })
           )
           const inviteTags: string[][] = [
