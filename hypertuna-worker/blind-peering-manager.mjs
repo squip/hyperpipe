@@ -77,6 +77,25 @@ function decodeCoreKey(value) {
   return null;
 }
 
+let corestoreCounter = 0;
+
+function ensureCorestoreId(store) {
+  if (!store) return null;
+  if (!store.__ht_id) {
+    corestoreCounter += 1;
+    store.__ht_id = `corestore-${corestoreCounter}`;
+  }
+  return store.__ht_id;
+}
+
+function describeCorestore(store) {
+  if (!store) return { corestoreId: null, storagePath: null };
+  return {
+    corestoreId: ensureCorestoreId(store),
+    storagePath: store.__ht_storage_path || null
+  };
+}
+
 export default class BlindPeeringManager extends EventEmitter {
   constructor({ logger, settingsProvider } = {}) {
     super();
@@ -266,6 +285,7 @@ export default class BlindPeeringManager extends EventEmitter {
     if (!this.blindPeering) return;
 
     const autobase = relayContext.autobase || null;
+    const relayCorestore = relayContext.corestore || null;
     let autobaseTarget = null;
     if (autobase) {
       autobaseTarget = this.#resolveAutobaseTarget(relayContext);
@@ -301,6 +321,17 @@ export default class BlindPeeringManager extends EventEmitter {
     if (!entry.context.identifier) {
       entry.context.identifier = identifier;
     }
+    if (relayCorestore) {
+      const storeInfo = describeCorestore(relayCorestore);
+      entry.context.corestore = relayCorestore;
+      entry.context.corestoreId = storeInfo.corestoreId;
+      entry.context.corestorePath = storeInfo.storagePath;
+      this.logger?.info?.('[BlindPeering] Relay mirror corestore override', {
+        identifier,
+        corestoreId: storeInfo.corestoreId,
+        storagePath: storeInfo.storagePath
+      });
+    }
     if (autobaseTarget) {
       try {
         entry.context.autobaseTarget = HypercoreId.encode(autobaseTarget);
@@ -313,7 +344,7 @@ export default class BlindPeeringManager extends EventEmitter {
       entry.coreRefs = coreRefs;
       entry.context.coreRefs = coreRefs;
     }
-    this.#primeCoreRefsBackground(coreRefs, entry);
+    this.#primeCoreRefsBackground(coreRefs, entry, relayCorestore);
     entry.ownerPeerKey = this.#getOwnerPeerKey();
     entry.announce = true;
     entry.priority = Number.isFinite(relayContext.priority)
@@ -331,14 +362,15 @@ export default class BlindPeeringManager extends EventEmitter {
     this.emit('mirror-requested', entry);
   }
 
-  async primeRelayCoreRefs({ relayKey = null, publicIdentifier = null, coreRefs = [], timeoutMs = 45000, reason = 'manual' } = {}) {
+  async primeRelayCoreRefs({ relayKey = null, publicIdentifier = null, coreRefs = [], timeoutMs = 45000, reason = 'manual', corestore = null } = {}) {
     if (!this.started) {
       return { status: 'skipped', reason: 'not-started' };
     }
     if (!this.blindPeering) {
       return { status: 'skipped', reason: 'not-configured' };
     }
-    if (!this.runtime?.corestore) {
+    const targetStore = corestore || this.runtime?.corestore;
+    if (!targetStore) {
       return { status: 'skipped', reason: 'no-corestore' };
     }
     const uniqueRefs = Array.from(new Set(
@@ -361,9 +393,19 @@ export default class BlindPeeringManager extends EventEmitter {
       connected: 0
     };
 
+    const storeInfo = describeCorestore(targetStore);
+    summary.corestoreId = storeInfo.corestoreId;
+    summary.storagePath = storeInfo.storagePath;
+    this.logger?.info?.('[BlindPeering] Relay core prefetch using corestore', {
+      relayKey: summary.relayKey,
+      reason,
+      corestoreId: storeInfo.corestoreId,
+      storagePath: storeInfo.storagePath
+    });
+
     for (const ref of uniqueRefs) {
       const label = `${labelBase}:${ref.slice(0, 16)}`;
-      const core = this.#getMirrorCore(ref, label);
+      const core = this.#getMirrorCore(ref, label, targetStore);
       if (!core) {
         summary.failed += 1;
         continue;
@@ -809,9 +851,10 @@ export default class BlindPeeringManager extends EventEmitter {
         }
         if (Array.isArray(entry.coreRefs) && entry.coreRefs.length) {
           const identifier = entry.identifier || entry.context?.relayKey || entry.context?.publicIdentifier || 'relay';
+          const entryStore = entry.context?.corestore || null;
           entry.coreRefs.forEach((ref, index) => {
             const label = `relay-core:${identifier}:${index}`;
-            const core = this.#getMirrorCore(ref, label);
+            const core = this.#getMirrorCore(ref, label, entryStore);
             if (core) {
               this.#addCoreObject(map, core, label);
             }
@@ -831,27 +874,36 @@ export default class BlindPeeringManager extends EventEmitter {
     return map;
   }
 
-  #getMirrorCore(key, label) {
-    if (!this.runtime?.corestore) return null;
+  #getMirrorCore(key, label, corestoreOverride = null) {
+    const store = corestoreOverride || this.runtime?.corestore;
+    if (!store) return null;
     const normalized = normalizeCoreKey(key);
     if (!normalized) return null;
-    let entry = this.mirrorCoreCache.get(normalized);
+    const storeId = ensureCorestoreId(store);
+    const cacheKey = `${storeId}:${normalized}`;
+    let entry = this.mirrorCoreCache.get(cacheKey);
     if (!entry) {
       const decoded = decodeCoreKey(normalized);
       if (!decoded) return null;
-      const core = this.runtime.corestore.get({ key: decoded, valueEncoding: 'binary', sparse: true });
-      entry = { core, labels: new Set() };
-      this.mirrorCoreCache.set(normalized, entry);
+      const core = store.get({ key: decoded, valueEncoding: 'binary', sparse: true });
+      entry = {
+        core,
+        labels: new Set(),
+        corestoreId: storeId,
+        storagePath: store.__ht_storage_path || null
+      };
+      this.mirrorCoreCache.set(cacheKey, entry);
       core.on('close', () => {
-        this.mirrorCoreCache.delete(normalized);
+        this.mirrorCoreCache.delete(cacheKey);
       });
     }
     if (label) entry.labels.add(label);
     return entry.core;
   }
 
-  #primeCoreRefsBackground(coreRefs = [], entry = {}) {
-    if (!this.started || !this.blindPeering || !this.runtime?.corestore) return;
+  #primeCoreRefsBackground(coreRefs = [], entry = {}, corestoreOverride = null) {
+    const targetStore = corestoreOverride || this.runtime?.corestore;
+    if (!this.started || !this.blindPeering || !targetStore) return;
     if (!Array.isArray(coreRefs) || !coreRefs.length) return;
     const identifier = entry.identifier || entry.context?.relayKey || entry.context?.publicIdentifier || 'relay';
     const priority = Number.isFinite(entry.priority) ? entry.priority : 2;
@@ -860,7 +912,7 @@ export default class BlindPeeringManager extends EventEmitter {
       .filter(Boolean)
       .forEach((ref, index) => {
         const label = `relay-core:${identifier}:${index}`;
-        const core = this.#getMirrorCore(ref, label);
+        const core = this.#getMirrorCore(ref, label, targetStore);
         if (!core) return;
         try {
           this.blindPeering.addCoreBackground(core, core.key, {

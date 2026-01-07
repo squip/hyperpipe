@@ -2933,7 +2933,8 @@ export async function startJoinAuthentication(options) {
           authToken: inviteToken,
           writerSecret,
           writerCore,
-          suppressInitMessage: true
+          suppressInitMessage: true,
+          useSharedCorestore: true
         });
         await applyPendingAuthUpdates(updateRelayAuthToken, fallbackRelayKey, publicIdentifier);
 

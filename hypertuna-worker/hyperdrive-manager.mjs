@@ -5,6 +5,7 @@ import Hyperdrive from 'hyperdrive'
 import Hyperswarm from 'hyperswarm'
 import b4a from 'b4a'
 import { setTimeout as scheduleTimeout, clearTimeout } from 'node:timers'
+import { join } from 'node:path'
 import crypto from 'node:crypto'
 
 let store = null
@@ -19,6 +20,25 @@ const topicCache = new Map() // key -> { discovery, refCount, lastUsed, readyPro
 const pfpTopicCache = new Map()
 let replicationConnectionsOpen = 0
 let replicationConnectionsTotal = 0
+const relayStores = new Map()
+let corestoreCounter = 0
+
+function ensureCorestoreId (target, prefix = 'corestore') {
+  if (!target) return null
+  if (!target.__ht_id) {
+    corestoreCounter += 1
+    target.__ht_id = `${prefix}-${corestoreCounter}`
+  }
+  return target.__ht_id
+}
+
+function attachCorestoreMetadata (target, storagePath = null, relayKey = null) {
+  if (!target) return null
+  ensureCorestoreId(target)
+  if (storagePath) target.__ht_storage_path = storagePath
+  if (relayKey) target.__ht_relay_key = relayKey
+  return target
+}
 
 function topicKey (discoveryKey) {
   return b4a.toString(discoveryKey, 'hex')
@@ -78,6 +98,39 @@ function setTimeoutEvict (key, ttlMs) {
 
 export function getCorestore() {
   return store
+}
+
+export function getRelayCorestore (relayKey, { storageBase = null } = {}) {
+  const normalized = normalizeIdentifier(relayKey)
+  if (!normalized) return store
+  const base = storageBase || storageDir
+  if (!base) {
+    console.warn('[Hyperdrive] Relay corestore unavailable (storage base missing)', {
+      relayKey: normalized
+    })
+    return store
+  }
+  let entry = relayStores.get(normalized)
+  const storagePath = join(base, 'relays', normalized)
+  if (!entry || entry.storagePath !== storagePath) {
+    const relayStore = new Corestore(storagePath)
+    attachCorestoreMetadata(relayStore, storagePath, normalized)
+    entry = { store: relayStore, storagePath }
+    relayStores.set(normalized, entry)
+    console.log('[Hyperdrive] Relay corestore created', {
+      relayKey: normalized,
+      storagePath,
+      corestoreId: relayStore.__ht_id
+    })
+  } else {
+    attachCorestoreMetadata(entry.store, entry.storagePath, normalized)
+    console.log('[Hyperdrive] Relay corestore reused', {
+      relayKey: normalized,
+      storagePath: entry.storagePath,
+      corestoreId: entry.store?.__ht_id || null
+    })
+  }
+  return entry.store
 }
 
 export function getLocalDrive() {
@@ -169,6 +222,7 @@ export async function joinRemoteDriveTopic (remoteDrive, ttlMs = 90000) {
 export async function initializeHyperdrive(config) {
   storageDir = config.storage
   store = new Corestore(storageDir)
+  attachCorestoreMetadata(store, storageDir, 'hyperdrive')
   drive = new Hyperdrive(store)
   await drive.ready()
   config.driveKey = drive.key.toString('hex')

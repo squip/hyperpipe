@@ -44,6 +44,7 @@ import {
   watchDrive,
   getReplicationHealth,
   getCorestore,
+  getRelayCorestore,
   getLocalDrive,
   getPfpDrive
 } from './hyperdrive-manager.mjs';
@@ -314,7 +315,8 @@ async function seedBlindPeeringMirrors(manager) {
     manager.ensureRelayMirror({
       relayKey,
       publicIdentifier: relayManager?.publicIdentifier || null,
-      autobase: relayManager.relay
+      autobase: relayManager.relay,
+      corestore: relayManager.store || null
     })
     attachRelayMirrorHooks(relayKey, relayManager, manager)
   }
@@ -329,7 +331,8 @@ function attachRelayMirrorHooks(relayKey, relayManager, manager) {
     manager.ensureRelayMirror({
       relayKey,
       publicIdentifier: relayManager?.publicIdentifier || null,
-      autobase
+      autobase,
+      corestore: relayManager?.store || null
     })
     manager.refreshFromBlindPeers('relay-update')
       .then(() => manager.rehydrateMirrors({
@@ -2150,6 +2153,14 @@ async function handleMessageObject(message) {
               if (manager) {
                 manager.markTrustedMirrors([data.blindPeer.publicKey])
                 const relayIdentifier = data.relayKey || publicIdentifier
+                const relayCorestore = getRelayCorestore(relayIdentifier, {
+                  storageBase: config?.storage || defaultStorageDir
+                })
+                console.log('[Worker] Blind-peer join flow: using relay corestore', {
+                  relayIdentifier,
+                  corestoreId: relayCorestore?.__ht_id || null,
+                  storagePath: relayCorestore?.__ht_storage_path || null
+                })
                 const coreRefs = Array.isArray(data.cores)
                   ? data.cores
                       .map((c) => (c && c.key ? String(c.key) : null))
@@ -2158,7 +2169,8 @@ async function handleMessageObject(message) {
                 manager.ensureRelayMirror({
                   relayKey: relayIdentifier,
                   publicIdentifier,
-                  coreRefs
+                  coreRefs,
+                  corestore: relayCorestore
                 })
                 console.log('[Worker] Blind-peer join flow: refreshing mirrors', {
                   relayIdentifier,
@@ -2173,7 +2185,8 @@ async function handleMessageObject(message) {
                     publicIdentifier,
                     coreRefs,
                     timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
-                    reason: 'join-flow'
+                    reason: 'join-flow',
+                    corestore: relayCorestore
                   })
                   console.log('[Worker] Blind-peer join flow: core prefetch completed', {
                     relayIdentifier,
@@ -2272,7 +2285,8 @@ async function handleMessageObject(message) {
               manager.ensureRelayMirror({
                 relayKey,
                 publicIdentifier: message?.data?.publicIdentifier || relayManager?.publicIdentifier || null,
-                autobase: relayManager.relay
+                autobase: relayManager.relay,
+                corestore: relayManager.store || null
               })
             } else {
               await seedBlindPeeringMirrors(manager)

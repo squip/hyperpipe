@@ -41,6 +41,25 @@ function releaseFileLock(filePath) {
   fileLocks.delete(filePath);
 }
 
+let relayCorestoreCounter = 0;
+
+function ensureCorestoreId(store) {
+  if (!store) return null;
+  if (!store.__ht_id) {
+    relayCorestoreCounter += 1;
+    store.__ht_id = `relay-corestore-${relayCorestoreCounter}`;
+  }
+  return store.__ht_id;
+}
+
+function describeCorestore(store) {
+  if (!store) return { corestoreId: null, storagePath: null };
+  return {
+    corestoreId: ensureCorestoreId(store),
+    storagePath: store.__ht_storage_path || null
+  };
+}
+
 async function verifyEventSignature(event) {
   try {
       console.log('Verifying Event Signature ===');
@@ -108,6 +127,7 @@ export class RelayManager {
       this.bootstrap = bootstrap;
       this.keyPair = options?.keyPair || null;
       this.expectedWriterKey = options?.expectedWriterKey || null;
+      this.corestore = options?.corestore || null;
       this.store = null;  // Initialize in the initialize method
       this.relay = null;
       this.swarm = null;
@@ -124,7 +144,25 @@ export class RelayManager {
         console.log(`Acquired lock for storage directory: ${this.storageDir}`);
         
         // Initialize Corestore after acquiring the lock
-        this.store = new Corestore(this.storageDir);
+        if (this.corestore) {
+          this.store = this.corestore;
+          const storeInfo = describeCorestore(this.store);
+          console.log('[RelayManager] Using shared corestore', {
+            relayKey: this.bootstrap,
+            storageDir: this.storageDir,
+            corestoreId: storeInfo.corestoreId,
+            corestorePath: storeInfo.storagePath
+          });
+        } else {
+          this.store = new Corestore(this.storageDir);
+          this.store.__ht_storage_path = this.storageDir;
+          const storeInfo = describeCorestore(this.store);
+          console.log('[RelayManager] Created relay corestore', {
+            relayKey: this.bootstrap,
+            storageDir: this.storageDir,
+            corestoreId: storeInfo.corestoreId
+          });
+        }
 
         if (!this.expectedWriterKey && this.keyPair?.publicKey) {
           this.expectedWriterKey = this.keyPair.publicKey;

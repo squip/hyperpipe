@@ -8,6 +8,7 @@ import hypercoreCrypto from 'hypercore-crypto';
 import HypercoreId from 'hypercore-id-encoding';
 import { NostrUtils } from './nostr-utils.js';
 import b4a from 'b4a';
+import { getRelayCorestore } from './hyperdrive-manager.mjs';
 
 // Import the legacy modules (adapted to run in a pure Node/Electron environment)
 import { RelayManager } from './hypertuna-relay-manager-bare.mjs';
@@ -465,7 +466,9 @@ export async function joinRelay(options = {}) {
         fromAutoConnect = false,
         writerSecret = null,
         writerCore = null,
-        suppressInitMessage = false
+        suppressInitMessage = false,
+        useSharedCorestore = false,
+        corestore = null
     } = options;
     
     // Store config globally if provided
@@ -622,6 +625,24 @@ export async function joinRelay(options = {}) {
         
         // Ensure storage directory exists
         await fs.mkdir(defaultStorageDir, { recursive: true });
+
+        let relayCorestore = corestore;
+        if (!relayCorestore && useSharedCorestore) {
+            relayCorestore = getRelayCorestore(relayKey, { storageBase: config?.storage || null });
+        }
+        if (relayCorestore) {
+            console.log('[RelayAdapter] Using shared corestore for relay', {
+                relayKey,
+                storageDir: defaultStorageDir,
+                corestoreId: relayCorestore.__ht_id || null,
+                corestorePath: relayCorestore.__ht_storage_path || null
+            });
+        } else {
+            console.log('[RelayAdapter] Using relay-local corestore', {
+                relayKey,
+                storageDir: defaultStorageDir
+            });
+        }
         
         // Create relay manager instance
         if (writerKeyPair) {
@@ -630,7 +651,8 @@ export async function joinRelay(options = {}) {
 
         const relayManager = new RelayManager(defaultStorageDir, relayKey, {
             keyPair: writerKeyPair,
-            expectedWriterKey
+            expectedWriterKey,
+            corestore: relayCorestore
         });
         await relayManager.initialize();
         
