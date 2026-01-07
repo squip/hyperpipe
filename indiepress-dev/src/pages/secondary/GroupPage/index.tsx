@@ -386,6 +386,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const [selectedInvitees, setSelectedInvitees] = useState<string[]>([])
   const [reportTarget, setReportTarget] = useState<string | null>(null)
   const [joinRequestAction, setJoinRequestAction] = useState<{ pubkey: string; action: 'approve' | 'reject' } | null>(null)
+  const [joinRelayRefreshNonce, setJoinRelayRefreshNonce] = useState(0)
   const { profiles: inviteProfiles, isFetching: isSearchingInvites } = useSearchProfiles(inviteSearch, 8)
   const { mutePrivately, mutePublicly } = useMuteList()
   const reportEvent = useMemo(() => {
@@ -584,6 +585,18 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     return id ? joinFlows[id] : undefined
   }, [groupId, joinFlows])
 
+  useEffect(() => {
+    if (!groupId) return
+    if (!joinFlow?.writableAt || !joinFlow?.writable) return
+    console.info('[GroupPage] relay writable: refreshing subscriptions', {
+      groupId,
+      relayKey: joinFlow.relayKey,
+      relayUrl: joinFlow.relayUrl,
+      mode: joinFlow.mode
+    })
+    setJoinRelayRefreshNonce((prev) => prev + 1)
+  }, [groupId, joinFlow?.mode, joinFlow?.relayKey, joinFlow?.relayUrl, joinFlow?.writable, joinFlow?.writableAt])
+
   const resolvedGroupRelay = useMemo(() => {
     return effectiveGroupRelay ? resolveRelayUrl(effectiveGroupRelay) : undefined
   }, [effectiveGroupRelay, resolveRelayUrl])
@@ -613,7 +626,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             }
           ]
         : [],
-    [groupId, effectiveGroupRelay, resolvedGroupRelay]
+    [groupId, effectiveGroupRelay, resolvedGroupRelay, joinRelayRefreshNonce]
   )
 
   useEffect(() => {
@@ -1299,6 +1312,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
               <NormalFeed
                 subRequests={groupSubRequests}
                 isMainFeed={false}
+                debugActiveTab={activeTab}
               />
             </TabsContent>
             <TabsContent value="members" className="mt-0">

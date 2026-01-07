@@ -17,11 +17,13 @@ import { RefreshButton } from '../RefreshButton'
 export default function NormalFeed({
   subRequests,
   isMainFeed = false,
-  showRelayCloseReason = false
+  showRelayCloseReason = false,
+  debugActiveTab
 }: {
   subRequests: TFeedSubRequest[]
   isMainFeed?: boolean
   showRelayCloseReason?: boolean
+  debugActiveTab?: string
 }) {
   const { t } = useTranslation()
   const { hideUntrustedNotes } = useUserTrust()
@@ -149,6 +151,7 @@ export default function NormalFeed({
           hideReplies={effectiveListMode === 'posts'}
           hideUntrustedNotes={hideUntrustedNotes}
           showRelayCloseReason={showRelayCloseReason}
+          debugActiveTab={debugActiveTab}
         />
       )}
     </>

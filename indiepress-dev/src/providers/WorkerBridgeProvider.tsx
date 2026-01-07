@@ -106,6 +106,10 @@ type JoinFlowState = {
   authToken?: string | null
   relayUrl?: string | null
   error?: string | null
+  writable?: boolean
+  expectedWriterActive?: boolean | null
+  writableAt?: number | null
+  mode?: string | null
 }
 
 type RelayCreateRequest = {
@@ -956,6 +960,54 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
               }
             })
             setLastError(errorText)
+            break
+          }
+          case 'relay-writable': {
+            const data = (msg as any)?.data || {}
+            const identifier = data.publicIdentifier
+            if (!identifier) break
+            const isWritable = data.writable === true
+            console.info('[WorkerBridge] relay-writable received', {
+              publicIdentifier: identifier,
+              relayKey: data.relayKey,
+              mode: data.mode,
+              writable: data.writable,
+              expectedWriterActive: data.expectedWriterActive
+            })
+            setJoinFlows((prev) => {
+              const current = prev[identifier]
+              if (!current) return prev
+              if (!isWritable) {
+                return {
+                  ...prev,
+                  [identifier]: {
+                    ...current,
+                    updatedAt: Date.now(),
+                    relayKey: data.relayKey ?? current.relayKey,
+                    relayUrl: data.relayUrl ?? current.relayUrl,
+                    authToken: data.authToken ?? current.authToken,
+                    mode: data.mode ?? current.mode,
+                    expectedWriterActive: data.expectedWriterActive ?? current.expectedWriterActive,
+                    writable: data.writable ?? current.writable
+                  }
+                }
+              }
+              return {
+                ...prev,
+                [identifier]: {
+                  ...current,
+                  phase: current.phase === 'error' ? current.phase : 'success',
+                  updatedAt: Date.now(),
+                  relayKey: data.relayKey ?? current.relayKey,
+                  relayUrl: data.relayUrl ?? current.relayUrl,
+                  authToken: data.authToken ?? current.authToken,
+                  mode: data.mode ?? current.mode,
+                  expectedWriterActive: data.expectedWriterActive ?? current.expectedWriterActive,
+                  writable: true,
+                  writableAt: Date.now()
+                }
+              }
+            })
             break
           }
           case 'error':

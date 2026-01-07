@@ -40,6 +40,7 @@ const NoteList = forwardRef(
       showOnlyReplies = false,
       hideUntrustedNotes = false,
       showRelayCloseReason = false,
+      debugActiveTab,
       sinceTimestamp,
       onNotesLoaded,
       pinnedEventIds,
@@ -52,6 +53,7 @@ const NoteList = forwardRef(
       showOnlyReplies?: boolean
       hideUntrustedNotes?: boolean
       showRelayCloseReason?: boolean
+      debugActiveTab?: string
       sinceTimestamp?: number
       onNotesLoaded?: (count: number, hasPosts: boolean, hasReplies: boolean) => void
       pinnedEventIds?: string[]
@@ -75,6 +77,7 @@ const NoteList = forwardRef(
     const supportTouch = useMemo(() => isTouchDevice(), [])
     const bottomRef = useRef<HTMLDivElement | null>(null)
     const topRef = useRef<HTMLDivElement | null>(null)
+    const hasLoggedMount = useRef(false)
 
     const shouldHideEvent = useCallback(
       (evt: Event) => {
@@ -177,6 +180,19 @@ const NoteList = forwardRef(
     useImperativeHandle(ref, () => ({ scrollToTop, refresh }), [])
 
     useEffect(() => {
+      const activeTab = debugActiveTab ?? 'unknown'
+      if (!hasLoggedMount.current) {
+        console.info('[NoteList] mount', {
+          activeTab,
+          subRequests: subRequests.length
+        })
+        hasLoggedMount.current = true
+      }
+      console.info('[NoteList] subscribe effect', {
+        activeTab,
+        subRequests: subRequests.length,
+        showKinds: showKinds.length
+      })
       if (!subRequests.length) return
 
       setLoading(true)

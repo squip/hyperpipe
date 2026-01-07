@@ -147,6 +147,13 @@ class ClientService extends EventTarget {
 
   async publishEvent(relayUrls: string[], event: NostrEvent) {
     const uniqueRelayUrls = Array.from(new Set(relayUrls))
+    const publishId = event.id || 'unknown'
+    console.info('[Publish] request', {
+      eventId: publishId,
+      kind: event.kind,
+      relayCount: uniqueRelayUrls.length,
+      relays: uniqueRelayUrls.slice(0, 5)
+    })
     await new Promise<void>((resolve, reject) => {
       let successCount = 0
       let finishedCount = 0
@@ -158,15 +165,35 @@ class ClientService extends EventTarget {
           const relay = await pool.ensureRelay(url)
           relay.publishTimeout = 10_000 // 10s
           const publishOnce = async () => {
-            return relay.publish(event).then(() => {
-              this.trackEventSeenOn(event.id, relay)
-              successCount++
+            const result = await relay.publish(event)
+            const ok =
+              typeof result === 'object' && result !== null && 'ok' in result
+                ? (result as { ok?: boolean }).ok !== false
+                : result !== false
+            if (!ok) {
+              const reason =
+                typeof result === 'object' && result !== null && 'reason' in result
+                  ? (result as { reason?: string }).reason
+                  : 'publish rejected'
+              throw new Error(reason || 'publish rejected')
+            }
+            console.info('[Publish] ok', {
+              eventId: publishId,
+              relay: url,
+              ok: true,
+              reason:
+                typeof result === 'object' && result !== null && 'reason' in result
+                  ? (result as { reason?: string }).reason ?? null
+                  : null
             })
+            this.trackEventSeenOn(event.id, relay)
+            successCount++
           }
 
           return publishOnce()
             .catch(async (error) => {
               const msg = error instanceof Error ? error.message : String(error)
+              console.warn('[Publish] error', { eventId: publishId, relay: url, error: msg })
               if (msg.startsWith('auth-required') && that.signer) {
                 try {
                   await that.ensureAuth(url)
@@ -265,6 +292,17 @@ class ClientService extends EventTarget {
           ...filterModification
         }
       }))
+    const relayUrls = Array.from(
+      new Set(relayRequests.flatMap(({ urls }) => urls))
+    )
+
+    console.info('[subscribeTimeline] start', {
+      subRequests: subRequests.length,
+      localRequests: localFilters.length,
+      relayRequests: relayRequests.length,
+      relayUrls,
+      signer: Boolean(this.signer)
+    })
 
     // do local db requests
     const local: Promise<[NostrEvent[], NostrEvent | undefined, string[]]> =
@@ -380,37 +418,45 @@ class ClientService extends EventTarget {
                   resolve(events)
                   events = []
                 },
-        onauth: (async (authEvt) => {
-          // already logged in
-          if (this.signer) {
-            const evt = await this.signer!.signEvent(authEvt)
-            if (!evt) {
-              throw new Error('sign event failed')
-            }
-            return evt as VerifiedEvent
-          }
+                onauth: (async (authEvt) => {
+                  // already logged in
+                  if (this.signer) {
+                    const evt = await this.signer!.signEvent(authEvt)
+                    if (!evt) {
+                      throw new Error('sign event failed')
+                    }
+                    return evt as VerifiedEvent
+                  }
 
-          // open login dialog
-          if (startLogin) {
-            startLogin()
-          }
+                  // open login dialog
+                  if (startLogin) {
+                    startLogin()
+                  }
 
-          throw new Error(
-            "<not logged in, can't auth to relay during this.subscribeTimeline>"
-          )
-        }) as (event: EventTemplate) => Promise<VerifiedEvent>,
-        onclose(reasons) {
-          if (onClose) {
-            for (let i = 0; i < reasons.length; i++) {
-              const reason = reasons[i]
-              onClose(urls[i], reason)
-            }
-          }
-          resolve(events)
-        }
-      }
-    )
-  })
+                  throw new Error(
+                    "<not logged in, can't auth to relay during this.subscribeTimeline>"
+                  )
+                }) as (event: EventTemplate) => Promise<VerifiedEvent>,
+                onclose(reasons) {
+                  const closeReport = reasons.map((reason, index) => ({
+                    url: urls[index],
+                    reason
+                  }))
+                  console.info('[subscribeTimeline] onclose', {
+                    label: 'f-timeline',
+                    reasons: closeReport
+                  })
+                  if (onClose) {
+                    for (let i = 0; i < reasons.length; i++) {
+                      const reason = reasons[i]
+                      onClose(urls[i], reason)
+                    }
+                  }
+                  resolve(events)
+                }
+              }
+            )
+          })
 
     if (localFilters.length > 0 && relayRequests.length > 0) {
       // if both exist, assume localFilters will load much faster and handle they first
@@ -530,6 +576,9 @@ class ClientService extends EventTarget {
           ...filterModification
         }
       }))
+    const relayUrls = Array.from(
+      new Set(relayRequests.flatMap(({ urls }) => urls))
+    )
 
     // do relay requests
     const network =
@@ -548,7 +597,15 @@ class ClientService extends EventTarget {
                   subc.close()
                   resolve(events)
                 },
-                onclose() {
+                onclose(reasons) {
+                  const closeReport = reasons.map((reason, index) => ({
+                    url: relayUrls[index],
+                    reason
+                  }))
+                  console.info('[loadMoreTimeline] onclose', {
+                    label: 'f-more',
+                    reasons: closeReport
+                  })
                   resolve(events)
                 },
                 onauth: (async (authEvt) => {
