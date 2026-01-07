@@ -365,6 +365,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let fileSharing: boolean | undefined
             let blindPeer: TGroupInvite['blindPeer'] | null | undefined
             let cores: TGroupInvite['cores'] | undefined
+            let writerCore: string | null | undefined
+            let writerSecret: string | null | undefined
             try {
               const payload = JSON.parse(decrypted)
               if (payload && typeof payload === 'object') {
@@ -373,6 +375,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 relayKey = typeof payload.relayKey === 'string' ? payload.relayKey : null
                 if (typeof payload.fileSharing === 'boolean') {
                   fileSharing = payload.fileSharing
+                }
+                if (typeof payload.writerCore === 'string') {
+                  writerCore = payload.writerCore
+                }
+                if (typeof payload.writerSecret === 'string') {
+                  writerSecret = payload.writerSecret
                 }
                 if (payload.blindPeer && typeof payload.blindPeer === 'object') {
                   blindPeer = {
@@ -394,12 +402,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             } catch {
               token = decrypted
             }
-            return { ...invite, token, relayUrl, relayKey, fileSharing, blindPeer, cores }
+            return { ...invite, token, relayUrl, relayKey, fileSharing, blindPeer, cores, writerCore, writerSecret }
           } catch (_err) {
             return invite
           }
         })
       )
+      console.info('[GroupsProvider] Refreshed invites writer stats', {
+        total: parsed.length,
+        withWriterSecret: parsed.filter((p) => (p as any).writerSecret).length,
+        withWriterCore: parsed.filter((p) => (p as any).writerCore).length
+      })
       setInvites(parsed)
     } catch (error) {
       console.warn('Failed to refresh group invites', error)
@@ -1008,6 +1021,31 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         )
       })()
 
+      let writerInfo: { writerCore?: string; writerSecret?: string } | null = null
+      if (sendToWorker && relayEntry?.relayKey && invitees.length === 1) {
+        try {
+          const res = await sendToWorker({
+            type: 'provision-writer-for-invitee',
+            data: { relayKey: relayEntry.relayKey, publicIdentifier: groupId, inviteePubkey: invitees[0] }
+          })
+          if (res && typeof res === 'object') {
+            writerInfo = {
+              writerCore: (res as any).writerCore,
+              writerSecret: (res as any).writerSecret
+            }
+          }
+          console.info('[GroupsProvider] Writer provisioning result (invite)', {
+            groupId,
+            invitee: invitees[0],
+            relayKey: relayEntry.relayKey,
+            hasWriterCore: !!writerInfo?.writerCore,
+            hasWriterSecret: !!writerInfo?.writerSecret
+          })
+        } catch (err) {
+          console.warn('[GroupsProvider] Failed to provision writer for invitee', err)
+        }
+      }
+
       let mirrorMetadata: { blindPeer?: any; cores?: { key: string; role?: string | null }[] } | null = null
       const fetchMirrorMetadata = async () => {
         const relayIdentifier = relayEntry?.relayKey || groupId
@@ -1067,6 +1105,14 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       await fetchMirrorMetadata()
 
+      // If we created a writer core for this invite, include it in cores so it gets mirrored.
+      if (writerInfo?.writerCore) {
+        if (!mirrorMetadata) mirrorMetadata = {}
+        const cores = Array.isArray(mirrorMetadata.cores) ? [...mirrorMetadata.cores] : []
+        cores.push({ key: writerInfo.writerCore, role: 'autobase-writer' })
+        mirrorMetadata.cores = cores
+      }
+
       await Promise.all(
         invitees.map(async (invitee) => {
           const token = randomString(24)
@@ -1081,9 +1127,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               about: meta?.about,
               fileSharing: meta?.isOpen !== false,
               blindPeer: mirrorMetadata?.blindPeer,
-              cores: mirrorMetadata?.cores
+              cores: mirrorMetadata?.cores,
+              writerCore: writerInfo?.writerCore || null,
+              writerSecret: writerInfo?.writerSecret || null
             })
           )
+          console.info('[GroupsProvider] Invite payload built', {
+            groupId,
+            invitee,
+            hasWriterCore: !!writerInfo?.writerCore,
+            hasWriterSecret: !!writerInfo?.writerSecret
+          })
           const inviteTags: string[][] = [
             ['h', groupId],
             ['p', invitee],
@@ -1188,6 +1242,31 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         )
       })()
 
+      let writerInfo: { writerCore?: string; writerSecret?: string } | null = null
+      if (sendToWorker && relayEntry?.relayKey) {
+        try {
+          const res = await sendToWorker({
+            type: 'provision-writer-for-invitee',
+            data: { relayKey: relayEntry.relayKey, publicIdentifier: groupId, inviteePubkey: targetPubkey }
+          })
+          if (res && typeof res === 'object') {
+            writerInfo = {
+              writerCore: (res as any).writerCore,
+              writerSecret: (res as any).writerSecret
+            }
+          }
+          console.info('[GroupsProvider] Writer provisioning result (approval)', {
+            groupId,
+            targetPubkey,
+            relayKey: relayEntry.relayKey,
+            hasWriterCore: !!writerInfo?.writerCore,
+            hasWriterSecret: !!writerInfo?.writerSecret
+          })
+        } catch (err) {
+          console.warn('[GroupsProvider] Failed to provision writer for approval', err)
+        }
+      }
+
       const payload = {
         relayUrl: baseRelayUrl || resolved || relay || null,
         token,
@@ -1195,8 +1274,16 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         isPublic: meta?.isPublic !== false,
         name: meta?.name,
         about: meta?.about,
-        fileSharing: meta?.isOpen !== false
+        fileSharing: meta?.isOpen !== false,
+        writerCore: writerInfo?.writerCore || null,
+        writerSecret: writerInfo?.writerSecret || null
       }
+      console.info('[GroupsProvider] Approval invite payload built', {
+        groupId,
+        targetPubkey,
+        hasWriterCore: !!writerInfo?.writerCore,
+        hasWriterSecret: !!writerInfo?.writerSecret
+      })
 
       // Build encrypted invite (9009)
       const tags: string[][] = [

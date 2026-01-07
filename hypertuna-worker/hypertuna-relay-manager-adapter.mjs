@@ -3,8 +3,11 @@
 
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
-import crypto from 'node:crypto';
+import nodeCrypto from 'node:crypto';
+import hypercoreCrypto from 'hypercore-crypto';
+import HypercoreId from 'hypercore-id-encoding';
 import { NostrUtils } from './nostr-utils.js';
+import b4a from 'b4a';
 
 // Import the legacy modules (adapted to run in a pure Node/Electron environment)
 import { RelayManager } from './hypertuna-relay-manager-bare.mjs';
@@ -451,7 +454,19 @@ function emitRelayLoadingEvent({ relayKey, publicIdentifier = null, name = '' },
  * @returns {Promise<Object>} - Result object with relay information
  */
 export async function joinRelay(options = {}) {
-    const { relayKey, name, description, publicIdentifier, authToken = null, storageDir, config, fromAutoConnect = false } = options;
+    const {
+        relayKey,
+        name,
+        description,
+        publicIdentifier,
+        authToken = null,
+        storageDir,
+        config,
+        fromAutoConnect = false,
+        writerSecret = null,
+        writerCore = null,
+        suppressInitMessage = false
+    } = options;
     
     // Store config globally if provided
     if (config) {
@@ -465,7 +480,90 @@ export async function joinRelay(options = {}) {
             error: 'Relay key is required'
         };
     }
-    
+
+    let writerKeyPair = null;
+    let expectedWriterKey = null;
+    let expectedWriterHex = null;
+    if (writerSecret) {
+        try {
+            const secretKey = Buffer.from(String(writerSecret), 'hex');
+            if (writerCore) {
+                try {
+                    expectedWriterKey = HypercoreId.decode(String(writerCore));
+                } catch {
+                    if (/^[0-9a-fA-F]{64}$/.test(String(writerCore))) {
+                        expectedWriterKey = Buffer.from(String(writerCore), 'hex');
+                    }
+                }
+            }
+            if (expectedWriterKey) {
+                expectedWriterHex = b4a.toString(expectedWriterKey, 'hex');
+                console.log('[RelayAdapter] Invite writer core decoded', {
+                    relayKey,
+                    writerCore: String(writerCore).slice(0, 16),
+                    expectedWriterHex: expectedWriterHex.slice(0, 16),
+                    expectedLen: expectedWriterKey.length
+                });
+            }
+
+            const seedCandidates = [];
+            if (secretKey.length >= 32) seedCandidates.push(secretKey.subarray(0, 32));
+            if (secretKey.length === 64 && expectedWriterKey) {
+                const secretTail = secretKey.subarray(32, 64);
+                const tailMatches = b4a.equals(secretTail, expectedWriterKey);
+                console.log('[RelayAdapter] Invite writer secret inspection', {
+                    relayKey,
+                    secretLen: secretKey.length,
+                    tailMatchesCore: tailMatches,
+                    expectedWriterHex: expectedWriterHex?.slice(0, 16) || null
+                });
+            }
+
+            let derivedPair = null;
+            for (const seed of seedCandidates) {
+                try {
+                    const candidate = hypercoreCrypto.keyPair(seed);
+                    if (!candidate?.publicKey || !candidate?.secretKey) continue;
+                    if (expectedWriterKey && !b4a.equals(candidate.publicKey, expectedWriterKey)) {
+                        console.warn('[RelayAdapter] Invite writer keypair mismatch with provided writerCore; retrying with alternate seed');
+                        continue;
+                    }
+                    derivedPair = { publicKey: candidate.publicKey, secretKey: candidate.secretKey };
+                    break;
+                } catch (err) {
+                    // try next seed form
+                }
+            }
+
+            if (!derivedPair && expectedWriterKey && secretKey.length === 64) {
+                const candidate = { publicKey: expectedWriterKey, secretKey };
+                if (hypercoreCrypto.validateKeyPair(candidate)) {
+                    derivedPair = candidate;
+                    console.warn('[RelayAdapter] Using invite secretKey directly (validated against writerCore)');
+                } else {
+                    console.warn('[RelayAdapter] Invite writer secretKey does not validate against writerCore; skipping keyPair injection');
+                }
+            }
+
+            if (derivedPair) {
+                writerKeyPair = derivedPair;
+                console.log('[RelayAdapter] Decoded invite writer keypair for relay', {
+                    relayKey,
+                    hasExpectedCore: !!expectedWriterKey,
+                    secretLen: secretKey.length,
+                    derivedPublicHex: b4a.toString(derivedPair.publicKey, 'hex').slice(0, 16),
+                    expectedWriterHex: expectedWriterHex?.slice(0, 16) || null
+                });
+            } else {
+                console.warn('[RelayAdapter] Provided writerSecret but failed to decode/derive writerCore/publicKey; skipping keyPair injection');
+            }
+        } catch (err) {
+            console.warn('[RelayAdapter] Failed to build writer keyPair from invite', err?.message || err);
+        }
+    } else {
+        console.log('[RelayAdapter] No writerSecret supplied for joinRelay', { relayKey, publicIdentifier });
+    }
+
     try {
         await ensureProfilesInitialized(globalUserKey);
         
@@ -494,7 +592,7 @@ export async function joinRelay(options = {}) {
             const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
 
             // Still send initialized message since the UI might be waiting
-            if (global.sendMessage) {
+            if (global.sendMessage && !suppressInitMessage) {
                 console.log(`[RelayAdapter] [1] joinRelay() ->Sending relay-initialized for ${relayKey} with URL ${connectionUrl}`);
                 global.sendMessage({
                     type: 'relay-initialized',
@@ -506,6 +604,10 @@ export async function joinRelay(options = {}) {
                     requiresAuth: profileInfo?.auth_config?.requiresAuth || false,
                     userAuthToken: userAuthToken,
                     timestamp: new Date().toISOString()
+                });
+            } else if (global.sendMessage && suppressInitMessage) {
+                console.log('[RelayAdapter] Suppressing relay-initialized (already active)', {
+                    relayKey
                 });
             }
             
@@ -522,7 +624,14 @@ export async function joinRelay(options = {}) {
         await fs.mkdir(defaultStorageDir, { recursive: true });
         
         // Create relay manager instance
-        const relayManager = new RelayManager(defaultStorageDir, relayKey);
+        if (writerKeyPair) {
+            console.log('[RelayAdapter] Using invite-provided writer keypair for relay', relayKey);
+        }
+
+        const relayManager = new RelayManager(defaultStorageDir, relayKey, {
+            keyPair: writerKeyPair,
+            expectedWriterKey
+        });
         await relayManager.initialize();
         
         activeRelays.set(relayKey, relayManager);
@@ -573,7 +682,7 @@ export async function joinRelay(options = {}) {
         console.log('[RelayAdapter] Joined relay:', relayKey);
         
         // Send relay initialized message for joined relay ONLY if not from auto-connect
-        if (!fromAutoConnect && global.sendMessage) {
+        if (!fromAutoConnect && global.sendMessage && !suppressInitMessage) {
             const identifierPath = profileInfo.public_identifier ? profileInfo.public_identifier.replace(':', '/') : relayKey;
             const gatewayBase = buildGatewayWebsocketBase(config);
             const baseGw = `${gatewayBase}/${identifierPath}`;
@@ -588,6 +697,11 @@ export async function joinRelay(options = {}) {
                 connectionUrl: gw,
                 isJoined: true,
                 timestamp: new Date().toISOString()
+            });
+        } else if (!fromAutoConnect && global.sendMessage && suppressInitMessage) {
+            console.log('[RelayAdapter] Suppressing relay-initialized (join flow)', {
+                relayKey,
+                publicIdentifier: profileInfo.public_identifier || null
             });
         }
         
@@ -1125,7 +1239,7 @@ export async function cleanupRelays() {
 
 // Helper function to generate hex keys
 function generateHexKey() {
-    return crypto.randomBytes(32).toString('hex');
+    return nodeCrypto.randomBytes(32).toString('hex');
 }
 
 // Export the active relays map for direct access if needed

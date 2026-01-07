@@ -158,7 +158,7 @@ type WorkerBridgeContextValue = {
   startWorker: () => Promise<void>
   stopWorker: () => Promise<void>
   restartWorker: () => Promise<void>
-  sendToWorker: (message: unknown) => Promise<void>
+  sendToWorker: (message: unknown) => Promise<unknown>
   createRelay: (data: RelayCreateRequest) => Promise<RelayCreatedPayload>
   startJoinFlow: (
     publicIdentifier: string,
@@ -174,6 +174,8 @@ type WorkerBridgeContextValue = {
         maxBytes?: number | null
       } | null
       cores?: { key: string; role?: string | null }[]
+      writerCore?: string | null
+      writerSecret?: string | null
     }
   ) => Promise<void>
   clearJoinFlow: (publicIdentifier: string) => void
@@ -185,6 +187,10 @@ const MAX_LOGS = 500
 const MAX_OUTPUT_LINES = 250
 const AUTOSTART_KEY = 'hypertuna_worker_autostart_enabled'
 const RESTART_DELAYS_MS = [1000, 3000, 10000, 30000]
+
+function makeRequestId(prefix = 'req') {
+  return `${prefix}-${Math.random().toString(16).slice(2)}-${Date.now().toString(16)}`
+}
 
 function isHex64(value: unknown): value is string {
   return typeof value === 'string' && /^[a-fA-F0-9]{64}$/.test(value)
@@ -324,6 +330,17 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       timeoutId: number
     }>
   >([])
+  const pendingRepliesRef = useRef<
+    Map<
+      string,
+      {
+        resolve: (value: any) => void
+        reject: (err: Error) => void
+        timeoutId: number
+        type: string
+      }
+    >
+  >(new Map())
 
   useEffect(() => {
     autostartEnabledRef.current = autostartEnabled
@@ -495,6 +512,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           maxBytes?: number | null
         } | null
         cores?: { key: string; role?: string | null }[]
+        writerCore?: string | null
+        writerSecret?: string | null
       }
     ) => {
       if (!isElectron()) throw new Error('Electron IPC unavailable')
@@ -549,9 +568,18 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         relayKey: opts?.relayKey || undefined,
         relayUrl: opts?.relayUrl || undefined,
         blindPeer: opts?.blindPeer,
-        cores: opts?.cores
+        cores: opts?.cores,
+        writerCore: opts?.writerCore,
+        writerSecret: opts?.writerSecret
       }
       if (hostPeers && hostPeers.length) data.hostPeers = hostPeers
+
+      console.info('[WorkerBridge] startJoinFlow sending to worker', {
+        publicIdentifier: identifier,
+        hasWriterSecret: !!opts?.writerSecret,
+        hasWriterCore: !!opts?.writerCore,
+        hostPeersCount: hostPeers?.length || 0
+      })
 
       await electronIpc.sendToWorker({ type: 'start-join-flow', data })
 
@@ -822,6 +850,34 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           case 'auth-data-updated':
             electronIpc.sendToWorker({ type: 'get-relays' }).catch(() => {})
             break
+          case 'provision-writer-for-invitee:result':
+          case 'provision-writer-for-invitee:error': {
+            const requestId = (msg as any)?.requestId
+            let matchedKey: string | null = null
+            if (requestId && pendingRepliesRef.current.has(requestId)) {
+              matchedKey = requestId
+            } else {
+              for (const [key, entry] of pendingRepliesRef.current.entries()) {
+                if (entry.type === 'provision-writer-for-invitee') {
+                  matchedKey = key
+                  break
+                }
+              }
+            }
+            if (matchedKey) {
+              const pending = pendingRepliesRef.current.get(matchedKey)
+              pendingRepliesRef.current.delete(matchedKey)
+              if (pending) {
+                window.clearTimeout(pending.timeoutId)
+                if (msg.type === 'provision-writer-for-invitee:result') {
+                  pending.resolve((msg as any).data ?? null)
+                } else {
+                  pending.reject(new Error((msg as any)?.error || 'Worker provisioning failed'))
+                }
+              }
+            }
+            break
+          }
           case 'join-auth-progress': {
             const identifier = msg?.data?.publicIdentifier
             const progress: JoinAuthProgress | null =
@@ -996,6 +1052,13 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       })
     }
   }, [scheduleAutoRestart, warmWorkerState])
+
+  useEffect(() => {
+    return () => {
+      pendingRepliesRef.current.forEach(({ timeoutId }) => window.clearTimeout(timeoutId))
+      pendingRepliesRef.current.clear()
+    }
+  }, [])
 
   useEffect(() => {
     if (!isElectron()) {
@@ -1216,8 +1279,32 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         if (!statusV1) {
           await startWorkerInternal({ resetRestartAttempts: false })
         }
+        const msgType = (message as any)?.type
+        const expectsReply = msgType === 'provision-writer-for-invitee'
+        if (expectsReply) {
+          const requestId = (message as any)?.requestId || makeRequestId('provision-writer')
+          const payload = { ...(message as any), requestId }
+          const promise = new Promise((resolve, reject) => {
+            const timeoutId = window.setTimeout(() => {
+              pendingRepliesRef.current.delete(requestId)
+              reject(new Error('Worker reply timeout'))
+            }, 15000)
+            pendingRepliesRef.current.set(requestId, {
+              resolve,
+              reject,
+              timeoutId,
+              type: msgType
+            })
+          })
+          await electronIpc.sendToWorker(payload)
+          return promise
+        }
+
         const res = await electronIpc.sendToWorker(message)
-        if (!res?.success) throw new Error(res?.error || 'Worker rejected message')
+        if (res && typeof res === 'object' && 'success' in res && (res as any).success === false) {
+          throw new Error((res as any).error || 'Worker rejected message')
+        }
+        return res
       },
       createRelay: async (data: RelayCreateRequest) => {
         return await createRelayInternal(data)

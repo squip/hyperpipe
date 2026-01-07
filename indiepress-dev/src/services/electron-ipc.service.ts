@@ -85,7 +85,7 @@ export type PublicGatewayStatus = {
 type ElectronAPI = {
   startWorker: (config?: unknown) => Promise<WorkerStartResult>
   stopWorker: () => Promise<WorkerCommandResult>
-  sendToWorker: (message: unknown) => Promise<WorkerCommandResult>
+  sendToWorker: (message: unknown) => Promise<any>
 
   getGatewayStatus: () => Promise<{ success: boolean; status: GatewayStatus | null }>
   getGatewayLogs: () => Promise<{ success: boolean; logs: GatewayLogEntry[] }>

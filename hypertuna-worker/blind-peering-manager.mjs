@@ -107,6 +107,7 @@ export default class BlindPeeringManager extends EventEmitter {
     this.metadataDirty = false;
     this.metadataSaveTimer = null;
     this.ownerPeerKey = null;
+    this.mirrorCoreCache = new Map();
 
     this.backoffConfig = {
       initialDelayMs: 1000,
@@ -312,6 +313,7 @@ export default class BlindPeeringManager extends EventEmitter {
       entry.coreRefs = coreRefs;
       entry.context.coreRefs = coreRefs;
     }
+    this.#primeCoreRefsBackground(coreRefs, entry);
     entry.ownerPeerKey = this.#getOwnerPeerKey();
     entry.announce = true;
     entry.priority = Number.isFinite(relayContext.priority)
@@ -327,6 +329,79 @@ export default class BlindPeeringManager extends EventEmitter {
       writers: coreRefs.length
     });
     this.emit('mirror-requested', entry);
+  }
+
+  async primeRelayCoreRefs({ relayKey = null, publicIdentifier = null, coreRefs = [], timeoutMs = 45000, reason = 'manual' } = {}) {
+    if (!this.started) {
+      return { status: 'skipped', reason: 'not-started' };
+    }
+    if (!this.blindPeering) {
+      return { status: 'skipped', reason: 'not-configured' };
+    }
+    if (!this.runtime?.corestore) {
+      return { status: 'skipped', reason: 'no-corestore' };
+    }
+    const uniqueRefs = Array.from(new Set(
+      (Array.isArray(coreRefs) ? coreRefs : [])
+        .map(normalizeCoreKey)
+        .filter(Boolean)
+    ));
+    if (!uniqueRefs.length) {
+      return { status: 'skipped', reason: 'no-cores' };
+    }
+
+    const labelBase = relayKey || publicIdentifier || 'unknown-relay';
+    const summary = {
+      status: 'ok',
+      reason,
+      relayKey: relayKey || null,
+      total: uniqueRefs.length,
+      synced: 0,
+      failed: 0,
+      connected: 0
+    };
+
+    for (const ref of uniqueRefs) {
+      const label = `${labelBase}:${ref.slice(0, 16)}`;
+      const core = this.#getMirrorCore(ref, label);
+      if (!core) {
+        summary.failed += 1;
+        continue;
+      }
+      try {
+        await this.blindPeering.addCore(core, core.key, {
+          announce: false,
+          priority: 2,
+          pick: 2
+        });
+        summary.connected += 1;
+      } catch (error) {
+        summary.failed += 1;
+        this.logger?.warn?.('[BlindPeering] Relay core mirror add failed', {
+          ref,
+          label,
+          reason,
+          error: error?.message || error
+        });
+        continue;
+      }
+
+      try {
+        await this.#waitForCoreSync(core, timeoutMs, label);
+        summary.synced += 1;
+      } catch (error) {
+        summary.failed += 1;
+        this.logger?.warn?.('[BlindPeering] Relay core prefetch failed', {
+          ref,
+          label,
+          reason,
+          err: error?.message || error
+        });
+      }
+    }
+
+    this.logger?.info?.('[BlindPeering] Relay core prefetch complete', summary);
+    return summary;
   }
 
   ensureHyperdriveMirror(driveContext = {}) {
@@ -724,12 +799,23 @@ export default class BlindPeeringManager extends EventEmitter {
     for (const entry of this.mirrorTargets.values()) {
       if (entry.type === 'relay') {
         const autobase = entry.context?.autobase || null;
-        if (!autobase) continue;
-        const objects = this.#collectAutobaseCoreObjects(autobase);
-        for (const [key, info] of objects) {
-          if (!map.has(key)) {
-            map.set(key, info);
+        if (autobase) {
+          const objects = this.#collectAutobaseCoreObjects(autobase);
+          for (const [key, info] of objects) {
+            if (!map.has(key)) {
+              map.set(key, info);
+            }
           }
+        }
+        if (Array.isArray(entry.coreRefs) && entry.coreRefs.length) {
+          const identifier = entry.identifier || entry.context?.relayKey || entry.context?.publicIdentifier || 'relay';
+          entry.coreRefs.forEach((ref, index) => {
+            const label = `relay-core:${identifier}:${index}`;
+            const core = this.#getMirrorCore(ref, label);
+            if (core) {
+              this.#addCoreObject(map, core, label);
+            }
+          });
         }
       } else if (entry.type === 'drive' || entry.type === 'pfp-drive') {
         const drive = entry.context?.drive || null;
@@ -743,6 +829,53 @@ export default class BlindPeeringManager extends EventEmitter {
       }
     }
     return map;
+  }
+
+  #getMirrorCore(key, label) {
+    if (!this.runtime?.corestore) return null;
+    const normalized = normalizeCoreKey(key);
+    if (!normalized) return null;
+    let entry = this.mirrorCoreCache.get(normalized);
+    if (!entry) {
+      const decoded = decodeCoreKey(normalized);
+      if (!decoded) return null;
+      const core = this.runtime.corestore.get({ key: decoded, valueEncoding: 'binary', sparse: true });
+      entry = { core, labels: new Set() };
+      this.mirrorCoreCache.set(normalized, entry);
+      core.on('close', () => {
+        this.mirrorCoreCache.delete(normalized);
+      });
+    }
+    if (label) entry.labels.add(label);
+    return entry.core;
+  }
+
+  #primeCoreRefsBackground(coreRefs = [], entry = {}) {
+    if (!this.started || !this.blindPeering || !this.runtime?.corestore) return;
+    if (!Array.isArray(coreRefs) || !coreRefs.length) return;
+    const identifier = entry.identifier || entry.context?.relayKey || entry.context?.publicIdentifier || 'relay';
+    const priority = Number.isFinite(entry.priority) ? entry.priority : 2;
+    coreRefs
+      .map(normalizeCoreKey)
+      .filter(Boolean)
+      .forEach((ref, index) => {
+        const label = `relay-core:${identifier}:${index}`;
+        const core = this.#getMirrorCore(ref, label);
+        if (!core) return;
+        try {
+          this.blindPeering.addCoreBackground(core, core.key, {
+            announce: false,
+            priority,
+            pick: 2
+          });
+        } catch (error) {
+          this.logger?.warn?.('[BlindPeering] Failed to prime relay core mirror', {
+            ref,
+            label,
+            error: error?.message || error
+          });
+        }
+      });
   }
 
   #addCoreObject(target, candidate, label) {

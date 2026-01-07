@@ -68,6 +68,7 @@ const defaultStorageDir = process.env.STORAGE_DIR || pearRuntime?.config?.storag
 const userKey = process.env.USER_KEY || null
 const BLIND_PEERING_METADATA_FILENAME = 'blind-peering-metadata.json'
 const BLIND_PEER_REHYDRATION_TIMEOUT_MS = 45000
+const BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS = 60000
 
 global.userConfig = {
   storage: defaultStorageDir,
@@ -2159,8 +2160,39 @@ async function handleMessageObject(message) {
                   publicIdentifier,
                   coreRefs
                 })
+                console.log('[Worker] Blind-peer join flow: refreshing mirrors', {
+                  relayIdentifier,
+                  coreRefsCount: coreRefs.length,
+                  timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
+                  coreRefsPreview: coreRefs.map((key) => String(key).slice(0, 16))
+                })
                 await manager.refreshFromBlindPeers('join-flow')
-                await manager.rehydrateMirrors({ reason: 'join-flow', timeoutMs: 30000 })
+                if (typeof manager.primeRelayCoreRefs === 'function' && coreRefs.length) {
+                  const primeSummary = await manager.primeRelayCoreRefs({
+                    relayKey: relayIdentifier,
+                    publicIdentifier,
+                    coreRefs,
+                    timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
+                    reason: 'join-flow'
+                  })
+                  console.log('[Worker] Blind-peer join flow: core prefetch completed', {
+                    relayIdentifier,
+                    status: primeSummary?.status ?? null,
+                    synced: primeSummary?.synced ?? null,
+                    failed: primeSummary?.failed ?? null,
+                    connected: primeSummary?.connected ?? null
+                  })
+                }
+                const rehydrateSummary = await manager.rehydrateMirrors({
+                  reason: 'join-flow',
+                  timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS
+                })
+                console.log('[Worker] Blind-peer join flow: rehydration completed', {
+                  relayIdentifier,
+                  status: rehydrateSummary?.status ?? null,
+                  synced: rehydrateSummary?.synced ?? null,
+                  failed: rehydrateSummary?.failed ?? null
+                })
                 hostPeers = [String(data.blindPeer.publicKey).toLowerCase()]
                 console.log('[Worker] Using blind-peer mirror as host peer for join flow', {
                   relayIdentifier,
@@ -2219,6 +2251,62 @@ async function handleMessageObject(message) {
             error: 'Relay server not initialized'
           }
         })
+      }
+      break
+
+    case 'provision-writer-for-invitee':
+      try {
+        const requestId = message?.requestId
+        if (!relayServer?.provisionWriterForInvitee) throw new Error('Relay server unavailable')
+        const result = await relayServer.provisionWriterForInvitee(message.data || {})
+        sendMessage({ type: 'provision-writer-for-invitee:result', requestId, data: result })
+        try {
+          const relayKey = result?.relayKey || null
+          console.log('[Worker] Refreshing blind-peer mirrors after invite writer', {
+            relayKey
+          })
+          const manager = await ensureBlindPeeringManager()
+          if (manager?.started) {
+            const relayManager = relayKey ? activeRelays.get(relayKey) : null
+            if (relayManager?.relay) {
+              manager.ensureRelayMirror({
+                relayKey,
+                publicIdentifier: message?.data?.publicIdentifier || relayManager?.publicIdentifier || null,
+                autobase: relayManager.relay
+              })
+            } else {
+              await seedBlindPeeringMirrors(manager)
+            }
+            await manager.refreshFromBlindPeers('invite-writer')
+            const summary = await manager.rehydrateMirrors({
+              reason: 'invite-writer',
+              timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+            })
+            console.log('[Worker] Blind-peer refresh complete after invite writer', {
+              relayKey,
+              status: summary?.status ?? null,
+              synced: summary?.synced ?? null,
+              failed: summary?.failed ?? null
+            })
+          } else {
+            console.log('[Worker] Blind-peer manager not started; skipping invite-writer refresh', {
+              relayKey,
+              enabled: manager?.enabled ?? null
+            })
+          }
+        } catch (err) {
+          console.warn('[Worker] Blind-peer refresh after invite writer failed', {
+            error: err?.message || err
+          })
+        }
+        return result
+      } catch (err) {
+        sendMessage({
+          type: 'provision-writer-for-invitee:error',
+          requestId: message?.requestId,
+          error: err?.message || String(err)
+        })
+        return { error: err?.message || String(err) }
       }
       break
 

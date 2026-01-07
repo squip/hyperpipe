@@ -677,13 +677,21 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       }
 
       if (shouldUseWorkerJoin) {
+        console.info('[GroupPage] Starting worker join with invite data', {
+          groupId,
+          hasWriterCore: !!(inviteData as any)?.writerCore,
+          hasWriterSecret: !!(inviteData as any)?.writerSecret,
+          hasBlindPeer: !!inviteData?.blindPeer
+        })
         await startJoinFlow(groupId, {
           fileSharing: isOpenGroup,
           token: inviteToken,
           relayKey,
           relayUrl: relayUrlForJoin,
           blindPeer: inviteData?.blindPeer,
-          cores: inviteData?.cores
+          cores: inviteData?.cores,
+          writerCore: (inviteData as any)?.writerCore,
+          writerSecret: (inviteData as any)?.writerSecret
         })
         return
       }

@@ -103,18 +103,21 @@ function validateEvent(event) {
 }
 
 export class RelayManager {
-    constructor(storageDir, bootstrap) {
+    constructor(storageDir, bootstrap, options = {}) {
       this.storageDir = storageDir;
       this.bootstrap = bootstrap;
+      this.keyPair = options?.keyPair || null;
+      this.expectedWriterKey = options?.expectedWriterKey || null;
       this.store = null;  // Initialize in the initialize method
       this.relay = null;
       this.swarm = null;
       this.peers = new Map(); // Track connected peers
+      this._relayStateSnapshot = null;
     }
   
     async initialize() {
       console.log('Initializing relay with bootstrap:', this.bootstrap);
-  
+
       try {
         // Acquire lock for the storage directory
         await acquireFileLock(this.storageDir);
@@ -122,7 +125,26 @@ export class RelayManager {
         
         // Initialize Corestore after acquiring the lock
         this.store = new Corestore(this.storageDir);
+
+        if (!this.expectedWriterKey && this.keyPair?.publicKey) {
+          this.expectedWriterKey = this.keyPair.publicKey;
+        }
+
+        await this.ensureAutobaseLocalKey().catch((error) => {
+          console.warn('[RelayManager] Failed to inspect autobase/local metadata', error?.message || error);
+        });
         
+        if (this.keyPair || this.expectedWriterKey) {
+          const keyPairHex = this.keyPair?.publicKey ? b4a.toString(this.keyPair.publicKey, 'hex') : null;
+          const expectedHex = this.expectedWriterKey ? b4a.toString(this.expectedWriterKey, 'hex') : null;
+          console.log('[RelayManager] Preparing autobase writer material', {
+            relayKey: this.bootstrap,
+            keyPairPublic: keyPairHex ? keyPairHex.slice(0, 16) : null,
+            expectedWriter: expectedHex ? expectedHex.slice(0, 16) : null,
+            matchesExpected: keyPairHex && expectedHex ? keyPairHex === expectedHex : null
+          });
+        }
+
         this.relay = new NostrRelay(this.store, this.bootstrap, {
           apply: async (batch, view, base) => {
             const kvOps = []
@@ -131,8 +153,26 @@ export class RelayManager {
             for (const node of batch) {
               const op = node.value
               if (op.type === 'addWriter') {
-                console.log('\rAdding writer', op.key)
-                await base.addWriter(b4a.from(op.key, 'hex'))
+                const localKeyHex = base?.local?.key ? b4a.toString(base.local.key, 'hex') : null;
+                const activeCount = base?.activeWriters?.size ?? null;
+                console.log('[RelayManager] Applying addWriter op', {
+                  relayKey: this.bootstrap,
+                  writer: String(op.key).slice(0, 16),
+                  writable: base?.writable ?? null,
+                  localKey: localKeyHex ? localKeyHex.slice(0, 16) : null,
+                  activeWriters: activeCount
+                });
+                await base.addWriter(b4a.from(op.key, 'hex'));
+                const updatedCount = base?.activeWriters?.size ?? null;
+                const nowActive = base?.activeWriters?.has
+                  ? base.activeWriters.has(b4a.from(op.key, 'hex'))
+                  : null;
+                console.log('[RelayManager] Applied addWriter op', {
+                  relayKey: this.bootstrap,
+                  writer: String(op.key).slice(0, 16),
+                  activeWriters: updatedCount,
+                  writerActive: nowActive
+                });
                 continue
               }
               if (op.type === 'put' || op.type === 'del') kvOps.push(node)
@@ -147,12 +187,51 @@ export class RelayManager {
             }
           },
           valueEncoding: c.any,
-          verifyEvent: this.verifyEvent.bind(this)
+          verifyEvent: this.verifyEvent.bind(this),
+          keyPair: this.keyPair || undefined
         });
+
+        if (typeof this.relay.ready === 'function') {
+          try {
+            await this.relay.ready();
+          } catch (error) {
+            console.warn('[RelayManager] Relay ready() failed before local key inspection', error?.message || error);
+          }
+        }
+        if (this.relay?.local && typeof this.relay.local.ready === 'function') {
+          try {
+            await this.relay.local.ready();
+          } catch (error) {
+            console.warn('[RelayManager] Local core ready() failed before local key inspection', error?.message || error);
+          }
+        }
+
+        const localKeyHex = this.relay?.local?.key ? b4a.toString(this.relay.local.key, 'hex') : null;
+        const expectedHex = this.expectedWriterKey ? b4a.toString(this.expectedWriterKey, 'hex') : null;
+        console.log('[RelayManager] Autobase local key set', {
+          relayKey: this.bootstrap,
+          localKey: localKeyHex ? localKeyHex.slice(0, 16) : null,
+          expectedWriter: expectedHex ? expectedHex.slice(0, 16) : null,
+          matchesExpected: localKeyHex && expectedHex ? localKeyHex === expectedHex : null
+        });
+
+        this.logRelayState('initialized');
+
+        if (typeof this.relay.on === 'function') {
+          this.relay.on('writable', () => this.logRelayState('writable'));
+          this.relay.on('unwritable', () => this.logRelayState('unwritable'));
+          this.relay.on('update', () => this.logRelayState('update'));
+        }
 
         this.relay.on('error', console.error);
 
         await this.relay.update();
+        console.log('[RelayManager] Relay update complete', {
+          relayKey: this.bootstrap,
+          writable: this.relay?.writable ?? null,
+          activeWriters: this.relay?.activeWriters?.size ?? null
+        });
+        this.logRelayState('update-complete');
         await this.ensureWakeupCapability().catch((error) => {
           console.warn('[RelayManager] Failed to prepare wakeup capability', error?.message || error);
         });
@@ -198,6 +277,105 @@ export class RelayManager {
         console.error(`Error during relay initialization: ${error.message}`);
         console.error(error.stack);
         throw error;
+      }
+    }
+
+    getRelayStateSnapshot() {
+      if (!this.relay) return null;
+      const localKey = this.relay?.local?.key ? b4a.toString(this.relay.local.key, 'hex') : null;
+      const expectedHex = this.expectedWriterKey ? b4a.toString(this.expectedWriterKey, 'hex') : null;
+      const expectedActive = this.expectedWriterKey && this.relay?.activeWriters?.has
+        ? this.relay.activeWriters.has(this.expectedWriterKey)
+        : null;
+      return {
+        writable: this.relay?.writable ?? null,
+        activeWriters: this.relay?.activeWriters?.size ?? null,
+        localKey: localKey ? localKey.slice(0, 16) : null,
+        expectedWriter: expectedHex ? expectedHex.slice(0, 16) : null,
+        expectedActive
+      };
+    }
+
+    logRelayState(reason, extra = {}) {
+      const snapshot = this.getRelayStateSnapshot();
+      if (!snapshot) return;
+      if (
+        this._relayStateSnapshot &&
+        snapshot.writable === this._relayStateSnapshot.writable &&
+        snapshot.activeWriters === this._relayStateSnapshot.activeWriters &&
+        snapshot.localKey === this._relayStateSnapshot.localKey &&
+        snapshot.expectedWriter === this._relayStateSnapshot.expectedWriter &&
+        snapshot.expectedActive === this._relayStateSnapshot.expectedActive
+      ) {
+        return;
+      }
+      this._relayStateSnapshot = snapshot;
+      console.log('[RelayManager] Relay state', {
+        relayKey: this.bootstrap,
+        reason,
+        ...snapshot,
+        ...extra
+      });
+    }
+
+    async ensureAutobaseLocalKey() {
+      if (!this.bootstrap) return;
+      if (!this.expectedWriterKey || !this.keyPair?.publicKey) {
+        console.log('[RelayManager] Autobase local key inspection skipped (missing expected writer or keyPair)', {
+          relayKey: this.bootstrap,
+          hasExpectedWriter: !!this.expectedWriterKey,
+          hasKeyPair: !!this.keyPair?.publicKey
+        });
+        return;
+      }
+
+      const expectedHex = b4a.toString(this.expectedWriterKey, 'hex');
+      const keyPairHex = b4a.toString(this.keyPair.publicKey, 'hex');
+      const bootstrapCore = this.store.get({ key: this.bootstrap, compat: false, active: false });
+      await bootstrapCore.ready();
+      const storedLocal = await bootstrapCore.getUserData('autobase/local');
+      const storedHex = storedLocal ? b4a.toString(storedLocal, 'hex') : null;
+      const matchesExpected = storedLocal ? b4a.equals(storedLocal, this.expectedWriterKey) : null;
+      const matchesKeyPair = expectedHex === keyPairHex;
+      console.log('[RelayManager] Autobase local key metadata', {
+        relayKey: this.bootstrap,
+        storedLocal: storedHex ? storedHex.slice(0, 16) : null,
+        expectedWriter: expectedHex.slice(0, 16),
+        keyPairPublic: keyPairHex.slice(0, 16),
+        matchesExpected,
+        matchesKeyPair
+      });
+
+      if (!matchesKeyPair) {
+        console.warn('[RelayManager] Skipping autobase/local override (keyPair does not match expected writer)', {
+          relayKey: this.bootstrap,
+          expectedWriter: expectedHex.slice(0, 16),
+          keyPairPublic: keyPairHex.slice(0, 16)
+        });
+        return;
+      }
+
+      if (!storedLocal || !matchesExpected) {
+        const reason = storedLocal ? 'mismatch' : 'missing';
+        console.warn('[RelayManager] Updating autobase/local to align with invite writer', {
+          relayKey: this.bootstrap,
+          reason,
+          previousLocal: storedHex ? storedHex.slice(0, 16) : null,
+          expectedWriter: expectedHex.slice(0, 16)
+        });
+        await bootstrapCore.setUserData('autobase/local', this.expectedWriterKey);
+        const updatedLocal = await bootstrapCore.getUserData('autobase/local');
+        const updatedHex = updatedLocal ? b4a.toString(updatedLocal, 'hex') : null;
+        console.log('[RelayManager] Autobase local key updated', {
+          relayKey: this.bootstrap,
+          updatedLocal: updatedHex ? updatedHex.slice(0, 16) : null,
+          matchesExpected: updatedLocal ? b4a.equals(updatedLocal, this.expectedWriterKey) : null
+        });
+      } else {
+        console.log('[RelayManager] Autobase local key matches expected writer; no update needed', {
+          relayKey: this.bootstrap,
+          localKey: storedHex ? storedHex.slice(0, 16) : null
+        });
       }
     }
 
@@ -353,10 +531,21 @@ export class RelayManager {
     }
 
     async addWriter(key) {
-      console.log('Adding writer:', key);
+      const localKeyHex = this.relay?.local?.key ? b4a.toString(this.relay.local.key, 'hex') : null;
+      console.log('[RelayManager] addWriter append requested', {
+        relayKey: this.bootstrap,
+        writer: String(key).slice(0, 16),
+        writable: this.relay?.writable ?? null,
+        localKey: localKeyHex ? localKeyHex.slice(0, 16) : null
+      });
       const result = await this.relay.append({
         type: 'addWriter',
         key
+      });
+      console.log('[RelayManager] addWriter append committed', {
+        relayKey: this.bootstrap,
+        writer: String(key).slice(0, 16),
+        viewVersion: this.relay?.view?.version ?? null
       });
       await this.relay.update().catch(() => {});
       await this.ensureWakeupCapability().catch((error) => {

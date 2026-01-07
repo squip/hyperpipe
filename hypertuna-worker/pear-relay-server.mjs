@@ -5,7 +5,7 @@ import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import process from 'node:process';
 import crypto from 'hypercore-crypto';
-import { setTimeout, setInterval, clearInterval } from 'node:timers';
+import { setTimeout, setInterval, clearInterval, clearTimeout } from 'node:timers';
 import b4a from 'b4a';
 import { URL } from 'node:url';
 import { initializeChallengeManager, getChallengeManager } from './challenge-manager.mjs';
@@ -14,6 +14,7 @@ import { nobleSecp256k1 } from './pure-secp256k1-bare.js';
 import { NostrUtils } from './nostr-utils.js';
 import { updateRelayAuthToken } from './hypertuna-relay-profile-manager-bare.mjs';
 import { applyPendingAuthUpdates } from './pending-auth.mjs';
+import HypercoreId from 'hypercore-id-encoding';
 import {
   createRelay as createRelayManager,
   joinRelay as joinRelayManager,
@@ -43,7 +44,6 @@ import {
   saveRelayProfile,
   calculateAuthorizedUsers
 } from './hypertuna-relay-profile-manager-bare.mjs';
-import HypercoreId from 'hypercore-id-encoding';
 
 import { getFile, getPfpFile } from './hyperdrive-manager.mjs';
 import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/GatewaySettings.mjs';
@@ -78,6 +78,10 @@ let gatewayRegistrationInterval = null;
 let gatewayConnection = null;
 let pendingRegistrations = []; // Queue registrations until gateway connects
 let connectedPeers = new Map(); // Track all connected peers
+const lateWriterRecoveryTasks = new Map();
+const BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS = 90000;
+const DIRECT_JOIN_WRITABLE_TIMEOUT_MS = 15000;
+const LATE_WRITER_RECOVERY_TIMEOUT_MS = 180000;
 let pendingPeerProtocols = new Map(); // Awaiters for outbound connections
 const peerJoinHandles = new Map(); // Persistent joinPeer handles
 let healthMonitorTimer = null;
@@ -1945,20 +1949,234 @@ async function publishEventToRelay(identifier, event) {
   }
 }
 
-// Wait for a relay to become writable before attempting writes
-async function waitForRelayWritable(relayKey, timeout = 10000) {
+function normalizeWriterKey(writerKey) {
+  if (!writerKey) return null;
+  if (b4a.isBuffer(writerKey)) return writerKey;
+  if (typeof writerKey !== 'string') return null;
+  try {
+    return HypercoreId.decode(writerKey);
+  } catch (_) {
+    if (/^[0-9a-fA-F]{64}$/.test(writerKey)) {
+      return Buffer.from(writerKey, 'hex');
+    }
+  }
+  return null;
+}
+
+function previewWriterKey(writerKey) {
+  if (!writerKey) return null;
+  try {
+    return b4a.toString(writerKey, 'hex').slice(0, 16);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function waitForRelayWriterActivation(options = {}) {
+  const {
+    relayKey,
+    expectedWriterKey = null,
+    timeoutMs = 10000,
+    reason = 'unknown'
+  } = options;
+  if (!relayKey) return { ok: false, reason, relayKey: null };
+
   const { activeRelays } = await import('./hypertuna-relay-manager-adapter.mjs');
   const relayManager = activeRelays.get(relayKey);
-  if (!relayManager) return;
-
-  const start = Date.now();
-  while (!relayManager.relay?.writable) {
-    if (Date.now() - start > timeout) {
-      console.warn(`[RelayServer] Timeout waiting for relay ${relayKey} to become writable`);
-      break;
-    }
-    await new Promise(res => setTimeout(res, 200));
+  if (!relayManager?.relay) {
+    console.warn('[RelayServer] waitForRelayWriterActivation: relay manager missing', { relayKey, reason });
+    return { ok: false, reason, relayKey };
   }
+
+  const relay = relayManager.relay;
+  const expectedKey = normalizeWriterKey(expectedWriterKey);
+  const expectedHex = previewWriterKey(expectedKey);
+  const start = Date.now();
+  let timeoutId = null;
+  let lastSnapshot = null;
+
+  if (typeof relay.ready === 'function') {
+    try {
+      await relay.ready();
+    } catch (error) {
+      console.warn('[RelayServer] waitForRelayWriterActivation: relay.ready() failed', {
+        relayKey,
+        reason,
+        error: error?.message || error
+      });
+    }
+  }
+
+  const snapshot = (context) => {
+    const localKey = relay?.local?.key ? b4a.toString(relay.local.key, 'hex') : null;
+    const expectedActive = expectedKey && relay?.activeWriters?.has
+      ? relay.activeWriters.has(expectedKey)
+      : null;
+    return {
+      relayKey,
+      reason,
+      context,
+      writable: relay?.writable ?? null,
+      activeWriters: relay?.activeWriters?.size ?? null,
+      localKey: localKey ? localKey.slice(0, 16) : null,
+      expectedWriter: expectedHex,
+      expectedWriterActive: expectedActive,
+      elapsedMs: Date.now() - start
+    };
+  };
+
+  const shouldLog = (snap) => {
+    if (!lastSnapshot) return true;
+    return (
+      snap.writable !== lastSnapshot.writable ||
+      snap.activeWriters !== lastSnapshot.activeWriters ||
+      snap.localKey !== lastSnapshot.localKey ||
+      snap.expectedWriterActive !== lastSnapshot.expectedWriterActive
+    );
+  };
+
+  const logState = (snap) => {
+    if (shouldLog(snap)) {
+      lastSnapshot = snap;
+      console.log('[RelayServer] waitForRelayWriterActivation state', snap);
+    }
+  };
+
+  const isReady = (snap) => Boolean(snap.writable) || (expectedKey ? Boolean(snap.expectedWriterActive) : false);
+
+  return await new Promise((resolve) => {
+    const cleanup = (result) => {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (typeof relay.off === 'function') {
+        relay.off('update', onUpdate);
+        relay.off('writable', onWritable);
+      } else if (typeof relay.removeListener === 'function') {
+        relay.removeListener('update', onUpdate);
+        relay.removeListener('writable', onWritable);
+      }
+      resolve(result);
+    };
+
+    const onUpdate = () => {
+      const snap = snapshot('update');
+      logState(snap);
+      if (isReady(snap)) {
+        console.log('[RelayServer] waitForRelayWriterActivation resolved on update', snap);
+        cleanup({ ok: true, ...snap });
+      }
+    };
+
+    const onWritable = () => {
+      const snap = snapshot('writable');
+      logState(snap);
+      if (isReady(snap)) {
+        console.log('[RelayServer] waitForRelayWriterActivation resolved on writable', snap);
+        cleanup({ ok: true, ...snap });
+      }
+    };
+
+    if (typeof relay.on === 'function') {
+      relay.on('update', onUpdate);
+      relay.on('writable', onWritable);
+    }
+
+    const initial = snapshot('initial');
+    logState(initial);
+    if (isReady(initial)) {
+      console.log('[RelayServer] waitForRelayWriterActivation already satisfied', initial);
+      cleanup({ ok: true, ...initial });
+      return;
+    }
+
+    timeoutId = setTimeout(() => {
+      const snap = snapshot('timeout');
+      console.warn('[RelayServer] waitForRelayWriterActivation timeout', snap);
+      cleanup({ ok: false, timeout: true, ...snap });
+    }, timeoutMs);
+  });
+}
+
+function scheduleLateWriterRecovery(options = {}) {
+  const {
+    relayKey,
+    expectedWriterKey = null,
+    publicIdentifier = null,
+    authToken = null,
+    relayUrl = null,
+    mode = 'unknown',
+    timeoutMs = LATE_WRITER_RECOVERY_TIMEOUT_MS,
+    requireWritable = true,
+    reason = 'unknown'
+  } = options;
+  if (!relayKey) return null;
+  if (lateWriterRecoveryTasks.has(relayKey)) {
+    console.log('[RelayServer] Late writer recovery already scheduled', { relayKey, reason, mode });
+    return lateWriterRecoveryTasks.get(relayKey);
+  }
+  console.log('[RelayServer] Scheduling late writer recovery', {
+    relayKey,
+    reason,
+    mode,
+    requireWritable,
+    timeoutMs,
+    expectedWriter: previewWriterKey(normalizeWriterKey(expectedWriterKey))
+  });
+
+  const waitKey = requireWritable ? null : expectedWriterKey;
+  const task = waitForRelayWriterActivation({
+    relayKey,
+    expectedWriterKey: waitKey,
+    timeoutMs,
+    reason: `${reason}-late`
+  }).then((result) => {
+    lateWriterRecoveryTasks.delete(relayKey);
+    if (result?.ok) {
+      console.log('[RelayServer] Late writer recovery succeeded', {
+        relayKey,
+        writable: result?.writable ?? null,
+        expectedWriterActive: result?.expectedWriterActive ?? null,
+        elapsedMs: result?.elapsedMs ?? null
+      });
+      if (global.sendMessage) {
+        console.log('[RelayServer] Emitting relay-writable (late recovery)', {
+          relayKey,
+          publicIdentifier,
+          mode,
+          writable: true,
+          expectedWriterActive: result?.expectedWriterActive ?? null
+        });
+        global.sendMessage({
+          type: 'relay-writable',
+          data: {
+            relayKey,
+            publicIdentifier,
+            relayUrl,
+            authToken,
+            mode,
+            writable: true,
+            expectedWriterActive: result?.expectedWriterActive ?? null
+          }
+        });
+      }
+    } else {
+      console.warn('[RelayServer] Late writer recovery timed out', {
+        relayKey,
+        writable: result?.writable ?? null,
+        expectedWriterActive: result?.expectedWriterActive ?? null,
+        elapsedMs: result?.elapsedMs ?? null
+      });
+    }
+    return result;
+  }).catch((error) => {
+    lateWriterRecoveryTasks.delete(relayKey);
+    console.warn('[RelayServer] Late writer recovery failed', {
+      relayKey,
+      error: error?.message || error
+    });
+  });
+
+  lateWriterRecoveryTasks.set(relayKey, task);
+  return task;
 }
 
 // Update health state
@@ -2569,8 +2787,18 @@ export async function startJoinAuthentication(options) {
     blindPeer = null,
     token: inviteToken = null,
     relayKey: inviteRelayKey = null,
-    relayUrl: inviteRelayUrl = null
+    relayUrl: inviteRelayUrl = null,
+    writerCore = null,
+    writerSecret = null
   } = options;
+  console.log('[RelayServer] startJoinAuthentication payload', {
+    publicIdentifier,
+    hasWriterSecret: !!writerSecret,
+    hasWriterCore: !!writerCore,
+    hostPeersCount: Array.isArray(hostPeerList) ? hostPeerList.length : 0,
+    blindPeer: !!blindPeer,
+    inviteRelayKey
+  });
   const userNsec = config.nostr_nsec_hex;
   const userPubkey = NostrUtils.getPublicKey(userNsec);
   if (config.nostr_pubkey_hex && userPubkey !== config.nostr_pubkey_hex) {
@@ -2668,14 +2896,45 @@ export async function startJoinAuthentication(options) {
     if (!challengePayload || !relayPubkey || !joinProtocol) {
       // Offline/blind-peer fallback: if we have an invite token and relay info, finalize locally without a host handshake.
       if (inviteToken && (inviteRelayKey || publicIdentifier)) {
-        const resolvedRelayKey = inviteRelayKey || (publicIdentifier ? await getRelayKeyFromPublicIdentifier(publicIdentifier) : null);
-        const fallbackRelayKey = resolvedRelayKey || publicIdentifier;
+        let resolvedRelayKey = inviteRelayKey || null;
+        if (!resolvedRelayKey && publicIdentifier) {
+          resolvedRelayKey = await getRelayKeyFromPublicIdentifier(publicIdentifier);
+        }
+        if (!resolvedRelayKey && inviteRelayUrl) {
+          try {
+            const parsed = new URL(inviteRelayUrl);
+            const parts = parsed.pathname.split('/').filter(Boolean);
+            const maybeKey = parts[0] || null;
+            if (maybeKey && /^[0-9a-fA-F]{64}$/.test(maybeKey)) {
+              resolvedRelayKey = maybeKey;
+            }
+          } catch (_) {
+            // ignore
+          }
+        }
+        if (!resolvedRelayKey) {
+          throw new Error('Missing relay key for invite fallback; cannot join relay');
+        }
+        const fallbackRelayKey = resolvedRelayKey;
         console.log('[RelayServer] Falling back to invite token path (no direct host)', {
           relayKey: fallbackRelayKey,
           publicIdentifier
         });
 
-        await joinRelayManager({ relayKey: fallbackRelayKey, config, fileSharing, publicIdentifier, authToken: inviteToken });
+        if (!writerSecret) {
+          console.warn('[RelayServer] No writerSecret provided in invite; fallback join may be read-only');
+        }
+
+        await joinRelayManager({
+          relayKey: fallbackRelayKey,
+          config,
+          fileSharing,
+          publicIdentifier,
+          authToken: inviteToken,
+          writerSecret,
+          writerCore,
+          suppressInitMessage: true
+        });
         await applyPendingAuthUpdates(updateRelayAuthToken, fallbackRelayKey, publicIdentifier);
 
         let joinedProfile = await getRelayProfileByKey(fallbackRelayKey);
@@ -2686,16 +2945,170 @@ export async function startJoinAuthentication(options) {
 
         await updateRelayAuthToken(fallbackRelayKey, userPubkey, inviteToken);
 
-        if (inviteRelayUrl && global.sendMessage) {
+        let relayManager = null;
+        try {
+          const { activeRelays } = await import('./hypertuna-relay-manager-adapter.mjs');
+          relayManager = activeRelays.get(fallbackRelayKey);
+          if (relayManager?.relay?.update) {
+            console.log('[RelayServer] Waiting for relay sync after join', {
+              relayKey: fallbackRelayKey,
+              reason: 'blind-peer-fallback'
+            });
+            try {
+              await relayManager.relay.update({ wait: true });
+            } catch (error) {
+              console.warn('[RelayServer] Relay update({ wait: true }) failed; retrying without options', {
+                relayKey: fallbackRelayKey,
+                error: error?.message || error
+              });
+              await relayManager.relay.update();
+            }
+            console.log('[RelayServer] Relay sync complete after join', {
+              relayKey: fallbackRelayKey,
+              writable: relayManager.relay?.writable ?? null,
+              activeWriters: relayManager.relay?.activeWriters?.size ?? null
+            });
+          }
+        } catch (err) {
+          console.warn('[RelayServer] Relay sync wait failed after join', {
+            relayKey: fallbackRelayKey,
+            error: err?.message || err
+          });
+        }
+
+        const relayWaitResult = await waitForRelayWriterActivation({
+          relayKey: fallbackRelayKey,
+          expectedWriterKey: writerCore,
+          timeoutMs: BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS,
+          reason: 'blind-peer-fallback'
+        });
+        console.log('[RelayServer] Blind-peer fallback writer wait result', {
+          relayKey: fallbackRelayKey,
+          ok: relayWaitResult?.ok ?? null,
+          writable: relayWaitResult?.writable ?? null,
+          expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
+          elapsedMs: relayWaitResult?.elapsedMs ?? null
+        });
+        const identifierPath = publicIdentifier
+          ? publicIdentifier.replace(':', '/')
+          : fallbackRelayKey;
+        const gatewayBase = buildGatewayWebsocketBase(config);
+        const baseUrl = `${gatewayBase}/${identifierPath}`;
+        const connectionUrl = inviteToken ? `${baseUrl}?token=${inviteToken}` : baseUrl;
+        const resolvedRelayUrl = inviteRelayUrl || connectionUrl;
+
+        if (relayWaitResult?.ok && global.sendMessage) {
+          console.log('[RelayServer] Emitting relay-writable (blind-peer fallback)', {
+            relayKey: fallbackRelayKey,
+            publicIdentifier,
+            writable: relayWaitResult?.writable ?? null,
+            expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
+          });
+          global.sendMessage({
+            type: 'relay-writable',
+            data: {
+              relayKey: fallbackRelayKey,
+              publicIdentifier,
+              relayUrl: resolvedRelayUrl,
+              authToken: inviteToken,
+              mode: 'blind-peer-offline',
+              writable: relayWaitResult?.writable ?? null,
+              expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
+            }
+          });
+        }
+        const relayWritable = relayWaitResult?.writable === true;
+        if (!relayWaitResult?.ok || !relayWaitResult?.writable) {
+          scheduleLateWriterRecovery({
+            relayKey: fallbackRelayKey,
+            expectedWriterKey: writerCore,
+            publicIdentifier,
+            authToken: inviteToken,
+            relayUrl: inviteRelayUrl,
+            mode: 'blind-peer-offline',
+            requireWritable: true,
+            reason: 'blind-peer-fallback'
+          });
+        }
+
+        // If the invite provided a writer core, add it to Autobase.
+        if (writerCore) {
+          try {
+            const { activeRelays } = await import('./hypertuna-relay-manager-adapter.mjs');
+            relayManager = relayManager || activeRelays.get(fallbackRelayKey);
+            if (relayManager) {
+              if (!relayWritable || !relayManager.relay?.writable) {
+                console.warn('[RelayServer] Skipping invite writer add (relay not writable)', {
+                  relayKey: fallbackRelayKey,
+                  relayWritable: relayManager.relay?.writable ?? null,
+                  expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
+                });
+              } else {
+              let writerHex = null;
+              try {
+                const decoded = HypercoreId.decode(String(writerCore));
+                writerHex = b4a.toString(decoded, 'hex');
+              } catch (_) {
+                if (/^[0-9a-fA-F]{64}$/.test(String(writerCore))) writerHex = String(writerCore);
+              }
+              if (writerHex && typeof relayManager.addWriter === 'function') {
+                await relayManager.addWriter(writerHex).catch((err) => {
+                  console.warn('[RelayServer] Failed to add invite writer core during fallback', err?.message || err);
+                });
+              }
+              }
+            }
+          } catch (err) {
+            console.warn('[RelayServer] Failed to add invite writer core during fallback', err?.message || err);
+          }
+        }
+
+        try {
+          const { activeRelays } = await import('./hypertuna-relay-manager-adapter.mjs');
+          relayManager = relayManager || activeRelays.get(fallbackRelayKey);
+          const writerKey = relayManager?.relay?.local?.key || relayManager?.relay?.localWriter?.core?.key || null;
+          if (relayManager && writerKey) {
+            if (!relayWritable || !relayManager.relay?.writable) {
+              console.warn('[RelayServer] Skipping local writer add (relay not writable)', {
+                relayKey: fallbackRelayKey,
+                relayWritable: relayManager.relay?.writable ?? null,
+                expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
+              });
+            } else {
+              const writerHex = b4a.toString(writerKey, 'hex');
+              console.log('[RelayServer] Adding local writer to relay during blind-peer fallback', { relayKey: fallbackRelayKey, writer: writerHex.substring(0, 8) });
+              await relayManager.addWriter(writerHex).catch((err) => {
+                console.warn('[RelayServer] Failed to add writer during blind-peer fallback', err?.message || err);
+              });
+            }
+          }
+        } catch (err) {
+          console.warn('[RelayServer] Writer bootstrap during blind-peer fallback failed', err?.message || err);
+        }
+        if (!relayWritable) {
+          console.warn('[RelayServer] Relay still not writable after blind-peer fallback; writes will remain disabled', {
+            relayKey: fallbackRelayKey
+          });
+        }
+
+        if (global.sendMessage) {
+          console.log('[RelayServer] Emitting relay-initialized (blind-peer fallback)', {
+            relayKey: fallbackRelayKey,
+            publicIdentifier,
+            writable: relayWaitResult?.writable ?? null,
+            expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
+          });
           global.sendMessage({
             type: 'relay-initialized',
             relayKey: fallbackRelayKey,
             publicIdentifier,
-            gatewayUrl: inviteRelayUrl,
-            connectionUrl: inviteRelayUrl,
+            gatewayUrl: resolvedRelayUrl,
+            connectionUrl: resolvedRelayUrl,
             alreadyActive: true,
             requiresAuth: true,
             userAuthToken: inviteToken,
+            writable: relayWaitResult?.writable ?? null,
+            expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
             timestamp: new Date().toISOString()
           });
         }
@@ -2799,7 +3212,7 @@ export async function startJoinAuthentication(options) {
     }
 
     // Join the relay locally so we have a profile and key mapping
-    await joinRelayManager({ relayKey, config, fileSharing });
+    await joinRelayManager({ relayKey, config, fileSharing, writerSecret, writerCore });
     await applyPendingAuthUpdates(updateRelayAuthToken, relayKey, finalIdentifier);
 
     // Ensure the joined relay profile has the public identifier recorded
@@ -2813,8 +3226,59 @@ export async function startJoinAuthentication(options) {
     console.log(`[RelayServer] Persisting auth token for ${userPubkey.substring(0, 8)}...`);
     await updateRelayAuthToken(relayKey, userPubkey, authToken);
 
-    // Wait for the relay to become writable before announcing membership
-    await waitForRelayWritable(relayKey);
+    // Wait for the relay to become writable or the expected writer to activate before announcing membership
+    const directWaitResult = await waitForRelayWriterActivation({
+      relayKey,
+      expectedWriterKey: writerCore,
+      timeoutMs: DIRECT_JOIN_WRITABLE_TIMEOUT_MS,
+      reason: 'direct-join'
+    });
+    console.log('[RelayServer] Direct join writer wait result', {
+      relayKey,
+      ok: directWaitResult?.ok ?? null,
+      writable: directWaitResult?.writable ?? null,
+      expectedWriterActive: directWaitResult?.expectedWriterActive ?? null,
+      elapsedMs: directWaitResult?.elapsedMs ?? null
+    });
+    if (directWaitResult?.ok && global.sendMessage) {
+      console.log('[RelayServer] Emitting relay-writable (direct join)', {
+        relayKey,
+        publicIdentifier: finalIdentifier,
+        writable: directWaitResult?.writable ?? null,
+        expectedWriterActive: directWaitResult?.expectedWriterActive ?? null
+      });
+      global.sendMessage({
+        type: 'relay-writable',
+        data: {
+          relayKey,
+          publicIdentifier: finalIdentifier,
+          relayUrl,
+          authToken,
+          mode: 'direct-join',
+          writable: directWaitResult?.writable ?? null,
+          expectedWriterActive: directWaitResult?.expectedWriterActive ?? null
+        }
+      });
+    }
+    if (!directWaitResult?.ok) {
+      console.warn('[RelayServer] Relay did not become writable before membership publish', {
+        relayKey,
+        writable: directWaitResult?.writable ?? null,
+        expectedWriterActive: directWaitResult?.expectedWriterActive ?? null
+      });
+      if (writerCore) {
+        scheduleLateWriterRecovery({
+          relayKey,
+          expectedWriterKey: writerCore,
+          publicIdentifier: finalIdentifier,
+          authToken,
+          relayUrl,
+          mode: 'direct-join',
+          requireWritable: true,
+          reason: 'direct-join'
+        });
+      }
+    }
 
     // Publish kind 9000 event to announce the new member
     console.log('[RelayServer] Publishing kind 9000 member add event...');
@@ -2842,6 +3306,45 @@ export async function startJoinAuthentication(options) {
       });
     }
   }
+}
+
+export async function provisionWriterForInvitee(options = {}) {
+  const { relayKey, publicIdentifier } = options;
+  const resolvedRelayKey = relayKey || (publicIdentifier ? await getRelayKeyFromPublicIdentifier(publicIdentifier) : null);
+  if (!resolvedRelayKey) {
+    throw new Error('relayKey or publicIdentifier is required to provision writer');
+  }
+  const { activeRelays } = await import('./hypertuna-relay-manager-adapter.mjs');
+  const relayManager = activeRelays.get(resolvedRelayKey);
+  if (!relayManager || !relayManager.relay) {
+    throw new Error('Relay manager not found for provisioning writer');
+  }
+
+  const keyPair = crypto.keyPair();
+  const writerCore = HypercoreId.encode(keyPair.publicKey);
+  const writerSecret = b4a.toString(keyPair.secretKey, 'hex');
+  const writerHex = b4a.toString(keyPair.publicKey, 'hex');
+
+  console.log('[RelayServer] Writing invite writer to relay', {
+    relayKey: resolvedRelayKey,
+    writer: writerHex.slice(0, 16),
+    writable: relayManager.relay?.writable ?? null
+  });
+  await relayManager.addWriter(writerHex);
+  console.log('[RelayServer] Invite writer add committed', {
+    relayKey: resolvedRelayKey,
+    writer: writerHex.slice(0, 16),
+    activeWriters: relayManager.relay?.activeWriters?.size ?? null,
+    viewVersion: relayManager.relay?.view?.version ?? null
+  });
+
+  console.log('[RelayServer] Provisioned writer for invitee', {
+    relayKey: resolvedRelayKey,
+    writerCore,
+    writerSecretPreview: writerSecret ? `${writerSecret.slice(0, 8)}...` : null
+  });
+
+  return { relayKey: resolvedRelayKey, writerCore, writerSecret };
 }
 
 export async function disconnectRelay(relayKey) {
