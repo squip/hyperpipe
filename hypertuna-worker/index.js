@@ -286,6 +286,7 @@ async function ensureBlindPeeringManager(runtime = {}) {
     blindPeeringManager.runtime.swarmKeyPair = swarmKeyPair
   }
 
+  global.blindPeeringManager = blindPeeringManager
   return blindPeeringManager
 }
 
@@ -2142,6 +2143,7 @@ async function handleMessageObject(message) {
         const fileSharing = data.fileSharing
         try {
           let hostPeers = Array.isArray(data.hostPeers) ? data.hostPeers : []
+          let coreRefs = []
           hostPeers = hostPeers
             .map((key) => String(key || '').trim().toLowerCase())
             .filter(Boolean)
@@ -2161,7 +2163,7 @@ async function handleMessageObject(message) {
                   corestoreId: relayCorestore?.__ht_id || null,
                   storagePath: relayCorestore?.__ht_storage_path || null
                 })
-                const coreRefs = Array.isArray(data.cores)
+                coreRefs = Array.isArray(data.cores)
                   ? data.cores
                       .map((c) => (c && c.key ? String(c.key) : null))
                       .filter(Boolean)
@@ -2245,7 +2247,8 @@ async function handleMessageObject(message) {
             ...data,
             publicIdentifier,
             fileSharing,
-            hostPeers
+            hostPeers,
+            coreRefs
           })
         } catch (err) {
           sendMessage({

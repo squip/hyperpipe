@@ -792,6 +792,17 @@ async handleSubscription(connectionKey) {
         return [[], null];
     }
 
+    const subscriptionCount = activeSubscriptions?.subscriptions
+        ? Object.keys(activeSubscriptions.subscriptions).length
+        : 0;
+    logWithTimestamp('handleSubscription: Subscription snapshot', {
+        connectionKey,
+        subscriptionCount,
+        viewVersion: this.view?.version ?? null,
+        relayVersion: this.version ?? null,
+        coreLength: this.core?.length ?? null
+    });
+
     // logWithTimestamp(`handleSubscription: Active subscriptions:`, JSON.stringify(activeSubscriptions, null, 2));
     const eventsForClient = [];
     let activeSubscriptionsUpdated = JSON.parse(JSON.stringify(activeSubscriptions));
@@ -809,6 +820,12 @@ async handleSubscription(connectionKey) {
             } else {
                 events = await this.queryEvents(filter, last_returned_event_timestamp);
             }
+
+            logWithTimestamp(`handleSubscription: Filter results for ${subscriptionId}`, {
+                eventCount: events.length,
+                newest: events[0]?.created_at ?? null,
+                oldest: events[events.length - 1]?.created_at ?? null
+            });
 
             // Sort events by created_at in descending order
             if (events.length > 0) {
@@ -846,6 +863,11 @@ async handleSubscription(connectionKey) {
     logWithTimestamp(`getSubscriptions: Attempting to retrieve subscriptions for connectionKey: ${connectionKey}`);
     const key = b4a.from(connectionKey, 'hex');
     logWithTimestamp(`getSubscriptions: Converted key: ${key.toString('hex')}`);
+    logWithTimestamp('getSubscriptions: View state', {
+      viewVersion: this.view?.version ?? null,
+      relayVersion: this.version ?? null,
+      coreLength: this.core?.length ?? null
+    });
     const subscriptionData = await this.view.get(key);
     if (subscriptionData) {
       logWithTimestamp(`getSubscriptions: Subscriptions found for connection ${connectionKey}: ${JSON.stringify(subscriptionData)}`);
@@ -881,6 +903,7 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null)
     logWithTimestamp('publishSubscription: Filters validation result:', isValid);
     
     if (isValid) {
+      const key = b4a.from(connectionKey, 'hex');
       let subscriptions = activeSubscriptions ? activeSubscriptions.subscriptions : {};
       
       // Create or update subscription with the new structure
@@ -893,11 +916,41 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null)
         connection: connectionKey,
         subscriptions: subscriptions
       };
+
+      logWithTimestamp('publishSubscription: Subscription write requested', {
+        connectionKey,
+        keyHex: key.toString('hex'),
+        filtersCount: filters.length,
+        existingCount: activeSubscriptions ? Object.keys(activeSubscriptions.subscriptions || {}).length : 0,
+        viewVersion: this.view?.version ?? null
+      });
       
       await this.append({
         type: 'subscriptions',
         subscriptions: JSON.stringify(subscriptionObject)
       });
+
+      const stored = await this.view.get(key);
+      if (stored) {
+        let storedCount = null;
+        try {
+          const parsed = typeof stored.value === 'string' ? JSON.parse(stored.value) : stored.value;
+          storedCount = parsed?.subscriptions ? Object.keys(parsed.subscriptions).length : 0;
+        } catch (error) {
+          logWithTimestamp('publishSubscription: Error parsing stored subscription snapshot', error.message);
+        }
+        logWithTimestamp('publishSubscription: Stored subscription snapshot', {
+          connectionKey,
+          storedCount,
+          storedBytes: typeof stored.value === 'string' ? stored.value.length : stored.value?.length ?? null,
+          viewVersion: this.view?.version ?? null
+        });
+      } else {
+        logWithTimestamp('publishSubscription: Storage verification failed (no record)', {
+          connectionKey,
+          viewVersion: this.view?.version ?? null
+        });
+      }
       
       logWithTimestamp(`publishSubscription: Published subscription for connection: ${connectionKey}, subscriptionId: ${subscriptionId}`);
       return ['NOTICE', `Subscription ${subscriptionId} created/updated successfully`];
@@ -920,6 +973,29 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null)
       subscriptions: JSON.stringify(activeSubscriptionsUpdated)
     });
     
+    const key = b4a.from(connectionKey, 'hex');
+    const stored = await this.view.get(key);
+    if (stored) {
+      let storedCount = null;
+      try {
+        const parsed = typeof stored.value === 'string' ? JSON.parse(stored.value) : stored.value;
+        storedCount = parsed?.subscriptions ? Object.keys(parsed.subscriptions).length : 0;
+      } catch (error) {
+        logWithTimestamp('updateSubscriptions: Error parsing stored subscription snapshot', error.message);
+      }
+      logWithTimestamp('updateSubscriptions: Stored subscription snapshot', {
+        connectionKey,
+        storedCount,
+        storedBytes: typeof stored.value === 'string' ? stored.value.length : stored.value?.length ?? null,
+        viewVersion: this.view?.version ?? null
+      });
+    } else {
+      logWithTimestamp('updateSubscriptions: Storage verification failed (no record)', {
+        connectionKey,
+        viewVersion: this.view?.version ?? null
+      });
+    }
+
     logWithTimestamp(`updateSubscriptions: Updated subscriptions for connection: ${connectionKey}`);
     return ['NOTICE', 'Subscriptions updated successfully'];
   }

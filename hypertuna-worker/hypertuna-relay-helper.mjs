@@ -2,6 +2,7 @@
 import Autobase from 'autobase';
 import b4a from 'b4a';
 import Hyperbee from 'hyperbee';
+import safetyCatch from 'safety-catch';
 
 export default class Autobee extends Autobase {
   constructor (store, bootstrap, handlers = {}) {
@@ -26,7 +27,8 @@ export default class Autobee extends Autobase {
         if (!this.subscriptions) {
           this.subscriptions = new Map();
         }
-  
+
+        this._bumpDiagnosticsLogged = false;
         this.cleanupInterval = setInterval(() => this.cleanupSubscriptions(), 5 * 60 * 1000);
       } catch (error) {
         console.error('Error initializing Autobee:', error);
@@ -95,10 +97,26 @@ export default class Autobee extends Autobase {
     return encKey
   }
 
+  _queueBump () {
+    const bumpResult = this._bump?.();
+    const isThenable = bumpResult && typeof bumpResult.catch === 'function';
+
+    if (!isThenable && !this._bumpDiagnosticsLogged) {
+      console.warn('[Autobee] _queueBump received non-promise bump result', {
+        hasBump: typeof this._bump === 'function',
+        bumpType: typeof bumpResult
+      });
+      this._bumpDiagnosticsLogged = true;
+    }
+
+    const bumpPromise = isThenable ? bumpResult : Promise.resolve(bumpResult);
+    bumpPromise.catch(safetyCatch);
+    return bumpPromise;
+  }
+
   async append(value) {
     try {
-      await super.append(value);
-      return this._bump(); // Ensure we return the Promise from _bump()
+      return await super.append(value);
     } catch (error) {
       console.error('Error in append operation:', error);
       throw error;

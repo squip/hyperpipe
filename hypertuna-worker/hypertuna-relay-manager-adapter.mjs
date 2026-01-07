@@ -31,6 +31,7 @@ import { normalizeRelayIdentifier } from './relay-identifier-utils.mjs';
 // Store active relay managers
 const activeRelays = new Map();
 const virtualRelayKeys = new Set();
+const AUTO_CONNECT_REHYDRATION_TIMEOUT_MS = 60000;
 
 // Store relay members keyed by relay key or public identifier
 const relayMembers = new Map();
@@ -73,6 +74,76 @@ function parseRelayMetadataEvent(event) {
     }
 
     return metadata;
+}
+
+function decodeWriterKey(value) {
+    if (!value) return null;
+    if (Buffer.isBuffer(value)) return value;
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (!trimmed) return null;
+        try {
+            return HypercoreId.decode(trimmed);
+        } catch (_) {
+            if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+                return Buffer.from(trimmed, 'hex');
+            }
+        }
+    }
+    return null;
+}
+
+function normalizeCoreRefs(coreRefs) {
+    if (!Array.isArray(coreRefs)) return [];
+    const normalized = [];
+    for (const ref of coreRefs) {
+        if (!ref) continue;
+        const trimmed = String(ref).trim();
+        if (trimmed) normalized.push(trimmed);
+    }
+    return normalized;
+}
+
+function sanitizeBlindPeerMeta(blindPeer) {
+    if (!blindPeer || typeof blindPeer !== 'object') return null;
+    const entry = {};
+    if (blindPeer.publicKey) entry.publicKey = String(blindPeer.publicKey);
+    if (blindPeer.encryptionKey) entry.encryptionKey = String(blindPeer.encryptionKey);
+    if (blindPeer.replicationTopic) entry.replicationTopic = String(blindPeer.replicationTopic);
+    if (Number.isFinite(blindPeer.maxBytes)) entry.maxBytes = blindPeer.maxBytes;
+    return Object.keys(entry).length ? entry : null;
+}
+
+function applyJoinMetadata(profile, {
+    writerSecret = null,
+    writerCore = null,
+    expectedWriterKey = null,
+    relayManager = null,
+    blindPeer = null,
+    coreRefs = null
+} = {}) {
+    const updated = { ...profile };
+    const localKeyHex = relayManager?.relay?.local?.key
+        ? b4a.toString(relayManager.relay.local.key, 'hex')
+        : null;
+    const expectedHexFull = expectedWriterKey
+        ? b4a.toString(expectedWriterKey, 'hex')
+        : null;
+    const normalizedRefs = normalizeCoreRefs(coreRefs);
+    const blindPeerMeta = sanitizeBlindPeerMeta(blindPeer);
+
+    if (writerSecret) updated.writer_secret = writerSecret;
+    if (writerCore) updated.writer_core = writerCore;
+    if (!writerCore && expectedHexFull) updated.writer_core_hex = expectedHexFull;
+    if (localKeyHex) updated.autobase_local = localKeyHex;
+    if (blindPeerMeta) updated.blind_peer = blindPeerMeta;
+    if (normalizedRefs.length) updated.core_refs = normalizedRefs;
+
+    if (writerSecret || writerCore || expectedHexFull || localKeyHex || blindPeerMeta || normalizedRefs.length) {
+        updated.updated_at = new Date().toISOString();
+    }
+
+    return updated;
 }
 
 export async function getRelayMetadata(relayKey, publicIdentifier = null) {
@@ -466,6 +537,9 @@ export async function joinRelay(options = {}) {
         fromAutoConnect = false,
         writerSecret = null,
         writerCore = null,
+        expectedWriterKey: expectedWriterOverride = null,
+        blindPeer = null,
+        coreRefs = null,
         suppressInitMessage = false,
         useSharedCorestore = false,
         corestore = null
@@ -565,6 +639,22 @@ export async function joinRelay(options = {}) {
         }
     } else {
         console.log('[RelayAdapter] No writerSecret supplied for joinRelay', { relayKey, publicIdentifier });
+    }
+
+    if (!expectedWriterKey && expectedWriterOverride) {
+        const decodedExpected = decodeWriterKey(expectedWriterOverride);
+        if (decodedExpected) {
+            expectedWriterKey = decodedExpected;
+            expectedWriterHex = b4a.toString(expectedWriterKey, 'hex');
+            console.log('[RelayAdapter] Using stored expected writer key', {
+                relayKey,
+                expectedWriterHex: expectedWriterHex.slice(0, 16)
+            });
+        } else {
+            console.warn('[RelayAdapter] Failed to decode stored expected writer key', {
+                relayKey
+            });
+        }
     }
 
     try {
@@ -680,6 +770,23 @@ export async function joinRelay(options = {}) {
                 is_active: true
             };
 
+            profileInfo = applyJoinMetadata(profileInfo, {
+                writerSecret,
+                writerCore,
+                expectedWriterKey,
+                relayManager,
+                blindPeer,
+                coreRefs
+            });
+            console.log('[RelayAdapter] Stored join metadata for new relay profile', {
+                relayKey,
+                hasWriterSecret: !!writerSecret,
+                hasWriterCore: !!writerCore,
+                hasBlindPeer: !!blindPeer,
+                coreRefsCount: Array.isArray(coreRefs) ? coreRefs.length : 0,
+                autobaseLocal: profileInfo.autobase_local ? profileInfo.autobase_local.slice(0, 16) : null
+            });
+
             await saveRelayProfile(profileInfo);
         } else {
             // Update existing profile
@@ -691,6 +798,23 @@ export async function joinRelay(options = {}) {
             if (publicIdentifier && !profileInfo.public_identifier) {
                 profileInfo.public_identifier = publicIdentifier;
             }
+
+            profileInfo = applyJoinMetadata(profileInfo, {
+                writerSecret,
+                writerCore,
+                expectedWriterKey,
+                relayManager,
+                blindPeer,
+                coreRefs
+            });
+            console.log('[RelayAdapter] Stored join metadata for existing relay profile', {
+                relayKey,
+                hasWriterSecret: !!writerSecret,
+                hasWriterCore: !!writerCore,
+                hasBlindPeer: !!blindPeer,
+                coreRefsCount: Array.isArray(coreRefs) ? coreRefs.length : 0,
+                autobaseLocal: profileInfo.autobase_local ? profileInfo.autobase_local.slice(0, 16) : null
+            });
 
             await saveRelayProfile(profileInfo);
         }
@@ -1055,13 +1179,90 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
             );
         }
 
+        const storedWriterSecret = profile.writer_secret || profile.writerSecret || null;
+        const storedWriterCore =
+            profile.writer_core ||
+            profile.writerCore ||
+            profile.writer_core_hex ||
+            profile.autobase_local ||
+            null;
+        const storedExpectedWriter =
+            profile.autobase_local ||
+            profile.writer_core_hex ||
+            profile.writer_core ||
+            null;
+        const storedBlindPeer = profile.blind_peer || profile.blindPeer || null;
+        const storedCoreRefs = normalizeCoreRefs(profile.core_refs || profile.coreRefs);
+
+        let relayCorestore = null;
+        if (storedBlindPeer && storedCoreRefs.length) {
+            relayCorestore = getRelayCorestore(relayKey, { storageBase: config?.storage || null });
+            const manager = global.blindPeeringManager || null;
+            if (manager?.started) {
+                console.log('[RelayAdapter] Auto-connect: prefetching relay cores from blind-peer mirror', {
+                    relayKey,
+                    publicIdentifier,
+                    coreRefsCount: storedCoreRefs.length,
+                    mirrorKey: storedBlindPeer?.publicKey ? String(storedBlindPeer.publicKey).slice(0, 16) : null
+                });
+                if (storedBlindPeer?.publicKey) {
+                    manager.markTrustedMirrors([String(storedBlindPeer.publicKey)]);
+                }
+                manager.ensureRelayMirror({
+                    relayKey,
+                    publicIdentifier,
+                    coreRefs: storedCoreRefs,
+                    corestore: relayCorestore
+                });
+                await manager.refreshFromBlindPeers('auto-connect');
+                if (typeof manager.primeRelayCoreRefs === 'function' && storedCoreRefs.length) {
+                    const primeSummary = await manager.primeRelayCoreRefs({
+                        relayKey,
+                        publicIdentifier,
+                        coreRefs: storedCoreRefs,
+                        timeoutMs: AUTO_CONNECT_REHYDRATION_TIMEOUT_MS,
+                        reason: 'auto-connect',
+                        corestore: relayCorestore
+                    });
+                    console.log('[RelayAdapter] Auto-connect: core prefetch completed', {
+                        relayKey,
+                        status: primeSummary?.status ?? null,
+                        synced: primeSummary?.synced ?? null,
+                        failed: primeSummary?.failed ?? null,
+                        connected: primeSummary?.connected ?? null
+                    });
+                }
+                const rehydrateSummary = await manager.rehydrateMirrors({
+                    reason: 'auto-connect',
+                    timeoutMs: AUTO_CONNECT_REHYDRATION_TIMEOUT_MS
+                });
+                console.log('[RelayAdapter] Auto-connect: rehydration completed', {
+                    relayKey,
+                    status: rehydrateSummary?.status ?? null,
+                    synced: rehydrateSummary?.synced ?? null,
+                    failed: rehydrateSummary?.failed ?? null
+                });
+            } else {
+                console.warn('[RelayAdapter] Auto-connect: blind-peering manager unavailable; skipping mirror rehydration', {
+                    relayKey
+                });
+            }
+        }
+
         const joinResult = await joinRelay({
             relayKey,
             name: profile.name,
             description: profile.description,
             storageDir: profile.relay_storage,
             config,
-            fromAutoConnect: true
+            fromAutoConnect: true,
+            writerSecret: storedWriterSecret,
+            writerCore: storedWriterCore,
+            expectedWriterKey: storedExpectedWriter,
+            blindPeer: storedBlindPeer,
+            coreRefs: storedCoreRefs,
+            useSharedCorestore: !!relayCorestore,
+            corestore: relayCorestore
         });
 
         if (!joinResult.success) {

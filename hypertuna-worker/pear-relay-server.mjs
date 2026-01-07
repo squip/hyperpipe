@@ -2789,12 +2789,14 @@ export async function startJoinAuthentication(options) {
     relayKey: inviteRelayKey = null,
     relayUrl: inviteRelayUrl = null,
     writerCore = null,
-    writerSecret = null
+    writerSecret = null,
+    coreRefs = []
   } = options;
   console.log('[RelayServer] startJoinAuthentication payload', {
     publicIdentifier,
     hasWriterSecret: !!writerSecret,
     hasWriterCore: !!writerCore,
+    coreRefsCount: Array.isArray(coreRefs) ? coreRefs.length : 0,
     hostPeersCount: Array.isArray(hostPeerList) ? hostPeerList.length : 0,
     blindPeer: !!blindPeer,
     inviteRelayKey
@@ -2933,6 +2935,8 @@ export async function startJoinAuthentication(options) {
           authToken: inviteToken,
           writerSecret,
           writerCore,
+          blindPeer,
+          coreRefs,
           suppressInitMessage: true,
           useSharedCorestore: true
         });
