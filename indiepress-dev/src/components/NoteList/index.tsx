@@ -41,6 +41,7 @@ const NoteList = forwardRef(
       hideUntrustedNotes = false,
       showRelayCloseReason = false,
       debugActiveTab,
+      debugLabel,
       sinceTimestamp,
       onNotesLoaded,
       pinnedEventIds,
@@ -54,6 +55,7 @@ const NoteList = forwardRef(
       hideUntrustedNotes?: boolean
       showRelayCloseReason?: boolean
       debugActiveTab?: string
+      debugLabel?: string
       sinceTimestamp?: number
       onNotesLoaded?: (count: number, hasPosts: boolean, hasReplies: boolean) => void
       pinnedEventIds?: string[]
@@ -78,6 +80,11 @@ const NoteList = forwardRef(
     const bottomRef = useRef<HTMLDivElement | null>(null)
     const topRef = useRef<HTMLDivElement | null>(null)
     const hasLoggedMount = useRef(false)
+    const effectIdRef = useRef(0)
+    const prevSnapshotRef = useRef<Record<string, unknown> | null>(null)
+    const resubscribeTimerRef = useRef<number | null>(null)
+    const resubscribeAttemptRef = useRef(0)
+    const softResubscribeRef = useRef(false)
 
     const shouldHideEvent = useCallback(
       (evt: Event) => {
@@ -183,27 +190,118 @@ const NoteList = forwardRef(
       const activeTab = debugActiveTab ?? 'unknown'
       if (!hasLoggedMount.current) {
         console.info('[NoteList] mount', {
+          label: debugLabel ?? null,
           activeTab,
           subRequests: subRequests.length
         })
         hasLoggedMount.current = true
       }
-      console.info('[NoteList] subscribe effect', {
+      if (debugLabel || debugActiveTab) {
+        console.info('[NoteList] activeTab change', {
+          label: debugLabel ?? null,
+          activeTab
+        })
+      }
+    }, [debugActiveTab, debugLabel, subRequests.length])
+
+    useEffect(() => {
+      const effectId = ++effectIdRef.current
+      const activeTab = debugActiveTab ?? 'unknown'
+      const subRequestsSignature = JSON.stringify(
+        subRequests.map((req) => {
+          if (req.source === 'local') {
+            return { source: 'local', filterKeys: Object.keys(req.filter ?? {}) }
+          }
+          const hTag = Array.isArray(req.filter?.['#h']) ? req.filter['#h'][0] : undefined
+          return {
+            source: 'relays',
+            urls: req.urls,
+            filterKeys: Object.keys(req.filter ?? {}),
+            kindsCount: Array.isArray(req.filter?.kinds) ? req.filter.kinds.length : 0,
+            hTag: hTag ? String(hTag).slice(0, 32) : null
+          }
+        })
+      )
+      const snapshot = {
+        effectId,
+        label: debugLabel ?? null,
         activeTab,
-        subRequests: subRequests.length,
-        showKinds: showKinds.length
+        subRequestsCount: subRequests.length,
+        subRequestsSignature,
+        showKindsKey: showKinds.join(','),
+        refreshCount,
+        sinceTimestamp: sinceTimestamp ?? null,
+        isFilteredView
+      }
+      const prev = prevSnapshotRef.current
+      const changes =
+        prev === null
+          ? ['initial']
+          : Object.keys(snapshot).filter(
+              (key) => (snapshot as Record<string, unknown>)[key] !== prev[key]
+            )
+      prevSnapshotRef.current = snapshot
+
+      console.info('[NoteList] subscribe effect', {
+        ...snapshot,
+        changes
       })
+
+      const softResubscribe = softResubscribeRef.current
+      if (!softResubscribe) {
+        resubscribeAttemptRef.current = 0
+      }
+      softResubscribeRef.current = false
       if (!subRequests.length) return
 
-      setLoading(true)
-      setEvents([])
-      setNewEvents([])
-      setHasMore(true)
+      if (!softResubscribe) {
+        setLoading(true)
+        setEvents([])
+        setNewEvents([])
+        setHasMore(true)
+      } else {
+        setLoading(true)
+      }
 
       if (showKinds.length === 0) {
         setLoading(false)
         setHasMore(false)
         return () => {}
+      }
+
+      const groupRelayUrls = new Set(
+        subRequests
+          .filter(
+            (
+              req
+            ): req is Extract<TFeedSubRequest, { source: 'relays' }> => {
+              if (req.source !== 'relays') return false
+              const hTags = (req.filter as { ['#h']?: string[] })?.['#h']
+              return Array.isArray(hTags) && hTags.length > 0
+            }
+          )
+          .flatMap((req) => req.urls)
+      )
+      const canResubscribe = groupRelayUrls.size > 0
+
+      const scheduleResubscribe = (url: string, reason: string) => {
+        if (!canResubscribe || !groupRelayUrls.has(url)) return
+        if (resubscribeTimerRef.current !== null) return
+        resubscribeAttemptRef.current += 1
+        const attempt = resubscribeAttemptRef.current
+        const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 15000)
+        softResubscribeRef.current = true
+        console.info('[NoteList] resubscribe scheduled', {
+          label: debugLabel ?? null,
+          url,
+          reason,
+          attempt,
+          delayMs
+        })
+        resubscribeTimerRef.current = window.setTimeout(() => {
+          resubscribeTimerRef.current = null
+          setRefreshCount((curr) => curr + 1)
+        }, delayMs)
       }
 
       const subc = client.subscribeTimeline(
@@ -278,6 +376,9 @@ const NoteList = forwardRef(
             })
           }, 1800),
           onClose(url, reason) {
+            if (reason === 'relay connection closed') {
+              scheduleResubscribe(url, reason)
+            }
             if (!showRelayCloseReason) return
             // ignore reasons from @nostr/tools
             if (
@@ -300,7 +401,19 @@ const NoteList = forwardRef(
         }
       )
 
-      return () => subc.close()
+      return () => {
+        if (resubscribeTimerRef.current !== null) {
+          clearTimeout(resubscribeTimerRef.current)
+          resubscribeTimerRef.current = null
+        }
+        console.info('[NoteList] subscribe cleanup', {
+          effectId,
+          label: debugLabel ?? null,
+          activeTab,
+          subRequestsCount: subRequests.length
+        })
+        subc.close(`NoteList cleanup effectId=${effectId}`)
+      }
     }, [subRequests, refreshCount, showKinds])
 
     const loadMore = useCallback(async () => {

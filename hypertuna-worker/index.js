@@ -79,6 +79,8 @@ global.userConfig = {
 const relayMirrorSubscriptions = new Map()
 let lastBlindPeerFingerprint = null
 let lastDispatcherAssignmentFingerprint = null
+let pendingRelayRegistryRefresh = false
+let gatewayWasRunning = false
 
 function getGatewayWebsocketProtocol(config) {
   return config?.proxy_websocket_protocol === 'ws' ? 'ws' : 'wss'
@@ -246,6 +248,56 @@ async function syncGatewayPeerMetadata(reason = 'unspecified', options = {}) {
   }
 }
 
+async function refreshGatewayRelayRegistry(reason = 'gateway-refresh', options = {}) {
+  const reasonText = typeof reason === 'string' ? reason : 'unspecified'
+  const triggerCategory = reasonText.includes('gateway')
+    ? 'gateway-restart'
+    : (reasonText.includes('relay-writable') || reasonText.includes('relay-joined'))
+      ? 'join-flow'
+      : 'other'
+  const triggerDetail = reasonText.includes('direct-join')
+    ? 'direct-join'
+    : reasonText.includes('blind-peer')
+      ? 'blind-peer'
+      : triggerCategory
+
+  console.log('[Worker] refreshGatewayRelayRegistry triggered', {
+    reason: reasonText,
+    category: triggerCategory,
+    detail: triggerDetail
+  })
+
+  if (!relayServer?.getActiveRelays) {
+    pendingRelayRegistryRefresh = true
+    console.warn('[Worker] Gateway relay registry refresh deferred (relay server not ready)', { reason })
+    return
+  }
+
+  try {
+    const { relays: precomputedRelays } = options || {}
+    const relays = Array.isArray(precomputedRelays)
+      ? precomputedRelays
+      : await relayServer.getActiveRelays()
+    const relaysAuth = await addAuthInfoToRelays(relays)
+
+    await syncGatewayPeerMetadata(reason, { relays: relaysAuth })
+
+    sendMessage({
+      type: 'relay-update',
+      relays: addMembersToRelays(relaysAuth)
+    })
+
+    pendingRelayRegistryRefresh = false
+    console.log('[Worker] Refreshed gateway relay registry', {
+      reason,
+      relayCount: relaysAuth.length
+    })
+  } catch (error) {
+    pendingRelayRegistryRefresh = true
+    console.warn('[Worker] Gateway relay registry refresh failed:', error?.message || error)
+  }
+}
+
 async function ensurePublicGatewaySettingsLoaded() {
   if (publicGatewaySettings) return publicGatewaySettings
   try {
@@ -401,10 +453,12 @@ async function startGatewayService(options = {}) {
         publicGatewayStatusCache = status.publicGateway
       }
       sendMessage({ type: 'gateway-status', status })
+      const wasRunning = gatewayWasRunning
+      gatewayWasRunning = !!status?.running
       if (status?.running) {
-        if (pendingGatewayMetadataSync) {
-          syncGatewayPeerMetadata('gateway-status-running').catch((err) => {
-            console.warn('[Worker] Deferred gateway metadata sync failed on status:', err?.message || err)
+        if (pendingGatewayMetadataSync || pendingRelayRegistryRefresh || !wasRunning) {
+          refreshGatewayRelayRegistry(wasRunning ? 'gateway-status-running' : 'gateway-restarted').catch((err) => {
+            console.warn('[Worker] Deferred gateway registry refresh failed on status:', err?.message || err)
           })
         }
         const { httpUrl, proxyHost, wsProtocol } = deriveGatewayHostFromStatus(status)
@@ -527,8 +581,8 @@ async function startGatewayService(options = {}) {
       }
     })
     if (pendingGatewayMetadataSync) {
-      syncGatewayPeerMetadata('gateway-service-initialized').catch((err) => {
-        console.warn('[Worker] Deferred gateway metadata sync failed:', err?.message || err)
+      refreshGatewayRelayRegistry('gateway-service-initialized').catch((err) => {
+        console.warn('[Worker] Deferred gateway registry refresh failed:', err?.message || err)
       })
     }
   }
@@ -576,11 +630,9 @@ async function startGatewayService(options = {}) {
       corestore: getCorestore(),
       wakeup: null
     })
-    if (pendingGatewayMetadataSync) {
-      syncGatewayPeerMetadata('gateway-started').catch((err) => {
-        console.warn('[Worker] Deferred gateway metadata sync failed after start:', err?.message || err)
-      })
-    }
+    refreshGatewayRelayRegistry('gateway-started').catch((err) => {
+      console.warn('[Worker] Gateway registry refresh failed after start:', err?.message || err)
+    })
   } catch (error) {
     console.error('[Worker] Failed to start gateway service:', error)
     throw error
@@ -1660,6 +1712,17 @@ function startHealthLogger(intervalMs = 60000) {
 // Make pipe and sendMessage globally available for the relay server
 global.workerPipe = workerPipe
 global.sendMessage = sendMessage
+global.onRelayWritable = (payload = {}) => {
+  const mode = payload?.mode ? String(payload.mode) : 'unknown'
+  console.log('[Worker] Relay writable received; refreshing gateway registry', {
+    mode,
+    relayKey: payload?.relayKey || null,
+    publicIdentifier: payload?.publicIdentifier || null
+  })
+  refreshGatewayRelayRegistry(`relay-writable-${mode}`).catch((err) => {
+    console.warn('[Worker] Gateway registry refresh failed after relay-writable:', err?.message || err)
+  })
+}
 
 async function handleMessageObject(message) {
   if (message == null) return
@@ -2015,8 +2078,8 @@ async function handleMessageObject(message) {
           }
 
           const relays = await relayServer.getActiveRelays()
-          await syncGatewayPeerMetadata('relay-created', { relays })
           const relaysAuth = await addAuthInfoToRelays(relays)
+          await syncGatewayPeerMetadata('relay-created', { relays: relaysAuth })
           console.log('[Worker][relay-update][relay-created] sending', relaysAuth.map(r => ({
             relayKey: r.relayKey,
             publicIdentifier: r.publicIdentifier,
@@ -2060,8 +2123,8 @@ async function handleMessageObject(message) {
           })
 
           const relays = await relayServer.getActiveRelays()
-          await syncGatewayPeerMetadata('relay-joined', { relays })
           const relaysAuth = await addAuthInfoToRelays(relays)
+          await syncGatewayPeerMetadata('relay-joined', { relays: relaysAuth })
           console.log('[Worker][relay-update][relay-joined] sending', relaysAuth.map(r => ({
             relayKey: r.relayKey,
             publicIdentifier: r.publicIdentifier,
@@ -2116,8 +2179,8 @@ async function handleMessageObject(message) {
           })
 
           const relays = await relayServer.getActiveRelays()
-          await syncGatewayPeerMetadata('relay-disconnected', { relays })
           const relaysAuth = await addAuthInfoToRelays(relays)
+          await syncGatewayPeerMetadata('relay-disconnected', { relays: relaysAuth })
           sendMessage({
             type: 'relay-update',
             relays: addMembersToRelays(relaysAuth)
@@ -2711,8 +2774,8 @@ async function main() {
     await initializePfpHyperdrive(pfpConfig);
     config.pfpDriveKey = pfpConfig.pfpDriveKey;
     if (config.pfpDriveKey) {
-      syncGatewayPeerMetadata('pfp-drive-ready').catch((err) => {
-        console.warn('[Worker] Gateway metadata sync failed (pfp-drive-ready):', err?.message || err)
+      refreshGatewayRelayRegistry('pfp-drive-ready').catch((err) => {
+        console.warn('[Worker] Gateway registry refresh failed (pfp-drive-ready):', err?.message || err)
       })
     }
 
@@ -2781,6 +2844,12 @@ async function main() {
       
       console.log('[Worker] Relay server base initialization complete')
 
+      if (pendingRelayRegistryRefresh) {
+        refreshGatewayRelayRegistry('relay-server-ready').catch((err) => {
+          console.warn('[Worker] Deferred gateway registry refresh failed after relay server init:', err?.message || err)
+        })
+      }
+
       const derivedSwarmKey = deriveSwarmPublicKey(config)
       if (derivedSwarmKey) {
         config.swarmPublicKey = derivedSwarmKey
@@ -2843,7 +2912,7 @@ async function main() {
           userAuthToken: r.userAuthToken,
           requiresAuth: r.requiresAuth
         })))
-        await syncGatewayPeerMetadata('auto-connect-complete', { relays: relaysSnapshot })
+        await syncGatewayPeerMetadata('auto-connect-complete', { relays: relaysAuth })
         sendMessage({
           type: 'relay-update',
           relays: addMembersToRelays(relaysAuth)

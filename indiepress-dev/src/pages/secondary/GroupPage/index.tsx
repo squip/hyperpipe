@@ -601,32 +601,62 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     return effectiveGroupRelay ? resolveRelayUrl(effectiveGroupRelay) : undefined
   }, [effectiveGroupRelay, resolveRelayUrl])
 
+  const [pinnedGroupRelay, setPinnedGroupRelay] = useState<string | null>(null)
+
+  useEffect(() => {
+    setPinnedGroupRelay(null)
+  }, [groupKey])
+
+  const isTokenizedRelayUrl = (relay?: string) => {
+    if (!relay) return false
+    try {
+      const parsed = new URL(relay)
+      return parsed.searchParams.has('token')
+    } catch (_err) {
+      return /[?&]token=/.test(relay)
+    }
+  }
+
+  const tokenizedResolvedGroupRelay = useMemo(() => {
+    return isTokenizedRelayUrl(resolvedGroupRelay) ? resolvedGroupRelay : undefined
+  }, [resolvedGroupRelay])
+
+  useEffect(() => {
+    if (!tokenizedResolvedGroupRelay) return
+    setPinnedGroupRelay((prev) =>
+      prev === tokenizedResolvedGroupRelay ? prev : tokenizedResolvedGroupRelay
+    )
+  }, [tokenizedResolvedGroupRelay])
+
+  const activeGroupRelay = pinnedGroupRelay || tokenizedResolvedGroupRelay
+  const shouldGateGroupSubRequests = Boolean(groupId && effectiveGroupRelay && !activeGroupRelay)
+
   const groupSubRequests = useMemo(
     () =>
       groupId
-        ? [
-            {
-              source: 'relays' as const,
-              urls: resolvedGroupRelay
-                ? [resolvedGroupRelay]
-                : effectiveGroupRelay
-                  ? [effectiveGroupRelay]
+        ? shouldGateGroupSubRequests
+          ? []
+          : [
+              {
+                source: 'relays' as const,
+                urls: activeGroupRelay
+                  ? [activeGroupRelay]
                   : BIG_RELAY_URLS,
-              filter: {
-                '#h': [groupId],
-                kinds: [
-                  // Core group metadata / membership / admin
-                  39000, 39001, 39002, 39003,
-                  // Hypertuna/NIP-29 flows
-                  9000, 9001, 9002, 9005, 9007, 9008, 9009, 9021, 9022,
-                  // Timeline kinds (retain existing set)
-                  1, 6, 20, 21, 22, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089
-                ]
+                filter: {
+                  '#h': [groupId],
+                  kinds: [
+                    // Core group metadata / membership / admin
+                    39000, 39001, 39002, 39003,
+                    // Hypertuna/NIP-29 flows
+                    9000, 9001, 9002, 9005, 9007, 9008, 9009, 9021, 9022,
+                    // Timeline kinds (retain existing set)
+                    1, 6, 20, 21, 22, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089
+                  ]
+                }
               }
-            }
-          ]
+            ]
         : [],
-    [groupId, effectiveGroupRelay, resolvedGroupRelay, joinRelayRefreshNonce]
+    [groupId, activeGroupRelay, shouldGateGroupSubRequests, joinRelayRefreshNonce]
   )
 
   useEffect(() => {
@@ -636,12 +666,34 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       groupId,
       groupRelay,
       effectiveGroupRelay,
-      resolvedGroupRelay
+      resolvedGroupRelay,
+      tokenizedGroupRelay: tokenizedResolvedGroupRelay,
+      pinnedGroupRelay: pinnedGroupRelay,
+      activeGroupRelay,
+      gateSubRequests: shouldGateGroupSubRequests
     })
+    if (shouldGateGroupSubRequests) {
+      console.info('[GroupPage] subRequests gated (awaiting tokenized relay)', {
+        groupId,
+        effectiveGroupRelay,
+        resolvedGroupRelay
+      })
+    }
     if (groupSubRequests.length) {
       console.info('[GroupPage] subRequests', groupSubRequests)
     }
-  }, [groupId, groupRelay, effectiveGroupRelay, id, resolvedGroupRelay, groupSubRequests])
+  }, [
+    groupId,
+    groupRelay,
+    effectiveGroupRelay,
+    id,
+    resolvedGroupRelay,
+    tokenizedResolvedGroupRelay,
+    pinnedGroupRelay,
+    activeGroupRelay,
+    shouldGateGroupSubRequests,
+    groupSubRequests
+  ])
 
   const isHypertunaGroup = useMemo(() => {
     const tags = detail?.metadata?.event?.tags
@@ -1313,6 +1365,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                 subRequests={groupSubRequests}
                 isMainFeed={false}
                 debugActiveTab={activeTab}
+                debugLabel={groupId ? `GroupPage:${groupId}` : 'GroupPage:unknown'}
               />
             </TabsContent>
             <TabsContent value="members" className="mt-0">

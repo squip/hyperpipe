@@ -47,7 +47,9 @@ const GroupedNoteList = forwardRef(
       showRelayCloseReason = false,
       onNotesLoaded,
       userFilter = '',
-      filterFn
+      filterFn,
+      debugActiveTab,
+      debugLabel
     }: {
       subRequests: TFeedSubRequest[]
       showKinds: number[]
@@ -61,6 +63,8 @@ const GroupedNoteList = forwardRef(
       ) => void
       userFilter?: string
       filterFn?: (event: Event) => boolean
+      debugActiveTab?: string
+      debugLabel?: string
     },
     ref
   ) => {
@@ -80,6 +84,13 @@ const GroupedNoteList = forwardRef(
     const [matchingPubkeys, setMatchingPubkeys] = useState<Set<string> | null>(null)
     const supportTouch = useMemo(() => isTouchDevice(), [])
     const topRef = useRef<HTMLDivElement | null>(null)
+    const hasLoggedMount = useRef(false)
+    const effectIdRef = useRef(0)
+    const prevSnapshotRef = useRef<Record<string, unknown> | null>(null)
+    const settingsIdentityRef = useRef(settings)
+    const resubscribeTimerRef = useRef<number | null>(null)
+    const resubscribeAttemptRef = useRef(0)
+    const softResubscribeRef = useRef(false)
     const { getPinBuryState } = usePinBury()
 
     const [{ noteGroups, hasNoResults }, setNoteGroups] = useState<{
@@ -300,11 +311,89 @@ const GroupedNoteList = forwardRef(
     useImperativeHandle(ref, () => ({ scrollToTop, refresh }), [])
 
     useEffect(() => {
+      if (hasLoggedMount.current) return
+      console.info('[GroupedNoteList] mount', {
+        label: debugLabel ?? null,
+        activeTab: debugActiveTab ?? null,
+        subRequests: subRequests.length
+      })
+      hasLoggedMount.current = true
+    }, [debugActiveTab, subRequests.length])
+
+    useEffect(() => {
+      if (!debugLabel && !debugActiveTab) return
+      console.info('[GroupedNoteList] activeTab change', {
+        label: debugLabel ?? null,
+        activeTab: debugActiveTab ?? null
+      })
+    }, [debugLabel, debugActiveTab])
+
+    useEffect(() => {
+      const effectId = ++effectIdRef.current
+      const subRequestsSignature = JSON.stringify(
+        subRequests.map((req) => {
+          if (req.source === 'local') {
+            return { source: 'local', filterKeys: Object.keys(req.filter ?? {}) }
+          }
+          const hTag = Array.isArray(req.filter?.['#h']) ? req.filter['#h'][0] : undefined
+          return {
+            source: 'relays',
+            urls: req.urls,
+            filterKeys: Object.keys(req.filter ?? {}),
+            kindsCount: Array.isArray(req.filter?.kinds) ? req.filter.kinds.length : 0,
+            hTag: hTag ? String(hTag).slice(0, 32) : null
+          }
+        })
+      )
+      const settingsSignature = JSON.stringify({
+        includeReplies: settings.includeReplies,
+        showOnlyFirstLevelReplies: settings.showOnlyFirstLevelReplies,
+        hideShortNotes: settings.hideShortNotes,
+        wordFilter: settings.wordFilter,
+        maxNotesFilter: settings.maxNotesFilter,
+        timeFrame: settings.timeFrame
+      })
+      const snapshot = {
+        effectId,
+        label: debugLabel ?? null,
+        activeTab: debugActiveTab ?? null,
+        subRequestsCount: subRequests.length,
+        subRequestsSignature,
+        showKindsKey: showKinds.join(','),
+        refreshCount,
+        settingsSignature,
+        settingsIdentityChanged: settingsIdentityRef.current !== settings
+      }
+      const prev = prevSnapshotRef.current
+      const changes =
+        prev === null
+          ? ['initial']
+          : Object.keys(snapshot).filter(
+              (key) => (snapshot as Record<string, unknown>)[key] !== prev[key]
+            )
+      prevSnapshotRef.current = snapshot
+      settingsIdentityRef.current = settings
+
+      console.info('[GroupedNoteList] subscribe effect', {
+        ...snapshot,
+        changes
+      })
+
+      const softResubscribe = softResubscribeRef.current
+      if (!softResubscribe) {
+        resubscribeAttemptRef.current = 0
+      }
+      softResubscribeRef.current = false
+
       if (!subRequests.length) return
 
-      setLoading(true)
-      setEvents([])
-      setNewEvents([])
+      if (!softResubscribe) {
+        setLoading(true)
+        setEvents([])
+        setNewEvents([])
+      } else {
+        setLoading(true)
+      }
 
       if (showKinds.length === 0) {
         setLoading(false)
@@ -313,6 +402,41 @@ const GroupedNoteList = forwardRef(
 
       const timeframeMs = getTimeFrameInMs(settings.timeFrame)
       const groupedNotesSince = Math.floor((Date.now() - timeframeMs) / 1000)
+
+      const groupRelayUrls = new Set(
+        subRequests
+          .filter(
+            (
+              req
+            ): req is Extract<TFeedSubRequest, { source: 'relays' }> => {
+              if (req.source !== 'relays') return false
+              const hTags = (req.filter as { ['#h']?: string[] })?.['#h']
+              return Array.isArray(hTags) && hTags.length > 0
+            }
+          )
+          .flatMap((req) => req.urls)
+      )
+      const canResubscribe = groupRelayUrls.size > 0
+
+      const scheduleResubscribe = (url: string, reason: string) => {
+        if (!canResubscribe || !groupRelayUrls.has(url)) return
+        if (resubscribeTimerRef.current !== null) return
+        resubscribeAttemptRef.current += 1
+        const attempt = resubscribeAttemptRef.current
+        const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 15000)
+        softResubscribeRef.current = true
+        console.info('[GroupedNoteList] resubscribe scheduled', {
+          label: debugLabel ?? null,
+          url,
+          reason,
+          attempt,
+          delayMs
+        })
+        resubscribeTimerRef.current = window.setTimeout(() => {
+          resubscribeTimerRef.current = null
+          setRefreshCount((curr) => curr + 1)
+        }, delayMs)
+      }
 
       const subc = client.subscribeTimeline(
         subRequests,
@@ -381,6 +505,9 @@ const GroupedNoteList = forwardRef(
             })
           }, 1800),
           onClose(url, reason) {
+            if (reason === 'relay connection closed') {
+              scheduleResubscribe(url, reason)
+            }
             if (!showRelayCloseReason) return
             // ignore reasons from @nostr/tools
             if (
@@ -403,7 +530,19 @@ const GroupedNoteList = forwardRef(
         }
       )
 
-      return () => subc.close()
+      return () => {
+        if (resubscribeTimerRef.current !== null) {
+          clearTimeout(resubscribeTimerRef.current)
+          resubscribeTimerRef.current = null
+        }
+        console.info('[GroupedNoteList] subscribe cleanup', {
+          effectId,
+          label: debugLabel ?? null,
+          activeTab: debugActiveTab ?? null,
+          subRequestsCount: subRequests.length
+        })
+        subc.close(`GroupedNoteList cleanup effectId=${effectId}`)
+      }
     }, [subRequests, refreshCount, showKinds, settings])
 
     function mergeNewEvents() {

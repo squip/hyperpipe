@@ -8,7 +8,7 @@ import { useUserTrust } from '@/providers/UserTrustProvider'
 import { useGroupedNotes } from '@/providers/GroupedNotesProvider'
 import storage from '@/services/local-storage.service'
 import { TFeedSubRequest, TNoteListMode } from '@/types'
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import KindFilter from '../KindFilter'
 import GroupedNotesFilter from '../GroupedNotesFilter'
@@ -18,12 +18,14 @@ export default function NormalFeed({
   subRequests,
   isMainFeed = false,
   showRelayCloseReason = false,
-  debugActiveTab
+  debugActiveTab,
+  debugLabel
 }: {
   subRequests: TFeedSubRequest[]
   isMainFeed?: boolean
   showRelayCloseReason?: boolean
   debugActiveTab?: string
+  debugLabel?: string
 }) {
   const { t } = useTranslation()
   const { hideUntrustedNotes } = useUserTrust()
@@ -73,6 +75,55 @@ export default function NormalFeed({
         { value: 'posts', label: 'Notes' },
         { value: 'postsAndReplies', label: 'Replies' }
       ]
+
+  const summarizeSubRequests = (requests: TFeedSubRequest[]) =>
+    requests.map((req) => {
+      if (req.source === 'local') {
+        return {
+          source: 'local',
+          filterKeys: Object.keys(req.filter ?? {})
+        }
+      }
+      const hTag = Array.isArray(req.filter?.['#h']) ? req.filter['#h'][0] : undefined
+      return {
+        source: 'relays',
+        urls: req.urls,
+        filterKeys: Object.keys(req.filter ?? {}),
+        kindsCount: Array.isArray(req.filter?.kinds) ? req.filter.kinds.length : 0,
+        hTag: hTag ? String(hTag).slice(0, 32) : null
+      }
+    })
+
+  const subRequestsSignature = useMemo(
+    () => JSON.stringify(summarizeSubRequests(subRequests)),
+    [subRequests]
+  )
+  const uniqueSubRequestsSignature = useMemo(
+    () => JSON.stringify(summarizeSubRequests(uniqueSubRequests)),
+    [uniqueSubRequests]
+  )
+
+  useEffect(() => {
+    if (!debugLabel && !debugActiveTab) return
+    console.info('[NormalFeed] subRequests update', {
+      label: debugLabel ?? null,
+      activeTab: debugActiveTab ?? null,
+      groupedMode: groupedNotesSettings.enabled,
+      listMode: effectiveListMode,
+      subRequestsCount: subRequests.length,
+      uniqueSubRequestsCount: uniqueSubRequests.length,
+      subRequests: summarizeSubRequests(subRequests),
+      uniqueSubRequests: summarizeSubRequests(uniqueSubRequests)
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    debugLabel,
+    debugActiveTab,
+    groupedNotesSettings.enabled,
+    effectiveListMode,
+    subRequestsSignature,
+    uniqueSubRequestsSignature
+  ])
 
   return (
     <>
@@ -142,6 +193,8 @@ export default function NormalFeed({
           subRequests={uniqueSubRequests}
           showRelayCloseReason={showRelayCloseReason}
           userFilter={userFilter}
+          debugActiveTab={debugActiveTab}
+          debugLabel={debugLabel}
         />
       ) : (
         <NoteList
@@ -152,6 +205,7 @@ export default function NormalFeed({
           hideUntrustedNotes={hideUntrustedNotes}
           showRelayCloseReason={showRelayCloseReason}
           debugActiveTab={debugActiveTab}
+          debugLabel={debugLabel}
         />
       )}
     </>

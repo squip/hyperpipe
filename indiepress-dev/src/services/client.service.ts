@@ -35,6 +35,8 @@ import { binarySearch } from '@nostr/tools/utils'
 import { seenOn } from '@nostr/gadgets/store'
 import { outboxFilterRelayBatch } from '@nostr/gadgets/outbox'
 
+let timelineSubscriptionCounter = 0
+
 class ClientService extends EventTarget {
   static instance: ClientService
 
@@ -273,6 +275,7 @@ class ClientService extends EventTarget {
   ): SubCloser {
     let subc: SubCloser
     const abort = new AbortController()
+    const subscriptionId = ++timelineSubscriptionCounter
 
     const localFilters = subRequests
       .filter((req): req is Extract<TFeedSubRequest, { source: 'local' }> => req.source === 'local')
@@ -297,6 +300,7 @@ class ClientService extends EventTarget {
     )
 
     console.info('[subscribeTimeline] start', {
+      subscriptionId,
       subRequests: subRequests.length,
       localRequests: localFilters.length,
       relayRequests: relayRequests.length,
@@ -444,6 +448,7 @@ class ClientService extends EventTarget {
                   }))
                   console.info('[subscribeTimeline] onclose', {
                     label: 'f-timeline',
+                    subscriptionId,
                     reasons: closeReport
                   })
                   if (onClose) {
