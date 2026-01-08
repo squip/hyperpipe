@@ -1551,6 +1551,17 @@ async fetchMultipleProfiles(pubkeys) {
             const baseUrl = connectionUrl ? this._getBaseRelayUrl(connectionUrl) : null;
             const relayName = relay.name || '';
             const authToken = relay.userAuthToken || relay.authToken || null;
+            const previousAuthToken = this.relayAuthTokens.get(identifier)
+                || this.relayReadyStates.get(identifier)?.authToken
+                || null;
+            const previousUrl = this.groupRelayUrls.get(identifier)
+                || this.relayReadyStates.get(identifier)?.relayUrl
+                || null;
+            const tokenChanged = (authToken || null) !== (previousAuthToken || null);
+            const urlChanged = !!(connectionUrl && previousUrl && connectionUrl !== previousUrl);
+            const shouldReconnect = (tokenChanged || urlChanged) && (
+                previousUrl || previousAuthToken || this.relayReadyStates.has(identifier)
+            );
 
             this.userRelayIds.add(identifier);
             if (connectionUrl) {
@@ -1570,6 +1581,29 @@ async fetchMultipleProfiles(pubkeys) {
                 requiresAuth,
                 authToken: authToken || readiness.authToken || null
             });
+
+            if (shouldReconnect && (connectionUrl || baseUrl)) {
+                const targetUrl = previousUrl || connectionUrl || baseUrl;
+                console.log(`[NostrGroupClient] Relay ${identifier} auth changed, forcing reconnect`);
+                try {
+                    this.relayManager.removeRelay(targetUrl);
+                } catch (e) {
+                    console.warn(`[NostrGroupClient] Failed to remove relay ${identifier} for reconnect:`, e);
+                }
+
+                if (this.pendingRelayConnections.has(identifier)) {
+                    const pending = this.pendingRelayConnections.get(identifier);
+                    if (pending) {
+                        pending.relayUrl = connectionUrl || baseUrl || pending.relayUrl;
+                        pending.originalUrl = baseUrl || pending.originalUrl || pending.relayUrl;
+                        pending.status = 'pending';
+                        pending.attempts = 0;
+                        this._attemptConnectionIfReady(identifier);
+                    }
+                } else {
+                    this.queueRelayConnection(identifier, connectionUrl || baseUrl);
+                }
+            }
 
             if (!this.pendingRelayConnections.has(identifier)) {
                 if (connectionUrl) {

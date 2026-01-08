@@ -3210,6 +3210,15 @@ export class GatewayService extends EventEmitter {
     }
     response.subscriptionId = subscriptionId;
 
+    if (!this.#isPublicGatewayRelayKey(relayKey)) {
+      this.log('debug', '[PublicGateway] Skip local serve for non-gateway relay', {
+        relayKey,
+        subscriptionId
+      });
+      response.shouldPollPeers = true;
+      return response;
+    }
+
     const filters = frame.slice(2);
 
     if (this.publicGatewaySettings?.delegateReqToPeers === false) {
@@ -3349,6 +3358,7 @@ export class GatewayService extends EventEmitter {
 
   #canServeRelayLocally(relayKey) {
     if (!relayKey) return false;
+    if (!this.#isPublicGatewayRelayKey(relayKey)) return false;
     if (!this.hyperbeeAdapter?.hasReplica()) return false;
     const relayState = this.publicGatewayRelayState.get(relayKey);
     const fallbackRelay = this.publicGatewaySettings?.resolvedGatewayRelay || null;

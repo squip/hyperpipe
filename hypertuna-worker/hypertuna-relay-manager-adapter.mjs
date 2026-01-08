@@ -1345,13 +1345,13 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
  * @param {string} connectionKey - Connection identifier
  * @returns {Promise<void>}
  */
-export async function handleRelayMessage(relayKey, message, sendResponse, connectionKey) {
+export async function handleRelayMessage(relayKey, message, sendResponse, connectionKey, clientId = null) {
     const relayManager = activeRelays.get(relayKey);
     if (!relayManager) {
         throw new Error(`Relay not found: ${relayKey}`);
     }
     
-    return relayManager.handleMessage(message, sendResponse, connectionKey);
+    return relayManager.handleMessage(message, sendResponse, connectionKey, clientId);
 }
 
 /**
@@ -1380,6 +1380,82 @@ export async function updateRelaySubscriptions(relayKey, connectionKey, activeSu
     
     return relayManager.updateSubscriptions(connectionKey, activeSubscriptionsUpdated);
   }
+
+export async function getRelaySubscriptions(relayKey, connectionKey) {
+    const relayManager = activeRelays.get(relayKey);
+    if (!relayManager) {
+      throw new Error(`Relay not found: ${relayKey}`);
+    }
+
+    return relayManager.getSubscriptions(connectionKey);
+}
+
+export async function getRelayClientSubscriptions(relayKey, clientId) {
+    const relayManager = activeRelays.get(relayKey);
+    if (!relayManager) {
+      throw new Error(`Relay not found: ${relayKey}`);
+    }
+
+    return relayManager.getClientSubscriptions(clientId);
+}
+
+export async function updateRelayClientSubscriptions(relayKey, clientId, subscriptionObject) {
+    const relayManager = activeRelays.get(relayKey);
+    if (!relayManager) {
+      throw new Error(`Relay not found: ${relayKey}`);
+    }
+
+    return relayManager.updateClientSubscriptions(clientId, subscriptionObject);
+}
+
+export async function rehydrateRelaySubscriptions(relayKey, fromKey, toKey, { clientId = null } = {}) {
+    const relayManager = activeRelays.get(relayKey);
+    if (!relayManager) {
+      throw new Error(`Relay not found: ${relayKey}`);
+    }
+
+    const existing = await relayManager.getSubscriptions(fromKey);
+    if (!existing || !existing.subscriptions) {
+      return {
+        ok: false,
+        reason: 'no-subscriptions',
+        subscriptionCount: 0
+      };
+    }
+
+    const subscriptionCount = Object.keys(existing.subscriptions).length;
+    if (subscriptionCount === 0) {
+      return {
+        ok: false,
+        reason: 'empty-subscriptions',
+        subscriptionCount
+      };
+    }
+
+    const updated = {
+      ...existing,
+      connection: toKey
+    };
+
+    const timestamps = Object.values(updated.subscriptions || {})
+      .map((subscription) => subscription?.last_returned_event_timestamp)
+      .filter((value) => typeof value === 'number');
+    const lastReturned = timestamps.length ? Math.max(...timestamps) : null;
+
+    await relayManager.updateSubscriptions(toKey, updated);
+    if (clientId) {
+      await relayManager.updateClientSubscriptions(clientId, {
+        ...updated,
+        clientId
+      });
+    }
+
+    return {
+      ok: true,
+      subscriptionCount,
+      lastReturned
+    };
+}
 
 /**
  * Get the members list for a relay

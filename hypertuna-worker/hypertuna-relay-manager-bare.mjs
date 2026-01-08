@@ -600,11 +600,11 @@ export class RelayManager {
       });
     }
 
-    async handleMessage(message, sendResponse, connectionKey) {
+    async handleMessage(message, sendResponse, connectionKey, clientId = null) {
       if (!this.relay) {
         throw new Error('Relay not initialized');
       }
-      return this.relay.handleMessage(message, sendResponse, connectionKey);
+      return this.relay.handleMessage(message, sendResponse, connectionKey, clientId);
     }
 
     async handleSubscription(connectionKey) {
@@ -613,6 +613,27 @@ export class RelayManager {
       }
       return this.relay.handleSubscription(connectionKey);
     }        
+
+    async getSubscriptions(connectionKey) {
+      if (!this.relay) {
+        throw new Error('Relay not initialized');
+      }
+      return this.relay.getSubscriptions(connectionKey);
+    }
+
+    async getClientSubscriptions(clientId) {
+      if (!this.relay) {
+        throw new Error('Relay not initialized');
+      }
+      return this.relay.getClientSubscriptions(clientId);
+    }
+
+    async updateClientSubscriptions(clientId, subscriptionObject) {
+      if (!this.relay) {
+        throw new Error('Relay not initialized');
+      }
+      return this.relay.updateClientSubscriptions(clientId, subscriptionObject);
+    }
 
     async updateSubscriptions(connectionKey, activeSubscriptionsUpdated) {
       try {

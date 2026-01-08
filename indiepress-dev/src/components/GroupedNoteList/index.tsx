@@ -418,8 +418,41 @@ const GroupedNoteList = forwardRef(
       )
       const canResubscribe = groupRelayUrls.size > 0
 
+      const stripRelayToken = (relayUrl: string) => {
+        try {
+          const parsed = new URL(relayUrl)
+          if (!parsed.searchParams.has('token')) return relayUrl
+          parsed.searchParams.delete('token')
+          const normalized = parsed.toString()
+          return normalized.endsWith('?') ? normalized.slice(0, -1) : normalized
+        } catch {
+          return relayUrl
+        }
+      }
+
+      const groupRelayBaseUrls = new Set(
+        Array.from(groupRelayUrls, (url) => stripRelayToken(url))
+      )
+
+      const isGroupRelayUrl = (url: string) =>
+        groupRelayUrls.has(url) || groupRelayBaseUrls.has(stripRelayToken(url))
+
+      const shouldResubscribeReason = (reason: string) => {
+        if (reason.startsWith('GroupedNoteList cleanup')) return false
+        if (['closed by caller', 'relay connection closed by us'].includes(reason)) {
+          return false
+        }
+
+        return [
+          'relay connection closed',
+          'relay connection errored',
+          'relay connection timed out',
+          'pingpong timed out'
+        ].includes(reason)
+      }
+
       const scheduleResubscribe = (url: string, reason: string) => {
-        if (!canResubscribe || !groupRelayUrls.has(url)) return
+        if (!canResubscribe || !isGroupRelayUrl(url)) return
         if (resubscribeTimerRef.current !== null) return
         resubscribeAttemptRef.current += 1
         const attempt = resubscribeAttemptRef.current
@@ -505,7 +538,7 @@ const GroupedNoteList = forwardRef(
             })
           }, 1800),
           onClose(url, reason) {
-            if (reason === 'relay connection closed') {
+            if (shouldResubscribeReason(reason)) {
               scheduleResubscribe(url, reason)
             }
             if (!showRelayCloseReason) return
@@ -515,6 +548,7 @@ const GroupedNoteList = forwardRef(
                 'closed by caller',
                 'relay connection errored',
                 'relay connection closed',
+                'relay connection timed out',
                 'pingpong timed out',
                 'relay connection closed by us'
               ].includes(reason)

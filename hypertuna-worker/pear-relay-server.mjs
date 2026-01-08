@@ -26,6 +26,9 @@ import {
   getActiveRelays,
   cleanupRelays,
   updateRelaySubscriptions,
+  getRelayClientSubscriptions,
+  updateRelayClientSubscriptions,
+  rehydrateRelaySubscriptions,
   getRelayMembers,
   getRelayMetadata
 } from './hypertuna-relay-manager-adapter.mjs';
@@ -78,6 +81,30 @@ let gatewayRegistrationInterval = null;
 let gatewayConnection = null;
 let pendingRegistrations = []; // Queue registrations until gateway connects
 let connectedPeers = new Map(); // Track all connected peers
+const relayClientConnections = new Map(); // relayKey -> Map(clientId -> { connectionKey, updatedAt })
+
+function getRelayClientMap(relayKey) {
+  let map = relayClientConnections.get(relayKey);
+  if (!map) {
+    map = new Map();
+    relayClientConnections.set(relayKey, map);
+  }
+  return map;
+}
+
+function getRelayClientConnectionKey(relayKey, clientId) {
+  if (!relayKey || !clientId) return null;
+  const map = relayClientConnections.get(relayKey);
+  return map?.get(clientId)?.connectionKey || null;
+}
+
+function setRelayClientConnectionKey(relayKey, clientId, connectionKey) {
+  if (!relayKey || !clientId || !connectionKey) return null;
+  const map = getRelayClientMap(relayKey);
+  const previous = map.get(clientId)?.connectionKey || null;
+  map.set(clientId, { connectionKey, updatedAt: Date.now() });
+  return previous;
+}
 const lateWriterRecoveryTasks = new Map();
 const BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS = 90000;
 const DIRECT_JOIN_WRITABLE_TIMEOUT_MS = 15000;
@@ -1346,6 +1373,7 @@ function setupProtocolHandlers(protocol) {
       if (!authToken && request.query?.token) {
         authToken = request.query.token;
       }
+      let clientId = null;
 
       console.log(`[RelayServer] Auth token present: ${!!authToken}`);
       
@@ -1440,6 +1468,7 @@ function setupProtocolHandlers(protocol) {
             }
             
             console.log(`[RelayServer] REQ authenticated for ${auth.pubkey.substring(0, 8)}...`);
+            clientId = authToken || auth.pubkey;
           }
         }
         
@@ -1474,6 +1503,8 @@ function setupProtocolHandlers(protocol) {
             };
           }
           
+          clientId = authToken || auth.pubkey;
+
           // Check if the event pubkey matches the authenticated user
           if (event && event.pubkey !== auth.pubkey) {
             console.warn(`[RelayServer] Event pubkey ${event.pubkey} doesn't match auth pubkey ${auth.pubkey}`);
@@ -1527,6 +1558,23 @@ function setupProtocolHandlers(protocol) {
         }
       }
       
+      if (!clientId && authToken) {
+        clientId = authToken;
+      }
+
+      if (clientId) {
+        const previousKey = setRelayClientConnectionKey(relayKey, clientId, connectionKey);
+        if (previousKey && previousKey !== connectionKey) {
+          console.log('[RelayServer] Client connectionKey updated', {
+            relayKey,
+            clientId,
+            fromKey: previousKey,
+            toKey: connectionKey,
+            context: `post-${nostrMessage[0]}`
+          });
+        }
+      }
+
       // Process the message through relay manager
       const responses = [];
       const sendResponse = (response) => {
@@ -1535,7 +1583,7 @@ function setupProtocolHandlers(protocol) {
         responses.push(response);
       };
       
-      await handleRelayMessage(relayKey, nostrMessage, sendResponse, connectionKey);
+      await handleRelayMessage(relayKey, nostrMessage, sendResponse, connectionKey, clientId);
       
       console.log(`[RelayServer] Handled message, ${responses.length} responses queued`);
       
@@ -1576,6 +1624,8 @@ function setupProtocolHandlers(protocol) {
     if (!authToken && request.query?.token) {
       authToken = request.query.token;
     }
+    let auth = null;
+    let clientId = null;
     const connectionKey = request.params.connectionKey;
 
     console.log(`[RelayServer] Checking subscriptions for identifier: ${rawIdentifier}, connectionKey: ${connectionKey}`);
@@ -1645,7 +1695,7 @@ function setupProtocolHandlers(protocol) {
             }
 
             // Verify auth
-            const auth = authStore.verifyAuth(relayKey, authToken);
+            auth = authStore.verifyAuth(relayKey, authToken);
             if (!auth) {
               console.warn(`[RelayServer] Invalid auth for read access`);
               updateMetrics(false);
@@ -1659,6 +1709,7 @@ function setupProtocolHandlers(protocol) {
             }
 
             console.log(`[RelayServer] Read access authenticated for ${auth.pubkey.substring(0, 8)}...`);
+            clientId = authToken || auth.pubkey;
             // Update last used timestamp
             auth.lastUsed = Date.now();
           } else {
@@ -1666,6 +1717,178 @@ function setupProtocolHandlers(protocol) {
           }
         }
         
+        if (!clientId && authToken) {
+          clientId = authToken;
+        }
+
+        const stableClientId = auth?.pubkey || null;
+
+        if (clientId) {
+          const previousKey = getRelayClientConnectionKey(relayKey, clientId);
+          let rehydrateResult = null;
+          let rehydrateOk = false;
+
+          if (previousKey && previousKey !== connectionKey) {
+            try {
+              rehydrateResult = await rehydrateRelaySubscriptions(relayKey, previousKey, connectionKey, { clientId });
+            } catch (rehydrateError) {
+              rehydrateResult = {
+                ok: false,
+                reason: rehydrateError?.message || rehydrateError
+              };
+            }
+
+            console.log('[RelayServer] Subscription rehydrate attempt', {
+              clientId,
+              relayKey,
+              fromKey: previousKey,
+              toKey: connectionKey,
+              subscriptionCount: rehydrateResult?.subscriptionCount ?? 0,
+              last_returned_event_timestamp: rehydrateResult?.lastReturned ?? null,
+              ok: rehydrateResult?.ok ?? false,
+              source: 'connection-key'
+            });
+          }
+
+          rehydrateOk = rehydrateResult?.ok === true;
+
+          if (!rehydrateOk) {
+            try {
+              const clientSnapshot = await getRelayClientSubscriptions(relayKey, clientId);
+              const subscriptionCount = clientSnapshot?.subscriptions
+                ? Object.keys(clientSnapshot.subscriptions).length
+                : 0;
+              if (subscriptionCount > 0) {
+                const snapshotTimestamps = Object.values(clientSnapshot.subscriptions || {})
+                  .map((subscription) => subscription?.last_returned_event_timestamp)
+                  .filter((value) => typeof value === 'number');
+                const lastReturned = snapshotTimestamps.length ? Math.max(...snapshotTimestamps) : null;
+                const updated = {
+                  ...clientSnapshot,
+                  clientId,
+                  connection: connectionKey
+                };
+                await updateRelaySubscriptions(relayKey, connectionKey, updated);
+                await updateRelayClientSubscriptions(relayKey, clientId, updated);
+                console.log('[RelayServer] Subscription rehydrate from client snapshot', {
+                  clientId,
+                  relayKey,
+                  fromKey: clientSnapshot.connection || null,
+                  toKey: connectionKey,
+                  subscriptionCount,
+                  last_returned_event_timestamp: lastReturned,
+                  ok: true,
+                  source: 'client-snapshot'
+                });
+                rehydrateOk = true;
+              }
+            } catch (snapshotError) {
+              console.log('[RelayServer] Subscription rehydrate from client snapshot failed', {
+                clientId,
+                relayKey,
+                error: snapshotError?.message || snapshotError
+              });
+            }
+          }
+
+          if (!rehydrateOk && stableClientId && stableClientId !== clientId) {
+            const stablePreviousKey = getRelayClientConnectionKey(relayKey, stableClientId);
+            let stableRehydrateResult = null;
+
+            if (stablePreviousKey && stablePreviousKey !== connectionKey) {
+              try {
+                stableRehydrateResult = await rehydrateRelaySubscriptions(relayKey, stablePreviousKey, connectionKey, { clientId });
+              } catch (rehydrateError) {
+                stableRehydrateResult = {
+                  ok: false,
+                  reason: rehydrateError?.message || rehydrateError
+                };
+              }
+
+              console.log('[RelayServer] Subscription rehydrate attempt', {
+                clientId,
+                relayKey,
+                fromKey: stablePreviousKey,
+                toKey: connectionKey,
+                subscriptionCount: stableRehydrateResult?.subscriptionCount ?? 0,
+                last_returned_event_timestamp: stableRehydrateResult?.lastReturned ?? null,
+                ok: stableRehydrateResult?.ok ?? false,
+                source: 'pubkey-connection-key'
+              });
+            }
+
+            rehydrateOk = stableRehydrateResult?.ok === true;
+
+            if (!rehydrateOk) {
+              try {
+                const stableSnapshot = await getRelayClientSubscriptions(relayKey, stableClientId);
+                const subscriptionCount = stableSnapshot?.subscriptions
+                  ? Object.keys(stableSnapshot.subscriptions).length
+                  : 0;
+                if (subscriptionCount > 0) {
+                  const snapshotTimestamps = Object.values(stableSnapshot.subscriptions || {})
+                    .map((subscription) => subscription?.last_returned_event_timestamp)
+                    .filter((value) => typeof value === 'number');
+                  const lastReturned = snapshotTimestamps.length ? Math.max(...snapshotTimestamps) : null;
+                  const updated = {
+                    ...stableSnapshot,
+                    clientId,
+                    connection: connectionKey
+                  };
+                  const stableUpdated = {
+                    ...stableSnapshot,
+                    clientId: stableClientId,
+                    connection: connectionKey
+                  };
+                  await updateRelaySubscriptions(relayKey, connectionKey, updated);
+                  await updateRelayClientSubscriptions(relayKey, clientId, updated);
+                  await updateRelayClientSubscriptions(relayKey, stableClientId, stableUpdated);
+                  console.log('[RelayServer] Subscription rehydrate from client snapshot', {
+                    clientId,
+                    relayKey,
+                    fromKey: stableSnapshot.connection || null,
+                    toKey: connectionKey,
+                    subscriptionCount,
+                    last_returned_event_timestamp: lastReturned,
+                    ok: true,
+                    source: 'pubkey-snapshot'
+                  });
+                  rehydrateOk = true;
+                }
+              } catch (snapshotError) {
+                console.log('[RelayServer] Subscription rehydrate from client snapshot failed', {
+                  clientId,
+                  relayKey,
+                  error: snapshotError?.message || snapshotError
+                });
+              }
+            }
+          }
+
+          const previousStored = setRelayClientConnectionKey(relayKey, clientId, connectionKey);
+          if (previousStored && previousStored !== connectionKey) {
+            console.log('[RelayServer] Client connectionKey updated', {
+              relayKey,
+              clientId,
+              fromKey: previousStored,
+              toKey: connectionKey,
+              context: 'get-relay'
+            });
+          }
+          if (stableClientId && stableClientId !== clientId) {
+            const previousStableStored = setRelayClientConnectionKey(relayKey, stableClientId, connectionKey);
+            if (previousStableStored && previousStableStored !== connectionKey) {
+              console.log('[RelayServer] Client connectionKey updated', {
+                relayKey,
+                clientId: stableClientId,
+                fromKey: previousStableStored,
+                toKey: connectionKey,
+                context: 'get-relay-pubkey'
+              });
+            }
+          }
+        }
+
         const [events, activeSubscriptionsUpdated] = await handleRelaySubscription(relayKey, connectionKey);
         
         if (!Array.isArray(events)) {
@@ -1691,6 +1914,18 @@ function setupProtocolHandlers(protocol) {
             try {
                 console.log(`[RelayServer] Updating subscriptions for connectionKey: ${connectionKey}`);
                 await updateRelaySubscriptions(relayKey, connectionKey, activeSubscriptionsUpdated);
+                if (clientId) {
+                    await updateRelayClientSubscriptions(relayKey, clientId, {
+                      ...activeSubscriptionsUpdated,
+                      clientId
+                    });
+                    if (stableClientId && stableClientId !== clientId) {
+                      await updateRelayClientSubscriptions(relayKey, stableClientId, {
+                        ...activeSubscriptionsUpdated,
+                        clientId: stableClientId
+                      });
+                    }
+                }
                 console.log(`[RelayServer] Successfully updated subscriptions for connectionKey: ${connectionKey}`);
             } catch (updateError) {
                 console.log(`[RelayServer] Warning: Failed to update subscriptions for connectionKey: ${connectionKey}:`, updateError.message);

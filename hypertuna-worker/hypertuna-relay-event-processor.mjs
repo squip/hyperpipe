@@ -212,6 +212,16 @@ export default class NostrRelay extends Autobee {
             const key = b4a.from(subscriptionData.connection, 'hex');
             logWithTimestamp(`NostrRelay.apply: Storing subscription data for connection: ${subscriptionData.connection}`);
             await b.put(key, op.subscriptions);
+        } else if (op.type === 'client-subscriptions') {
+            const subscriptionData = JSON.parse(op.subscriptions);
+            const clientId = subscriptionData.clientId || op.clientId;
+            if (!clientId) {
+                logWithTimestamp('NostrRelay.apply: Missing clientId for client-subscriptions');
+                continue;
+            }
+            const key = b4a.from(`client:${clientId}`, 'utf8');
+            logWithTimestamp(`NostrRelay.apply: Storing client subscription data for client: ${clientId}`);
+            await b.put(key, op.subscriptions);
         }
     }
   
@@ -884,7 +894,7 @@ async handleSubscription(connectionKey) {
   }
 
 
-async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null) {
+async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null, clientId = null) {
     // logWithTimestamp('publishSubscription: Attempting to publish subscription:', JSON.stringify(reqMessage, null, 2));
     
     if (!this.writable) {
@@ -953,6 +963,28 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null)
       }
       
       logWithTimestamp(`publishSubscription: Published subscription for connection: ${connectionKey}, subscriptionId: ${subscriptionId}`);
+      if (clientId) {
+        const clientSnapshot = {
+          clientId,
+          connection: connectionKey,
+          subscriptions
+        };
+        try {
+          await this.updateClientSubscriptions(clientId, clientSnapshot);
+          logWithTimestamp('publishSubscription: Client subscription snapshot stored', {
+            clientId,
+            connectionKey,
+            subscriptionCount: Object.keys(subscriptions || {}).length,
+            viewVersion: this.view?.version ?? null
+          });
+        } catch (error) {
+          logWithTimestamp('publishSubscription: Failed to store client subscription snapshot', {
+            clientId,
+            connectionKey,
+            error: error?.message || error
+          });
+        }
+      }
       return ['NOTICE', `Subscription ${subscriptionId} created/updated successfully`];
     } else {
       logWithTimestamp('publishSubscription: Invalid filters');
@@ -1000,6 +1032,64 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null)
     return ['NOTICE', 'Subscriptions updated successfully'];
   }
 
+  async getClientSubscriptions(clientId) {
+    logWithTimestamp(`getClientSubscriptions: Attempting to retrieve subscriptions for clientId: ${clientId}`);
+    const key = b4a.from(`client:${clientId}`, 'utf8');
+    const subscriptionData = await this.view.get(key);
+    if (subscriptionData) {
+      logWithTimestamp(`getClientSubscriptions: Subscriptions found for clientId ${clientId}`);
+      try {
+        return typeof subscriptionData.value === 'string' ? JSON.parse(subscriptionData.value) : subscriptionData.value;
+      } catch (error) {
+        logWithTimestamp('getClientSubscriptions: Error parsing subscriptions:', error.message);
+        return null;
+      }
+    }
+    logWithTimestamp(`getClientSubscriptions: No subscriptions found for clientId: ${clientId}`);
+    return null;
+  }
+
+  async updateClientSubscriptions(clientId, subscriptionObject) {
+    if (!this.writable) {
+      logWithTimestamp('updateClientSubscriptions: Error - Not writable');
+      throw new Error('Not writable');
+    }
+
+    const safeSnapshot = {
+      clientId,
+      connection: subscriptionObject?.connection ?? null,
+      subscriptions: subscriptionObject?.subscriptions ?? {}
+    };
+
+    await this.append({
+      type: 'client-subscriptions',
+      clientId,
+      subscriptions: JSON.stringify(safeSnapshot)
+    });
+
+    const key = b4a.from(`client:${clientId}`, 'utf8');
+    const stored = await this.view.get(key);
+    if (stored) {
+      let storedCount = null;
+      try {
+        const parsed = typeof stored.value === 'string' ? JSON.parse(stored.value) : stored.value;
+        storedCount = parsed?.subscriptions ? Object.keys(parsed.subscriptions).length : 0;
+      } catch (error) {
+        logWithTimestamp('updateClientSubscriptions: Error parsing stored snapshot', error.message);
+      }
+      logWithTimestamp('updateClientSubscriptions: Stored client snapshot', {
+        clientId,
+        storedCount,
+        viewVersion: this.view?.version ?? null
+      });
+    } else {
+      logWithTimestamp('updateClientSubscriptions: Storage verification failed (no record)', {
+        clientId,
+        viewVersion: this.view?.version ?? null
+      });
+    }
+  }
+
   // helper function for publishSubscription() to verify that the structure and attributes of REQ 'filters' object 
   // conforms to NIP-01 specifications before appending subscription entry to hyperbee log.
   validateFilters(filters) {
@@ -1035,7 +1125,7 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null)
   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
   // Update handleMessage to work with the new subscription structure
-async handleMessage(message, sendResponse, connectionKey) {
+async handleMessage(message, sendResponse, connectionKey, clientId = null) {
     // logWithTimestamp(`handleMessage: Received message:`, JSON.stringify(message, null, 2));
     try {
       const [type, ...params] = message;
@@ -1057,7 +1147,7 @@ async handleMessage(message, sendResponse, connectionKey) {
         case 'REQ':
           logWithTimestamp(`handleMessage: Processing REQ message for client connection: ${connectionKey}`);
           const activeSubscriptions = await this.getSubscriptions(connectionKey);
-          const publishSubResult = await this.publishSubscription(connectionKey, message, activeSubscriptions);
+          const publishSubResult = await this.publishSubscription(connectionKey, message, activeSubscriptions, clientId);
           logWithTimestamp(`handleMessage: REQ publish result:`, JSON.stringify(publishSubResult, null, 2));
           sendResponse(publishSubResult);
           break;
