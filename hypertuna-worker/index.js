@@ -9,10 +9,12 @@ import { join } from 'node:path'
 import nodeCrypto from 'node:crypto'
 import swarmCrypto from 'hypercore-crypto'
 import b4a from 'b4a'
+import HypercoreId from 'hypercore-id-encoding'
 import GatewayService from './gateway/GatewayService.mjs'
 import {
   getAllRelayProfiles,
   getRelayProfileByKey,
+  getRelayProfileByPublicIdentifier,
   saveRelayProfile,
   removeRelayAuth, // <-- NEW IMPORT
   updateRelayMembers, // This is likely not used directly anymore for member_adds/removes
@@ -68,8 +70,11 @@ const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd
 const defaultStorageDir = process.env.STORAGE_DIR || pearRuntime?.config?.storage || join(process.cwd(), 'data')
 const userKey = process.env.USER_KEY || null
 const BLIND_PEERING_METADATA_FILENAME = 'blind-peering-metadata.json'
+const RELAY_CORE_REFS_CACHE_FILENAME = 'relay-core-refs-cache.json'
 const BLIND_PEER_REHYDRATION_TIMEOUT_MS = 45000
 const BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS = 60000
+const BLIND_PEER_MIRROR_METADATA_REFRESH_MS = 1 * 60 * 1000
+const BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS = 8000
 
 global.userConfig = {
   storage: defaultStorageDir,
@@ -77,10 +82,18 @@ global.userConfig = {
 }
 
 const relayMirrorSubscriptions = new Map()
+const relayMirrorCoreRefs = new Map()
+const relayMirrorCoreRefsCache = new Map()
+const relayMirrorSyncState = new Map()
 let lastBlindPeerFingerprint = null
 let lastDispatcherAssignmentFingerprint = null
 let pendingRelayRegistryRefresh = false
 let gatewayWasRunning = false
+let lastMirrorMetadataRefreshAt = 0
+let mirrorMetadataRefreshInFlight = null
+let relayCoreRefsCacheLoaded = false
+let relayCoreRefsCacheDirty = false
+let relayCoreRefsCacheTimer = null
 
 function getGatewayWebsocketProtocol(config) {
   return config?.proxy_websocket_protocol === 'ws' ? 'ws' : 'wss'
@@ -132,6 +145,473 @@ function normalizeGatewayPathFragment(fragment) {
 function resolveRelayIdentifierPath(identifier) {
   if (!identifier || typeof identifier !== 'string') return null
   return identifier.includes(':') ? identifier.replace(':', '/') : identifier
+}
+
+function normalizeCoreRef(value) {
+  if (!value) return null
+  if (Buffer.isBuffer(value)) {
+    try {
+      return HypercoreId.encode(value)
+    } catch (_) {
+      return null
+    }
+  }
+  if (value instanceof Uint8Array) {
+    return normalizeCoreRef(Buffer.from(value))
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) return null
+    try {
+      const decoded = HypercoreId.decode(trimmed)
+      return HypercoreId.encode(decoded)
+    } catch (_) {
+      if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+        try {
+          return HypercoreId.encode(Buffer.from(trimmed, 'hex'))
+        } catch (_) {
+          return null
+        }
+      }
+      return null
+    }
+  }
+  if (value && typeof value === 'object') {
+    if (value.key) return normalizeCoreRef(value.key)
+    if (value.core) return normalizeCoreRef(value.core)
+  }
+  return null
+}
+
+function decodeCoreRef(value) {
+  if (!value) return null
+  if (Buffer.isBuffer(value)) return Buffer.from(value)
+  if (value instanceof Uint8Array) return Buffer.from(value)
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) return null
+    try {
+      return HypercoreId.decode(trimmed)
+    } catch (_) {
+      if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+        return Buffer.from(trimmed, 'hex')
+      }
+      return null
+    }
+  }
+  if (value && typeof value === 'object') {
+    if (value.key) return decodeCoreRef(value.key)
+    if (value.core) return decodeCoreRef(value.core)
+  }
+  return null
+}
+
+function normalizeCoreRefList(refs) {
+  if (!Array.isArray(refs)) return []
+  const seen = new Set()
+  const result = []
+  for (const ref of refs) {
+    const normalized = normalizeCoreRef(ref)
+    if (!normalized || seen.has(normalized)) continue
+    seen.add(normalized)
+    result.push(normalized)
+  }
+  return result
+}
+
+function normalizeMirrorCoreRefs(cores) {
+  if (!Array.isArray(cores)) return []
+  return normalizeCoreRefList(cores)
+}
+
+function mergeCoreRefLists(...lists) {
+  const merged = []
+  const seen = new Set()
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue
+    for (const ref of list) {
+      if (!ref || seen.has(ref)) continue
+      seen.add(ref)
+      merged.push(ref)
+    }
+  }
+  return merged
+}
+
+function coreRefsFingerprint(coreRefs = []) {
+  return Array.isArray(coreRefs) ? coreRefs.join('|') : ''
+}
+
+function getRelayCoreRefsCachePath() {
+  return join(defaultStorageDir, RELAY_CORE_REFS_CACHE_FILENAME)
+}
+
+async function loadRelayCoreRefsCache() {
+  if (relayCoreRefsCacheLoaded) return
+  relayCoreRefsCacheLoaded = true
+  const cachePath = getRelayCoreRefsCachePath()
+  try {
+    const payload = await fs.readFile(cachePath, 'utf8')
+    const parsed = JSON.parse(payload)
+    const relays = parsed?.relays && typeof parsed.relays === 'object'
+      ? parsed.relays
+      : parsed
+    if (!relays || typeof relays !== 'object') return
+    for (const [relayKey, entry] of Object.entries(relays)) {
+      const coreRefs = Array.isArray(entry) ? entry : entry?.coreRefs
+      const normalized = normalizeCoreRefList(coreRefs)
+      if (!normalized.length) continue
+      relayMirrorCoreRefsCache.set(relayKey, normalized)
+      const existing = relayMirrorCoreRefs.get(relayKey) || []
+      const merged = mergeCoreRefLists(existing, normalized)
+      if (merged.length && coreRefsFingerprint(existing) !== coreRefsFingerprint(merged)) {
+        relayMirrorCoreRefs.set(relayKey, merged)
+      }
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      console.warn('[Worker] Failed to load relay core refs cache', {
+        path: cachePath,
+        error: error?.message || error
+      })
+    }
+  }
+}
+
+function scheduleRelayCoreRefsCachePersist() {
+  if (relayCoreRefsCacheTimer) return
+  relayCoreRefsCacheTimer = setTimeout(() => {
+    relayCoreRefsCacheTimer = null
+    persistRelayCoreRefsCache().catch((error) => {
+      console.warn('[Worker] Failed to persist relay core refs cache', {
+        error: error?.message || error
+      })
+    })
+  }, 2000)
+  relayCoreRefsCacheTimer.unref?.()
+}
+
+async function persistRelayCoreRefsCache(force = false) {
+  await loadRelayCoreRefsCache()
+  if (!force && !relayCoreRefsCacheDirty) return
+  const relays = {}
+  for (const [relayKey, coreRefs] of relayMirrorCoreRefs.entries()) {
+    const normalized = normalizeCoreRefList(coreRefs)
+    if (!normalized.length) continue
+    relays[relayKey] = { coreRefs: normalized }
+  }
+  const payload = JSON.stringify({
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    relays
+  }, null, 2)
+  const cachePath = getRelayCoreRefsCachePath()
+  try {
+    await fs.mkdir(defaultStorageDir, { recursive: true })
+    await fs.writeFile(cachePath, payload, 'utf8')
+    relayMirrorCoreRefsCache.clear()
+    for (const [relayKey, entry] of Object.entries(relays)) {
+      relayMirrorCoreRefsCache.set(relayKey, entry.coreRefs)
+    }
+    relayCoreRefsCacheDirty = false
+  } catch (error) {
+    console.warn('[Worker] Failed to persist relay core refs cache', {
+      path: cachePath,
+      error: error?.message || error
+    })
+  }
+}
+
+async function getRelayMirrorCoreRefsCache(relayKey) {
+  await loadRelayCoreRefsCache()
+  if (!relayKey) return []
+  return relayMirrorCoreRefsCache.get(relayKey) || []
+}
+
+function updateRelayMirrorCoreRefs(relayKey, coreRefs, { persist = true } = {}) {
+  if (!relayKey || !Array.isArray(coreRefs) || !coreRefs.length) return
+  const normalized = normalizeCoreRefList(coreRefs)
+  if (!normalized.length) return
+  const existing = relayMirrorCoreRefs.get(relayKey) || []
+  if (coreRefsFingerprint(existing) === coreRefsFingerprint(normalized)) {
+    return
+  }
+  relayMirrorCoreRefs.set(relayKey, normalized)
+  if (persist) {
+    relayCoreRefsCacheDirty = true
+    scheduleRelayCoreRefsCachePersist()
+  }
+}
+
+async function resolveRelayMirrorCoreRefs(relayKey, publicIdentifier = null, fallbackRefs = []) {
+  const normalizedFallback = normalizeCoreRefList(fallbackRefs)
+  await loadRelayCoreRefsCache()
+  const cachedRefs = relayKey ? (relayMirrorCoreRefsCache.get(relayKey) || []) : []
+  if (relayKey && relayMirrorCoreRefs.has(relayKey)) {
+    const cached = relayMirrorCoreRefs.get(relayKey) || []
+    const merged = mergeCoreRefLists(cachedRefs, cached, normalizedFallback)
+    updateRelayMirrorCoreRefs(relayKey, merged)
+    return merged
+  }
+
+  let profile = null
+  if (relayKey) {
+    profile = await getRelayProfileByKey(relayKey)
+  }
+  if (!profile && publicIdentifier) {
+    profile = await getRelayProfileByPublicIdentifier(publicIdentifier)
+  }
+  const storedRefs = normalizeCoreRefList(profile?.core_refs || profile?.coreRefs)
+  const merged = mergeCoreRefLists(cachedRefs, storedRefs, normalizedFallback)
+  updateRelayMirrorCoreRefs(relayKey, merged)
+  return merged
+}
+
+function bufferListHas(buffers, candidate) {
+  if (!candidate || !Array.isArray(buffers)) return false
+  return buffers.some((entry) => entry && b4a.equals(entry, candidate))
+}
+
+function relayHasWriter(activeWriters, candidate) {
+  if (!candidate || !activeWriters) return false
+  if (typeof activeWriters.has === 'function') {
+    try {
+      return activeWriters.has(candidate)
+    } catch (_) {
+      // fall through to manual scan
+    }
+  }
+  const iterable = Array.isArray(activeWriters) ? activeWriters : activeWriters[Symbol.iterator] ? activeWriters : []
+  for (const writer of iterable) {
+    const key = writer?.core?.key || writer
+    if (key && b4a.equals(key, candidate)) return true
+  }
+  return false
+}
+
+function collectRelaySkipKeys(relay) {
+  const skip = []
+  const pushKey = (value) => {
+    const decoded = decodeCoreRef(value)
+    if (decoded) skip.push(decoded)
+  }
+  if (!relay) return skip
+  pushKey(relay.view?.core?.key || relay.view?.key)
+  pushKey(relay.core?.key)
+  pushKey(relay.key)
+  pushKey(relay.local?.core?.key || relay.local?.key)
+  pushKey(relay.localWriter?.core?.key)
+  if (Array.isArray(relay.viewCores)) {
+    relay.viewCores.forEach((core) => {
+      pushKey(core?.core?.key || core?.key || core)
+    })
+  }
+  return skip
+}
+
+async function ensureRelayWritersFromCoreRefs(relayManager, coreRefs, reason = 'mirror-update') {
+  const relay = relayManager?.relay
+  if (!relay || typeof relayManager?.addWriter !== 'function') {
+    return { status: 'skipped', reason: 'relay-unavailable' }
+  }
+  const normalized = normalizeCoreRefList(coreRefs)
+  if (!normalized.length) {
+    return { status: 'skipped', reason: 'no-core-refs' }
+  }
+  if (relay.writable === false) {
+    return {
+      status: 'read-only',
+      reason: 'relay-not-writable',
+      added: 0,
+      skipped: normalized.length,
+      failed: 0
+    }
+  }
+
+  try {
+    if (typeof relay.update === 'function') {
+      try {
+        await relay.update({ wait: true })
+      } catch (_) {
+        await relay.update()
+      }
+    }
+  } catch (error) {
+    console.warn('[Worker] Relay update failed before writer sync', {
+      relayKey: relayManager?.bootstrap || null,
+      reason,
+      error: error?.message || error
+    })
+  }
+
+  const skipKeys = collectRelaySkipKeys(relay)
+  const activeWriters = relay.activeWriters || []
+  const summary = {
+    status: 'ok',
+    added: 0,
+    skipped: 0,
+    failed: 0
+  }
+
+  for (const ref of normalized) {
+    const decoded = decodeCoreRef(ref)
+    if (!decoded) {
+      summary.failed += 1
+      continue
+    }
+    if (bufferListHas(skipKeys, decoded) || relayHasWriter(activeWriters, decoded)) {
+      summary.skipped += 1
+      continue
+    }
+    try {
+      const writerHex = b4a.toString(decoded, 'hex')
+      await relayManager.addWriter(writerHex)
+      summary.added += 1
+    } catch (error) {
+      summary.failed += 1
+      console.warn('[Worker] Failed to add writer from mirror core refs', {
+        relayKey: relayManager?.bootstrap || null,
+        writer: ref.slice(0, 16),
+        reason,
+        error: error?.message || error
+      })
+    }
+  }
+
+  if (summary.added && typeof relay.update === 'function') {
+    try {
+      await relay.update({ wait: true })
+    } catch (_) {
+      try {
+        await relay.update()
+      } catch (error) {
+        console.warn('[Worker] Relay update failed after writer sync', {
+          relayKey: relayManager?.bootstrap || null,
+          reason,
+          error: error?.message || error
+        })
+      }
+    }
+  }
+
+  return summary
+}
+
+async function syncActiveRelayCoreRefs({
+  relayKey,
+  publicIdentifier = null,
+  coreRefs = [],
+  reason = 'mirror-update'
+} = {}) {
+  const normalized = normalizeCoreRefList(coreRefs)
+  if (!relayKey || !normalized.length) {
+    return { status: 'skipped', reason: 'missing-core-refs' }
+  }
+
+  updateRelayMirrorCoreRefs(relayKey, normalized)
+  const fingerprint = coreRefsFingerprint(normalized)
+  if (relayMirrorSyncState.get(relayKey) === fingerprint) {
+    return { status: 'skipped', reason: 'already-synced' }
+  }
+
+  const relayManager = activeRelays.get(relayKey)
+  if (!relayManager?.relay) {
+    return { status: 'skipped', reason: 'relay-not-active' }
+  }
+
+  const manager = await ensureBlindPeeringManager()
+  if (!manager?.started) {
+    return { status: 'skipped', reason: 'blind-peering-unavailable' }
+  }
+
+  const identifier = publicIdentifier || relayManager?.publicIdentifier || null
+  const relayCorestore = relayManager?.store || null
+  manager.ensureRelayMirror({
+    relayKey,
+    publicIdentifier: identifier,
+    autobase: relayManager.relay,
+    coreRefs: normalized,
+    corestore: relayCorestore
+  })
+
+  let primeSummary = null
+  if (typeof manager.primeRelayCoreRefs === 'function') {
+    primeSummary = await manager.primeRelayCoreRefs({
+      relayKey,
+      publicIdentifier: identifier,
+      coreRefs: normalized,
+      timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS,
+      reason,
+      corestore: relayCorestore
+    })
+  }
+
+  const rehydrateSummary = await manager.rehydrateMirrors({
+    reason,
+    timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+  })
+
+  const writerSummary = await ensureRelayWritersFromCoreRefs(relayManager, normalized, reason)
+
+  if (writerSummary?.status === 'ok' || writerSummary?.status === 'read-only') {
+    relayMirrorSyncState.set(relayKey, fingerprint)
+  }
+  return { status: 'ok', primeSummary, rehydrateSummary, writerSummary }
+}
+
+function sanitizeBlindPeerMeta(blindPeer) {
+  if (!blindPeer || typeof blindPeer !== 'object') return null
+  const entry = {}
+  if (blindPeer.publicKey) entry.publicKey = String(blindPeer.publicKey)
+  if (blindPeer.encryptionKey) entry.encryptionKey = String(blindPeer.encryptionKey)
+  if (blindPeer.replicationTopic) entry.replicationTopic = String(blindPeer.replicationTopic)
+  if (Number.isFinite(blindPeer.maxBytes)) entry.maxBytes = blindPeer.maxBytes
+  return Object.keys(entry).length ? entry : null
+}
+
+function blindPeerFingerprint(blindPeer) {
+  if (!blindPeer || typeof blindPeer !== 'object') return ''
+  const maxBytes = Number.isFinite(blindPeer.maxBytes) ? String(blindPeer.maxBytes) : ''
+  return [
+    blindPeer.publicKey || '',
+    blindPeer.encryptionKey || '',
+    blindPeer.replicationTopic || '',
+    maxBytes
+  ].join('|')
+}
+
+function normalizeHttpOrigin(candidate) {
+  if (!candidate || typeof candidate !== 'string') return null
+  const trimmed = candidate.trim()
+  if (!trimmed) return null
+  try {
+    const url = new URL(trimmed)
+    if (url.protocol === 'ws:') url.protocol = 'http:'
+    if (url.protocol === 'wss:') url.protocol = 'https:'
+    return url.origin
+  } catch (_) {
+    return null
+  }
+}
+
+function collectPublicGatewayOrigins() {
+  const origins = new Set()
+  const addOrigin = (candidate) => {
+    const origin = normalizeHttpOrigin(candidate)
+    if (origin) origins.add(origin)
+  }
+
+  const settings = publicGatewaySettings || {}
+  addOrigin(settings.preferredBaseUrl)
+  addOrigin(settings.baseUrl)
+  addOrigin(settings.resolvedWsUrl)
+  addOrigin(publicGatewayStatusCache?.wsBase)
+
+  if (origins.size === 0) {
+    origins.add('https://hypertuna.com')
+  }
+
+  return Array.from(origins)
 }
 
 async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
@@ -298,6 +778,280 @@ async function refreshGatewayRelayRegistry(reason = 'gateway-refresh', options =
   }
 }
 
+async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mirror-refresh' } = {}) {
+  if (!relayKey) {
+    return { status: 'skipped', reason: 'missing-relay-key' }
+  }
+  const fetchImpl = globalThis.fetch
+  if (typeof fetchImpl !== 'function') {
+    return { status: 'skipped', reason: 'fetch-unavailable' }
+  }
+
+  const originList = Array.isArray(origins) && origins.length ? origins : collectPublicGatewayOrigins()
+  const encodedRelay = encodeURIComponent(relayKey)
+  let lastError = null
+
+  for (const origin of originList) {
+    if (!origin) continue
+    const url = `${origin.replace(/\/$/, '')}/api/relays/${encodedRelay}/mirror`
+    const controller = typeof AbortController === 'function' ? new AbortController() : null
+    const timer = controller
+      ? setTimeout(() => controller.abort(), BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS)
+      : null
+    try {
+      const response = await fetchImpl(url, { signal: controller?.signal })
+      if (!response.ok) {
+        lastError = new Error(`status ${response.status}`)
+        continue
+      }
+      const data = await response.json().catch(() => null)
+      if (!data || typeof data !== 'object') {
+        lastError = new Error('invalid-payload')
+        continue
+      }
+      return { status: 'ok', origin, data }
+    } catch (error) {
+      lastError = error
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  if (lastError) {
+    console.warn('[Worker] Mirror metadata fetch failed', {
+      relayKey,
+      reason,
+      error: lastError?.message || lastError
+    })
+  }
+  return { status: 'error', reason: 'mirror-unavailable', error: lastError }
+}
+
+async function fetchAndApplyRelayMirrorMetadata({
+  relayKey,
+  publicIdentifier = null,
+  reason = 'auto-connect',
+  origins = null
+} = {}) {
+  if (!relayKey) {
+    return { status: 'skipped', reason: 'missing-relay-key' }
+  }
+  await ensurePublicGatewaySettingsLoaded()
+  const originList = Array.isArray(origins) && origins.length ? origins : collectPublicGatewayOrigins()
+  const mirrorResult = await fetchRelayMirrorMetadata(relayKey, { origins: originList, reason })
+  if (mirrorResult.status !== 'ok') {
+    return {
+      status: 'error',
+      reason: mirrorResult.reason || 'mirror-unavailable',
+      error: mirrorResult.error || null
+    }
+  }
+  const applyResult = await applyMirrorMetadataToProfile({
+    relayKey,
+    publicIdentifier,
+    mirrorData: mirrorResult.data,
+    origin: mirrorResult.origin,
+    reason
+  })
+  return { status: 'ok', applyResult }
+}
+
+async function applyMirrorMetadataToProfile({
+  relayKey,
+  publicIdentifier = null,
+  mirrorData = null,
+  origin = null,
+  reason = 'mirror-refresh'
+} = {}) {
+  if (!mirrorData || typeof mirrorData !== 'object') {
+    return { status: 'skipped', reason: 'missing-mirror-data' }
+  }
+
+  let profile = relayKey ? await getRelayProfileByKey(relayKey) : null
+  if (!profile && publicIdentifier) {
+    profile = await getRelayProfileByPublicIdentifier(publicIdentifier)
+  }
+  if (!profile) {
+    return { status: 'skipped', reason: 'profile-missing' }
+  }
+
+  const rawCoreRefs = Array.isArray(profile.core_refs || profile.coreRefs)
+    ? (profile.core_refs || profile.coreRefs)
+    : []
+  const existingCoreRefs = normalizeCoreRefList(rawCoreRefs)
+  const mirrorCoreRefs = normalizeMirrorCoreRefs(mirrorData.cores)
+  const extraCoreRefs = normalizeCoreRefList([
+    profile.writer_core,
+    profile.writerCore,
+    profile.writer_core_hex,
+    profile.autobase_local,
+    profile.autobaseLocal
+  ])
+  const mergedCoreRefs = mergeCoreRefLists(existingCoreRefs, mirrorCoreRefs, extraCoreRefs)
+  const mergedFingerprint = coreRefsFingerprint(mergedCoreRefs)
+  const existingFingerprint = coreRefsFingerprint(existingCoreRefs)
+  const nextBlindPeer = sanitizeBlindPeerMeta(mirrorData.blindPeer)
+  const updates = {}
+  let coreRefsChanged = false
+  let blindPeerChanged = false
+  const resolvedRelayKey = profile.relay_key || relayKey || null
+
+  const needsNormalization = rawCoreRefs.some((ref) => {
+    if (!ref) return false
+    if (typeof ref !== 'string') return true
+    const normalized = normalizeCoreRef(ref)
+    return normalized && normalized !== ref.trim()
+  })
+
+  if ((mergedFingerprint && mergedFingerprint !== existingFingerprint) || needsNormalization) {
+    updates.core_refs = mergedCoreRefs
+    coreRefsChanged = true
+  }
+
+  if (nextBlindPeer?.publicKey) {
+    const mergedBlindPeer = {
+      ...(profile.blind_peer || {}),
+      ...nextBlindPeer
+    }
+    if (blindPeerFingerprint(profile.blind_peer) !== blindPeerFingerprint(mergedBlindPeer)) {
+      updates.blind_peer = mergedBlindPeer
+      blindPeerChanged = true
+    }
+  }
+
+  updateRelayMirrorCoreRefs(resolvedRelayKey, mergedCoreRefs)
+  const shouldSyncActive = !!resolvedRelayKey
+    && mergedCoreRefs.length > 0
+    && relayMirrorSyncState.get(resolvedRelayKey) !== mergedFingerprint
+
+  if (!coreRefsChanged && !blindPeerChanged) {
+    if (shouldSyncActive) {
+      await syncActiveRelayCoreRefs({
+        relayKey: resolvedRelayKey,
+        publicIdentifier: profile.public_identifier || publicIdentifier,
+        coreRefs: mergedCoreRefs,
+        reason: `${reason}-mirror-sync`
+      })
+      return {
+        status: 'synced',
+        coreRefs: mergedCoreRefs.length,
+        coreRefsChanged,
+        blindPeerChanged
+      }
+    }
+    return { status: 'skipped', reason: 'no-change', coreRefs: existingCoreRefs.length }
+  }
+
+  const updatedProfile = {
+    ...profile,
+    ...updates,
+    updated_at: new Date().toISOString()
+  }
+  await saveRelayProfile(updatedProfile)
+
+  console.log('[Worker] Relay mirror metadata updated', {
+    relayKey: updatedProfile.relay_key || relayKey,
+    publicIdentifier: updatedProfile.public_identifier || publicIdentifier || null,
+    origin,
+    reason,
+    coreRefs: updates.core_refs ? updates.core_refs.length : existingCoreRefs.length,
+    blindPeerKey: updates.blind_peer?.publicKey
+      ? String(updates.blind_peer.publicKey).slice(0, 16)
+      : profile?.blind_peer?.publicKey
+        ? String(profile.blind_peer.publicKey).slice(0, 16)
+        : null
+  })
+
+  if (shouldSyncActive) {
+    await syncActiveRelayCoreRefs({
+      relayKey: resolvedRelayKey,
+      publicIdentifier: updatedProfile.public_identifier || publicIdentifier,
+      coreRefs: mergedCoreRefs,
+      reason: `${reason}-mirror-sync`
+    })
+  }
+
+  return {
+    status: 'updated',
+    coreRefs: updates.core_refs ? updates.core_refs.length : existingCoreRefs.length,
+    coreRefsChanged,
+    blindPeerChanged
+  }
+}
+
+async function refreshRelayMirrorMetadata(reason = 'periodic') {
+  if (mirrorMetadataRefreshInFlight) return mirrorMetadataRefreshInFlight
+
+  mirrorMetadataRefreshInFlight = (async () => {
+    await ensurePublicGatewaySettingsLoaded()
+    const startedAt = Date.now()
+    lastMirrorMetadataRefreshAt = startedAt
+    const originList = collectPublicGatewayOrigins()
+
+    try {
+      await refreshGatewayRelayRegistry(`${reason}-mirror-registry`)
+    } catch (error) {
+      console.warn('[Worker] Mirror registry refresh failed', {
+        reason,
+        error: error?.message || error
+      })
+    }
+
+    const relayKeys = Array.from(activeRelays.keys())
+      .filter((key) => key && !virtualRelayKeys.has(key))
+    if (!relayKeys.length) {
+      return { status: 'skipped', reason: 'no-relays' }
+    }
+
+    const summary = {
+      reason,
+      total: relayKeys.length,
+      updated: 0,
+      skipped: 0,
+      failed: 0
+    }
+
+    for (const relayKey of relayKeys) {
+      const publicIdentifier = keyToPublic.get(relayKey) || null
+      const mirrorResult = await fetchRelayMirrorMetadata(relayKey, { origins: originList, reason })
+      if (mirrorResult.status !== 'ok') {
+        summary.failed += 1
+        continue
+      }
+      const updateResult = await applyMirrorMetadataToProfile({
+        relayKey,
+        publicIdentifier,
+        mirrorData: mirrorResult.data,
+        origin: mirrorResult.origin,
+        reason
+      })
+      if (updateResult.status === 'updated') {
+        summary.updated += 1
+      } else {
+        summary.skipped += 1
+      }
+    }
+
+    const elapsedMs = Date.now() - startedAt
+    console.log('[Worker] Mirror metadata refresh complete', {
+      reason,
+      total: summary.total,
+      updated: summary.updated,
+      skipped: summary.skipped,
+      failed: summary.failed,
+      elapsedMs
+    })
+
+    return { status: 'ok', ...summary }
+  })()
+
+  try {
+    return await mirrorMetadataRefreshInFlight
+  } finally {
+    mirrorMetadataRefreshInFlight = null
+  }
+}
+
 async function ensurePublicGatewaySettingsLoaded() {
   if (publicGatewaySettings) return publicGatewaySettings
   try {
@@ -365,10 +1119,15 @@ async function seedBlindPeeringMirrors(manager) {
   }
   for (const [relayKey, relayManager] of activeRelays.entries()) {
     if (!relayManager?.relay) continue
+    const storedCoreRefs = await resolveRelayMirrorCoreRefs(
+      relayKey,
+      relayManager?.publicIdentifier || null
+    )
     manager.ensureRelayMirror({
       relayKey,
       publicIdentifier: relayManager?.publicIdentifier || null,
       autobase: relayManager.relay,
+      coreRefs: storedCoreRefs,
       corestore: relayManager.store || null
     })
     attachRelayMirrorHooks(relayKey, relayManager, manager)
@@ -381,17 +1140,24 @@ function attachRelayMirrorHooks(relayKey, relayManager, manager) {
   if (!autobase || typeof autobase.on !== 'function') return
   if (relayMirrorSubscriptions.has(autobase)) return
   const handler = () => {
-    manager.ensureRelayMirror({
+    Promise.resolve(resolveRelayMirrorCoreRefs(
       relayKey,
-      publicIdentifier: relayManager?.publicIdentifier || null,
-      autobase,
-      corestore: relayManager?.store || null
-    })
-    manager.refreshFromBlindPeers('relay-update')
-      .then(() => manager.rehydrateMirrors({
-        reason: 'relay-update',
-        timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
-      }))
+      relayManager?.publicIdentifier || null
+    ))
+      .then((coreRefs) => {
+        manager.ensureRelayMirror({
+          relayKey,
+          publicIdentifier: relayManager?.publicIdentifier || null,
+          autobase,
+          coreRefs,
+          corestore: relayManager?.store || null
+        })
+        return manager.refreshFromBlindPeers('relay-update')
+          .then(() => manager.rehydrateMirrors({
+            reason: 'relay-update',
+            timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+          }))
+      })
       .catch((error) => {
         manager.logger?.warn?.('[BlindPeering] Relay update sync failed', {
           relayKey,
@@ -1712,6 +2478,17 @@ function startHealthLogger(intervalMs = 60000) {
 // Make pipe and sendMessage globally available for the relay server
 global.workerPipe = workerPipe
 global.sendMessage = sendMessage
+global.fetchAndApplyRelayMirrorMetadata = fetchAndApplyRelayMirrorMetadata
+global.resolveRelayMirrorCoreRefs = resolveRelayMirrorCoreRefs
+global.getRelayMirrorCoreRefsCache = getRelayMirrorCoreRefsCache
+global.syncActiveRelayCoreRefs = syncActiveRelayCoreRefs
+global.requestRelaySubscriptionRefresh = async ({ relayKey = null, reason = 'manual' } = {}) => {
+  console.log('[Worker] Subscription refresh requested before relay server ready', {
+    relayKey,
+    reason
+  })
+  return { status: 'skipped', reason: 'relay-server-unavailable' }
+}
 global.onRelayWritable = (payload = {}) => {
   const mode = payload?.mode ? String(payload.mode) : 'unknown'
   console.log('[Worker] Relay writable received; refreshing gateway registry', {
@@ -2227,9 +3004,7 @@ async function handleMessageObject(message) {
                   storagePath: relayCorestore?.__ht_storage_path || null
                 })
                 coreRefs = Array.isArray(data.cores)
-                  ? data.cores
-                      .map((c) => (c && c.key ? String(c.key) : null))
-                      .filter(Boolean)
+                  ? normalizeCoreRefList(data.cores)
                   : []
                 manager.ensureRelayMirror({
                   relayKey: relayIdentifier,
@@ -2348,10 +3123,15 @@ async function handleMessageObject(message) {
           if (manager?.started) {
             const relayManager = relayKey ? activeRelays.get(relayKey) : null
             if (relayManager?.relay) {
+              const storedCoreRefs = await resolveRelayMirrorCoreRefs(
+                relayKey,
+                message?.data?.publicIdentifier || relayManager?.publicIdentifier || null
+              )
               manager.ensureRelayMirror({
                 relayKey,
                 publicIdentifier: message?.data?.publicIdentifier || relayManager?.publicIdentifier || null,
                 autobase: relayManager.relay,
+                coreRefs: storedCoreRefs,
                 corestore: relayManager.store || null
               })
             } else {
@@ -2379,6 +3159,9 @@ async function handleMessageObject(message) {
             error: err?.message || err
           })
         }
+        refreshRelayMirrorMetadata('invite-writer').catch((error) => {
+          console.warn('[Worker] Mirror metadata refresh failed after invite writer:', error?.message || error)
+        })
         return result
       } catch (err) {
         sendMessage({
@@ -2843,6 +3626,9 @@ async function main() {
       await relayServer.initializeRelayServer(config)
       
       console.log('[Worker] Relay server base initialization complete')
+      if (typeof relayServer.requestRelaySubscriptionRefresh === 'function') {
+        global.requestRelaySubscriptionRefresh = relayServer.requestRelaySubscriptionRefresh
+      }
 
       if (pendingRelayRegistryRefresh) {
         refreshGatewayRelayRegistry('relay-server-ready').catch((err) => {
@@ -2964,6 +3750,7 @@ async function main() {
 
     setInterval(() => {
       if (!isShuttingDown) {
+        const now = Date.now()
         // Keep the legacy reconcilation for now, and also refresh mirrors to discover new providers
         reconcileRelayFiles().catch(err => console.error('[Worker] File reconciliation error:', err))
         ensureMirrorsForAllRelays().catch(err => console.error('[Worker] Mirror refresh error:', err))
@@ -2980,6 +3767,11 @@ async function main() {
             .catch(err => {
               console.warn('[Worker] Blind peering periodic sync failed:', err?.message || err)
             })
+        }
+        if (now - lastMirrorMetadataRefreshAt >= BLIND_PEER_MIRROR_METADATA_REFRESH_MS) {
+          refreshRelayMirrorMetadata('periodic').catch((error) => {
+            console.warn('[Worker] Mirror metadata refresh failed:', error?.message || error)
+          })
         }
       }
     }, 60000)

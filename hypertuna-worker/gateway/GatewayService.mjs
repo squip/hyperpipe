@@ -225,6 +225,7 @@ export class GatewayService extends EventEmitter {
     this.publicGatewaySettings = this.#normalizePublicGatewayConfig(options.publicGateway);
     this.publicGatewayRegistrar = null;
     this.publicGatewayRelayState = new Map();
+    this.relayCoreCache = new Map();
     this.blindPeerSummary = null;
     this.blindPeerFallbackState = {
       inflight: null,
@@ -2096,6 +2097,33 @@ export class GatewayService extends EventEmitter {
       addCore(autobase.writer.core || autobase.writer, 'autobase-writer');
     }
 
+    const cached = this.relayCoreCache.get(relayKey) || [];
+    if (!cores.length) {
+      return cached;
+    }
+
+    if (cached.length) {
+      const merged = [];
+      const indexByKey = new Map();
+      const addEntry = (entry) => {
+        if (!entry || !entry.key) return;
+        const existingIndex = indexByKey.get(entry.key);
+        if (existingIndex === undefined) {
+          indexByKey.set(entry.key, merged.length);
+          merged.push({ key: entry.key, role: entry.role ?? null });
+          return;
+        }
+        if (!merged[existingIndex].role && entry.role) {
+          merged[existingIndex] = { ...merged[existingIndex], role: entry.role };
+        }
+      };
+      cached.forEach(addEntry);
+      cores.forEach(addEntry);
+      this.relayCoreCache.set(relayKey, merged);
+      return merged;
+    }
+
+    this.relayCoreCache.set(relayKey, cores);
     return cores;
   }
 

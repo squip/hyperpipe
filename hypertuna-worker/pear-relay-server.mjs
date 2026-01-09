@@ -26,6 +26,7 @@ import {
   getActiveRelays,
   cleanupRelays,
   updateRelaySubscriptions,
+  getRelaySubscriptions,
   getRelayClientSubscriptions,
   updateRelayClientSubscriptions,
   rehydrateRelaySubscriptions,
@@ -104,6 +105,97 @@ function setRelayClientConnectionKey(relayKey, clientId, connectionKey) {
   const previous = map.get(clientId)?.connectionKey || null;
   map.set(clientId, { connectionKey, updatedAt: Date.now() });
   return previous;
+}
+
+function resetSubscriptionTimestamps(snapshot, connectionKey) {
+  if (!snapshot || typeof snapshot !== 'object') return null;
+  if (!snapshot.subscriptions || typeof snapshot.subscriptions !== 'object') return null;
+  const subscriptions = {};
+  for (const [subscriptionId, subscription] of Object.entries(snapshot.subscriptions)) {
+    subscriptions[subscriptionId] = {
+      ...subscription,
+      last_returned_event_timestamp: null
+    };
+  }
+  return {
+    ...snapshot,
+    connection: connectionKey || snapshot.connection || null,
+    subscriptions
+  };
+}
+
+export async function requestRelaySubscriptionRefresh(relayKey, { reason = 'writer-sync' } = {}) {
+  if (!relayKey) {
+    return { status: 'skipped', reason: 'missing-relay-key', total: 0, updated: 0, failed: 0 };
+  }
+  const map = relayClientConnections.get(relayKey);
+  if (!map || map.size === 0) {
+    console.log('[RelayServer] Subscription refresh skipped (no clients)', { relayKey, reason });
+    return { status: 'skipped', reason: 'no-clients', total: 0, updated: 0, failed: 0 };
+  }
+
+  const summary = {
+    status: 'ok',
+    reason,
+    total: map.size,
+    updated: 0,
+    failed: 0
+  };
+
+  for (const [clientId, info] of map.entries()) {
+    const connectionKey = info?.connectionKey || null;
+    if (!connectionKey) continue;
+    let updated = false;
+
+    try {
+      const snapshot = await getRelaySubscriptions(relayKey, connectionKey);
+      const resetSnapshot = resetSubscriptionTimestamps(snapshot, connectionKey);
+      if (resetSnapshot) {
+        await updateRelaySubscriptions(relayKey, connectionKey, resetSnapshot);
+        updated = true;
+      }
+    } catch (error) {
+      summary.failed += 1;
+      console.warn('[RelayServer] Failed to reset connection subscription cursor', {
+        relayKey,
+        connectionKey,
+        reason,
+        error: error?.message || error
+      });
+    }
+
+    if (clientId) {
+      try {
+        const clientSnapshot = await getRelayClientSubscriptions(relayKey, clientId);
+        const resetClient = resetSubscriptionTimestamps(clientSnapshot, connectionKey);
+        if (resetClient) {
+          await updateRelayClientSubscriptions(relayKey, clientId, resetClient);
+          updated = true;
+        }
+      } catch (error) {
+        summary.failed += 1;
+        console.warn('[RelayServer] Failed to reset client subscription cursor', {
+          relayKey,
+          clientId,
+          reason,
+          error: error?.message || error
+        });
+      }
+    }
+
+    if (updated) {
+      summary.updated += 1;
+    }
+  }
+
+  console.log('[RelayServer] Subscription refresh complete', {
+    relayKey,
+    reason,
+    total: summary.total,
+    updated: summary.updated,
+    failed: summary.failed
+  });
+  return summary;
 }
 const lateWriterRecoveryTasks = new Map();
 const BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS = 90000;

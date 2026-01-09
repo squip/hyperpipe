@@ -24,8 +24,8 @@ function normalizeCoreKey(value) {
     const trimmed = value.trim();
     if (!trimmed) return null;
     try {
-      HypercoreId.decode(trimmed);
-      return trimmed;
+      const decoded = HypercoreId.decode(trimmed);
+      return HypercoreId.encode(decoded);
     } catch (_) {
       if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
         try {
@@ -309,10 +309,21 @@ export default class BlindPeeringManager extends EventEmitter {
     }
     const identifier = sanitizeKey(relayContext.relayKey || relayContext.publicIdentifier);
     if (!identifier) return;
+    const existingEntry = this.mirrorTargets.get(`relay:${identifier}`);
+    const mergedContext = { ...relayContext };
+    if (Array.isArray(existingEntry?.coreRefs) && existingEntry.coreRefs.length) {
+      const mergedRefs = Array.from(new Set([
+        ...existingEntry.coreRefs,
+        ...(Array.isArray(relayContext.coreRefs) ? relayContext.coreRefs : [])
+      ].map(normalizeCoreKey).filter(Boolean)));
+      if (mergedRefs.length) {
+        mergedContext.coreRefs = mergedRefs;
+      }
+    }
     const entry = {
       type: 'relay',
       identifier,
-      context: { ...relayContext },
+      context: { ...mergedContext },
       updatedAt: Date.now()
     };
     if (!entry.context.relayKey) {
@@ -339,7 +350,7 @@ export default class BlindPeeringManager extends EventEmitter {
         entry.context.autobaseTarget = autobaseTarget.toString('hex');
       }
     }
-    const coreRefs = this.#collectRelayCoreRefs(relayContext);
+    const coreRefs = this.#collectRelayCoreRefs(mergedContext);
     if (coreRefs.length) {
       entry.coreRefs = coreRefs;
       entry.context.coreRefs = coreRefs;
