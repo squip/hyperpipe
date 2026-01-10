@@ -166,6 +166,8 @@ function resolveHostPeersFromGatewayStatus(status, identifier) {
   if (!status || !identifier) return []
   const peerRelayMap = status?.peerRelayMap
   if (!peerRelayMap || typeof peerRelayMap !== 'object') return []
+  const localPeerKeyRaw = status?.ownPeerPublicKey || config?.swarmPublicKey || deriveSwarmPublicKey(config)
+  const localPeerKey = typeof localPeerKeyRaw === 'string' ? localPeerKeyRaw.trim().toLowerCase() : null
   const candidates = [identifier]
   if (typeof identifier === 'string' && identifier.includes(':')) {
     candidates.push(identifier.replace(':', '/'))
@@ -178,6 +180,7 @@ function resolveHostPeersFromGatewayStatus(status, identifier) {
     const normalized = peers
       .map((key) => String(key || '').trim().toLowerCase())
       .filter(Boolean)
+      .filter((key) => !localPeerKey || key !== localPeerKey)
     if (normalized.length) return normalized
   }
   return []

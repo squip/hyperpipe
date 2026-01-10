@@ -2168,6 +2168,7 @@ export class GatewayService extends EventEmitter {
   }
 
   getStatus() {
+    const ownPeerPublicKey = this.ownPeerPublicKey || this.connectionPool?.getPublicKey?.() || null;
     const peerRelayMap = {};
     for (const [identifier, relay] of this.activeRelays.entries()) {
       peerRelayMap[identifier] = {
@@ -2200,6 +2201,7 @@ export class GatewayService extends EventEmitter {
       hostname: this.config?.hostname || 'localhost',
       startedAt: this.startedAt,
       urls: this.config?.urls || this.gatewayServer?.getServerUrls() || null,
+      ownPeerPublicKey,
       health: this.healthState,
       peers: this.activePeers.length,
       relays: this.activeRelays.size,
