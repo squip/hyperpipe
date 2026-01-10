@@ -6,6 +6,7 @@
 
 // Import from local module if available, otherwise try window object
 import { nobleSecp256k1 } from './crypto-libraries.js';
+import { schnorr as nobleSchnorr } from '@noble/curves/secp256k1';
 import b4a from 'b4a';
 
 export class NostrUtils {
@@ -50,20 +51,23 @@ export class NostrUtils {
      * @returns {string} - Hex-encoded public key (without compression prefix)
      */
     static getPublicKey(privateKey) {
-        // Access nobleSecp256k1 from either the import or window global
+        if (nobleSchnorr?.getPublicKey) {
+            const pubKeyBytes = nobleSchnorr.getPublicKey(privateKey);
+            return this.bytesToHex(pubKeyBytes);
+        }
+
+        // Fallback to local secp implementation if noble schnorr is unavailable
         const secp = nobleSecp256k1;
         if (!secp) {
             throw new Error('Noble Secp256k1 library not available');
         }
-        
+
         // Get the compressed public key (33 bytes)
         const pubKeyBytes = secp.getPublicKey(privateKey, true);
-        
-        // Convert to hex
-        const pubKeyHex = this.bytesToHex(pubKeyBytes);
-        
-        // Remove the compression prefix (first 2 hex chars)
+
+        // Convert to hex and remove the compression prefix (first 2 hex chars)
         // This returns only the x-coordinate (32 bytes = 64 hex chars)
+        const pubKeyHex = this.bytesToHex(pubKeyBytes);
         return pubKeyHex.substring(2);
     }
     
@@ -74,12 +78,6 @@ export class NostrUtils {
      * @returns {Promise<Object>} - Signed event
      */
     static async signEvent(event, privateKey) {
-        // Access nobleSecp256k1 from either the import or window global
-        const secp = nobleSecp256k1;
-        if (!secp) {
-            throw new Error('Noble Secp256k1 library not available');
-        }
-        
         // Prepare the event for signing
         const eventData = JSON.stringify([
             0,
@@ -91,13 +89,21 @@ export class NostrUtils {
         ]);
         
         // Generate the event ID (sha256 returns Uint8Array)
+        const secp = nobleSecp256k1;
+        if (!secp) {
+            throw new Error('Noble Secp256k1 library not available');
+        }
         const hashBytes = await secp.utils.sha256(
             b4a.from(eventData, 'utf8')
         );
         event.id = this.bytesToHex(hashBytes);
         
+        if (!nobleSchnorr?.sign) {
+            throw new Error('Noble Schnorr signer not available');
+        }
+
         // Sign the event (schnorr.sign returns Uint8Array)
-        const sigBytes = await secp.schnorr.sign(event.id, privateKey);
+        const sigBytes = await nobleSchnorr.sign(event.id, privateKey);
         event.sig = this.bytesToHex(sigBytes);
         
         return event;
@@ -110,10 +116,8 @@ export class NostrUtils {
      */
     static async verifySignature(event) {
         try {
-            // Access nobleSecp256k1 from either the import or window global
-            const secp = nobleSecp256k1;
-            if (!secp) {
-                throw new Error('Noble Secp256k1 library not available');
+            if (!nobleSchnorr?.verify) {
+                throw new Error('Noble Schnorr verifier not available');
             }
             
             // Recreate the event ID
@@ -126,6 +130,10 @@ export class NostrUtils {
                 event.content
             ]);
             
+            const secp = nobleSecp256k1;
+            if (!secp) {
+                throw new Error('Noble Secp256k1 library not available');
+            }
             const hashBytes = await secp.utils.sha256(
                 b4a.from(eventData, 'utf8')
             );
@@ -139,7 +147,7 @@ export class NostrUtils {
             // Verify the signature
             // Note: Schnorr signatures in Nostr use x-only pubkeys (32 bytes)
             // So we don't need to add the '02' prefix
-            return await secp.schnorr.verify(
+            return nobleSchnorr.verify(
                 event.sig,
                 event.id,
                 event.pubkey

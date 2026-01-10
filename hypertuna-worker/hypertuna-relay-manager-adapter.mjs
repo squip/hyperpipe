@@ -1668,7 +1668,9 @@ export async function getActiveRelays() {
             description: profile?.description || '',
             connectionUrl: `${buildGatewayWebsocketBase(globalConfig || { proxy_server_address: 'localhost', proxy_websocket_protocol: 'wss' })}/${identifierPath}`,
             createdAt: profile?.created_at || profile?.joined_at || null,
-            isActive: true
+            isActive: true,
+            isOpen: profile?.isOpen === true,
+            isPublic: profile?.isPublic === true
         });
     }
     

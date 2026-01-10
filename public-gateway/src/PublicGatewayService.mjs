@@ -1,11 +1,12 @@
 import http from 'node:http';
 import https from 'node:https';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import express from 'express';
 import WebSocket, { WebSocketServer } from 'ws';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
+import { schnorr } from '@noble/curves/secp256k1';
 
 import {
   EnhancedHyperswarmPool,
@@ -60,6 +61,19 @@ function safeString(value) {
   }
 }
 
+function hexToBytes(hex) {
+  if (typeof hex !== 'string') return null;
+  const normalized = hex.trim();
+  if (!normalized || normalized.length % 2 !== 0 || /[^0-9a-fA-F]/.test(normalized)) {
+    return null;
+  }
+  const bytes = new Uint8Array(normalized.length / 2);
+  for (let i = 0; i < bytes.length; i += 1) {
+    bytes[i] = parseInt(normalized.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
 class PublicGatewayService {
   constructor({ config, logger, tlsOptions = null, registrationStore }) {
     this.config = config;
@@ -67,6 +81,9 @@ class PublicGatewayService {
     this.tlsOptions = tlsOptions;
     this.registrationStore = registrationStore || new MemoryRegistrationStore(config.registration?.cacheTtlSeconds);
     this.sharedSecret = config.registration?.sharedSecret || null;
+    this.openJoinConfig = this.#normalizeOpenJoinConfig(config?.openJoin);
+    this.openJoinChallenges = new Map();
+    this.openJoinLeaseLocks = new Set();
     this.discoveryConfig = config.discovery || {};
     this.explicitSharedSecretVersion = this.discoveryConfig?.sharedSecretVersion || null;
     this.sharedSecretVersion = this.explicitSharedSecretVersion;
@@ -442,6 +459,9 @@ class PublicGatewayService {
     app.post('/api/relays', (req, res) => this.#handleRelayRegistration(req, res));
     app.delete('/api/relays/:relayKey', (req, res) => this.#handleRelayDeletion(req, res));
     app.get('/api/relays/:relayKey/mirror', (req, res) => this.#handleRelayMirrorMetadata(req, res));
+    app.post('/api/relays/:relayKey/open-join/pool', (req, res) => this.#handleOpenJoinPoolUpdate(req, res));
+    app.get('/api/relays/:relayKey/open-join/challenge', (req, res) => this.#handleOpenJoinChallenge(req, res));
+    app.post('/api/relays/:relayKey/open-join', (req, res) => this.#handleOpenJoinRequest(req, res));
 
     app.post('/api/relay-tokens/issue', (req, res) => this.#handleTokenIssue(req, res));
     app.post('/api/relay-tokens/refresh', (req, res) => this.#handleTokenRefresh(req, res));
@@ -512,6 +532,327 @@ class PublicGatewayService {
       canonicalPath,
       aliasPaths: Array.from(aliasSet)
     };
+  }
+
+  #normalizeOpenJoinConfig(raw = {}) {
+    const enabled = raw?.enabled !== false;
+    const poolEntryTtlMs = Number(raw?.poolEntryTtlMs);
+    const challengeTtlMs = Number(raw?.challengeTtlMs);
+    const authWindowSeconds = Number(raw?.authWindowSeconds);
+    const maxPoolSize = Number(raw?.maxPoolSize);
+    return {
+      enabled,
+      poolEntryTtlMs: Number.isFinite(poolEntryTtlMs) && poolEntryTtlMs > 0 ? poolEntryTtlMs : 6 * 60 * 60 * 1000,
+      challengeTtlMs: Number.isFinite(challengeTtlMs) && challengeTtlMs > 0 ? challengeTtlMs : 2 * 60 * 1000,
+      authWindowSeconds: Number.isFinite(authWindowSeconds) && authWindowSeconds > 0 ? authWindowSeconds : 300,
+      maxPoolSize: Number.isFinite(maxPoolSize) && maxPoolSize > 0 ? Math.trunc(maxPoolSize) : 50
+    };
+  }
+
+  #isHexRelayKey(value) {
+    return typeof value === 'string' && /^[0-9a-fA-F]{64}$/.test(value);
+  }
+
+  async #resolveRelayAlias(identifier) {
+    if (!identifier || typeof this.registrationStore?.resolveRelayAlias !== 'function') return null;
+    const candidates = new Set();
+    const addCandidate = (value) => {
+      if (typeof value !== 'string') return;
+      const trimmed = value.trim();
+      if (trimmed) candidates.add(trimmed);
+    };
+
+    addCandidate(identifier);
+    const normalized = this.#normalizePathValue(identifier);
+    if (normalized) {
+      addCandidate(normalized);
+      const colon = this.#toColonIdentifier(normalized);
+      if (colon) addCandidate(colon);
+    }
+
+    for (const candidate of candidates) {
+      // eslint-disable-next-line no-await-in-loop
+      const mapped = await this.registrationStore.resolveRelayAlias(candidate);
+      if (mapped) return mapped;
+    }
+    return null;
+  }
+
+  #collectRelayAliases(registration, relayKey) {
+    const aliases = new Set();
+    const addAlias = (value) => {
+      if (typeof value !== 'string') return;
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      if (relayKey && trimmed === relayKey) return;
+      aliases.add(trimmed);
+    };
+
+    addAlias(registration?.metadata?.identifier);
+    addAlias(registration?.identifier);
+    addAlias(registration?.publicIdentifier);
+
+    const gatewayPath = this.#normalizePathValue(registration?.metadata?.gatewayPath);
+    if (gatewayPath) {
+      addAlias(gatewayPath);
+      const colon = this.#toColonIdentifier(gatewayPath);
+      if (colon) addAlias(colon);
+    }
+
+    const pathAliases = Array.isArray(registration?.metadata?.pathAliases)
+      ? registration.metadata.pathAliases
+      : [];
+    for (const rawAlias of pathAliases) {
+      const normalizedAlias = this.#normalizePathValue(rawAlias);
+      if (!normalizedAlias) continue;
+      addAlias(normalizedAlias);
+      const colon = this.#toColonIdentifier(normalizedAlias);
+      if (colon) addAlias(colon);
+    }
+
+    const connectionUrl = registration?.metadata?.connectionUrl;
+    if (connectionUrl) {
+      try {
+        const parsed = new URL(connectionUrl);
+        const normalizedPath = this.#normalizePathValue(parsed.pathname);
+        if (normalizedPath) {
+          addAlias(normalizedPath);
+          const colon = this.#toColonIdentifier(normalizedPath);
+          if (colon) addAlias(colon);
+        }
+      } catch (_) {}
+    }
+
+    return Array.from(aliases);
+  }
+
+  async #storeRelayAliases(relayKey, registration) {
+    if (!this.#isHexRelayKey(relayKey)) return;
+    if (typeof this.registrationStore?.storeRelayAlias !== 'function') return;
+    const aliases = this.#collectRelayAliases(registration, relayKey);
+    if (!aliases.length) return;
+    for (const alias of aliases) {
+      // eslint-disable-next-line no-await-in-loop
+      await this.registrationStore.storeRelayAlias(alias, relayKey);
+    }
+  }
+
+  #pruneOpenJoinChallenges() {
+    if (!this.openJoinChallenges?.size) return;
+    const now = Date.now();
+    for (const [challenge, entry] of this.openJoinChallenges.entries()) {
+      if (!entry?.expiresAt || entry.expiresAt <= now) {
+        this.openJoinChallenges.delete(challenge);
+      }
+    }
+  }
+
+  #issueOpenJoinChallenge({ relayKey, publicIdentifier }) {
+    this.#pruneOpenJoinChallenges();
+    const now = Date.now();
+    const ttlMs = this.openJoinConfig?.challengeTtlMs || 120000;
+    const challenge = randomBytes(16).toString('hex');
+    const entry = {
+      relayKey,
+      publicIdentifier: publicIdentifier || relayKey,
+      issuedAt: now,
+      expiresAt: now + ttlMs
+    };
+    this.openJoinChallenges.set(challenge, entry);
+    return { challenge, expiresAt: entry.expiresAt };
+  }
+
+  #consumeOpenJoinChallenge(challenge, relayKey) {
+    if (!challenge) return null;
+    this.#pruneOpenJoinChallenges();
+    const entry = this.openJoinChallenges.get(challenge);
+    if (!entry) return null;
+    if (relayKey && entry.relayKey && relayKey !== entry.relayKey) return null;
+    if (entry.expiresAt && entry.expiresAt <= Date.now()) {
+      this.openJoinChallenges.delete(challenge);
+      return null;
+    }
+    this.openJoinChallenges.delete(challenge);
+    return entry;
+  }
+
+  async #resolveOpenJoinRegistration(identifier) {
+    if (!identifier) return null;
+    const aliasRelayKey = this.#resolveRelayKeyFromPath(identifier);
+    if (aliasRelayKey) {
+      const record = await this.registrationStore.getRelay(aliasRelayKey);
+      if (record) return { relayKey: aliasRelayKey, record };
+    }
+
+    const mappedRelayKey = await this.#resolveRelayAlias(identifier);
+    if (mappedRelayKey && this.#isHexRelayKey(mappedRelayKey)) {
+      const record = await this.registrationStore.getRelay(mappedRelayKey);
+      if (record) return { relayKey: mappedRelayKey, record };
+      return null;
+    }
+
+    const target = await this.#resolveRelayTarget(identifier);
+    if (target?.relayKey && this.#isHexRelayKey(target.relayKey)) {
+      const record = await this.registrationStore.getRelay(target.relayKey);
+      if (record) return { relayKey: target.relayKey, record };
+    }
+
+    if (!this.#isHexRelayKey(identifier)) {
+      return null;
+    }
+
+    const direct = await this.registrationStore.getRelay(identifier);
+    if (direct) {
+      return { relayKey: identifier, record: direct };
+    }
+
+    return null;
+  }
+
+  #isOpenJoinAllowed(record) {
+    return record?.metadata?.isOpen === true;
+  }
+
+  #buildOpenJoinMirrorPayload(record, relayKey) {
+    const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
+    const cores = Array.isArray(record?.relayCores) ? record.relayCores : [];
+    return {
+      relayKey,
+      publicIdentifier: record?.metadata?.identifier || relayKey,
+      relayUrl: record?.metadata?.connectionUrl || null,
+      cores,
+      blindPeer: blindPeerInfo && blindPeerInfo.enabled
+        ? {
+            publicKey: blindPeerInfo.publicKey || null,
+            encryptionKey: blindPeerInfo.encryptionKey || null,
+            maxBytes: blindPeerInfo.maxBytes ?? null
+          }
+        : { enabled: false }
+    };
+  }
+
+  #extractTagValue(tags, key) {
+    if (!Array.isArray(tags)) return null;
+    for (const tag of tags) {
+      if (Array.isArray(tag) && tag[0] === key && typeof tag[1] === 'string') {
+        return tag[1];
+      }
+    }
+    return null;
+  }
+
+  #extractTagValues(tags, key) {
+    if (!Array.isArray(tags)) return [];
+    const values = [];
+    for (const tag of tags) {
+      if (Array.isArray(tag) && tag[0] === key && typeof tag[1] === 'string') {
+        values.push(tag[1]);
+      }
+    }
+    return values;
+  }
+
+  async #verifyOpenJoinAuthEvent(event, { challenge, relayKey, publicIdentifier } = {}) {
+    if (!event || typeof event !== 'object') {
+      return { ok: false, error: 'missing-auth-event' };
+    }
+
+    const createdAt = Number(event.created_at);
+    if (!Number.isFinite(createdAt)) {
+      return { ok: false, error: 'missing-created-at' };
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const maxSkew = this.openJoinConfig?.authWindowSeconds || 300;
+    if (Math.abs(now - createdAt) > maxSkew) {
+      return { ok: false, error: 'auth-event-expired' };
+    }
+
+    if (event.kind !== 22242) {
+      return { ok: false, error: 'invalid-auth-kind' };
+    }
+
+    const pubkey = typeof event.pubkey === 'string' ? event.pubkey : null;
+    const sig = typeof event.sig === 'string' ? event.sig : null;
+    if (!pubkey || !sig) {
+      return { ok: false, error: 'missing-auth-signature' };
+    }
+
+    const tags = Array.isArray(event.tags) ? event.tags : [];
+    const challengeTag = this.#extractTagValue(tags, 'challenge');
+    if (!challengeTag || challengeTag !== challenge) {
+      return { ok: false, error: 'challenge-mismatch' };
+    }
+
+    const relayTags = this.#extractTagValues(tags, 'relay');
+    const expectedRelay = this.config?.publicBaseUrl || null;
+    const expectedWs = this.wsBaseUrl || null;
+    const relayMatch = relayTags.some((value) => value === expectedRelay || value === expectedWs);
+    if (!relayMatch) {
+      return { ok: false, error: 'relay-tag-missing' };
+    }
+
+    const hTag = this.#extractTagValue(tags, 'h');
+    if (publicIdentifier && hTag && hTag !== publicIdentifier) {
+      return { ok: false, error: 'identifier-mismatch' };
+    }
+
+    const serialized = JSON.stringify([
+      0,
+      pubkey,
+      createdAt,
+      event.kind,
+      tags,
+      typeof event.content === 'string' ? event.content : ''
+    ]);
+    const computedId = createHash('sha256').update(serialized).digest('hex');
+    if (event.id && event.id !== computedId) {
+      return { ok: false, error: 'auth-event-id-mismatch' };
+    }
+
+    if (!schnorr?.verify) {
+      this.logger?.warn?.('[PublicGateway] Schnorr verify unavailable for open join', {
+        relayKey,
+        publicIdentifier
+      });
+      return { ok: false, error: 'auth-signature-invalid' };
+    }
+
+    const sigBytes = typeof sig === 'string' ? hexToBytes(sig) : sig;
+    const pubkeyBytes = typeof pubkey === 'string' ? hexToBytes(pubkey) : pubkey;
+    const msgBytes = typeof computedId === 'string' ? hexToBytes(computedId) : computedId;
+    if (!sigBytes || !pubkeyBytes || !msgBytes) {
+      this.logger?.warn?.('[PublicGateway] Open join auth signature decode failed', {
+        relayKey,
+        publicIdentifier,
+        pubkeyPrefix: pubkey ? pubkey.slice(0, 12) : null,
+        sigLength: typeof sig === 'string' ? sig.length : null,
+        idPrefix: computedId ? computedId.slice(0, 12) : null
+      });
+      return { ok: false, error: 'auth-signature-invalid' };
+    }
+
+    try {
+      const ok = await schnorr.verify(sigBytes, msgBytes, pubkeyBytes);
+      if (!ok) {
+        this.logger?.warn?.('[PublicGateway] Open join auth signature invalid', {
+          relayKey,
+          publicIdentifier,
+          pubkeyPrefix: pubkey ? pubkey.slice(0, 12) : null,
+          idPrefix: computedId ? computedId.slice(0, 12) : null
+        });
+        return { ok: false, error: 'auth-signature-invalid' };
+      }
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Open join auth signature verify error', {
+        relayKey,
+        publicIdentifier,
+        error: error?.message || error
+      });
+      return { ok: false, error: 'auth-signature-invalid' };
+    }
+
+    return { ok: true, pubkey };
   }
 
   #buildRelayAliasMap(paths = [], relayKey = this.internalRelayKey) {
@@ -2695,6 +3036,24 @@ class PublicGatewayService {
       metadata.gatewayPath = gatewayPath;
     }
 
+    const payloadAliases = Array.isArray(relayPayload?.pathAliases)
+      ? relayPayload.pathAliases
+      : [];
+    if (payloadAliases.length) {
+      const aliasSet = new Set(
+        (Array.isArray(metadata.pathAliases) ? metadata.pathAliases : [])
+          .map((alias) => this.#normalizePathValue(alias))
+          .filter(Boolean)
+      );
+      for (const alias of payloadAliases) {
+        const normalizedAlias = this.#normalizePathValue(alias);
+        if (normalizedAlias) {
+          aliasSet.add(normalizedAlias);
+        }
+      }
+      metadata.pathAliases = Array.from(aliasSet);
+    }
+
     if (typeof relayPayload?.isPublic === 'boolean') {
       metadata.isPublic = relayPayload.isPublic;
     }
@@ -2853,6 +3212,12 @@ class PublicGatewayService {
 
     record.blindPeer = this.#getBlindPeerSummary();
     await this.registrationStore.upsertRelay(relayKey, record);
+    this.#storeRelayAliases(relayKey, record).catch((error) => {
+      this.logger?.warn?.('[PublicGateway] Failed to store relay aliases', {
+        relayKey,
+        error: error?.message || error
+      });
+    });
     this.#syncSessionsWithRelay(relayKey, record);
     this.#markPeerReachable(peerKey, { relayKey, timestamp: now });
     const rawPeerKey = this.#getPeerRawKey(peerKey);
@@ -2926,6 +3291,12 @@ class PublicGatewayService {
     try {
       const upsertPayload = relayCoreMetadata ? { ...registration, relayCores: relayCoreMetadata } : registration;
       await this.registrationStore.upsertRelay(registration.relayKey, upsertPayload);
+      this.#storeRelayAliases(registration.relayKey, upsertPayload).catch((error) => {
+        this.logger?.warn?.('[PublicGateway] Failed to store relay aliases', {
+          relayKey: registration.relayKey,
+          error: error?.message || error
+        });
+      });
       this.logger.info?.('Relay registration accepted', { relayKey: registration.relayKey });
       const hyperbeeInfo = this.#getRelayHostInfo();
       return res.json({
@@ -2999,6 +3370,198 @@ class PublicGatewayService {
         err: error?.message || error
       });
       return res.status(500).json({ error: 'relay-mirror-metadata-unavailable' });
+    }
+  }
+
+  async #handleOpenJoinPoolUpdate(req, res) {
+    if (!this.openJoinConfig?.enabled) {
+      return res.status(503).json({ error: 'open-join-disabled' });
+    }
+    if (!this.sharedSecret) {
+      return res.status(503).json({ error: 'registration-disabled' });
+    }
+
+    const { payload, signature } = req.body || {};
+    if (!this.#verifySignedPayload(payload, signature)) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const relayKey = payload?.relayKey || req.params?.relayKey;
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+
+    const record = await this.registrationStore.getRelay(relayKey);
+    if (!record) {
+      return res.status(404).json({ error: 'relay-not-found' });
+    }
+
+    if (!this.#isOpenJoinAllowed(record)) {
+      return res.status(409).json({ error: 'relay-not-open' });
+    }
+
+    const entriesRaw = Array.isArray(payload?.entries) ? payload.entries : [];
+    const now = Date.now();
+    const ttlMs = this.openJoinConfig?.poolEntryTtlMs || 6 * 60 * 60 * 1000;
+    const maxPool = this.openJoinConfig?.maxPoolSize || 50;
+    const sanitized = [];
+
+    for (const entry of entriesRaw) {
+      if (!entry || typeof entry !== 'object') continue;
+      const writerCore = typeof entry.writerCore === 'string' ? entry.writerCore : null;
+      const writerSecret = typeof entry.writerSecret === 'string' ? entry.writerSecret : null;
+      if (!writerCore || !writerSecret) continue;
+      const issuedAt = Number.isFinite(entry.issuedAt) ? Math.trunc(entry.issuedAt) : now;
+      const expiresAt = Number.isFinite(entry.expiresAt) ? Math.trunc(entry.expiresAt) : (issuedAt + ttlMs);
+      if (expiresAt <= now) continue;
+      sanitized.push({ writerCore, writerSecret, issuedAt, expiresAt });
+      if (sanitized.length >= maxPool) break;
+    }
+
+    await this.registrationStore.storeOpenJoinPool(relayKey, {
+      entries: sanitized,
+      updatedAt: payload?.updatedAt || now
+    });
+
+    this.logger?.info?.('[PublicGateway] Open join pool updated', {
+      relayKey,
+      received: entriesRaw.length,
+      stored: sanitized.length
+    });
+
+    return res.json({
+      status: 'ok',
+      relayKey,
+      stored: sanitized.length
+    });
+  }
+
+  async #handleOpenJoinChallenge(req, res) {
+    if (!this.openJoinConfig?.enabled) {
+      return res.status(503).json({ error: 'open-join-disabled' });
+    }
+    const identifier = req.params?.relayKey;
+    if (!identifier) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+
+    try {
+      const resolved = await this.#resolveOpenJoinRegistration(identifier);
+      if (!resolved) {
+        return res.status(404).json({ error: 'relay-not-found' });
+      }
+      const { relayKey, record } = resolved;
+      if (!this.#isOpenJoinAllowed(record)) {
+        return res.status(403).json({ error: 'relay-not-open' });
+      }
+
+      const publicIdentifier = record?.metadata?.identifier || relayKey;
+      const { challenge, expiresAt } = this.#issueOpenJoinChallenge({ relayKey, publicIdentifier });
+      this.logger?.info?.('[PublicGateway] Open join challenge issued', {
+        relayKey,
+        publicIdentifier
+      });
+      return res.json({
+        relayKey,
+        publicIdentifier,
+        challenge,
+        expiresAt,
+        gateway: this.config?.publicBaseUrl || null
+      });
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Failed to issue open join challenge', {
+        identifier,
+        err: error?.message || error
+      });
+      return res.status(500).json({ error: 'open-join-challenge-unavailable' });
+    }
+  }
+
+  async #handleOpenJoinRequest(req, res) {
+    if (!this.openJoinConfig?.enabled) {
+      return res.status(503).json({ error: 'open-join-disabled' });
+    }
+
+    const identifier = req.params?.relayKey;
+    if (!identifier) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+
+    const authEvent = req.body?.authEvent || req.body?.event || null;
+    if (!authEvent || typeof authEvent !== 'object') {
+      return res.status(400).json({ error: 'missing-auth-event' });
+    }
+
+    try {
+      const resolved = await this.#resolveOpenJoinRegistration(identifier);
+      if (!resolved) {
+        return res.status(404).json({ error: 'relay-not-found' });
+      }
+      const { relayKey, record } = resolved;
+      if (!this.#isOpenJoinAllowed(record)) {
+        return res.status(403).json({ error: 'relay-not-open' });
+      }
+
+      const challengeTag = this.#extractTagValue(authEvent.tags, 'challenge');
+      if (!challengeTag) {
+        return res.status(400).json({ error: 'missing-challenge' });
+      }
+      const challengeEntry = this.#consumeOpenJoinChallenge(challengeTag, relayKey);
+      if (!challengeEntry) {
+        return res.status(401).json({ error: 'invalid-challenge' });
+      }
+
+      const publicIdentifier = record?.metadata?.identifier || relayKey;
+      const verification = await this.#verifyOpenJoinAuthEvent(authEvent, {
+        challenge: challengeTag,
+        relayKey,
+        publicIdentifier
+      });
+      if (!verification.ok) {
+        return res.status(401).json({ error: verification.error || 'auth-invalid' });
+      }
+
+      if (this.openJoinLeaseLocks.has(relayKey)) {
+        return res.status(429).json({ error: 'open-join-busy' });
+      }
+      this.openJoinLeaseLocks.add(relayKey);
+      let lease = null;
+      try {
+        lease = await this.registrationStore.takeOpenJoinLease(relayKey);
+      } finally {
+        this.openJoinLeaseLocks.delete(relayKey);
+      }
+
+      if (!lease) {
+        this.logger?.warn?.('[PublicGateway] Open join lease unavailable', {
+          relayKey,
+          publicIdentifier,
+          identifier
+        });
+        return res.status(409).json({ error: 'open-join-empty' });
+      }
+
+      const mirrorPayload = this.#buildOpenJoinMirrorPayload(record, relayKey);
+      this.logger?.info?.('[PublicGateway] Open join lease issued', {
+        relayKey,
+        publicIdentifier,
+        writerCore: lease.writerCore ? lease.writerCore.slice(0, 16) : null
+      });
+      return res.json({
+        relayKey,
+        publicIdentifier,
+        writerCore: lease.writerCore,
+        writerSecret: lease.writerSecret,
+        issuedAt: lease.issuedAt || null,
+        expiresAt: lease.expiresAt || null,
+        ...mirrorPayload
+      });
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Open join request failed', {
+        identifier,
+        err: error?.message || error
+      });
+      return res.status(500).json({ error: 'open-join-failed' });
     }
   }
 

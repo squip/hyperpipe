@@ -30,7 +30,8 @@
     "dotenv": "^16.4.5",
     "redis": "^4.6.13",
     "helmet": "^7.0.0",
-    "express-rate-limit": "^7.2.0"
+    "express-rate-limit": "^7.2.0",
+    "@noble/curves": "^1.2.0"
   },
   "devDependencies": {
     "eslint": "^8.57.0"

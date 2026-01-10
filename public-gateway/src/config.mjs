@@ -75,6 +75,13 @@ const DEFAULT_CONFIG = {
     dedupeBatchSize: Number(process.env.GATEWAY_BLINDPEER_DEDUPE_BATCH) || 100,
     staleCoreTtlMs: Number(process.env.GATEWAY_BLINDPEER_STALE_TTL_MS) || (7 * 24 * 60 * 60 * 1000),
     trustedPeersPersistPath: process.env.GATEWAY_BLINDPEER_TRUSTED_PATH || null
+  },
+  openJoin: {
+    enabled: process.env.GATEWAY_OPEN_JOIN_ENABLED !== 'false',
+    poolEntryTtlMs: Number(process.env.GATEWAY_OPEN_JOIN_POOL_TTL_MS) || (6 * 60 * 60 * 1000),
+    challengeTtlMs: Number(process.env.GATEWAY_OPEN_JOIN_CHALLENGE_TTL_MS) || (2 * 60 * 1000),
+    authWindowSeconds: Number(process.env.GATEWAY_OPEN_JOIN_AUTH_WINDOW || 300),
+    maxPoolSize: Number(process.env.GATEWAY_OPEN_JOIN_MAX_POOL || 50)
   }
 };
 
@@ -131,6 +138,10 @@ function loadConfig(overrides = {}) {
     blindPeer: {
       ...DEFAULT_CONFIG.blindPeer,
       ...(overrides.blindPeer || {})
+    },
+    openJoin: {
+      ...DEFAULT_CONFIG.openJoin,
+      ...(overrides.openJoin || {})
     }
   };
 

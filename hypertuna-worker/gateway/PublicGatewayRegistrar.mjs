@@ -100,6 +100,19 @@ class PublicGatewayRegistrar {
     return this.#postJson('/api/relay-tokens/revoke', body);
   }
 
+  async updateOpenJoinPool(relayKey, entries = [], options = {}) {
+    if (!this.isEnabled()) return { success: false };
+    if (!relayKey) throw new Error('relayKey is required');
+    const payload = {
+      relayKey,
+      entries: Array.isArray(entries) ? entries : [],
+      updatedAt: options.updatedAt || Date.now()
+    };
+    const body = await this.#signedPayload(payload);
+    const path = `/api/relays/${encodeURIComponent(relayKey)}/open-join/pool`;
+    return this.#postJson(path, body);
+  }
+
   async #postJson(path, body) {
     if (!this.isEnabled()) {
       throw new Error('Public gateway registrar not configured');

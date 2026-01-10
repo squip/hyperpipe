@@ -224,6 +224,9 @@ export class GatewayService extends EventEmitter {
     this.loggerBridge = null;
     this.publicGatewaySettings = this.#normalizePublicGatewayConfig(options.publicGateway);
     this.publicGatewayRegistrar = null;
+    this.openJoinPoolProvider = typeof options.openJoinPoolProvider === 'function'
+      ? options.openJoinPoolProvider
+      : null;
     this.publicGatewayRelayState = new Map();
     this.relayCoreCache = new Map();
     this.blindPeerSummary = null;
@@ -1218,6 +1221,8 @@ export class GatewayService extends EventEmitter {
         });
       }
 
+      await this.#syncOpenJoinPool(relayKey, metadataCopy);
+
       if (this.#isPublicGatewayRelayKey(relayKey)) {
         await this.#registerPublicGatewayVirtualRelay(metadataCopy);
       }
@@ -1767,6 +1772,41 @@ export class GatewayService extends EventEmitter {
       telemetry,
       delegateReqToPeers: !!this.publicGatewaySettings?.delegateReqToPeers
     };
+  }
+
+  async #syncOpenJoinPool(relayKey, metadata) {
+    if (!this.openJoinPoolProvider || !this.publicGatewayRegistrar?.isEnabled?.()) {
+      return;
+    }
+    if (this.#isPublicGatewayRelayKey(relayKey)) {
+      return;
+    }
+    if (!metadata || metadata.isOpen !== true) {
+      return;
+    }
+    try {
+      const result = await this.openJoinPoolProvider({
+        relayKey,
+        publicIdentifier: metadata?.identifier || null,
+        metadata
+      });
+      if (!result) {
+        this.log('debug', `[PublicGateway] Open join pool provider returned no entries relay=${relayKey}`);
+        return;
+      }
+      const entries = Array.isArray(result.entries) ? result.entries : (Array.isArray(result) ? result : []);
+      if (!entries.length) {
+        this.log('debug', `[PublicGateway] Open join pool provider returned empty entries relay=${relayKey}`);
+        return;
+      }
+      const updatedAt = result.updatedAt || Date.now();
+      await this.publicGatewayRegistrar.updateOpenJoinPool(relayKey, entries, { updatedAt });
+      this.log('info', `[PublicGateway] Open join pool updated relay=${relayKey}`, {
+        count: entries.length
+      });
+    } catch (error) {
+      this.log('warn', `[PublicGateway] Open join pool update failed relay=${relayKey}: ${error?.message || error}`);
+    }
   }
 
   async syncPublicGatewayRelay(relayKey, { forceTokenRefresh = true } = {}) {
@@ -2578,6 +2618,10 @@ export class GatewayService extends EventEmitter {
           nextMetadata.isPublic = relayObj.isPublic;
         } else if (nextMetadata.isPublic === undefined) {
           nextMetadata.isPublic = true;
+        }
+
+        if (typeof relayObj.isOpen === 'boolean') {
+          nextMetadata.isOpen = relayObj.isOpen;
         }
 
         if (typeof relayObj.isGatewayReplica === 'boolean') {

@@ -75,6 +75,7 @@ const BLIND_PEER_REHYDRATION_TIMEOUT_MS = 45000
 const BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS = 60000
 const BLIND_PEER_MIRROR_METADATA_REFRESH_MS = 1 * 60 * 1000
 const BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS = 8000
+const OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS = 8000
 
 global.userConfig = {
   storage: defaultStorageDir,
@@ -94,6 +95,14 @@ let mirrorMetadataRefreshInFlight = null
 let relayCoreRefsCacheLoaded = false
 let relayCoreRefsCacheDirty = false
 let relayCoreRefsCacheTimer = null
+const openJoinContexts = new Map()
+const pendingOpenJoinReauth = new Map()
+const OPEN_JOIN_REAUTH_MIN_INTERVAL_MS = 30000
+const OPEN_JOIN_POOL_TARGET_SIZE = 4
+const OPEN_JOIN_POOL_ENTRY_TTL_MS = 6 * 60 * 60 * 1000
+const OPEN_JOIN_POOL_REFRESH_MS = 2 * 60 * 60 * 1000
+const openJoinWriterPoolCache = new Map()
+const openJoinWriterPoolLocks = new Set()
 
 function getGatewayWebsocketProtocol(config) {
   return config?.proxy_websocket_protocol === 'ws' ? 'ws' : 'wss'
@@ -142,9 +151,36 @@ function normalizeGatewayPathFragment(fragment) {
   return trimmed.replace(/^\//, '').replace(/\/+$/, '')
 }
 
+function normalizeRelayKeyHex(value) {
+  const trimmed = typeof value === 'string' ? value.trim() : null
+  if (!trimmed || !isHex64(trimmed)) return null
+  return trimmed.toLowerCase()
+}
+
 function resolveRelayIdentifierPath(identifier) {
   if (!identifier || typeof identifier !== 'string') return null
   return identifier.includes(':') ? identifier.replace(':', '/') : identifier
+}
+
+function resolveHostPeersFromGatewayStatus(status, identifier) {
+  if (!status || !identifier) return []
+  const peerRelayMap = status?.peerRelayMap
+  if (!peerRelayMap || typeof peerRelayMap !== 'object') return []
+  const candidates = [identifier]
+  if (typeof identifier === 'string' && identifier.includes(':')) {
+    candidates.push(identifier.replace(':', '/'))
+  }
+  for (const candidate of candidates) {
+    if (!candidate) continue
+    const entry = peerRelayMap?.[candidate]
+    const peers = Array.isArray(entry?.peers) ? entry.peers : []
+    if (!peers.length) continue
+    const normalized = peers
+      .map((key) => String(key || '').trim().toLowerCase())
+      .filter(Boolean)
+    if (normalized.length) return normalized
+  }
+  return []
 }
 
 function normalizeCoreRef(value) {
@@ -614,6 +650,105 @@ function collectPublicGatewayOrigins() {
   return Array.from(origins)
 }
 
+function pruneOpenJoinPoolEntries(entries = [], now = Date.now()) {
+  return entries.filter((entry) => {
+    if (!entry || typeof entry !== 'object') return false
+    if (!entry.writerCore || !entry.writerSecret) return false
+    if (entry.expiresAt && entry.expiresAt <= now) return false
+    return true
+  })
+}
+
+async function ensureOpenJoinWriterPool({ relayKey, publicIdentifier } = {}) {
+  const key = relayKey || publicIdentifier
+  if (!key) return null
+  if (openJoinWriterPoolLocks.has(key)) return null
+  if (!relayServer?.provisionWriterForInvitee) return null
+
+  openJoinWriterPoolLocks.add(key)
+  try {
+    const profile = relayKey
+      ? await getRelayProfileByKey(relayKey)
+      : await getRelayProfileByPublicIdentifier(publicIdentifier)
+    if (!profile) {
+      console.warn('[Worker] Open join pool skipped: profile not found', {
+        relayKey: relayKey || null,
+        publicIdentifier: publicIdentifier || null
+      })
+      return null
+    }
+    if (profile.isOpen !== true) {
+      console.warn('[Worker] Open join pool skipped: relay not open', {
+        relayKey: relayKey || profile.relay_key || null,
+        publicIdentifier: publicIdentifier || profile.public_identifier || null,
+        isOpen: profile.isOpen
+      })
+      return null
+    }
+
+    const now = Date.now()
+    const cached = openJoinWriterPoolCache.get(key) || { entries: [], updatedAt: 0 }
+    const entries = pruneOpenJoinPoolEntries(cached.entries, now)
+    const stale = !cached.updatedAt || (now - cached.updatedAt) >= OPEN_JOIN_POOL_REFRESH_MS
+    const needed = Math.max(OPEN_JOIN_POOL_TARGET_SIZE - entries.length, 0)
+    const generateCount = needed > 0 ? needed : (stale ? 1 : 0)
+
+    if (generateCount <= 0) {
+      if (cached.entries.length !== entries.length) {
+        openJoinWriterPoolCache.set(key, { ...cached, entries })
+      }
+      console.log('[Worker] Open join pool warm', {
+        relayKey: relayKey || profile.relay_key || null,
+        publicIdentifier: publicIdentifier || profile.public_identifier || null,
+        cached: entries.length,
+        updatedAt: cached.updatedAt || null
+      })
+      return null
+    }
+
+    const newEntries = []
+    for (let i = 0; i < generateCount; i += 1) {
+      const provision = await relayServer.provisionWriterForInvitee({
+        relayKey,
+        publicIdentifier
+      })
+      const writerCore = provision?.writerCore || null
+      const writerSecret = provision?.writerSecret || null
+      if (!writerCore || !writerSecret) continue
+      const issuedAt = Date.now()
+      const expiresAt = issuedAt + OPEN_JOIN_POOL_ENTRY_TTL_MS
+      const entry = { writerCore, writerSecret, issuedAt, expiresAt }
+      entries.push(entry)
+      newEntries.push(entry)
+    }
+
+    if (!newEntries.length) {
+      openJoinWriterPoolCache.set(key, { ...cached, entries })
+      return null
+    }
+
+    const updatedAt = Date.now()
+    openJoinWriterPoolCache.set(key, { entries, updatedAt })
+    console.log('[Worker] Open join pool provisioned', {
+      relayKey: relayKey || profile.relay_key || null,
+      publicIdentifier: publicIdentifier || profile.public_identifier || null,
+      generated: newEntries.length,
+      cached: entries.length,
+      updatedAt
+    })
+    return { entries: newEntries, updatedAt }
+  } catch (error) {
+    console.warn('[Worker] Failed to provision open-join writer pool', {
+      relayKey: relayKey || null,
+      publicIdentifier: publicIdentifier || null,
+      error: error?.message || error
+    })
+    return null
+  } finally {
+    openJoinWriterPoolLocks.delete(key)
+  }
+}
+
 async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
   if (!relayServer?.getActiveRelays) {
     return { entries: [], relayCount: 0 }
@@ -635,8 +770,11 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
         description,
         connectionUrl,
         createdAt,
-        isActive = true
+        isActive = true,
+        isOpen
       } = relay
+
+      const isPublic = typeof relay.isPublic === 'boolean' ? relay.isPublic : isActive !== false
 
       const primaryIdentifier = publicIdentifier || relayKey
       if (!primaryIdentifier) continue
@@ -650,7 +788,8 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
         description,
         gatewayPath: gatewayPath || normalizeGatewayPathFragment(primaryIdentifier),
         connectionUrl: effectiveConnectionUrl,
-        isPublic: isActive !== false,
+        isPublic,
+        isOpen: isOpen === true,
         metadataUpdatedAt: createdAt || null
       }
 
@@ -677,7 +816,8 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
           description,
           gatewayPath: aliasPath || relayKey,
           connectionUrl: aliasConnectionUrl,
-          isPublic: isActive !== false,
+          isPublic,
+          isOpen: isOpen === true,
           metadataUpdatedAt: createdAt || null,
           pathAliases: gatewayPath ? [gatewayPath] : []
         }
@@ -775,6 +915,181 @@ async function refreshGatewayRelayRegistry(reason = 'gateway-refresh', options =
   } catch (error) {
     pendingRelayRegistryRefresh = true
     console.warn('[Worker] Gateway relay registry refresh failed:', error?.message || error)
+  }
+}
+
+async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason = 'open-join' } = {}) {
+  if (!relayIdentifier) {
+    return { status: 'skipped', reason: 'missing-relay-identifier' }
+  }
+  if (!config?.nostr_nsec_hex) {
+    return { status: 'skipped', reason: 'missing-nostr-credentials' }
+  }
+  const fetchImpl = globalThis.fetch
+  if (typeof fetchImpl !== 'function') {
+    return { status: 'skipped', reason: 'fetch-unavailable' }
+  }
+
+  const originList = Array.isArray(origins) && origins.length ? origins : collectPublicGatewayOrigins()
+  console.log('[Worker] Open join bootstrap start', {
+    relayIdentifier,
+    origins: originList,
+    reason
+  })
+  const encodedRelay = encodeURIComponent(relayIdentifier)
+  let lastError = null
+  let authPubkey = null
+
+  try {
+    authPubkey = NostrUtils.getPublicKey(config.nostr_nsec_hex)
+    if (config.nostr_pubkey_hex && authPubkey !== config.nostr_pubkey_hex) {
+      console.warn('[Worker] Open join auth pubkey mismatch; using derived pubkey')
+    }
+  } catch (error) {
+    return { status: 'skipped', reason: 'nostr-pubkey-derivation-failed' }
+  }
+
+  for (const origin of originList) {
+    if (!origin) continue
+    const base = origin.replace(/\/$/, '')
+    const controller = typeof AbortController === 'function' ? new AbortController() : null
+    const timer = controller
+      ? setTimeout(() => controller.abort(), OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS)
+      : null
+    try {
+      const challengeUrl = `${base}/api/relays/${encodedRelay}/open-join/challenge`
+      const challengeResponse = await fetchImpl(challengeUrl, { signal: controller?.signal })
+      if (!challengeResponse.ok) {
+        let body = null
+        try {
+          body = await challengeResponse.text()
+        } catch (_) {}
+        console.warn('[Worker] Open join challenge failed', {
+          relayIdentifier,
+          origin: base,
+          status: challengeResponse.status,
+          body: body ? body.slice(0, 200) : null
+        })
+        lastError = new Error(`challenge status ${challengeResponse.status}`)
+        continue
+      }
+      const challengeData = await challengeResponse.json().catch(() => null)
+      if (!challengeData || typeof challengeData !== 'object') {
+        console.warn('[Worker] Open join challenge invalid payload', {
+          relayIdentifier,
+          origin: base
+        })
+        lastError = new Error('challenge invalid payload')
+        continue
+      }
+      const challenge = challengeData?.challenge || null
+      if (!challenge) {
+        console.warn('[Worker] Open join challenge missing', {
+          relayIdentifier,
+          origin: base
+        })
+        lastError = new Error('challenge missing')
+        continue
+      }
+
+      const publicIdentifier = challengeData?.publicIdentifier || relayIdentifier
+      console.log('[Worker] Open join challenge ok', {
+        relayIdentifier,
+        origin: base,
+        relayKey: challengeData?.relayKey ? String(challengeData.relayKey).slice(0, 16) : null,
+        publicIdentifier,
+        expiresAt: challengeData?.expiresAt || null
+      })
+      const tags = [
+        ['relay', base],
+        ['challenge', challenge]
+      ]
+      if (publicIdentifier) {
+        tags.push(['h', publicIdentifier])
+      }
+      const unsigned = {
+        kind: 22242,
+        created_at: Math.floor(Date.now() / 1000),
+        pubkey: authPubkey,
+        tags,
+        content: ''
+      }
+      const authEvent = await NostrUtils.signEvent(unsigned, config.nostr_nsec_hex)
+      let authVerified = null
+      try {
+        authVerified = await NostrUtils.verifySignature(authEvent)
+      } catch (error) {
+        authVerified = false
+        console.warn('[Worker] Open join auth event verification threw', {
+          relayIdentifier,
+          origin: base,
+          error: error?.message || error
+        })
+      }
+      if (authVerified === false) {
+        console.warn('[Worker] Open join auth event verification failed', {
+          relayIdentifier,
+          origin: base,
+          pubkeyPrefix: authEvent?.pubkey ? String(authEvent.pubkey).slice(0, 12) : null,
+          idPrefix: authEvent?.id ? String(authEvent.id).slice(0, 12) : null,
+          sigPrefix: authEvent?.sig ? String(authEvent.sig).slice(0, 12) : null
+        })
+      }
+      console.log('[Worker] Open join auth event signed', {
+        relayIdentifier,
+        origin: base,
+        verified: authVerified,
+        pubkeyPrefix: authEvent?.pubkey ? String(authEvent.pubkey).slice(0, 12) : null,
+        idPrefix: authEvent?.id ? String(authEvent.id).slice(0, 12) : null,
+        sigPrefix: authEvent?.sig ? String(authEvent.sig).slice(0, 12) : null,
+        tagCount: Array.isArray(authEvent?.tags) ? authEvent.tags.length : 0
+      })
+
+      const joinUrl = `${base}/api/relays/${encodedRelay}/open-join`
+      const joinResponse = await fetchImpl(joinUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ authEvent })
+      })
+      if (!joinResponse.ok) {
+        let body = null
+        try {
+          body = await joinResponse.text()
+        } catch (_) {}
+        console.warn('[Worker] Open join request failed', {
+          relayIdentifier,
+          origin: base,
+          status: joinResponse.status,
+          body: body ? body.slice(0, 200) : null
+        })
+        lastError = new Error(`open-join status ${joinResponse.status}`)
+        continue
+      }
+      const data = await joinResponse.json().catch(() => null)
+      if (!data || typeof data !== 'object') {
+        console.warn('[Worker] Open join response invalid payload', {
+          relayIdentifier,
+          origin: base
+        })
+        lastError = new Error('open-join invalid payload')
+        continue
+      }
+      return {
+        status: 'ok',
+        origin: base,
+        data
+      }
+    } catch (error) {
+      lastError = error
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  return {
+    status: 'error',
+    reason: reason || 'open-join-failed',
+    error: lastError?.message || String(lastError || 'open-join-failed')
   }
 }
 
@@ -1207,7 +1522,8 @@ async function startGatewayService(options = {}) {
     gatewayService = new GatewayService({
       publicGateway: publicGatewaySettings,
       getCurrentPubkey: () => config?.nostr_pubkey_hex || null,
-      getOwnPeerPublicKey: () => config?.swarmPublicKey || deriveSwarmPublicKey(config)
+      getOwnPeerPublicKey: () => config?.swarmPublicKey || deriveSwarmPublicKey(config),
+      openJoinPoolProvider: ensureOpenJoinWriterPool
     })
     global.gatewayService = gatewayService
     gatewayService.on('log', (entry) => {
@@ -1219,6 +1535,9 @@ async function startGatewayService(options = {}) {
         publicGatewayStatusCache = status.publicGateway
       }
       sendMessage({ type: 'gateway-status', status })
+      maybeReauthOpenJoins(status).catch((err) => {
+        console.warn('[Worker] Open join reauth check failed', err?.message || err)
+      })
       const wasRunning = gatewayWasRunning
       gatewayWasRunning = !!status?.running
       if (status?.running) {
@@ -1910,10 +2229,93 @@ function trackRegistrationStatus(message) {
   }
 }
 
+function recordOpenJoinContext({ publicIdentifier, fileSharing, relayKey, relayUrl } = {}) {
+  if (!publicIdentifier) return
+  const current = openJoinContexts.get(publicIdentifier) || { publicIdentifier }
+  openJoinContexts.set(publicIdentifier, {
+    ...current,
+    fileSharing: typeof fileSharing === 'boolean' ? fileSharing : current.fileSharing,
+    relayKey: relayKey ?? current.relayKey ?? null,
+    relayUrl: relayUrl ?? current.relayUrl ?? null
+  })
+}
+
+function trackOpenJoinReauthState(message) {
+  if (!message || typeof message !== 'object') return
+  if (message.type === 'join-auth-success') {
+    const data = message.data || {}
+    const identifier = data.publicIdentifier
+    if (!identifier) return
+    recordOpenJoinContext({
+      publicIdentifier: identifier,
+      relayKey: data.relayKey || null,
+      relayUrl: data.relayUrl || null
+    })
+    if (data.provisional) {
+      const context = openJoinContexts.get(identifier) || { publicIdentifier: identifier }
+      pendingOpenJoinReauth.set(identifier, {
+        ...context,
+        relayKey: data.relayKey || context.relayKey || null,
+        relayUrl: data.relayUrl || context.relayUrl || null,
+        lastAttempt: 0,
+        inFlight: false
+      })
+    } else {
+      pendingOpenJoinReauth.delete(identifier)
+      openJoinContexts.delete(identifier)
+    }
+    return
+  }
+
+  if (message.type === 'join-auth-error') {
+    const identifier = message?.data?.publicIdentifier
+    if (!identifier) return
+    const entry = pendingOpenJoinReauth.get(identifier)
+    if (entry) {
+      pendingOpenJoinReauth.set(identifier, {
+        ...entry,
+        inFlight: false,
+        lastAttempt: Date.now()
+      })
+    }
+  }
+}
+
+async function maybeReauthOpenJoins(status) {
+  if (!relayServer || !pendingOpenJoinReauth.size) return
+  if (!status?.peerRelayMap) return
+  const now = Date.now()
+  for (const [identifier, entry] of pendingOpenJoinReauth.entries()) {
+    if (!identifier || entry?.inFlight) continue
+    if (entry?.lastAttempt && now - entry.lastAttempt < OPEN_JOIN_REAUTH_MIN_INTERVAL_MS) continue
+    const hostPeers = resolveHostPeersFromGatewayStatus(status, identifier)
+    if (!hostPeers.length) continue
+    pendingOpenJoinReauth.set(identifier, { ...entry, inFlight: true, lastAttempt: now })
+    console.log('[Worker] Reauthing open join with host peers', {
+      publicIdentifier: identifier,
+      hostPeersCount: hostPeers.length
+    })
+    try {
+      await relayServer.startJoinAuthentication({
+        publicIdentifier: identifier,
+        fileSharing: entry?.fileSharing !== false,
+        relayKey: entry?.relayKey || undefined,
+        relayUrl: entry?.relayUrl || undefined,
+        hostPeers,
+        openJoin: false
+      })
+    } catch (err) {
+      console.warn('[Worker] Open join reauth attempt failed', err?.message || err)
+      pendingOpenJoinReauth.set(identifier, { ...entry, inFlight: false, lastAttempt: Date.now() })
+    }
+  }
+}
+
 const sendMessage = (message) => {
   if (isShuttingDown) return
 
   trackRegistrationStatus(message)
+  trackOpenJoinReauthState(message)
 
   if (workerPipe) {
     const messageStr = JSON.stringify(message) + '\n'
@@ -2981,20 +3383,125 @@ async function handleMessageObject(message) {
         const data = (message && typeof message === 'object' ? message.data : null) || {}
         const publicIdentifier = data.publicIdentifier
         const fileSharing = data.fileSharing
+        const openJoin = data.openJoin === true
+        const inviteToken = typeof data.token === 'string' ? data.token.trim() : null
         try {
           let hostPeers = Array.isArray(data.hostPeers) ? data.hostPeers : []
-          let coreRefs = []
+          let coreRefs = Array.isArray(data.cores) ? normalizeCoreRefList(data.cores) : []
+          let blindPeer = sanitizeBlindPeerMeta(data.blindPeer)
+          let joinRelayKey = normalizeRelayKeyHex(data.relayKey)
+          let joinRelayUrl = data.relayUrl || null
+          let writerCore = data.writerCore || null
+          let writerSecret = data.writerSecret || null
           hostPeers = hostPeers
             .map((key) => String(key || '').trim().toLowerCase())
             .filter(Boolean)
 
+          if (openJoin && publicIdentifier) {
+            recordOpenJoinContext({
+              publicIdentifier,
+              fileSharing: fileSharing !== false,
+              relayKey: joinRelayKey,
+              relayUrl: joinRelayUrl
+            })
+          }
+
+          if (openJoin && !inviteToken && (!writerCore || !writerSecret)) {
+            const relayIdentifier = joinRelayKey || publicIdentifier
+            if (relayIdentifier) {
+              try {
+                await ensurePublicGatewaySettingsLoaded()
+                const bootstrapResult = await fetchOpenJoinBootstrap(relayIdentifier, { reason: 'open-join' })
+                if (bootstrapResult?.status === 'ok' && bootstrapResult.data) {
+                  const bootstrapData = bootstrapResult.data
+                  const bootstrapBlindPeer = sanitizeBlindPeerMeta(bootstrapData.blindPeer)
+                  const bootstrapCoreRefs = normalizeMirrorCoreRefs(bootstrapData.cores)
+                  const bootstrapRelayKey = normalizeRelayKeyHex(
+                    bootstrapData.relayKey || bootstrapData.relay_key || null
+                  )
+                  if (!joinRelayKey && bootstrapRelayKey) joinRelayKey = bootstrapRelayKey
+                  if (!joinRelayUrl && bootstrapData.relayUrl) joinRelayUrl = String(bootstrapData.relayUrl)
+                  if (!writerCore && bootstrapData.writerCore) writerCore = String(bootstrapData.writerCore)
+                  if (!writerSecret && bootstrapData.writerSecret) writerSecret = String(bootstrapData.writerSecret)
+                  if (!blindPeer && bootstrapBlindPeer) blindPeer = bootstrapBlindPeer
+                  if (!coreRefs.length && bootstrapCoreRefs.length) coreRefs = bootstrapCoreRefs
+                  if (openJoin && publicIdentifier) {
+                    recordOpenJoinContext({
+                      publicIdentifier,
+                      fileSharing: fileSharing !== false,
+                      relayKey: joinRelayKey,
+                      relayUrl: joinRelayUrl
+                    })
+                  }
+                  console.log('[Worker] Open join bootstrap fetched', {
+                    relayIdentifier,
+                    relayKey: joinRelayKey ? String(joinRelayKey).slice(0, 16) : null,
+                    hasWriterCore: !!writerCore,
+                    hasWriterSecret: !!writerSecret,
+                    hasBlindPeer: !!blindPeer
+                  })
+                } else {
+                  console.warn('[Worker] Open join bootstrap unavailable', {
+                    relayIdentifier,
+                    status: bootstrapResult?.status || 'unknown',
+                    reason: bootstrapResult?.reason || null,
+                    error: bootstrapResult?.error || null
+                  })
+                }
+              } catch (err) {
+                console.warn('[Worker] Open join bootstrap failed', err?.message || err)
+              }
+            }
+          }
+
+          if ((!hostPeers || hostPeers.length === 0) && (!blindPeer || !blindPeer.publicKey)) {
+            const relayIdentifier = joinRelayKey || publicIdentifier
+            if (relayIdentifier) {
+              try {
+                await ensurePublicGatewaySettingsLoaded()
+                const mirrorResult = await fetchRelayMirrorMetadata(relayIdentifier, { reason: 'join-flow' })
+                if (mirrorResult?.status === 'ok' && mirrorResult.data) {
+                  const mirrorData = mirrorResult.data
+                  const mirrorBlindPeer = sanitizeBlindPeerMeta(mirrorData.blindPeer)
+                  const mirrorCoreRefs = normalizeMirrorCoreRefs(mirrorData.cores)
+                  const mirrorRelayKey = normalizeRelayKeyHex(
+                    mirrorData.relayKey || mirrorData.relay_key || null
+                  )
+                  if (!joinRelayKey && mirrorRelayKey) joinRelayKey = mirrorRelayKey
+                  if (!blindPeer && mirrorBlindPeer) blindPeer = mirrorBlindPeer
+                  if (!coreRefs.length && mirrorCoreRefs.length) coreRefs = mirrorCoreRefs
+                  if (!writerCore && mirrorData.writerCore) writerCore = String(mirrorData.writerCore)
+                  if (!writerSecret && mirrorData.writerSecret) writerSecret = String(mirrorData.writerSecret)
+                  if (openJoin && publicIdentifier) {
+                    recordOpenJoinContext({
+                      publicIdentifier,
+                      fileSharing: fileSharing !== false,
+                      relayKey: joinRelayKey,
+                      relayUrl: joinRelayUrl
+                    })
+                  }
+                  console.log('[Worker] Mirror metadata fetched for join flow', {
+                    relayIdentifier,
+                    hasBlindPeer: !!blindPeer,
+                    coreRefsCount: coreRefs.length,
+                    relayKey: joinRelayKey ? String(joinRelayKey).slice(0, 16) : null,
+                    coreRefsPreview: coreRefs.slice(0, 3),
+                    origin: mirrorResult?.origin || null
+                  })
+                }
+              } catch (err) {
+                console.warn('[Worker] Failed to fetch mirror metadata for join flow', err?.message || err)
+              }
+            }
+          }
+
           // Blind-peer fallback: if no host peers but mirror info provided, hydrate mirrors and trust the mirror key.
-          if ((!hostPeers || hostPeers.length === 0) && data.blindPeer && data.blindPeer.publicKey) {
+          if ((!hostPeers || hostPeers.length === 0) && blindPeer && blindPeer.publicKey) {
             try {
               const manager = await ensureBlindPeeringManager()
               if (manager) {
-                manager.markTrustedMirrors([data.blindPeer.publicKey])
-                const relayIdentifier = data.relayKey || publicIdentifier
+                manager.markTrustedMirrors([blindPeer.publicKey])
+                const relayIdentifier = joinRelayKey || publicIdentifier
                 const relayCorestore = getRelayCorestore(relayIdentifier, {
                   storageBase: config?.storage || defaultStorageDir
                 })
@@ -3003,9 +3510,6 @@ async function handleMessageObject(message) {
                   corestoreId: relayCorestore?.__ht_id || null,
                   storagePath: relayCorestore?.__ht_storage_path || null
                 })
-                coreRefs = Array.isArray(data.cores)
-                  ? normalizeCoreRefList(data.cores)
-                  : []
                 manager.ensureRelayMirror({
                   relayKey: relayIdentifier,
                   publicIdentifier,
@@ -3046,7 +3550,7 @@ async function handleMessageObject(message) {
                   synced: rehydrateSummary?.synced ?? null,
                   failed: rehydrateSummary?.failed ?? null
                 })
-                hostPeers = [String(data.blindPeer.publicKey).toLowerCase()]
+                hostPeers = [String(blindPeer.publicKey).toLowerCase()]
                 console.log('[Worker] Using blind-peer mirror as host peer for join flow', {
                   relayIdentifier,
                   coreRefsCount: coreRefs.length
@@ -3058,35 +3562,21 @@ async function handleMessageObject(message) {
           }
 
           if (!hostPeers.length) {
-            const status = getGatewayStatus()
-            const peerRelayMap = status?.peerRelayMap
-            const candidates = []
-            if (peerRelayMap && typeof peerRelayMap === 'object') {
-              candidates.push(publicIdentifier)
-              if (typeof publicIdentifier === 'string' && publicIdentifier.includes(':')) {
-                candidates.push(publicIdentifier.replace(':', '/'))
-              }
-            }
-
-            for (const identifier of candidates) {
-              if (!identifier) continue
-              const entry = peerRelayMap?.[identifier]
-              const peers = Array.isArray(entry?.peers) ? entry.peers : []
-              if (peers.length) {
-                hostPeers = peers
-                  .map((key) => String(key || '').trim().toLowerCase())
-                  .filter(Boolean)
-                if (hostPeers.length) break
-              }
-            }
+            hostPeers = resolveHostPeersFromGatewayStatus(getGatewayStatus(), publicIdentifier)
           }
 
           await relayServer.startJoinAuthentication({
             ...data,
             publicIdentifier,
             fileSharing,
+            openJoin,
+            relayKey: joinRelayKey || undefined,
+            relayUrl: joinRelayUrl || undefined,
+            blindPeer,
             hostPeers,
-            coreRefs
+            coreRefs,
+            writerCore,
+            writerSecret
           })
         } catch (err) {
           sendMessage({

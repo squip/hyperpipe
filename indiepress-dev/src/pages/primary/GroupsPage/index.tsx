@@ -273,8 +273,8 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         relayUrl,
         blindPeer: inv.blindPeer,
         cores: inv.cores,
-        writerCore: (inv as any).writerCore,
-        writerSecret: (inv as any).writerSecret
+        writerCore: inv.writerCore,
+        writerSecret: inv.writerSecret
       })
 
       push(toGroup(inv.groupId, relayUrl || inv.relay))

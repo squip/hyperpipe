@@ -110,6 +110,7 @@ type JoinFlowState = {
   expectedWriterActive?: boolean | null
   writableAt?: number | null
   mode?: string | null
+  provisional?: boolean | null
 }
 
 type RelayCreateRequest = {
@@ -180,6 +181,7 @@ type WorkerBridgeContextValue = {
       cores?: { key: string; role?: string | null }[]
       writerCore?: string | null
       writerSecret?: string | null
+      openJoin?: boolean
     }
   ) => Promise<void>
   clearJoinFlow: (publicIdentifier: string) => void
@@ -518,6 +520,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         cores?: { key: string; role?: string | null }[]
         writerCore?: string | null
         writerSecret?: string | null
+        openJoin?: boolean
       }
     ) => {
       if (!isElectron()) throw new Error('Electron IPC unavailable')
@@ -568,6 +571,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       const data: any = {
         publicIdentifier: identifier,
         fileSharing,
+        openJoin: opts?.openJoin === true,
         token: opts?.token,
         relayKey: opts?.relayKey || undefined,
         relayUrl: opts?.relayUrl || undefined,
@@ -582,7 +586,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         publicIdentifier: identifier,
         hasWriterSecret: !!opts?.writerSecret,
         hasWriterCore: !!opts?.writerCore,
-        hostPeersCount: hostPeers?.length || 0
+        hostPeersCount: hostPeers?.length || 0,
+        openJoin: opts?.openJoin === true
       })
 
       await electronIpc.sendToWorker({ type: 'start-join-flow', data })
@@ -904,7 +909,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   relayKey: current?.relayKey ?? null,
                   authToken: current?.authToken ?? null,
                   relayUrl: current?.relayUrl ?? null,
-                  error: null
+                  error: null,
+                  mode: current?.mode ?? null,
+                  provisional: current?.provisional ?? null
                 }
               }
             })
@@ -928,7 +935,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   relayKey: msg?.data?.relayKey || null,
                   authToken: msg?.data?.authToken || null,
                   relayUrl: msg?.data?.relayUrl || null,
-                  error: null
+                  error: null,
+                  mode: msg?.data?.mode ?? current?.mode ?? null,
+                  provisional: msg?.data?.provisional ?? current?.provisional ?? null
                 }
               }
             })
@@ -955,7 +964,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   relayKey: current?.relayKey ?? null,
                   authToken: current?.authToken ?? null,
                   relayUrl: current?.relayUrl ?? null,
-                  error: errorText
+                  error: errorText,
+                  mode: current?.mode ?? null,
+                  provisional: current?.provisional ?? null
                 }
               }
             })

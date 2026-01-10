@@ -150,6 +150,37 @@ const defaultDiscoveryRelays = BIG_RELAY_URLS
 
 const toGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${groupId}` : groupId)
 
+type InviteMirrorMetadata = {
+  blindPeer?: {
+    publicKey?: string | null
+    encryptionKey?: string | null
+    replicationTopic?: string | null
+    maxBytes?: number | null
+  } | null
+  cores?: { key: string; role?: string | null }[]
+} | null
+
+const buildInvitePayload = (args: {
+  token: string
+  relayUrl: string | null
+  relayKey?: string | null
+  meta?: TGroupMetadata | null
+  mirrorMetadata?: InviteMirrorMetadata
+  writerInfo?: { writerCore?: string; writerSecret?: string } | null
+}) => ({
+  relayUrl: args.relayUrl,
+  token: args.token,
+  relayKey: args.relayKey ?? null,
+  isPublic: args.meta?.isPublic !== false,
+  name: args.meta?.name,
+  about: args.meta?.about,
+  fileSharing: args.meta?.isOpen !== false,
+  blindPeer: args.mirrorMetadata?.blindPeer,
+  cores: args.mirrorMetadata?.cores,
+  writerCore: args.writerInfo?.writerCore || null,
+  writerSecret: args.writerInfo?.writerSecret || null
+})
+
 export function GroupsProvider({ children }: { children: ReactNode }) {
   const { pubkey, publish, relayList, nip04Decrypt, nip04Encrypt } = useNostr()
   const { relays: workerRelays, joinFlows, createRelay, sendToWorker } = useWorkerBridge()
@@ -265,6 +296,76 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     },
     [workerRelayUrlMap]
   )
+
+  const getRelayEntryForGroup = useCallback(
+    (groupId: string) => {
+      if (!groupId) return null
+      const candidates = new Set([groupId, groupId.replace(':', '/'), groupId.replace('/', ':')])
+      return (
+        workerRelays.find(
+          (r) =>
+            (r.publicIdentifier && candidates.has(r.publicIdentifier)) ||
+            (r.relayKey && candidates.has(r.relayKey))
+        ) || null
+      )
+    },
+    [workerRelays]
+  )
+
+  const fetchInviteMirrorMetadata = useCallback(async (relayIdentifier: string, resolved?: string | null) => {
+    const origins: string[] = [DEFAULT_PUBLIC_GATEWAY_BASE]
+    if (resolved) {
+      try {
+        const baseUrl = new URL(resolved)
+        baseUrl.protocol = baseUrl.protocol === 'wss:' ? 'https:' : 'http:'
+        const hostOrigin = baseUrl.origin
+        if (!origins.includes(hostOrigin)) {
+          origins.push(hostOrigin)
+        }
+      } catch (_err) {
+        // fall back to default only
+      }
+    }
+
+    for (const origin of origins) {
+      try {
+        const resp = await fetch(`${origin}/api/relays/${encodeURIComponent(relayIdentifier)}/mirror`)
+        if (!resp.ok) {
+          console.warn('[GroupsProvider] Mirror metadata request failed', {
+            origin,
+            status: resp.status,
+            statusText: resp.statusText
+          })
+          continue
+        }
+        const data = await resp.json()
+        const cores = Array.isArray(data?.cores)
+          ? data.cores
+              .filter((c: any) => c && typeof c === 'object' && c.key)
+              .map((c: any) => ({
+                key: String(c.key),
+                role: typeof c.role === 'string' ? c.role : null
+              }))
+          : undefined
+        const blindPeer = data?.blindPeer && typeof data.blindPeer === 'object'
+          ? {
+              publicKey: data.blindPeer.publicKey ?? null,
+              encryptionKey: data.blindPeer.encryptionKey ?? null,
+              replicationTopic: data.blindPeer.replicationTopic ?? null,
+              maxBytes: typeof data.blindPeer.maxBytes === 'number' ? data.blindPeer.maxBytes : null
+            }
+          : undefined
+        return { blindPeer, cores }
+      } catch (err) {
+        console.warn('[GroupsProvider] Failed to fetch relay mirror metadata', {
+          origin,
+          err: err instanceof Error ? err.message : err
+        })
+      }
+    }
+
+    return null
+  }, [])
 
   useEffect(() => {
     setFavoriteGroups(localStorageService.getFavoriteGroups(pubkey))
@@ -1012,14 +1113,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         discoveryGroups.find(
           (g) => g.id === groupId && (!relay || !g.relay || g.relay === relay || g.relay === resolved)
         ) || null
-      const relayEntry = (() => {
-        const candidates = new Set([groupId, groupId.replace(':', '/'), groupId.replace('/', ':')])
-        return workerRelays.find(
-          (r) =>
-            (r.publicIdentifier && candidates.has(r.publicIdentifier)) ||
-            (r.relayKey && candidates.has(r.relayKey))
-        )
-      })()
+      const relayEntry = getRelayEntryForGroup(groupId)
 
       let writerInfo: { writerCore?: string; writerSecret?: string } | null = null
       if (sendToWorker && relayEntry?.relayKey && invitees.length === 1) {
@@ -1046,64 +1140,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      let mirrorMetadata: { blindPeer?: any; cores?: { key: string; role?: string | null }[] } | null = null
-      const fetchMirrorMetadata = async () => {
-        const relayIdentifier = relayEntry?.relayKey || groupId
-        const origins: string[] = [DEFAULT_PUBLIC_GATEWAY_BASE]
-
-        if (resolved) {
-          try {
-            const baseUrl = new URL(resolved)
-            baseUrl.protocol = baseUrl.protocol === 'wss:' ? 'https:' : 'http:'
-            const hostOrigin = baseUrl.origin
-            if (!origins.includes(hostOrigin)) {
-              origins.push(hostOrigin)
-            }
-          } catch (_err) {
-            // fall back to default only
-          }
-        }
-
-        for (const origin of origins) {
-          try {
-            const resp = await fetch(`${origin}/api/relays/${encodeURIComponent(relayIdentifier)}/mirror`)
-            if (!resp.ok) {
-              console.warn('[GroupsProvider] Mirror metadata request failed', {
-                origin,
-                status: resp.status,
-                statusText: resp.statusText
-              })
-              continue
-            }
-            const data = await resp.json()
-            const cores = Array.isArray(data?.cores)
-              ? data.cores
-                  .filter((c: any) => c && typeof c === 'object' && c.key)
-                  .map((c: any) => ({
-                    key: String(c.key),
-                    role: typeof c.role === 'string' ? c.role : null
-                  }))
-              : undefined
-            const blindPeer = data?.blindPeer && typeof data.blindPeer === 'object'
-              ? {
-                  publicKey: data.blindPeer.publicKey ?? null,
-                  encryptionKey: data.blindPeer.encryptionKey ?? null,
-                  replicationTopic: data.blindPeer.replicationTopic ?? null,
-                  maxBytes: typeof data.blindPeer.maxBytes === 'number' ? data.blindPeer.maxBytes : null
-                }
-              : undefined
-            mirrorMetadata = { blindPeer, cores }
-            return
-          } catch (err) {
-            console.warn('[GroupsProvider] Failed to fetch relay mirror metadata', {
-              origin,
-              err: err instanceof Error ? err.message : err
-            })
-          }
-        }
-      }
-
-      await fetchMirrorMetadata()
+      let mirrorMetadata = await fetchInviteMirrorMetadata(relayEntry?.relayKey || groupId, resolved)
 
       // If we created a writer core for this invite, include it in cores so it gets mirrored.
       if (writerInfo?.writerCore) {
@@ -1113,24 +1150,22 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         mirrorMetadata.cores = cores
       }
 
+      const inviteRelayUrl = getBaseRelayUrl(resolved || relay || '') || resolved || relay || null
+
       await Promise.all(
         invitees.map(async (invitee) => {
           const token = randomString(24)
+          const payload = buildInvitePayload({
+            token,
+            relayUrl: inviteRelayUrl,
+            relayKey: relayEntry?.relayKey || null,
+            meta,
+            mirrorMetadata,
+            writerInfo
+          })
           const encryptedPayload = await nip04Encrypt(
             invitee,
-            JSON.stringify({
-              relayUrl: getBaseRelayUrl(resolved || relay || '') || resolved || relay || null,
-              token,
-              relayKey: relayEntry?.relayKey || null,
-              isPublic: meta?.isPublic !== false,
-              name: meta?.name,
-              about: meta?.about,
-              fileSharing: meta?.isOpen !== false,
-              blindPeer: mirrorMetadata?.blindPeer,
-              cores: mirrorMetadata?.cores,
-              writerCore: writerInfo?.writerCore || null,
-              writerSecret: writerInfo?.writerSecret || null
-            })
+            JSON.stringify(payload)
           )
           console.info('[GroupsProvider] Invite payload built', {
             groupId,
@@ -1194,7 +1229,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         })
       )
     },
-    [discoveryGroups, nip04Encrypt, pubkey, publish, resolveRelayUrl, sendToWorker, workerRelays]
+    [discoveryGroups, fetchInviteMirrorMetadata, getRelayEntryForGroup, nip04Encrypt, pubkey, publish, resolveRelayUrl, sendToWorker]
   )
 
   const approveJoinRequest = useCallback(
@@ -1233,14 +1268,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       }
 
       const baseRelayUrl = resolved ? getBaseRelayUrl(resolved) : undefined
-      const relayEntry = (() => {
-        const candidates = new Set([groupId, groupId.replace(':', '/'), groupId.replace('/', ':')])
-        return workerRelays.find(
-          (r) =>
-            (r.publicIdentifier && candidates.has(r.publicIdentifier)) ||
-            (r.relayKey && candidates.has(r.relayKey))
-        )
-      })()
+      const relayEntry = getRelayEntryForGroup(groupId)
 
       let writerInfo: { writerCore?: string; writerSecret?: string } | null = null
       if (sendToWorker && relayEntry?.relayKey) {
@@ -1267,17 +1295,21 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      const payload = {
-        relayUrl: baseRelayUrl || resolved || relay || null,
-        token,
-        relayKey: relayEntry?.relayKey || null,
-        isPublic: meta?.isPublic !== false,
-        name: meta?.name,
-        about: meta?.about,
-        fileSharing: meta?.isOpen !== false,
-        writerCore: writerInfo?.writerCore || null,
-        writerSecret: writerInfo?.writerSecret || null
+      let mirrorMetadata = await fetchInviteMirrorMetadata(relayEntry?.relayKey || groupId, resolved)
+      if (writerInfo?.writerCore) {
+        if (!mirrorMetadata) mirrorMetadata = {}
+        const cores = Array.isArray(mirrorMetadata.cores) ? [...mirrorMetadata.cores] : []
+        cores.push({ key: writerInfo.writerCore, role: 'autobase-writer' })
+        mirrorMetadata.cores = cores
       }
+      const payload = buildInvitePayload({
+        token,
+        relayUrl: baseRelayUrl || resolved || relay || null,
+        relayKey: relayEntry?.relayKey || null,
+        meta,
+        mirrorMetadata,
+        writerInfo
+      })
       console.info('[GroupsProvider] Approval invite payload built', {
         groupId,
         targetPubkey,
@@ -1343,7 +1375,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         return next
       })
     },
-    [discoveryGroups, discoveryRelays, fetchGroupDetail, publish, pubkey, resolveRelayUrl, sendToWorker, workerRelays]
+    [discoveryGroups, discoveryRelays, fetchGroupDetail, fetchInviteMirrorMetadata, getRelayEntryForGroup, nip04Encrypt, publish, pubkey, resolveRelayUrl, sendToWorker]
   )
 
   const rejectJoinRequest = useCallback(

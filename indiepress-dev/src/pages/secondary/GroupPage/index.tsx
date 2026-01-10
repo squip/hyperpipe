@@ -579,6 +579,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     )
   }, [invites, groupId, effectiveGroupRelay])
   const inviteToken = inviteData?.token
+  const hasInviteJoinData =
+    !!inviteData?.token ||
+    !!inviteData?.blindPeer?.publicKey ||
+    (Array.isArray(inviteData?.cores) && inviteData.cores.length > 0) ||
+    !!inviteData?.relayKey ||
+    !!inviteData?.relayUrl
 
   const joinFlow = useMemo(() => {
     const id = groupId || ''
@@ -732,7 +738,9 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     try {
       const relayUrlForJoin = resolvedGroupRelay || effectiveGroupRelay || null
       const relayKey = relayKeyForGroup || null
-      const shouldUseWorkerJoin = isElectron() && isHypertunaGroup
+      const shouldUseWorkerJoin =
+        isElectron() &&
+        (isHypertunaGroup || hasInviteJoinData || !!relayKeyForGroup || !!groupId?.includes(':'))
 
       if (shouldUseWorkerJoin && inviteToken && sendToWorker && pubkey) {
         sendToWorker({
@@ -744,19 +752,20 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       if (shouldUseWorkerJoin) {
         console.info('[GroupPage] Starting worker join with invite data', {
           groupId,
-          hasWriterCore: !!(inviteData as any)?.writerCore,
-          hasWriterSecret: !!(inviteData as any)?.writerSecret,
+          hasWriterCore: !!inviteData?.writerCore,
+          hasWriterSecret: !!inviteData?.writerSecret,
           hasBlindPeer: !!inviteData?.blindPeer
         })
         await startJoinFlow(groupId, {
           fileSharing: isOpenGroup,
+          openJoin: openJoinAllowed,
           token: inviteToken,
           relayKey,
           relayUrl: relayUrlForJoin,
           blindPeer: inviteData?.blindPeer,
           cores: inviteData?.cores,
-          writerCore: (inviteData as any)?.writerCore,
-          writerSecret: (inviteData as any)?.writerSecret
+          writerCore: inviteData?.writerCore,
+          writerSecret: inviteData?.writerSecret
         })
         return
       }
@@ -888,6 +897,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     }
   }, [baseDetail, membershipStatus, membersWithSelf, mockMembersConfig])
   const isOpenGroup = effectiveDetail?.metadata?.isOpen !== false
+  const openJoinAllowed = !!effectiveDetail?.metadata && effectiveDetail.metadata.isOpen !== false
 
   const isAdmin =
     !!pubkey &&
