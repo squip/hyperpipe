@@ -5,6 +5,7 @@ import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import nodeCrypto from 'node:crypto';
 import hypercoreCrypto from 'hypercore-crypto';
+import Corestore from 'corestore';
 import HypercoreId from 'hypercore-id-encoding';
 import { NostrUtils } from './nostr-utils.js';
 import b4a from 'b4a';
@@ -136,6 +137,28 @@ function mergeCoreRefLists(...lists) {
     return merged;
 }
 
+let localCorestoreCounter = 0;
+
+function ensureLocalCorestoreId(store) {
+    if (!store) return null;
+    if (!store.__ht_id) {
+        localCorestoreCounter += 1;
+        store.__ht_id = `local-corestore-${localCorestoreCounter}`;
+    }
+    return store.__ht_id;
+}
+
+function createLocalCorestore(storageDir, relayKey = null) {
+    if (!storageDir) return null;
+    const store = new Corestore(storageDir);
+    ensureLocalCorestoreId(store);
+    store.__ht_storage_path = storageDir;
+    if (relayKey) {
+        store.__ht_relay_key = relayKey;
+    }
+    return store;
+}
+
 function sanitizeBlindPeerMeta(blindPeer) {
     if (!blindPeer || typeof blindPeer !== 'object') return null;
     const entry = {};
@@ -162,6 +185,210 @@ function collectActiveWriterSample(relayManager, limit = 4) {
     return sample;
 }
 
+function validateWriterSecret(writerSecret, { writerCore = null, expectedWriterKey = null } = {}) {
+    if (!writerSecret) {
+        return { valid: false, expectedWriterKey: expectedWriterKey || null };
+    }
+
+    let expectedKey = expectedWriterKey || null;
+    if (!expectedKey && writerCore) {
+        expectedKey = decodeWriterKey(writerCore);
+    }
+    if (!expectedKey) {
+        return { valid: false, expectedWriterKey: null };
+    }
+
+    const secretHex = String(writerSecret).trim();
+    if (!/^[0-9a-fA-F]+$/.test(secretHex)) {
+        return { valid: false, expectedWriterKey: expectedKey };
+    }
+
+    let secretKey = null;
+    try {
+        secretKey = Buffer.from(secretHex, 'hex');
+    } catch (_) {
+        return { valid: false, expectedWriterKey: expectedKey };
+    }
+
+    if (!secretKey || secretKey.length < 32) {
+        return { valid: false, expectedWriterKey: expectedKey };
+    }
+
+    const seedCandidates = [];
+    if (secretKey.length >= 32) seedCandidates.push(secretKey.subarray(0, 32));
+
+    for (const seed of seedCandidates) {
+        try {
+            const candidate = hypercoreCrypto.keyPair(seed);
+            if (candidate?.publicKey && b4a.equals(candidate.publicKey, expectedKey)) {
+                return { valid: true, expectedWriterKey: expectedKey };
+            }
+        } catch (_) {
+            // try next seed
+        }
+    }
+
+    if (secretKey.length === 64) {
+        const candidate = { publicKey: expectedKey, secretKey };
+        if (hypercoreCrypto.validateKeyPair(candidate)) {
+            return { valid: true, expectedWriterKey: expectedKey };
+        }
+    }
+
+    return { valid: false, expectedWriterKey: expectedKey };
+}
+
+function snapshotWriterMaterial(source = {}) {
+    return {
+        writer_secret: source.writer_secret ?? source.writerSecret ?? null,
+        writer_core: source.writer_core ?? source.writerCore ?? null,
+        writer_core_hex: source.writer_core_hex ?? source.writerCoreHex ?? null,
+        autobase_local: source.autobase_local ?? source.autobaseLocal ?? null
+    };
+}
+
+function logWriterMaterialChange({ stage, relayKey, before, after, extra = {} } = {}) {
+    console.log('[RelayAdapter][WriterMaterial] change', {
+        stage,
+        relayKey,
+        before: before || null,
+        after: after || null,
+        ...extra
+    });
+}
+
+function resolveCoreKeyMaterial(core) {
+    if (!core) {
+        return {
+            coreKey: null,
+            signerKey: null,
+            coreKeyHex: null,
+            signerKeyHex: null,
+            writerKey: null,
+            writerCore: null,
+            writerCoreSource: null,
+            coreMatchesSigner: null
+        };
+    }
+
+    const coreKey = decodeWriterKey(core.key || null);
+    const signerKey = decodeWriterKey(core.keyPair?.publicKey || null);
+    const coreKeyHex = coreKey ? b4a.toString(coreKey, 'hex') : null;
+    const signerKeyHex = signerKey ? b4a.toString(signerKey, 'hex') : null;
+    const writerKey = signerKey || coreKey || null;
+    let writerCore = null;
+    if (writerKey) {
+        try {
+            writerCore = HypercoreId.encode(writerKey);
+        } catch (_) {
+            writerCore = null;
+        }
+    }
+    const writerCoreSource = signerKey ? 'signer' : coreKey ? 'core' : null;
+    const coreMatchesSigner = coreKey && signerKey ? b4a.equals(coreKey, signerKey) : null;
+
+    return {
+        coreKey,
+        signerKey,
+        coreKeyHex,
+        signerKeyHex,
+        writerKey,
+        writerCore,
+        writerCoreSource,
+        coreMatchesSigner
+    };
+}
+
+function buildWriterCandidateFromCore(core, label) {
+    if (!core) return null;
+    const keyInfo = resolveCoreKeyMaterial(core);
+    const autobaseLocal = keyInfo.coreKeyHex;
+    const secretKey = core.keyPair?.secretKey || core.secretKey || null;
+    const writerSecret = secretKey
+        ? (typeof secretKey === 'string' ? secretKey : b4a.toString(secretKey, 'hex'))
+        : null;
+
+    if (keyInfo.coreKeyHex && keyInfo.signerKeyHex && keyInfo.coreMatchesSigner === false) {
+        console.warn('[RelayAdapter][WriterMaterial] Core key differs from signer key', {
+            label,
+            coreKeyHex: keyInfo.coreKeyHex,
+            signerKeyHex: keyInfo.signerKeyHex
+        });
+    } else if (!keyInfo.coreKeyHex && keyInfo.signerKeyHex) {
+        console.warn('[RelayAdapter][WriterMaterial] Missing core key for writer candidate', {
+            label,
+            signerKeyHex: keyInfo.signerKeyHex
+        });
+    }
+
+    return {
+        label,
+        writerSecret,
+        writerCore: keyInfo.writerCore,
+        autobaseLocal,
+        coreKeyHex: keyInfo.coreKeyHex,
+        signerKeyHex: keyInfo.signerKeyHex,
+        writerCoreSource: keyInfo.writerCoreSource,
+        coreMatchesSigner: keyInfo.coreMatchesSigner
+    };
+}
+
+function collectWriterMaterialCandidates(relayManager) {
+    const candidates = [];
+    const addCandidate = (core, label) => {
+        const candidate = buildWriterCandidateFromCore(core, label);
+        if (candidate) candidates.push(candidate);
+    };
+    addCandidate(relayManager?.relay?.localWriter?.core || null, 'localWriter');
+    addCandidate(relayManager?.relay?.local || null, 'local');
+    const relayCore = relayManager?.relay?.core || null;
+    if (relayCore && relayCore !== relayManager?.relay?.local) {
+        addCandidate(relayCore, 'relayCore');
+    }
+    return candidates;
+}
+
+function selectValidWriterMaterial(candidates, { relayKey = null, stage = null } = {}) {
+    const inspected = [];
+    let selected = null;
+    let fallback = null;
+
+    for (const candidate of candidates) {
+        if (!candidate) continue;
+        if (!fallback && candidate.autobaseLocal) fallback = candidate;
+        const validation = validateWriterSecret(candidate.writerSecret, {
+            writerCore: candidate.writerCore || candidate.autobaseLocal
+        });
+        inspected.push({
+            label: candidate.label,
+            writerCore: candidate.writerCore,
+            autobaseLocal: candidate.autobaseLocal,
+            writerCoreSource: candidate.writerCoreSource,
+            coreKeyHex: candidate.coreKeyHex,
+            signerKeyHex: candidate.signerKeyHex,
+            coreMatchesSigner: candidate.coreMatchesSigner,
+            hasWriterSecret: !!candidate.writerSecret,
+            writerSecretLen: candidate.writerSecret ? candidate.writerSecret.length : 0,
+            valid: validation.valid
+        });
+        if (validation.valid && !selected) {
+            selected = candidate;
+        }
+    }
+
+    if (stage) {
+        console.log('[RelayAdapter][WriterMaterial] candidate selection', {
+            stage,
+            relayKey,
+            inspected,
+            selected: selected ? selected.label : null,
+            fallback: fallback ? fallback.label : null
+        });
+    }
+
+    return { selected, fallback, inspected };
+}
+
 function applyJoinMetadata(profile, {
     writerSecret = null,
     writerCore = null,
@@ -182,18 +409,241 @@ function applyJoinMetadata(profile, {
     const mergedRefs = mergeCoreRefLists(existingRefs, normalizedRefs);
     const blindPeerMeta = sanitizeBlindPeerMeta(blindPeer);
 
-    if (writerSecret) updated.writer_secret = writerSecret;
-    if (writerCore) updated.writer_core = writerCore;
-    if (!writerCore && expectedHexFull) updated.writer_core_hex = expectedHexFull;
-    if (localKeyHex) updated.autobase_local = localKeyHex;
+    const existingExpectedKey = decodeWriterKey(
+        profile.writer_core ||
+        profile.writerCore ||
+        profile.writer_core_hex ||
+        profile.autobase_local ||
+        null
+    );
+    const existingWriterValid = validateWriterSecret(profile.writer_secret || profile.writerSecret, {
+        expectedWriterKey: existingExpectedKey
+    }).valid;
+    const incomingWriterValid = validateWriterSecret(writerSecret, {
+        writerCore,
+        expectedWriterKey
+    }).valid;
+
+    const shouldUpdateWriterMaterial = incomingWriterValid && !existingWriterValid;
+
+    const beforeWriterSnapshot = shouldUpdateWriterMaterial ? snapshotWriterMaterial(profile) : null;
+
+    if (writerSecret && shouldUpdateWriterMaterial) updated.writer_secret = writerSecret;
+    if (writerCore && shouldUpdateWriterMaterial) updated.writer_core = writerCore;
+    if (!writerCore && localKeyHex && shouldUpdateWriterMaterial) updated.writer_core_hex = localKeyHex;
+    if (localKeyHex && shouldUpdateWriterMaterial) updated.autobase_local = localKeyHex;
     if (blindPeerMeta) updated.blind_peer = blindPeerMeta;
     if (mergedRefs.length) updated.core_refs = mergedRefs;
 
-    if (writerSecret || writerCore || expectedHexFull || localKeyHex || blindPeerMeta || mergedRefs.length) {
+    if (
+        (writerSecret && shouldUpdateWriterMaterial) ||
+        (writerCore && shouldUpdateWriterMaterial) ||
+        (!writerCore && localKeyHex && shouldUpdateWriterMaterial) ||
+        (localKeyHex && shouldUpdateWriterMaterial) ||
+        blindPeerMeta ||
+        mergedRefs.length
+    ) {
         updated.updated_at = new Date().toISOString();
     }
 
+    if (shouldUpdateWriterMaterial && !writerCore && expectedHexFull && !localKeyHex) {
+        console.warn('[RelayAdapter][WriterMaterial] Skipping writer_core_hex update; core key unavailable', {
+            relayKey: profile.relay_key || profile.relayKey || relayManager?.relay?.key || null,
+            expectedWriterHex: expectedHexFull
+        });
+    }
+
+    if (shouldUpdateWriterMaterial) {
+        const afterWriterSnapshot = snapshotWriterMaterial(updated);
+        logWriterMaterialChange({
+            stage: 'join-metadata-update',
+            relayKey: profile.relay_key || profile.relayKey || relayManager?.relay?.key || null,
+            before: beforeWriterSnapshot,
+            after: afterWriterSnapshot,
+            extra: {
+                incomingWriterValid,
+                existingWriterValid,
+                expectedWriterKey: expectedHexFull,
+                localKeyHex
+            }
+        });
+    }
+
     return updated;
+}
+
+function extractLocalWriterProfileFields(relayManager) {
+    const core = relayManager?.relay?.localWriter?.core
+        || relayManager?.relay?.local
+        || relayManager?.relay?.core
+        || null;
+    if (!core) {
+        return { writerSecret: null, writerCore: null, autobaseLocal: null };
+    }
+
+    const keyInfo = resolveCoreKeyMaterial(core);
+    const autobaseLocal = keyInfo.coreKeyHex;
+    const writerCore = keyInfo.writerCore;
+
+    const secretKey = core.keyPair?.secretKey || core.secretKey || null;
+    const writerSecret = secretKey
+        ? (typeof secretKey === 'string' ? secretKey : b4a.toString(secretKey, 'hex'))
+        : null;
+
+    return {
+        writerSecret,
+        writerCore,
+        autobaseLocal,
+        coreKeyHex: keyInfo.coreKeyHex,
+        signerKeyHex: keyInfo.signerKeyHex,
+        writerCoreSource: keyInfo.writerCoreSource,
+        coreMatchesSigner: keyInfo.coreMatchesSigner
+    };
+}
+
+async function recoverLocalWriterMaterial({ relayKey, profile, config, preferBootstrapLocal = false }) {
+    const attempts = [];
+    if (profile?.relay_storage) {
+        const localStore = createLocalCorestore(profile.relay_storage, relayKey);
+        if (localStore) {
+            attempts.push({ source: 'local-storage', store: localStore });
+        }
+    }
+
+    const sharedStore = getRelayCorestore(relayKey, { storageBase: config?.storage || null });
+    if (sharedStore && typeof sharedStore.get === 'function') {
+        attempts.push({ source: 'shared-storage', store: sharedStore });
+    }
+
+    const profileAutobaseKey = decodeWriterKey(profile?.autobase_local || null);
+    const profileCoreHexKey = decodeWriterKey(profile?.writer_core_hex || null);
+    const profileWriterCoreKey = decodeWriterKey(profile?.writer_core || profile?.writerCore || null);
+    let localKey = profileAutobaseKey || profileCoreHexKey || null;
+    const profileLocalKey = localKey;
+    const legacyWriterCoreKey = !localKey && profileWriterCoreKey ? profileWriterCoreKey : null;
+
+    if (!localKey) {
+        console.warn('[RelayAdapter][WriterMaterial] No autobase local key stored; will rely on bootstrap lookup', {
+            relayKey,
+            hasWriterCore: !!profileWriterCoreKey,
+            hasWriterCoreHex: !!profileCoreHexKey
+        });
+    }
+
+    for (const attempt of attempts) {
+        const relayCorestore = attempt.store;
+        if (!relayCorestore || typeof relayCorestore.get !== 'function') continue;
+
+        let resolvedLocalKey = localKey;
+        if (preferBootstrapLocal || !resolvedLocalKey) {
+            const bootstrapKey = decodeWriterKey(relayKey);
+            if (bootstrapKey) {
+                try {
+                    const bootstrapCore = relayCorestore.get({ key: bootstrapKey, compat: false, active: false });
+                    await bootstrapCore.ready();
+                    const storedLocal = await bootstrapCore.getUserData('autobase/local');
+                    if (storedLocal) {
+                        const bootstrapHex = b4a.toString(storedLocal, 'hex');
+                        const profileHex = resolvedLocalKey ? b4a.toString(resolvedLocalKey, 'hex') : null;
+                        if (!resolvedLocalKey || !b4a.equals(storedLocal, resolvedLocalKey)) {
+                            console.warn('[RelayAdapter] Autobase local key mismatch; preferring bootstrap local', {
+                                relayKey,
+                                source: attempt.source,
+                                preferBootstrapLocal,
+                                profileAutobaseLocal: profileHex,
+                                bootstrapAutobaseLocal: bootstrapHex
+                            });
+                        }
+                        resolvedLocalKey = storedLocal;
+                    }
+                } catch (error) {
+                    console.warn('[RelayAdapter] Failed to read autobase/local metadata for writer recovery', {
+                        relayKey,
+                        source: attempt.source,
+                        error: error?.message || error
+                    });
+                }
+            }
+        }
+
+        if (!resolvedLocalKey && legacyWriterCoreKey) {
+            resolvedLocalKey = legacyWriterCoreKey;
+            console.warn('[RelayAdapter][WriterMaterial] Falling back to writer_core as autobase local key (legacy profile)', {
+                relayKey,
+                source: attempt.source,
+                writerCoreHex: b4a.toString(legacyWriterCoreKey, 'hex')
+            });
+        }
+
+        if (!resolvedLocalKey) continue;
+
+        try {
+            const localCore = relayCorestore.get({ key: resolvedLocalKey, compat: false, active: false });
+            await localCore.ready();
+            const secretKey = localCore?.keyPair?.secretKey || localCore?.secretKey || null;
+            if (!secretKey) {
+                continue;
+            }
+            const writerSecret = typeof secretKey === 'string' ? secretKey : b4a.toString(secretKey, 'hex');
+            const autobaseLocal = b4a.toString(resolvedLocalKey, 'hex');
+            const keyInfo = resolveCoreKeyMaterial(localCore);
+            let writerCore = keyInfo.writerCore;
+            let writerCoreSource = keyInfo.writerCoreSource;
+            let signerKeyHex = keyInfo.signerKeyHex;
+
+            if (!writerCore && secretKey) {
+                const secretBuf = Buffer.isBuffer(secretKey) ? secretKey : Buffer.from(secretKey);
+                if (secretBuf.length >= 32) {
+                    try {
+                        const candidate = hypercoreCrypto.keyPair(secretBuf.subarray(0, 32));
+                        if (candidate?.publicKey) {
+                            writerCore = HypercoreId.encode(candidate.publicKey);
+                            signerKeyHex = b4a.toString(candidate.publicKey, 'hex');
+                            writerCoreSource = 'derived-secret';
+                        }
+                    } catch (_) {
+                        // ignore
+                    }
+                }
+            }
+
+            const usedLegacyWriterCore = legacyWriterCoreKey && resolvedLocalKey
+                ? b4a.equals(resolvedLocalKey, legacyWriterCoreKey)
+                : false;
+            console.log('[RelayAdapter][WriterMaterial] Recovered local writer core material', {
+                relayKey,
+                source: attempt.source,
+                resolvedLocalKey: autobaseLocal,
+                coreKeyHex: keyInfo.coreKeyHex,
+                signerKeyHex,
+                writerCoreSource,
+                coreMatchesSigner: keyInfo.coreMatchesSigner,
+                usedLegacyWriterCore
+            });
+            return {
+                writerSecret,
+                writerCore,
+                autobaseLocal,
+                source: attempt.source,
+                corestore: relayCorestore,
+                preferBootstrapLocal,
+                profileAutobaseLocal: profileLocalKey ? b4a.toString(profileLocalKey, 'hex') : null,
+                coreKeyHex: keyInfo.coreKeyHex,
+                signerKeyHex,
+                writerCoreSource,
+                coreMatchesSigner: keyInfo.coreMatchesSigner,
+                usedLegacyWriterCore
+            };
+        } catch (error) {
+            console.warn('[RelayAdapter] Failed to recover local writer material from corestore', {
+                relayKey,
+                source: attempt.source,
+                error: error?.message || error
+            });
+        }
+    }
+
+    return null;
 }
 
 export async function getRelayMetadata(relayKey, publicIdentifier = null) {
@@ -411,9 +861,18 @@ export async function createRelay(options = {}) {
         // Create relay manager instance
         const relayManager = new RelayManager(defaultStorageDir, null);
         await relayManager.initialize();
-        
+
         const relayKey = relayManager.getPublicKey();
         activeRelays.set(relayKey, relayManager);
+
+        const localWriterInfo = extractLocalWriterProfileFields(relayManager);
+        const writerCandidates = collectWriterMaterialCandidates(relayManager);
+        const writerSelection = selectValidWriterMaterial(writerCandidates, {
+            relayKey,
+            stage: 'create-relay'
+        });
+        const selectedWriterInfo = writerSelection.selected || null;
+        const fallbackWriterInfo = writerSelection.fallback || null;
         
         // Generate public identifier
         const npub = config.nostr_npub || (config.nostr_pubkey_hex ? 
@@ -453,6 +912,73 @@ export async function createRelay(options = {}) {
                 auth_removes: []
             }
         };
+
+        const beforeWriterSnapshot = snapshotWriterMaterial(profileInfo);
+
+        if (selectedWriterInfo?.writerSecret) {
+            profileInfo.writer_secret = selectedWriterInfo.writerSecret;
+            if (selectedWriterInfo.writerCore) {
+                profileInfo.writer_core = selectedWriterInfo.writerCore;
+            } else if (selectedWriterInfo.autobaseLocal) {
+                profileInfo.writer_core_hex = selectedWriterInfo.autobaseLocal;
+            }
+        } else if (fallbackWriterInfo?.autobaseLocal) {
+            profileInfo.writer_core_hex = fallbackWriterInfo.autobaseLocal;
+        }
+        if (selectedWriterInfo?.autobaseLocal) {
+            profileInfo.autobase_local = selectedWriterInfo.autobaseLocal;
+        } else if (fallbackWriterInfo?.autobaseLocal) {
+            profileInfo.autobase_local = fallbackWriterInfo.autobaseLocal;
+        }
+
+        const afterWriterSnapshot = snapshotWriterMaterial(profileInfo);
+        logWriterMaterialChange({
+            stage: 'create-relay-profile',
+            relayKey,
+            before: beforeWriterSnapshot,
+            after: afterWriterSnapshot,
+            extra: {
+                selectedWriter: selectedWriterInfo ? selectedWriterInfo.label : null,
+                selectedWriterMeta: selectedWriterInfo
+                    ? {
+                        writerCore: selectedWriterInfo.writerCore,
+                        autobaseLocal: selectedWriterInfo.autobaseLocal,
+                        coreKeyHex: selectedWriterInfo.coreKeyHex,
+                        signerKeyHex: selectedWriterInfo.signerKeyHex,
+                        writerCoreSource: selectedWriterInfo.writerCoreSource,
+                        coreMatchesSigner: selectedWriterInfo.coreMatchesSigner
+                    }
+                    : null,
+                fallbackWriter: fallbackWriterInfo ? fallbackWriterInfo.label : null,
+                fallbackWriterMeta: fallbackWriterInfo
+                    ? {
+                        writerCore: fallbackWriterInfo.writerCore,
+                        autobaseLocal: fallbackWriterInfo.autobaseLocal,
+                        coreKeyHex: fallbackWriterInfo.coreKeyHex,
+                        signerKeyHex: fallbackWriterInfo.signerKeyHex,
+                        writerCoreSource: fallbackWriterInfo.writerCoreSource,
+                        coreMatchesSigner: fallbackWriterInfo.coreMatchesSigner
+                    }
+                    : null,
+                extractedLocalWriter: snapshotWriterMaterial(localWriterInfo),
+                extractedLocalWriterMeta: localWriterInfo
+                    ? {
+                        coreKeyHex: localWriterInfo.coreKeyHex,
+                        signerKeyHex: localWriterInfo.signerKeyHex,
+                        writerCoreSource: localWriterInfo.writerCoreSource,
+                        coreMatchesSigner: localWriterInfo.coreMatchesSigner
+                    }
+                    : null
+            }
+        });
+
+        if (!selectedWriterInfo?.writerSecret) {
+            console.warn('[RelayAdapter] Writer material not persisted (invalid or missing); relying on recovery', {
+                relayKey,
+                selectedWriter: selectedWriterInfo ? selectedWriterInfo.label : null,
+                fallbackWriter: fallbackWriterInfo ? fallbackWriterInfo.label : null
+            });
+        }
         
         // Save relay profile
         const saved = await saveRelayProfile(profileInfo);
@@ -1283,20 +1809,116 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
             );
         }
 
-        const storedWriterSecret = profile.writer_secret || profile.writerSecret || null;
-        const storedWriterCore =
+        let storedWriterSecret = profile.writer_secret || profile.writerSecret || null;
+        let storedWriterCore =
             profile.writer_core ||
             profile.writerCore ||
             profile.writer_core_hex ||
             profile.autobase_local ||
             null;
-        const storedExpectedWriter =
+        let storedExpectedWriter =
             profile.autobase_local ||
             profile.writer_core_hex ||
             profile.writer_core ||
             null;
         let storedBlindPeer = profile.blind_peer || profile.blindPeer || null;
         const initialCoreRefs = normalizeCoreRefs(profile.core_refs || profile.coreRefs);
+
+        const expectedWriterKey = decodeWriterKey(storedWriterCore || storedExpectedWriter || null);
+        let storedWriterValid = false;
+        let storedWriterInvalid = false;
+        if (storedWriterSecret) {
+            storedWriterValid = validateWriterSecret(storedWriterSecret, {
+                expectedWriterKey,
+                writerCore: storedWriterCore || storedExpectedWriter || null
+            }).valid;
+            if (!storedWriterValid) {
+                const beforeWriterSnapshot = snapshotWriterMaterial(profile);
+                const afterWriterSnapshot = {
+                    ...beforeWriterSnapshot,
+                    writer_secret: null
+                };
+                logWriterMaterialChange({
+                    stage: 'auto-connect-invalid-stored-writer',
+                    relayKey,
+                    before: beforeWriterSnapshot,
+                    after: afterWriterSnapshot,
+                    extra: {
+                        expectedWriterKey: expectedWriterKey ? b4a.toString(expectedWriterKey, 'hex') : null
+                    }
+                });
+                console.warn('[RelayAdapter] Stored writer secret invalid; discarding before auto-connect', {
+                    relayKey
+                });
+                storedWriterInvalid = true;
+                storedWriterSecret = null;
+            }
+        }
+
+        let recoveredCorestore = null;
+        if (!storedWriterSecret) {
+            const recovered = await recoverLocalWriterMaterial({
+                relayKey,
+                profile,
+                config,
+                preferBootstrapLocal: storedWriterInvalid
+            });
+            if (recovered?.writerSecret) {
+                const recoveredValid = validateWriterSecret(recovered.writerSecret, {
+                    expectedWriterKey: decodeWriterKey(recovered.writerCore || recovered.autobaseLocal || null)
+                }).valid;
+                if (recoveredValid) {
+                    const beforeWriterSnapshot = snapshotWriterMaterial(profile);
+                    storedWriterSecret = recovered.writerSecret;
+                    storedWriterCore = recovered.writerCore || recovered.autobaseLocal || storedWriterCore;
+                    storedExpectedWriter = recovered.autobaseLocal || storedExpectedWriter;
+                    storedWriterValid = true;
+                    recoveredCorestore = recovered.source === 'local-storage' ? recovered.corestore : null;
+
+                    const updatedProfile = { ...profile };
+                    updatedProfile.writer_secret = recovered.writerSecret;
+                    if (recovered.writerCore && recovered.writerCore !== updatedProfile.writer_core) {
+                        updatedProfile.writer_core = recovered.writerCore;
+                    } else if (recovered.autobaseLocal && !updatedProfile.writer_core_hex) {
+                        updatedProfile.writer_core_hex = recovered.autobaseLocal;
+                    }
+                    if (recovered.autobaseLocal && recovered.autobaseLocal !== updatedProfile.autobase_local) {
+                        updatedProfile.autobase_local = recovered.autobaseLocal;
+                    }
+                    updatedProfile.updated_at = new Date().toISOString();
+                    await saveRelayProfile(updatedProfile);
+                    profile = updatedProfile;
+                    const afterWriterSnapshot = snapshotWriterMaterial(updatedProfile);
+                    logWriterMaterialChange({
+                        stage: 'auto-connect-recovered-writer',
+                        relayKey,
+                        before: beforeWriterSnapshot,
+                        after: afterWriterSnapshot,
+                        extra: {
+                            source: recovered.source || null,
+                            preferBootstrapLocal: recovered.preferBootstrapLocal,
+                            profileAutobaseLocal: recovered.profileAutobaseLocal,
+                            recoveredCoreKeyHex: recovered.coreKeyHex || null,
+                            recoveredSignerKeyHex: recovered.signerKeyHex || null,
+                            recoveredWriterCoreSource: recovered.writerCoreSource || null,
+                            recoveredCoreMatchesSigner: recovered.coreMatchesSigner,
+                            usedLegacyWriterCore: recovered.usedLegacyWriterCore || false
+                        }
+                    });
+                    console.log('[RelayAdapter] Restored local writer secret for auto-connect', {
+                        relayKey,
+                        writerCore: recovered.writerCore ? recovered.writerCore.slice(0, 16) : null,
+                        autobaseLocal: recovered.autobaseLocal ? recovered.autobaseLocal.slice(0, 16) : null,
+                        source: recovered.source || null
+                    });
+                } else {
+                    console.warn('[RelayAdapter] Recovered writer secret failed validation; skipping', {
+                        relayKey,
+                        source: recovered.source || null
+                    });
+                }
+            }
+        }
 
         let mirrorFetchStatus = 'skipped';
         if (typeof global.fetchAndApplyRelayMirrorMetadata === 'function') {
@@ -1340,9 +1962,14 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
         const allowPrefetch = !!storedBlindPeer
             && (mirrorFetchStatus === 'ok' || cachedCoreRefs.length > 0);
 
+        const prefersLocalCorestore = storedWriterValid && !!profile.relay_storage;
         let relayCorestore = null;
         if (storedBlindPeer) {
-            relayCorestore = getRelayCorestore(relayKey, { storageBase: config?.storage || null });
+            if (prefersLocalCorestore) {
+                relayCorestore = recoveredCorestore || createLocalCorestore(profile.relay_storage, relayKey);
+            } else {
+                relayCorestore = getRelayCorestore(relayKey, { storageBase: config?.storage || null });
+            }
         }
 
         if (storedBlindPeer && mergedCoreRefs.length && allowPrefetch) {
@@ -1419,7 +2046,7 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
             expectedWriterKey: storedExpectedWriter,
             blindPeer: storedBlindPeer,
             coreRefs: mergedCoreRefs,
-            useSharedCorestore: !!relayCorestore,
+            useSharedCorestore: !prefersLocalCorestore && !!relayCorestore,
             corestore: relayCorestore
         });
 
