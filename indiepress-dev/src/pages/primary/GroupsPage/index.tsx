@@ -274,6 +274,8 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         blindPeer: inv.blindPeer,
         cores: inv.cores,
         writerCore: inv.writerCore,
+        writerCoreHex: inv.writerCoreHex,
+        autobaseLocal: inv.autobaseLocal,
         writerSecret: inv.writerSecret
       })
 

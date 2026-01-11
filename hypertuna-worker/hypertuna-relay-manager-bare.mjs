@@ -4,6 +4,8 @@
 import Corestore from 'corestore';
 import Hyperswarm from 'hyperswarm';
 import NostrRelay from './hypertuna-relay-event-processor.mjs';
+import Hypercore from 'hypercore';
+import hypercoreCaps from 'hypercore/lib/caps.js';
 import b4a from 'b4a';
 import c from 'compact-encoding';
 import Protomux from 'protomux';
@@ -13,6 +15,8 @@ import { NostrUtils } from './nostr-utils.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import { promises as fs } from 'node:fs';
+
+const { DEFAULT_NAMESPACE } = hypercoreCaps;
 
 // File locking utility to handle concurrent access
 const fileLocks = new Map();
@@ -170,6 +174,9 @@ export class RelayManager {
 
         await this.ensureAutobaseLocalKey().catch((error) => {
           console.warn('[RelayManager] Failed to inspect autobase/local metadata', error?.message || error);
+        });
+        await this.ensureLocalWriterManifest().catch((error) => {
+          console.warn('[RelayManager] Failed to ensure local writer manifest', error?.message || error);
         });
         
         if (this.keyPair || this.expectedWriterKey) {
@@ -369,26 +376,61 @@ export class RelayManager {
 
       const expectedHex = b4a.toString(this.expectedWriterKey, 'hex');
       const keyPairHex = b4a.toString(this.keyPair.publicKey, 'hex');
+      const manifestVersion = Number.isInteger(this.store?.manifestVersion)
+        ? this.store.manifestVersion
+        : 0;
+      let derivedCoreKey = null;
+      let derivedCoreHex = null;
+      let derivedMatchesExpected = null;
+      try {
+        derivedCoreKey = Hypercore.key(this.keyPair.publicKey, {
+          compat: false,
+          version: manifestVersion,
+          namespace: DEFAULT_NAMESPACE
+        });
+        derivedCoreHex = b4a.toString(derivedCoreKey, 'hex');
+        derivedMatchesExpected = b4a.equals(derivedCoreKey, this.expectedWriterKey);
+      } catch (error) {
+        console.warn('[RelayManager] Failed to derive core key from signer for autobase/local check', {
+          relayKey: this.bootstrap,
+          error: error?.message || error,
+          manifestVersion
+        });
+      }
       const bootstrapCore = this.store.get({ key: this.bootstrap, compat: false, active: false });
       await bootstrapCore.ready();
       const storedLocal = await bootstrapCore.getUserData('autobase/local');
       const storedHex = storedLocal ? b4a.toString(storedLocal, 'hex') : null;
       const matchesExpected = storedLocal ? b4a.equals(storedLocal, this.expectedWriterKey) : null;
-      const matchesKeyPair = expectedHex === keyPairHex;
       console.log('[RelayManager] Autobase local key metadata', {
         relayKey: this.bootstrap,
         storedLocal: storedHex ? storedHex.slice(0, 16) : null,
         expectedWriter: expectedHex.slice(0, 16),
         keyPairPublic: keyPairHex.slice(0, 16),
+        derivedCore: derivedCoreHex ? derivedCoreHex.slice(0, 16) : null,
+        derivedMatchesExpected,
+        manifestVersion,
         matchesExpected,
-        matchesKeyPair
+        matchesKeyPair: derivedMatchesExpected
       });
 
-      if (!matchesKeyPair) {
-        console.warn('[RelayManager] Skipping autobase/local override (keyPair does not match expected writer)', {
+      if (!derivedCoreKey) {
+        console.warn('[RelayManager] Skipping autobase/local override (unable to derive core key from signer)', {
           relayKey: this.bootstrap,
           expectedWriter: expectedHex.slice(0, 16),
-          keyPairPublic: keyPairHex.slice(0, 16)
+          keyPairPublic: keyPairHex.slice(0, 16),
+          manifestVersion
+        });
+        return;
+      }
+
+      if (derivedMatchesExpected === false) {
+        console.warn('[RelayManager] Skipping autobase/local override (keyPair does not match expected writer core)', {
+          relayKey: this.bootstrap,
+          expectedWriter: expectedHex.slice(0, 16),
+          keyPairPublic: keyPairHex.slice(0, 16),
+          derivedCore: derivedCoreHex ? derivedCoreHex.slice(0, 16) : null,
+          manifestVersion
         });
         return;
       }
@@ -414,6 +456,148 @@ export class RelayManager {
           relayKey: this.bootstrap,
           localKey: storedHex ? storedHex.slice(0, 16) : null
         });
+      }
+    }
+
+    async ensureLocalWriterManifest() {
+      if (!this.store) return;
+      if (!this.expectedWriterKey || !this.keyPair?.publicKey) {
+        console.log('[RelayManager] Local writer manifest check skipped (missing expected writer or keyPair)', {
+          relayKey: this.bootstrap,
+          hasExpectedWriter: !!this.expectedWriterKey,
+          hasKeyPair: !!this.keyPair?.publicKey
+        });
+        return;
+      }
+
+      const expectedHex = b4a.toString(this.expectedWriterKey, 'hex');
+      const keyPairHex = b4a.toString(this.keyPair.publicKey, 'hex');
+      const manifestVersion = Number.isInteger(this.store?.manifestVersion)
+        ? this.store.manifestVersion
+        : 0;
+      let derivedCoreKey = null;
+      let derivedCoreHex = null;
+      try {
+        derivedCoreKey = Hypercore.key(this.keyPair.publicKey, {
+          compat: false,
+          version: manifestVersion,
+          namespace: DEFAULT_NAMESPACE
+        });
+        derivedCoreHex = b4a.toString(derivedCoreKey, 'hex');
+      } catch (error) {
+        console.warn('[RelayManager] Failed to derive core key for manifest pre-open', {
+          relayKey: this.bootstrap,
+          error: error?.message || error,
+          manifestVersion
+        });
+        return;
+      }
+
+      const derivedMatchesExpected = b4a.equals(derivedCoreKey, this.expectedWriterKey);
+      if (!derivedMatchesExpected) {
+        console.warn('[RelayManager] Skipping manifest pre-open (derived core key mismatch)', {
+          relayKey: this.bootstrap,
+          expectedWriter: expectedHex.slice(0, 16),
+          derivedCore: derivedCoreHex.slice(0, 16),
+          keyPairPublic: keyPairHex.slice(0, 16),
+          manifestVersion
+        });
+        return;
+      }
+
+      const manifest = {
+        version: manifestVersion,
+        hash: 'blake2b',
+        allowPatch: false,
+        quorum: 1,
+        signers: [{
+          signature: 'ed25519',
+          namespace: DEFAULT_NAMESPACE,
+          publicKey: this.keyPair.publicKey
+        }],
+        prologue: null
+      };
+
+      let core = null;
+      try {
+        core = this.store.get({
+          key: this.expectedWriterKey,
+          keyPair: this.keyPair,
+          manifest,
+          compat: false,
+          active: false
+        });
+      } catch (error) {
+        console.warn('[RelayManager] Failed to open local writer core for manifest check', {
+          relayKey: this.bootstrap,
+          error: error?.message || error
+        });
+        return;
+      }
+
+      try {
+        await core.ready();
+      } catch (error) {
+        console.warn('[RelayManager] Local writer core ready() failed during manifest check', {
+          relayKey: this.bootstrap,
+          error: error?.message || error
+        });
+        return;
+      }
+
+      const hasManifest = !!core.manifest;
+      const coreKeyHex = core.key ? b4a.toString(core.key, 'hex') : null;
+      const coreKeyMatchesExpected = core.key
+        ? b4a.equals(core.key, this.expectedWriterKey)
+        : null;
+      const coreKeyPairHex = core.keyPair?.publicKey ? b4a.toString(core.keyPair.publicKey, 'hex') : null;
+      const coreKeyPairMatches = core.keyPair?.publicKey
+        ? b4a.equals(core.keyPair.publicKey, this.keyPair.publicKey)
+        : null;
+
+      console.log('[RelayManager] Local writer core manifest inspection', {
+        relayKey: this.bootstrap,
+        expectedWriter: expectedHex.slice(0, 16),
+        derivedCore: derivedCoreHex.slice(0, 16),
+        coreKey: coreKeyHex ? coreKeyHex.slice(0, 16) : null,
+        coreKeyMatchesExpected,
+        hasManifest,
+        coreKeyPair: coreKeyPairHex ? coreKeyPairHex.slice(0, 16) : null,
+        coreKeyPairMatches,
+        manifestVersion
+      });
+
+      if (!hasManifest) {
+        try {
+          await core.setManifest(manifest);
+          console.log('[RelayManager] Local writer core manifest set', {
+            relayKey: this.bootstrap,
+            expectedWriter: expectedHex.slice(0, 16),
+            manifestVersion
+          });
+        } catch (error) {
+          console.warn('[RelayManager] Failed to set local writer manifest', {
+            relayKey: this.bootstrap,
+            error: error?.message || error,
+            manifestVersion
+          });
+        }
+      }
+
+      if (!core.keyPair?.secretKey || coreKeyPairMatches === false) {
+        try {
+          core.setKeyPair(this.keyPair);
+          console.log('[RelayManager] Local writer core keyPair updated', {
+            relayKey: this.bootstrap,
+            expectedWriter: expectedHex.slice(0, 16),
+            manifestVersion
+          });
+        } catch (error) {
+          console.warn('[RelayManager] Failed to update local writer core keyPair', {
+            relayKey: this.bootstrap,
+            error: error?.message || error
+          });
+        }
       }
     }
 

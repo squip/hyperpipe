@@ -47,11 +47,12 @@ export default class Autobee extends Autobase {
   }
 
   // Add this method to properly clean up when the instance is no longer needed
-  close() {
+  async close() {
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
     }
-    // Add any other necessary cleanup logic here
+    return await super.close();
   }
 
   static async apply (batch, view, base) {

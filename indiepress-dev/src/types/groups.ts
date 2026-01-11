@@ -44,6 +44,8 @@ export type TGroupInvite = {
   relayUrl?: string | null
   relayKey?: string | null
   writerCore?: string | null
+  writerCoreHex?: string | null
+  autobaseLocal?: string | null
   writerSecret?: string | null
   blindPeer?: {
     publicKey?: string | null

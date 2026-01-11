@@ -604,22 +604,22 @@ export class GatewayService extends EventEmitter {
 
   #resolveRelayAuth(relayKey, requestingPubkey) {
     if (!relayKey || !requestingPubkey) return null;
-    const relayData = this.activeRelays.get(relayKey);
-    if (!relayData) return null;
-
     const authStore = getRelayAuthStore();
     const candidateIdentifiers = new Set([relayKey]);
 
-    const metadataIdentifier = relayData.metadata?.identifier;
-    if (metadataIdentifier) {
-      candidateIdentifiers.add(metadataIdentifier);
-    }
+    const relayData = this.activeRelays.get(relayKey);
+    if (relayData) {
+      const metadataIdentifier = relayData.metadata?.identifier;
+      if (metadataIdentifier) {
+        candidateIdentifiers.add(metadataIdentifier);
+      }
 
-    const metadataGatewayPath = relayData.metadata?.gatewayPath;
-    if (metadataGatewayPath && typeof metadataGatewayPath === 'string') {
-      const normalizedPath = this._normalizeRelayIdentifier(metadataGatewayPath);
-      if (normalizedPath) {
-        candidateIdentifiers.add(normalizedPath);
+      const metadataGatewayPath = relayData.metadata?.gatewayPath;
+      if (metadataGatewayPath && typeof metadataGatewayPath === 'string') {
+        const normalizedPath = this._normalizeRelayIdentifier(metadataGatewayPath);
+        if (normalizedPath) {
+          candidateIdentifiers.add(normalizedPath);
+        }
       }
     }
 
@@ -632,6 +632,30 @@ export class GatewayService extends EventEmitter {
     }
 
     return null;
+  }
+
+  #resolveConnectionAuthToken(connData, identifier) {
+    if (!connData) return null;
+    const relayKey = identifier || connData.relayKey;
+    if (!relayKey) return connData.authToken || null;
+
+    const requestingPubkey = this.getCurrentPubkey?.() || null;
+    const authResolution = requestingPubkey ? this.#resolveRelayAuth(relayKey, requestingPubkey) : null;
+    const resolvedToken = authResolution?.token || null;
+
+    if (resolvedToken && resolvedToken !== connData.authToken) {
+      const prevToken = connData.authToken;
+      connData.authToken = resolvedToken;
+      this.log('debug', '[PublicGateway] Updated connection auth token from store', {
+        connectionKey: connData.connectionKey,
+        relayKey,
+        authIdentifier: authResolution?.identifier || null,
+        prevTokenPreview: prevToken ? `${prevToken.slice(0, 8)}...` : null,
+        nextTokenPreview: `${resolvedToken.slice(0, 8)}...`
+      });
+    }
+
+    return resolvedToken || connData.authToken || null;
   }
 
   #recordRelayToken(relayKey, info, { schedule = true } = {}) {
@@ -3556,13 +3580,14 @@ export class GatewayService extends EventEmitter {
     }
 
     const outboundMessage = typeof rawMessage === 'string' ? rawMessage : rawMessage?.toString?.() ?? '';
+    const authToken = this.#resolveConnectionAuthToken(connData, identifier);
     const responses = await forwardMessageToPeerHyperswarm(
       healthyPeer.publicKey,
       identifier,
       outboundMessage,
       connData.connectionKey,
       this.connectionPool,
-      connData.authToken
+      authToken
     );
 
     if (subscriptionId) {
@@ -3691,7 +3716,7 @@ export class GatewayService extends EventEmitter {
           identifier,
           connectionKey,
           this.connectionPool,
-          connectionData.authToken
+          this.#resolveConnectionAuthToken(connectionData, identifier)
         );
 
         for (const event of events) {

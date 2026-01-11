@@ -180,6 +180,8 @@ type WorkerBridgeContextValue = {
       } | null
       cores?: { key: string; role?: string | null }[]
       writerCore?: string | null
+      writerCoreHex?: string | null
+      autobaseLocal?: string | null
       writerSecret?: string | null
       openJoin?: boolean
     }
@@ -519,6 +521,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         } | null
         cores?: { key: string; role?: string | null }[]
         writerCore?: string | null
+        writerCoreHex?: string | null
+        autobaseLocal?: string | null
         writerSecret?: string | null
         openJoin?: boolean
       }
@@ -578,6 +582,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         blindPeer: opts?.blindPeer,
         cores: opts?.cores,
         writerCore: opts?.writerCore,
+        writerCoreHex: opts?.writerCoreHex,
+        autobaseLocal: opts?.autobaseLocal,
         writerSecret: opts?.writerSecret
       }
       if (hostPeers && hostPeers.length) data.hostPeers = hostPeers
@@ -586,6 +592,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         publicIdentifier: identifier,
         hasWriterSecret: !!opts?.writerSecret,
         hasWriterCore: !!opts?.writerCore,
+        hasWriterCoreHex: !!opts?.writerCoreHex,
+        hasAutobaseLocal: !!opts?.autobaseLocal,
         hostPeersCount: hostPeers?.length || 0,
         openJoin: opts?.openJoin === true
       })

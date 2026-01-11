@@ -716,11 +716,19 @@ async function ensureOpenJoinWriterPool({ relayKey, publicIdentifier } = {}) {
         publicIdentifier
       })
       const writerCore = provision?.writerCore || null
+      const writerCoreHex = provision?.writerCoreHex || provision?.autobaseLocal || null
       const writerSecret = provision?.writerSecret || null
       if (!writerCore || !writerSecret) continue
       const issuedAt = Date.now()
       const expiresAt = issuedAt + OPEN_JOIN_POOL_ENTRY_TTL_MS
-      const entry = { writerCore, writerSecret, issuedAt, expiresAt }
+      const entry = {
+        writerCore,
+        writerCoreHex,
+        autobaseLocal: writerCoreHex,
+        writerSecret,
+        issuedAt,
+        expiresAt
+      }
       entries.push(entry)
       newEntries.push(entry)
     }
@@ -3396,6 +3404,15 @@ async function handleMessageObject(message) {
           let joinRelayUrl = data.relayUrl || null
           let writerCore = data.writerCore || null
           let writerSecret = data.writerSecret || null
+          let writerCoreHex =
+            data.writerCoreHex ||
+            data.writer_core_hex ||
+            data.autobaseLocal ||
+            data.autobase_local ||
+            null
+          let autobaseLocal = data.autobaseLocal || data.autobase_local || null
+          if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
+          if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
           hostPeers = hostPeers
             .map((key) => String(key || '').trim().toLowerCase())
             .filter(Boolean)
@@ -3425,6 +3442,12 @@ async function handleMessageObject(message) {
                   if (!joinRelayKey && bootstrapRelayKey) joinRelayKey = bootstrapRelayKey
                   if (!joinRelayUrl && bootstrapData.relayUrl) joinRelayUrl = String(bootstrapData.relayUrl)
                   if (!writerCore && bootstrapData.writerCore) writerCore = String(bootstrapData.writerCore)
+                  if (!writerCoreHex && (bootstrapData.writerCoreHex || bootstrapData.writer_core_hex)) {
+                    writerCoreHex = String(bootstrapData.writerCoreHex || bootstrapData.writer_core_hex)
+                  }
+                  if (!autobaseLocal && (bootstrapData.autobaseLocal || bootstrapData.autobase_local)) {
+                    autobaseLocal = String(bootstrapData.autobaseLocal || bootstrapData.autobase_local)
+                  }
                   if (!writerSecret && bootstrapData.writerSecret) writerSecret = String(bootstrapData.writerSecret)
                   if (!blindPeer && bootstrapBlindPeer) blindPeer = bootstrapBlindPeer
                   if (!coreRefs.length && bootstrapCoreRefs.length) coreRefs = bootstrapCoreRefs
@@ -3440,6 +3463,8 @@ async function handleMessageObject(message) {
                     relayIdentifier,
                     relayKey: joinRelayKey ? String(joinRelayKey).slice(0, 16) : null,
                     hasWriterCore: !!writerCore,
+                    hasWriterCoreHex: !!writerCoreHex,
+                    hasAutobaseLocal: !!autobaseLocal,
                     hasWriterSecret: !!writerSecret,
                     hasBlindPeer: !!blindPeer
                   })
@@ -3474,6 +3499,12 @@ async function handleMessageObject(message) {
                   if (!blindPeer && mirrorBlindPeer) blindPeer = mirrorBlindPeer
                   if (!coreRefs.length && mirrorCoreRefs.length) coreRefs = mirrorCoreRefs
                   if (!writerCore && mirrorData.writerCore) writerCore = String(mirrorData.writerCore)
+                  if (!writerCoreHex && (mirrorData.writerCoreHex || mirrorData.writer_core_hex)) {
+                    writerCoreHex = String(mirrorData.writerCoreHex || mirrorData.writer_core_hex)
+                  }
+                  if (!autobaseLocal && (mirrorData.autobaseLocal || mirrorData.autobase_local)) {
+                    autobaseLocal = String(mirrorData.autobaseLocal || mirrorData.autobase_local)
+                  }
                   if (!writerSecret && mirrorData.writerSecret) writerSecret = String(mirrorData.writerSecret)
                   if (openJoin && publicIdentifier) {
                     recordOpenJoinContext({
@@ -3489,6 +3520,9 @@ async function handleMessageObject(message) {
                     coreRefsCount: coreRefs.length,
                     relayKey: joinRelayKey ? String(joinRelayKey).slice(0, 16) : null,
                     coreRefsPreview: coreRefs.slice(0, 3),
+                    hasWriterCore: !!writerCore,
+                    hasWriterCoreHex: !!writerCoreHex,
+                    hasAutobaseLocal: !!autobaseLocal,
                     origin: mirrorResult?.origin || null
                   })
                 }
@@ -3568,6 +3602,9 @@ async function handleMessageObject(message) {
             hostPeers = resolveHostPeersFromGatewayStatus(getGatewayStatus(), publicIdentifier)
           }
 
+          if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
+          if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
+
           await relayServer.startJoinAuthentication({
             ...data,
             publicIdentifier,
@@ -3579,6 +3616,8 @@ async function handleMessageObject(message) {
             hostPeers,
             coreRefs,
             writerCore,
+            writerCoreHex,
+            autobaseLocal,
             writerSecret
           })
         } catch (err) {
@@ -3609,8 +3648,10 @@ async function handleMessageObject(message) {
         sendMessage({ type: 'provision-writer-for-invitee:result', requestId, data: result })
         try {
           const relayKey = result?.relayKey || null
+          const writerCoreHex = result?.writerCoreHex || result?.autobaseLocal || null
           console.log('[Worker] Refreshing blind-peer mirrors after invite writer', {
-            relayKey
+            relayKey,
+            hasWriterCoreHex: !!writerCoreHex
           })
           const manager = await ensureBlindPeeringManager()
           if (manager?.started) {

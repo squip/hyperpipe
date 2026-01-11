@@ -753,6 +753,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         console.info('[GroupPage] Starting worker join with invite data', {
           groupId,
           hasWriterCore: !!inviteData?.writerCore,
+          hasWriterCoreHex: !!inviteData?.writerCoreHex,
+          hasAutobaseLocal: !!inviteData?.autobaseLocal,
           hasWriterSecret: !!inviteData?.writerSecret,
           hasBlindPeer: !!inviteData?.blindPeer
         })
@@ -765,6 +767,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           blindPeer: inviteData?.blindPeer,
           cores: inviteData?.cores,
           writerCore: inviteData?.writerCore,
+          writerCoreHex: inviteData?.writerCoreHex,
+          autobaseLocal: inviteData?.autobaseLocal,
           writerSecret: inviteData?.writerSecret
         })
         return

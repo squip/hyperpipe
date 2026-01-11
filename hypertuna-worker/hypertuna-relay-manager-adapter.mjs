@@ -5,6 +5,8 @@ import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import nodeCrypto from 'node:crypto';
 import hypercoreCrypto from 'hypercore-crypto';
+import Hypercore from 'hypercore';
+import hypercoreCaps from 'hypercore/lib/caps.js';
 import Corestore from 'corestore';
 import HypercoreId from 'hypercore-id-encoding';
 import { NostrUtils } from './nostr-utils.js';
@@ -28,6 +30,7 @@ calculateMembers
 import { ChallengeManager } from './challenge-manager.mjs';
 import { normalizeRelayIdentifier } from './relay-identifier-utils.mjs';
 
+const { DEFAULT_NAMESPACE } = hypercoreCaps;
 
 // Store active relay managers
 const activeRelays = new Map();
@@ -93,6 +96,22 @@ function decodeWriterKey(value) {
         }
     }
     return null;
+}
+
+function deriveCoreKeyFromSignerKey(signerKey, manifestVersion = 0) {
+    if (!signerKey) {
+        return { key: null, error: null };
+    }
+    try {
+        const key = Hypercore.key(signerKey, {
+            compat: false,
+            version: manifestVersion,
+            namespace: DEFAULT_NAMESPACE
+        });
+        return { key, error: null };
+    } catch (error) {
+        return { key: null, error };
+    }
 }
 
 function normalizeCoreRef(value) {
@@ -190,9 +209,12 @@ function validateWriterSecret(writerSecret, { writerCore = null, expectedWriterK
         return { valid: false, expectedWriterKey: expectedWriterKey || null };
     }
 
-    let expectedKey = expectedWriterKey || null;
-    if (!expectedKey && writerCore) {
+    let expectedKey = null;
+    if (writerCore) {
         expectedKey = decodeWriterKey(writerCore);
+    }
+    if (!expectedKey && expectedWriterKey) {
+        expectedKey = decodeWriterKey(expectedWriterKey);
     }
     if (!expectedKey) {
         return { valid: false, expectedWriterKey: null };
@@ -401,9 +423,11 @@ function applyJoinMetadata(profile, {
     const localKeyHex = relayManager?.relay?.local?.key
         ? b4a.toString(relayManager.relay.local.key, 'hex')
         : null;
-    const expectedHexFull = expectedWriterKey
-        ? b4a.toString(expectedWriterKey, 'hex')
+    const expectedWriterKeyBuffer = decodeWriterKey(expectedWriterKey);
+    const expectedHexFull = expectedWriterKeyBuffer
+        ? b4a.toString(expectedWriterKeyBuffer, 'hex')
         : null;
+    const resolvedCoreKeyHex = expectedHexFull || localKeyHex || null;
     const normalizedRefs = normalizeCoreRefs(coreRefs);
     const existingRefs = normalizeCoreRefs(profile.core_refs || profile.coreRefs);
     const mergedRefs = mergeCoreRefLists(existingRefs, normalizedRefs);
@@ -430,23 +454,22 @@ function applyJoinMetadata(profile, {
 
     if (writerSecret && shouldUpdateWriterMaterial) updated.writer_secret = writerSecret;
     if (writerCore && shouldUpdateWriterMaterial) updated.writer_core = writerCore;
-    if (!writerCore && localKeyHex && shouldUpdateWriterMaterial) updated.writer_core_hex = localKeyHex;
-    if (localKeyHex && shouldUpdateWriterMaterial) updated.autobase_local = localKeyHex;
+    if (resolvedCoreKeyHex && shouldUpdateWriterMaterial) updated.writer_core_hex = resolvedCoreKeyHex;
+    if (resolvedCoreKeyHex && shouldUpdateWriterMaterial) updated.autobase_local = resolvedCoreKeyHex;
     if (blindPeerMeta) updated.blind_peer = blindPeerMeta;
     if (mergedRefs.length) updated.core_refs = mergedRefs;
 
     if (
         (writerSecret && shouldUpdateWriterMaterial) ||
         (writerCore && shouldUpdateWriterMaterial) ||
-        (!writerCore && localKeyHex && shouldUpdateWriterMaterial) ||
-        (localKeyHex && shouldUpdateWriterMaterial) ||
+        (resolvedCoreKeyHex && shouldUpdateWriterMaterial) ||
         blindPeerMeta ||
         mergedRefs.length
     ) {
         updated.updated_at = new Date().toISOString();
     }
 
-    if (shouldUpdateWriterMaterial && !writerCore && expectedHexFull && !localKeyHex) {
+    if (shouldUpdateWriterMaterial && expectedHexFull && !resolvedCoreKeyHex) {
         console.warn('[RelayAdapter][WriterMaterial] Skipping writer_core_hex update; core key unavailable', {
             relayKey: profile.relay_key || profile.relayKey || relayManager?.relay?.key || null,
             expectedWriterHex: expectedHexFull
@@ -464,6 +487,8 @@ function applyJoinMetadata(profile, {
                 incomingWriterValid,
                 existingWriterValid,
                 expectedWriterKey: expectedHexFull,
+                expectedWriterKeyRaw: expectedWriterKeyBuffer ? b4a.toString(expectedWriterKeyBuffer, 'hex') : expectedWriterKey || null,
+                resolvedCoreKeyHex,
                 localKeyHex
             }
         });
@@ -1113,6 +1138,8 @@ export async function joinRelay(options = {}) {
         fromAutoConnect = false,
         writerSecret = null,
         writerCore = null,
+        writerCoreHex = null,
+        autobaseLocal = null,
         expectedWriterKey: expectedWriterOverride = null,
         blindPeer = null,
         coreRefs = null,
@@ -1135,40 +1162,68 @@ export async function joinRelay(options = {}) {
     }
 
     let writerKeyPair = null;
-    let expectedWriterKey = null;
-    let expectedWriterHex = null;
+    const writerSignerKey = decodeWriterKey(writerCore);
+    const writerSignerHex = writerSignerKey ? b4a.toString(writerSignerKey, 'hex') : null;
+    let expectedWriterKey = decodeWriterKey(writerCoreHex || autobaseLocal || expectedWriterOverride || null);
+    let expectedWriterHex = expectedWriterKey ? b4a.toString(expectedWriterKey, 'hex') : null;
+    let expectedWriterSource = null;
+    if (writerCoreHex) {
+        expectedWriterSource = 'writerCoreHex';
+    } else if (autobaseLocal) {
+        expectedWriterSource = 'autobaseLocal';
+    } else if (expectedWriterOverride) {
+        expectedWriterSource = 'expectedWriterOverride';
+    }
+    if (!expectedWriterKey && writerSignerKey) {
+        expectedWriterKey = writerSignerKey;
+        expectedWriterHex = writerSignerHex;
+        expectedWriterSource = 'writerCore';
+    }
+
+    console.log('[RelayAdapter][WriterMaterial] Join relay writer expectations', {
+        relayKey,
+        publicIdentifier,
+        writerCore,
+        writerCoreHex,
+        autobaseLocal,
+        expectedWriterOverride,
+        writerSignerHex,
+        expectedWriterKey: expectedWriterHex,
+        expectedWriterSource
+    });
+    if (!expectedWriterKey && (writerCoreHex || autobaseLocal || expectedWriterOverride)) {
+        console.warn('[RelayAdapter][WriterMaterial] Failed to decode expected writer key', {
+            relayKey,
+            writerCoreHex,
+            autobaseLocal,
+            expectedWriterOverride
+        });
+    }
+
     if (writerSecret) {
         try {
             const secretKey = Buffer.from(String(writerSecret), 'hex');
-            if (writerCore) {
-                try {
-                    expectedWriterKey = HypercoreId.decode(String(writerCore));
-                } catch {
-                    if (/^[0-9a-fA-F]{64}$/.test(String(writerCore))) {
-                        expectedWriterKey = Buffer.from(String(writerCore), 'hex');
-                    }
-                }
-            }
-            if (expectedWriterKey) {
-                expectedWriterHex = b4a.toString(expectedWriterKey, 'hex');
-                console.log('[RelayAdapter] Invite writer core decoded', {
+            const expectedSignerKey = writerSignerKey || null;
+            const expectedSignerHex = expectedSignerKey ? b4a.toString(expectedSignerKey, 'hex') : null;
+
+            if (expectedSignerKey) {
+                console.log('[RelayAdapter] Invite writer signer decoded', {
                     relayKey,
                     writerCore: String(writerCore).slice(0, 16),
-                    expectedWriterHex: expectedWriterHex.slice(0, 16),
-                    expectedLen: expectedWriterKey.length
+                    writerSignerHex: expectedSignerHex ? expectedSignerHex.slice(0, 16) : null
                 });
             }
 
             const seedCandidates = [];
             if (secretKey.length >= 32) seedCandidates.push(secretKey.subarray(0, 32));
-            if (secretKey.length === 64 && expectedWriterKey) {
+            if (secretKey.length === 64 && expectedSignerKey) {
                 const secretTail = secretKey.subarray(32, 64);
-                const tailMatches = b4a.equals(secretTail, expectedWriterKey);
+                const tailMatches = b4a.equals(secretTail, expectedSignerKey);
                 console.log('[RelayAdapter] Invite writer secret inspection', {
                     relayKey,
                     secretLen: secretKey.length,
-                    tailMatchesCore: tailMatches,
-                    expectedWriterHex: expectedWriterHex?.slice(0, 16) || null
+                    tailMatchesSigner: tailMatches,
+                    expectedSignerHex: expectedSignerHex?.slice(0, 16) || null
                 });
             }
 
@@ -1177,7 +1232,7 @@ export async function joinRelay(options = {}) {
                 try {
                     const candidate = hypercoreCrypto.keyPair(seed);
                     if (!candidate?.publicKey || !candidate?.secretKey) continue;
-                    if (expectedWriterKey && !b4a.equals(candidate.publicKey, expectedWriterKey)) {
+                    if (expectedSignerKey && !b4a.equals(candidate.publicKey, expectedSignerKey)) {
                         console.warn('[RelayAdapter] Invite writer keypair mismatch with provided writerCore; retrying with alternate seed');
                         continue;
                     }
@@ -1188,8 +1243,8 @@ export async function joinRelay(options = {}) {
                 }
             }
 
-            if (!derivedPair && expectedWriterKey && secretKey.length === 64) {
-                const candidate = { publicKey: expectedWriterKey, secretKey };
+            if (!derivedPair && expectedSignerKey && secretKey.length === 64) {
+                const candidate = { publicKey: expectedSignerKey, secretKey };
                 if (hypercoreCrypto.validateKeyPair(candidate)) {
                     derivedPair = candidate;
                     console.warn('[RelayAdapter] Using invite secretKey directly (validated against writerCore)');
@@ -1202,10 +1257,11 @@ export async function joinRelay(options = {}) {
                 writerKeyPair = derivedPair;
                 console.log('[RelayAdapter] Decoded invite writer keypair for relay', {
                     relayKey,
-                    hasExpectedCore: !!expectedWriterKey,
+                    hasExpectedSigner: !!expectedSignerKey,
                     secretLen: secretKey.length,
                     derivedPublicHex: b4a.toString(derivedPair.publicKey, 'hex').slice(0, 16),
-                    expectedWriterHex: expectedWriterHex?.slice(0, 16) || null
+                    expectedSignerHex: expectedSignerHex?.slice(0, 16) || null,
+                    expectedWriterSource
                 });
             } else {
                 console.warn('[RelayAdapter] Provided writerSecret but failed to decode/derive writerCore/publicKey; skipping keyPair injection');
@@ -1215,22 +1271,6 @@ export async function joinRelay(options = {}) {
         }
     } else {
         console.log('[RelayAdapter] No writerSecret supplied for joinRelay', { relayKey, publicIdentifier });
-    }
-
-    if (!expectedWriterKey && expectedWriterOverride) {
-        const decodedExpected = decodeWriterKey(expectedWriterOverride);
-        if (decodedExpected) {
-            expectedWriterKey = decodedExpected;
-            expectedWriterHex = b4a.toString(expectedWriterKey, 'hex');
-            console.log('[RelayAdapter] Using stored expected writer key', {
-                relayKey,
-                expectedWriterHex: expectedWriterHex.slice(0, 16)
-            });
-        } else {
-            console.warn('[RelayAdapter] Failed to decode stored expected writer key', {
-                relayKey
-            });
-        }
     }
 
     try {
@@ -1309,6 +1349,51 @@ export async function joinRelay(options = {}) {
                 storageDir: defaultStorageDir
             });
         }
+
+        if (writerKeyPair?.publicKey) {
+            const manifestVersion = Number.isInteger(relayCorestore?.manifestVersion)
+                ? relayCorestore.manifestVersion
+                : 0;
+            const { key: derivedKey, error: deriveError } = deriveCoreKeyFromSignerKey(
+                writerKeyPair.publicKey,
+                manifestVersion
+            );
+            const derivedKeyHex = derivedKey ? b4a.toString(derivedKey, 'hex') : null;
+            const expectedMatchesDerived = expectedWriterKey && derivedKey
+                ? b4a.equals(expectedWriterKey, derivedKey)
+                : null;
+            if (derivedKey) {
+                if (!expectedWriterKey || expectedWriterSource === 'writerCore') {
+                    expectedWriterKey = derivedKey;
+                    expectedWriterHex = derivedKeyHex;
+                    expectedWriterSource = 'derived-signer';
+                } else if (expectedWriterKey && expectedMatchesDerived === false) {
+                    console.warn('[RelayAdapter][WriterMaterial] Expected writer core key differs from derived core key', {
+                        relayKey,
+                        expectedWriterKey: expectedWriterHex,
+                        derivedWriterKey: derivedKeyHex,
+                        expectedWriterSource
+                    });
+                }
+            } else {
+                console.warn('[RelayAdapter][WriterMaterial] Failed to derive core key from signer', {
+                    relayKey,
+                    expectedWriterKey: expectedWriterHex,
+                    expectedWriterSource,
+                    manifestVersion,
+                    error: deriveError?.message || deriveError
+                });
+            }
+            console.log('[RelayAdapter][WriterMaterial] Derived writer core key from signer', {
+                relayKey,
+                expectedWriterKey: expectedWriterHex,
+                expectedWriterSource,
+                derivedWriterKey: derivedKeyHex,
+                manifestVersion,
+                corestoreId: relayCorestore?.__ht_id || null,
+                corestorePath: relayCorestore?.__ht_storage_path || null
+            });
+        }
         
         // Create relay manager instance
         if (writerKeyPair) {
@@ -1358,9 +1443,12 @@ export async function joinRelay(options = {}) {
                 relayKey,
                 hasWriterSecret: !!writerSecret,
                 hasWriterCore: !!writerCore,
+                hasWriterCoreHex: !!writerCoreHex,
+                hasAutobaseLocal: !!autobaseLocal,
                 hasBlindPeer: !!blindPeer,
                 coreRefsCount: Array.isArray(coreRefs) ? coreRefs.length : 0,
-                autobaseLocal: profileInfo.autobase_local ? profileInfo.autobase_local.slice(0, 16) : null
+                autobaseLocal: profileInfo.autobase_local ? profileInfo.autobase_local.slice(0, 16) : null,
+                expectedWriterKey: expectedWriterHex
             });
 
             await saveRelayProfile(profileInfo);
@@ -1387,9 +1475,12 @@ export async function joinRelay(options = {}) {
                 relayKey,
                 hasWriterSecret: !!writerSecret,
                 hasWriterCore: !!writerCore,
+                hasWriterCoreHex: !!writerCoreHex,
+                hasAutobaseLocal: !!autobaseLocal,
                 hasBlindPeer: !!blindPeer,
                 coreRefsCount: Array.isArray(coreRefs) ? coreRefs.length : 0,
-                autobaseLocal: profileInfo.autobase_local ? profileInfo.autobase_local.slice(0, 16) : null
+                autobaseLocal: profileInfo.autobase_local ? profileInfo.autobase_local.slice(0, 16) : null,
+                expectedWriterKey: expectedWriterHex
             });
 
             await saveRelayProfile(profileInfo);

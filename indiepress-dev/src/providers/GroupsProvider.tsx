@@ -166,7 +166,12 @@ const buildInvitePayload = (args: {
   relayKey?: string | null
   meta?: TGroupMetadata | null
   mirrorMetadata?: InviteMirrorMetadata
-  writerInfo?: { writerCore?: string; writerSecret?: string } | null
+  writerInfo?: {
+    writerCore?: string
+    writerCoreHex?: string
+    autobaseLocal?: string
+    writerSecret?: string
+  } | null
 }) => ({
   relayUrl: args.relayUrl,
   token: args.token,
@@ -178,6 +183,8 @@ const buildInvitePayload = (args: {
   blindPeer: args.mirrorMetadata?.blindPeer,
   cores: args.mirrorMetadata?.cores,
   writerCore: args.writerInfo?.writerCore || null,
+  writerCoreHex: args.writerInfo?.writerCoreHex || args.writerInfo?.autobaseLocal || null,
+  autobaseLocal: args.writerInfo?.autobaseLocal || args.writerInfo?.writerCoreHex || null,
   writerSecret: args.writerInfo?.writerSecret || null
 })
 
@@ -467,6 +474,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let blindPeer: TGroupInvite['blindPeer'] | null | undefined
             let cores: TGroupInvite['cores'] | undefined
             let writerCore: string | null | undefined
+            let writerCoreHex: string | null | undefined
+            let autobaseLocal: string | null | undefined
             let writerSecret: string | null | undefined
             try {
               const payload = JSON.parse(decrypted)
@@ -479,6 +488,16 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 }
                 if (typeof payload.writerCore === 'string') {
                   writerCore = payload.writerCore
+                }
+                if (typeof payload.writerCoreHex === 'string') {
+                  writerCoreHex = payload.writerCoreHex
+                } else if (typeof payload.writer_core_hex === 'string') {
+                  writerCoreHex = payload.writer_core_hex
+                }
+                if (typeof payload.autobaseLocal === 'string') {
+                  autobaseLocal = payload.autobaseLocal
+                } else if (typeof payload.autobase_local === 'string') {
+                  autobaseLocal = payload.autobase_local
                 }
                 if (typeof payload.writerSecret === 'string') {
                   writerSecret = payload.writerSecret
@@ -503,7 +522,21 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             } catch {
               token = decrypted
             }
-            return { ...invite, token, relayUrl, relayKey, fileSharing, blindPeer, cores, writerCore, writerSecret }
+            if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
+            if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
+            return {
+              ...invite,
+              token,
+              relayUrl,
+              relayKey,
+              fileSharing,
+              blindPeer,
+              cores,
+              writerCore,
+              writerCoreHex,
+              autobaseLocal,
+              writerSecret
+            }
           } catch (_err) {
             return invite
           }
@@ -512,7 +545,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       console.info('[GroupsProvider] Refreshed invites writer stats', {
         total: parsed.length,
         withWriterSecret: parsed.filter((p) => (p as any).writerSecret).length,
-        withWriterCore: parsed.filter((p) => (p as any).writerCore).length
+        withWriterCore: parsed.filter((p) => (p as any).writerCore).length,
+        withWriterCoreHex: parsed.filter((p) => (p as any).writerCoreHex).length
       })
       setInvites(parsed)
     } catch (error) {
@@ -1115,7 +1149,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         ) || null
       const relayEntry = getRelayEntryForGroup(groupId)
 
-      let writerInfo: { writerCore?: string; writerSecret?: string } | null = null
+      let writerInfo: {
+        writerCore?: string
+        writerCoreHex?: string
+        autobaseLocal?: string
+        writerSecret?: string
+      } | null = null
       if (sendToWorker && relayEntry?.relayKey && invitees.length === 1) {
         try {
           const res = await sendToWorker({
@@ -1125,6 +1164,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           if (res && typeof res === 'object') {
             writerInfo = {
               writerCore: (res as any).writerCore,
+              writerCoreHex: (res as any).writerCoreHex,
+              autobaseLocal: (res as any).autobaseLocal,
               writerSecret: (res as any).writerSecret
             }
           }
@@ -1133,6 +1174,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             invitee: invitees[0],
             relayKey: relayEntry.relayKey,
             hasWriterCore: !!writerInfo?.writerCore,
+            hasWriterCoreHex: !!writerInfo?.writerCoreHex,
+            hasAutobaseLocal: !!writerInfo?.autobaseLocal,
             hasWriterSecret: !!writerInfo?.writerSecret
           })
         } catch (err) {
@@ -1143,10 +1186,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       let mirrorMetadata = await fetchInviteMirrorMetadata(relayEntry?.relayKey || groupId, resolved)
 
       // If we created a writer core for this invite, include it in cores so it gets mirrored.
-      if (writerInfo?.writerCore) {
+      const writerCoreKey =
+        writerInfo?.writerCoreHex || writerInfo?.autobaseLocal || writerInfo?.writerCore
+      if (writerCoreKey) {
         if (!mirrorMetadata) mirrorMetadata = {}
         const cores = Array.isArray(mirrorMetadata.cores) ? [...mirrorMetadata.cores] : []
-        cores.push({ key: writerInfo.writerCore, role: 'autobase-writer' })
+        cores.push({ key: writerCoreKey, role: 'autobase-writer' })
         mirrorMetadata.cores = cores
       }
 
@@ -1171,6 +1216,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             groupId,
             invitee,
             hasWriterCore: !!writerInfo?.writerCore,
+            hasWriterCoreHex: !!writerInfo?.writerCoreHex,
+            hasAutobaseLocal: !!writerInfo?.autobaseLocal,
             hasWriterSecret: !!writerInfo?.writerSecret
           })
           const inviteTags: string[][] = [
@@ -1270,7 +1317,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const baseRelayUrl = resolved ? getBaseRelayUrl(resolved) : undefined
       const relayEntry = getRelayEntryForGroup(groupId)
 
-      let writerInfo: { writerCore?: string; writerSecret?: string } | null = null
+      let writerInfo: {
+        writerCore?: string
+        writerCoreHex?: string
+        autobaseLocal?: string
+        writerSecret?: string
+      } | null = null
       if (sendToWorker && relayEntry?.relayKey) {
         try {
           const res = await sendToWorker({
@@ -1280,6 +1332,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           if (res && typeof res === 'object') {
             writerInfo = {
               writerCore: (res as any).writerCore,
+              writerCoreHex: (res as any).writerCoreHex,
+              autobaseLocal: (res as any).autobaseLocal,
               writerSecret: (res as any).writerSecret
             }
           }
@@ -1288,6 +1342,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             targetPubkey,
             relayKey: relayEntry.relayKey,
             hasWriterCore: !!writerInfo?.writerCore,
+            hasWriterCoreHex: !!writerInfo?.writerCoreHex,
+            hasAutobaseLocal: !!writerInfo?.autobaseLocal,
             hasWriterSecret: !!writerInfo?.writerSecret
           })
         } catch (err) {
@@ -1296,10 +1352,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       }
 
       let mirrorMetadata = await fetchInviteMirrorMetadata(relayEntry?.relayKey || groupId, resolved)
-      if (writerInfo?.writerCore) {
+      const writerCoreKey =
+        writerInfo?.writerCoreHex || writerInfo?.autobaseLocal || writerInfo?.writerCore
+      if (writerCoreKey) {
         if (!mirrorMetadata) mirrorMetadata = {}
         const cores = Array.isArray(mirrorMetadata.cores) ? [...mirrorMetadata.cores] : []
-        cores.push({ key: writerInfo.writerCore, role: 'autobase-writer' })
+        cores.push({ key: writerCoreKey, role: 'autobase-writer' })
         mirrorMetadata.cores = cores
       }
       const payload = buildInvitePayload({
@@ -1314,6 +1372,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         groupId,
         targetPubkey,
         hasWriterCore: !!writerInfo?.writerCore,
+        hasWriterCoreHex: !!writerInfo?.writerCoreHex,
+        hasAutobaseLocal: !!writerInfo?.autobaseLocal,
         hasWriterSecret: !!writerInfo?.writerSecret
       })
 

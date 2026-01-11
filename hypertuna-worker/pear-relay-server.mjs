@@ -5,6 +5,8 @@ import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import process from 'node:process';
 import crypto from 'hypercore-crypto';
+import Hypercore from 'hypercore';
+import hypercoreCaps from 'hypercore/lib/caps.js';
 import { setTimeout, setInterval, clearInterval, clearTimeout } from 'node:timers';
 import b4a from 'b4a';
 import { URL } from 'node:url';
@@ -53,6 +55,7 @@ import { getFile, getPfpFile } from './hyperdrive-manager.mjs';
 import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/GatewaySettings.mjs';
 
 const PUBLIC_GATEWAY_REPLICA_IDENTIFIER = 'public-gateway:hyperbee';
+const { DEFAULT_NAMESPACE } = hypercoreCaps;
 
 function parseNostrMessagePayload(message) {
   if (typeof message === 'string') {
@@ -1350,7 +1353,9 @@ function setupProtocolHandlers(protocol) {
           console.log('[RelayServer] Provisioned writer for open join', {
             relayKey: internalRelayKey,
             publicIdentifier: canonicalIdentifier,
-            writerCore: writerInfo?.writerCore ? String(writerInfo.writerCore).slice(0, 16) : null
+            writerCore: writerInfo?.writerCore ? String(writerInfo.writerCore).slice(0, 16) : null,
+            writerCoreHex: writerInfo?.writerCoreHex ? String(writerInfo.writerCoreHex).slice(0, 16) : null,
+            autobaseLocal: writerInfo?.autobaseLocal ? String(writerInfo.autobaseLocal).slice(0, 16) : null
           });
         } catch (writerError) {
           console.warn('[RelayServer] Failed to provision writer for open join', writerError?.message || writerError);
@@ -1369,6 +1374,8 @@ function setupProtocolHandlers(protocol) {
           authToken: result.token,
           relayUrl,
           writerCore: writerInfo?.writerCore || null,
+          writerCoreHex: writerInfo?.writerCoreHex || null,
+          autobaseLocal: writerInfo?.autobaseLocal || null,
           writerSecret: writerInfo?.writerSecret || null
         }))
       };
@@ -2317,6 +2324,50 @@ function normalizeWriterKey(writerKey) {
   return null;
 }
 
+function resolveExpectedWriterKey({ writerCoreHex = null, autobaseLocal = null, writerCore = null } = {}) {
+  if (writerCoreHex) {
+    return { expectedWriterKey: writerCoreHex, source: 'writerCoreHex' };
+  }
+  if (autobaseLocal) {
+    return { expectedWriterKey: autobaseLocal, source: 'autobaseLocal' };
+  }
+  if (writerCore) {
+    return { expectedWriterKey: writerCore, source: 'writerCore' };
+  }
+  return { expectedWriterKey: null, source: null };
+}
+
+function resolveWriterKeyHex(candidate) {
+  const normalized = normalizeWriterKey(candidate);
+  return normalized ? b4a.toString(normalized, 'hex') : null;
+}
+
+function deriveCoreKeyFromSignerKey(signerKey, manifestVersion = 0) {
+  if (!signerKey) {
+    return { key: null, error: null };
+  }
+  try {
+    const key = Hypercore.key(signerKey, {
+      compat: false,
+      version: manifestVersion,
+      namespace: DEFAULT_NAMESPACE
+    });
+    return { key, error: null };
+  } catch (error) {
+    return { key: null, error };
+  }
+}
+
+function normalizeCoreRefString(candidate) {
+  const normalized = normalizeWriterKey(candidate);
+  if (!normalized) return null;
+  try {
+    return HypercoreId.encode(normalized);
+  } catch (_) {
+    return null;
+  }
+}
+
 function previewWriterKey(writerKey) {
   if (!writerKey) return null;
   try {
@@ -3211,17 +3262,44 @@ export async function startJoinAuthentication(options) {
     openJoin = false,
     writerCore = null,
     writerSecret = null,
+    writerCoreHex = null,
+    autobaseLocal = null,
     coreRefs = []
   } = options;
+  const expectedWriter = resolveExpectedWriterKey({ writerCoreHex, autobaseLocal, writerCore });
+  const expectedWriterKey = expectedWriter.expectedWriterKey;
+  const expectedWriterSource = expectedWriter.source;
+  const expectedWriterKeyHex = resolveWriterKeyHex(expectedWriterKey);
+  let resolvedCoreRefs = Array.isArray(coreRefs) ? [...coreRefs] : [];
+  const expectedCoreRef = normalizeCoreRefString(expectedWriterKey);
+  if (expectedCoreRef && !resolvedCoreRefs.includes(expectedCoreRef)) {
+    resolvedCoreRefs.push(expectedCoreRef);
+  }
+  const coreRefsForJoin = resolvedCoreRefs;
   console.log('[RelayServer] startJoinAuthentication payload', {
     publicIdentifier,
     hasWriterSecret: !!writerSecret,
     hasWriterCore: !!writerCore,
-    coreRefsCount: Array.isArray(coreRefs) ? coreRefs.length : 0,
+    hasWriterCoreHex: !!writerCoreHex,
+    hasAutobaseLocal: !!autobaseLocal,
+    expectedWriterSource,
+    expectedWriterKeyHex,
+    coreRefsCount: resolvedCoreRefs.length,
     hostPeersCount: Array.isArray(hostPeerList) ? hostPeerList.length : 0,
     blindPeer: !!blindPeer,
     inviteRelayKey,
     openJoin
+  });
+  console.log('[RelayServer][WriterMaterial] Join auth writer material', {
+    publicIdentifier,
+    writerCore,
+    writerSecret,
+    writerCoreHex,
+    autobaseLocal,
+    expectedWriterKey,
+    expectedWriterSource,
+    expectedWriterKeyHex,
+    coreRefs: resolvedCoreRefs
   });
   const userNsec = config.nostr_nsec_hex;
   const userPubkey = NostrUtils.getPublicKey(userNsec);
@@ -3366,8 +3444,11 @@ export async function startJoinAuthentication(options) {
           authToken: inviteToken,
           writerSecret,
           writerCore,
+          writerCoreHex,
+          autobaseLocal,
           blindPeer,
-          coreRefs,
+          coreRefs: coreRefsForJoin,
+          expectedWriterKey,
           suppressInitMessage: true,
           useSharedCorestore: true
         });
@@ -3414,7 +3495,7 @@ export async function startJoinAuthentication(options) {
 
         const relayWaitResult = await waitForRelayWriterActivation({
           relayKey: fallbackRelayKey,
-          expectedWriterKey: writerCore,
+          expectedWriterKey,
           timeoutMs: BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS,
           reason: 'blind-peer-fallback'
         });
@@ -3467,7 +3548,7 @@ export async function startJoinAuthentication(options) {
         if (!relayWaitResult?.ok || !relayWaitResult?.writable) {
           scheduleLateWriterRecovery({
             relayKey: fallbackRelayKey,
-            expectedWriterKey: writerCore,
+            expectedWriterKey,
             publicIdentifier,
             authToken: inviteToken,
             relayUrl: inviteRelayUrl,
@@ -3478,7 +3559,8 @@ export async function startJoinAuthentication(options) {
         }
 
         // If the invite provided a writer core, add it to Autobase.
-        if (writerCore) {
+        const inviteWriterKey = expectedWriterKey || writerCore || null;
+        if (inviteWriterKey) {
           try {
             const { activeRelays } = await import('./hypertuna-relay-manager-adapter.mjs');
             relayManager = relayManager || activeRelays.get(fallbackRelayKey);
@@ -3492,10 +3574,10 @@ export async function startJoinAuthentication(options) {
               } else {
               let writerHex = null;
               try {
-                const decoded = HypercoreId.decode(String(writerCore));
+                const decoded = HypercoreId.decode(String(inviteWriterKey));
                 writerHex = b4a.toString(decoded, 'hex');
               } catch (_) {
-                if (/^[0-9a-fA-F]{64}$/.test(String(writerCore))) writerHex = String(writerCore);
+                if (/^[0-9a-fA-F]{64}$/.test(String(inviteWriterKey))) writerHex = String(inviteWriterKey);
               }
               if (writerHex && typeof relayManager.addWriter === 'function') {
                 await relayManager.addWriter(writerHex).catch((err) => {
@@ -3622,8 +3704,11 @@ export async function startJoinAuthentication(options) {
           authToken: provisionalToken,
           writerSecret,
           writerCore,
+          writerCoreHex,
+          autobaseLocal,
           blindPeer,
-          coreRefs,
+          coreRefs: coreRefsForJoin,
+          expectedWriterKey,
           suppressInitMessage: true,
           useSharedCorestore: true
         });
@@ -3639,7 +3724,7 @@ export async function startJoinAuthentication(options) {
 
         const relayWaitResult = await waitForRelayWriterActivation({
           relayKey: fallbackRelayKey,
-          expectedWriterKey: writerCore,
+          expectedWriterKey,
           timeoutMs: BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS,
           reason: 'open-offline'
         });
@@ -3693,7 +3778,7 @@ export async function startJoinAuthentication(options) {
         if (!relayWaitResult?.ok || !relayWaitResult?.writable) {
           scheduleLateWriterRecovery({
             relayKey: fallbackRelayKey,
-            expectedWriterKey: writerCore,
+            expectedWriterKey,
             publicIdentifier,
             authToken: provisionalToken,
             relayUrl: resolvedRelayUrl,
@@ -3818,11 +3903,45 @@ export async function startJoinAuthentication(options) {
       relayKey,
       publicIdentifier: returnedIdentifier,
       writerCore: responseWriterCore,
+      writerCoreHex: responseWriterCoreHex,
+      autobaseLocal: responseAutobaseLocal,
       writerSecret: responseWriterSecret
     } = verifyResponse;
     const finalIdentifier = returnedIdentifier || publicIdentifier;
     const finalWriterCore = responseWriterCore || writerCore;
     const finalWriterSecret = responseWriterSecret || writerSecret;
+    const finalWriterCoreHex =
+      responseWriterCoreHex ||
+      responseAutobaseLocal ||
+      writerCoreHex ||
+      autobaseLocal ||
+      null;
+    const directExpectedWriter = resolveExpectedWriterKey({
+      writerCoreHex: finalWriterCoreHex,
+      autobaseLocal: null,
+      writerCore: finalWriterCore
+    });
+    const finalExpectedWriterKey = directExpectedWriter.expectedWriterKey;
+    const finalExpectedWriterSource = directExpectedWriter.source;
+    const finalExpectedWriterKeyHex = resolveWriterKeyHex(finalExpectedWriterKey);
+    let directCoreRefs = coreRefsForJoin;
+    const finalCoreRef = normalizeCoreRefString(finalExpectedWriterKey);
+    if (finalCoreRef && !directCoreRefs.includes(finalCoreRef)) {
+      directCoreRefs = [...coreRefsForJoin, finalCoreRef];
+    }
+
+    console.log('[RelayServer][WriterMaterial] Direct join writer material', {
+      publicIdentifier: finalIdentifier,
+      relayKey,
+      writerCore: finalWriterCore,
+      writerCoreHex: finalWriterCoreHex,
+      autobaseLocal: finalWriterCoreHex,
+      writerSecret: finalWriterSecret,
+      expectedWriterKey: finalExpectedWriterKey,
+      expectedWriterSource: finalExpectedWriterSource,
+      expectedWriterKeyHex: finalExpectedWriterKeyHex,
+      coreRefs: directCoreRefs
+    });
     if (!authToken || !relayUrl || !relayKey) {
       throw new Error('Final response from relay host missing authToken, relayKey, or relayUrl');
     }
@@ -3843,8 +3962,11 @@ export async function startJoinAuthentication(options) {
       fileSharing,
       writerSecret: finalWriterSecret,
       writerCore: finalWriterCore,
+      writerCoreHex: finalWriterCoreHex,
+      autobaseLocal: finalWriterCoreHex,
       blindPeer,
-      coreRefs
+      coreRefs: directCoreRefs,
+      expectedWriterKey: finalExpectedWriterKey
     });
     await applyPendingAuthUpdates(updateRelayAuthToken, relayKey, finalIdentifier);
 
@@ -3862,7 +3984,7 @@ export async function startJoinAuthentication(options) {
     // Wait for the relay to become writable or the expected writer to activate before announcing membership
     const directWaitResult = await waitForRelayWriterActivation({
       relayKey,
-      expectedWriterKey: finalWriterCore,
+      expectedWriterKey: finalExpectedWriterKey,
       timeoutMs: DIRECT_JOIN_WRITABLE_TIMEOUT_MS,
       reason: 'direct-join'
     });
@@ -3909,10 +4031,10 @@ export async function startJoinAuthentication(options) {
         writable: directWaitResult?.writable ?? null,
         expectedWriterActive: directWaitResult?.expectedWriterActive ?? null
       });
-      if (finalWriterCore) {
+      if (finalExpectedWriterKey) {
         scheduleLateWriterRecovery({
           relayKey,
-          expectedWriterKey: finalWriterCore,
+          expectedWriterKey: finalExpectedWriterKey,
           publicIdentifier: finalIdentifier,
           authToken,
           relayUrl,
@@ -3975,18 +4097,68 @@ export async function provisionWriterForInvitee(options = {}) {
   const writerCore = HypercoreId.encode(keyPair.publicKey);
   const writerSecret = b4a.toString(keyPair.secretKey, 'hex');
   const writerHex = b4a.toString(keyPair.publicKey, 'hex');
+  let writerCoreHex = null;
+  let writerCoreId = null;
+  let coreKeyMatchesSigner = null;
+  let corestoreId = null;
+  let corestorePath = null;
+
+  const relayCorestore = relayManager.store || relayManager.corestore || relayManager.relay?.corestore || relayManager.relay?.store || null;
+  corestoreId = relayCorestore?.__ht_id || null;
+  corestorePath = relayCorestore?.__ht_storage_path || null;
+  const manifestVersion = Number.isInteger(relayCorestore?.manifestVersion)
+    ? relayCorestore.manifestVersion
+    : 0;
+  const { key: derivedKey, error: deriveError } = deriveCoreKeyFromSignerKey(
+    keyPair.publicKey,
+    manifestVersion
+  );
+  if (derivedKey) {
+    writerCoreHex = b4a.toString(derivedKey, 'hex');
+    try {
+      writerCoreId = HypercoreId.encode(derivedKey);
+    } catch (_) {
+      writerCoreId = null;
+    }
+  } else {
+    console.warn('[RelayServer] Failed to derive invite writer core key from signer', {
+      relayKey: resolvedRelayKey,
+      manifestVersion,
+      error: deriveError?.message || deriveError
+    });
+  }
+
+  coreKeyMatchesSigner = writerCoreHex ? writerCoreHex === writerHex : null;
+  const writerAddHex = writerCoreHex || writerHex;
 
   console.log('[RelayServer] Writing invite writer to relay', {
     relayKey: resolvedRelayKey,
-    writer: writerHex.slice(0, 16),
+    writer: writerAddHex.slice(0, 16),
+    writerSigner: writerHex.slice(0, 16),
+    writerCoreHex: writerCoreHex ? writerCoreHex.slice(0, 16) : null,
     writable: relayManager.relay?.writable ?? null
   });
-  await relayManager.addWriter(writerHex);
+  await relayManager.addWriter(writerAddHex);
   console.log('[RelayServer] Invite writer add committed', {
     relayKey: resolvedRelayKey,
-    writer: writerHex.slice(0, 16),
+    writer: writerAddHex.slice(0, 16),
     activeWriters: relayManager.relay?.activeWriters?.size ?? null,
     viewVersion: relayManager.relay?.view?.version ?? null
+  });
+
+  console.log('[RelayServer][WriterMaterial] Invite writer material', {
+    relayKey: resolvedRelayKey,
+    writerCore,
+    writerCoreHex,
+    writerCoreId,
+    autobaseLocal: writerCoreHex,
+    writerSecret,
+    writerSignerHex: writerHex,
+    writerAddHex,
+    coreKeyMatchesSigner,
+    corestoreId,
+    corestorePath,
+    manifestVersion
   });
 
   console.log('[RelayServer] Provisioned writer for invitee', {
@@ -3995,7 +4167,13 @@ export async function provisionWriterForInvitee(options = {}) {
     writerSecretPreview: writerSecret ? `${writerSecret.slice(0, 8)}...` : null
   });
 
-  return { relayKey: resolvedRelayKey, writerCore, writerSecret };
+  return {
+    relayKey: resolvedRelayKey,
+    writerCore,
+    writerCoreHex,
+    autobaseLocal: writerCoreHex,
+    writerSecret
+  };
 }
 
 export async function disconnectRelay(relayKey) {
