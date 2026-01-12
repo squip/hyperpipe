@@ -106,7 +106,8 @@ class PublicGatewayRegistrar {
     const payload = {
       relayKey,
       entries: Array.isArray(entries) ? entries : [],
-      updatedAt: options.updatedAt || Date.now()
+      updatedAt: options.updatedAt || Date.now(),
+      targetSize: Number.isFinite(options.targetSize) ? Math.trunc(options.targetSize) : undefined
     };
     const body = await this.#signedPayload(payload);
     const path = `/api/relays/${encodeURIComponent(relayKey)}/open-join/pool`;

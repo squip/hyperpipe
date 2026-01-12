@@ -838,6 +838,10 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
             break
           case 'gateway-log':
             if (msg.entry) {
+              const message = typeof msg.entry.message === 'string' ? msg.entry.message : ''
+              if (message.includes('Open join pool')) {
+                console.info('[GatewayLog]', msg.entry)
+              }
               setGatewayLogs((prev) => {
                 const next = [...prev, msg.entry]
                 return next.length > MAX_LOGS ? next.slice(-MAX_LOGS) : next

@@ -434,6 +434,15 @@ export class GatewayService extends EventEmitter {
 
   #configurePublicGateway() {
     const config = this.publicGatewaySettings || { enabled: false };
+    const hasBaseUrl = !!(config.baseUrl && String(config.baseUrl).trim());
+    const hasSharedSecret = !!(config.sharedSecret && String(config.sharedSecret).trim());
+
+    console.info('[PublicGateway] Registrar config', {
+      enabled: !!config.enabled,
+      hasBaseUrl,
+      hasSharedSecret,
+      baseUrl: hasBaseUrl ? config.baseUrl : null
+    });
 
     if (!this.loggerBridge) {
       this.loggerBridge = this.#createExternalLogger();
@@ -1850,34 +1859,131 @@ export class GatewayService extends EventEmitter {
   }
 
   async #syncOpenJoinPool(relayKey, metadata) {
-    if (!this.openJoinPoolProvider || !this.publicGatewayRegistrar?.isEnabled?.()) {
+    if (!this.openJoinPoolProvider) {
+      console.info('[PublicGateway] Open join pool sync skipped: missing provider', { relayKey });
+      return;
+    }
+    if (!this.publicGatewayRegistrar?.isEnabled?.()) {
+      console.info('[PublicGateway] Open join pool sync skipped: registrar disabled', {
+        relayKey,
+        enabled: !!this.publicGatewaySettings?.enabled
+      });
       return;
     }
     if (this.#isPublicGatewayRelayKey(relayKey)) {
+      console.info('[PublicGateway] Open join pool sync skipped: public gateway relay', { relayKey });
       return;
     }
     if (!metadata || metadata.isOpen !== true) {
+      console.info('[PublicGateway] Open join pool sync skipped: relay not open', {
+        relayKey,
+        isOpen: metadata?.isOpen ?? null
+      });
       return;
     }
     try {
-      const result = await this.openJoinPoolProvider({
+      const publicIdentifier = metadata?.identifier || null;
+      const targetResult = await this.openJoinPoolProvider({
         relayKey,
-        publicIdentifier: metadata?.identifier || null,
-        metadata
+        publicIdentifier,
+        metadata,
+        mode: 'target-only'
       });
-      if (!result) {
-        this.log('debug', `[PublicGateway] Open join pool provider returned no entries relay=${relayKey}`);
+      const canonicalRelayKeyRaw = typeof targetResult?.relayKey === 'string'
+        ? targetResult.relayKey.trim()
+        : null;
+      const canonicalRelayKey = canonicalRelayKeyRaw && /^[a-fA-F0-9]{64}$/.test(canonicalRelayKeyRaw)
+        ? canonicalRelayKeyRaw.toLowerCase()
+        : null;
+      const poolRelayKey = canonicalRelayKey || relayKey;
+      const poolPublicIdentifier = typeof targetResult?.publicIdentifier === 'string'
+        ? targetResult.publicIdentifier
+        : publicIdentifier;
+      const targetSize = Number.isFinite(targetResult?.targetSize)
+        ? Math.trunc(targetResult.targetSize)
+        : null;
+      if (!targetSize || targetSize <= 0) {
+        this.log('debug', `[PublicGateway] Open join pool target unavailable relay=${poolRelayKey}`);
         return;
       }
-      const entries = Array.isArray(result.entries) ? result.entries : (Array.isArray(result) ? result : []);
-      if (!entries.length) {
-        this.log('debug', `[PublicGateway] Open join pool provider returned empty entries relay=${relayKey}`);
+
+      if (canonicalRelayKey && canonicalRelayKey !== relayKey) {
+        this.log('info', `[PublicGateway] Open join pool canonical relay ${relayKey} -> ${canonicalRelayKey}`);
+      }
+      if (canonicalRelayKey
+        && canonicalRelayKey !== relayKey
+        && this.activeRelays?.has?.(canonicalRelayKey)) {
+        this.log('debug', `[PublicGateway] Open join pool sync skipped: alias relay=${relayKey}`, {
+          canonicalRelayKey
+        });
         return;
       }
-      const updatedAt = result.updatedAt || Date.now();
-      await this.publicGatewayRegistrar.updateOpenJoinPool(relayKey, entries, { updatedAt });
-      this.log('info', `[PublicGateway] Open join pool updated relay=${relayKey}`, {
-        count: entries.length
+
+      const logReport = (phase, report) => {
+        if (!report || typeof report !== 'object') return;
+        this.log('info', `[PublicGateway] Open join pool report ${phase} relay=${poolRelayKey}`, {
+          total: report?.total ?? null,
+          targetSize,
+          needed: report?.needed ?? null,
+          stored: report?.stored ?? null
+        });
+      };
+
+      let report = await this.publicGatewayRegistrar.updateOpenJoinPool(poolRelayKey, [], {
+        updatedAt: Date.now(),
+        targetSize
+      });
+      logReport('preflight', report);
+      let needed = Number.isFinite(report?.needed) ? Math.trunc(report.needed) : 0;
+      if (needed <= 0) {
+        this.log('debug', `[PublicGateway] Open join pool already satisfied relay=${poolRelayKey}`, {
+          total: report?.total ?? null,
+          targetSize
+        });
+        return;
+      }
+
+      let attempts = 0;
+      while (needed > 0 && attempts < 2) {
+        const provision = await this.openJoinPoolProvider({
+          relayKey: poolRelayKey,
+          publicIdentifier: poolPublicIdentifier,
+          metadata,
+          needed,
+          targetSize
+        });
+        const entries = Array.isArray(provision?.entries)
+          ? provision.entries
+          : (Array.isArray(provision) ? provision : []);
+        if (!entries.length) {
+          this.log('warn', `[PublicGateway] Open join pool provider returned empty entries relay=${poolRelayKey}`, {
+            needed,
+            targetSize
+          });
+          return;
+        }
+        const updatedAt = provision.updatedAt || Date.now();
+        report = await this.publicGatewayRegistrar.updateOpenJoinPool(poolRelayKey, entries, {
+          updatedAt,
+          targetSize
+        });
+        logReport('provision', report);
+        needed = Number.isFinite(report?.needed) ? Math.trunc(report.needed) : 0;
+        attempts += 1;
+      }
+
+      if (needed > 0) {
+        this.log('warn', `[PublicGateway] Open join pool still below target relay=${poolRelayKey}`, {
+          needed,
+          total: report?.total ?? null,
+          targetSize
+        });
+        return;
+      }
+
+      this.log('info', `[PublicGateway] Open join pool updated relay=${poolRelayKey}`, {
+        total: report?.total ?? null,
+        targetSize
       });
     } catch (error) {
       this.log('warn', `[PublicGateway] Open join pool update failed relay=${relayKey}: ${error?.message || error}`);

@@ -703,17 +703,59 @@ function pruneOpenJoinPoolEntries(entries = [], now = Date.now()) {
   })
 }
 
-async function ensureOpenJoinWriterPool({ relayKey, publicIdentifier } = {}) {
-  const key = relayKey || publicIdentifier
-  if (!key) return null
-  if (openJoinWriterPoolLocks.has(key)) return null
-  if (!relayServer?.provisionWriterForInvitee) return null
+async function ensureOpenJoinWriterPool({
+  relayKey,
+  publicIdentifier,
+  needed = null,
+  targetSize = OPEN_JOIN_POOL_TARGET_SIZE,
+  mode = 'provision'
+} = {}) {
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey)
+  const normalizedPublicIdentifier = typeof publicIdentifier === 'string' ? publicIdentifier.trim() : null
+  const fallbackIdentifier = typeof relayKey === 'string' ? relayKey.trim() : null
+  const requestIdentifier = normalizedRelayKey || normalizedPublicIdentifier || fallbackIdentifier
+  if (!requestIdentifier) return null
 
-  openJoinWriterPoolLocks.add(key)
+  const resolvedTarget = Number.isFinite(targetSize) && targetSize > 0
+    ? Math.trunc(targetSize)
+    : OPEN_JOIN_POOL_TARGET_SIZE
+
+  let profile = null
+  if (normalizedRelayKey) {
+    profile = await getRelayProfileByKey(normalizedRelayKey)
+  }
+  const lookupPublicIdentifier = normalizedPublicIdentifier || (normalizedRelayKey ? null : fallbackIdentifier)
+  if (!profile && lookupPublicIdentifier) {
+    profile = await getRelayProfileByPublicIdentifier(lookupPublicIdentifier)
+  }
+
+  const canonicalRelayKey = normalizeRelayKeyHex(profile?.relay_key || profile?.relayKey || null) || normalizedRelayKey
+  const canonicalPublicIdentifier =
+    profile?.public_identifier || profile?.publicIdentifier || normalizedPublicIdentifier || null
+  const poolKey = canonicalRelayKey || canonicalPublicIdentifier || requestIdentifier
+
+  if (canonicalRelayKey && requestIdentifier !== canonicalRelayKey) {
+    console.info('[Worker] Open join pool canonicalized', {
+      requestIdentifier,
+      canonicalRelayKey,
+      publicIdentifier: canonicalPublicIdentifier
+    })
+  }
+
+  if (mode === 'target-only') {
+    return {
+      targetSize: resolvedTarget,
+      relayKey: canonicalRelayKey || normalizedRelayKey || null,
+      publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || null
+    }
+  }
+  if (!relayServer?.provisionWriterForInvitee) return null
+  if (openJoinWriterPoolLocks.has(poolKey)) return null
+
+  openJoinWriterPoolLocks.add(poolKey)
   try {
-    const profile = relayKey
-      ? await getRelayProfileByKey(relayKey)
-      : await getRelayProfileByPublicIdentifier(publicIdentifier)
+    const relayKeyForLog = canonicalRelayKey || normalizedRelayKey || null
+    const publicIdentifierForLog = canonicalPublicIdentifier || normalizedPublicIdentifier || null
     if (!profile) {
       console.warn('[Worker] Open join pool skipped: profile not found', {
         relayKey: relayKey || null,
@@ -723,38 +765,47 @@ async function ensureOpenJoinWriterPool({ relayKey, publicIdentifier } = {}) {
     }
     if (profile.isOpen !== true) {
       console.warn('[Worker] Open join pool skipped: relay not open', {
-        relayKey: relayKey || profile.relay_key || null,
-        publicIdentifier: publicIdentifier || profile.public_identifier || null,
+        relayKey: relayKeyForLog || null,
+        publicIdentifier: publicIdentifierForLog || null,
         isOpen: profile.isOpen
       })
       return null
     }
 
     const now = Date.now()
-    const cached = openJoinWriterPoolCache.get(key) || { entries: [], updatedAt: 0 }
+    const cached = openJoinWriterPoolCache.get(poolKey) || { entries: [], updatedAt: 0 }
     const entries = pruneOpenJoinPoolEntries(cached.entries, now)
+    const requestedCount = Number.isFinite(needed) ? Math.max(Math.trunc(needed), 0) : null
     const stale = !cached.updatedAt || (now - cached.updatedAt) >= OPEN_JOIN_POOL_REFRESH_MS
-    const needed = Math.max(OPEN_JOIN_POOL_TARGET_SIZE - entries.length, 0)
-    const generateCount = needed > 0 ? needed : (stale ? 1 : 0)
+    const poolNeeded = Math.max(resolvedTarget - entries.length, 0)
+    const generateCount = requestedCount !== null
+      ? requestedCount
+      : (poolNeeded > 0 ? poolNeeded : (stale ? 1 : 0))
 
     if (generateCount <= 0) {
       if (cached.entries.length !== entries.length) {
-        openJoinWriterPoolCache.set(key, { ...cached, entries })
+        openJoinWriterPoolCache.set(poolKey, { ...cached, entries })
       }
       console.log('[Worker] Open join pool warm', {
-        relayKey: relayKey || profile.relay_key || null,
-        publicIdentifier: publicIdentifier || profile.public_identifier || null,
+        relayKey: relayKeyForLog,
+        publicIdentifier: publicIdentifierForLog,
         cached: entries.length,
         updatedAt: cached.updatedAt || null
       })
-      return null
+      return {
+        entries: [],
+        updatedAt: cached.updatedAt || null,
+        targetSize: resolvedTarget,
+        relayKey: canonicalRelayKey || normalizedRelayKey || null,
+        publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || null
+      }
     }
 
     const newEntries = []
     for (let i = 0; i < generateCount; i += 1) {
       const provision = await relayServer.provisionWriterForInvitee({
-        relayKey,
-        publicIdentifier
+        relayKey: canonicalRelayKey || relayKey,
+        publicIdentifier: canonicalPublicIdentifier || publicIdentifier
       })
       const writerCore = provision?.writerCore || null
       const writerCoreHex = provision?.writerCoreHex || provision?.autobaseLocal || null
@@ -775,20 +826,32 @@ async function ensureOpenJoinWriterPool({ relayKey, publicIdentifier } = {}) {
     }
 
     if (!newEntries.length) {
-      openJoinWriterPoolCache.set(key, { ...cached, entries })
-      return null
+      openJoinWriterPoolCache.set(poolKey, { ...cached, entries })
+      return {
+        entries: [],
+        updatedAt: cached.updatedAt || null,
+        targetSize: resolvedTarget,
+        relayKey: canonicalRelayKey || normalizedRelayKey || null,
+        publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || null
+      }
     }
 
     const updatedAt = Date.now()
-    openJoinWriterPoolCache.set(key, { entries, updatedAt })
+    openJoinWriterPoolCache.set(poolKey, { entries, updatedAt })
     console.log('[Worker] Open join pool provisioned', {
-      relayKey: relayKey || profile.relay_key || null,
-      publicIdentifier: publicIdentifier || profile.public_identifier || null,
+      relayKey: relayKeyForLog,
+      publicIdentifier: publicIdentifierForLog,
       generated: newEntries.length,
       cached: entries.length,
       updatedAt
     })
-    return { entries: newEntries, updatedAt }
+    return {
+      entries: newEntries,
+      updatedAt,
+      targetSize: resolvedTarget,
+      relayKey: canonicalRelayKey || normalizedRelayKey || null,
+      publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || null
+    }
   } catch (error) {
     console.warn('[Worker] Failed to provision open-join writer pool', {
       relayKey: relayKey || null,
@@ -797,7 +860,7 @@ async function ensureOpenJoinWriterPool({ relayKey, publicIdentifier } = {}) {
     })
     return null
   } finally {
-    openJoinWriterPoolLocks.delete(key)
+    openJoinWriterPoolLocks.delete(poolKey)
   }
 }
 

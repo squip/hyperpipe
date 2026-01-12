@@ -3435,35 +3435,107 @@ class PublicGatewayService {
     const now = Date.now();
     const ttlMs = this.openJoinConfig?.poolEntryTtlMs || 6 * 60 * 60 * 1000;
     const maxPool = this.openJoinConfig?.maxPoolSize || 50;
-    const sanitized = [];
+    const targetSizeRaw = Number(payload?.targetSize);
+    const targetSize = Number.isFinite(targetSizeRaw) && targetSizeRaw > 0
+      ? Math.min(Math.trunc(targetSizeRaw), maxPool)
+      : maxPool;
 
-    for (const entry of entriesRaw) {
-      if (!entry || typeof entry !== 'object') continue;
+    const normalizeEntry = (entry) => {
+      if (!entry || typeof entry !== 'object') return null;
       const writerCore = typeof entry.writerCore === 'string' ? entry.writerCore : null;
       const writerSecret = typeof entry.writerSecret === 'string' ? entry.writerSecret : null;
-      if (!writerCore || !writerSecret) continue;
+      if (!writerCore || !writerSecret) return null;
       const issuedAt = Number.isFinite(entry.issuedAt) ? Math.trunc(entry.issuedAt) : now;
       const expiresAt = Number.isFinite(entry.expiresAt) ? Math.trunc(entry.expiresAt) : (issuedAt + ttlMs);
-      if (expiresAt <= now) continue;
-      sanitized.push({ writerCore, writerSecret, issuedAt, expiresAt });
-      if (sanitized.length >= maxPool) break;
+      if (expiresAt <= now) return null;
+      const writerCoreHex = typeof entry.writerCoreHex === 'string'
+        ? entry.writerCoreHex
+        : (typeof entry.writer_core_hex === 'string' ? entry.writer_core_hex : null);
+      const autobaseLocal = typeof entry.autobaseLocal === 'string'
+        ? entry.autobaseLocal
+        : (typeof entry.autobase_local === 'string' ? entry.autobase_local : null);
+      const normalized = { writerCore, writerSecret, issuedAt, expiresAt };
+      if (writerCoreHex) normalized.writerCoreHex = writerCoreHex;
+      if (autobaseLocal) normalized.autobaseLocal = autobaseLocal;
+      return normalized;
+    };
+
+    const sanitizeEntries = (entries) => {
+      const sanitized = [];
+      for (const entry of entries) {
+        const normalized = normalizeEntry(entry);
+        if (!normalized) continue;
+        sanitized.push(normalized);
+        if (sanitized.length >= maxPool) break;
+      }
+      return sanitized;
+    };
+
+    const existingPool = await this.registrationStore.getOpenJoinPool?.(relayKey);
+    const existingEntries = sanitizeEntries(Array.isArray(existingPool?.entries) ? existingPool.entries : []);
+    const incomingEntries = sanitizeEntries(entriesRaw);
+
+    const merged = new Map();
+    const mergeEntry = (entry) => {
+      const current = merged.get(entry.writerCore);
+      if (!current) {
+        merged.set(entry.writerCore, entry);
+        return;
+      }
+      const currentExpires = Number.isFinite(current.expiresAt) ? current.expiresAt : 0;
+      const incomingExpires = Number.isFinite(entry.expiresAt) ? entry.expiresAt : 0;
+      if (incomingExpires > currentExpires) {
+        merged.set(entry.writerCore, {
+          ...current,
+          ...entry,
+          issuedAt: entry.issuedAt,
+          expiresAt: entry.expiresAt,
+          writerSecret: entry.writerSecret
+        });
+        return;
+      }
+      const mergedEntry = { ...current };
+      if (!mergedEntry.writerCoreHex && entry.writerCoreHex) mergedEntry.writerCoreHex = entry.writerCoreHex;
+      if (!mergedEntry.autobaseLocal && entry.autobaseLocal) mergedEntry.autobaseLocal = entry.autobaseLocal;
+      merged.set(entry.writerCore, mergedEntry);
+    };
+
+    for (const entry of existingEntries) mergeEntry(entry);
+    for (const entry of incomingEntries) mergeEntry(entry);
+
+    let mergedEntries = Array.from(merged.values());
+    mergedEntries.sort((a, b) => (b.expiresAt || 0) - (a.expiresAt || 0));
+    if (mergedEntries.length > maxPool) {
+      mergedEntries = mergedEntries.slice(0, maxPool);
     }
 
+    const updatedAt = incomingEntries.length
+      ? (payload?.updatedAt || now)
+      : (existingPool?.updatedAt || payload?.updatedAt || now);
+
     await this.registrationStore.storeOpenJoinPool(relayKey, {
-      entries: sanitized,
-      updatedAt: payload?.updatedAt || now
+      entries: mergedEntries,
+      updatedAt
     });
+
+    const total = mergedEntries.length;
+    const needed = Math.max(targetSize - total, 0);
 
     this.logger?.info?.('[PublicGateway] Open join pool updated', {
       relayKey,
       received: entriesRaw.length,
-      stored: sanitized.length
+      stored: incomingEntries.length,
+      total,
+      targetSize
     });
 
     return res.json({
       status: 'ok',
       relayKey,
-      stored: sanitized.length
+      stored: incomingEntries.length,
+      total,
+      targetSize,
+      needed
     });
   }
 
