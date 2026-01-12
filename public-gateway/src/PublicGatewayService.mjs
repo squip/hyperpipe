@@ -713,13 +713,12 @@ class PublicGatewayService {
     return record?.metadata?.isOpen === true;
   }
 
-  #buildOpenJoinMirrorPayload(record, relayKey) {
+  #buildMirrorMetadataPayload(record, relayKey) {
     const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
     const cores = Array.isArray(record?.relayCores) ? record.relayCores : [];
     return {
       relayKey,
       publicIdentifier: record?.metadata?.identifier || relayKey,
-      relayUrl: record?.metadata?.connectionUrl || null,
       cores,
       blindPeer: blindPeerInfo && blindPeerInfo.enabled
         ? {
@@ -729,6 +728,26 @@ class PublicGatewayService {
           }
         : { enabled: false }
     };
+  }
+
+  #buildOpenJoinMirrorPayload(record, relayKey) {
+    const base = this.#buildMirrorMetadataPayload(record, relayKey);
+    return {
+      ...base,
+      relayUrl: record?.metadata?.connectionUrl || null
+    };
+  }
+
+  async #storeMirrorMetadataPayload(relayKey, payload) {
+    if (!relayKey || !payload || !this.registrationStore?.storeMirrorMetadata) return;
+    try {
+      await this.registrationStore.storeMirrorMetadata(relayKey, payload);
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Failed to persist mirror metadata payload', {
+        relayKey,
+        err: error?.message || error
+      });
+    }
   }
 
   #extractTagValue(tags, key) {
@@ -2348,6 +2367,7 @@ class PublicGatewayService {
         };
 
         await this.registrationStore.upsertRelay(relayKey, record);
+        await this.#storeMirrorMetadataPayload(relayKey, this.#buildMirrorMetadataPayload(record, relayKey));
         this.#syncSessionsWithRelay(relayKey, record);
 
         if (!updatedPeers.length) {
@@ -3212,6 +3232,7 @@ class PublicGatewayService {
 
     record.blindPeer = this.#getBlindPeerSummary();
     await this.registrationStore.upsertRelay(relayKey, record);
+    await this.#storeMirrorMetadataPayload(relayKey, this.#buildMirrorMetadataPayload(record, relayKey));
     this.#storeRelayAliases(relayKey, record).catch((error) => {
       this.logger?.warn?.('[PublicGateway] Failed to store relay aliases', {
         relayKey,
@@ -3291,6 +3312,10 @@ class PublicGatewayService {
     try {
       const upsertPayload = relayCoreMetadata ? { ...registration, relayCores: relayCoreMetadata } : registration;
       await this.registrationStore.upsertRelay(registration.relayKey, upsertPayload);
+      await this.#storeMirrorMetadataPayload(
+        registration.relayKey,
+        this.#buildMirrorMetadataPayload(upsertPayload, registration.relayKey)
+      );
       this.#storeRelayAliases(registration.relayKey, upsertPayload).catch((error) => {
         this.logger?.warn?.('[PublicGateway] Failed to store relay aliases', {
           relayKey: registration.relayKey,
@@ -3347,22 +3372,28 @@ class PublicGatewayService {
     try {
       const record = await this.registrationStore.getRelay(relayKey);
       if (!record) {
+        const cached = await this.registrationStore.getMirrorMetadata?.(relayKey);
+        if (cached && typeof cached === 'object') {
+          const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
+          const payload = {
+            ...cached,
+            relayKey: cached.relayKey || relayKey,
+            publicIdentifier: cached.publicIdentifier || relayKey,
+            blindPeer: blindPeerInfo && blindPeerInfo.enabled
+              ? {
+                  publicKey: blindPeerInfo.publicKey || null,
+                  encryptionKey: blindPeerInfo.encryptionKey || null,
+                  maxBytes: blindPeerInfo.maxBytes ?? null
+                }
+              : (cached.blindPeer || { enabled: false })
+          };
+          await this.#storeMirrorMetadataPayload(relayKey, payload);
+          return res.json(payload);
+        }
         return res.status(404).json({ error: 'relay-not-found' });
       }
-      const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
-      const cores = Array.isArray(record.relayCores) ? record.relayCores : [];
-      const payload = {
-        relayKey,
-        publicIdentifier: record.metadata?.identifier || relayKey,
-        cores,
-        blindPeer: blindPeerInfo && blindPeerInfo.enabled
-          ? {
-              publicKey: blindPeerInfo.publicKey || null,
-              encryptionKey: blindPeerInfo.encryptionKey || null,
-              maxBytes: blindPeerInfo.maxBytes ?? null
-            }
-          : { enabled: false }
-      };
+      const payload = this.#buildMirrorMetadataPayload(record, relayKey);
+      await this.#storeMirrorMetadataPayload(relayKey, payload);
       return res.json(payload);
     } catch (error) {
       this.logger?.warn?.('[PublicGateway] Failed to fetch relay mirror metadata', {

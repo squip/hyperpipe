@@ -71,8 +71,12 @@ const defaultStorageDir = process.env.STORAGE_DIR || pearRuntime?.config?.storag
 const userKey = process.env.USER_KEY || null
 const BLIND_PEERING_METADATA_FILENAME = 'blind-peering-metadata.json'
 const RELAY_CORE_REFS_CACHE_FILENAME = 'relay-core-refs-cache.json'
-const BLIND_PEER_REHYDRATION_TIMEOUT_MS = 45000
-const BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS = 60000
+const BLIND_PEER_REHYDRATION_TIMEOUT_MS = 60000
+const BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS = 90000
+const BLIND_PEER_REHYDRATION_RETRIES = 1
+const BLIND_PEER_REHYDRATION_BACKOFF_MS = 5000
+const BLIND_PEER_JOIN_REHYDRATION_RETRIES = 1
+const BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS = 7000
 const BLIND_PEER_MIRROR_METADATA_REFRESH_MS = 1 * 60 * 1000
 const BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS = 8000
 const OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS = 8000
@@ -98,9 +102,9 @@ let relayCoreRefsCacheTimer = null
 const openJoinContexts = new Map()
 const pendingOpenJoinReauth = new Map()
 const OPEN_JOIN_REAUTH_MIN_INTERVAL_MS = 30000
-const OPEN_JOIN_POOL_TARGET_SIZE = 4
+const OPEN_JOIN_POOL_TARGET_SIZE = 8
 const OPEN_JOIN_POOL_ENTRY_TTL_MS = 6 * 60 * 60 * 1000
-const OPEN_JOIN_POOL_REFRESH_MS = 2 * 60 * 60 * 1000
+const OPEN_JOIN_POOL_REFRESH_MS = 30 * 60 * 1000
 const openJoinWriterPoolCache = new Map()
 const openJoinWriterPoolLocks = new Set()
 
@@ -585,9 +589,11 @@ async function syncActiveRelayCoreRefs({
     })
   }
 
-  const rehydrateSummary = await manager.rehydrateMirrors({
+  const rehydrateSummary = await rehydrateMirrorsWithRetry(manager, {
     reason,
-    timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+    timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS,
+    retries: BLIND_PEER_REHYDRATION_RETRIES,
+    backoffMs: BLIND_PEER_REHYDRATION_BACKOFF_MS
   })
 
   const writerSummary = await ensureRelayWritersFromCoreRefs(relayManager, normalized, reason)
@@ -651,6 +657,41 @@ function collectPublicGatewayOrigins() {
   }
 
   return Array.from(origins)
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function rehydrateMirrorsWithRetry(manager, {
+  reason = 'manual',
+  timeoutMs,
+  retries = 0,
+  backoffMs = 0
+} = {}) {
+  if (!manager?.rehydrateMirrors) {
+    return { status: 'skipped', reason: 'rehydration-unavailable', synced: 0, failed: 0 }
+  }
+  let attempt = 0
+  let summary = await manager.rehydrateMirrors({ reason, timeoutMs })
+  while (summary?.failed > 0 && attempt < retries) {
+    const waitMs = backoffMs * Math.pow(2, attempt)
+    if (waitMs > 0) {
+      console.warn('[Worker] Mirror rehydration retry scheduled', {
+        reason,
+        failed: summary?.failed ?? null,
+        attempt: attempt + 1,
+        waitMs
+      })
+      await delay(waitMs)
+    }
+    summary = await manager.rehydrateMirrors({
+      reason: `${reason}-retry-${attempt + 1}`,
+      timeoutMs: timeoutMs ? Math.round(timeoutMs * 1.5) : timeoutMs
+    })
+    attempt += 1
+  }
+  return summary
 }
 
 function pruneOpenJoinPoolEntries(entries = [], now = Date.now()) {
@@ -3577,9 +3618,11 @@ async function handleMessageObject(message) {
                     connected: primeSummary?.connected ?? null
                   })
                 }
-                const rehydrateSummary = await manager.rehydrateMirrors({
+                const rehydrateSummary = await rehydrateMirrorsWithRetry(manager, {
                   reason: 'join-flow',
-                  timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS
+                  timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
+                  retries: BLIND_PEER_JOIN_REHYDRATION_RETRIES,
+                  backoffMs: BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS
                 })
                 console.log('[Worker] Blind-peer join flow: rehydration completed', {
                   relayIdentifier,
@@ -3672,9 +3715,11 @@ async function handleMessageObject(message) {
               await seedBlindPeeringMirrors(manager)
             }
             await manager.refreshFromBlindPeers('invite-writer')
-            const summary = await manager.rehydrateMirrors({
+            const summary = await rehydrateMirrorsWithRetry(manager, {
               reason: 'invite-writer',
-              timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+              timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS,
+              retries: BLIND_PEER_REHYDRATION_RETRIES,
+              backoffMs: BLIND_PEER_REHYDRATION_BACKOFF_MS
             })
             console.log('[Worker] Blind-peer refresh complete after invite writer', {
               relayKey,

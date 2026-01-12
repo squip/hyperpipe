@@ -1,9 +1,17 @@
 class MemoryRegistrationStore {
-  constructor(ttlSeconds = 300) {
-    this.ttlSeconds = ttlSeconds;
+  constructor(options = 300) {
+    const resolved = typeof options === 'object' && options !== null
+      ? options
+      : { ttlSeconds: options };
+    this.ttlSeconds = Number.isFinite(resolved.ttlSeconds) ? resolved.ttlSeconds : 300;
+    this.mirrorTtlSeconds = Number.isFinite(resolved.mirrorTtlSeconds) ? resolved.mirrorTtlSeconds : null;
+    this.openJoinPoolTtlSeconds = Number.isFinite(resolved.openJoinPoolTtlSeconds)
+      ? resolved.openJoinPoolTtlSeconds
+      : null;
     this.items = new Map();
     this.tokenMetadata = new Map();
     this.openJoinPools = new Map();
+    this.mirrorMetadata = new Map();
     this.relayAliases = new Map();
     this.relayAliasIndex = new Map();
   }
@@ -48,12 +56,22 @@ class MemoryRegistrationStore {
     }
 
     for (const [key, pool] of this.openJoinPools.entries()) {
+      if (pool?.expiresAt && pool.expiresAt <= now) {
+        this.openJoinPools.delete(key);
+        continue;
+      }
       const entries = Array.isArray(pool?.entries) ? pool.entries : [];
       const nextEntries = entries.filter((entry) => !entry?.expiresAt || entry.expiresAt > now);
       if (nextEntries.length) {
         this.openJoinPools.set(key, { ...pool, entries: nextEntries });
       } else {
         this.openJoinPools.delete(key);
+      }
+    }
+
+    for (const [key, record] of this.mirrorMetadata.entries()) {
+      if (record?.expiresAt && record.expiresAt <= now) {
+        this.mirrorMetadata.delete(key);
       }
     }
 
@@ -96,9 +114,16 @@ class MemoryRegistrationStore {
 
   async storeOpenJoinPool(relayKey, pool = {}) {
     if (!relayKey) return;
+    const now = Date.now();
+    const poolTtlSeconds = Number.isFinite(this.openJoinPoolTtlSeconds)
+      ? this.openJoinPoolTtlSeconds
+      : this.ttlSeconds;
     const record = {
       entries: Array.isArray(pool.entries) ? pool.entries : [],
-      updatedAt: pool.updatedAt || Date.now()
+      updatedAt: pool.updatedAt || now,
+      expiresAt: Number.isFinite(poolTtlSeconds) && poolTtlSeconds > 0
+        ? now + poolTtlSeconds * 1000
+        : null
     };
     this.openJoinPools.set(relayKey, record);
   }
@@ -106,11 +131,15 @@ class MemoryRegistrationStore {
   async getOpenJoinPool(relayKey) {
     const record = this.openJoinPools.get(relayKey);
     if (!record) return null;
+    if (record.expiresAt && record.expiresAt <= Date.now()) {
+      this.openJoinPools.delete(relayKey);
+      return null;
+    }
     return record;
   }
 
   async takeOpenJoinLease(relayKey) {
-    const record = this.openJoinPools.get(relayKey);
+    const record = await this.getOpenJoinPool(relayKey);
     if (!record) return null;
     const now = Date.now();
     const entries = Array.isArray(record.entries) ? record.entries : [];
@@ -126,6 +155,33 @@ class MemoryRegistrationStore {
 
   async clearOpenJoinPool(relayKey) {
     this.openJoinPools.delete(relayKey);
+  }
+
+  async storeMirrorMetadata(relayKey, payload = {}) {
+    if (!relayKey) return;
+    const ttlSeconds = Number.isFinite(this.mirrorTtlSeconds) ? this.mirrorTtlSeconds : this.ttlSeconds;
+    const record = {
+      payload,
+      storedAt: Date.now(),
+      expiresAt: Number.isFinite(ttlSeconds) && ttlSeconds > 0
+        ? Date.now() + ttlSeconds * 1000
+        : null
+    };
+    this.mirrorMetadata.set(relayKey, record);
+  }
+
+  async getMirrorMetadata(relayKey) {
+    const record = this.mirrorMetadata.get(relayKey);
+    if (!record) return null;
+    if (record.expiresAt && record.expiresAt <= Date.now()) {
+      this.mirrorMetadata.delete(relayKey);
+      return null;
+    }
+    return record.payload || null;
+  }
+
+  async clearMirrorMetadata(relayKey) {
+    this.mirrorMetadata.delete(relayKey);
   }
 
   async storeRelayAlias(identifier, relayKey) {

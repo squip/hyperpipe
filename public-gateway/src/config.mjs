@@ -22,7 +22,9 @@ const DEFAULT_CONFIG = {
     sharedSecret: process.env.GATEWAY_REGISTRATION_SECRET || null,
     redisUrl: process.env.GATEWAY_REGISTRATION_REDIS || null,
     redisPrefix: process.env.GATEWAY_REGISTRATION_REDIS_PREFIX || 'gateway:registrations:',
-    cacheTtlSeconds: Number(process.env.GATEWAY_REGISTRATION_TTL || 300),
+    cacheTtlSeconds: Number(process.env.GATEWAY_REGISTRATION_TTL || 1800),
+    mirrorTtlSeconds: Number(process.env.GATEWAY_MIRROR_METADATA_TTL || 86400),
+    openJoinPoolTtlSeconds: Number(process.env.GATEWAY_OPEN_JOIN_POOL_TTL || 21600),
     defaultTokenTtl: Number(process.env.GATEWAY_DEFAULT_TOKEN_TTL || 3600),
     tokenRefreshWindowSeconds: Number(process.env.GATEWAY_TOKEN_REFRESH_WINDOW || 300)
   },
@@ -81,7 +83,7 @@ const DEFAULT_CONFIG = {
     poolEntryTtlMs: Number(process.env.GATEWAY_OPEN_JOIN_POOL_TTL_MS) || (6 * 60 * 60 * 1000),
     challengeTtlMs: Number(process.env.GATEWAY_OPEN_JOIN_CHALLENGE_TTL_MS) || (2 * 60 * 1000),
     authWindowSeconds: Number(process.env.GATEWAY_OPEN_JOIN_AUTH_WINDOW || 300),
-    maxPoolSize: Number(process.env.GATEWAY_OPEN_JOIN_MAX_POOL || 50)
+    maxPoolSize: Number(process.env.GATEWAY_OPEN_JOIN_MAX_POOL || 100)
   }
 };
 

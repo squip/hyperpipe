@@ -1138,6 +1138,57 @@ export class GatewayService extends EventEmitter {
     }
 
     if (!peers.length) {
+      if (metadataCopy?.isOpen === true) {
+        const payload = {
+          peers,
+          metadata: metadataCopy
+        };
+        if (relayCores?.length) {
+          payload.relayCores = relayCores;
+        }
+        try {
+          const registrationResult = await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
+          if (!registrationResult?.success) {
+            throw new Error(registrationResult?.error || 'Registration rejected by gateway');
+          }
+          await this.#syncOpenJoinPool(relayKey, metadataCopy);
+          this.publicGatewayRelayState.set(relayKey, {
+            relayKey,
+            status: 'offline',
+            peerCount: 0,
+            lastSyncedAt: now,
+            message: 'No peers connected',
+            metadata: metadataCopy,
+            peers: [],
+            blindPeer: this.blindPeerSummary || null,
+            relayCores: relayCores || [],
+            localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
+              ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
+              : null,
+            requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
+          });
+        } catch (error) {
+          this.publicGatewayRelayState.set(relayKey, {
+            relayKey,
+            status: 'error',
+            peerCount: 0,
+            lastSyncedAt: now,
+            message: error.message,
+            metadata: metadataCopy,
+            peers: [],
+            blindPeer: this.blindPeerSummary || null,
+            relayCores: relayCores || [],
+            localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
+              ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
+              : null,
+            requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
+          });
+          this.log('warn', `[PublicGateway] Failed to register offline relay ${relayKey}: ${error.message}`);
+        }
+        this.#clearRelayToken(relayKey);
+        this.#emitPublicGatewayStatus();
+        return;
+      }
       try {
         await this.publicGatewayRegistrar.unregisterRelay(relayKey);
         this.publicGatewayRelayState.set(relayKey, {

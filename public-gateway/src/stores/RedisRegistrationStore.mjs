@@ -1,13 +1,23 @@
 import { createClient } from 'redis';
 
 class RedisRegistrationStore {
-  constructor({ url, ttlSeconds = 300, prefix = 'gateway:registrations:', logger } = {}) {
+  constructor({
+    url,
+    ttlSeconds = 300,
+    mirrorTtlSeconds = null,
+    openJoinPoolTtlSeconds = null,
+    prefix = 'gateway:registrations:',
+    logger
+  } = {}) {
     if (!url) throw new Error('Redis URL is required for RedisRegistrationStore');
     this.url = url;
     this.ttlSeconds = ttlSeconds;
+    this.mirrorTtlSeconds = Number.isFinite(mirrorTtlSeconds) ? mirrorTtlSeconds : null;
+    this.openJoinPoolTtlSeconds = Number.isFinite(openJoinPoolTtlSeconds) ? openJoinPoolTtlSeconds : null;
     this.prefix = prefix.endsWith(':') ? prefix : `${prefix}:`;
     this.tokenPrefix = `${this.prefix}tokens:`;
     this.openJoinPrefix = `${this.prefix}open-join:`;
+    this.mirrorPrefix = `${this.prefix}mirrors:`;
     this.aliasPrefix = `${this.prefix}aliases:`;
     this.logger = logger || console;
     this.client = createClient({ url: this.url });
@@ -42,6 +52,10 @@ class RedisRegistrationStore {
 
   #openJoinKey(relayKey) {
     return `${this.openJoinPrefix}${relayKey}`;
+  }
+
+  #mirrorKey(relayKey) {
+    return `${this.mirrorPrefix}${relayKey}`;
   }
 
   #aliasKey(identifier) {
@@ -118,7 +132,14 @@ class RedisRegistrationStore {
       entries: Array.isArray(pool.entries) ? pool.entries : [],
       updatedAt: pool.updatedAt || Date.now()
     });
-    await this.client.set(this.#openJoinKey(relayKey), payload, { EX: this.ttlSeconds });
+    const ttlSeconds = Number.isFinite(this.openJoinPoolTtlSeconds)
+      ? this.openJoinPoolTtlSeconds
+      : this.ttlSeconds;
+    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+      await this.client.set(this.#openJoinKey(relayKey), payload, { EX: ttlSeconds });
+    } else {
+      await this.client.set(this.#openJoinKey(relayKey), payload);
+    }
   }
 
   async getOpenJoinPool(relayKey) {
@@ -152,6 +173,41 @@ class RedisRegistrationStore {
   async clearOpenJoinPool(relayKey) {
     await this.#ensureConnected();
     await this.client.del(this.#openJoinKey(relayKey));
+  }
+
+  async storeMirrorMetadata(relayKey, payload = {}) {
+    if (!relayKey) return;
+    await this.#ensureConnected();
+    const record = JSON.stringify({
+      payload,
+      storedAt: Date.now()
+    });
+    const ttlSeconds = Number.isFinite(this.mirrorTtlSeconds)
+      ? this.mirrorTtlSeconds
+      : this.ttlSeconds;
+    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+      await this.client.set(this.#mirrorKey(relayKey), record, { EX: ttlSeconds });
+    } else {
+      await this.client.set(this.#mirrorKey(relayKey), record);
+    }
+  }
+
+  async getMirrorMetadata(relayKey) {
+    await this.#ensureConnected();
+    const value = await this.client.get(this.#mirrorKey(relayKey));
+    if (!value) return null;
+    try {
+      const parsed = JSON.parse(value);
+      return parsed?.payload || null;
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse redis mirror metadata payload', { relayKey, error: error.message });
+      return null;
+    }
+  }
+
+  async clearMirrorMetadata(relayKey) {
+    await this.#ensureConnected();
+    await this.client.del(this.#mirrorKey(relayKey));
   }
 
   async storeRelayAlias(identifier, relayKey) {
