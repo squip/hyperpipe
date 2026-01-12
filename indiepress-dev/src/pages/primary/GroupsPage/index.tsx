@@ -252,6 +252,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     if (joiningInviteId) return
     const relayUrl = inv.relayUrl ?? (inv.relay ? resolveRelayUrl(inv.relay) : null) ?? inv.relay ?? null
     const relayKey = inv.relayKey ?? null
+    const openJoin = !inv.token && inv.fileSharing !== false
     setJoiningInviteId(inv.event.id)
     try {
       if (sendToWorker && pubkey && inv.token) {
@@ -268,6 +269,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
 
       await startJoinFlow(inv.groupId, {
         fileSharing: inv.fileSharing !== false,
+        openJoin,
         token: inv.token,
         relayKey,
         relayUrl,

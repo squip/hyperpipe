@@ -69,7 +69,7 @@ type TGroupsContext = {
     members: string[]
     membershipStatus: TGroupMembershipStatus
   }>
-  sendInvites: (groupId: string, invitees: string[], relay?: string) => Promise<void>
+  sendInvites: (groupId: string, invitees: string[], relay?: string, options?: SendInviteOptions) => Promise<void>
   updateMetadata: (groupId: string, data: Partial<{ name: string; about: string; picture: string; isPublic: boolean; isOpen: boolean }>, relay?: string) => Promise<void>
   grantAdmin: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
   approveJoinRequest: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
@@ -160,6 +160,12 @@ type InviteMirrorMetadata = {
   cores?: { key: string; role?: string | null }[]
 } | null
 
+type SendInviteOptions = {
+  isOpen?: boolean
+  name?: string
+  about?: string
+}
+
 const buildInvitePayload = (args: {
   token: string
   relayUrl: string | null
@@ -186,6 +192,11 @@ const buildInvitePayload = (args: {
   writerCoreHex: args.writerInfo?.writerCoreHex || args.writerInfo?.autobaseLocal || null,
   autobaseLocal: args.writerInfo?.autobaseLocal || args.writerInfo?.writerCoreHex || null,
   writerSecret: args.writerInfo?.writerSecret || null
+})
+
+const buildOpenInvitePayload = (args: { relayUrl: string | null; relayKey?: string | null }) => ({
+  relayUrl: args.relayUrl,
+  relayKey: args.relayKey ?? null
 })
 
 export function GroupsProvider({ children }: { children: ReactNode }) {
@@ -470,7 +481,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let token: string | undefined
             let relayUrl: string | null | undefined
             let relayKey: string | null | undefined
-            let fileSharing: boolean | undefined
+            let fileSharing: boolean | undefined = invite.fileSharing
             let blindPeer: TGroupInvite['blindPeer'] | null | undefined
             let cores: TGroupInvite['cores'] | undefined
             let writerCore: string | null | undefined
@@ -1136,7 +1147,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   )
 
   const sendInvites = useCallback(
-    async (groupId: string, invitees: string[], relay?: string) => {
+    async (groupId: string, invitees: string[], relay?: string, options?: SendInviteOptions) => {
       if (!pubkey) throw new Error('Not logged in')
       if (!invitees.length) return
 
@@ -1148,6 +1159,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           (g) => g.id === groupId && (!relay || !g.relay || g.relay === relay || g.relay === resolved)
         ) || null
       const relayEntry = getRelayEntryForGroup(groupId)
+      const resolvedIsOpen = typeof options?.isOpen === 'boolean' ? options.isOpen : meta?.isOpen
+      const isOpenGroup = resolvedIsOpen === true
+      const inviteName = options?.name ?? meta?.name
+      const inviteAbout = options?.about ?? meta?.about
 
       let writerInfo: {
         writerCore?: string
@@ -1155,7 +1170,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         autobaseLocal?: string
         writerSecret?: string
       } | null = null
-      if (sendToWorker && relayEntry?.relayKey && invitees.length === 1) {
+      if (!isOpenGroup && sendToWorker && relayEntry?.relayKey && invitees.length === 1) {
         try {
           const res = await sendToWorker({
             type: 'provision-writer-for-invitee',
@@ -1183,31 +1198,39 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      let mirrorMetadata = await fetchInviteMirrorMetadata(relayEntry?.relayKey || groupId, resolved)
+      let mirrorMetadata: InviteMirrorMetadata = null
+      if (!isOpenGroup) {
+        mirrorMetadata = await fetchInviteMirrorMetadata(relayEntry?.relayKey || groupId, resolved)
 
-      // If we created a writer core for this invite, include it in cores so it gets mirrored.
-      const writerCoreKey =
-        writerInfo?.writerCoreHex || writerInfo?.autobaseLocal || writerInfo?.writerCore
-      if (writerCoreKey) {
-        if (!mirrorMetadata) mirrorMetadata = {}
-        const cores = Array.isArray(mirrorMetadata.cores) ? [...mirrorMetadata.cores] : []
-        cores.push({ key: writerCoreKey, role: 'autobase-writer' })
-        mirrorMetadata.cores = cores
+        // If we created a writer core for this invite, include it in cores so it gets mirrored.
+        const writerCoreKey =
+          writerInfo?.writerCoreHex || writerInfo?.autobaseLocal || writerInfo?.writerCore
+        if (writerCoreKey) {
+          if (!mirrorMetadata) mirrorMetadata = {}
+          const cores = Array.isArray(mirrorMetadata.cores) ? [...mirrorMetadata.cores] : []
+          cores.push({ key: writerCoreKey, role: 'autobase-writer' })
+          mirrorMetadata.cores = cores
+        }
       }
 
       const inviteRelayUrl = getBaseRelayUrl(resolved || relay || '') || resolved || relay || null
 
       await Promise.all(
         invitees.map(async (invitee) => {
-          const token = randomString(24)
-          const payload = buildInvitePayload({
-            token,
-            relayUrl: inviteRelayUrl,
-            relayKey: relayEntry?.relayKey || null,
-            meta,
-            mirrorMetadata,
-            writerInfo
-          })
+          const token = isOpenGroup ? null : randomString(24)
+          const payload = isOpenGroup
+            ? buildOpenInvitePayload({
+                relayUrl: inviteRelayUrl,
+                relayKey: relayEntry?.relayKey || null
+              })
+            : buildInvitePayload({
+                token: token as string,
+                relayUrl: inviteRelayUrl,
+                relayKey: relayEntry?.relayKey || null,
+                meta,
+                mirrorMetadata,
+                writerInfo
+              })
           const encryptedPayload = await nip04Encrypt(
             invitee,
             JSON.stringify(payload)
@@ -1215,6 +1238,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           console.info('[GroupsProvider] Invite payload built', {
             groupId,
             invitee,
+            openInvite: isOpenGroup,
             hasWriterCore: !!writerInfo?.writerCore,
             hasWriterCoreHex: !!writerInfo?.writerCoreHex,
             hasAutobaseLocal: !!writerInfo?.autobaseLocal,
@@ -1225,21 +1249,23 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             ['p', invitee],
             ['i', 'hypertuna']
           ]
-          if (meta?.name) inviteTags.push(['name', meta.name])
-          if (meta?.about) inviteTags.push(['about', meta.about])
-          inviteTags.push([meta?.isOpen === false ? 'file-sharing-off' : 'file-sharing-on'])
+          if (inviteName) inviteTags.push(['name', inviteName])
+          if (inviteAbout) inviteTags.push(['about', inviteAbout])
+          inviteTags.push([resolvedIsOpen === false ? 'file-sharing-off' : 'file-sharing-on'])
 
-          // Add 9000 put-user so membership/auth is consistent with legacy flow
-          const putUser: TDraftEvent = {
-            kind: 9000,
-            created_at: Math.floor(Date.now() / 1000),
-            tags: [
-              ['h', groupId],
-              ['p', invitee, 'member', token]
-            ],
-            content: ''
+          if (!isOpenGroup && token) {
+            // Add 9000 put-user so membership/auth is consistent with legacy flow
+            const putUser: TDraftEvent = {
+              kind: 9000,
+              created_at: Math.floor(Date.now() / 1000),
+              tags: [
+                ['h', groupId],
+                ['p', invitee, 'member', token]
+              ],
+              content: ''
+            }
+            await publish(putUser, { specifiedRelayUrls: relayUrls })
           }
-          await publish(putUser, { specifiedRelayUrls: relayUrls })
 
           const draftEvent: TDraftEvent = {
             kind: 9009,
@@ -1249,29 +1275,31 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           }
           await publish(draftEvent, { specifiedRelayUrls: relayUrls })
 
-          try {
-            if (sendToWorker) {
-              const memberTs = Date.now()
-              await sendToWorker({
-                type: 'update-auth-data',
-                data: {
-                  relayKey: relayEntry?.relayKey,
-                  publicIdentifier: groupId,
-                  pubkey: invitee,
-                  token
-                }
-              })
-              await sendToWorker({
-                type: 'update-members',
-                data: {
-                  relayKey: relayEntry?.relayKey,
-                  publicIdentifier: groupId,
-                  member_adds: [{ pubkey: invitee, ts: memberTs }]
-                }
-              })
+          if (!isOpenGroup && token) {
+            try {
+              if (sendToWorker) {
+                const memberTs = Date.now()
+                await sendToWorker({
+                  type: 'update-auth-data',
+                  data: {
+                    relayKey: relayEntry?.relayKey,
+                    publicIdentifier: groupId,
+                    pubkey: invitee,
+                    token
+                  }
+                })
+                await sendToWorker({
+                  type: 'update-members',
+                  data: {
+                    relayKey: relayEntry?.relayKey,
+                    publicIdentifier: groupId,
+                    member_adds: [{ pubkey: invitee, ts: memberTs }]
+                  }
+                })
+              }
+            } catch (_err) {
+              // best effort
             }
-          } catch (_err) {
-            // best effort
           }
         })
       )

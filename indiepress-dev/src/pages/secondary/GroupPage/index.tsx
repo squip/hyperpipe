@@ -901,7 +901,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     }
   }, [baseDetail, membershipStatus, membersWithSelf, mockMembersConfig])
   const isOpenGroup = effectiveDetail?.metadata?.isOpen !== false
-  const openJoinAllowed = !!effectiveDetail?.metadata && effectiveDetail.metadata.isOpen !== false
+  const inviteOpenJoin = !!inviteData && !inviteToken && inviteData.fileSharing !== false
+  const openJoinAllowed = inviteOpenJoin || effectiveDetail?.metadata?.isOpen === true
 
   const isAdmin =
     !!pubkey &&
@@ -1005,7 +1006,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     if (!groupId || !selectedInvitees.length) return
     setIsSendingInvite(true)
     try {
-      await sendInvites(groupId, selectedInvitees, effectiveGroupRelay)
+      await sendInvites(groupId, selectedInvitees, effectiveGroupRelay, {
+        isOpen: isOpenGroup,
+        name: effectiveDetail?.metadata?.name,
+        about: effectiveDetail?.metadata?.about
+      })
       toast.success(t('Invites sent'))
       setSelectedInvitees([])
       setInviteSearch('')

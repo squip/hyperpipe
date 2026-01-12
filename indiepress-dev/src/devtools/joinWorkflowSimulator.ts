@@ -7,7 +7,12 @@ type SimulatorDeps = {
   sendJoinRequest: (groupId: string, relay?: string, code?: string) => Promise<void>
   approveJoinRequest: (groupId: string, pubkey: string, relay?: string) => Promise<void>
   rejectJoinRequest: (groupId: string, pubkey: string, relay?: string) => Promise<void>
-  sendInvites: (groupId: string, invitees: string[], relay?: string) => Promise<void>
+  sendInvites: (
+    groupId: string,
+    invitees: string[],
+    relay?: string,
+    options?: { isOpen?: boolean; name?: string; about?: string }
+  ) => Promise<void>
   loadJoinRequests: (groupId: string, relay?: string) => Promise<void>
 }
 
