@@ -14,6 +14,8 @@ class MemoryRegistrationStore {
     this.mirrorMetadata = new Map();
     this.relayAliases = new Map();
     this.relayAliasIndex = new Map();
+    this.openJoinAliases = new Map();
+    this.openJoinAliasIndex = new Map();
   }
 
   async upsertRelay(relayKey, payload) {
@@ -39,6 +41,7 @@ class MemoryRegistrationStore {
     this.tokenMetadata.delete(relayKey);
     this.openJoinPools.delete(relayKey);
     this.removeRelayAliases(relayKey);
+    this.clearOpenJoinAliases(relayKey);
   }
 
   pruneExpired() {
@@ -58,6 +61,7 @@ class MemoryRegistrationStore {
     for (const [key, pool] of this.openJoinPools.entries()) {
       if (pool?.expiresAt && pool.expiresAt <= now) {
         this.openJoinPools.delete(key);
+        this.clearOpenJoinAliases(key);
         continue;
       }
       const entries = Array.isArray(pool?.entries) ? pool.entries : [];
@@ -66,6 +70,7 @@ class MemoryRegistrationStore {
         this.openJoinPools.set(key, { ...pool, entries: nextEntries });
       } else {
         this.openJoinPools.delete(key);
+        this.clearOpenJoinAliases(key);
       }
     }
 
@@ -85,6 +90,20 @@ class MemoryRegistrationStore {
         aliasSet.delete(alias);
         if (aliasSet.size === 0) {
           this.relayAliasIndex.delete(relayKey);
+        }
+      }
+    }
+
+    for (const [alias, record] of this.openJoinAliases.entries()) {
+      if (!record?.expiresAt || record.expiresAt > now) continue;
+      this.openJoinAliases.delete(alias);
+      const relayKey = record?.relayKey;
+      if (!relayKey) continue;
+      const aliasSet = this.openJoinAliasIndex.get(relayKey);
+      if (aliasSet) {
+        aliasSet.delete(alias);
+        if (aliasSet.size === 0) {
+          this.openJoinAliasIndex.delete(relayKey);
         }
       }
     }
@@ -121,6 +140,11 @@ class MemoryRegistrationStore {
     const record = {
       entries: Array.isArray(pool.entries) ? pool.entries : [],
       updatedAt: pool.updatedAt || now,
+      publicIdentifier: typeof pool.publicIdentifier === 'string' ? pool.publicIdentifier : null,
+      relayUrl: typeof pool.relayUrl === 'string' ? pool.relayUrl : null,
+      relayCores: Array.isArray(pool.relayCores) ? pool.relayCores : [],
+      metadata: pool.metadata && typeof pool.metadata === 'object' ? pool.metadata : null,
+      aliases: Array.isArray(pool.aliases) ? pool.aliases : [],
       expiresAt: Number.isFinite(poolTtlSeconds) && poolTtlSeconds > 0
         ? now + poolTtlSeconds * 1000
         : null
@@ -133,6 +157,7 @@ class MemoryRegistrationStore {
     if (!record) return null;
     if (record.expiresAt && record.expiresAt <= Date.now()) {
       this.openJoinPools.delete(relayKey);
+      this.clearOpenJoinAliases(relayKey);
       return null;
     }
     return record;
@@ -149,12 +174,64 @@ class MemoryRegistrationStore {
       this.openJoinPools.set(relayKey, { ...record, entries: nextEntries, updatedAt: record.updatedAt || now });
     } else {
       this.openJoinPools.delete(relayKey);
+      this.clearOpenJoinAliases(relayKey);
     }
     return lease;
   }
 
   async clearOpenJoinPool(relayKey) {
     this.openJoinPools.delete(relayKey);
+    this.clearOpenJoinAliases(relayKey);
+  }
+
+  async storeOpenJoinAliases(relayKey, aliases = []) {
+    if (!relayKey) return;
+    const ttlSeconds = Number.isFinite(this.openJoinPoolTtlSeconds)
+      ? this.openJoinPoolTtlSeconds
+      : this.ttlSeconds;
+    const expiresAt = Number.isFinite(ttlSeconds) && ttlSeconds > 0
+      ? Date.now() + ttlSeconds * 1000
+      : null;
+    const aliasList = Array.isArray(aliases) ? aliases : [];
+    const unique = new Set();
+    for (const rawAlias of aliasList) {
+      const alias = typeof rawAlias === 'string' ? rawAlias.trim() : null;
+      if (!alias || unique.has(alias)) continue;
+      unique.add(alias);
+      this.openJoinAliases.set(alias, { relayKey, expiresAt });
+      const aliasSet = this.openJoinAliasIndex.get(relayKey) || new Set();
+      aliasSet.add(alias);
+      this.openJoinAliasIndex.set(relayKey, aliasSet);
+    }
+  }
+
+  async resolveOpenJoinAlias(identifier) {
+    if (!identifier) return null;
+    const alias = typeof identifier === 'string' ? identifier.trim() : null;
+    if (!alias) return null;
+    const record = this.openJoinAliases.get(alias);
+    if (!record) return null;
+    if (record.expiresAt && record.expiresAt <= Date.now()) {
+      this.openJoinAliases.delete(alias);
+      const aliasSet = this.openJoinAliasIndex.get(record.relayKey);
+      if (aliasSet) {
+        aliasSet.delete(alias);
+        if (aliasSet.size === 0) {
+          this.openJoinAliasIndex.delete(record.relayKey);
+        }
+      }
+      return null;
+    }
+    return record.relayKey || null;
+  }
+
+  clearOpenJoinAliases(relayKey) {
+    const aliasSet = this.openJoinAliasIndex.get(relayKey);
+    if (!aliasSet) return;
+    for (const alias of aliasSet) {
+      this.openJoinAliases.delete(alias);
+    }
+    this.openJoinAliasIndex.delete(relayKey);
   }
 
   async storeMirrorMetadata(relayKey, payload = {}) {

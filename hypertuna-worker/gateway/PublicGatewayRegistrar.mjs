@@ -103,15 +103,60 @@ class PublicGatewayRegistrar {
   async updateOpenJoinPool(relayKey, entries = [], options = {}) {
     if (!this.isEnabled()) return { success: false };
     if (!relayKey) throw new Error('relayKey is required');
+    const metadata = options?.metadata && typeof options.metadata === 'object' ? options.metadata : null;
+    const relayCores = Array.isArray(options?.relayCores)
+      ? options.relayCores
+      : null;
+    const aliases = Array.isArray(options?.aliases)
+      ? options.aliases
+      : null;
+    const publicIdentifier = typeof options?.publicIdentifier === 'string'
+      ? options.publicIdentifier
+      : null;
+    const relayUrl = typeof options?.relayUrl === 'string'
+      ? options.relayUrl
+      : null;
     const payload = {
       relayKey,
       entries: Array.isArray(entries) ? entries : [],
       updatedAt: options.updatedAt || Date.now(),
-      targetSize: Number.isFinite(options.targetSize) ? Math.trunc(options.targetSize) : undefined
+      targetSize: Number.isFinite(options.targetSize) ? Math.trunc(options.targetSize) : undefined,
+      publicIdentifier,
+      relayUrl,
+      relayCores: relayCores || undefined,
+      metadata: metadata || undefined,
+      aliases: aliases || undefined
     };
     const body = await this.#signedPayload(payload);
     const path = `/api/relays/${encodeURIComponent(relayKey)}/open-join/pool`;
-    return this.#postJson(path, body);
+    const entryPreview = payload.entries.slice(0, 3).map((entry) => ({
+      writerCore: entry?.writerCore ? String(entry.writerCore).slice(0, 16) : null,
+      writerCoreHex: entry?.writerCoreHex
+        ? String(entry.writerCoreHex).slice(0, 16)
+        : entry?.autobaseLocal
+          ? String(entry.autobaseLocal).slice(0, 16)
+          : null,
+      expiresAt: entry?.expiresAt ?? null
+    }));
+    this.logger?.info?.('[PublicGateway] Open join pool update request', {
+      relayKey,
+      entries: payload.entries.length,
+      targetSize: payload.targetSize ?? null,
+      updatedAt: payload.updatedAt ?? null,
+      entryPreview,
+      publicIdentifier: payload.publicIdentifier ?? null,
+      relayCores: relayCores ? relayCores.length : null,
+      aliases: Array.isArray(payload.aliases) ? payload.aliases.length : null
+    });
+    const response = await this.#postJson(path, body);
+    this.logger?.info?.('[PublicGateway] Open join pool update response', {
+      relayKey,
+      stored: response?.stored ?? null,
+      total: response?.total ?? null,
+      needed: response?.needed ?? null,
+      targetSize: response?.targetSize ?? null
+    });
+    return response;
   }
 
   async #postJson(path, body) {

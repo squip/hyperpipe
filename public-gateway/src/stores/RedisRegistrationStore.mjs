@@ -17,6 +17,7 @@ class RedisRegistrationStore {
     this.prefix = prefix.endsWith(':') ? prefix : `${prefix}:`;
     this.tokenPrefix = `${this.prefix}tokens:`;
     this.openJoinPrefix = `${this.prefix}open-join:`;
+    this.openJoinAliasPrefix = `${this.prefix}open-join-aliases:`;
     this.mirrorPrefix = `${this.prefix}mirrors:`;
     this.aliasPrefix = `${this.prefix}aliases:`;
     this.logger = logger || console;
@@ -54,6 +55,10 @@ class RedisRegistrationStore {
     return `${this.openJoinPrefix}${relayKey}`;
   }
 
+  #openJoinAliasKey(identifier) {
+    return `${this.openJoinAliasPrefix}${identifier}`;
+  }
+
   #mirrorKey(relayKey) {
     return `${this.mirrorPrefix}${relayKey}`;
   }
@@ -85,7 +90,7 @@ class RedisRegistrationStore {
     await this.#ensureConnected();
     await this.client.del(this.#key(relayKey));
     await this.client.del(this.#tokenKey(relayKey));
-    await this.client.del(this.#openJoinKey(relayKey));
+    await this.clearOpenJoinPool(relayKey);
   }
 
   pruneExpired() {
@@ -130,7 +135,12 @@ class RedisRegistrationStore {
     await this.#ensureConnected();
     const payload = JSON.stringify({
       entries: Array.isArray(pool.entries) ? pool.entries : [],
-      updatedAt: pool.updatedAt || Date.now()
+      updatedAt: pool.updatedAt || Date.now(),
+      publicIdentifier: typeof pool.publicIdentifier === 'string' ? pool.publicIdentifier : null,
+      relayUrl: typeof pool.relayUrl === 'string' ? pool.relayUrl : null,
+      relayCores: Array.isArray(pool.relayCores) ? pool.relayCores : [],
+      metadata: pool.metadata && typeof pool.metadata === 'object' ? pool.metadata : null,
+      aliases: Array.isArray(pool.aliases) ? pool.aliases : []
     });
     const ttlSeconds = Number.isFinite(this.openJoinPoolTtlSeconds)
       ? this.openJoinPoolTtlSeconds
@@ -163,7 +173,11 @@ class RedisRegistrationStore {
     const nextEntries = entries.filter((entry) => !entry?.expiresAt || entry.expiresAt > now);
     const lease = nextEntries.shift() || null;
     if (nextEntries.length) {
-      await this.storeOpenJoinPool(relayKey, { entries: nextEntries, updatedAt: pool.updatedAt || now });
+      await this.storeOpenJoinPool(relayKey, {
+        ...pool,
+        entries: nextEntries,
+        updatedAt: pool.updatedAt || now
+      });
     } else {
       await this.clearOpenJoinPool(relayKey);
     }
@@ -172,7 +186,64 @@ class RedisRegistrationStore {
 
   async clearOpenJoinPool(relayKey) {
     await this.#ensureConnected();
+    const pool = await this.getOpenJoinPool(relayKey);
     await this.client.del(this.#openJoinKey(relayKey));
+    const aliases = Array.isArray(pool?.aliases) ? pool.aliases : [];
+    if (aliases.length) {
+      await this.clearOpenJoinAliases(relayKey, aliases);
+    }
+  }
+
+  async storeOpenJoinAliases(relayKey, aliases = []) {
+    if (!relayKey) return;
+    await this.#ensureConnected();
+    const ttlSeconds = Number.isFinite(this.openJoinPoolTtlSeconds)
+      ? this.openJoinPoolTtlSeconds
+      : this.ttlSeconds;
+    const aliasList = Array.isArray(aliases) ? aliases : [];
+    const unique = new Set();
+    const multi = this.client.multi();
+    for (const rawAlias of aliasList) {
+      const alias = typeof rawAlias === 'string' ? rawAlias.trim() : null;
+      if (!alias || unique.has(alias)) continue;
+      unique.add(alias);
+      if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+        multi.set(this.#openJoinAliasKey(alias), relayKey, { EX: ttlSeconds });
+      } else {
+        multi.set(this.#openJoinAliasKey(alias), relayKey);
+      }
+    }
+    if (unique.size === 0) return;
+    await multi.exec();
+  }
+
+  async resolveOpenJoinAlias(identifier) {
+    if (!identifier) return null;
+    await this.#ensureConnected();
+    const alias = typeof identifier === 'string' ? identifier.trim() : null;
+    if (!alias) return null;
+    const value = await this.client.get(this.#openJoinAliasKey(alias));
+    return value || null;
+  }
+
+  async clearOpenJoinAliases(relayKey, aliases = null) {
+    await this.#ensureConnected();
+    let aliasList = Array.isArray(aliases) ? aliases : null;
+    if (!aliasList && relayKey) {
+      const pool = await this.getOpenJoinPool(relayKey);
+      aliasList = Array.isArray(pool?.aliases) ? pool.aliases : [];
+    }
+    if (!Array.isArray(aliasList) || aliasList.length === 0) return;
+    const keys = [];
+    const seen = new Set();
+    for (const rawAlias of aliasList) {
+      const alias = typeof rawAlias === 'string' ? rawAlias.trim() : null;
+      if (!alias || seen.has(alias)) continue;
+      seen.add(alias);
+      keys.push(this.#openJoinAliasKey(alias));
+    }
+    if (!keys.length) return;
+    await this.client.del(...keys);
   }
 
   async storeMirrorMetadata(relayKey, payload = {}) {

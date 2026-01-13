@@ -597,8 +597,16 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         hasWriterCore: !!opts?.writerCore,
         hasWriterCoreHex: !!opts?.writerCoreHex,
         hasAutobaseLocal: !!opts?.autobaseLocal,
+        writerSecretLen: opts?.writerSecret ? String(opts.writerSecret).length : 0,
         hostPeersCount: hostPeers?.length || 0,
-        openJoin: opts?.openJoin === true
+        coreRefsCount: Array.isArray(opts?.cores) ? opts.cores.length : 0,
+        hasBlindPeer: !!opts?.blindPeer?.publicKey,
+        relayKey: opts?.relayKey ? String(opts.relayKey).slice(0, 16) : null,
+        relayUrl: opts?.relayUrl ? String(opts.relayUrl).slice(0, 80) : null,
+        hasToken: !!opts?.token,
+        isOpen: typeof opts?.isOpen === 'boolean' ? opts.isOpen : null,
+        openJoin: opts?.openJoin === true,
+        fileSharing
       })
 
       await electronIpc.sendToWorker({ type: 'start-join-flow', data })

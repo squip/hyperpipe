@@ -703,6 +703,28 @@ function pruneOpenJoinPoolEntries(entries = [], now = Date.now()) {
   })
 }
 
+function previewValue(value, limit = 16) {
+  if (value === null || value === undefined) return null
+  const text = typeof value === 'string' ? value : String(value)
+  if (!text) return null
+  return text.length > limit ? text.slice(0, limit) : text
+}
+
+function summarizeOpenJoinEntries(entries = [], limit = 3) {
+  if (!Array.isArray(entries) || entries.length === 0) return []
+  return entries.slice(0, limit).map((entry) => ({
+    writerCore: previewValue(entry?.writerCore, 16),
+    writerCoreHex: previewValue(entry?.writerCoreHex || entry?.autobaseLocal, 16),
+    issuedAt: entry?.issuedAt ?? null,
+    expiresAt: entry?.expiresAt ?? null
+  }))
+}
+
+function summarizeCoreRefs(coreRefs = [], limit = 3) {
+  if (!Array.isArray(coreRefs) || coreRefs.length === 0) return []
+  return coreRefs.slice(0, limit).map((ref) => previewValue(ref, 16))
+}
+
 async function ensureOpenJoinWriterPool({
   relayKey,
   publicIdentifier,
@@ -719,6 +741,16 @@ async function ensureOpenJoinWriterPool({
   const resolvedTarget = Number.isFinite(targetSize) && targetSize > 0
     ? Math.trunc(targetSize)
     : OPEN_JOIN_POOL_TARGET_SIZE
+  const requestedCount = Number.isFinite(needed) ? Math.max(Math.trunc(needed), 0) : null
+
+  console.info('[Worker] Open join pool request', {
+    requestIdentifier,
+    relayKey: normalizedRelayKey || relayKey || null,
+    publicIdentifier: normalizedPublicIdentifier || publicIdentifier || null,
+    mode,
+    requestedCount,
+    targetSize: resolvedTarget
+  })
 
   let profile = null
   if (normalizedRelayKey) {
@@ -733,6 +765,18 @@ async function ensureOpenJoinWriterPool({
   const canonicalPublicIdentifier =
     profile?.public_identifier || profile?.publicIdentifier || normalizedPublicIdentifier || null
   const poolKey = canonicalRelayKey || canonicalPublicIdentifier || requestIdentifier
+
+  console.info('[Worker] Open join pool resolved', {
+    requestIdentifier,
+    canonicalRelayKey: previewValue(canonicalRelayKey, 16),
+    canonicalPublicIdentifier,
+    poolKey: previewValue(poolKey, 16),
+    profileRelayKey: previewValue(profile?.relay_key || profile?.relayKey || null, 16),
+    profilePublicIdentifier: profile?.public_identifier || profile?.publicIdentifier || null,
+    profileIsOpen: profile?.isOpen ?? null,
+    profileIsHosted: profile?.isHosted ?? null,
+    profileIsJoined: profile?.isJoined ?? null
+  })
 
   if (canonicalRelayKey && requestIdentifier !== canonicalRelayKey) {
     console.info('[Worker] Open join pool canonicalized', {
@@ -750,7 +794,14 @@ async function ensureOpenJoinWriterPool({
     }
   }
   if (!relayServer?.provisionWriterForInvitee) return null
-  if (openJoinWriterPoolLocks.has(poolKey)) return null
+  if (openJoinWriterPoolLocks.has(poolKey)) {
+    console.warn('[Worker] Open join pool skipped: lock active', {
+      poolKey: previewValue(poolKey, 16),
+      relayKey: previewValue(canonicalRelayKey || normalizedRelayKey || relayKey || null, 16),
+      publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || publicIdentifier || null
+    })
+    return null
+  }
 
   openJoinWriterPoolLocks.add(poolKey)
   try {
@@ -775,12 +826,25 @@ async function ensureOpenJoinWriterPool({
     const now = Date.now()
     const cached = openJoinWriterPoolCache.get(poolKey) || { entries: [], updatedAt: 0 }
     const entries = pruneOpenJoinPoolEntries(cached.entries, now)
-    const requestedCount = Number.isFinite(needed) ? Math.max(Math.trunc(needed), 0) : null
     const stale = !cached.updatedAt || (now - cached.updatedAt) >= OPEN_JOIN_POOL_REFRESH_MS
     const poolNeeded = Math.max(resolvedTarget - entries.length, 0)
     const generateCount = requestedCount !== null
       ? requestedCount
       : (poolNeeded > 0 ? poolNeeded : (stale ? 1 : 0))
+
+    console.log('[Worker] Open join pool status', {
+      poolKey: previewValue(poolKey, 16),
+      relayKey: relayKeyForLog ? previewValue(relayKeyForLog, 16) : null,
+      publicIdentifier: publicIdentifierForLog,
+      cachedTotal: Array.isArray(cached.entries) ? cached.entries.length : 0,
+      cachedValid: entries.length,
+      cachedUpdatedAt: cached.updatedAt || null,
+      stale,
+      requestedCount,
+      poolNeeded,
+      generateCount,
+      targetSize: resolvedTarget
+    })
 
     if (generateCount <= 0) {
       if (cached.entries.length !== entries.length) {
@@ -827,6 +891,12 @@ async function ensureOpenJoinWriterPool({
 
     if (!newEntries.length) {
       openJoinWriterPoolCache.set(poolKey, { ...cached, entries })
+      console.warn('[Worker] Open join pool provisioned empty', {
+        relayKey: relayKeyForLog ? previewValue(relayKeyForLog, 16) : null,
+        publicIdentifier: publicIdentifierForLog,
+        requestedCount: generateCount,
+        cached: entries.length
+      })
       return {
         entries: [],
         updatedAt: cached.updatedAt || null,
@@ -843,7 +913,8 @@ async function ensureOpenJoinWriterPool({
       publicIdentifier: publicIdentifierForLog,
       generated: newEntries.length,
       cached: entries.length,
-      updatedAt
+      updatedAt,
+      entryPreview: summarizeOpenJoinEntries(newEntries)
     })
     return {
       entries: newEntries,
@@ -1195,6 +1266,27 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
         lastError = new Error('open-join invalid payload')
         continue
       }
+      const dataBlindPeer = data.blindPeer || data.blind_peer || null
+      console.log('[Worker] Open join bootstrap response', {
+        relayIdentifier,
+        origin: base,
+        relayKey: previewValue(data.relayKey || data.relay_key, 16),
+        publicIdentifier: data.publicIdentifier || data.public_identifier || null,
+        hasWriterCore: !!data.writerCore,
+        hasWriterCoreHex: !!(data.writerCoreHex || data.writer_core_hex),
+        hasAutobaseLocal: !!(data.autobaseLocal || data.autobase_local),
+        writerCorePrefix: previewValue(data.writerCore, 16),
+        writerCoreHexPrefix: previewValue(
+          data.writerCoreHex || data.writer_core_hex || data.autobaseLocal || data.autobase_local,
+          16
+        ),
+        writerSecretLen: data.writerSecret ? String(data.writerSecret).length : 0,
+        coreRefsCount: Array.isArray(data.cores) ? data.cores.length : 0,
+        blindPeerKey: previewValue(dataBlindPeer?.publicKey, 16),
+        blindPeerHasEncryptionKey: !!dataBlindPeer?.encryptionKey,
+        issuedAt: data.issuedAt ?? null,
+        expiresAt: data.expiresAt ?? null
+      })
       return {
         status: 'ok',
         origin: base,
@@ -1245,6 +1337,16 @@ async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mi
         lastError = new Error('invalid-payload')
         continue
       }
+      const mirrorBlindPeer = data.blindPeer || data.blind_peer || null
+      console.log('[Worker] Mirror metadata response', {
+        relayKey,
+        origin,
+        resolvedRelayKey: previewValue(data.relayKey || data.relay_key, 16),
+        publicIdentifier: data.publicIdentifier || data.public_identifier || null,
+        coreRefsCount: Array.isArray(data.cores) ? data.cores.length : 0,
+        blindPeerKey: previewValue(mirrorBlindPeer?.publicKey, 16),
+        blindPeerHasEncryptionKey: !!mirrorBlindPeer?.encryptionKey
+      })
       return { status: 'ok', origin, data }
     } catch (error) {
       lastError = error
@@ -3499,7 +3601,6 @@ async function handleMessageObject(message) {
       break
 
     case 'start-join-flow':
-      console.log('[Worker] Start join flow requested:', message.data)
       if (relayServer) {
         const data = (message && typeof message === 'object' ? message.data : null) || {}
         const publicIdentifier = data.publicIdentifier
@@ -3532,6 +3633,22 @@ async function handleMessageObject(message) {
           hostPeers = hostPeers
             .map((key) => String(key || '').trim().toLowerCase())
             .filter(Boolean)
+
+          console.info('[Worker] Start join flow input', {
+            publicIdentifier,
+            openJoin,
+            isOpen,
+            hasInviteToken: !!inviteToken,
+            relayKey: previewValue(joinRelayKey, 16),
+            relayUrl: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
+            hostPeersCount: hostPeers.length,
+            hasBlindPeer: !!blindPeer?.publicKey,
+            coreRefsCount: coreRefs.length,
+            coreRefsPreview: summarizeCoreRefs(coreRefs),
+            writerCorePrefix: previewValue(writerCore, 16),
+            writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
+            writerSecretLen: writerSecret ? String(writerSecret).length : 0
+          })
 
           if (openJoin && publicIdentifier) {
             recordOpenJoinContext({
@@ -3583,6 +3700,19 @@ async function handleMessageObject(message) {
                     hasAutobaseLocal: !!autobaseLocal,
                     hasWriterSecret: !!writerSecret,
                     hasBlindPeer: !!blindPeer
+                  })
+                  console.log('[Worker] Open join bootstrap resolved', {
+                    relayIdentifier,
+                    origin: bootstrapResult?.origin || null,
+                    relayKey: previewValue(joinRelayKey, 16),
+                    relayUrl: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
+                    coreRefsCount: coreRefs.length,
+                    coreRefsPreview: summarizeCoreRefs(coreRefs),
+                    writerCorePrefix: previewValue(writerCore, 16),
+                    writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
+                    writerSecretLen: writerSecret ? String(writerSecret).length : 0,
+                    blindPeerKey: previewValue(blindPeer?.publicKey, 16),
+                    blindPeerHasEncryptionKey: !!blindPeer?.encryptionKey
                   })
                 } else {
                   console.warn('[Worker] Open join bootstrap unavailable', {
@@ -3639,7 +3769,10 @@ async function handleMessageObject(message) {
                     hasWriterCore: !!writerCore,
                     hasWriterCoreHex: !!writerCoreHex,
                     hasAutobaseLocal: !!autobaseLocal,
-                    origin: mirrorResult?.origin || null
+                    origin: mirrorResult?.origin || null,
+                    writerSecretLen: writerSecret ? String(writerSecret).length : 0,
+                    blindPeerKey: previewValue(blindPeer?.publicKey, 16),
+                    blindPeerHasEncryptionKey: !!blindPeer?.encryptionKey
                   })
                 }
               } catch (err) {
@@ -3722,6 +3855,22 @@ async function handleMessageObject(message) {
 
           if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
           if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
+
+          console.info('[Worker] Start join flow resolved', {
+            publicIdentifier,
+            openJoin,
+            isOpen,
+            hasInviteToken: !!inviteToken,
+            relayKey: previewValue(joinRelayKey, 16),
+            relayUrl: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
+            hostPeersCount: hostPeers.length,
+            hasBlindPeer: !!blindPeer?.publicKey,
+            coreRefsCount: coreRefs.length,
+            coreRefsPreview: summarizeCoreRefs(coreRefs),
+            writerCorePrefix: previewValue(writerCore, 16),
+            writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
+            writerSecretLen: writerSecret ? String(writerSecret).length : 0
+          })
 
           await relayServer.startJoinAuthentication({
             ...data,

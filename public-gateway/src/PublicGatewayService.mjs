@@ -709,8 +709,58 @@ class PublicGatewayService {
     return null;
   }
 
+  async #resolveOpenJoinPool(identifier) {
+    if (!identifier || typeof this.registrationStore?.getOpenJoinPool !== 'function') return null;
+    const trimmed = typeof identifier === 'string' ? identifier.trim() : null;
+    if (!trimmed) return null;
+    const normalized = this.#normalizePathValue(trimmed) || trimmed;
+    const directCandidate = this.#isHexRelayKey(trimmed)
+      ? trimmed
+      : (this.#isHexRelayKey(normalized) ? normalized : null);
+    const directRelayKey = directCandidate ? directCandidate.toLowerCase() : null;
+    if (directRelayKey) {
+      const pool = await this.registrationStore.getOpenJoinPool(directRelayKey);
+      if (pool) return { relayKey: directRelayKey, pool };
+    }
+    if (typeof this.registrationStore?.resolveOpenJoinAlias === 'function') {
+      const resolvedKey = await this.registrationStore.resolveOpenJoinAlias(normalized);
+      const aliasRelayKey = resolvedKey && this.#isHexRelayKey(resolvedKey)
+        ? resolvedKey.toLowerCase()
+        : null;
+      if (aliasRelayKey) {
+        const pool = await this.registrationStore.getOpenJoinPool(aliasRelayKey);
+        if (pool) return { relayKey: aliasRelayKey, pool };
+      }
+    }
+    return null;
+  }
+
+  async #resolveOpenJoinTarget(identifier) {
+    const poolResolved = await this.#resolveOpenJoinPool(identifier);
+    if (poolResolved) {
+      return {
+        relayKey: poolResolved.relayKey,
+        pool: poolResolved.pool,
+        record: null,
+        source: 'pool'
+      };
+    }
+    const registration = await this.#resolveOpenJoinRegistration(identifier);
+    if (!registration) return null;
+    return {
+      relayKey: registration.relayKey,
+      record: registration.record,
+      pool: null,
+      source: 'registration'
+    };
+  }
+
   #isOpenJoinAllowed(record) {
     return record?.metadata?.isOpen === true;
+  }
+
+  #isOpenJoinPoolAllowed(pool) {
+    return pool?.metadata?.isOpen === true;
   }
 
   #buildMirrorMetadataPayload(record, relayKey) {
@@ -735,6 +785,28 @@ class PublicGatewayService {
     return {
       ...base,
       relayUrl: record?.metadata?.connectionUrl || null
+    };
+  }
+
+  #buildOpenJoinMirrorPayloadFromPool(pool, relayKey) {
+    if (!pool || typeof pool !== 'object') return null;
+    const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
+    const relayCores = Array.isArray(pool?.relayCores) ? pool.relayCores : [];
+    const metadata = pool?.metadata && typeof pool.metadata === 'object' ? pool.metadata : null;
+    const publicIdentifier = pool?.publicIdentifier || metadata?.identifier || relayKey;
+    const relayUrl = pool?.relayUrl || metadata?.relayUrl || metadata?.connectionUrl || null;
+    return {
+      relayKey,
+      publicIdentifier: publicIdentifier || relayKey,
+      cores: relayCores,
+      relayUrl,
+      blindPeer: blindPeerInfo && blindPeerInfo.enabled
+        ? {
+            publicKey: blindPeerInfo.publicKey || null,
+            encryptionKey: blindPeerInfo.encryptionKey || null,
+            maxBytes: blindPeerInfo.maxBytes ?? null
+          }
+        : { enabled: false }
     };
   }
 
@@ -3382,6 +3454,26 @@ class PublicGatewayService {
       }
 
       if (!record) {
+        const poolResolved = trimmedIdentifier
+          ? await this.#resolveOpenJoinPool(trimmedIdentifier)
+          : null;
+        if (poolResolved?.pool) {
+          const poolRelayKey = poolResolved.relayKey || relayKey || trimmedIdentifier;
+          const poolPayload = this.#buildOpenJoinMirrorPayloadFromPool(
+            poolResolved.pool,
+            poolRelayKey || trimmedIdentifier
+          );
+          if (poolPayload) {
+            await this.#storeMirrorMetadataPayload(poolRelayKey || trimmedIdentifier, poolPayload);
+            return res.json(poolPayload);
+          }
+        }
+
+        if (!relayKey && trimmedIdentifier && typeof this.registrationStore?.resolveOpenJoinAlias === 'function') {
+          const aliasRelayKey = await this.registrationStore.resolveOpenJoinAlias(trimmedIdentifier);
+          relayKey = this.#isHexRelayKey(aliasRelayKey) ? aliasRelayKey.toLowerCase() : aliasRelayKey;
+        }
+
         let cached = null;
         if (typeof this.registrationStore?.getMirrorMetadata === 'function') {
           if (relayKey) {
@@ -3451,12 +3543,32 @@ class PublicGatewayService {
       return res.status(400).json({ error: 'relayKey is required' });
     }
 
+    const payloadMetadata = payload?.metadata && typeof payload.metadata === 'object'
+      ? payload.metadata
+      : null;
+    const payloadPublicIdentifier = typeof payload?.publicIdentifier === 'string'
+      ? payload.publicIdentifier
+      : null;
+    const payloadRelayUrl = typeof payload?.relayUrl === 'string'
+      ? payload.relayUrl
+      : null;
+    const payloadRelayCores = Array.isArray(payload?.relayCores)
+      ? payload.relayCores
+      : [];
+    const payloadAliases = Array.isArray(payload?.aliases)
+      ? payload.aliases
+      : [];
+
     const record = await this.registrationStore.getRelay(relayKey);
-    if (!record) {
+    const recordMetadata = record?.metadata && typeof record.metadata === 'object'
+      ? record.metadata
+      : null;
+
+    if (!record && payloadMetadata?.isOpen !== true) {
       return res.status(404).json({ error: 'relay-not-found' });
     }
 
-    if (!this.#isOpenJoinAllowed(record)) {
+    if (record && !this.#isOpenJoinAllowed(record)) {
       return res.status(409).json({ error: 'relay-not-open' });
     }
 
@@ -3468,6 +3580,49 @@ class PublicGatewayService {
     const targetSize = Number.isFinite(targetSizeRaw) && targetSizeRaw > 0
       ? Math.min(Math.trunc(targetSizeRaw), maxPool)
       : maxPool;
+
+    const poolMetadata = payloadMetadata || (recordMetadata
+      ? {
+          identifier: recordMetadata.identifier || null,
+          isOpen: recordMetadata.isOpen ?? null,
+          isPublic: recordMetadata.isPublic ?? null,
+          isHosted: recordMetadata.isHosted ?? null,
+          isJoined: recordMetadata.isJoined ?? null,
+          metadataUpdatedAt: recordMetadata.metadataUpdatedAt ?? null,
+          gatewayPath: recordMetadata.gatewayPath || null,
+          relayUrl: recordMetadata.connectionUrl || recordMetadata.relayUrl || null
+        }
+      : null);
+    const poolPublicIdentifier = payloadPublicIdentifier
+      || poolMetadata?.identifier
+      || recordMetadata?.identifier
+      || relayKey;
+    const poolRelayUrl = payloadRelayUrl
+      || poolMetadata?.relayUrl
+      || recordMetadata?.connectionUrl
+      || recordMetadata?.relayUrl
+      || null;
+    const poolRelayCores = payloadRelayCores.length
+      ? payloadRelayCores
+      : (Array.isArray(record?.relayCores) ? record.relayCores : []);
+    const aliasSet = new Set();
+    const addAlias = (value) => {
+      const normalized = this.#normalizePathValue(value);
+      if (!normalized) return;
+      aliasSet.add(normalized);
+    };
+    for (const alias of payloadAliases) {
+      addAlias(alias);
+    }
+    addAlias(poolPublicIdentifier);
+    const gatewayPath = poolMetadata?.gatewayPath || recordMetadata?.gatewayPath || null;
+    const normalizedGatewayPath = this.#normalizePathValue(gatewayPath);
+    if (normalizedGatewayPath) {
+      addAlias(normalizedGatewayPath);
+      const colonAlias = this.#toColonIdentifier(normalizedGatewayPath);
+      if (colonAlias) addAlias(colonAlias);
+    }
+    const poolAliases = Array.from(aliasSet);
 
     const normalizeEntry = (entry) => {
       if (!entry || typeof entry !== 'object') return null;
@@ -3503,6 +3658,27 @@ class PublicGatewayService {
     const existingPool = await this.registrationStore.getOpenJoinPool?.(relayKey);
     const existingEntries = sanitizeEntries(Array.isArray(existingPool?.entries) ? existingPool.entries : []);
     const incomingEntries = sanitizeEntries(entriesRaw);
+    const existingCount = existingEntries.length;
+    const incomingCount = incomingEntries.length;
+    const rejectedCount = Math.max(entriesRaw.length - incomingCount, 0);
+
+    this.logger?.info?.('[PublicGateway] Open join pool update received', {
+      relayKey,
+      received: entriesRaw.length,
+      existing: existingCount,
+      incoming: incomingCount,
+      rejected: rejectedCount,
+      publicIdentifier: poolPublicIdentifier || null,
+      relayUrl: poolRelayUrl || null,
+      relayCores: poolRelayCores.length,
+      aliases: poolAliases.length,
+      metadataUpdatedAt: poolMetadata?.metadataUpdatedAt ?? null,
+      recordFound: !!record,
+      targetSize,
+      maxPool,
+      ttlMs,
+      updatedAt: payload?.updatedAt || null
+    });
 
     const merged = new Map();
     const mergeEntry = (entry) => {
@@ -3537,15 +3713,43 @@ class PublicGatewayService {
     if (mergedEntries.length > maxPool) {
       mergedEntries = mergedEntries.slice(0, maxPool);
     }
+    const mergedCount = mergedEntries.length;
 
     const updatedAt = incomingEntries.length
       ? (payload?.updatedAt || now)
       : (existingPool?.updatedAt || payload?.updatedAt || now);
 
+    this.logger?.info?.('[PublicGateway] Open join pool merge result', {
+      relayKey,
+      existing: existingCount,
+      incoming: incomingCount,
+      merged: mergedCount,
+      publicIdentifier: poolPublicIdentifier || null,
+      targetSize,
+      maxPool
+    });
+
     await this.registrationStore.storeOpenJoinPool(relayKey, {
       entries: mergedEntries,
-      updatedAt
+      updatedAt,
+      publicIdentifier: poolPublicIdentifier || null,
+      relayUrl: poolRelayUrl || null,
+      relayCores: poolRelayCores,
+      metadata: poolMetadata,
+      aliases: poolAliases
     });
+    if (poolAliases.length && typeof this.registrationStore?.storeOpenJoinAliases === 'function') {
+      await this.registrationStore.storeOpenJoinAliases(relayKey, poolAliases);
+    }
+    const mirrorPayload = this.#buildOpenJoinMirrorPayloadFromPool({
+      publicIdentifier: poolPublicIdentifier || null,
+      relayUrl: poolRelayUrl || null,
+      relayCores: poolRelayCores,
+      metadata: poolMetadata
+    }, relayKey);
+    if (mirrorPayload) {
+      await this.#storeMirrorMetadataPayload(relayKey, mirrorPayload);
+    }
 
     const total = mergedEntries.length;
     const needed = Math.max(targetSize - total, 0);
@@ -3555,7 +3759,14 @@ class PublicGatewayService {
       received: entriesRaw.length,
       stored: incomingEntries.length,
       total,
-      targetSize
+      targetSize,
+      existing: existingCount,
+      merged: mergedCount,
+      needed,
+      updatedAt,
+      publicIdentifier: poolPublicIdentifier || null,
+      relayCores: poolRelayCores.length,
+      aliases: poolAliases.length
     });
 
     return res.json({
@@ -3578,20 +3789,28 @@ class PublicGatewayService {
     }
 
     try {
-      const resolved = await this.#resolveOpenJoinRegistration(identifier);
+      const resolved = await this.#resolveOpenJoinTarget(identifier);
       if (!resolved) {
         return res.status(404).json({ error: 'relay-not-found' });
       }
-      const { relayKey, record } = resolved;
-      if (!this.#isOpenJoinAllowed(record)) {
+      const { relayKey, record, pool } = resolved;
+      const isAllowed = record ? this.#isOpenJoinAllowed(record) : this.#isOpenJoinPoolAllowed(pool);
+      if (!isAllowed) {
         return res.status(403).json({ error: 'relay-not-open' });
       }
 
-      const publicIdentifier = record?.metadata?.identifier || relayKey;
+      const publicIdentifier =
+        record?.metadata?.identifier
+        || pool?.publicIdentifier
+        || pool?.metadata?.identifier
+        || relayKey;
       const { challenge, expiresAt } = this.#issueOpenJoinChallenge({ relayKey, publicIdentifier });
       this.logger?.info?.('[PublicGateway] Open join challenge issued', {
         relayKey,
-        publicIdentifier
+        publicIdentifier,
+        expiresAt,
+        source: record ? 'registration' : 'pool',
+        challengePrefix: challenge ? challenge.slice(0, 12) : null
       });
       return res.json({
         relayKey,
@@ -3625,12 +3844,13 @@ class PublicGatewayService {
     }
 
     try {
-      const resolved = await this.#resolveOpenJoinRegistration(identifier);
+      const resolved = await this.#resolveOpenJoinTarget(identifier);
       if (!resolved) {
         return res.status(404).json({ error: 'relay-not-found' });
       }
-      const { relayKey, record } = resolved;
-      if (!this.#isOpenJoinAllowed(record)) {
+      const { relayKey, record, pool } = resolved;
+      const isAllowed = record ? this.#isOpenJoinAllowed(record) : this.#isOpenJoinPoolAllowed(pool);
+      if (!isAllowed) {
         return res.status(403).json({ error: 'relay-not-open' });
       }
 
@@ -3643,7 +3863,12 @@ class PublicGatewayService {
         return res.status(401).json({ error: 'invalid-challenge' });
       }
 
-      const publicIdentifier = record?.metadata?.identifier || relayKey;
+      const publicIdentifier =
+        challengeEntry?.publicIdentifier
+        || record?.metadata?.identifier
+        || pool?.publicIdentifier
+        || pool?.metadata?.identifier
+        || relayKey;
       const verification = await this.#verifyOpenJoinAuthEvent(authEvent, {
         challenge: challengeTag,
         relayKey,
@@ -3653,7 +3878,20 @@ class PublicGatewayService {
         return res.status(401).json({ error: verification.error || 'auth-invalid' });
       }
 
+      let poolBefore = null;
+      try {
+        poolBefore = await this.registrationStore.getOpenJoinPool?.(relayKey);
+      } catch (_) {
+        poolBefore = null;
+      }
+      const poolBeforeCount = Array.isArray(poolBefore?.entries) ? poolBefore.entries.length : 0;
+
       if (this.openJoinLeaseLocks.has(relayKey)) {
+        this.logger?.warn?.('[PublicGateway] Open join lease busy', {
+          relayKey,
+          publicIdentifier,
+          poolBefore: poolBeforeCount
+        });
         return res.status(429).json({ error: 'open-join-busy' });
       }
       this.openJoinLeaseLocks.add(relayKey);
@@ -3664,16 +3902,28 @@ class PublicGatewayService {
         this.openJoinLeaseLocks.delete(relayKey);
       }
 
+      let poolAfter = null;
+      try {
+        poolAfter = await this.registrationStore.getOpenJoinPool?.(relayKey);
+      } catch (_) {
+        poolAfter = null;
+      }
+      const poolAfterCount = Array.isArray(poolAfter?.entries) ? poolAfter.entries.length : 0;
+
       if (!lease) {
         this.logger?.warn?.('[PublicGateway] Open join lease unavailable', {
           relayKey,
           publicIdentifier,
-          identifier
+          identifier,
+          poolBefore: poolBeforeCount,
+          poolAfter: poolAfterCount
         });
         return res.status(409).json({ error: 'open-join-empty' });
       }
 
-      const mirrorPayload = this.#buildOpenJoinMirrorPayload(record, relayKey);
+      const mirrorPayload = record
+        ? this.#buildOpenJoinMirrorPayload(record, relayKey)
+        : this.#buildOpenJoinMirrorPayloadFromPool(pool, relayKey);
       const writerCoreHex = typeof lease.writerCoreHex === 'string'
         ? lease.writerCoreHex
         : (typeof lease.writer_core_hex === 'string' ? lease.writer_core_hex : null);
@@ -3684,7 +3934,13 @@ class PublicGatewayService {
       this.logger?.info?.('[PublicGateway] Open join lease issued', {
         relayKey,
         publicIdentifier,
-        writerCore: lease.writerCore ? lease.writerCore.slice(0, 16) : null
+        source: record ? 'registration' : 'pool',
+        poolBefore: poolBeforeCount,
+        poolAfter: poolAfterCount,
+        writerCore: lease.writerCore ? lease.writerCore.slice(0, 16) : null,
+        writerCoreHex: writerCoreHex ? String(writerCoreHex).slice(0, 16) : null,
+        issuedAt: lease.issuedAt || null,
+        expiresAt: lease.expiresAt || null
       });
       return res.json({
         relayKey,
@@ -3695,7 +3951,7 @@ class PublicGatewayService {
         writerSecret: lease.writerSecret,
         issuedAt: lease.issuedAt || null,
         expiresAt: lease.expiresAt || null,
-        ...mirrorPayload
+        ...(mirrorPayload || {})
       });
     } catch (error) {
       this.logger?.warn?.('[PublicGateway] Open join request failed', {

@@ -1580,6 +1580,9 @@ export async function joinRelay(options = {}) {
             writerCount,
             writerSample,
             coreRefsCount: postJoinCoreRefs.length,
+            coreRefsPreview: postJoinCoreRefs.slice(0, 3),
+            expectedWriter: expectedWriterHex,
+            expectedWriterSource,
             writerSyncStatus: postJoinSync?.writerSummary?.status ?? null,
             writerAdded: postJoinSync?.writerSummary?.added ?? 0
         });

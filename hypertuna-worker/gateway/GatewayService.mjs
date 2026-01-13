@@ -1870,6 +1870,22 @@ export class GatewayService extends EventEmitter {
   }
 
   async #syncOpenJoinPool(relayKey, metadata) {
+    const previewValue = (value, limit = 16) => {
+      if (value === null || value === undefined) return null;
+      const text = typeof value === 'string' ? value : String(value);
+      if (!text) return null;
+      return text.length > limit ? text.slice(0, limit) : text;
+    };
+    const previewEntries = (entries = [], limit = 3) => {
+      if (!Array.isArray(entries) || entries.length === 0) return [];
+      return entries.slice(0, limit).map((entry) => ({
+        writerCore: previewValue(entry?.writerCore, 16),
+        writerCoreHex: previewValue(entry?.writerCoreHex || entry?.autobaseLocal, 16),
+        issuedAt: entry?.issuedAt ?? null,
+        expiresAt: entry?.expiresAt ?? null
+      }));
+    };
+
     if (!this.openJoinPoolProvider) {
       console.info('[PublicGateway] Open join pool sync skipped: missing provider', { relayKey });
       return;
@@ -1885,6 +1901,16 @@ export class GatewayService extends EventEmitter {
       console.info('[PublicGateway] Open join pool sync skipped: public gateway relay', { relayKey });
       return;
     }
+
+    this.log('info', `[PublicGateway] Open join pool sync start relay=${relayKey}`, {
+      identifier: metadata?.identifier ?? null,
+      isOpen: metadata?.isOpen ?? null,
+      isHosted: metadata?.isHosted ?? null,
+      isJoined: metadata?.isJoined ?? null,
+      isPublic: metadata?.isPublic ?? null,
+      metadataUpdatedAt: metadata?.metadataUpdatedAt ?? null
+    });
+
     if (metadata?.isHosted === false || metadata?.isJoined === true) {
       console.info('[PublicGateway] Open join pool sync skipped: joined relay', {
         relayKey,
@@ -1896,15 +1922,24 @@ export class GatewayService extends EventEmitter {
     if (!metadata || metadata.isOpen !== true) {
       console.info('[PublicGateway] Open join pool sync skipped: relay not open', {
         relayKey,
-        isOpen: metadata?.isOpen ?? null
+        isOpen: metadata?.isOpen ?? null,
+        identifier: metadata?.identifier ?? null,
+        isHosted: metadata?.isHosted ?? null,
+        isJoined: metadata?.isJoined ?? null,
+        metadataUpdatedAt: metadata?.metadataUpdatedAt ?? null
       });
       return;
     }
     try {
-      const publicIdentifier = metadata?.identifier || null;
+      const metadataIdentifier = typeof metadata?.identifier === 'string' ? metadata.identifier : null;
+      const relayUrl = typeof metadata?.connectionUrl === 'string'
+        ? metadata.connectionUrl
+        : (typeof metadata?.relayUrl === 'string' ? metadata.relayUrl : null);
+      const gatewayPath = this._normalizeGatewayPath(metadataIdentifier || relayKey, metadata?.gatewayPath, relayUrl);
+      const relayCores = this.#collectRelayCoreMetadata(relayKey) || [];
       const targetResult = await this.openJoinPoolProvider({
         relayKey,
-        publicIdentifier,
+        publicIdentifier: metadataIdentifier,
         metadata,
         mode: 'target-only'
       });
@@ -1917,10 +1952,32 @@ export class GatewayService extends EventEmitter {
       const poolRelayKey = canonicalRelayKey || relayKey;
       const poolPublicIdentifier = typeof targetResult?.publicIdentifier === 'string'
         ? targetResult.publicIdentifier
-        : publicIdentifier;
+        : metadataIdentifier;
       const targetSize = Number.isFinite(targetResult?.targetSize)
         ? Math.trunc(targetResult.targetSize)
         : null;
+      const poolMetadata = {
+        identifier: poolPublicIdentifier || metadataIdentifier || null,
+        isOpen: metadata?.isOpen ?? null,
+        isPublic: metadata?.isPublic ?? null,
+        isHosted: metadata?.isHosted ?? null,
+        isJoined: metadata?.isJoined ?? null,
+        metadataUpdatedAt: metadata?.metadataUpdatedAt ?? null,
+        gatewayPath: gatewayPath || null,
+        relayUrl: relayUrl || null
+      };
+      const aliasSet = new Set();
+      if (poolPublicIdentifier) aliasSet.add(poolPublicIdentifier);
+      if (gatewayPath) aliasSet.add(gatewayPath);
+      const aliases = Array.from(aliasSet);
+      const poolRelayCores = relayCores.length ? relayCores : null;
+      this.log('info', `[PublicGateway] Open join pool target resolved relay=${poolRelayKey}`, {
+        requestRelay: relayKey,
+        canonicalRelayKey: canonicalRelayKey ? previewValue(canonicalRelayKey, 16) : null,
+        publicIdentifier: poolPublicIdentifier,
+        targetSize,
+        metadataIdentifier: metadata?.identifier ?? null
+      });
       if (!targetSize || targetSize <= 0) {
         this.log('debug', `[PublicGateway] Open join pool target unavailable relay=${poolRelayKey}`);
         return;
@@ -1938,21 +1995,28 @@ export class GatewayService extends EventEmitter {
         return;
       }
 
-      const logReport = (phase, report) => {
+      const logReport = (phase, report, extra = null) => {
         if (!report || typeof report !== 'object') return;
         this.log('info', `[PublicGateway] Open join pool report ${phase} relay=${poolRelayKey}`, {
           total: report?.total ?? null,
           targetSize,
           needed: report?.needed ?? null,
-          stored: report?.stored ?? null
+          stored: report?.stored ?? null,
+          received: report?.received ?? null,
+          entriesSent: extra?.entriesSent ?? null
         });
       };
 
       let report = await this.publicGatewayRegistrar.updateOpenJoinPool(poolRelayKey, [], {
         updatedAt: Date.now(),
-        targetSize
+        targetSize,
+        publicIdentifier: poolPublicIdentifier || null,
+        relayUrl,
+        relayCores: poolRelayCores,
+        metadata: poolMetadata,
+        aliases
       });
-      logReport('preflight', report);
+      logReport('preflight', report, { entriesSent: 0 });
       let needed = Number.isFinite(report?.needed) ? Math.trunc(report.needed) : 0;
       if (needed <= 0) {
         this.log('debug', `[PublicGateway] Open join pool already satisfied relay=${poolRelayKey}`, {
@@ -1974,6 +2038,12 @@ export class GatewayService extends EventEmitter {
         const entries = Array.isArray(provision?.entries)
           ? provision.entries
           : (Array.isArray(provision) ? provision : []);
+        this.log('info', `[PublicGateway] Open join pool provision batch relay=${poolRelayKey}`, {
+          needed,
+          provided: entries.length,
+          entryPreview: previewEntries(entries),
+          targetSize
+        });
         if (!entries.length) {
           this.log('warn', `[PublicGateway] Open join pool provider returned empty entries relay=${poolRelayKey}`, {
             needed,
@@ -1984,9 +2054,14 @@ export class GatewayService extends EventEmitter {
         const updatedAt = provision.updatedAt || Date.now();
         report = await this.publicGatewayRegistrar.updateOpenJoinPool(poolRelayKey, entries, {
           updatedAt,
-          targetSize
+          targetSize,
+          publicIdentifier: poolPublicIdentifier || null,
+          relayUrl,
+          relayCores: poolRelayCores,
+          metadata: poolMetadata,
+          aliases
         });
-        logReport('provision', report);
+        logReport('provision', report, { entriesSent: entries.length });
         needed = Number.isFinite(report?.needed) ? Math.trunc(report.needed) : 0;
         attempts += 1;
       }

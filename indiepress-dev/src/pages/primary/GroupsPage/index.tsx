@@ -255,6 +255,21 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     const openJoin = !inv.token && inv.fileSharing !== false
     setJoiningInviteId(inv.event.id)
     try {
+      console.info('[GroupsPage] Use invite', {
+        groupId: inv.groupId,
+        inviteId: inv.event?.id || null,
+        openJoin,
+        hasToken: !!inv.token,
+        fileSharing: inv.fileSharing !== false,
+        relayKey: relayKey ? String(relayKey).slice(0, 16) : null,
+        relayUrl: relayUrl ? String(relayUrl).slice(0, 80) : null,
+        hasBlindPeer: !!inv.blindPeer?.publicKey,
+        coreRefsCount: Array.isArray(inv.cores) ? inv.cores.length : 0,
+        hasWriterCore: !!inv.writerCore,
+        hasWriterCoreHex: !!inv.writerCoreHex,
+        hasAutobaseLocal: !!inv.autobaseLocal,
+        writerSecretLen: inv.writerSecret ? String(inv.writerSecret).length : 0
+      })
       if (sendToWorker && pubkey && inv.token) {
         sendToWorker({
           type: 'update-auth-data',

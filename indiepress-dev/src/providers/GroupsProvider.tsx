@@ -1242,7 +1242,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             hasWriterCore: !!writerInfo?.writerCore,
             hasWriterCoreHex: !!writerInfo?.writerCoreHex,
             hasAutobaseLocal: !!writerInfo?.autobaseLocal,
-            hasWriterSecret: !!writerInfo?.writerSecret
+            hasWriterSecret: !!writerInfo?.writerSecret,
+            writerSecretLen: writerInfo?.writerSecret ? String(writerInfo.writerSecret).length : 0,
+            relayKey: relayEntry?.relayKey ? String(relayEntry.relayKey).slice(0, 16) : null,
+            relayUrl: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 80) : null,
+            mirrorCoresCount: Array.isArray(mirrorMetadata?.cores) ? mirrorMetadata.cores.length : 0,
+            fileSharing: resolvedIsOpen === false ? false : true
           })
           const inviteTags: string[][] = [
             ['h', groupId],

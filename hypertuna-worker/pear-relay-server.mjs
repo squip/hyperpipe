@@ -2447,6 +2447,22 @@ function previewWriterKey(writerKey) {
   }
 }
 
+function sampleActiveWriterKeys(relay, limit = 4) {
+  const writers = relay?.activeWriters;
+  if (!writers || typeof writers[Symbol.iterator] !== 'function') {
+    return [];
+  }
+  const sample = [];
+  for (const writer of writers) {
+    const key = writer?.core?.key || writer?.key || writer;
+    if (key && b4a.isBuffer(key)) {
+      sample.push(b4a.toString(key, 'hex').slice(0, 16));
+    }
+    if (sample.length >= limit) break;
+  }
+  return sample;
+}
+
 async function waitForRelayWriterActivation(options = {}) {
   const {
     relayKey,
@@ -2493,6 +2509,7 @@ async function waitForRelayWriterActivation(options = {}) {
       context,
       writable: relay?.writable ?? null,
       activeWriters: relay?.activeWriters?.size ?? null,
+      writerSample: sampleActiveWriterKeys(relay),
       localKey: localKey ? localKey.slice(0, 16) : null,
       expectedWriter: expectedHex,
       expectedWriterActive: expectedActive,
