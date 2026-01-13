@@ -3365,20 +3365,45 @@ class PublicGatewayService {
   }
 
   async #handleRelayMirrorMetadata(req, res) {
-    const relayKey = req.params?.relayKey;
-    if (!relayKey) {
+    const identifier = req.params?.relayKey;
+    if (!identifier) {
       return res.status(400).json({ error: 'relayKey is required' });
     }
     try {
-      const record = await this.registrationStore.getRelay(relayKey);
+      const trimmedIdentifier = typeof identifier === 'string' ? identifier.trim() : null;
+      const resolved = trimmedIdentifier
+        ? await this.#resolveOpenJoinRegistration(trimmedIdentifier)
+        : null;
+      let relayKey = resolved?.relayKey || null;
+      let record = resolved?.record || null;
+
+      if (!relayKey && this.#isHexRelayKey(trimmedIdentifier)) {
+        relayKey = trimmedIdentifier.toLowerCase();
+      }
+
       if (!record) {
-        const cached = await this.registrationStore.getMirrorMetadata?.(relayKey);
+        let cached = null;
+        if (typeof this.registrationStore?.getMirrorMetadata === 'function') {
+          if (relayKey) {
+            cached = await this.registrationStore.getMirrorMetadata(relayKey);
+          }
+          if (!cached && trimmedIdentifier && trimmedIdentifier !== relayKey) {
+            cached = await this.registrationStore.getMirrorMetadata(trimmedIdentifier);
+          }
+        }
         if (cached && typeof cached === 'object') {
+          const cachedRelayKey = this.#isHexRelayKey(cached.relayKey) ? cached.relayKey.toLowerCase() : null;
+          const canonicalRelayKey = relayKey || cachedRelayKey || null;
           const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
+          const publicIdentifier =
+            cached.publicIdentifier ||
+            (resolved?.record?.metadata?.identifier ?? null) ||
+            trimmedIdentifier ||
+            canonicalRelayKey;
           const payload = {
             ...cached,
-            relayKey: cached.relayKey || relayKey,
-            publicIdentifier: cached.publicIdentifier || relayKey,
+            relayKey: canonicalRelayKey || cached.relayKey || trimmedIdentifier || null,
+            publicIdentifier,
             blindPeer: blindPeerInfo && blindPeerInfo.enabled
               ? {
                   publicKey: blindPeerInfo.publicKey || null,
@@ -3387,17 +3412,21 @@ class PublicGatewayService {
                 }
               : (cached.blindPeer || { enabled: false })
           };
-          await this.#storeMirrorMetadataPayload(relayKey, payload);
+          const storeKey = canonicalRelayKey || relayKey || cached.relayKey || trimmedIdentifier;
+          await this.#storeMirrorMetadataPayload(storeKey, payload);
           return res.json(payload);
         }
         return res.status(404).json({ error: 'relay-not-found' });
       }
-      const payload = this.#buildMirrorMetadataPayload(record, relayKey);
-      await this.#storeMirrorMetadataPayload(relayKey, payload);
+      const payload = this.#buildMirrorMetadataPayload(record, relayKey || trimmedIdentifier);
+      if (relayKey) {
+        payload.relayKey = relayKey;
+      }
+      await this.#storeMirrorMetadataPayload(relayKey || trimmedIdentifier, payload);
       return res.json(payload);
     } catch (error) {
       this.logger?.warn?.('[PublicGateway] Failed to fetch relay mirror metadata', {
-        relayKey,
+        relayKey: identifier,
         err: error?.message || error
       });
       return res.status(500).json({ error: 'relay-mirror-metadata-unavailable' });
@@ -3645,6 +3674,13 @@ class PublicGatewayService {
       }
 
       const mirrorPayload = this.#buildOpenJoinMirrorPayload(record, relayKey);
+      const writerCoreHex = typeof lease.writerCoreHex === 'string'
+        ? lease.writerCoreHex
+        : (typeof lease.writer_core_hex === 'string' ? lease.writer_core_hex : null);
+      const autobaseLocal = typeof lease.autobaseLocal === 'string'
+        ? lease.autobaseLocal
+        : (typeof lease.autobase_local === 'string' ? lease.autobase_local : null);
+      const resolvedAutobaseLocal = autobaseLocal || writerCoreHex || null;
       this.logger?.info?.('[PublicGateway] Open join lease issued', {
         relayKey,
         publicIdentifier,
@@ -3654,6 +3690,8 @@ class PublicGatewayService {
         relayKey,
         publicIdentifier,
         writerCore: lease.writerCore,
+        writerCoreHex,
+        autobaseLocal: resolvedAutobaseLocal,
         writerSecret: lease.writerSecret,
         issuedAt: lease.issuedAt || null,
         expiresAt: lease.expiresAt || null,

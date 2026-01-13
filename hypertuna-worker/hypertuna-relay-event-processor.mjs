@@ -134,8 +134,87 @@ export default class NostrRelay extends Autobee {
       this.verifyEvent = handlers.verifyEvent || this.defaultVerifyEvent.bind(this);
       this.executeIdQueries = this.executeIdQueries.bind(this);
       this.findCommonIds = this.findCommonIds.bind(this);
+      this.subscriptionWriteQueue = new Map();
       logWithTimestamp('NostrRelay: Initialized');
     }
+
+  _queueSubscriptionWrite(queueKey, task) {
+    const key = queueKey || 'unknown';
+    const previous = this.subscriptionWriteQueue.get(key) || Promise.resolve();
+    const next = previous.catch(() => null).then(task);
+    this.subscriptionWriteQueue.set(key, next.finally(() => {
+      if (this.subscriptionWriteQueue.get(key) === next) {
+        this.subscriptionWriteQueue.delete(key);
+      }
+    }));
+    return next;
+  }
+
+  _isEphemeralSubscriptionId(subscriptionId) {
+    return typeof subscriptionId === 'string' && subscriptionId.startsWith('f-fetch-events');
+  }
+
+  _filterEphemeralSubscriptions(subscriptions) {
+    if (!subscriptions || typeof subscriptions !== 'object') return {};
+    const filtered = {};
+    for (const [subscriptionId, entry] of Object.entries(subscriptions)) {
+      if (this._isEphemeralSubscriptionId(subscriptionId)) {
+        continue;
+      }
+      filtered[subscriptionId] = entry;
+    }
+    return filtered;
+  }
+
+  _mergeSubscriptionEntry(baseEntry, incomingEntry) {
+    if (!baseEntry) return incomingEntry ? { ...incomingEntry } : {};
+    if (!incomingEntry) return { ...baseEntry };
+
+    const merged = { ...baseEntry, ...incomingEntry };
+    if (incomingEntry.filters) {
+      merged.filters = incomingEntry.filters;
+    } else if (baseEntry.filters && !merged.filters) {
+      merged.filters = baseEntry.filters;
+    }
+
+    const baseTimestamp = baseEntry.last_returned_event_timestamp;
+    const incomingTimestamp = incomingEntry.last_returned_event_timestamp;
+    if (Number.isFinite(baseTimestamp) || Number.isFinite(incomingTimestamp)) {
+      const safeBase = Number.isFinite(baseTimestamp) ? baseTimestamp : -Infinity;
+      const safeIncoming = Number.isFinite(incomingTimestamp) ? incomingTimestamp : -Infinity;
+      merged.last_returned_event_timestamp = Math.max(safeBase, safeIncoming);
+    }
+
+    return merged;
+  }
+
+  _mergeSubscriptionSnapshots(baseSnapshot, incomingSnapshot) {
+    const baseSubscriptions = baseSnapshot?.subscriptions && typeof baseSnapshot.subscriptions === 'object'
+      ? baseSnapshot.subscriptions
+      : {};
+    const incomingSubscriptions = incomingSnapshot?.subscriptions && typeof incomingSnapshot.subscriptions === 'object'
+      ? incomingSnapshot.subscriptions
+      : {};
+    const mergedSubscriptions = { ...baseSubscriptions };
+
+    for (const [subscriptionId, entry] of Object.entries(incomingSubscriptions)) {
+      mergedSubscriptions[subscriptionId] = this._mergeSubscriptionEntry(
+        mergedSubscriptions[subscriptionId],
+        entry
+      );
+    }
+
+    const merged = {
+      connection: incomingSnapshot?.connection || baseSnapshot?.connection || null,
+      subscriptions: mergedSubscriptions
+    };
+
+    if (baseSnapshot?.clientId || incomingSnapshot?.clientId) {
+      merged.clientId = incomingSnapshot?.clientId || baseSnapshot?.clientId || null;
+    }
+
+    return merged;
+  }
   
   // Update defaultVerifyEvent to be async
   async defaultVerifyEvent(event) {
@@ -896,45 +975,56 @@ async handleSubscription(connectionKey) {
 
 async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null, clientId = null) {
     // logWithTimestamp('publishSubscription: Attempting to publish subscription:', JSON.stringify(reqMessage, null, 2));
-    
-    if (!this.writable) {
-      logWithTimestamp('publishSubscription: Error - Not writable');
-      throw new Error('Not writable');
-    }
-    
-    const [, subscriptionId, ...filters] = reqMessage;
-    
-    if (!connectionKey || !subscriptionId || filters.length === 0) {
-      logWithTimestamp('publishSubscription: Error - Invalid subscription parameters');
-      return ['NOTICE', 'Error: Invalid subscription parameters'];
-    }
-    
-    const isValid = this.validateFilters(filters);
-    logWithTimestamp('publishSubscription: Filters validation result:', isValid);
-    
-    if (isValid) {
+
+    return this._queueSubscriptionWrite(connectionKey, async () => {
+      if (!this.writable) {
+        logWithTimestamp('publishSubscription: Error - Not writable');
+        throw new Error('Not writable');
+      }
+
+      const [, subscriptionId, ...filters] = reqMessage;
+
+      if (!connectionKey || !subscriptionId || filters.length === 0) {
+        logWithTimestamp('publishSubscription: Error - Invalid subscription parameters');
+        return ['NOTICE', 'Error: Invalid subscription parameters'];
+      }
+
+      const isValid = this.validateFilters(filters);
+      logWithTimestamp('publishSubscription: Filters validation result:', isValid);
+
+      if (!isValid) {
+        logWithTimestamp('publishSubscription: Invalid filters');
+        return ['NOTICE', 'Error: Invalid filters'];
+      }
+
       const key = b4a.from(connectionKey, 'hex');
-      let subscriptions = activeSubscriptions ? activeSubscriptions.subscriptions : {};
-      
+      const storedSnapshot = await this.getSubscriptions(connectionKey);
+      const mergedSnapshot = this._mergeSubscriptionSnapshots(storedSnapshot, activeSubscriptions);
+      const existingSubscriptions = mergedSnapshot?.subscriptions || {};
+      const existingCount = Object.keys(existingSubscriptions).length;
+      const subscriptions = { ...existingSubscriptions };
+
       // Create or update subscription with the new structure
       subscriptions[subscriptionId] = {
+        ...(subscriptions[subscriptionId] || {}),
         last_returned_event_timestamp: undefined,
         filters: filters
       };
-      
+
       const subscriptionObject = {
+        ...mergedSnapshot,
         connection: connectionKey,
-        subscriptions: subscriptions
+        subscriptions
       };
 
       logWithTimestamp('publishSubscription: Subscription write requested', {
         connectionKey,
         keyHex: key.toString('hex'),
         filtersCount: filters.length,
-        existingCount: activeSubscriptions ? Object.keys(activeSubscriptions.subscriptions || {}).length : 0,
+        existingCount,
         viewVersion: this.view?.version ?? null
       });
-      
+
       await this.append({
         type: 'subscriptions',
         subscriptions: JSON.stringify(subscriptionObject)
@@ -961,20 +1051,21 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
           viewVersion: this.view?.version ?? null
         });
       }
-      
+
       logWithTimestamp(`publishSubscription: Published subscription for connection: ${connectionKey}, subscriptionId: ${subscriptionId}`);
       if (clientId) {
+        const persistentSubscriptions = this._filterEphemeralSubscriptions(subscriptions);
         const clientSnapshot = {
           clientId,
           connection: connectionKey,
-          subscriptions
+          subscriptions: persistentSubscriptions
         };
         try {
           await this.updateClientSubscriptions(clientId, clientSnapshot);
           logWithTimestamp('publishSubscription: Client subscription snapshot stored', {
             clientId,
             connectionKey,
-            subscriptionCount: Object.keys(subscriptions || {}).length,
+            subscriptionCount: Object.keys(persistentSubscriptions || {}).length,
             viewVersion: this.view?.version ?? null
           });
         } catch (error) {
@@ -986,50 +1077,53 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
         }
       }
       return ['NOTICE', `Subscription ${subscriptionId} created/updated successfully`];
-    } else {
-      logWithTimestamp('publishSubscription: Invalid filters');
-      return ['NOTICE', 'Error: Invalid filters'];
-    }
+    });
   }
 
  async updateSubscriptions(connectionKey, activeSubscriptionsUpdated) {
     // logWithTimestamp('updateSubscriptions: Updating subscriptions:', JSON.stringify(activeSubscriptionsUpdated, null, 2));
     
-    if (!this.writable) {
-      logWithTimestamp('updateSubscriptions: Error - Not writable');
-      throw new Error('Not writable');
-    }
-    
-    await this.append({
-      type: 'subscriptions',
-      subscriptions: JSON.stringify(activeSubscriptionsUpdated)
-    });
-    
-    const key = b4a.from(connectionKey, 'hex');
-    const stored = await this.view.get(key);
-    if (stored) {
-      let storedCount = null;
-      try {
-        const parsed = typeof stored.value === 'string' ? JSON.parse(stored.value) : stored.value;
-        storedCount = parsed?.subscriptions ? Object.keys(parsed.subscriptions).length : 0;
-      } catch (error) {
-        logWithTimestamp('updateSubscriptions: Error parsing stored subscription snapshot', error.message);
+    return this._queueSubscriptionWrite(connectionKey, async () => {
+      if (!this.writable) {
+        logWithTimestamp('updateSubscriptions: Error - Not writable');
+        throw new Error('Not writable');
       }
-      logWithTimestamp('updateSubscriptions: Stored subscription snapshot', {
-        connectionKey,
-        storedCount,
-        storedBytes: typeof stored.value === 'string' ? stored.value.length : stored.value?.length ?? null,
-        viewVersion: this.view?.version ?? null
-      });
-    } else {
-      logWithTimestamp('updateSubscriptions: Storage verification failed (no record)', {
-        connectionKey,
-        viewVersion: this.view?.version ?? null
-      });
-    }
 
-    logWithTimestamp(`updateSubscriptions: Updated subscriptions for connection: ${connectionKey}`);
-    return ['NOTICE', 'Subscriptions updated successfully'];
+      const storedSnapshot = await this.getSubscriptions(connectionKey);
+      const mergedSnapshot = this._mergeSubscriptionSnapshots(storedSnapshot, activeSubscriptionsUpdated);
+      mergedSnapshot.connection = connectionKey;
+
+      await this.append({
+        type: 'subscriptions',
+        subscriptions: JSON.stringify(mergedSnapshot)
+      });
+
+      const key = b4a.from(connectionKey, 'hex');
+      const stored = await this.view.get(key);
+      if (stored) {
+        let storedCount = null;
+        try {
+          const parsed = typeof stored.value === 'string' ? JSON.parse(stored.value) : stored.value;
+          storedCount = parsed?.subscriptions ? Object.keys(parsed.subscriptions).length : 0;
+        } catch (error) {
+          logWithTimestamp('updateSubscriptions: Error parsing stored subscription snapshot', error.message);
+        }
+        logWithTimestamp('updateSubscriptions: Stored subscription snapshot', {
+          connectionKey,
+          storedCount,
+          storedBytes: typeof stored.value === 'string' ? stored.value.length : stored.value?.length ?? null,
+          viewVersion: this.view?.version ?? null
+        });
+      } else {
+        logWithTimestamp('updateSubscriptions: Storage verification failed (no record)', {
+          connectionKey,
+          viewVersion: this.view?.version ?? null
+        });
+      }
+
+      logWithTimestamp(`updateSubscriptions: Updated subscriptions for connection: ${connectionKey}`);
+      return ['NOTICE', 'Subscriptions updated successfully'];
+    });
   }
 
   async getClientSubscriptions(clientId) {
@@ -1050,44 +1144,50 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
   }
 
   async updateClientSubscriptions(clientId, subscriptionObject) {
-    if (!this.writable) {
-      logWithTimestamp('updateClientSubscriptions: Error - Not writable');
-      throw new Error('Not writable');
-    }
-
-    const safeSnapshot = {
-      clientId,
-      connection: subscriptionObject?.connection ?? null,
-      subscriptions: subscriptionObject?.subscriptions ?? {}
-    };
-
-    await this.append({
-      type: 'client-subscriptions',
-      clientId,
-      subscriptions: JSON.stringify(safeSnapshot)
-    });
-
-    const key = b4a.from(`client:${clientId}`, 'utf8');
-    const stored = await this.view.get(key);
-    if (stored) {
-      let storedCount = null;
-      try {
-        const parsed = typeof stored.value === 'string' ? JSON.parse(stored.value) : stored.value;
-        storedCount = parsed?.subscriptions ? Object.keys(parsed.subscriptions).length : 0;
-      } catch (error) {
-        logWithTimestamp('updateClientSubscriptions: Error parsing stored snapshot', error.message);
+    return this._queueSubscriptionWrite(`client:${clientId}`, async () => {
+      if (!this.writable) {
+        logWithTimestamp('updateClientSubscriptions: Error - Not writable');
+        throw new Error('Not writable');
       }
-      logWithTimestamp('updateClientSubscriptions: Stored client snapshot', {
+
+      const existingSnapshot = await this.getClientSubscriptions(clientId);
+      const mergedSnapshot = this._mergeSubscriptionSnapshots(existingSnapshot, subscriptionObject);
+      const filteredSubscriptions = this._filterEphemeralSubscriptions(mergedSnapshot?.subscriptions || {});
+
+      const safeSnapshot = {
         clientId,
-        storedCount,
-        viewVersion: this.view?.version ?? null
-      });
-    } else {
-      logWithTimestamp('updateClientSubscriptions: Storage verification failed (no record)', {
+        connection: mergedSnapshot?.connection ?? null,
+        subscriptions: filteredSubscriptions
+      };
+
+      await this.append({
+        type: 'client-subscriptions',
         clientId,
-        viewVersion: this.view?.version ?? null
+        subscriptions: JSON.stringify(safeSnapshot)
       });
-    }
+
+      const key = b4a.from(`client:${clientId}`, 'utf8');
+      const stored = await this.view.get(key);
+      if (stored) {
+        let storedCount = null;
+        try {
+          const parsed = typeof stored.value === 'string' ? JSON.parse(stored.value) : stored.value;
+          storedCount = parsed?.subscriptions ? Object.keys(parsed.subscriptions).length : 0;
+        } catch (error) {
+          logWithTimestamp('updateClientSubscriptions: Error parsing stored snapshot', error.message);
+        }
+        logWithTimestamp('updateClientSubscriptions: Stored client snapshot', {
+          clientId,
+          storedCount,
+          viewVersion: this.view?.version ?? null
+        });
+      } else {
+        logWithTimestamp('updateClientSubscriptions: Storage verification failed (no record)', {
+          clientId,
+          viewVersion: this.view?.version ?? null
+        });
+      }
+    });
   }
 
   // helper function for publishSubscription() to verify that the structure and attributes of REQ 'filters' object 
@@ -1173,21 +1273,23 @@ async handleMessage(message, sendResponse, connectionKey, clientId = null) {
   // Add the missing unsubscribe method
   async unsubscribe(connectionKey, subscriptionId) {
     logWithTimestamp(`unsubscribe: Removing subscription ${subscriptionId} for connection ${connectionKey}`);
-    const activeSubscriptions = await this.getSubscriptions(connectionKey);
-    
-    if (!activeSubscriptions || !activeSubscriptions.subscriptions[subscriptionId]) {
-      logWithTimestamp(`unsubscribe: Subscription ${subscriptionId} not found`);
-      return;
-    }
-    
-    delete activeSubscriptions.subscriptions[subscriptionId];
-    
-    // Update the subscriptions in the database
-    await this.append({
-      type: 'subscriptions',
-      subscriptions: JSON.stringify(activeSubscriptions)
+    await this._queueSubscriptionWrite(connectionKey, async () => {
+      const activeSubscriptions = await this.getSubscriptions(connectionKey);
+
+      if (!activeSubscriptions || !activeSubscriptions.subscriptions[subscriptionId]) {
+        logWithTimestamp(`unsubscribe: Subscription ${subscriptionId} not found`);
+        return;
+      }
+
+      delete activeSubscriptions.subscriptions[subscriptionId];
+
+      // Update the subscriptions in the database
+      await this.append({
+        type: 'subscriptions',
+        subscriptions: JSON.stringify(activeSubscriptions)
+      });
+
+      logWithTimestamp(`unsubscribe: Successfully removed subscription ${subscriptionId}`);
     });
-    
-    logWithTimestamp(`unsubscribe: Successfully removed subscription ${subscriptionId}`);
   }
 }

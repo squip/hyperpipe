@@ -204,7 +204,10 @@ function collectActiveWriterSample(relayManager, limit = 4) {
     return sample;
 }
 
-function validateWriterSecret(writerSecret, { writerCore = null, expectedWriterKey = null } = {}) {
+function validateWriterSecret(
+    writerSecret,
+    { writerCore = null, expectedWriterKey = null, manifestVersion = 0 } = {}
+) {
     if (!writerSecret) {
         return { valid: false, expectedWriterKey: expectedWriterKey || null };
     }
@@ -239,10 +242,17 @@ function validateWriterSecret(writerSecret, { writerCore = null, expectedWriterK
     const seedCandidates = [];
     if (secretKey.length >= 32) seedCandidates.push(secretKey.subarray(0, 32));
 
+    const matchesExpectedKey = (publicKey) => {
+        if (!publicKey || !expectedKey) return false;
+        if (b4a.equals(publicKey, expectedKey)) return true;
+        const { key: derivedKey } = deriveCoreKeyFromSignerKey(publicKey, manifestVersion);
+        return derivedKey ? b4a.equals(derivedKey, expectedKey) : false;
+    };
+
     for (const seed of seedCandidates) {
         try {
             const candidate = hypercoreCrypto.keyPair(seed);
-            if (candidate?.publicKey && b4a.equals(candidate.publicKey, expectedKey)) {
+            if (candidate?.publicKey && matchesExpectedKey(candidate.publicKey)) {
                 return { valid: true, expectedWriterKey: expectedKey };
             }
         } catch (_) {
@@ -251,9 +261,12 @@ function validateWriterSecret(writerSecret, { writerCore = null, expectedWriterK
     }
 
     if (secretKey.length === 64) {
-        const candidate = { publicKey: expectedKey, secretKey };
-        if (hypercoreCrypto.validateKeyPair(candidate)) {
-            return { valid: true, expectedWriterKey: expectedKey };
+        const candidatePublic = secretKey.subarray(32, 64);
+        if (matchesExpectedKey(candidatePublic)) {
+            const candidate = { publicKey: candidatePublic, secretKey };
+            if (hypercoreCrypto.validateKeyPair(candidate)) {
+                return { valid: true, expectedWriterKey: expectedKey };
+            }
         }
     }
 
@@ -1136,6 +1149,7 @@ export async function joinRelay(options = {}) {
         storageDir,
         config,
         fromAutoConnect = false,
+        isOpen = null,
         writerSecret = null,
         writerCore = null,
         writerCoreHex = null,
@@ -1179,6 +1193,7 @@ export async function joinRelay(options = {}) {
         expectedWriterHex = writerSignerHex;
         expectedWriterSource = 'writerCore';
     }
+    const expectsCoreKey = expectedWriterSource && expectedWriterSource !== 'writerCore';
 
     console.log('[RelayAdapter][WriterMaterial] Join relay writer expectations', {
         relayKey,
@@ -1203,8 +1218,10 @@ export async function joinRelay(options = {}) {
     if (writerSecret) {
         try {
             const secretKey = Buffer.from(String(writerSecret), 'hex');
-            const expectedSignerKey = writerSignerKey || null;
+            const expectedSignerKey = expectsCoreKey ? null : writerSignerKey;
             const expectedSignerHex = expectedSignerKey ? b4a.toString(expectedSignerKey, 'hex') : null;
+            const expectedCoreKey = expectsCoreKey ? expectedWriterKey : null;
+            const manifestVersion = 0;
 
             if (expectedSignerKey) {
                 console.log('[RelayAdapter] Invite writer signer decoded', {
@@ -1225,6 +1242,16 @@ export async function joinRelay(options = {}) {
                     tailMatchesSigner: tailMatches,
                     expectedSignerHex: expectedSignerHex?.slice(0, 16) || null
                 });
+            } else if (secretKey.length === 64 && expectedCoreKey) {
+                const secretTail = secretKey.subarray(32, 64);
+                const { key: derivedCore } = deriveCoreKeyFromSignerKey(secretTail, manifestVersion);
+                const tailMatchesCore = derivedCore ? b4a.equals(derivedCore, expectedCoreKey) : null;
+                console.log('[RelayAdapter] Invite writer secret inspection', {
+                    relayKey,
+                    secretLen: secretKey.length,
+                    tailMatchesCore,
+                    expectedWriterSource
+                });
             }
 
             let derivedPair = null;
@@ -1233,8 +1260,18 @@ export async function joinRelay(options = {}) {
                     const candidate = hypercoreCrypto.keyPair(seed);
                     if (!candidate?.publicKey || !candidate?.secretKey) continue;
                     if (expectedSignerKey && !b4a.equals(candidate.publicKey, expectedSignerKey)) {
-                        console.warn('[RelayAdapter] Invite writer keypair mismatch with provided writerCore; retrying with alternate seed');
+                        console.warn('[RelayAdapter] Invite writer keypair mismatch with expected signer; retrying with alternate seed');
                         continue;
+                    }
+                    if (expectedCoreKey) {
+                        const { key: derivedCore } = deriveCoreKeyFromSignerKey(candidate.publicKey, manifestVersion);
+                        if (!derivedCore || !b4a.equals(derivedCore, expectedCoreKey)) {
+                            console.warn('[RelayAdapter] Invite writer keypair mismatch with expected core; retrying with alternate seed', {
+                                relayKey,
+                                expectedWriterSource
+                            });
+                            continue;
+                        }
                     }
                     derivedPair = { publicKey: candidate.publicKey, secretKey: candidate.secretKey };
                     break;
@@ -1243,13 +1280,28 @@ export async function joinRelay(options = {}) {
                 }
             }
 
-            if (!derivedPair && expectedSignerKey && secretKey.length === 64) {
-                const candidate = { publicKey: expectedSignerKey, secretKey };
-                if (hypercoreCrypto.validateKeyPair(candidate)) {
-                    derivedPair = candidate;
-                    console.warn('[RelayAdapter] Using invite secretKey directly (validated against writerCore)');
-                } else {
-                    console.warn('[RelayAdapter] Invite writer secretKey does not validate against writerCore; skipping keyPair injection');
+            if (!derivedPair && secretKey.length === 64) {
+                if (expectedSignerKey) {
+                    const candidate = { publicKey: expectedSignerKey, secretKey };
+                    if (hypercoreCrypto.validateKeyPair(candidate)) {
+                        derivedPair = candidate;
+                        console.warn('[RelayAdapter] Using invite secretKey directly (validated against writerCore)');
+                    } else {
+                        console.warn('[RelayAdapter] Invite writer secretKey does not validate against writerCore; skipping keyPair injection');
+                    }
+                } else if (expectedCoreKey) {
+                    const candidatePublic = secretKey.subarray(32, 64);
+                    const { key: derivedCore } = deriveCoreKeyFromSignerKey(candidatePublic, manifestVersion);
+                    if (derivedCore && b4a.equals(derivedCore, expectedCoreKey)) {
+                        const candidate = { publicKey: candidatePublic, secretKey };
+                        if (hypercoreCrypto.validateKeyPair(candidate)) {
+                            derivedPair = candidate;
+                            console.warn('[RelayAdapter] Using invite secretKey directly (validated against expected core)');
+                        }
+                    }
+                    if (!derivedPair) {
+                        console.warn('[RelayAdapter] Invite writer secretKey does not validate against expected core; skipping keyPair injection');
+                    }
                 }
             }
 
@@ -1430,6 +1482,9 @@ export async function joinRelay(options = {}) {
                 auto_connect: true,
                 is_active: true
             };
+            if (typeof isOpen === 'boolean') {
+                profileInfo.isOpen = isOpen;
+            }
 
             profileInfo = applyJoinMetadata(profileInfo, {
                 writerSecret,
@@ -1461,6 +1516,9 @@ export async function joinRelay(options = {}) {
             if (description) profileInfo.description = description;
             if (publicIdentifier && !profileInfo.public_identifier) {
                 profileInfo.public_identifier = publicIdentifier;
+            }
+            if (typeof isOpen === 'boolean') {
+                profileInfo.isOpen = isOpen;
             }
 
             profileInfo = applyJoinMetadata(profileInfo, {
@@ -2388,7 +2446,9 @@ export async function getActiveRelays() {
             createdAt: profile?.created_at || profile?.joined_at || null,
             isActive: true,
             isOpen: profile?.isOpen === true,
-            isPublic: profile?.isPublic === true
+            isPublic: profile?.isPublic === true,
+            isHosted: !!profile?.created_at,
+            isJoined: !!profile?.joined_at && !profile?.created_at
         });
     }
     

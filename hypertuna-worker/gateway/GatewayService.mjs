@@ -1135,6 +1135,17 @@ export class GatewayService extends EventEmitter {
       };
     }
 
+    if (!this.#isPublicGatewayRelayKey(relayKey) && (metadataCopy?.isHosted === false || metadataCopy?.isJoined === true)) {
+      this.publicGatewayRelayState.delete(relayKey);
+      this.#clearRelayToken(relayKey);
+      this.log('debug', `[PublicGateway] Skipping registration for joined relay ${relayKey}`, {
+        isHosted: metadataCopy?.isHosted ?? null,
+        isJoined: metadataCopy?.isJoined ?? null
+      });
+      this.#emitPublicGatewayStatus();
+      return;
+    }
+
     const now = Date.now();
 
     const relayCores = this.#collectRelayCoreMetadata(relayKey);
@@ -1872,6 +1883,14 @@ export class GatewayService extends EventEmitter {
     }
     if (this.#isPublicGatewayRelayKey(relayKey)) {
       console.info('[PublicGateway] Open join pool sync skipped: public gateway relay', { relayKey });
+      return;
+    }
+    if (metadata?.isHosted === false || metadata?.isJoined === true) {
+      console.info('[PublicGateway] Open join pool sync skipped: joined relay', {
+        relayKey,
+        isHosted: metadata?.isHosted ?? null,
+        isJoined: metadata?.isJoined ?? null
+      });
       return;
     }
     if (!metadata || metadata.isOpen !== true) {
@@ -2805,6 +2824,14 @@ export class GatewayService extends EventEmitter {
 
         if (typeof relayObj.isOpen === 'boolean') {
           nextMetadata.isOpen = relayObj.isOpen;
+        }
+
+        if (typeof relayObj.isHosted === 'boolean') {
+          nextMetadata.isHosted = relayObj.isHosted;
+        }
+
+        if (typeof relayObj.isJoined === 'boolean') {
+          nextMetadata.isJoined = relayObj.isJoined;
         }
 
         if (typeof relayObj.isGatewayReplica === 'boolean') {

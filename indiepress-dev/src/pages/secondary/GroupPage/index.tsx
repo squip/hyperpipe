@@ -760,6 +760,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         })
         await startJoinFlow(groupId, {
           fileSharing: isOpenGroup,
+          isOpen: isOpenGroup,
           openJoin: openJoinAllowed,
           token: inviteToken,
           relayKey,

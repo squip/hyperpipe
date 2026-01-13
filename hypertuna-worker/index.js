@@ -886,7 +886,9 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
         connectionUrl,
         createdAt,
         isActive = true,
-        isOpen
+        isOpen,
+        isHosted,
+        isJoined
       } = relay
 
       const isPublic = typeof relay.isPublic === 'boolean' ? relay.isPublic : isActive !== false
@@ -905,6 +907,8 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
         connectionUrl: effectiveConnectionUrl,
         isPublic,
         isOpen: isOpen === true,
+        isHosted: isHosted === true ? true : isHosted === false ? false : undefined,
+        isJoined: isJoined === true ? true : isJoined === false ? false : undefined,
         metadataUpdatedAt: createdAt || null
       }
 
@@ -933,6 +937,8 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
           connectionUrl: aliasConnectionUrl,
           isPublic,
           isOpen: isOpen === true,
+          isHosted: isHosted === true ? true : isHosted === false ? false : undefined,
+          isJoined: isJoined === true ? true : isJoined === false ? false : undefined,
           metadataUpdatedAt: createdAt || null,
           pathAliases: gatewayPath ? [gatewayPath] : []
         }
@@ -3499,6 +3505,12 @@ async function handleMessageObject(message) {
         const publicIdentifier = data.publicIdentifier
         const fileSharing = data.fileSharing
         const openJoin = data.openJoin === true
+        const isOpen =
+          typeof data.isOpen === 'boolean'
+            ? data.isOpen
+            : openJoin
+              ? true
+              : undefined
         const inviteToken = typeof data.token === 'string' ? data.token.trim() : null
         try {
           let hostPeers = Array.isArray(data.hostPeers) ? data.hostPeers : []
@@ -3716,6 +3728,7 @@ async function handleMessageObject(message) {
             publicIdentifier,
             fileSharing,
             openJoin,
+            isOpen,
             relayKey: joinRelayKey || undefined,
             relayUrl: joinRelayUrl || undefined,
             blindPeer,

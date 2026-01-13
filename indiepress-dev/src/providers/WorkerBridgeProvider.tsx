@@ -169,6 +169,7 @@ type WorkerBridgeContextValue = {
     publicIdentifier: string,
     opts?: {
       fileSharing?: boolean
+      isOpen?: boolean
       token?: string
       relayKey?: string | null
       relayUrl?: string | null
@@ -510,6 +511,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       publicIdentifier: string,
       opts?: {
         fileSharing?: boolean
+        isOpen?: boolean
         token?: string
         relayKey?: string | null
         relayUrl?: string | null
@@ -575,6 +577,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       const data: any = {
         publicIdentifier: identifier,
         fileSharing,
+        isOpen: typeof opts?.isOpen === 'boolean' ? opts.isOpen : undefined,
         openJoin: opts?.openJoin === true,
         token: opts?.token,
         relayKey: opts?.relayKey || undefined,

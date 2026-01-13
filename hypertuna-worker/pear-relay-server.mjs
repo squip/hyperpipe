@@ -127,6 +127,70 @@ function resetSubscriptionTimestamps(snapshot, connectionKey) {
   };
 }
 
+function isEphemeralSubscriptionId(subscriptionId) {
+  return typeof subscriptionId === 'string' && subscriptionId.startsWith('f-fetch-events');
+}
+
+function stripEphemeralSubscriptions(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return snapshot;
+  if (!snapshot.subscriptions || typeof snapshot.subscriptions !== 'object') return snapshot;
+  const filtered = {};
+  for (const [subscriptionId, entry] of Object.entries(snapshot.subscriptions)) {
+    if (isEphemeralSubscriptionId(subscriptionId)) continue;
+    filtered[subscriptionId] = entry;
+  }
+  return {
+    ...snapshot,
+    subscriptions: filtered
+  };
+}
+
+function mergeSubscriptionEntry(primary = {}, secondary = {}) {
+  const merged = { ...secondary, ...primary };
+  if (!merged.filters) {
+    merged.filters = primary.filters || secondary.filters;
+  }
+
+  const primaryTimestamp = primary.last_returned_event_timestamp;
+  const secondaryTimestamp = secondary.last_returned_event_timestamp;
+  if (Number.isFinite(primaryTimestamp) || Number.isFinite(secondaryTimestamp)) {
+    const safePrimary = Number.isFinite(primaryTimestamp) ? primaryTimestamp : -Infinity;
+    const safeSecondary = Number.isFinite(secondaryTimestamp) ? secondaryTimestamp : -Infinity;
+    merged.last_returned_event_timestamp = Math.max(safePrimary, safeSecondary);
+  }
+
+  return merged;
+}
+
+function mergeSubscriptionSnapshots(primarySnapshot, secondarySnapshot) {
+  const primarySubscriptions = primarySnapshot?.subscriptions && typeof primarySnapshot.subscriptions === 'object'
+    ? primarySnapshot.subscriptions
+    : {};
+  const secondarySubscriptions = secondarySnapshot?.subscriptions && typeof secondarySnapshot.subscriptions === 'object'
+    ? secondarySnapshot.subscriptions
+    : {};
+  const mergedSubscriptions = { ...secondarySubscriptions };
+
+  for (const [subscriptionId, entry] of Object.entries(primarySubscriptions)) {
+    mergedSubscriptions[subscriptionId] = mergeSubscriptionEntry(entry, mergedSubscriptions[subscriptionId]);
+  }
+
+  const merged = {
+    ...(secondarySnapshot || {}),
+    ...(primarySnapshot || {}),
+    subscriptions: mergedSubscriptions
+  };
+
+  if (primarySnapshot?.connection || secondarySnapshot?.connection) {
+    merged.connection = primarySnapshot?.connection || secondarySnapshot?.connection || null;
+  }
+  if (primarySnapshot?.clientId || secondarySnapshot?.clientId) {
+    merged.clientId = primarySnapshot?.clientId || secondarySnapshot?.clientId || null;
+  }
+
+  return merged;
+}
+
 export async function requestRelaySubscriptionRefresh(relayKey, { reason = 'writer-sync' } = {}) {
   if (!relayKey) {
     return { status: 'skipped', reason: 'missing-relay-key', total: 0, updated: 0, failed: 0 };
@@ -1871,17 +1935,20 @@ function setupProtocolHandlers(protocol) {
 
           if (!rehydrateOk) {
             try {
-              const clientSnapshot = await getRelayClientSubscriptions(relayKey, clientId);
-              const subscriptionCount = clientSnapshot?.subscriptions
-                ? Object.keys(clientSnapshot.subscriptions).length
+              const clientSnapshotRaw = await getRelayClientSubscriptions(relayKey, clientId);
+              const clientSnapshot = stripEphemeralSubscriptions(clientSnapshotRaw);
+              const currentSnapshot = await getRelaySubscriptions(relayKey, connectionKey);
+              const mergedSnapshot = mergeSubscriptionSnapshots(currentSnapshot, clientSnapshot);
+              const subscriptionCount = mergedSnapshot?.subscriptions
+                ? Object.keys(mergedSnapshot.subscriptions).length
                 : 0;
               if (subscriptionCount > 0) {
-                const snapshotTimestamps = Object.values(clientSnapshot.subscriptions || {})
+                const snapshotTimestamps = Object.values(mergedSnapshot.subscriptions || {})
                   .map((subscription) => subscription?.last_returned_event_timestamp)
                   .filter((value) => typeof value === 'number');
                 const lastReturned = snapshotTimestamps.length ? Math.max(...snapshotTimestamps) : null;
                 const updated = {
-                  ...clientSnapshot,
+                  ...mergedSnapshot,
                   clientId,
                   connection: connectionKey
                 };
@@ -1890,7 +1957,7 @@ function setupProtocolHandlers(protocol) {
                 console.log('[RelayServer] Subscription rehydrate from client snapshot', {
                   clientId,
                   relayKey,
-                  fromKey: clientSnapshot.connection || null,
+                  fromKey: clientSnapshot?.connection || null,
                   toKey: connectionKey,
                   subscriptionCount,
                   last_returned_event_timestamp: lastReturned,
@@ -1938,22 +2005,25 @@ function setupProtocolHandlers(protocol) {
 
             if (!rehydrateOk) {
               try {
-                const stableSnapshot = await getRelayClientSubscriptions(relayKey, stableClientId);
-                const subscriptionCount = stableSnapshot?.subscriptions
-                  ? Object.keys(stableSnapshot.subscriptions).length
+                const stableSnapshotRaw = await getRelayClientSubscriptions(relayKey, stableClientId);
+                const stableSnapshot = stripEphemeralSubscriptions(stableSnapshotRaw);
+                const currentSnapshot = await getRelaySubscriptions(relayKey, connectionKey);
+                const mergedSnapshot = mergeSubscriptionSnapshots(currentSnapshot, stableSnapshot);
+                const subscriptionCount = mergedSnapshot?.subscriptions
+                  ? Object.keys(mergedSnapshot.subscriptions).length
                   : 0;
                 if (subscriptionCount > 0) {
-                  const snapshotTimestamps = Object.values(stableSnapshot.subscriptions || {})
+                  const snapshotTimestamps = Object.values(mergedSnapshot.subscriptions || {})
                     .map((subscription) => subscription?.last_returned_event_timestamp)
                     .filter((value) => typeof value === 'number');
                   const lastReturned = snapshotTimestamps.length ? Math.max(...snapshotTimestamps) : null;
                   const updated = {
-                    ...stableSnapshot,
+                    ...mergedSnapshot,
                     clientId,
                     connection: connectionKey
                   };
                   const stableUpdated = {
-                    ...stableSnapshot,
+                    ...mergedSnapshot,
                     clientId: stableClientId,
                     connection: connectionKey
                   };
@@ -1963,7 +2033,7 @@ function setupProtocolHandlers(protocol) {
                   console.log('[RelayServer] Subscription rehydrate from client snapshot', {
                     clientId,
                     relayKey,
-                    fromKey: stableSnapshot.connection || null,
+                    fromKey: stableSnapshot?.connection || null,
                     toKey: connectionKey,
                     subscriptionCount,
                     last_returned_event_timestamp: lastReturned,
@@ -3260,6 +3330,7 @@ export async function startJoinAuthentication(options) {
     relayKey: inviteRelayKey = null,
     relayUrl: inviteRelayUrl = null,
     openJoin = false,
+    isOpen = null,
     writerCore = null,
     writerSecret = null,
     writerCoreHex = null,
@@ -3440,6 +3511,7 @@ export async function startJoinAuthentication(options) {
           relayKey: fallbackRelayKey,
           config,
           fileSharing,
+          isOpen,
           publicIdentifier,
           authToken: inviteToken,
           writerSecret,
@@ -3700,6 +3772,7 @@ export async function startJoinAuthentication(options) {
           relayKey: fallbackRelayKey,
           config,
           fileSharing,
+          isOpen,
           publicIdentifier,
           authToken: provisionalToken,
           writerSecret,
@@ -3960,6 +4033,7 @@ export async function startJoinAuthentication(options) {
       relayKey,
       config,
       fileSharing,
+      isOpen,
       writerSecret: finalWriterSecret,
       writerCore: finalWriterCore,
       writerCoreHex: finalWriterCoreHex,
@@ -4094,9 +4168,10 @@ export async function provisionWriterForInvitee(options = {}) {
   }
 
   const keyPair = crypto.keyPair();
-  const writerCore = HypercoreId.encode(keyPair.publicKey);
+  const writerSigner = HypercoreId.encode(keyPair.publicKey);
   const writerSecret = b4a.toString(keyPair.secretKey, 'hex');
   const writerHex = b4a.toString(keyPair.publicKey, 'hex');
+  let writerCore = writerSigner;
   let writerCoreHex = null;
   let writerCoreId = null;
   let coreKeyMatchesSigner = null;
@@ -4119,6 +4194,9 @@ export async function provisionWriterForInvitee(options = {}) {
       writerCoreId = HypercoreId.encode(derivedKey);
     } catch (_) {
       writerCoreId = null;
+    }
+    if (writerCoreId) {
+      writerCore = writerCoreId;
     }
   } else {
     console.warn('[RelayServer] Failed to derive invite writer core key from signer', {
@@ -4151,6 +4229,7 @@ export async function provisionWriterForInvitee(options = {}) {
     writerCore,
     writerCoreHex,
     writerCoreId,
+    writerSigner,
     autobaseLocal: writerCoreHex,
     writerSecret,
     writerSignerHex: writerHex,
