@@ -7,6 +7,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { schnorr } from '@noble/curves/secp256k1';
+import HypercoreId from 'hypercore-id-encoding';
 
 import {
   EnhancedHyperswarmPool,
@@ -51,6 +52,7 @@ import BlindPeerService from './blind-peer/BlindPeerService.mjs';
 import BlindPeerReplicaManager from './blind-peer/BlindPeerReplicaManager.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
+const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores';
 
 function safeString(value) {
   if (typeof value === 'string') return value;
@@ -462,6 +464,7 @@ class PublicGatewayService {
     app.post('/api/relays/:relayKey/open-join/pool', (req, res) => this.#handleOpenJoinPoolUpdate(req, res));
     app.get('/api/relays/:relayKey/open-join/challenge', (req, res) => this.#handleOpenJoinChallenge(req, res));
     app.post('/api/relays/:relayKey/open-join', (req, res) => this.#handleOpenJoinRequest(req, res));
+    app.post('/api/relays/:relayKey/open-join/append-cores', (req, res) => this.#handleOpenJoinAppendCores(req, res));
 
     app.post('/api/relay-tokens/issue', (req, res) => this.#handleTokenIssue(req, res));
     app.post('/api/relay-tokens/refresh', (req, res) => this.#handleTokenRefresh(req, res));
@@ -540,12 +543,16 @@ class PublicGatewayService {
     const challengeTtlMs = Number(raw?.challengeTtlMs);
     const authWindowSeconds = Number(raw?.authWindowSeconds);
     const maxPoolSize = Number(raw?.maxPoolSize);
+    const maxAppendCores = Number(raw?.maxAppendCores);
+    const maxRelayCores = Number(raw?.maxRelayCores);
     return {
       enabled,
       poolEntryTtlMs: Number.isFinite(poolEntryTtlMs) && poolEntryTtlMs > 0 ? poolEntryTtlMs : 6 * 60 * 60 * 1000,
       challengeTtlMs: Number.isFinite(challengeTtlMs) && challengeTtlMs > 0 ? challengeTtlMs : 2 * 60 * 1000,
       authWindowSeconds: Number.isFinite(authWindowSeconds) && authWindowSeconds > 0 ? authWindowSeconds : 300,
-      maxPoolSize: Number.isFinite(maxPoolSize) && maxPoolSize > 0 ? Math.trunc(maxPoolSize) : 50
+      maxPoolSize: Number.isFinite(maxPoolSize) && maxPoolSize > 0 ? Math.trunc(maxPoolSize) : 50,
+      maxAppendCores: Number.isFinite(maxAppendCores) && maxAppendCores > 0 ? Math.trunc(maxAppendCores) : 64,
+      maxRelayCores: Number.isFinite(maxRelayCores) && maxRelayCores > 0 ? Math.trunc(maxRelayCores) : 1024
     };
   }
 
@@ -647,7 +654,7 @@ class PublicGatewayService {
     }
   }
 
-  #issueOpenJoinChallenge({ relayKey, publicIdentifier }) {
+  #issueOpenJoinChallenge({ relayKey, publicIdentifier, purpose = null }) {
     this.#pruneOpenJoinChallenges();
     const now = Date.now();
     const ttlMs = this.openJoinConfig?.challengeTtlMs || 120000;
@@ -655,6 +662,7 @@ class PublicGatewayService {
     const entry = {
       relayKey,
       publicIdentifier: publicIdentifier || relayKey,
+      purpose: typeof purpose === 'string' && purpose.trim() ? purpose.trim() : null,
       issuedAt: now,
       expiresAt: now + ttlMs
     };
@@ -662,12 +670,17 @@ class PublicGatewayService {
     return { challenge, expiresAt: entry.expiresAt };
   }
 
-  #consumeOpenJoinChallenge(challenge, relayKey) {
+  #consumeOpenJoinChallenge(challenge, relayKey, purpose = null) {
     if (!challenge) return null;
     this.#pruneOpenJoinChallenges();
     const entry = this.openJoinChallenges.get(challenge);
     if (!entry) return null;
     if (relayKey && entry.relayKey && relayKey !== entry.relayKey) return null;
+    const expectedPurpose = typeof purpose === 'string' && purpose.trim() ? purpose.trim() : null;
+    const entryPurpose = typeof entry?.purpose === 'string' && entry.purpose.trim() ? entry.purpose.trim() : null;
+    if (entryPurpose || expectedPurpose) {
+      if (!expectedPurpose || entryPurpose !== expectedPurpose) return null;
+    }
     if (entry.expiresAt && entry.expiresAt <= Date.now()) {
       this.openJoinChallenges.delete(challenge);
       return null;
@@ -843,7 +856,116 @@ class PublicGatewayService {
     return values;
   }
 
-  async #verifyOpenJoinAuthEvent(event, { challenge, relayKey, publicIdentifier } = {}) {
+  #normalizeOpenJoinCoreKey(value) {
+    if (!value) return null;
+    if (Buffer.isBuffer(value)) {
+      try {
+        return HypercoreId.encode(value);
+      } catch (_) {
+        return value.toString('hex');
+      }
+    }
+    if (value instanceof Uint8Array) {
+      try {
+        return HypercoreId.encode(Buffer.from(value));
+      } catch (_) {
+        return Buffer.from(value).toString('hex');
+      }
+    }
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      try {
+        return HypercoreId.encode(HypercoreId.decode(trimmed));
+      } catch (_) {
+        if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+          try {
+            return HypercoreId.encode(Buffer.from(trimmed, 'hex'));
+          } catch (_) {
+            return null;
+          }
+        }
+        return null;
+      }
+    }
+    if (value && typeof value === 'object') {
+      if (value.key) return this.#normalizeOpenJoinCoreKey(value.key);
+      if (value.core) return this.#normalizeOpenJoinCoreKey(value.core);
+    }
+    return null;
+  }
+
+  #normalizeOpenJoinCoreEntry(entry) {
+    if (!entry) return null;
+    const key = this.#normalizeOpenJoinCoreKey(entry);
+    if (!key) return null;
+    let role = null;
+    if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+      if (typeof entry.role === 'string' && entry.role.trim()) {
+        role = entry.role.trim();
+      }
+    }
+    return role ? { key, role } : { key };
+  }
+
+  #normalizeOpenJoinCoreEntries(entries = [], { maxEntries = null } = {}) {
+    const normalized = [];
+    let rejected = 0;
+    let truncated = 0;
+    const limit = Number.isFinite(maxEntries) && maxEntries > 0 ? Math.trunc(maxEntries) : null;
+    for (const entry of entries) {
+      if (limit && normalized.length >= limit) {
+        truncated += 1;
+        continue;
+      }
+      const normalizedEntry = this.#normalizeOpenJoinCoreEntry(entry);
+      if (!normalizedEntry) {
+        rejected += 1;
+        continue;
+      }
+      normalized.push(normalizedEntry);
+    }
+    return { entries: normalized, rejected, truncated };
+  }
+
+  #mergeOpenJoinCoreEntries(existingEntries = [], incomingEntries = [], { maxTotal = null } = {}) {
+    const merged = [];
+    const indexByKey = new Map();
+    let added = 0;
+    let ignored = 0;
+
+    const addEntry = (entry, isIncoming = false) => {
+      const normalized = this.#normalizeOpenJoinCoreEntry(entry);
+      if (!normalized) return;
+      const key = normalized.key;
+      const existingIndex = indexByKey.get(key);
+      if (existingIndex === undefined) {
+        indexByKey.set(key, merged.length);
+        merged.push(normalized);
+        if (isIncoming) added += 1;
+        return;
+      }
+      if (isIncoming) ignored += 1;
+      const current = merged[existingIndex];
+      if (!current.role && normalized.role) {
+        merged[existingIndex] = { ...current, role: normalized.role };
+      }
+    };
+
+    for (const entry of existingEntries) addEntry(entry, false);
+    for (const entry of incomingEntries) addEntry(entry, true);
+
+    let trimmed = 0;
+    const maxAllowed = Number.isFinite(maxTotal) && maxTotal > 0 ? Math.trunc(maxTotal) : null;
+    if (maxAllowed && merged.length > maxAllowed) {
+      trimmed = merged.length - maxAllowed;
+      merged.splice(0, trimmed);
+    }
+
+    return { merged, added, ignored, trimmed };
+  }
+
+  async #verifyOpenJoinAuthEvent(event, { challenge, relayKey, publicIdentifier, purpose } = {}) {
     if (!event || typeof event !== 'object') {
       return { ok: false, error: 'missing-auth-event' };
     }
@@ -873,6 +995,14 @@ class PublicGatewayService {
     const challengeTag = this.#extractTagValue(tags, 'challenge');
     if (!challengeTag || challengeTag !== challenge) {
       return { ok: false, error: 'challenge-mismatch' };
+    }
+
+    const expectedPurpose = typeof purpose === 'string' && purpose.trim() ? purpose.trim() : null;
+    if (expectedPurpose) {
+      const purposeTag = this.#extractTagValue(tags, 'purpose');
+      if (!purposeTag || purposeTag !== expectedPurpose) {
+        return { ok: false, error: 'purpose-mismatch' };
+      }
     }
 
     const relayTags = this.#extractTagValues(tags, 'relay');
@@ -3787,6 +3917,11 @@ class PublicGatewayService {
     if (!identifier) {
       return res.status(400).json({ error: 'relayKey is required' });
     }
+    const rawPurpose = typeof req.query?.purpose === 'string' ? req.query.purpose.trim() : null;
+    const purpose = rawPurpose || null;
+    if (purpose && purpose !== OPEN_JOIN_APPEND_CORES_PURPOSE) {
+      return res.status(400).json({ error: 'invalid-purpose' });
+    }
 
     try {
       const resolved = await this.#resolveOpenJoinTarget(identifier);
@@ -3804,12 +3939,13 @@ class PublicGatewayService {
         || pool?.publicIdentifier
         || pool?.metadata?.identifier
         || relayKey;
-      const { challenge, expiresAt } = this.#issueOpenJoinChallenge({ relayKey, publicIdentifier });
+      const { challenge, expiresAt } = this.#issueOpenJoinChallenge({ relayKey, publicIdentifier, purpose });
       this.logger?.info?.('[PublicGateway] Open join challenge issued', {
         relayKey,
         publicIdentifier,
         expiresAt,
         source: record ? 'registration' : 'pool',
+        purpose,
         challengePrefix: challenge ? challenge.slice(0, 12) : null
       });
       return res.json({
@@ -3817,6 +3953,7 @@ class PublicGatewayService {
         publicIdentifier,
         challenge,
         expiresAt,
+        purpose,
         gateway: this.config?.publicBaseUrl || null
       });
     } catch (error) {
@@ -3959,6 +4096,132 @@ class PublicGatewayService {
         err: error?.message || error
       });
       return res.status(500).json({ error: 'open-join-failed' });
+    }
+  }
+
+  async #handleOpenJoinAppendCores(req, res) {
+    if (!this.openJoinConfig?.enabled) {
+      return res.status(503).json({ error: 'open-join-disabled' });
+    }
+
+    const identifier = req.params?.relayKey;
+    if (!identifier) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+
+    const authEvent = req.body?.authEvent || req.body?.event || null;
+    if (!authEvent || typeof authEvent !== 'object') {
+      return res.status(400).json({ error: 'missing-auth-event' });
+    }
+
+    const rawCores = Array.isArray(req.body?.cores)
+      ? req.body.cores
+      : (Array.isArray(req.body?.relayCores) ? req.body.relayCores : []);
+    const maxAppend = this.openJoinConfig?.maxAppendCores || 64;
+    const normalized = this.#normalizeOpenJoinCoreEntries(rawCores, { maxEntries: maxAppend });
+    const rejected = normalized.rejected + normalized.truncated;
+    if (!normalized.entries.length) {
+      return res.status(400).json({ error: 'missing-cores', rejected });
+    }
+
+    try {
+      const resolved = await this.#resolveOpenJoinTarget(identifier);
+      if (!resolved) {
+        return res.status(404).json({ error: 'relay-not-found' });
+      }
+      const { relayKey, record, pool } = resolved;
+      const isAllowed = record ? this.#isOpenJoinAllowed(record) : this.#isOpenJoinPoolAllowed(pool);
+      if (!isAllowed) {
+        return res.status(403).json({ error: 'relay-not-open' });
+      }
+
+      const challengeTag = this.#extractTagValue(authEvent.tags, 'challenge');
+      if (!challengeTag) {
+        return res.status(400).json({ error: 'missing-challenge' });
+      }
+      const challengeEntry = this.#consumeOpenJoinChallenge(
+        challengeTag,
+        relayKey,
+        OPEN_JOIN_APPEND_CORES_PURPOSE
+      );
+      if (!challengeEntry) {
+        return res.status(401).json({ error: 'invalid-challenge' });
+      }
+
+      const publicIdentifier =
+        challengeEntry?.publicIdentifier
+        || record?.metadata?.identifier
+        || pool?.publicIdentifier
+        || pool?.metadata?.identifier
+        || relayKey;
+      const verification = await this.#verifyOpenJoinAuthEvent(authEvent, {
+        challenge: challengeTag,
+        relayKey,
+        publicIdentifier,
+        purpose: OPEN_JOIN_APPEND_CORES_PURPOSE
+      });
+      if (!verification.ok) {
+        return res.status(401).json({ error: verification.error || 'auth-invalid' });
+      }
+
+      const poolRecord = pool || await this.registrationStore.getOpenJoinPool?.(relayKey);
+      if (!poolRecord) {
+        return res.status(409).json({ error: 'open-join-pool-unavailable' });
+      }
+
+      const existingCores = Array.isArray(poolRecord.relayCores) ? poolRecord.relayCores : [];
+      const mergeResult = this.#mergeOpenJoinCoreEntries(existingCores, normalized.entries, {
+        maxTotal: this.openJoinConfig?.maxRelayCores || null
+      });
+      const updatedAt = Date.now();
+      const updatedPool = {
+        entries: Array.isArray(poolRecord.entries) ? poolRecord.entries : [],
+        updatedAt,
+        publicIdentifier: poolRecord.publicIdentifier || publicIdentifier || null,
+        relayUrl: typeof poolRecord.relayUrl === 'string' ? poolRecord.relayUrl : null,
+        relayCores: mergeResult.merged,
+        metadata: poolRecord.metadata && typeof poolRecord.metadata === 'object' ? poolRecord.metadata : null,
+        aliases: Array.isArray(poolRecord.aliases) ? poolRecord.aliases : []
+      };
+
+      await this.registrationStore.storeOpenJoinPool(relayKey, updatedPool);
+      if (updatedPool.aliases.length && typeof this.registrationStore?.storeOpenJoinAliases === 'function') {
+        await this.registrationStore.storeOpenJoinAliases(relayKey, updatedPool.aliases);
+      }
+
+      const mirrorPayload = this.#buildOpenJoinMirrorPayloadFromPool(updatedPool, relayKey);
+      if (mirrorPayload) {
+        await this.#storeMirrorMetadataPayload(relayKey, mirrorPayload);
+      }
+
+      this.logger?.info?.('[PublicGateway] Open join core append', {
+        relayKey,
+        publicIdentifier,
+        received: rawCores.length,
+        added: mergeResult.added,
+        ignored: mergeResult.ignored,
+        rejected,
+        trimmed: mergeResult.trimmed,
+        total: mergeResult.merged.length
+      });
+
+      return res.json({
+        status: 'ok',
+        relayKey,
+        publicIdentifier,
+        added: mergeResult.added,
+        ignored: mergeResult.ignored,
+        rejected,
+        trimmed: mergeResult.trimmed,
+        total: mergeResult.merged.length,
+        updatedAt
+      });
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Open join core append failed', {
+        identifier,
+        err: error?.message || error
+      });
+      return res.status(500).json({ error: 'open-join-append-failed' });
     }
   }
 

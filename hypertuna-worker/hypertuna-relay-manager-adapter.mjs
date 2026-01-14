@@ -1607,6 +1607,28 @@ export async function joinRelay(options = {}) {
             }
         }
 
+        if (profileInfo.isOpen === true && typeof global.appendOpenJoinMirrorCores === 'function') {
+            global.appendOpenJoinMirrorCores({
+                relayKey,
+                publicIdentifier: profileInfo.public_identifier || publicIdentifier,
+                relayManager,
+                reason: 'post-join'
+            }).then((appendSummary) => {
+                console.log('[RelayAdapter] Open join mirror append scheduled', {
+                    relayKey,
+                    status: appendSummary?.status ?? null,
+                    added: appendSummary?.data?.added ?? null,
+                    ignored: appendSummary?.data?.ignored ?? null,
+                    rejected: appendSummary?.data?.rejected ?? null
+                });
+            }).catch((error) => {
+                console.warn('[RelayAdapter] Open join mirror append failed', {
+                    relayKey,
+                    error: error?.message || error
+                });
+            });
+        }
+
         console.log('[RelayAdapter] Joined relay:', relayKey);
         
         // Send relay initialized message for joined relay ONLY if not from auto-connect

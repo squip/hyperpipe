@@ -80,6 +80,8 @@ const BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS = 7000
 const BLIND_PEER_MIRROR_METADATA_REFRESH_MS = 1 * 60 * 1000
 const BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS = 8000
 const OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS = 8000
+const OPEN_JOIN_APPEND_CORES_TIMEOUT_MS = 8000
+const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores'
 
 global.userConfig = {
   storage: defaultStorageDir,
@@ -265,6 +267,52 @@ function normalizeCoreRefList(refs) {
 function normalizeMirrorCoreRefs(cores) {
   if (!Array.isArray(cores)) return []
   return normalizeCoreRefList(cores)
+}
+
+function normalizeOpenJoinCoreEntry(entry) {
+  const key = normalizeCoreRef(entry)
+  if (!key) return null
+  if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+    const role = typeof entry.role === 'string' && entry.role.trim() ? entry.role.trim() : null
+    return role ? { key, role } : { key }
+  }
+  return { key }
+}
+
+function collectRelayCoreEntriesForAppend(relayManager) {
+  const autobase = relayManager?.relay || null
+  if (!autobase) return []
+  const seen = new Set()
+  const entries = []
+  const addCore = (candidate, role = null) => {
+    const normalized = normalizeOpenJoinCoreEntry(candidate)
+    if (!normalized?.key || seen.has(normalized.key)) return
+    seen.add(normalized.key)
+    if (role) {
+      entries.push({ key: normalized.key, role })
+    } else {
+      entries.push(normalized.role ? normalized : { key: normalized.key })
+    }
+  }
+  const addArray = (arr, prefix) => {
+    if (!arr) return
+    const list = Array.isArray(arr) ? arr : (arr[Symbol.iterator] ? Array.from(arr) : [])
+    list.forEach((entry, index) => addCore(entry?.core || entry, prefix ? `${prefix}-${index}` : null))
+  }
+  addCore(autobase, 'autobase')
+  addCore(autobase?.core, 'autobase-core')
+  addCore(autobase?.local || autobase?.local?.core, 'autobase-local')
+  addCore(autobase?.localInput || autobase?.localInput?.core, 'autobase-local')
+  addCore(autobase?.localWriter || autobase?.localWriter?.core, 'autobase-local')
+  addCore(autobase?.defaultWriter || autobase?.defaultWriter?.core, 'autobase-writer')
+  addCore(autobase?.view || autobase?.view?.core, 'autobase-view')
+  addArray(autobase?.activeWriters, 'autobase-writer')
+  addArray(autobase?.writers, 'autobase-writer')
+  addArray(Array.isArray(autobase?.inputs) ? autobase.inputs : (autobase?.inputs ? Array.from(autobase.inputs) : []), 'autobase-writer')
+  if (autobase?.writer && typeof autobase.writer === 'object') {
+    addCore(autobase.writer.core || autobase.writer, 'autobase-writer')
+  }
+  return entries
 }
 
 function mergeCoreRefLists(...lists) {
@@ -1108,6 +1156,254 @@ async function refreshGatewayRelayRegistry(reason = 'gateway-refresh', options =
     pendingRelayRegistryRefresh = true
     console.warn('[Worker] Gateway relay registry refresh failed:', error?.message || error)
   }
+}
+
+async function fetchOpenJoinChallenge(relayIdentifier, { origin, purpose = null } = {}) {
+  if (!relayIdentifier) {
+    return { status: 'skipped', reason: 'missing-relay-identifier' }
+  }
+  if (!origin) {
+    return { status: 'skipped', reason: 'missing-origin' }
+  }
+  const fetchImpl = globalThis.fetch
+  if (typeof fetchImpl !== 'function') {
+    return { status: 'skipped', reason: 'fetch-unavailable' }
+  }
+  const base = origin.replace(/\/$/, '')
+  const encodedRelay = encodeURIComponent(relayIdentifier)
+  const query = purpose ? `?purpose=${encodeURIComponent(purpose)}` : ''
+  const url = `${base}/api/relays/${encodedRelay}/open-join/challenge${query}`
+  const controller = typeof AbortController === 'function' ? new AbortController() : null
+  const timer = controller
+    ? setTimeout(() => controller.abort(), OPEN_JOIN_APPEND_CORES_TIMEOUT_MS)
+    : null
+  try {
+    const response = await fetchImpl(url, { signal: controller?.signal })
+    if (!response.ok) {
+      let body = null
+      try {
+        body = await response.text()
+      } catch (_) {}
+      return {
+        status: 'error',
+        reason: `challenge status ${response.status}`,
+        origin: base,
+        body: body ? body.slice(0, 200) : null
+      }
+    }
+    const data = await response.json().catch(() => null)
+    if (!data || typeof data !== 'object') {
+      return { status: 'error', reason: 'challenge invalid payload', origin: base }
+    }
+    if (!data?.challenge) {
+      return { status: 'error', reason: 'challenge missing', origin: base }
+    }
+    return { status: 'ok', origin: base, data }
+  } catch (error) {
+    return { status: 'error', reason: error?.message || 'challenge failed', origin: base }
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function submitOpenJoinAppendCores(relayIdentifier, {
+  publicIdentifier = null,
+  cores = [],
+  origins = null,
+  reason = 'open-join-append-cores'
+} = {}) {
+  if (!relayIdentifier) {
+    return { status: 'skipped', reason: 'missing-relay-identifier' }
+  }
+  if (!config?.nostr_nsec_hex) {
+    return { status: 'skipped', reason: 'missing-nostr-credentials' }
+  }
+  const fetchImpl = globalThis.fetch
+  if (typeof fetchImpl !== 'function') {
+    return { status: 'skipped', reason: 'fetch-unavailable' }
+  }
+
+  const normalizedEntries = Array.isArray(cores)
+    ? cores.map((entry) => normalizeOpenJoinCoreEntry(entry)).filter(Boolean)
+    : []
+  if (!normalizedEntries.length) {
+    return { status: 'skipped', reason: 'missing-cores' }
+  }
+
+  let authPubkey = null
+  try {
+    authPubkey = NostrUtils.getPublicKey(config.nostr_nsec_hex)
+    if (config.nostr_pubkey_hex && authPubkey !== config.nostr_pubkey_hex) {
+      console.warn('[Worker] Open join append auth pubkey mismatch; using derived pubkey')
+    }
+  } catch (error) {
+    return { status: 'skipped', reason: 'nostr-pubkey-derivation-failed' }
+  }
+
+  const originList = Array.isArray(origins) && origins.length ? origins : collectPublicGatewayOrigins()
+  const encodedRelay = encodeURIComponent(relayIdentifier)
+  let lastError = null
+
+  for (const origin of originList) {
+    if (!origin) continue
+    const base = origin.replace(/\/$/, '')
+    const challengeResult = await fetchOpenJoinChallenge(relayIdentifier, {
+      origin: base,
+      purpose: OPEN_JOIN_APPEND_CORES_PURPOSE
+    })
+    if (!challengeResult || challengeResult.status !== 'ok') {
+      lastError = new Error(challengeResult?.reason || 'challenge failed')
+      console.warn('[Worker] Open join append challenge failed', {
+        relayIdentifier,
+        origin: base,
+        reason: challengeResult?.reason || null
+      })
+      continue
+    }
+    const challengeData = challengeResult.data
+    const challenge = challengeData?.challenge || null
+    if (!challenge) {
+      lastError = new Error('challenge missing')
+      continue
+    }
+    const resolvedPublicIdentifier = publicIdentifier || challengeData?.publicIdentifier || relayIdentifier
+    const tags = [
+      ['relay', base],
+      ['challenge', challenge],
+      ['purpose', OPEN_JOIN_APPEND_CORES_PURPOSE]
+    ]
+    if (resolvedPublicIdentifier) {
+      tags.push(['h', resolvedPublicIdentifier])
+    }
+    const unsigned = {
+      kind: 22242,
+      created_at: Math.floor(Date.now() / 1000),
+      pubkey: authPubkey,
+      tags,
+      content: ''
+    }
+    const authEvent = await NostrUtils.signEvent(unsigned, config.nostr_nsec_hex)
+    let authVerified = null
+    try {
+      authVerified = await NostrUtils.verifySignature(authEvent)
+    } catch (error) {
+      authVerified = false
+      console.warn('[Worker] Open join append auth event verification threw', {
+        relayIdentifier,
+        origin: base,
+        error: error?.message || error
+      })
+    }
+    if (authVerified === false) {
+      console.warn('[Worker] Open join append auth event verification failed', {
+        relayIdentifier,
+        origin: base,
+        pubkeyPrefix: authEvent?.pubkey ? String(authEvent.pubkey).slice(0, 12) : null,
+        idPrefix: authEvent?.id ? String(authEvent.id).slice(0, 12) : null,
+        sigPrefix: authEvent?.sig ? String(authEvent.sig).slice(0, 12) : null
+      })
+    }
+
+    const appendUrl = `${base}/api/relays/${encodedRelay}/open-join/append-cores`
+    const payload = {
+      authEvent,
+      cores: normalizedEntries
+    }
+    if (resolvedPublicIdentifier) payload.publicIdentifier = resolvedPublicIdentifier
+
+    const controller = typeof AbortController === 'function' ? new AbortController() : null
+    const timer = controller
+      ? setTimeout(() => controller.abort(), OPEN_JOIN_APPEND_CORES_TIMEOUT_MS)
+      : null
+    try {
+      const response = await fetchImpl(appendUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller?.signal
+      })
+      if (!response.ok) {
+        let body = null
+        try {
+          body = await response.text()
+        } catch (_) {}
+        lastError = new Error(`open-join-append status ${response.status}`)
+        console.warn('[Worker] Open join append request failed', {
+          relayIdentifier,
+          origin: base,
+          status: response.status,
+          body: body ? body.slice(0, 200) : null
+        })
+        continue
+      }
+      const data = await response.json().catch(() => null)
+      if (!data || typeof data !== 'object') {
+        lastError = new Error('open-join-append invalid payload')
+        console.warn('[Worker] Open join append response invalid payload', {
+          relayIdentifier,
+          origin: base
+        })
+        continue
+      }
+      console.log('[Worker] Open join append response', {
+        relayIdentifier,
+        origin: base,
+        added: data?.added ?? null,
+        ignored: data?.ignored ?? null,
+        rejected: data?.rejected ?? null,
+        total: data?.total ?? null
+      })
+      return { status: 'ok', origin: base, data }
+    } catch (error) {
+      lastError = error
+      console.warn('[Worker] Open join append request threw', {
+        relayIdentifier,
+        origin: base,
+        error: error?.message || error
+      })
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  return {
+    status: 'error',
+    reason: reason || 'open-join-append-failed',
+    error: lastError?.message || String(lastError || 'open-join-append-failed')
+  }
+}
+
+async function appendOpenJoinMirrorCores({
+  relayKey,
+  publicIdentifier = null,
+  relayManager = null,
+  reason = 'open-join-append'
+} = {}) {
+  const relayIdentifier = relayKey || publicIdentifier
+  if (!relayIdentifier) {
+    return { status: 'skipped', reason: 'missing-relay-identifier' }
+  }
+  if (!config?.nostr_nsec_hex) {
+    return { status: 'skipped', reason: 'missing-nostr-credentials' }
+  }
+  const manager = relayManager || (relayKey ? activeRelays.get(relayKey) : null)
+  const coreEntries = collectRelayCoreEntriesForAppend(manager)
+  if (!coreEntries.length) {
+    return { status: 'skipped', reason: 'missing-cores' }
+  }
+
+  await ensurePublicGatewaySettingsLoaded()
+  console.log('[Worker] Open join append start', {
+    relayIdentifier,
+    coreRefsCount: coreEntries.length,
+    coreRefsPreview: summarizeCoreRefs(coreEntries.map((entry) => entry?.key).filter(Boolean))
+  })
+
+  return submitOpenJoinAppendCores(relayIdentifier, {
+    publicIdentifier: publicIdentifier || manager?.publicIdentifier || null,
+    cores: coreEntries,
+    reason
+  })
 }
 
 async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason = 'open-join' } = {}) {
@@ -3107,6 +3403,7 @@ global.fetchAndApplyRelayMirrorMetadata = fetchAndApplyRelayMirrorMetadata
 global.resolveRelayMirrorCoreRefs = resolveRelayMirrorCoreRefs
 global.getRelayMirrorCoreRefsCache = getRelayMirrorCoreRefsCache
 global.syncActiveRelayCoreRefs = syncActiveRelayCoreRefs
+global.appendOpenJoinMirrorCores = appendOpenJoinMirrorCores
 global.requestRelaySubscriptionRefresh = async ({ relayKey = null, reason = 'manual' } = {}) => {
   console.log('[Worker] Subscription refresh requested before relay server ready', {
     relayKey,
