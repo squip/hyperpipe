@@ -159,6 +159,58 @@ class PublicGatewayRegistrar {
     return response;
   }
 
+  async appendClosedJoinMirrorCores(relayKey, relayCores = [], options = {}) {
+    if (!this.isEnabled()) return { success: false };
+    if (!relayKey) throw new Error('relayKey is required');
+    const metadata = options?.metadata && typeof options.metadata === 'object' ? options.metadata : null;
+    const publicIdentifier = typeof options?.publicIdentifier === 'string'
+      ? options.publicIdentifier
+      : null;
+    const relayUrl = typeof options?.relayUrl === 'string'
+      ? options.relayUrl
+      : null;
+    const cores = Array.isArray(relayCores) ? relayCores : [];
+    const payload = {
+      relayKey,
+      relayCores: cores,
+      publicIdentifier: publicIdentifier || undefined,
+      relayUrl: relayUrl || undefined,
+      metadata: metadata || undefined,
+      closedJoin: true,
+      updatedAt: options.updatedAt || Date.now(),
+      reason: options.reason || undefined
+    };
+    const body = await this.#signedPayload(payload);
+    const path = `/api/relays/${encodeURIComponent(relayKey)}/closed-join/append-cores`;
+    const corePreview = cores.slice(0, 3).map((entry) => {
+      if (entry && typeof entry === 'object') {
+        return {
+          key: entry.key ? String(entry.key).slice(0, 16) : null,
+          role: entry.role || null
+        };
+      }
+      return {
+        key: entry ? String(entry).slice(0, 16) : null,
+        role: null
+      };
+    });
+    this.logger?.info?.('[PublicGateway] Closed join core append request', {
+      relayKey,
+      cores: cores.length,
+      publicIdentifier: publicIdentifier || null,
+      corePreview
+    });
+    const response = await this.#postJson(path, body);
+    this.logger?.info?.('[PublicGateway] Closed join core append response', {
+      relayKey,
+      added: response?.added ?? null,
+      ignored: response?.ignored ?? null,
+      rejected: response?.rejected ?? null,
+      total: response?.total ?? null
+    });
+    return response;
+  }
+
   async #postJson(path, body) {
     if (!this.isEnabled()) {
       throw new Error('Public gateway registrar not configured');

@@ -2116,6 +2116,23 @@ export class GatewayService extends EventEmitter {
     }
   }
 
+  async appendClosedJoinMirrorCores(relayKey, relayCores = [], options = {}) {
+    if (!relayKey) {
+      throw new Error('relayKey is required');
+    }
+    const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    if (!enabled) {
+      this.log('debug', `[PublicGateway] Closed join core append skipped relay=${relayKey}`);
+      return { status: 'skipped', reason: 'gateway-disabled' };
+    }
+    try {
+      return await this.publicGatewayRegistrar.appendClosedJoinMirrorCores(relayKey, relayCores, options);
+    } catch (error) {
+      this.log('warn', `[PublicGateway] Closed join core append failed relay=${relayKey}: ${error?.message || error}`);
+      return { status: 'error', error: error?.message || String(error) };
+    }
+  }
+
   async updatePublicGatewayConfig(rawConfig = {}) {
     const previousSettings = this.publicGatewaySettings;
     const mergedConfig = {

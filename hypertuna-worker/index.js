@@ -79,6 +79,7 @@ const BLIND_PEER_JOIN_REHYDRATION_RETRIES = 1
 const BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS = 7000
 const BLIND_PEER_MIRROR_METADATA_REFRESH_MS = 1 * 60 * 1000
 const BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS = 8000
+const RELAY_WRITER_SYNC_RETRY_TIMEOUT_MS = 30000
 const OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores'
@@ -92,6 +93,7 @@ const relayMirrorSubscriptions = new Map()
 const relayMirrorCoreRefs = new Map()
 const relayMirrorCoreRefsCache = new Map()
 const relayMirrorSyncState = new Map()
+const relayWriterSyncTasks = new Map()
 let lastBlindPeerFingerprint = null
 let lastDispatcherAssignmentFingerprint = null
 let pendingRelayRegistryRefresh = false
@@ -458,6 +460,83 @@ async function resolveRelayMirrorCoreRefs(relayKey, publicIdentifier = null, fal
   return merged
 }
 
+async function mergeRelayCoreRefsFromInviteWriter({
+  relayKey,
+  publicIdentifier = null,
+  writerCoreRef = null,
+  reason = 'invite-writer'
+} = {}) {
+  const writerRefs = normalizeCoreRefList(writerCoreRef ? [writerCoreRef] : [])
+  if (!writerRefs.length) {
+    return { status: 'skipped', reason: 'missing-writer-core-ref' }
+  }
+
+  let profile = relayKey ? await getRelayProfileByKey(relayKey) : null
+  if (!profile && publicIdentifier) {
+    profile = await getRelayProfileByPublicIdentifier(publicIdentifier)
+  }
+
+  const resolvedRelayKey = normalizeRelayKeyHex(profile?.relay_key || profile?.relayKey || relayKey || null)
+  const existingCoreRefs = normalizeCoreRefList(profile?.core_refs || profile?.coreRefs || [])
+  const mergedCoreRefs = mergeCoreRefLists(existingCoreRefs, writerRefs)
+  const existingFingerprint = coreRefsFingerprint(existingCoreRefs)
+  const mergedFingerprint = coreRefsFingerprint(mergedCoreRefs)
+  const changed = mergedFingerprint && mergedFingerprint !== existingFingerprint
+
+  if (resolvedRelayKey && mergedCoreRefs.length) {
+    updateRelayMirrorCoreRefs(resolvedRelayKey, mergedCoreRefs)
+  }
+
+  if (!profile) {
+    console.warn('[Worker] Invite writer core refs stored in cache only (profile missing)', {
+      relayKey: resolvedRelayKey || relayKey || null,
+      publicIdentifier,
+      reason,
+      coreRefsCount: mergedCoreRefs.length
+    })
+    return {
+      status: changed ? 'cached' : 'skipped',
+      reason: changed ? 'cached-only' : 'no-change',
+      relayKey: resolvedRelayKey || relayKey || null,
+      coreRefsCount: mergedCoreRefs.length,
+      added: Math.max(mergedCoreRefs.length - existingCoreRefs.length, 0)
+    }
+  }
+
+  if (!changed) {
+    return {
+      status: 'skipped',
+      reason: 'no-change',
+      relayKey: resolvedRelayKey || relayKey || null,
+      coreRefsCount: existingCoreRefs.length,
+      added: 0
+    }
+  }
+
+  const updatedProfile = {
+    ...profile,
+    core_refs: mergedCoreRefs,
+    updated_at: new Date().toISOString()
+  }
+  await saveRelayProfile(updatedProfile)
+
+  console.log('[Worker] Invite writer core refs merged into profile', {
+    relayKey: resolvedRelayKey || relayKey || null,
+    publicIdentifier: updatedProfile.public_identifier || publicIdentifier || null,
+    reason,
+    coreRefsCount: mergedCoreRefs.length,
+    added: Math.max(mergedCoreRefs.length - existingCoreRefs.length, 0),
+    coreRefsPreview: summarizeCoreRefs(mergedCoreRefs)
+  })
+
+  return {
+    status: 'updated',
+    relayKey: resolvedRelayKey || relayKey || null,
+    coreRefsCount: mergedCoreRefs.length,
+    added: Math.max(mergedCoreRefs.length - existingCoreRefs.length, 0)
+  }
+}
+
 function bufferListHas(buffers, candidate) {
   if (!candidate || !Array.isArray(buffers)) return false
   return buffers.some((entry) => entry && b4a.equals(entry, candidate))
@@ -588,6 +667,148 @@ async function ensureRelayWritersFromCoreRefs(relayManager, coreRefs, reason = '
   return summary
 }
 
+function scheduleRelayWriterSyncOnWritable({
+  relayKey,
+  publicIdentifier = null,
+  coreRefs = [],
+  reason = 'mirror-update',
+  timeoutMs = RELAY_WRITER_SYNC_RETRY_TIMEOUT_MS
+} = {}) {
+  if (!relayKey) return { status: 'skipped', reason: 'missing-relay-key' }
+  const normalized = normalizeCoreRefList(coreRefs)
+  if (!normalized.length) return { status: 'skipped', reason: 'no-core-refs' }
+
+  if (relayWriterSyncTasks.has(relayKey)) {
+    console.log('[Worker] Relay writer sync retry already scheduled', {
+      relayKey,
+      publicIdentifier,
+      reason
+    })
+    return { status: 'skipped', reason: 'already-scheduled' }
+  }
+
+  const relayManager = activeRelays.get(relayKey)
+  const relay = relayManager?.relay
+  if (!relay) {
+    return { status: 'skipped', reason: 'relay-unavailable' }
+  }
+
+  let timeoutId = null
+  let inFlight = false
+
+  const cleanup = (finalReason = 'complete') => {
+    if (timeoutId) clearTimeout(timeoutId)
+    if (typeof relay.off === 'function') {
+      relay.off('writable', onWritable)
+      relay.off('update', onUpdate)
+    } else if (typeof relay.removeListener === 'function') {
+      relay.removeListener('writable', onWritable)
+      relay.removeListener('update', onUpdate)
+    }
+    relayWriterSyncTasks.delete(relayKey)
+    console.log('[Worker] Relay writer sync retry cleared', {
+      relayKey,
+      publicIdentifier,
+      reason,
+      finalReason
+    })
+  }
+
+  const attempt = async (trigger) => {
+    if (inFlight) return
+    if (!relayManager?.relay?.writable) return
+    inFlight = true
+    try {
+      const summary = await ensureRelayWritersFromCoreRefs(
+        relayManager,
+        normalized,
+        `${reason}-retry-${trigger}`
+      )
+      console.log('[Worker] Relay writer sync retry result', {
+        relayKey,
+        publicIdentifier,
+        reason,
+        trigger,
+        status: summary?.status ?? null,
+        added: summary?.added ?? 0,
+        skipped: summary?.skipped ?? 0,
+        failed: summary?.failed ?? 0
+      })
+      if (summary?.status === 'ok') {
+        if (summary.added > 0 && typeof global.requestRelaySubscriptionRefresh === 'function') {
+          try {
+            const refreshSummary = await global.requestRelaySubscriptionRefresh({
+              relayKey,
+              reason: `${reason}-writer-sync`
+            })
+            console.log('[Worker] Subscription refresh scheduled after writer sync retry', {
+              relayKey,
+              status: refreshSummary?.status ?? null,
+              updated: refreshSummary?.updated ?? null,
+              failed: refreshSummary?.failed ?? null
+            })
+          } catch (error) {
+            console.warn('[Worker] Subscription refresh after writer sync retry failed', {
+              relayKey,
+              error: error?.message || error
+            })
+          }
+        }
+        cleanup('resolved')
+      }
+    } catch (error) {
+      console.warn('[Worker] Relay writer sync retry failed', {
+        relayKey,
+        publicIdentifier,
+        reason,
+        trigger,
+        error: error?.message || error
+      })
+    } finally {
+      inFlight = false
+    }
+  }
+
+  const onWritable = () => attempt('writable')
+  const onUpdate = () => attempt('update')
+
+  if (typeof relay.on === 'function') {
+    relay.on('writable', onWritable)
+    relay.on('update', onUpdate)
+  }
+
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    timeoutId = setTimeout(() => {
+      console.warn('[Worker] Relay writer sync retry timed out', {
+        relayKey,
+        publicIdentifier,
+        reason,
+        timeoutMs
+      })
+      cleanup('timeout')
+    }, timeoutMs)
+  }
+
+  relayWriterSyncTasks.set(relayKey, {
+    relayKey,
+    publicIdentifier,
+    reason,
+    startedAt: Date.now(),
+    timeoutMs
+  })
+
+  console.log('[Worker] Scheduled relay writer sync retry', {
+    relayKey,
+    publicIdentifier,
+    reason,
+    timeoutMs,
+    coreRefsCount: normalized.length,
+    coreRefsPreview: summarizeCoreRefs(normalized)
+  })
+
+  return { status: 'scheduled', relayKey }
+}
+
 async function syncActiveRelayCoreRefs({
   relayKey,
   publicIdentifier = null,
@@ -645,6 +866,22 @@ async function syncActiveRelayCoreRefs({
   })
 
   const writerSummary = await ensureRelayWritersFromCoreRefs(relayManager, normalized, reason)
+
+  if (writerSummary?.status === 'read-only') {
+    console.warn('[Worker] Relay writer sync deferred (read-only)', {
+      relayKey,
+      publicIdentifier: identifier,
+      reason,
+      coreRefsCount: normalized.length,
+      coreRefsPreview: summarizeCoreRefs(normalized)
+    })
+    scheduleRelayWriterSyncOnWritable({
+      relayKey,
+      publicIdentifier: identifier,
+      coreRefs: normalized,
+      reason
+    })
+  }
 
   if (writerSummary?.status === 'ok' || writerSummary?.status === 'read-only') {
     relayMirrorSyncState.set(relayKey, fingerprint)
@@ -1404,6 +1641,97 @@ async function appendOpenJoinMirrorCores({
     cores: coreEntries,
     reason
   })
+}
+
+async function appendClosedJoinMirrorCores({
+  relayKey,
+  publicIdentifier = null,
+  relayManager = null,
+  writerCoreRef = null,
+  reason = 'invite-writer'
+} = {}) {
+  const relayIdentifier = relayKey || publicIdentifier
+  if (!relayIdentifier) {
+    return { status: 'skipped', reason: 'missing-relay-identifier' }
+  }
+  await ensurePublicGatewaySettingsLoaded()
+  if (!gatewayService?.appendClosedJoinMirrorCores) {
+    return { status: 'skipped', reason: 'gateway-unavailable' }
+  }
+
+  const manager = relayManager || (relayKey ? activeRelays.get(relayKey) : null)
+  const coreEntries = collectRelayCoreEntriesForAppend(manager)
+  const writerKey = normalizeCoreRef(writerCoreRef)
+  if (writerKey && !coreEntries.some((entry) => entry?.key === writerKey)) {
+    coreEntries.push({ key: writerKey, role: 'invite-writer' })
+  }
+
+  const collectedKeys = coreEntries.map((entry) => entry?.key).filter(Boolean)
+  const storedRefs = await resolveRelayMirrorCoreRefs(
+    relayKey || relayIdentifier,
+    publicIdentifier || manager?.publicIdentifier || null,
+    writerKey ? [writerKey] : []
+  )
+  const mergedRefs = mergeCoreRefLists(collectedKeys, storedRefs)
+  const payloadCores = [...coreEntries]
+  const seen = new Set(collectedKeys)
+  for (const ref of mergedRefs) {
+    if (!ref || seen.has(ref)) continue
+    seen.add(ref)
+    payloadCores.push(ref)
+  }
+
+  if (!payloadCores.length) {
+    return { status: 'skipped', reason: 'missing-cores' }
+  }
+
+  let profile = null
+  if (relayKey) {
+    profile = await getRelayProfileByKey(relayKey)
+  }
+  if (!profile && publicIdentifier) {
+    profile = await getRelayProfileByPublicIdentifier(publicIdentifier)
+  }
+  const profileIdentifier = profile?.public_identifier || profile?.publicIdentifier || null
+  const metadata = {
+    identifier: profileIdentifier || publicIdentifier || relayIdentifier,
+    isOpen: profile?.isOpen === true ? true : false,
+    isPublic: profile?.isPublic === true ? true : false
+  }
+
+  console.log('[Worker] Closed join core append start', {
+    relayKey: relayKey || relayIdentifier,
+    publicIdentifier: profileIdentifier || publicIdentifier || null,
+    coreRefsCount: payloadCores.length,
+    coreRefsPreview: summarizeCoreRefs(
+      payloadCores.map((entry) => entry?.key || entry).filter(Boolean)
+    ),
+    reason
+  })
+
+  try {
+    const response = await gatewayService.appendClosedJoinMirrorCores(relayKey || relayIdentifier, payloadCores, {
+      publicIdentifier: profileIdentifier || publicIdentifier || null,
+      metadata,
+      reason
+    })
+    console.log('[Worker] Closed join core append response', {
+      relayKey: relayKey || relayIdentifier,
+      publicIdentifier: profileIdentifier || publicIdentifier || null,
+      status: response?.status ?? null,
+      added: response?.added ?? null,
+      ignored: response?.ignored ?? null,
+      rejected: response?.rejected ?? null,
+      total: response?.total ?? null
+    })
+    return response
+  } catch (error) {
+    console.warn('[Worker] Closed join core append failed', {
+      relayKey: relayKey || relayIdentifier,
+      error: error?.message || error
+    })
+    return { status: 'error', error: error?.message || String(error) }
+  }
 }
 
 async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason = 'open-join' } = {}) {
@@ -3910,6 +4238,7 @@ async function handleMessageObject(message) {
               ? true
               : undefined
         const inviteToken = typeof data.token === 'string' ? data.token.trim() : null
+        const closedInvite = !openJoin && !!inviteToken
         try {
           let hostPeers = Array.isArray(data.hostPeers) ? data.hostPeers : []
           let coreRefs = Array.isArray(data.cores) ? normalizeCoreRefList(data.cores) : []
@@ -3934,6 +4263,7 @@ async function handleMessageObject(message) {
           console.info('[Worker] Start join flow input', {
             publicIdentifier,
             openJoin,
+            closedInvite,
             isOpen,
             hasInviteToken: !!inviteToken,
             relayKey: previewValue(joinRelayKey, 16),
@@ -4025,7 +4355,9 @@ async function handleMessageObject(message) {
             }
           }
 
-          if ((!hostPeers || hostPeers.length === 0) && (!blindPeer || !blindPeer.publicKey)) {
+          const shouldFetchMirror = (!hostPeers || hostPeers.length === 0)
+            && (!blindPeer || !blindPeer.publicKey || closedInvite)
+          if (shouldFetchMirror) {
             const relayIdentifier = joinRelayKey || publicIdentifier
             if (relayIdentifier) {
               try {
@@ -4040,7 +4372,15 @@ async function handleMessageObject(message) {
                   )
                   if (!joinRelayKey && mirrorRelayKey) joinRelayKey = mirrorRelayKey
                   if (!blindPeer && mirrorBlindPeer) blindPeer = mirrorBlindPeer
-                  if (!coreRefs.length && mirrorCoreRefs.length) coreRefs = mirrorCoreRefs
+                  const coreRefsBefore = coreRefs.length
+                  if (mirrorCoreRefs.length) {
+                    if (closedInvite) {
+                      coreRefs = mergeCoreRefLists(coreRefs, mirrorCoreRefs)
+                    } else if (!coreRefs.length) {
+                      coreRefs = mirrorCoreRefs
+                    }
+                  }
+                  const coreRefsAdded = Math.max(coreRefs.length - coreRefsBefore, 0)
                   if (!writerCore && mirrorData.writerCore) writerCore = String(mirrorData.writerCore)
                   if (!writerCoreHex && (mirrorData.writerCoreHex || mirrorData.writer_core_hex)) {
                     writerCoreHex = String(mirrorData.writerCoreHex || mirrorData.writer_core_hex)
@@ -4061,6 +4401,9 @@ async function handleMessageObject(message) {
                     relayIdentifier,
                     hasBlindPeer: !!blindPeer,
                     coreRefsCount: coreRefs.length,
+                    mirrorCoreRefsCount: mirrorCoreRefs.length,
+                    coreRefsAdded,
+                    closedInvite,
                     relayKey: joinRelayKey ? String(joinRelayKey).slice(0, 16) : null,
                     coreRefsPreview: coreRefs.slice(0, 3),
                     hasWriterCore: !!writerCore,
@@ -4156,6 +4499,7 @@ async function handleMessageObject(message) {
           console.info('[Worker] Start join flow resolved', {
             publicIdentifier,
             openJoin,
+            closedInvite,
             isOpen,
             hasInviteToken: !!inviteToken,
             relayKey: previewValue(joinRelayKey, 16),
@@ -4210,13 +4554,70 @@ async function handleMessageObject(message) {
         const requestId = message?.requestId
         if (!relayServer?.provisionWriterForInvitee) throw new Error('Relay server unavailable')
         const result = await relayServer.provisionWriterForInvitee(message.data || {})
+        const relayKey = result?.relayKey || normalizeRelayKeyHex(message?.data?.relayKey) || null
+        const publicIdentifier = message?.data?.publicIdentifier || null
+        const writerCoreRef = result?.writerCoreHex || result?.autobaseLocal || result?.writerCore || null
+        let coreRefUpdate = null
+        let mirrorUpdate = null
+        if (writerCoreRef) {
+          try {
+            coreRefUpdate = await mergeRelayCoreRefsFromInviteWriter({
+              relayKey,
+              publicIdentifier,
+              writerCoreRef,
+              reason: 'invite-writer'
+            })
+            console.log('[Worker] Invite writer core refs update result', {
+              relayKey,
+              publicIdentifier,
+              status: coreRefUpdate?.status ?? null,
+              coreRefsCount: coreRefUpdate?.coreRefsCount ?? null,
+              added: coreRefUpdate?.added ?? null,
+              writerCorePreview: previewValue(writerCoreRef, 16)
+            })
+          } catch (error) {
+            console.warn('[Worker] Invite writer core refs update failed', {
+              relayKey,
+              publicIdentifier,
+              error: error?.message || error
+            })
+          }
+        }
+        if (writerCoreRef) {
+          try {
+            const resolvedRelayKey = coreRefUpdate?.relayKey || relayKey
+            const relayManager = resolvedRelayKey
+              ? activeRelays.get(resolvedRelayKey)
+              : (relayKey ? activeRelays.get(relayKey) : null)
+            mirrorUpdate = await appendClosedJoinMirrorCores({
+              relayKey: resolvedRelayKey || relayKey,
+              publicIdentifier,
+              relayManager,
+              writerCoreRef,
+              reason: 'invite-writer'
+            })
+            console.log('[Worker] Closed join mirror core append result', {
+              relayKey: resolvedRelayKey || relayKey,
+              publicIdentifier,
+              status: mirrorUpdate?.status ?? null,
+              total: mirrorUpdate?.total ?? null,
+              added: mirrorUpdate?.added ?? null
+            })
+          } catch (error) {
+            console.warn('[Worker] Closed join mirror core append failed', {
+              relayKey,
+              publicIdentifier,
+              error: error?.message || error
+            })
+          }
+        }
         sendMessage({ type: 'provision-writer-for-invitee:result', requestId, data: result })
         try {
-          const relayKey = result?.relayKey || null
           const writerCoreHex = result?.writerCoreHex || result?.autobaseLocal || null
           console.log('[Worker] Refreshing blind-peer mirrors after invite writer', {
             relayKey,
-            hasWriterCoreHex: !!writerCoreHex
+            hasWriterCoreHex: !!writerCoreHex,
+            writerCorePreview: previewValue(writerCoreHex || writerCoreRef, 16)
           })
           const manager = await ensureBlindPeeringManager()
           if (manager?.started) {
@@ -4224,14 +4625,20 @@ async function handleMessageObject(message) {
             if (relayManager?.relay) {
               const storedCoreRefs = await resolveRelayMirrorCoreRefs(
                 relayKey,
-                message?.data?.publicIdentifier || relayManager?.publicIdentifier || null
+                publicIdentifier || relayManager?.publicIdentifier || null,
+                writerCoreRef ? [writerCoreRef] : []
               )
               manager.ensureRelayMirror({
                 relayKey,
-                publicIdentifier: message?.data?.publicIdentifier || relayManager?.publicIdentifier || null,
+                publicIdentifier: publicIdentifier || relayManager?.publicIdentifier || null,
                 autobase: relayManager.relay,
                 coreRefs: storedCoreRefs,
                 corestore: relayManager.store || null
+              })
+              console.log('[Worker] Blind-peer ensure mirror after invite writer', {
+                relayKey,
+                coreRefsCount: storedCoreRefs.length,
+                coreRefsPreview: summarizeCoreRefs(storedCoreRefs)
               })
             } else {
               await seedBlindPeeringMirrors(manager)
@@ -4260,9 +4667,18 @@ async function handleMessageObject(message) {
             error: err?.message || err
           })
         }
-        refreshRelayMirrorMetadata('invite-writer').catch((error) => {
-          console.warn('[Worker] Mirror metadata refresh failed after invite writer:', error?.message || error)
-        })
+        if (mirrorUpdate?.mirrorUnioned === true) {
+          refreshGatewayRelayRegistry('invite-writer').then(() => {
+            return refreshRelayMirrorMetadata('invite-writer')
+          }).catch((error) => {
+            console.warn('[Worker] Gateway/mirror refresh failed after invite writer:', error?.message || error)
+          })
+        } else {
+          console.log('[Worker] Skipping gateway/mirror refresh after invite writer', {
+            relayKey,
+            mirrorUnioned: mirrorUpdate?.mirrorUnioned ?? null
+          })
+        }
         return result
       } catch (err) {
         sendMessage({

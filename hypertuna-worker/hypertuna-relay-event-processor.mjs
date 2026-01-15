@@ -135,7 +135,18 @@ export default class NostrRelay extends Autobee {
       this.executeIdQueries = this.executeIdQueries.bind(this);
       this.findCommonIds = this.findCommonIds.bind(this);
       this.subscriptionWriteQueue = new Map();
+      this.pendingSubscriptions = new Map();
+      this.pendingClientSubscriptions = new Map();
+      this.pendingSubscriptionFlushInFlight = false;
       logWithTimestamp('NostrRelay: Initialized');
+
+      if (typeof this.on === 'function') {
+        this.on('writable', () => {
+          this.flushPendingSubscriptionWrites('writable').catch((error) => {
+            logWithTimestamp('flushPendingSubscriptionWrites: Error on writable', error?.message || error);
+          });
+        });
+      }
     }
 
   _queueSubscriptionWrite(queueKey, task) {
@@ -148,6 +159,137 @@ export default class NostrRelay extends Autobee {
       }
     }));
     return next;
+  }
+
+  _setPendingSubscriptions(connectionKey, snapshot, { reason = 'unknown', source = 'unknown' } = {}) {
+    if (!connectionKey || !snapshot) return null;
+    const existing = this.pendingSubscriptions.get(connectionKey);
+    const merged = this._mergeSubscriptionSnapshots(existing, snapshot);
+    this.pendingSubscriptions.set(connectionKey, merged);
+    const subscriptionCount = merged?.subscriptions ? Object.keys(merged.subscriptions).length : 0;
+    logWithTimestamp('Pending subscriptions updated', {
+      connectionKey,
+      reason,
+      source,
+      subscriptionCount,
+      writable: this.writable ?? null
+    });
+    return merged;
+  }
+
+  _setPendingClientSubscriptions(clientId, snapshot, { reason = 'unknown', source = 'unknown' } = {}) {
+    if (!clientId || !snapshot) return null;
+    const existing = this.pendingClientSubscriptions.get(clientId);
+    const merged = this._mergeSubscriptionSnapshots(existing, snapshot);
+    this.pendingClientSubscriptions.set(clientId, merged);
+    const subscriptionCount = merged?.subscriptions ? Object.keys(merged.subscriptions).length : 0;
+    logWithTimestamp('Pending client subscriptions updated', {
+      clientId,
+      reason,
+      source,
+      subscriptionCount,
+      writable: this.writable ?? null
+    });
+    return merged;
+  }
+
+  async flushPendingSubscriptionWrites(reason = 'writable') {
+    if (!this.writable) {
+      const skipped = {
+        status: 'skipped',
+        reason: 'not-writable',
+        pendingConnections: this.pendingSubscriptions.size,
+        pendingClients: this.pendingClientSubscriptions.size
+      };
+      logWithTimestamp('flushPendingSubscriptionWrites: Relay not writable', skipped);
+      return skipped;
+    }
+
+    if (this.pendingSubscriptionFlushInFlight) {
+      const skipped = {
+        status: 'skipped',
+        reason: 'in-flight',
+        pendingConnections: this.pendingSubscriptions.size,
+        pendingClients: this.pendingClientSubscriptions.size
+      };
+      logWithTimestamp('flushPendingSubscriptionWrites: Flush already in progress', skipped);
+      return skipped;
+    }
+
+    if (!this.pendingSubscriptions.size && !this.pendingClientSubscriptions.size) {
+      const empty = { status: 'skipped', reason: 'empty', pendingConnections: 0, pendingClients: 0 };
+      logWithTimestamp('flushPendingSubscriptionWrites: No pending writes', empty);
+      return empty;
+    }
+
+    this.pendingSubscriptionFlushInFlight = true;
+    const summary = {
+      status: 'ok',
+      reason,
+      pendingConnections: this.pendingSubscriptions.size,
+      pendingClients: this.pendingClientSubscriptions.size,
+      flushedConnections: 0,
+      flushedClients: 0,
+      failed: 0
+    };
+
+    try {
+      for (const [connectionKey, snapshot] of this.pendingSubscriptions.entries()) {
+        const currentSnapshot = snapshot;
+        try {
+          await this._queueSubscriptionWrite(connectionKey, async () => {
+            if (!this.writable) {
+              throw new Error('Not writable');
+            }
+            await this.append({
+              type: 'subscriptions',
+              subscriptions: JSON.stringify(currentSnapshot)
+            });
+          });
+          if (this.pendingSubscriptions.get(connectionKey) === currentSnapshot) {
+            this.pendingSubscriptions.delete(connectionKey);
+          }
+          summary.flushedConnections += 1;
+        } catch (error) {
+          summary.failed += 1;
+          logWithTimestamp('flushPendingSubscriptionWrites: Failed to flush connection snapshot', {
+            connectionKey,
+            error: error?.message || error
+          });
+        }
+      }
+
+      for (const [clientId, snapshot] of this.pendingClientSubscriptions.entries()) {
+        const currentSnapshot = snapshot;
+        try {
+          await this._queueSubscriptionWrite(`client:${clientId}`, async () => {
+            if (!this.writable) {
+              throw new Error('Not writable');
+            }
+            await this.append({
+              type: 'client-subscriptions',
+              clientId,
+              subscriptions: JSON.stringify(currentSnapshot)
+            });
+          });
+          if (this.pendingClientSubscriptions.get(clientId) === currentSnapshot) {
+            this.pendingClientSubscriptions.delete(clientId);
+          }
+          summary.flushedClients += 1;
+        } catch (error) {
+          summary.failed += 1;
+          logWithTimestamp('flushPendingSubscriptionWrites: Failed to flush client snapshot', {
+            clientId,
+            error: error?.message || error
+          });
+        }
+      }
+    } finally {
+      this.pendingSubscriptionFlushInFlight = false;
+    }
+
+    logWithTimestamp('flushPendingSubscriptionWrites: Completed', summary);
+    return summary;
   }
 
   _isEphemeralSubscriptionId(subscriptionId) {
@@ -958,15 +1100,40 @@ async handleSubscription(connectionKey) {
       coreLength: this.core?.length ?? null
     });
     const subscriptionData = await this.view.get(key);
+    const pendingSnapshot = this.pendingSubscriptions.get(connectionKey) || null;
     if (subscriptionData) {
       logWithTimestamp(`getSubscriptions: Subscriptions found for connection ${connectionKey}: ${JSON.stringify(subscriptionData)}`);
       try {
-        return typeof subscriptionData.value === 'string' ? JSON.parse(subscriptionData.value) : subscriptionData.value;
+        const parsed = typeof subscriptionData.value === 'string' ? JSON.parse(subscriptionData.value) : subscriptionData.value;
+        if (pendingSnapshot) {
+          const merged = this._mergeSubscriptionSnapshots(parsed, pendingSnapshot);
+          logWithTimestamp('getSubscriptions: Merged pending snapshot with stored data', {
+            connectionKey,
+            subscriptionCount: Object.keys(merged?.subscriptions || {}).length,
+            pendingCount: Object.keys(pendingSnapshot?.subscriptions || {}).length
+          });
+          return merged;
+        }
+        return parsed;
       } catch (error) {
         logWithTimestamp('getSubscriptions: Error parsing subscriptions:', error.message);
+        if (pendingSnapshot) {
+          logWithTimestamp('getSubscriptions: Returning pending snapshot after parse failure', {
+            connectionKey,
+            pendingCount: Object.keys(pendingSnapshot?.subscriptions || {}).length
+          });
+          return pendingSnapshot;
+        }
         return null;
       }
     } else {
+      if (pendingSnapshot) {
+        logWithTimestamp('getSubscriptions: Using pending snapshot (no stored data)', {
+          connectionKey,
+          subscriptionCount: Object.keys(pendingSnapshot?.subscriptions || {}).length
+        });
+        return pendingSnapshot;
+      }
       logWithTimestamp(`getSubscriptions: No subscriptions found for connection: ${connectionKey}`);
       return null;
     }
@@ -977,11 +1144,6 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
     // logWithTimestamp('publishSubscription: Attempting to publish subscription:', JSON.stringify(reqMessage, null, 2));
 
     return this._queueSubscriptionWrite(connectionKey, async () => {
-      if (!this.writable) {
-        logWithTimestamp('publishSubscription: Error - Not writable');
-        throw new Error('Not writable');
-      }
-
       const [, subscriptionId, ...filters] = reqMessage;
 
       if (!connectionKey || !subscriptionId || filters.length === 0) {
@@ -1016,6 +1178,28 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
         connection: connectionKey,
         subscriptions
       };
+
+      if (!this.writable) {
+        logWithTimestamp('publishSubscription: Relay not writable; queueing subscription', {
+          connectionKey,
+          subscriptionId,
+          filtersCount: filters.length,
+          viewVersion: this.view?.version ?? null
+        });
+        this._setPendingSubscriptions(connectionKey, subscriptionObject, {
+          reason: 'not-writable',
+          source: 'publish'
+        });
+        if (clientId) {
+          const persistentSubscriptions = this._filterEphemeralSubscriptions(subscriptions);
+          this._setPendingClientSubscriptions(clientId, {
+            clientId,
+            connection: connectionKey,
+            subscriptions: persistentSubscriptions
+          }, { reason: 'not-writable', source: 'publish-client' });
+        }
+        return ['NOTICE', `Subscription ${subscriptionId} queued (relay not writable)`];
+      }
 
       logWithTimestamp('publishSubscription: Subscription write requested', {
         connectionKey,
@@ -1084,14 +1268,22 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
     // logWithTimestamp('updateSubscriptions: Updating subscriptions:', JSON.stringify(activeSubscriptionsUpdated, null, 2));
     
     return this._queueSubscriptionWrite(connectionKey, async () => {
-      if (!this.writable) {
-        logWithTimestamp('updateSubscriptions: Error - Not writable');
-        throw new Error('Not writable');
-      }
-
       const storedSnapshot = await this.getSubscriptions(connectionKey);
       const mergedSnapshot = this._mergeSubscriptionSnapshots(storedSnapshot, activeSubscriptionsUpdated);
       mergedSnapshot.connection = connectionKey;
+
+      if (!this.writable) {
+        logWithTimestamp('updateSubscriptions: Relay not writable; queueing snapshot update', {
+          connectionKey,
+          subscriptionCount: Object.keys(mergedSnapshot?.subscriptions || {}).length,
+          viewVersion: this.view?.version ?? null
+        });
+        this._setPendingSubscriptions(connectionKey, mergedSnapshot, {
+          reason: 'not-writable',
+          source: 'update'
+        });
+        return ['NOTICE', 'Subscriptions queued (relay not writable)'];
+      }
 
       await this.append({
         type: 'subscriptions',
@@ -1130,14 +1322,39 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
     logWithTimestamp(`getClientSubscriptions: Attempting to retrieve subscriptions for clientId: ${clientId}`);
     const key = b4a.from(`client:${clientId}`, 'utf8');
     const subscriptionData = await this.view.get(key);
+    const pendingSnapshot = this.pendingClientSubscriptions.get(clientId) || null;
     if (subscriptionData) {
       logWithTimestamp(`getClientSubscriptions: Subscriptions found for clientId ${clientId}`);
       try {
-        return typeof subscriptionData.value === 'string' ? JSON.parse(subscriptionData.value) : subscriptionData.value;
+        const parsed = typeof subscriptionData.value === 'string' ? JSON.parse(subscriptionData.value) : subscriptionData.value;
+        if (pendingSnapshot) {
+          const merged = this._mergeSubscriptionSnapshots(parsed, pendingSnapshot);
+          logWithTimestamp('getClientSubscriptions: Merged pending snapshot with stored data', {
+            clientId,
+            subscriptionCount: Object.keys(merged?.subscriptions || {}).length,
+            pendingCount: Object.keys(pendingSnapshot?.subscriptions || {}).length
+          });
+          return merged;
+        }
+        return parsed;
       } catch (error) {
         logWithTimestamp('getClientSubscriptions: Error parsing subscriptions:', error.message);
+        if (pendingSnapshot) {
+          logWithTimestamp('getClientSubscriptions: Returning pending snapshot after parse failure', {
+            clientId,
+            pendingCount: Object.keys(pendingSnapshot?.subscriptions || {}).length
+          });
+          return pendingSnapshot;
+        }
         return null;
       }
+    }
+    if (pendingSnapshot) {
+      logWithTimestamp('getClientSubscriptions: Using pending snapshot (no stored data)', {
+        clientId,
+        subscriptionCount: Object.keys(pendingSnapshot?.subscriptions || {}).length
+      });
+      return pendingSnapshot;
     }
     logWithTimestamp(`getClientSubscriptions: No subscriptions found for clientId: ${clientId}`);
     return null;
@@ -1145,11 +1362,6 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
 
   async updateClientSubscriptions(clientId, subscriptionObject) {
     return this._queueSubscriptionWrite(`client:${clientId}`, async () => {
-      if (!this.writable) {
-        logWithTimestamp('updateClientSubscriptions: Error - Not writable');
-        throw new Error('Not writable');
-      }
-
       const existingSnapshot = await this.getClientSubscriptions(clientId);
       const mergedSnapshot = this._mergeSubscriptionSnapshots(existingSnapshot, subscriptionObject);
       const filteredSubscriptions = this._filterEphemeralSubscriptions(mergedSnapshot?.subscriptions || {});
@@ -1159,6 +1371,18 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
         connection: mergedSnapshot?.connection ?? null,
         subscriptions: filteredSubscriptions
       };
+
+      if (!this.writable) {
+        logWithTimestamp('updateClientSubscriptions: Relay not writable; queueing snapshot update', {
+          clientId,
+          subscriptionCount: Object.keys(filteredSubscriptions || {}).length
+        });
+        this._setPendingClientSubscriptions(clientId, safeSnapshot, {
+          reason: 'not-writable',
+          source: 'update-client'
+        });
+        return ['NOTICE', 'Client subscriptions queued (relay not writable)'];
+      }
 
       await this.append({
         type: 'client-subscriptions',
@@ -1282,6 +1506,18 @@ async handleMessage(message, sendResponse, connectionKey, clientId = null) {
       }
 
       delete activeSubscriptions.subscriptions[subscriptionId];
+
+      if (!this.writable) {
+        logWithTimestamp('unsubscribe: Relay not writable; queueing removal', {
+          connectionKey,
+          subscriptionId
+        });
+        this._setPendingSubscriptions(connectionKey, activeSubscriptions, {
+          reason: 'not-writable',
+          source: 'unsubscribe'
+        });
+        return;
+      }
 
       // Update the subscriptions in the database
       await this.append({

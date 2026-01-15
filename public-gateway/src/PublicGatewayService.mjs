@@ -465,6 +465,7 @@ class PublicGatewayService {
     app.get('/api/relays/:relayKey/open-join/challenge', (req, res) => this.#handleOpenJoinChallenge(req, res));
     app.post('/api/relays/:relayKey/open-join', (req, res) => this.#handleOpenJoinRequest(req, res));
     app.post('/api/relays/:relayKey/open-join/append-cores', (req, res) => this.#handleOpenJoinAppendCores(req, res));
+    app.post('/api/relays/:relayKey/closed-join/append-cores', (req, res) => this.#handleClosedJoinAppendCores(req, res));
 
     app.post('/api/relay-tokens/issue', (req, res) => this.#handleTokenIssue(req, res));
     app.post('/api/relay-tokens/refresh', (req, res) => this.#handleTokenRefresh(req, res));
@@ -823,10 +824,128 @@ class PublicGatewayService {
     };
   }
 
+  #normalizeMirrorCoreEntries(entries = []) {
+    if (!Array.isArray(entries)) return [];
+    const normalized = [];
+    for (const entry of entries) {
+      const normalizedEntry = this.#normalizeOpenJoinCoreEntry(entry);
+      if (normalizedEntry?.key) {
+        normalized.push(normalizedEntry);
+      }
+    }
+    return normalized;
+  }
+
+  #mergeMirrorCoreEntries(...lists) {
+    const merged = [];
+    const indexByKey = new Map();
+    const addEntry = (entry) => {
+      const normalized = this.#normalizeOpenJoinCoreEntry(entry);
+      if (!normalized?.key) return;
+      const existingIndex = indexByKey.get(normalized.key);
+      if (existingIndex === undefined) {
+        indexByKey.set(normalized.key, merged.length);
+        merged.push(normalized.role ? { key: normalized.key, role: normalized.role } : { key: normalized.key });
+        return;
+      }
+      if (!merged[existingIndex].role && normalized.role) {
+        merged[existingIndex] = { ...merged[existingIndex], role: normalized.role };
+      }
+    };
+    for (const list of lists) {
+      if (!Array.isArray(list)) continue;
+      for (const entry of list) addEntry(entry);
+    }
+    return merged;
+  }
+
+  async #getClosedJoinMirrorPayload(relayKey, identifier = null) {
+    if (typeof this.registrationStore?.getClosedJoinCoreRefs !== 'function') return null;
+    const payloads = [];
+    if (relayKey) {
+      const stored = await this.registrationStore.getClosedJoinCoreRefs(relayKey);
+      if (stored && typeof stored === 'object') payloads.push(stored);
+    }
+    if (identifier && identifier !== relayKey) {
+      const stored = await this.registrationStore.getClosedJoinCoreRefs(identifier);
+      if (stored && typeof stored === 'object') payloads.push(stored);
+    }
+    if (!payloads.length) return null;
+    const mergedCores = this.#mergeMirrorCoreEntries(
+      ...payloads.map((entry) => (Array.isArray(entry?.cores) ? entry.cores : []))
+    );
+    const publicIdentifier = payloads.find((entry) => typeof entry?.publicIdentifier === 'string' && entry.publicIdentifier.trim())
+      ?.publicIdentifier
+      || (typeof identifier === 'string' && identifier.trim() ? identifier.trim() : null);
+    const updatedAt = payloads.reduce((max, entry) => {
+      const value = Number(entry?.updatedAt);
+      return Number.isFinite(value) ? Math.max(max, value) : max;
+    }, 0);
+    return {
+      relayKey: relayKey || payloads[0]?.relayKey || null,
+      publicIdentifier,
+      cores: mergedCores,
+      updatedAt: updatedAt || null,
+      closedJoin: true,
+      mirrorSource: 'closed-join'
+    };
+  }
+
+  #composeMirrorPayload({ relayKey = null, publicIdentifier = null, basePayload = null, cachedPayload = null, closedJoinPayload = null } = {}) {
+    const mergedCores = this.#mergeMirrorCoreEntries(
+      this.#normalizeMirrorCoreEntries(closedJoinPayload?.cores || []),
+      this.#normalizeMirrorCoreEntries(cachedPayload?.cores || cachedPayload?.relayCores || []),
+      this.#normalizeMirrorCoreEntries(basePayload?.cores || basePayload?.relayCores || [])
+    );
+    const mergedPayload = {
+      ...(cachedPayload || {}),
+      ...(basePayload || {})
+    };
+    if (closedJoinPayload?.closedJoin) {
+      mergedPayload.closedJoin = true;
+      mergedPayload.mirrorSource = mergedPayload.mirrorSource || closedJoinPayload.mirrorSource || 'closed-join';
+    }
+    if (relayKey) {
+      mergedPayload.relayKey = relayKey;
+    }
+    if (!mergedPayload.publicIdentifier && publicIdentifier) {
+      mergedPayload.publicIdentifier = publicIdentifier;
+    }
+    if (mergedCores.length) {
+      mergedPayload.cores = mergedCores;
+    }
+    return { payload: mergedPayload, mergedCores };
+  }
+
   async #storeMirrorMetadataPayload(relayKey, payload) {
     if (!relayKey || !payload || !this.registrationStore?.storeMirrorMetadata) return;
     try {
-      await this.registrationStore.storeMirrorMetadata(relayKey, payload);
+      const existing = typeof this.registrationStore?.getMirrorMetadata === 'function'
+        ? await this.registrationStore.getMirrorMetadata(relayKey)
+        : null;
+      const closedJoinPayload = await this.#getClosedJoinMirrorPayload(relayKey, payload?.publicIdentifier || null);
+      const existingCores = this.#normalizeMirrorCoreEntries(existing?.cores || existing?.relayCores || []);
+      const incomingCores = this.#normalizeMirrorCoreEntries(payload?.cores || payload?.relayCores || []);
+      const closedJoinCores = this.#normalizeMirrorCoreEntries(closedJoinPayload?.cores || []);
+      const mergedCores = this.#mergeMirrorCoreEntries(closedJoinCores, existingCores, incomingCores);
+      const mergedPayload = {
+        ...(existing || {}),
+        ...payload
+      };
+      if (closedJoinPayload?.closedJoin) {
+        mergedPayload.closedJoin = true;
+        mergedPayload.mirrorSource = mergedPayload.mirrorSource || closedJoinPayload.mirrorSource || 'closed-join';
+      }
+      if (!mergedPayload.publicIdentifier && closedJoinPayload?.publicIdentifier) {
+        mergedPayload.publicIdentifier = closedJoinPayload.publicIdentifier;
+      }
+      if (!mergedPayload.relayKey && closedJoinPayload?.relayKey) {
+        mergedPayload.relayKey = closedJoinPayload.relayKey;
+      }
+      if (mergedCores.length) {
+        mergedPayload.cores = mergedCores;
+      }
+      await this.registrationStore.storeMirrorMetadata(relayKey, mergedPayload);
     } catch (error) {
       this.logger?.warn?.('[PublicGateway] Failed to persist mirror metadata payload', {
         relayKey,
@@ -3583,6 +3702,8 @@ class PublicGatewayService {
         relayKey = trimmedIdentifier.toLowerCase();
       }
 
+      let closedJoinPayload = await this.#getClosedJoinMirrorPayload(relayKey, trimmedIdentifier);
+
       if (!record) {
         const poolResolved = trimmedIdentifier
           ? await this.#resolveOpenJoinPool(trimmedIdentifier)
@@ -3603,6 +3724,9 @@ class PublicGatewayService {
           const aliasRelayKey = await this.registrationStore.resolveOpenJoinAlias(trimmedIdentifier);
           relayKey = this.#isHexRelayKey(aliasRelayKey) ? aliasRelayKey.toLowerCase() : aliasRelayKey;
         }
+        if (!closedJoinPayload && relayKey) {
+          closedJoinPayload = await this.#getClosedJoinMirrorPayload(relayKey, trimmedIdentifier);
+        }
 
         let cached = null;
         if (typeof this.registrationStore?.getMirrorMetadata === 'function') {
@@ -3622,7 +3746,7 @@ class PublicGatewayService {
             (resolved?.record?.metadata?.identifier ?? null) ||
             trimmedIdentifier ||
             canonicalRelayKey;
-          const payload = {
+          const cachedPayload = {
             ...cached,
             relayKey: canonicalRelayKey || cached.relayKey || trimmedIdentifier || null,
             publicIdentifier,
@@ -3635,16 +3759,78 @@ class PublicGatewayService {
               : (cached.blindPeer || { enabled: false })
           };
           const storeKey = canonicalRelayKey || relayKey || cached.relayKey || trimmedIdentifier;
+          const { payload, mergedCores } = this.#composeMirrorPayload({
+            relayKey: cachedPayload.relayKey || storeKey,
+            publicIdentifier,
+            cachedPayload,
+            closedJoinPayload
+          });
           await this.#storeMirrorMetadataPayload(storeKey, payload);
+          this.logger?.info?.('[PublicGateway] Relay mirror metadata merged', {
+            relayKey: storeKey,
+            publicIdentifier,
+            cachedCores: Array.isArray(cachedPayload?.cores) ? cachedPayload.cores.length : 0,
+            closedJoinCores: Array.isArray(closedJoinPayload?.cores) ? closedJoinPayload.cores.length : 0,
+            mergedCores: mergedCores.length
+          });
           return res.json(payload);
+        }
+        if (closedJoinPayload && Array.isArray(closedJoinPayload.cores) && closedJoinPayload.cores.length) {
+          const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
+          const publicIdentifier = closedJoinPayload.publicIdentifier || trimmedIdentifier || relayKey;
+          const storeKey = relayKey || closedJoinPayload.relayKey || trimmedIdentifier;
+          const basePayload = {
+            ...closedJoinPayload,
+            relayKey: storeKey || closedJoinPayload.relayKey || null,
+            publicIdentifier,
+            blindPeer: blindPeerInfo && blindPeerInfo.enabled
+              ? {
+                  publicKey: blindPeerInfo.publicKey || null,
+                  encryptionKey: blindPeerInfo.encryptionKey || null,
+                  maxBytes: blindPeerInfo.maxBytes ?? null
+                }
+              : (closedJoinPayload.blindPeer || { enabled: false })
+          };
+          await this.#storeMirrorMetadataPayload(storeKey || trimmedIdentifier, basePayload);
+          this.logger?.info?.('[PublicGateway] Relay mirror metadata served from closed-join store', {
+            relayKey: storeKey || trimmedIdentifier,
+            publicIdentifier,
+            closedJoinCores: closedJoinPayload.cores.length
+          });
+          return res.json(basePayload);
         }
         return res.status(404).json({ error: 'relay-not-found' });
       }
-      const payload = this.#buildMirrorMetadataPayload(record, relayKey || trimmedIdentifier);
-      if (relayKey) {
-        payload.relayKey = relayKey;
+      let cached = null;
+      if (typeof this.registrationStore?.getMirrorMetadata === 'function') {
+        if (relayKey) {
+          cached = await this.registrationStore.getMirrorMetadata(relayKey);
+        }
+        if (!cached && trimmedIdentifier && trimmedIdentifier !== relayKey) {
+          cached = await this.registrationStore.getMirrorMetadata(trimmedIdentifier);
+        }
       }
+      const basePayload = this.#buildMirrorMetadataPayload(record, relayKey || trimmedIdentifier);
+      if (relayKey) {
+        basePayload.relayKey = relayKey;
+      }
+      const publicIdentifier = basePayload.publicIdentifier || trimmedIdentifier || relayKey;
+      const { payload, mergedCores } = this.#composeMirrorPayload({
+        relayKey: basePayload.relayKey || relayKey || trimmedIdentifier,
+        publicIdentifier,
+        basePayload,
+        cachedPayload: cached,
+        closedJoinPayload
+      });
       await this.#storeMirrorMetadataPayload(relayKey || trimmedIdentifier, payload);
+      this.logger?.info?.('[PublicGateway] Relay mirror metadata merged', {
+        relayKey: relayKey || trimmedIdentifier,
+        publicIdentifier,
+        recordCores: Array.isArray(basePayload?.cores) ? basePayload.cores.length : 0,
+        cachedCores: Array.isArray(cached?.cores) ? cached.cores.length : 0,
+        closedJoinCores: Array.isArray(closedJoinPayload?.cores) ? closedJoinPayload.cores.length : 0,
+        mergedCores: mergedCores.length
+      });
       return res.json(payload);
     } catch (error) {
       this.logger?.warn?.('[PublicGateway] Failed to fetch relay mirror metadata', {
@@ -4223,6 +4409,155 @@ class PublicGatewayService {
       });
       return res.status(500).json({ error: 'open-join-append-failed' });
     }
+  }
+
+  async #handleClosedJoinAppendCores(req, res) {
+    if (!this.sharedSecret) {
+      return res.status(503).json({ error: 'registration-disabled' });
+    }
+
+    const { payload, signature } = req.body || {};
+    if (!this.#verifySignedPayload(payload, signature)) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const relayKey = payload?.relayKey || req.params?.relayKey;
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+
+    const closedJoin = payload?.closedJoin === true || payload?.closed_join === true;
+    if (!closedJoin) {
+      return res.status(400).json({ error: 'closed-join-required' });
+    }
+
+    const rawCores = Array.isArray(payload?.relayCores)
+      ? payload.relayCores
+      : (Array.isArray(payload?.cores)
+        ? payload.cores
+        : (Array.isArray(payload?.coreRefs) ? payload.coreRefs : []));
+    const maxAppend = this.openJoinConfig?.maxAppendCores || 64;
+    const normalized = this.#normalizeOpenJoinCoreEntries(rawCores, { maxEntries: maxAppend });
+    const rejected = normalized.rejected + normalized.truncated;
+    if (!normalized.entries.length) {
+      return res.status(400).json({ error: 'missing-cores', rejected });
+    }
+
+    const record = await this.registrationStore.getRelay(relayKey);
+    const recordMetadata = record?.metadata && typeof record.metadata === 'object'
+      ? record.metadata
+      : null;
+    const payloadMetadata = payload?.metadata && typeof payload.metadata === 'object'
+      ? payload.metadata
+      : null;
+    const payloadPublicIdentifier = typeof payload?.publicIdentifier === 'string'
+      ? payload.publicIdentifier.trim()
+      : null;
+
+    if (record && this.#isOpenJoinAllowed(record)) {
+      return res.status(409).json({ error: 'relay-not-closed' });
+    }
+    if (!record && payloadMetadata?.isOpen === true) {
+      return res.status(409).json({ error: 'relay-not-closed' });
+    }
+
+    const existingCores = Array.isArray(record?.relayCores) ? record.relayCores : [];
+    const mergeResult = this.#mergeOpenJoinCoreEntries(existingCores, normalized.entries, {
+      maxTotal: this.openJoinConfig?.maxRelayCores || null
+    });
+    const updatedAt = Date.now();
+    const publicIdentifier = payloadPublicIdentifier
+      || payloadMetadata?.identifier
+      || recordMetadata?.identifier
+      || relayKey;
+
+    if (record) {
+      const nextMetadata = { ...(recordMetadata || {}) };
+      if (payloadMetadata && typeof payloadMetadata.isOpen === 'boolean') {
+        nextMetadata.isOpen = payloadMetadata.isOpen;
+      }
+      if (payloadMetadata?.identifier && typeof payloadMetadata.identifier === 'string') {
+        nextMetadata.identifier = payloadMetadata.identifier;
+      }
+      if (payloadPublicIdentifier) {
+        nextMetadata.identifier = payloadPublicIdentifier;
+      }
+      const updatedRecord = {
+        ...record,
+        relayKey,
+        relayCores: mergeResult.merged,
+        metadata: nextMetadata,
+        updatedAt
+      };
+      await this.registrationStore.upsertRelay(relayKey, updatedRecord);
+    }
+
+    const mirrorRecord = {
+      relayCores: mergeResult.merged,
+      metadata: {
+        ...(recordMetadata || {}),
+        ...(payloadMetadata || {}),
+        identifier: publicIdentifier || relayKey
+      }
+    };
+    const mirrorPayload = this.#buildMirrorMetadataPayload(mirrorRecord, relayKey);
+    const relayUrl = typeof payload?.relayUrl === 'string' ? payload.relayUrl : null;
+    if (relayUrl) {
+      mirrorPayload.relayUrl = relayUrl;
+    }
+    mirrorPayload.closedJoin = true;
+    mirrorPayload.mirrorSource = 'closed-join';
+    mirrorPayload.updatedAt = updatedAt;
+    await this.#storeMirrorMetadataPayload(relayKey, mirrorPayload);
+    if (publicIdentifier && publicIdentifier !== relayKey) {
+      await this.#storeMirrorMetadataPayload(publicIdentifier, mirrorPayload);
+    }
+
+    let closedJoinStored = false;
+    if (typeof this.registrationStore?.storeClosedJoinCoreRefs === 'function') {
+      const closedJoinPayload = {
+        relayKey,
+        publicIdentifier: publicIdentifier || null,
+        cores: mergeResult.merged,
+        updatedAt,
+        closedJoin: true,
+        mirrorSource: 'closed-join'
+      };
+      await this.registrationStore.storeClosedJoinCoreRefs(relayKey, closedJoinPayload);
+      if (publicIdentifier && publicIdentifier !== relayKey) {
+        await this.registrationStore.storeClosedJoinCoreRefs(publicIdentifier, closedJoinPayload);
+      }
+      closedJoinStored = true;
+    }
+
+    this.logger?.info?.('[PublicGateway] Closed join core append', {
+      relayKey,
+      publicIdentifier: publicIdentifier || null,
+      received: rawCores.length,
+      added: mergeResult.added,
+      ignored: mergeResult.ignored,
+      rejected,
+      trimmed: mergeResult.trimmed,
+      total: mergeResult.merged.length,
+      recordFound: !!record,
+      updatedAt,
+      relayUrl: relayUrl ? relayUrl.slice(0, 80) : null,
+      closedJoinStored
+    });
+
+    return res.json({
+      status: 'ok',
+      relayKey,
+      publicIdentifier: publicIdentifier || null,
+      added: mergeResult.added,
+      ignored: mergeResult.ignored,
+      rejected,
+      trimmed: mergeResult.trimmed,
+      total: mergeResult.merged.length,
+      updatedAt,
+      mirrorUnioned: true,
+      closedJoinStored
+    });
   }
 
   #parseWebSocketRequest(req) {

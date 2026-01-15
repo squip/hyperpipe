@@ -591,6 +591,10 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     return id ? joinFlows[id] : undefined
   }, [groupId, joinFlows])
 
+  const joinFlowWritableDerived = Boolean(joinFlow?.writable || joinFlow?.phase === 'success')
+  const joinFlowStableKey =
+    joinFlow?.relayKey || joinFlow?.publicIdentifier || groupId || null
+
   useEffect(() => {
     if (!groupId) return
     if (!joinFlow?.writableAt || !joinFlow?.writable) return
@@ -635,7 +639,15 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   }, [tokenizedResolvedGroupRelay])
 
   const activeGroupRelay = pinnedGroupRelay || tokenizedResolvedGroupRelay
-  const shouldGateGroupSubRequests = Boolean(groupId && effectiveGroupRelay && !activeGroupRelay)
+  const joinFlowAwaitingWritable = Boolean(
+    groupId &&
+      hasInviteJoinData &&
+      joinFlow &&
+      joinFlow.phase !== 'error' &&
+      joinFlow.phase !== 'success' &&
+      !joinFlowWritableDerived
+  )
+  const shouldGateGroupSubRequests = Boolean(groupId && effectiveGroupRelay && !activeGroupRelay) || joinFlowAwaitingWritable
 
   const groupSubRequests = useMemo(
     () =>
@@ -679,10 +691,17 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       gateSubRequests: shouldGateGroupSubRequests
     })
     if (shouldGateGroupSubRequests) {
-      console.info('[GroupPage] subRequests gated (awaiting tokenized relay)', {
+      console.info('[GroupPage] subRequests gated', {
         groupId,
         effectiveGroupRelay,
-        resolvedGroupRelay
+        resolvedGroupRelay,
+        awaitingWritable: joinFlowAwaitingWritable,
+        joinFlowPhase: joinFlow?.phase,
+        joinFlowWritable: joinFlow?.writable,
+        joinFlowWritableDerived,
+        joinFlowMode: joinFlow?.mode,
+        expectedWriterActive: joinFlow?.expectedWriterActive,
+        joinFlowStableKey
       })
     }
     if (groupSubRequests.length) {
@@ -698,7 +717,14 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     pinnedGroupRelay,
     activeGroupRelay,
     shouldGateGroupSubRequests,
-    groupSubRequests
+    groupSubRequests,
+    joinFlowAwaitingWritable,
+    joinFlow?.phase,
+    joinFlow?.writable,
+    joinFlowWritableDerived,
+    joinFlow?.mode,
+    joinFlow?.expectedWriterActive,
+    joinFlowStableKey
   ])
 
   const isHypertunaGroup = useMemo(() => {

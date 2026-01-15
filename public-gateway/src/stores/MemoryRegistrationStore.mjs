@@ -12,6 +12,7 @@ class MemoryRegistrationStore {
     this.tokenMetadata = new Map();
     this.openJoinPools = new Map();
     this.mirrorMetadata = new Map();
+    this.closedJoinCoreRefs = new Map();
     this.relayAliases = new Map();
     this.relayAliasIndex = new Map();
     this.openJoinAliases = new Map();
@@ -77,6 +78,12 @@ class MemoryRegistrationStore {
     for (const [key, record] of this.mirrorMetadata.entries()) {
       if (record?.expiresAt && record.expiresAt <= now) {
         this.mirrorMetadata.delete(key);
+      }
+    }
+
+    for (const [key, record] of this.closedJoinCoreRefs.entries()) {
+      if (record?.expiresAt && record.expiresAt <= now) {
+        this.closedJoinCoreRefs.delete(key);
       }
     }
 
@@ -259,6 +266,37 @@ class MemoryRegistrationStore {
 
   async clearMirrorMetadata(relayKey) {
     this.mirrorMetadata.delete(relayKey);
+  }
+
+  async storeClosedJoinCoreRefs(relayKey, payload = {}) {
+    if (!relayKey) return;
+    const ttlSeconds = Number.isFinite(this.mirrorTtlSeconds) ? this.mirrorTtlSeconds : this.ttlSeconds;
+    const cores = Array.isArray(payload)
+      ? payload
+      : (Array.isArray(payload?.cores) ? payload.cores : []);
+    if (!cores.length) return;
+    const record = {
+      payload: Array.isArray(payload) ? { cores, updatedAt: Date.now() } : { ...payload, cores },
+      storedAt: Date.now(),
+      expiresAt: Number.isFinite(ttlSeconds) && ttlSeconds > 0
+        ? Date.now() + ttlSeconds * 1000
+        : null
+    };
+    this.closedJoinCoreRefs.set(relayKey, record);
+  }
+
+  async getClosedJoinCoreRefs(relayKey) {
+    const record = this.closedJoinCoreRefs.get(relayKey);
+    if (!record) return null;
+    if (record.expiresAt && record.expiresAt <= Date.now()) {
+      this.closedJoinCoreRefs.delete(relayKey);
+      return null;
+    }
+    return record.payload || null;
+  }
+
+  async clearClosedJoinCoreRefs(relayKey) {
+    this.closedJoinCoreRefs.delete(relayKey);
   }
 
   async storeRelayAlias(identifier, relayKey) {

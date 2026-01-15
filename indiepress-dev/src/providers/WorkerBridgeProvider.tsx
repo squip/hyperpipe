@@ -113,6 +113,14 @@ type JoinFlowState = {
   provisional?: boolean | null
 }
 
+type JoinFlowWritableCacheEntry = {
+  writable: boolean
+  writableAt: number | null
+  expectedWriterActive?: boolean | null
+  mode?: string | null
+  updatedAt: number
+}
+
 type RelayCreateRequest = {
   name: string
   description?: string
@@ -203,6 +211,13 @@ function makeRequestId(prefix = 'req') {
 
 function isHex64(value: unknown): value is string {
   return typeof value === 'string' && /^[a-fA-F0-9]{64}$/.test(value)
+}
+
+function normalizeJoinFlowKey(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  return isHex64(trimmed) ? trimmed.toLowerCase() : trimmed
 }
 
 function readAutostartEnabled(): boolean {
@@ -332,6 +347,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
   const autostartEnabledRef = useRef(autostartEnabled)
   const sessionStopRequestedRef = useRef(sessionStopRequested)
   const identityReadyRef = useRef(identityReady)
+  const joinFlowWritableCacheRef = useRef<Map<string, JoinFlowWritableCacheEntry>>(new Map())
   const relayCreateResolversRef = useRef<
     Array<{
       resolve: (payload: RelayCreatedPayload) => void
@@ -505,6 +521,52 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       return next
     })
   }, [])
+
+  const readJoinFlowWritableCache = useCallback(
+    (publicIdentifier?: string | null, relayKey?: string | null) => {
+      const relayKeyKey = normalizeJoinFlowKey(relayKey)
+      if (relayKeyKey) {
+        const cached = joinFlowWritableCacheRef.current.get(relayKeyKey)
+        if (cached) return cached
+      }
+      const identifierKey = normalizeJoinFlowKey(publicIdentifier)
+      if (identifierKey) {
+        const cached = joinFlowWritableCacheRef.current.get(identifierKey)
+        if (cached) return cached
+      }
+      return null
+    },
+    []
+  )
+
+  const updateJoinFlowWritableCache = useCallback(
+    (
+      publicIdentifier: string | null | undefined,
+      relayKey: string | null | undefined,
+      patch: Partial<JoinFlowWritableCacheEntry>
+    ) => {
+      const keys = [normalizeJoinFlowKey(publicIdentifier), normalizeJoinFlowKey(relayKey)]
+        .filter(Boolean) as string[]
+      if (!keys.length) return null
+      const now = Date.now()
+      let updated: JoinFlowWritableCacheEntry | null = null
+      keys.forEach((key) => {
+        const existing = joinFlowWritableCacheRef.current.get(key)
+        const next: JoinFlowWritableCacheEntry = {
+          writable: existing?.writable ?? false,
+          writableAt: existing?.writableAt ?? null,
+          expectedWriterActive: existing?.expectedWriterActive ?? null,
+          mode: existing?.mode ?? null,
+          updatedAt: now,
+          ...patch
+        }
+        joinFlowWritableCacheRef.current.set(key, next)
+        updated = next
+      })
+      return updated
+    },
+    []
+  )
 
   const startJoinFlowInternal = useCallback(
     async (
@@ -919,12 +981,32 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
             if (!identifier || !progress) break
             setJoinFlows((prev) => {
               const current = prev[identifier]
+              const cachedWritable = readJoinFlowWritableCache(
+                identifier,
+                msg?.data?.relayKey || current?.relayKey
+              )
+              const stickyWritable = current?.writable === true || cachedWritable?.writable === true
+              const stickyWritableAt = current?.writableAt ?? cachedWritable?.writableAt ?? null
+              const stickyExpectedWriterActive =
+                current?.expectedWriterActive ?? cachedWritable?.expectedWriterActive ?? null
+              const stickyMode = current?.mode ?? cachedWritable?.mode ?? null
+              const nextPhase = current?.phase === 'success' ? 'success' : progress
+              if (cachedWritable?.writable && !current?.writable) {
+                console.info('[WorkerBridge] join flow writable cache applied', {
+                  publicIdentifier: identifier,
+                  relayKey: current?.relayKey ?? null,
+                  phase: nextPhase,
+                  writableAt: cachedWritable.writableAt,
+                  expectedWriterActive: cachedWritable.expectedWriterActive ?? null,
+                  mode: cachedWritable.mode ?? null
+                })
+              }
               const startedAt = current?.startedAt ?? Date.now()
               return {
                 ...prev,
                 [identifier]: {
                   publicIdentifier: identifier,
-                  phase: progress,
+                  phase: nextPhase,
                   startedAt,
                   updatedAt: Date.now(),
                   hostPeers: current?.hostPeers,
@@ -933,8 +1015,11 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   authToken: current?.authToken ?? null,
                   relayUrl: current?.relayUrl ?? null,
                   error: null,
-                  mode: current?.mode ?? null,
-                  provisional: current?.provisional ?? null
+                  mode: stickyMode,
+                  provisional: current?.provisional ?? null,
+                  writable: stickyWritable ? true : current?.writable,
+                  writableAt: stickyWritable ? stickyWritableAt : current?.writableAt ?? null,
+                  expectedWriterActive: stickyExpectedWriterActive
                 }
               }
             })
@@ -945,6 +1030,24 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
             if (!identifier) break
             setJoinFlows((prev) => {
               const current = prev[identifier]
+              const cachedWritable = readJoinFlowWritableCache(
+                identifier,
+                msg?.data?.relayKey || current?.relayKey
+              )
+              const stickyWritable = current?.writable === true || cachedWritable?.writable === true
+              const stickyWritableAt = current?.writableAt ?? cachedWritable?.writableAt ?? null
+              const stickyExpectedWriterActive =
+                current?.expectedWriterActive ?? cachedWritable?.expectedWriterActive ?? null
+              if (cachedWritable?.writable && !current?.writable) {
+                console.info('[WorkerBridge] join flow writable cache applied', {
+                  publicIdentifier: identifier,
+                  relayKey: msg?.data?.relayKey || current?.relayKey || null,
+                  phase: 'success',
+                  writableAt: cachedWritable.writableAt,
+                  expectedWriterActive: cachedWritable.expectedWriterActive ?? null,
+                  mode: cachedWritable.mode ?? null
+                })
+              }
               const startedAt = current?.startedAt ?? Date.now()
               return {
                 ...prev,
@@ -959,8 +1062,11 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   authToken: msg?.data?.authToken || null,
                   relayUrl: msg?.data?.relayUrl || null,
                   error: null,
-                  mode: msg?.data?.mode ?? current?.mode ?? null,
-                  provisional: msg?.data?.provisional ?? current?.provisional ?? null
+                  mode: msg?.data?.mode ?? current?.mode ?? cachedWritable?.mode ?? null,
+                  provisional: msg?.data?.provisional ?? current?.provisional ?? null,
+                  writable: stickyWritable ? true : current?.writable,
+                  writableAt: stickyWritable ? stickyWritableAt : current?.writableAt ?? null,
+                  expectedWriterActive: stickyExpectedWriterActive
                 }
               }
             })
@@ -1001,6 +1107,22 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
             const identifier = data.publicIdentifier
             if (!identifier) break
             const isWritable = data.writable === true
+            if (isWritable) {
+              const writableAt = Date.now()
+              updateJoinFlowWritableCache(identifier, data.relayKey ?? null, {
+                writable: true,
+                writableAt,
+                expectedWriterActive: data.expectedWriterActive ?? null,
+                mode: data.mode ?? null
+              })
+              console.info('[WorkerBridge] join flow writable cached', {
+                publicIdentifier: identifier,
+                relayKey: data.relayKey ?? null,
+                writableAt,
+                expectedWriterActive: data.expectedWriterActive ?? null,
+                mode: data.mode ?? null
+              })
+            }
             console.info('[WorkerBridge] relay-writable received', {
               publicIdentifier: identifier,
               relayKey: data.relayKey,

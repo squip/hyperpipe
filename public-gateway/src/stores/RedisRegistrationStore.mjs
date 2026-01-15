@@ -19,6 +19,7 @@ class RedisRegistrationStore {
     this.openJoinPrefix = `${this.prefix}open-join:`;
     this.openJoinAliasPrefix = `${this.prefix}open-join-aliases:`;
     this.mirrorPrefix = `${this.prefix}mirrors:`;
+    this.closedJoinPrefix = `${this.prefix}closed-join:`;
     this.aliasPrefix = `${this.prefix}aliases:`;
     this.logger = logger || console;
     this.client = createClient({ url: this.url });
@@ -61,6 +62,10 @@ class RedisRegistrationStore {
 
   #mirrorKey(relayKey) {
     return `${this.mirrorPrefix}${relayKey}`;
+  }
+
+  #closedJoinKey(relayKey) {
+    return `${this.closedJoinPrefix}${relayKey}`;
   }
 
   #aliasKey(identifier) {
@@ -279,6 +284,48 @@ class RedisRegistrationStore {
   async clearMirrorMetadata(relayKey) {
     await this.#ensureConnected();
     await this.client.del(this.#mirrorKey(relayKey));
+  }
+
+  async storeClosedJoinCoreRefs(relayKey, payload = {}) {
+    if (!relayKey) return;
+    await this.#ensureConnected();
+    const cores = Array.isArray(payload)
+      ? payload
+      : (Array.isArray(payload?.cores) ? payload.cores : []);
+    if (!cores.length) return;
+    const record = JSON.stringify({
+      payload: Array.isArray(payload) ? { cores, updatedAt: Date.now() } : { ...payload, cores },
+      storedAt: Date.now()
+    });
+    const ttlSeconds = Number.isFinite(this.mirrorTtlSeconds)
+      ? this.mirrorTtlSeconds
+      : this.ttlSeconds;
+    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+      await this.client.set(this.#closedJoinKey(relayKey), record, { EX: ttlSeconds });
+    } else {
+      await this.client.set(this.#closedJoinKey(relayKey), record);
+    }
+  }
+
+  async getClosedJoinCoreRefs(relayKey) {
+    await this.#ensureConnected();
+    const value = await this.client.get(this.#closedJoinKey(relayKey));
+    if (!value) return null;
+    try {
+      const parsed = JSON.parse(value);
+      return parsed?.payload || null;
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse redis closed-join core payload', {
+        relayKey,
+        error: error.message
+      });
+      return null;
+    }
+  }
+
+  async clearClosedJoinCoreRefs(relayKey) {
+    await this.#ensureConnected();
+    await this.client.del(this.#closedJoinKey(relayKey));
   }
 
   async storeRelayAlias(identifier, relayKey) {
