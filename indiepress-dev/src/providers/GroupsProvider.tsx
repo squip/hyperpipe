@@ -1164,150 +1164,150 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const inviteName = options?.name ?? meta?.name
       const inviteAbout = options?.about ?? meta?.about
 
-      let writerInfo: {
-        writerCore?: string
-        writerCoreHex?: string
-        autobaseLocal?: string
-        writerSecret?: string
-      } | null = null
-      if (!isOpenGroup && sendToWorker && relayEntry?.relayKey && invitees.length === 1) {
-        try {
-          const res = await sendToWorker({
-            type: 'provision-writer-for-invitee',
-            data: { relayKey: relayEntry.relayKey, publicIdentifier: groupId, inviteePubkey: invitees[0] }
-          })
-          if (res && typeof res === 'object') {
-            writerInfo = {
-              writerCore: (res as any).writerCore,
-              writerCoreHex: (res as any).writerCoreHex,
-              autobaseLocal: (res as any).autobaseLocal,
-              writerSecret: (res as any).writerSecret
-            }
-          }
-          console.info('[GroupsProvider] Writer provisioning result (invite)', {
-            groupId,
-            invitee: invitees[0],
-            relayKey: relayEntry.relayKey,
-            hasWriterCore: !!writerInfo?.writerCore,
-            hasWriterCoreHex: !!writerInfo?.writerCoreHex,
-            hasAutobaseLocal: !!writerInfo?.autobaseLocal,
-            hasWriterSecret: !!writerInfo?.writerSecret
-          })
-        } catch (err) {
-          console.warn('[GroupsProvider] Failed to provision writer for invitee', err)
-        }
-      }
-
       let mirrorMetadata: InviteMirrorMetadata = null
-      if (!isOpenGroup) {
-        mirrorMetadata = await fetchInviteMirrorMetadata(relayEntry?.relayKey || groupId, resolved)
-
-        // If we created a writer core for this invite, include it in cores so it gets mirrored.
-        const writerCoreKey =
-          writerInfo?.writerCoreHex || writerInfo?.autobaseLocal || writerInfo?.writerCore
-        if (writerCoreKey) {
-          if (!mirrorMetadata) mirrorMetadata = {}
-          const cores = Array.isArray(mirrorMetadata.cores) ? [...mirrorMetadata.cores] : []
-          cores.push({ key: writerCoreKey, role: 'autobase-writer' })
-          mirrorMetadata.cores = cores
-        }
-      }
 
       const inviteRelayUrl = getBaseRelayUrl(resolved || relay || '') || resolved || relay || null
+      const canProvisionWriter = !isOpenGroup && sendToWorker && relayEntry?.relayKey
+      const mergeWriterCoreIntoMirror = (current: InviteMirrorMetadata, writerCoreKey: string | null) => {
+        if (!writerCoreKey) return current
+        const nextCores = Array.isArray(current?.cores) ? [...current.cores] : []
+        if (!nextCores.some((core) => core?.key === writerCoreKey)) {
+          nextCores.push({ key: writerCoreKey, role: 'autobase-writer' })
+        }
+        return current ? { ...current, cores: nextCores } : { cores: nextCores }
+      }
 
-      await Promise.all(
-        invitees.map(async (invitee) => {
-          const token = isOpenGroup ? null : randomString(24)
-          const payload = isOpenGroup
-            ? buildOpenInvitePayload({
-                relayUrl: inviteRelayUrl,
-                relayKey: relayEntry?.relayKey || null
-              })
-            : buildInvitePayload({
-                token: token as string,
-                relayUrl: inviteRelayUrl,
-                relayKey: relayEntry?.relayKey || null,
-                meta,
-                mirrorMetadata,
-                writerInfo
-              })
-          const encryptedPayload = await nip04Encrypt(
-            invitee,
-            JSON.stringify(payload)
-          )
-          console.info('[GroupsProvider] Invite payload built', {
-            groupId,
-            invitee,
-            openInvite: isOpenGroup,
-            hasWriterCore: !!writerInfo?.writerCore,
-            hasWriterCoreHex: !!writerInfo?.writerCoreHex,
-            hasAutobaseLocal: !!writerInfo?.autobaseLocal,
-            hasWriterSecret: !!writerInfo?.writerSecret,
-            writerSecretLen: writerInfo?.writerSecret ? String(writerInfo.writerSecret).length : 0,
-            relayKey: relayEntry?.relayKey ? String(relayEntry.relayKey).slice(0, 16) : null,
-            relayUrl: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 80) : null,
-            mirrorCoresCount: Array.isArray(mirrorMetadata?.cores) ? mirrorMetadata.cores.length : 0,
-            fileSharing: resolvedIsOpen === false ? false : true
-          })
-          const inviteTags: string[][] = [
-            ['h', groupId],
-            ['p', invitee],
-            ['i', 'hypertuna']
-          ]
-          if (inviteName) inviteTags.push(['name', inviteName])
-          if (inviteAbout) inviteTags.push(['about', inviteAbout])
-          inviteTags.push([resolvedIsOpen === false ? 'file-sharing-off' : 'file-sharing-on'])
-
-          if (!isOpenGroup && token) {
-            // Add 9000 put-user so membership/auth is consistent with legacy flow
-            const putUser: TDraftEvent = {
-              kind: 9000,
-              created_at: Math.floor(Date.now() / 1000),
-              tags: [
-                ['h', groupId],
-                ['p', invitee, 'member', token]
-              ],
-              content: ''
-            }
-            await publish(putUser, { specifiedRelayUrls: relayUrls })
-          }
-
-          const draftEvent: TDraftEvent = {
-            kind: 9009,
-            created_at: Math.floor(Date.now() / 1000),
-            tags: inviteTags,
-            content: encryptedPayload
-          }
-          await publish(draftEvent, { specifiedRelayUrls: relayUrls })
-
-          if (!isOpenGroup && token) {
-            try {
-              if (sendToWorker) {
-                const memberTs = Date.now()
-                await sendToWorker({
-                  type: 'update-auth-data',
-                  data: {
-                    relayKey: relayEntry?.relayKey,
-                    publicIdentifier: groupId,
-                    pubkey: invitee,
-                    token
-                  }
-                })
-                await sendToWorker({
-                  type: 'update-members',
-                  data: {
-                    relayKey: relayEntry?.relayKey,
-                    publicIdentifier: groupId,
-                    member_adds: [{ pubkey: invitee, ts: memberTs }]
-                  }
-                })
+      for (const invitee of invitees) {
+        let writerInfo: {
+          writerCore?: string
+          writerCoreHex?: string
+          autobaseLocal?: string
+          writerSecret?: string
+        } | null = null
+        if (canProvisionWriter) {
+          try {
+            const res = await sendToWorker({
+              type: 'provision-writer-for-invitee',
+              data: { relayKey: relayEntry?.relayKey, publicIdentifier: groupId, inviteePubkey: invitee }
+            })
+            if (res && typeof res === 'object') {
+              writerInfo = {
+                writerCore: (res as any).writerCore,
+                writerCoreHex: (res as any).writerCoreHex,
+                autobaseLocal: (res as any).autobaseLocal,
+                writerSecret: (res as any).writerSecret
               }
-            } catch (_err) {
-              // best effort
             }
+            console.info('[GroupsProvider] Writer provisioning result (invite)', {
+              groupId,
+              invitee,
+              relayKey: relayEntry?.relayKey,
+              hasWriterCore: !!writerInfo?.writerCore,
+              hasWriterCoreHex: !!writerInfo?.writerCoreHex,
+              hasAutobaseLocal: !!writerInfo?.autobaseLocal,
+              hasWriterSecret: !!writerInfo?.writerSecret
+            })
+          } catch (err) {
+            console.warn('[GroupsProvider] Failed to provision writer for invitee', err)
           }
+        }
+
+        const writerCoreKey =
+          writerInfo?.writerCoreHex || writerInfo?.autobaseLocal || writerInfo?.writerCore || null
+        let inviteMirrorMetadata = mirrorMetadata
+        if (!isOpenGroup) {
+          const refreshedMirror = await fetchInviteMirrorMetadata(relayEntry?.relayKey || groupId, resolved)
+          inviteMirrorMetadata = mergeWriterCoreIntoMirror(refreshedMirror || mirrorMetadata, writerCoreKey)
+          mirrorMetadata = inviteMirrorMetadata
+        }
+
+        const token = isOpenGroup ? null : randomString(24)
+        const payload = isOpenGroup
+          ? buildOpenInvitePayload({
+              relayUrl: inviteRelayUrl,
+              relayKey: relayEntry?.relayKey || null
+            })
+          : buildInvitePayload({
+              token: token as string,
+              relayUrl: inviteRelayUrl,
+              relayKey: relayEntry?.relayKey || null,
+              meta,
+              mirrorMetadata: inviteMirrorMetadata,
+              writerInfo
+            })
+        const encryptedPayload = await nip04Encrypt(invitee, JSON.stringify(payload))
+        console.info('[GroupsProvider] Invite payload built', {
+          groupId,
+          invitee,
+          openInvite: isOpenGroup,
+          hasWriterCore: !!writerInfo?.writerCore,
+          hasWriterCoreHex: !!writerInfo?.writerCoreHex,
+          hasAutobaseLocal: !!writerInfo?.autobaseLocal,
+          hasWriterSecret: !!writerInfo?.writerSecret,
+          writerSecretLen: writerInfo?.writerSecret ? String(writerInfo.writerSecret).length : 0,
+          relayKey: relayEntry?.relayKey ? String(relayEntry.relayKey).slice(0, 16) : null,
+          relayUrl: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 80) : null,
+          mirrorCoresCount: Array.isArray(inviteMirrorMetadata?.cores) ? inviteMirrorMetadata.cores.length : 0,
+          fileSharing: resolvedIsOpen === false ? false : true
         })
-      )
+        const inviteTags: string[][] = [
+          ['h', groupId],
+          ['p', invitee],
+          ['i', 'hypertuna']
+        ]
+        if (inviteName) inviteTags.push(['name', inviteName])
+        if (inviteAbout) inviteTags.push(['about', inviteAbout])
+        inviteTags.push([resolvedIsOpen === false ? 'file-sharing-off' : 'file-sharing-on'])
+
+        if (!isOpenGroup && token) {
+          // Add 9000 put-user so membership/auth is consistent with legacy flow
+          const putUser: TDraftEvent = {
+            kind: 9000,
+            created_at: Math.floor(Date.now() / 1000),
+            tags: [
+              ['h', groupId],
+              ['p', invitee, 'member', token]
+            ],
+            content: ''
+          }
+          await publish(putUser, { specifiedRelayUrls: relayUrls })
+        }
+
+        const draftEvent: TDraftEvent = {
+          kind: 9009,
+          created_at: Math.floor(Date.now() / 1000),
+          tags: inviteTags,
+          content: encryptedPayload
+        }
+        await publish(draftEvent, { specifiedRelayUrls: relayUrls })
+
+        if (!isOpenGroup && token) {
+          try {
+            if (sendToWorker) {
+              const memberTs = Date.now()
+              await sendToWorker({
+                type: 'update-auth-data',
+                data: {
+                  relayKey: relayEntry?.relayKey,
+                  publicIdentifier: groupId,
+                  pubkey: invitee,
+                  token
+                }
+              })
+              await sendToWorker({
+                type: 'update-members',
+                data: {
+                  relayKey: relayEntry?.relayKey,
+                  publicIdentifier: groupId,
+                  member_adds: [{ pubkey: invitee, ts: memberTs }]
+                }
+              })
+            }
+          } catch (_err) {
+            // best effort
+          }
+        }
+      }
     },
     [discoveryGroups, fetchInviteMirrorMetadata, getRelayEntryForGroup, nip04Encrypt, pubkey, publish, resolveRelayUrl, sendToWorker]
   )
