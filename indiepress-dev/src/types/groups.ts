@@ -40,7 +40,10 @@ export type TGroupInvite = {
   relay?: string
   name?: string
   about?: string
+  picture?: string
   fileSharing?: boolean
+  isPublic?: boolean
+  isOpen?: boolean
   relayUrl?: string | null
   relayKey?: string | null
   writerCore?: string | null

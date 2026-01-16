@@ -105,7 +105,7 @@ export const useGroups = () => {
     return {
       discoveryGroups: [],
       invites: [],
-       joinRequests: {},
+      joinRequests: {},
       favoriteGroups: [],
       myGroupList: [],
       isLoadingDiscovery: false,
@@ -162,8 +162,10 @@ type InviteMirrorMetadata = {
 
 type SendInviteOptions = {
   isOpen?: boolean
+  isPublic?: boolean
   name?: string
   about?: string
+  picture?: string
 }
 
 const buildInvitePayload = (args: {
@@ -171,6 +173,12 @@ const buildInvitePayload = (args: {
   relayUrl: string | null
   relayKey?: string | null
   meta?: TGroupMetadata | null
+  isPublic?: boolean
+  isOpen?: boolean
+  name?: string
+  about?: string
+  picture?: string
+  fileSharing?: boolean
   mirrorMetadata?: InviteMirrorMetadata
   writerInfo?: {
     writerCore?: string
@@ -178,26 +186,82 @@ const buildInvitePayload = (args: {
     autobaseLocal?: string
     writerSecret?: string
   } | null
-}) => ({
-  relayUrl: args.relayUrl,
-  token: args.token,
-  relayKey: args.relayKey ?? null,
-  isPublic: args.meta?.isPublic !== false,
-  name: args.meta?.name,
-  about: args.meta?.about,
-  fileSharing: args.meta?.isOpen !== false,
-  blindPeer: args.mirrorMetadata?.blindPeer,
-  cores: args.mirrorMetadata?.cores,
-  writerCore: args.writerInfo?.writerCore || null,
-  writerCoreHex: args.writerInfo?.writerCoreHex || args.writerInfo?.autobaseLocal || null,
-  autobaseLocal: args.writerInfo?.autobaseLocal || args.writerInfo?.writerCoreHex || null,
-  writerSecret: args.writerInfo?.writerSecret || null
-})
+}) => {
+  const resolvedIsPublic =
+    typeof args.isPublic === 'boolean'
+      ? args.isPublic
+      : typeof args.meta?.isPublic === 'boolean'
+        ? args.meta.isPublic
+        : undefined
+  const resolvedIsOpen =
+    typeof args.isOpen === 'boolean'
+      ? args.isOpen
+      : typeof args.meta?.isOpen === 'boolean'
+        ? args.meta.isOpen
+        : undefined
+  const resolvedName = args.name ?? args.meta?.name
+  const resolvedAbout = args.about ?? args.meta?.about
+  const resolvedPicture = args.picture ?? args.meta?.picture
+  const resolvedFileSharing =
+    typeof args.fileSharing === 'boolean' ? args.fileSharing : resolvedIsOpen !== false
+  return {
+    relayUrl: args.relayUrl,
+    token: args.token,
+    relayKey: args.relayKey ?? null,
+    isPublic: resolvedIsPublic,
+    isOpen: resolvedIsOpen,
+    name: resolvedName,
+    about: resolvedAbout,
+    picture: resolvedPicture,
+    fileSharing: resolvedFileSharing,
+    blindPeer: args.mirrorMetadata?.blindPeer,
+    cores: args.mirrorMetadata?.cores,
+    writerCore: args.writerInfo?.writerCore || null,
+    writerCoreHex: args.writerInfo?.writerCoreHex || args.writerInfo?.autobaseLocal || null,
+    autobaseLocal: args.writerInfo?.autobaseLocal || args.writerInfo?.writerCoreHex || null,
+    writerSecret: args.writerInfo?.writerSecret || null
+  }
+}
 
-const buildOpenInvitePayload = (args: { relayUrl: string | null; relayKey?: string | null }) => ({
-  relayUrl: args.relayUrl,
-  relayKey: args.relayKey ?? null
-})
+const buildOpenInvitePayload = (args: {
+  relayUrl: string | null
+  relayKey?: string | null
+  meta?: TGroupMetadata | null
+  isPublic?: boolean
+  isOpen?: boolean
+  name?: string
+  about?: string
+  picture?: string
+  fileSharing?: boolean
+}) => {
+  const resolvedIsPublic =
+    typeof args.isPublic === 'boolean'
+      ? args.isPublic
+      : typeof args.meta?.isPublic === 'boolean'
+        ? args.meta.isPublic
+        : undefined
+  const resolvedIsOpen =
+    typeof args.isOpen === 'boolean'
+      ? args.isOpen
+      : typeof args.meta?.isOpen === 'boolean'
+        ? args.meta.isOpen
+        : undefined
+  const resolvedName = args.name ?? args.meta?.name
+  const resolvedAbout = args.about ?? args.meta?.about
+  const resolvedPicture = args.picture ?? args.meta?.picture
+  const resolvedFileSharing =
+    typeof args.fileSharing === 'boolean' ? args.fileSharing : resolvedIsOpen !== false
+  return {
+    relayUrl: args.relayUrl,
+    relayKey: args.relayKey ?? null,
+    isPublic: resolvedIsPublic,
+    isOpen: resolvedIsOpen,
+    name: resolvedName,
+    about: resolvedAbout,
+    picture: resolvedPicture,
+    fileSharing: resolvedFileSharing
+  }
+}
 
 export function GroupsProvider({ children }: { children: ReactNode }) {
   const { pubkey, publish, relayList, nip04Decrypt, nip04Encrypt } = useNostr()
@@ -482,6 +546,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let relayUrl: string | null | undefined
             let relayKey: string | null | undefined
             let fileSharing: boolean | undefined = invite.fileSharing
+            let inviteIsPublic: boolean | undefined
+            let inviteIsOpen: boolean | undefined
+            let inviteName: string | undefined = invite.name
+            let inviteAbout: string | undefined = invite.about
+            let invitePicture: string | undefined = invite.picture
             let blindPeer: TGroupInvite['blindPeer'] | null | undefined
             let cores: TGroupInvite['cores'] | undefined
             let writerCore: string | null | undefined
@@ -496,6 +565,21 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 relayKey = typeof payload.relayKey === 'string' ? payload.relayKey : null
                 if (typeof payload.fileSharing === 'boolean') {
                   fileSharing = payload.fileSharing
+                }
+                if (typeof payload.isPublic === 'boolean') {
+                  inviteIsPublic = payload.isPublic
+                }
+                if (typeof payload.isOpen === 'boolean') {
+                  inviteIsOpen = payload.isOpen
+                }
+                if (typeof payload.name === 'string') {
+                  inviteName = payload.name
+                }
+                if (typeof payload.about === 'string') {
+                  inviteAbout = payload.about
+                }
+                if (typeof payload.picture === 'string') {
+                  invitePicture = payload.picture
                 }
                 if (typeof payload.writerCore === 'string') {
                   writerCore = payload.writerCore
@@ -519,6 +603,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                     encryptionKey: payload.blindPeer.encryptionKey ?? payload.blindPeer.encryption_key ?? null,
                     replicationTopic: payload.blindPeer.replicationTopic ?? payload.blindPeer.replication_topic ?? null,
                     maxBytes: typeof payload.blindPeer.maxBytes === 'number' ? payload.blindPeer.maxBytes : null
+                  }
                 }
               }
               if (Array.isArray(payload.cores)) {
@@ -529,7 +614,6 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                     role: typeof c.role === 'string' ? c.role : null
                   }))
               }
-            }
             } catch {
               token = decrypted
             }
@@ -541,6 +625,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               relayUrl,
               relayKey,
               fileSharing,
+              name: inviteName,
+              about: inviteAbout,
+              picture: invitePicture,
+              isPublic: inviteIsPublic,
+              isOpen: inviteIsOpen,
               blindPeer,
               cores,
               writerCore,
@@ -1045,9 +1134,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const result = await createRelay({
         name,
         description: about || undefined,
+        about: about || undefined,
         isPublic,
         isOpen,
-        fileSharing
+        fileSharing,
+        picture: picture || undefined
       })
       if (!result?.success) throw new Error(result?.error || 'Failed to create relay')
 
@@ -1087,23 +1178,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         isPublic ? { specifiedRelayUrls: BIG_RELAY_URLS } : undefined
       )
 
-      // Publish the same discovery events to the group relay itself (authenticated URL).
-      await Promise.all([
-        publish(groupCreateEvent, { specifiedRelayUrls: [authenticatedRelayUrl] }),
-        publish(metadataEvent, { specifiedRelayUrls: [authenticatedRelayUrl] }),
-        publish(hypertunaEvent, { specifiedRelayUrls: [authenticatedRelayUrl] })
-      ])
-
-      // Bootstrap admin/member snapshots on the group relay.
-      const { adminListEvent, memberListEvent } = buildHypertunaAdminBootstrapDraftEvents({
-        publicIdentifier,
-        adminPubkeyHex: pubkey,
-        name
+      console.info('[GroupsProvider] relay metadata publish delegated to worker', {
+        groupId: publicIdentifier,
+        relayUrl: String(authenticatedRelayUrl).slice(0, 80),
+        isPublic,
+        isOpen,
+        hasPicture: !!picture
       })
-      await Promise.all([
-        publish(adminListEvent, { specifiedRelayUrls: [authenticatedRelayUrl] }),
-        publish(memberListEvent, { specifiedRelayUrls: [authenticatedRelayUrl] })
-      ])
 
       return { groupId: publicIdentifier, relay: relayWsUrl }
     },
@@ -1159,10 +1240,27 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           (g) => g.id === groupId && (!relay || !g.relay || g.relay === relay || g.relay === resolved)
         ) || null
       const relayEntry = getRelayEntryForGroup(groupId)
-      const resolvedIsOpen = typeof options?.isOpen === 'boolean' ? options.isOpen : meta?.isOpen
+      const resolvedIsOpen =
+        typeof options?.isOpen === 'boolean'
+          ? options.isOpen
+          : typeof meta?.isOpen === 'boolean'
+            ? meta.isOpen
+            : typeof relayEntry?.isOpen === 'boolean'
+              ? relayEntry.isOpen
+              : undefined
+      const resolvedIsPublic =
+        typeof options?.isPublic === 'boolean'
+          ? options.isPublic
+          : typeof meta?.isPublic === 'boolean'
+            ? meta.isPublic
+            : typeof relayEntry?.isPublic === 'boolean'
+              ? relayEntry.isPublic
+              : undefined
       const isOpenGroup = resolvedIsOpen === true
-      const inviteName = options?.name ?? meta?.name
-      const inviteAbout = options?.about ?? meta?.about
+      const inviteName = options?.name ?? meta?.name ?? relayEntry?.name
+      const inviteAbout = options?.about ?? meta?.about ?? relayEntry?.description
+      const invitePicture = options?.picture ?? meta?.picture
+      const inviteFileSharing = resolvedIsOpen === false ? false : true
 
       let mirrorMetadata: InviteMirrorMetadata = null
 
@@ -1225,21 +1323,46 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         const payload = isOpenGroup
           ? buildOpenInvitePayload({
               relayUrl: inviteRelayUrl,
-              relayKey: relayEntry?.relayKey || null
+              relayKey: relayEntry?.relayKey || null,
+              meta,
+              isPublic: resolvedIsPublic,
+              isOpen: resolvedIsOpen,
+              name: inviteName,
+              about: inviteAbout,
+              picture: invitePicture,
+              fileSharing: inviteFileSharing
             })
           : buildInvitePayload({
               token: token as string,
               relayUrl: inviteRelayUrl,
               relayKey: relayEntry?.relayKey || null,
               meta,
+              isPublic: resolvedIsPublic,
+              isOpen: resolvedIsOpen,
+              name: inviteName,
+              about: inviteAbout,
+              picture: invitePicture,
+              fileSharing: inviteFileSharing,
               mirrorMetadata: inviteMirrorMetadata,
               writerInfo
             })
+        if (!isOpenGroup) {
+          console.info('[GroupsProvider] Invite payload visibility', {
+            groupId,
+            invitee,
+            isPublic: (payload as { isPublic?: boolean }).isPublic ?? null
+          })
+        }
         const encryptedPayload = await nip04Encrypt(invitee, JSON.stringify(payload))
         console.info('[GroupsProvider] Invite payload built', {
           groupId,
           invitee,
           openInvite: isOpenGroup,
+          isPublic: (payload as { isPublic?: boolean }).isPublic ?? null,
+          isOpen: (payload as { isOpen?: boolean }).isOpen ?? null,
+          hasName: !!inviteName,
+          hasAbout: !!inviteAbout,
+          hasPicture: !!invitePicture,
           hasWriterCore: !!writerInfo?.writerCore,
           hasWriterCoreHex: !!writerInfo?.writerCoreHex,
           hasAutobaseLocal: !!writerInfo?.autobaseLocal,
@@ -1248,7 +1371,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           relayKey: relayEntry?.relayKey ? String(relayEntry.relayKey).slice(0, 16) : null,
           relayUrl: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 80) : null,
           mirrorCoresCount: Array.isArray(inviteMirrorMetadata?.cores) ? inviteMirrorMetadata.cores.length : 0,
-          fileSharing: resolvedIsOpen === false ? false : true
+          fileSharing: inviteFileSharing
         })
         const inviteTags: string[][] = [
           ['h', groupId],
@@ -1257,7 +1380,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         ]
         if (inviteName) inviteTags.push(['name', inviteName])
         if (inviteAbout) inviteTags.push(['about', inviteAbout])
-        inviteTags.push([resolvedIsOpen === false ? 'file-sharing-off' : 'file-sharing-on'])
+        inviteTags.push([inviteFileSharing ? 'file-sharing-on' : 'file-sharing-off'])
 
         if (!isOpenGroup && token) {
           // Add 9000 put-user so membership/auth is consistent with legacy flow
@@ -1349,6 +1472,22 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       const baseRelayUrl = resolved ? getBaseRelayUrl(resolved) : undefined
       const relayEntry = getRelayEntryForGroup(groupId)
+      const resolvedIsOpen =
+        typeof meta?.isOpen === 'boolean'
+          ? meta.isOpen
+          : typeof relayEntry?.isOpen === 'boolean'
+            ? relayEntry.isOpen
+            : undefined
+      const resolvedIsPublic =
+        typeof meta?.isPublic === 'boolean'
+          ? meta.isPublic
+          : typeof relayEntry?.isPublic === 'boolean'
+            ? relayEntry.isPublic
+            : undefined
+      const inviteName = meta?.name ?? relayEntry?.name
+      const inviteAbout = meta?.about ?? relayEntry?.description
+      const invitePicture = meta?.picture
+      const inviteFileSharing = resolvedIsOpen === false ? false : true
 
       let writerInfo: {
         writerCore?: string
@@ -1398,12 +1537,23 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         relayUrl: baseRelayUrl || resolved || relay || null,
         relayKey: relayEntry?.relayKey || null,
         meta,
+        isPublic: resolvedIsPublic,
+        isOpen: resolvedIsOpen,
+        name: inviteName,
+        about: inviteAbout,
+        picture: invitePicture,
+        fileSharing: inviteFileSharing,
         mirrorMetadata,
         writerInfo
       })
       console.info('[GroupsProvider] Approval invite payload built', {
         groupId,
         targetPubkey,
+        isPublic: (payload as { isPublic?: boolean }).isPublic ?? null,
+        isOpen: (payload as { isOpen?: boolean }).isOpen ?? null,
+        hasName: !!inviteName,
+        hasAbout: !!inviteAbout,
+        hasPicture: !!invitePicture,
         hasWriterCore: !!writerInfo?.writerCore,
         hasWriterCoreHex: !!writerInfo?.writerCoreHex,
         hasAutobaseLocal: !!writerInfo?.autobaseLocal,
@@ -1416,9 +1566,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         ['p', targetPubkey],
         ['i', 'hypertuna']
       ]
-      if (meta?.name) tags.push(['name', meta.name])
-      if (meta?.about) tags.push(['about', meta.about])
-      tags.push([payload.fileSharing === false ? 'file-sharing-off' : 'file-sharing-on'])
+      if (inviteName) tags.push(['name', inviteName])
+      if (inviteAbout) tags.push(['about', inviteAbout])
+      tags.push([inviteFileSharing ? 'file-sharing-on' : 'file-sharing-off'])
 
       const encryptedPayload = await nip04Encrypt(targetPubkey, JSON.stringify(payload))
       const inviteEvent: TDraftEvent = {

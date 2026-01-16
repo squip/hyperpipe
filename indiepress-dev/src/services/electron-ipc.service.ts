@@ -19,6 +19,11 @@ export type RelayEntry = {
   registrationStatus?: string
   registrationError?: string
   isActive?: boolean
+  isOpen?: boolean
+  isPublic?: boolean
+  isHosted?: boolean
+  isJoined?: boolean
+  peerCount?: number
   gatewayPath?: string
 }
 

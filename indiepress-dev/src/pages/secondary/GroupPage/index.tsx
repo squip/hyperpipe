@@ -412,13 +412,32 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     [groupId, myGroupList]
   )
   const effectiveGroupRelay = useMemo(() => groupRelay || myGroupRelay, [groupRelay, myGroupRelay])
-  const fallbackMeta = useMemo(
-    () =>
-      discoveryGroups.find(
-        (g) => g.id === groupId && (!effectiveGroupRelay || !g.relay || g.relay === effectiveGroupRelay)
-      ),
-    [discoveryGroups, effectiveGroupRelay, groupId]
-  )
+  const inviteData = useMemo(() => {
+    return invites.find(
+      (inv) =>
+        inv.groupId === groupId && (!effectiveGroupRelay || !inv.relay || inv.relay === effectiveGroupRelay)
+    )
+  }, [invites, groupId, effectiveGroupRelay])
+  const inviteMeta = useMemo(() => {
+    if (!inviteData || !groupId) return null
+    return {
+      id: groupId,
+      relay: effectiveGroupRelay,
+      name: inviteData.name || groupId,
+      about: inviteData.about,
+      picture: inviteData.picture,
+      isPublic: inviteData.isPublic,
+      isOpen: inviteData.isOpen,
+      tags: [],
+      event: inviteData.event
+    }
+  }, [effectiveGroupRelay, groupId, inviteData])
+  const fallbackMeta = useMemo(() => {
+    const discoveryMeta = discoveryGroups.find(
+      (g) => g.id === groupId && (!effectiveGroupRelay || !g.relay || g.relay === effectiveGroupRelay)
+    )
+    return discoveryMeta || inviteMeta
+  }, [discoveryGroups, effectiveGroupRelay, groupId, inviteMeta])
 
   useEffect(() => {
     const searchRelay =
@@ -572,12 +591,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const joinRequestCount = pendingJoinRequests.length
   const isFavorite = favoriteGroups.includes(groupKey)
 
-  const inviteData = useMemo(() => {
-    return invites.find(
-      (inv) =>
-        inv.groupId === groupId && (!effectiveGroupRelay || !inv.relay || inv.relay === effectiveGroupRelay)
-    )
-  }, [invites, groupId, effectiveGroupRelay])
   const inviteToken = inviteData?.token
   const hasInviteJoinData =
     !!inviteData?.token ||
@@ -927,9 +940,44 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       membershipStatus: 'member' as const
     }
   }, [baseDetail, membershipStatus, membersWithSelf, mockMembersConfig])
-  const isOpenGroup = effectiveDetail?.metadata?.isOpen !== false
-  const inviteOpenJoin = !!inviteData && !inviteToken && inviteData.fileSharing !== false
-  const openJoinAllowed = inviteOpenJoin || effectiveDetail?.metadata?.isOpen === true
+  const relayEntryForGroup = useMemo(() => {
+    if (!groupId || !relays?.length) return null
+    const candidates = new Set<string>()
+    candidates.add(groupId)
+    candidates.add(groupId.replace(':', '/'))
+    candidates.add(groupId.replace('/', ':'))
+    return (
+      relays.find(
+        (r) =>
+          (r.publicIdentifier && candidates.has(r.publicIdentifier)) ||
+          (r.relayKey && candidates.has(r.relayKey))
+      ) || null
+    )
+  }, [groupId, relays])
+  const resolvedIsOpen =
+    typeof effectiveDetail?.metadata?.isOpen === 'boolean'
+      ? effectiveDetail.metadata.isOpen
+      : typeof inviteData?.isOpen === 'boolean'
+        ? inviteData.isOpen
+        : typeof relayEntryForGroup?.isOpen === 'boolean'
+          ? relayEntryForGroup.isOpen
+          : undefined
+  const resolvedIsPublic =
+    typeof effectiveDetail?.metadata?.isPublic === 'boolean'
+      ? effectiveDetail.metadata.isPublic
+      : typeof inviteData?.isPublic === 'boolean'
+        ? inviteData.isPublic
+        : typeof relayEntryForGroup?.isPublic === 'boolean'
+          ? relayEntryForGroup.isPublic
+          : undefined
+  const isOpenGroup = resolvedIsOpen === true
+  const inviteOpenJoin =
+    !!inviteData &&
+    !inviteToken &&
+    (typeof inviteData.isOpen === 'boolean'
+      ? inviteData.isOpen
+      : inviteData.fileSharing !== false)
+  const openJoinAllowed = inviteOpenJoin || resolvedIsOpen === true
 
   const isAdmin =
     !!pubkey &&
@@ -967,19 +1015,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   //   startJoinFlow
   // ])
 
-  const relayKeyForGroup = useMemo(() => {
-    if (!groupId || !relays?.length) return undefined
-    const candidates = new Set<string>()
-    candidates.add(groupId)
-    candidates.add(groupId.replace(':', '/'))
-    candidates.add(groupId.replace('/', ':'))
-    const match = relays.find(
-      (r) =>
-        (r.publicIdentifier && candidates.has(r.publicIdentifier)) ||
-        (r.relayKey && candidates.has(r.relayKey))
-    )
-    return match?.relayKey
-  }, [groupId, relays])
+  const relayKeyForGroup = relayEntryForGroup?.relayKey
 
   const groupDisplayName =
     effectiveDetail?.metadata?.name || fallbackMeta?.name || groupId || t('Group')
@@ -992,6 +1028,10 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   )
 
   const relayUrlToCopy = resolvedGroupRelay || effectiveGroupRelay
+  const inviteMetaSource = effectiveDetail?.metadata || inviteMeta || fallbackMeta
+  const inviteMetaName = inviteMetaSource?.name ?? relayEntryForGroup?.name
+  const inviteMetaAbout = inviteMetaSource?.about ?? relayEntryForGroup?.description
+  const inviteMetaPicture = inviteMetaSource?.picture
 
   const filteredMembers = useMemo(() => {
     const term = memberSearch.trim().toLowerCase()
@@ -1033,10 +1073,20 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     if (!groupId || !selectedInvitees.length) return
     setIsSendingInvite(true)
     try {
+      console.info('[GroupPage] invite metadata resolved', {
+        groupId,
+        isOpen: resolvedIsOpen ?? null,
+        isPublic: resolvedIsPublic ?? null,
+        hasName: !!inviteMetaName,
+        hasAbout: !!inviteMetaAbout,
+        hasPicture: !!inviteMetaPicture
+      })
       await sendInvites(groupId, selectedInvitees, effectiveGroupRelay, {
-        isOpen: isOpenGroup,
-        name: effectiveDetail?.metadata?.name,
-        about: effectiveDetail?.metadata?.about
+        isOpen: resolvedIsOpen,
+        isPublic: resolvedIsPublic,
+        name: inviteMetaName,
+        about: inviteMetaAbout,
+        picture: inviteMetaPicture
       })
       toast.success(t('Invites sent'))
       setSelectedInvitees([])

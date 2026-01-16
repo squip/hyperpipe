@@ -4,6 +4,7 @@ import { TPageRef } from '@/types'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Badge } from '@/components/ui/badge'
 import { useTranslation } from 'react-i18next'
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import { Loader2, Users } from 'lucide-react'
@@ -318,27 +319,47 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
           </Button>
         </div>
         {invitesError && <div className="text-sm text-red-500">{invitesError}</div>}
-        {invites.map((inv) => (
-          <Card key={inv.event.id} className="overflow-hidden">
-            <CardContent className="p-4 flex items-center justify-between gap-3">
-              <div>
-                <div className="font-semibold">{inv.groupId}</div>
-                {inv.relay && (
-                  <div className="text-xs text-muted-foreground truncate max-w-[200px]">
-                    {inv.relay}
+        {invites.map((inv) => {
+          const displayName = inv.name || inv.groupId
+          const initials = displayName.slice(0, 2).toUpperCase()
+          return (
+            <Card key={inv.event.id} className="overflow-hidden">
+              <CardContent className="p-4 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3 min-w-0">
+                  <Avatar className="h-10 w-10 shrink-0">
+                    <AvatarImage src={inv.picture || undefined} alt={displayName} />
+                    <AvatarFallback className="text-xs font-semibold">{initials}</AvatarFallback>
+                  </Avatar>
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="font-semibold truncate max-w-[240px]">{displayName}</div>
+                      {typeof inv.isPublic === 'boolean' && (
+                        <Badge variant="outline" className="capitalize">
+                          {inv.isPublic ? t('Public') : t('Private')}
+                        </Badge>
+                      )}
+                    </div>
+                    {inv.about && (
+                      <div className="text-xs text-muted-foreground line-clamp-2">
+                        {inv.about}
+                      </div>
+                    )}
+                    <div className="text-xs text-muted-foreground truncate max-w-[240px]">
+                      {inv.groupId}
+                    </div>
                   </div>
-                )}
-              </div>
-              <Button
-                size="sm"
-                disabled={joiningInviteId === inv.event.id}
-                onClick={() => handleUseInvite(inv)}
-              >
-                {joiningInviteId === inv.event.id ? t('Joining…') : t('Use invite')}
-              </Button>
-            </CardContent>
-          </Card>
-        ))}
+                </div>
+                <Button
+                  size="sm"
+                  disabled={joiningInviteId === inv.event.id}
+                  onClick={() => handleUseInvite(inv)}
+                >
+                  {joiningInviteId === inv.event.id ? t('Joining…') : t('Use invite')}
+                </Button>
+              </CardContent>
+            </Card>
+          )
+        })}
       </div>
     )
   }

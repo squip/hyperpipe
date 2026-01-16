@@ -124,6 +124,8 @@ type JoinFlowWritableCacheEntry = {
 type RelayCreateRequest = {
   name: string
   description?: string
+  about?: string
+  picture?: string
   isPublic?: boolean
   isOpen?: boolean
   fileSharing?: boolean
@@ -892,6 +894,28 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           case 'relay-joined':
             // let relay-update events drive the main list; optionally merge here
             break
+          case 'relay-metadata-published': {
+            const payload = msg?.data || msg
+            console.info('[WorkerBridge] relay-metadata-published', {
+              relayKey: payload?.relayKey,
+              publicIdentifier: payload?.publicIdentifier,
+              metadataEventId: payload?.metadataEventId,
+              adminListEventId: payload?.adminListEventId,
+              memberListEventId: payload?.memberListEventId,
+              timestamp: payload?.timestamp
+            })
+            break
+          }
+          case 'relay-metadata-error': {
+            const payload = msg?.data || msg
+            console.warn('[WorkerBridge] relay-metadata-error', {
+              relayKey: payload?.relayKey,
+              publicIdentifier: payload?.publicIdentifier,
+              error: payload?.error,
+              timestamp: payload?.timestamp
+            })
+            break
+          }
           case 'relay-disconnected':
             setRelays((prev) => prev.filter((r) => r.relayKey !== msg?.data?.relayKey))
             break

@@ -55,6 +55,7 @@ import { getFile, getPfpFile } from './hyperdrive-manager.mjs';
 import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/GatewaySettings.mjs';
 
 const PUBLIC_GATEWAY_REPLICA_IDENTIFIER = 'public-gateway:hyperbee';
+const HYPERTUNA_IDENTIFIER_TAG = 'hypertuna:relay';
 const { DEFAULT_NAMESPACE } = hypercoreCaps;
 
 function parseNostrMessagePayload(message) {
@@ -2324,6 +2325,146 @@ async function publishMemberAddEvent(identifier, pubkey, token, subnetHashes = [
   }
 }
 
+async function publishGroupMetadataEvents({
+  relayKey = null,
+  publicIdentifier = null,
+  name = null,
+  about = '',
+  picture = null,
+  isPublic = false,
+  isOpen = false,
+  fileSharing = true,
+  adminPubkey = null
+} = {}) {
+  const identifier = normalizeRelayIdentifier(publicIdentifier || relayKey || '');
+  if (!identifier) {
+    console.warn('[RelayServer] Skipping group metadata publish: missing identifier', {
+      relayKey,
+      publicIdentifier
+    });
+    return null;
+  }
+  if (!config?.nostr_pubkey_hex || !config?.nostr_nsec_hex) {
+    console.warn('[RelayServer] Skipping group metadata publish: missing signer config', {
+      relayKey,
+      publicIdentifier,
+      hasPubkey: !!config?.nostr_pubkey_hex,
+      hasPrivkey: !!config?.nostr_nsec_hex
+    });
+    return null;
+  }
+
+  const safeName = typeof name === 'string' && name.trim() ? name.trim() : identifier;
+  const safeAbout = typeof about === 'string' ? about : '';
+  const pictureUrl = typeof picture === 'string' && picture.trim() ? picture.trim() : null;
+  const adminKey = adminPubkey || config.nostr_pubkey_hex;
+  const fileSharingEnabled = fileSharing !== false;
+  const now = Math.floor(Date.now() / 1000);
+
+  const metadataTags = [
+    ['d', identifier],
+    ['name', safeName],
+    ['about', safeAbout],
+    ['hypertuna', identifier],
+    ['i', HYPERTUNA_IDENTIFIER_TAG],
+    [isPublic ? 'public' : 'private'],
+    [isOpen ? 'open' : 'closed'],
+    [fileSharingEnabled ? 'file-sharing-on' : 'file-sharing-off']
+  ];
+  if (pictureUrl) {
+    metadataTags.push(['picture', pictureUrl, 'hypertuna:drive:pfp']);
+  }
+
+  const adminTags = [
+    ['d', identifier],
+    ['hypertuna', identifier],
+    ['p', adminKey, 'admin']
+  ];
+
+  let metadataEvent = {
+    kind: 39000,
+    content: `Group metadata for: ${safeName}`,
+    created_at: now,
+    tags: metadataTags,
+    pubkey: config.nostr_pubkey_hex
+  };
+  let adminListEvent = {
+    kind: 39001,
+    content: `Admin list for group: ${safeName}`,
+    created_at: now,
+    tags: adminTags,
+    pubkey: config.nostr_pubkey_hex
+  };
+  let memberListEvent = {
+    kind: 39002,
+    content: `Member list for group: ${safeName}`,
+    created_at: now,
+    tags: adminTags,
+    pubkey: config.nostr_pubkey_hex
+  };
+
+  try {
+    console.log('[RelayServer] Publishing group metadata events', {
+      relayKey,
+      publicIdentifier: identifier,
+      isPublic,
+      isOpen,
+      fileSharing: fileSharingEnabled,
+      hasPicture: !!pictureUrl
+    });
+
+    metadataEvent = await NostrUtils.signEvent(metadataEvent, config.nostr_nsec_hex);
+    adminListEvent = await NostrUtils.signEvent(adminListEvent, config.nostr_nsec_hex);
+    memberListEvent = await NostrUtils.signEvent(memberListEvent, config.nostr_nsec_hex);
+
+    await publishEventToRelay(identifier, metadataEvent);
+    await publishEventToRelay(identifier, adminListEvent);
+    await publishEventToRelay(identifier, memberListEvent);
+
+    console.log('[RelayServer] Group metadata events published', {
+      relayKey,
+      publicIdentifier: identifier,
+      metadataEventId: metadataEvent.id,
+      adminListEventId: adminListEvent.id,
+      memberListEventId: memberListEvent.id
+    });
+
+    if (global.sendMessage) {
+      global.sendMessage({
+        type: 'relay-metadata-published',
+        relayKey,
+        publicIdentifier: identifier,
+        metadataEventId: metadataEvent.id,
+        adminListEventId: adminListEvent.id,
+        memberListEventId: memberListEvent.id,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    return {
+      metadataEventId: metadataEvent.id,
+      adminListEventId: adminListEvent.id,
+      memberListEventId: memberListEvent.id
+    };
+  } catch (error) {
+    console.error('[RelayServer] Error publishing group metadata events', {
+      relayKey,
+      publicIdentifier: identifier,
+      error: error?.message || error
+    });
+    if (global.sendMessage) {
+      global.sendMessage({
+        type: 'relay-metadata-error',
+        relayKey,
+        publicIdentifier: identifier,
+        error: error?.message || String(error),
+        timestamp: new Date().toISOString()
+      });
+    }
+    return null;
+  }
+}
+
 async function isRelayAuthProtected(identifier) {
   try {
     const canonicalIdentifier = normalizeRelayIdentifier(identifier);
@@ -3150,8 +3291,23 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
 // Export relay management functions for worker access
 export async function createRelay(options) {
   // The subnetHash is no longer passed in, it's retrieved from the config
-  const { name, description, isPublic = false, isOpen = false, fileSharing = true } = options;
-  console.log('[RelayServer] Creating relay via adapter:', { name, description, isPublic, isOpen, fileSharing });
+  const {
+    name,
+    description,
+    about,
+    picture,
+    isPublic = false,
+    isOpen = false,
+    fileSharing = true
+  } = options;
+  console.log('[RelayServer] Creating relay via adapter:', {
+    name,
+    description,
+    isPublic,
+    isOpen,
+    fileSharing,
+    hasPicture: !!picture
+  });
 
   const result = await createRelayManager({
     name,
@@ -3169,8 +3325,8 @@ export async function createRelay(options) {
     // Auto-authorize the creator
     // Use nostr_pubkey_hex to check if an admin exists to be authorized.
     if (config.nostr_pubkey_hex) {
+      const adminPubkey = config.nostr_pubkey_hex;
       try {
-        const adminPubkey = config.nostr_pubkey_hex;
         const challengeManager = getChallengeManager();
         const authToken = challengeManager.generateAuthToken(adminPubkey);
         const authStore = getRelayAuthStore();
@@ -3204,6 +3360,24 @@ export async function createRelay(options) {
         console.error('[RelayServer] Failed to auto-authorize creator:', authError);
         result.registrationError = (result.registrationError || '') + ` | Auth Error: ${authError.message}`;
       }
+
+      publishGroupMetadataEvents({
+        relayKey: result.relayKey,
+        publicIdentifier: result.publicIdentifier,
+        name: name || result.profile?.name,
+        about: typeof about === 'string' ? about : description,
+        picture: picture || null,
+        isPublic: typeof isPublic === 'boolean' ? isPublic : result.profile?.isPublic,
+        isOpen: typeof isOpen === 'boolean' ? isOpen : result.profile?.isOpen,
+        fileSharing,
+        adminPubkey
+      }).catch((error) => {
+        console.warn('[RelayServer] Group metadata publish failed', {
+          relayKey: result.relayKey,
+          publicIdentifier: result.publicIdentifier,
+          error: error?.message || error
+        });
+      });
     }
 
     // ALWAYS register with gateway via Hyperswarm if enabled
