@@ -520,7 +520,14 @@ export default class BlindPeeringManager extends EventEmitter {
     }
   }
 
-  async removeRelayMirror(relayContext = {}, { reason = 'manual' } = {}) {
+  async removeRelayMirror(
+    relayContext = {},
+    {
+      reason = 'manual',
+      deleteRemote = true,
+      preserveMetadata = false
+    } = {}
+  ) {
     const identifier = sanitizeKey(relayContext.relayKey || relayContext.identifier || relayContext.publicIdentifier);
     if (!identifier) return false;
     const entryKey = `relay:${identifier}`;
@@ -546,10 +553,12 @@ export default class BlindPeeringManager extends EventEmitter {
       this.mirrorTargets.delete(entryKey);
     }
 
-    this.#removeMetadataEntry(entryKey);
+    if (!preserveMetadata) {
+      this.#removeMetadataEntry(entryKey);
+    }
 
     let deleted = 0;
-    if (this.blindPeering && collected.size) {
+    if (this.blindPeering && collected.size && deleteRemote !== false) {
       const operations = [];
       for (const key of collected) {
         operations.push(
@@ -573,7 +582,9 @@ export default class BlindPeeringManager extends EventEmitter {
       identifier,
       reason,
       mirroredCores: collected.size,
-      deletedCores: deleted
+      deletedCores: deleted,
+      deleteRemote: deleteRemote !== false,
+      preserveMetadata: preserveMetadata === true
     });
     this.emit('mirror-removed', {
       type: 'relay',
@@ -584,7 +595,14 @@ export default class BlindPeeringManager extends EventEmitter {
     return true;
   }
 
-  async removeHyperdriveMirror(driveContext = {}, { reason = 'manual' } = {}) {
+  async removeHyperdriveMirror(
+    driveContext = {},
+    {
+      reason = 'manual',
+      deleteRemote = true,
+      preserveMetadata = false
+    } = {}
+  ) {
     const identifier = sanitizeKey(driveContext.identifier || driveContext.driveKey);
     if (!identifier) return false;
     const entryKey = `drive:${identifier}`;
@@ -609,10 +627,12 @@ export default class BlindPeeringManager extends EventEmitter {
       this.mirrorTargets.delete(entryKey);
     }
 
-    this.#removeMetadataEntry(entryKey);
+    if (!preserveMetadata) {
+      this.#removeMetadataEntry(entryKey);
+    }
 
     let deleted = 0;
-    if (this.blindPeering && collected.size) {
+    if (this.blindPeering && collected.size && deleteRemote !== false) {
       const operations = [];
       for (const key of collected) {
         operations.push(
@@ -638,7 +658,9 @@ export default class BlindPeeringManager extends EventEmitter {
       reason,
       type: eventType,
       mirroredCores: collected.size,
-      deletedCores: deleted
+      deletedCores: deleted,
+      deleteRemote: deleteRemote !== false,
+      preserveMetadata: preserveMetadata === true
     });
     this.emit('mirror-removed', {
       type: eventType,
@@ -649,18 +671,22 @@ export default class BlindPeeringManager extends EventEmitter {
     return true;
   }
 
-  async clearAllMirrors({ reason = 'cleanup' } = {}) {
+  async clearAllMirrors({
+    reason = 'cleanup',
+    deleteRemote = true,
+    preserveMetadata = false
+  } = {}) {
     const entries = Array.from(this.mirrorTargets.values());
     for (const entry of entries) {
       if (entry.type === 'relay') {
         await this.removeRelayMirror(
           { ...entry.context, relayKey: entry.identifier },
-          { reason }
+          { reason, deleteRemote, preserveMetadata }
         );
       } else {
         await this.removeHyperdriveMirror(
           { ...entry.context, identifier: entry.identifier },
-          { reason }
+          { reason, deleteRemote, preserveMetadata }
         );
       }
     }
@@ -691,6 +717,15 @@ export default class BlindPeeringManager extends EventEmitter {
 
       for (const [key, info] of targets) {
         const label = info.label || key;
+        const beforeState = this.#describeCoreSyncState(info.core, label);
+        if (beforeState) {
+          this.logger?.info?.('[BlindPeering] Mirror core sync state', {
+            phase: 'before',
+            reason,
+            targetKey: key,
+            ...beforeState
+          });
+        }
         try {
           await this.#waitForCoreSync(info.core, timeoutMs, label);
           summary.synced += 1;
@@ -702,6 +737,16 @@ export default class BlindPeeringManager extends EventEmitter {
             reason,
             err: error?.message || error
           });
+        } finally {
+          const afterState = this.#describeCoreSyncState(info.core, label);
+          if (afterState) {
+            this.logger?.info?.('[BlindPeering] Mirror core sync state', {
+              phase: 'after',
+              reason,
+              targetKey: key,
+              ...afterState
+            });
+          }
         }
       }
 
@@ -950,6 +995,61 @@ export default class BlindPeeringManager extends EventEmitter {
     const key = normalizeCoreKey(core.key);
     if (!key || target.has(key)) return;
     target.set(key, { core, label });
+  }
+
+  #describeCoreSyncState(core, label = null) {
+    if (!core) return null;
+    const key = normalizeCoreKey(core.key || core.discoveryKey || null);
+    const localLength = Number.isFinite(core.length) ? core.length : null;
+    const contiguousLength = Number.isFinite(core.contiguousLength) ? core.contiguousLength : null;
+    let remoteLength = Number.isFinite(core.remoteLength) ? core.remoteLength : null;
+    let remoteContiguousLength = Number.isFinite(core.remoteContiguousLength) ? core.remoteContiguousLength : null;
+    let lastSeenAt = null;
+    const peers = Array.isArray(core.peers)
+      ? core.peers
+      : (core.peers && typeof core.peers[Symbol.iterator] === 'function'
+        ? Array.from(core.peers)
+        : []);
+    for (const peer of peers) {
+      const peerRemoteLength = Number.isFinite(peer.remoteLength)
+        ? peer.remoteLength
+        : (Number.isFinite(peer.remote?.length) ? peer.remote.length : null);
+      if (Number.isFinite(peerRemoteLength)) {
+        remoteLength = remoteLength === null ? peerRemoteLength : Math.max(remoteLength, peerRemoteLength);
+      }
+      const peerRemoteContiguous = Number.isFinite(peer.remoteContiguousLength)
+        ? peer.remoteContiguousLength
+        : (Number.isFinite(peer.remote?.contiguousLength) ? peer.remote.contiguousLength : null);
+      if (Number.isFinite(peerRemoteContiguous)) {
+        remoteContiguousLength = remoteContiguousLength === null
+          ? peerRemoteContiguous
+          : Math.max(remoteContiguousLength, peerRemoteContiguous);
+      }
+      const lastSeenCandidates = [
+        peer.lastReceived,
+        peer.lastSent,
+        peer.lastSeen,
+        peer.stats?.lastReceived,
+        peer.stats?.lastSent,
+        peer.stats?.lastSeen,
+        peer.stream?.lastReceived,
+        peer.stream?.lastSent
+      ].filter((value) => Number.isFinite(value));
+      if (lastSeenCandidates.length) {
+        const candidate = Math.max(...lastSeenCandidates);
+        lastSeenAt = lastSeenAt === null ? candidate : Math.max(lastSeenAt, candidate);
+      }
+    }
+    return {
+      key,
+      label,
+      localLength,
+      contiguousLength,
+      remoteLength,
+      remoteContiguousLength,
+      peerCount: peers.length,
+      lastSeenAt
+    };
   }
 
   async #deleteCoreByKey(key) {

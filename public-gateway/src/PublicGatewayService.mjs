@@ -945,6 +945,18 @@ class PublicGatewayService {
       if (mergedCores.length) {
         mergedPayload.cores = mergedCores;
       }
+      if (incomingCores.length || closedJoinCores.length) {
+        this.logger?.info?.('[PublicGateway] Mirror metadata merge', {
+          relayKey,
+          publicIdentifier: mergedPayload.publicIdentifier || null,
+          existing: existingCores.length,
+          incoming: incomingCores.length,
+          closedJoin: closedJoinCores.length,
+          merged: mergedCores.length,
+          mirrorSource: mergedPayload.mirrorSource || null,
+          closedJoinEnabled: closedJoinPayload?.closedJoin === true
+        });
+      }
       await this.registrationStore.storeMirrorMetadata(relayKey, mergedPayload);
     } catch (error) {
       this.logger?.warn?.('[PublicGateway] Failed to persist mirror metadata payload', {
@@ -1027,31 +1039,53 @@ class PublicGatewayService {
     return role ? { key, role } : { key };
   }
 
-  #normalizeOpenJoinCoreEntries(entries = [], { maxEntries = null } = {}) {
+  #describeCoreEntrySample(entry) {
+    if (!entry) return null;
+    if (Buffer.isBuffer(entry)) return entry.toString('hex').slice(0, 16);
+    if (typeof entry === 'string') return entry.trim().slice(0, 16);
+    if (entry && typeof entry === 'object') {
+      if (entry.key) return String(entry.key).slice(0, 16);
+      if (entry.core) return String(entry.core).slice(0, 16);
+    }
+    return String(entry).slice(0, 16);
+  }
+
+  #normalizeOpenJoinCoreEntries(entries = [], { maxEntries = null, sampleLimit = 3 } = {}) {
     const normalized = [];
     let rejected = 0;
     let truncated = 0;
+    const rejectedSamples = [];
+    const truncatedSamples = [];
     const limit = Number.isFinite(maxEntries) && maxEntries > 0 ? Math.trunc(maxEntries) : null;
     for (const entry of entries) {
       if (limit && normalized.length >= limit) {
         truncated += 1;
+        if (truncatedSamples.length < sampleLimit) {
+          const sample = this.#describeCoreEntrySample(entry);
+          if (sample) truncatedSamples.push(sample);
+        }
         continue;
       }
       const normalizedEntry = this.#normalizeOpenJoinCoreEntry(entry);
       if (!normalizedEntry) {
         rejected += 1;
+        if (rejectedSamples.length < sampleLimit) {
+          const sample = this.#describeCoreEntrySample(entry);
+          if (sample) rejectedSamples.push(sample);
+        }
         continue;
       }
       normalized.push(normalizedEntry);
     }
-    return { entries: normalized, rejected, truncated };
+    return { entries: normalized, rejected, truncated, rejectedSamples, truncatedSamples };
   }
 
-  #mergeOpenJoinCoreEntries(existingEntries = [], incomingEntries = [], { maxTotal = null } = {}) {
+  #mergeOpenJoinCoreEntries(existingEntries = [], incomingEntries = [], { maxTotal = null, sampleLimit = 3 } = {}) {
     const merged = [];
     const indexByKey = new Map();
     let added = 0;
     let ignored = 0;
+    const ignoredSamples = [];
 
     const addEntry = (entry, isIncoming = false) => {
       const normalized = this.#normalizeOpenJoinCoreEntry(entry);
@@ -1064,7 +1098,13 @@ class PublicGatewayService {
         if (isIncoming) added += 1;
         return;
       }
-      if (isIncoming) ignored += 1;
+      if (isIncoming) {
+        ignored += 1;
+        if (ignoredSamples.length < sampleLimit) {
+          const sample = this.#describeCoreEntrySample(normalized);
+          if (sample) ignoredSamples.push(sample);
+        }
+      }
       const current = merged[existingIndex];
       if (!current.role && normalized.role) {
         merged[existingIndex] = { ...current, role: normalized.role };
@@ -1075,13 +1115,18 @@ class PublicGatewayService {
     for (const entry of incomingEntries) addEntry(entry, true);
 
     let trimmed = 0;
+    let trimmedSamples = [];
     const maxAllowed = Number.isFinite(maxTotal) && maxTotal > 0 ? Math.trunc(maxTotal) : null;
     if (maxAllowed && merged.length > maxAllowed) {
       trimmed = merged.length - maxAllowed;
+      trimmedSamples = merged
+        .slice(0, Math.min(trimmed, sampleLimit))
+        .map((entry) => this.#describeCoreEntrySample(entry))
+        .filter(Boolean);
       merged.splice(0, trimmed);
     }
 
-    return { merged, added, ignored, trimmed };
+    return { merged, added, ignored, trimmed, ignoredSamples, trimmedSamples };
   }
 
   async #verifyOpenJoinAuthEvent(event, { challenge, relayKey, publicIdentifier, purpose } = {}) {
@@ -4306,6 +4351,17 @@ class PublicGatewayService {
     const maxAppend = this.openJoinConfig?.maxAppendCores || 64;
     const normalized = this.#normalizeOpenJoinCoreEntries(rawCores, { maxEntries: maxAppend });
     const rejected = normalized.rejected + normalized.truncated;
+    if (rejected > 0) {
+      this.logger?.warn?.('[PublicGateway] Open join core normalization dropped entries', {
+        relayKey: identifier,
+        received: rawCores.length,
+        normalized: normalized.entries.length,
+        rejected: normalized.rejected,
+        truncated: normalized.truncated,
+        rejectedSamples: normalized.rejectedSamples,
+        truncatedSamples: normalized.truncatedSamples
+      });
+    }
     if (!normalized.entries.length) {
       return res.status(400).json({ error: 'missing-cores', rejected });
     }
@@ -4384,10 +4440,13 @@ class PublicGatewayService {
         relayKey,
         publicIdentifier,
         received: rawCores.length,
+        normalized: normalized.entries.length,
         added: mergeResult.added,
         ignored: mergeResult.ignored,
+        ignoredSamples: mergeResult.ignoredSamples,
         rejected,
         trimmed: mergeResult.trimmed,
+        trimmedSamples: mergeResult.trimmedSamples,
         total: mergeResult.merged.length
       });
 
@@ -4439,6 +4498,17 @@ class PublicGatewayService {
     const maxAppend = this.openJoinConfig?.maxAppendCores || 64;
     const normalized = this.#normalizeOpenJoinCoreEntries(rawCores, { maxEntries: maxAppend });
     const rejected = normalized.rejected + normalized.truncated;
+    if (rejected > 0) {
+      this.logger?.warn?.('[PublicGateway] Closed join core normalization dropped entries', {
+        relayKey,
+        received: rawCores.length,
+        normalized: normalized.entries.length,
+        rejected: normalized.rejected,
+        truncated: normalized.truncated,
+        rejectedSamples: normalized.rejectedSamples,
+        truncatedSamples: normalized.truncatedSamples
+      });
+    }
     if (!normalized.entries.length) {
       return res.status(400).json({ error: 'missing-cores', rejected });
     }
@@ -4534,15 +4604,20 @@ class PublicGatewayService {
       relayKey,
       publicIdentifier: publicIdentifier || null,
       received: rawCores.length,
+      normalized: normalized.entries.length,
       added: mergeResult.added,
       ignored: mergeResult.ignored,
+      ignoredSamples: mergeResult.ignoredSamples,
       rejected,
       trimmed: mergeResult.trimmed,
+      trimmedSamples: mergeResult.trimmedSamples,
       total: mergeResult.merged.length,
       recordFound: !!record,
       updatedAt,
       relayUrl: relayUrl ? relayUrl.slice(0, 80) : null,
-      closedJoinStored
+      closedJoinStored,
+      mirrorTtlSeconds: this.registrationStore?.mirrorTtlSeconds ?? null,
+      cacheTtlSeconds: this.registrationStore?.ttlSeconds ?? null
     });
 
     return res.json({

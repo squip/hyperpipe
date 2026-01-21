@@ -266,6 +266,130 @@ function normalizeCoreRefList(refs) {
   return result
 }
 
+function describeCoreRefCandidate(value) {
+  if (value === null || value === undefined) return null
+  if (Buffer.isBuffer(value)) {
+    return previewValue(b4a.toString(value, 'hex'), 16)
+  }
+  if (value instanceof Uint8Array) {
+    return previewValue(b4a.toString(Buffer.from(value), 'hex'), 16)
+  }
+  if (typeof value === 'string') {
+    return previewValue(value, 16)
+  }
+  if (value && typeof value === 'object') {
+    if (value.key) return describeCoreRefCandidate(value.key)
+    if (value.core) return describeCoreRefCandidate(value.core)
+    if (value.publicKey) return previewValue(value.publicKey, 16)
+  }
+  return previewValue(value, 16)
+}
+
+function normalizeCoreRefListWithStats(refs, { context = null, log = null, maxSample = 3 } = {}) {
+  const input = Array.isArray(refs) ? refs : []
+  const seen = new Set()
+  const normalized = []
+  const invalidSamples = []
+  const duplicateSamples = []
+  let invalidCount = 0
+  let duplicateCount = 0
+
+  for (const ref of input) {
+    const normalizedRef = normalizeCoreRef(ref)
+    if (!normalizedRef) {
+      invalidCount += 1
+      if (invalidSamples.length < maxSample) {
+        const sample = describeCoreRefCandidate(ref)
+        if (sample) invalidSamples.push(sample)
+      }
+      continue
+    }
+    if (seen.has(normalizedRef)) {
+      duplicateCount += 1
+      if (duplicateSamples.length < maxSample) {
+        duplicateSamples.push(previewValue(normalizedRef, 16))
+      }
+      continue
+    }
+    seen.add(normalizedRef)
+    normalized.push(normalizedRef)
+  }
+
+  const inputCount = input.length
+  const normalizedCount = normalized.length
+  const droppedCount = inputCount - normalizedCount
+
+  if (context && log && (invalidCount > 0 || duplicateCount > 0)) {
+    const warn = typeof log.warn === 'function' ? log.warn.bind(log) : console.warn
+    warn('[Worker] Core refs normalized with drops', {
+      context,
+      inputCount,
+      normalizedCount,
+      invalidCount,
+      duplicateCount,
+      droppedCount,
+      invalidSamples,
+      duplicateSamples
+    })
+  }
+
+  return {
+    normalized,
+    inputCount,
+    normalizedCount,
+    invalidCount,
+    duplicateCount,
+    droppedCount,
+    invalidSamples,
+    duplicateSamples
+  }
+}
+
+function mergeCoreRefListsWithStats(lists = [], { context = null, log = null, maxSample = 3 } = {}) {
+  const merged = []
+  const seen = new Set()
+  let inputCount = 0
+  let duplicateCount = 0
+  const duplicateSamples = []
+
+  const arrays = Array.isArray(lists) ? lists : []
+  for (const list of arrays) {
+    if (!Array.isArray(list)) continue
+    for (const ref of list) {
+      if (!ref) continue
+      inputCount += 1
+      if (seen.has(ref)) {
+        duplicateCount += 1
+        if (duplicateSamples.length < maxSample) {
+          duplicateSamples.push(previewValue(ref, 16))
+        }
+        continue
+      }
+      seen.add(ref)
+      merged.push(ref)
+    }
+  }
+
+  if (context && log && duplicateCount > 0) {
+    const info = typeof log.info === 'function' ? log.info.bind(log) : console.log
+    info('[Worker] Core refs merged with duplicates', {
+      context,
+      inputCount,
+      mergedCount: merged.length,
+      duplicateCount,
+      duplicateSamples
+    })
+  }
+
+  return {
+    merged,
+    inputCount,
+    mergedCount: merged.length,
+    duplicateCount,
+    duplicateSamples
+  }
+}
+
 function normalizeMirrorCoreRefs(cores) {
   if (!Array.isArray(cores)) return []
   return normalizeCoreRefList(cores)
@@ -352,7 +476,11 @@ async function loadRelayCoreRefsCache() {
     if (!relays || typeof relays !== 'object') return
     for (const [relayKey, entry] of Object.entries(relays)) {
       const coreRefs = Array.isArray(entry) ? entry : entry?.coreRefs
-      const normalized = normalizeCoreRefList(coreRefs)
+      const normalizedStats = normalizeCoreRefListWithStats(coreRefs, {
+        context: { phase: 'relay-core-refs-cache-load', relayKey: previewValue(relayKey, 16) },
+        log: console
+      })
+      const normalized = normalizedStats.normalized
       if (!normalized.length) continue
       relayMirrorCoreRefsCache.set(relayKey, normalized)
       const existing = relayMirrorCoreRefs.get(relayKey) || []
@@ -388,10 +516,27 @@ async function persistRelayCoreRefsCache(force = false) {
   await loadRelayCoreRefsCache()
   if (!force && !relayCoreRefsCacheDirty) return
   const relays = {}
+  let totalInput = 0
+  let totalNormalized = 0
+  let totalDropped = 0
   for (const [relayKey, coreRefs] of relayMirrorCoreRefs.entries()) {
-    const normalized = normalizeCoreRefList(coreRefs)
-    if (!normalized.length) continue
-    relays[relayKey] = { coreRefs: normalized }
+    const normalizedStats = normalizeCoreRefListWithStats(coreRefs, {
+      context: { phase: 'relay-core-refs-cache-persist', relayKey: previewValue(relayKey, 16) },
+      log: console
+    })
+    totalInput += normalizedStats.inputCount
+    totalNormalized += normalizedStats.normalizedCount
+    totalDropped += normalizedStats.droppedCount
+    if (!normalizedStats.normalized.length) continue
+    relays[relayKey] = { coreRefs: normalizedStats.normalized }
+  }
+  if (totalDropped > 0) {
+    console.warn('[Worker] Relay core refs cache persist dropped entries', {
+      relayCount: Object.keys(relays).length,
+      totalInput,
+      totalNormalized,
+      totalDropped
+    })
   }
   const payload = JSON.stringify({
     version: 1,
@@ -421,30 +566,103 @@ async function getRelayMirrorCoreRefsCache(relayKey) {
   return relayMirrorCoreRefsCache.get(relayKey) || []
 }
 
-function updateRelayMirrorCoreRefs(relayKey, coreRefs, { persist = true } = {}) {
+function updateRelayMirrorCoreRefs(relayKey, coreRefs, { persist = true, context = null } = {}) {
   if (!relayKey || !Array.isArray(coreRefs) || !coreRefs.length) return
-  const normalized = normalizeCoreRefList(coreRefs)
+  const normalizedStats = normalizeCoreRefListWithStats(coreRefs, {
+    context: context
+      ? { phase: 'relay-core-refs-update', relayKey: previewValue(relayKey, 16), context }
+      : null,
+    log: console
+  })
+  const normalized = normalizedStats.normalized
   if (!normalized.length) return
   const existing = relayMirrorCoreRefs.get(relayKey) || []
   if (coreRefsFingerprint(existing) === coreRefsFingerprint(normalized)) {
+    if (context) {
+      console.log('[Worker] Relay core refs update skipped', {
+        relayKey,
+        context,
+        existingCount: existing.length,
+        normalizedCount: normalized.length
+      })
+    }
     return
   }
   relayMirrorCoreRefs.set(relayKey, normalized)
+  if (context) {
+    console.log('[Worker] Relay core refs updated', {
+      relayKey,
+      context,
+      inputCount: normalizedStats.inputCount,
+      normalizedCount: normalizedStats.normalizedCount,
+      droppedCount: normalizedStats.droppedCount,
+      existingCount: existing.length,
+      nextCount: normalized.length,
+      added: Math.max(normalized.length - existing.length, 0),
+      removed: Math.max(existing.length - normalized.length, 0),
+      coreRefsPreview: summarizeCoreRefs(normalized)
+    })
+  }
   if (persist) {
     relayCoreRefsCacheDirty = true
     scheduleRelayCoreRefsCachePersist()
   }
 }
 
-async function resolveRelayMirrorCoreRefs(relayKey, publicIdentifier = null, fallbackRefs = []) {
-  const normalizedFallback = normalizeCoreRefList(fallbackRefs)
+async function resolveRelayMirrorCoreRefs(
+  relayKey,
+  publicIdentifier = null,
+  fallbackRefs = [],
+  { context = null } = {}
+) {
+  const fallbackStats = normalizeCoreRefListWithStats(fallbackRefs, {
+    context: context
+      ? { phase: 'relay-core-refs-fallback', relayKey: previewValue(relayKey, 16), context }
+      : null,
+    log: console
+  })
+  const normalizedFallback = fallbackStats.normalized
   await loadRelayCoreRefsCache()
   const cachedRefs = relayKey ? (relayMirrorCoreRefsCache.get(relayKey) || []) : []
+  const cachedStats = normalizeCoreRefListWithStats(cachedRefs, {
+    context: context
+      ? { phase: 'relay-core-refs-cache', relayKey: previewValue(relayKey, 16), context }
+      : null,
+    log: console
+  })
+  const normalizedCached = cachedStats.normalized
   if (relayKey && relayMirrorCoreRefs.has(relayKey)) {
     const cached = relayMirrorCoreRefs.get(relayKey) || []
-    const merged = mergeCoreRefLists(cachedRefs, cached, normalizedFallback)
-    updateRelayMirrorCoreRefs(relayKey, merged)
-    return merged
+    const liveStats = normalizeCoreRefListWithStats(cached, {
+      context: context
+        ? { phase: 'relay-core-refs-live', relayKey: previewValue(relayKey, 16), context }
+        : null,
+      log: console
+    })
+    const mergeStats = mergeCoreRefListsWithStats(
+      [normalizedCached, liveStats.normalized, normalizedFallback],
+      {
+        context: context
+          ? { phase: 'relay-core-refs-merge', relayKey: previewValue(relayKey, 16), context, source: 'cache' }
+          : null,
+        log: console
+      }
+    )
+    updateRelayMirrorCoreRefs(relayKey, mergeStats.merged, {
+      context: context ? `${context}-resolve-cache` : null
+    })
+    if (context) {
+      console.log('[Worker] Relay core refs resolved from cache', {
+        relayKey,
+        publicIdentifier,
+        context,
+        cachedCount: normalizedCached.length,
+        liveCount: liveStats.normalized.length,
+        fallbackCount: normalizedFallback.length,
+        mergedCount: mergeStats.merged.length
+      })
+    }
+    return mergeStats.merged
   }
 
   let profile = null
@@ -454,10 +672,43 @@ async function resolveRelayMirrorCoreRefs(relayKey, publicIdentifier = null, fal
   if (!profile && publicIdentifier) {
     profile = await getRelayProfileByPublicIdentifier(publicIdentifier)
   }
-  const storedRefs = normalizeCoreRefList(profile?.core_refs || profile?.coreRefs)
-  const merged = mergeCoreRefLists(cachedRefs, storedRefs, normalizedFallback)
-  updateRelayMirrorCoreRefs(relayKey, merged)
-  return merged
+  if (context && !profile) {
+    console.warn('[Worker] Relay core refs profile missing', {
+      relayKey,
+      publicIdentifier,
+      context
+    })
+  }
+  const storedStats = normalizeCoreRefListWithStats(profile?.core_refs || profile?.coreRefs, {
+    context: context
+      ? { phase: 'relay-core-refs-profile', relayKey: previewValue(relayKey, 16), context }
+      : null,
+    log: console
+  })
+  const mergeStats = mergeCoreRefListsWithStats(
+    [normalizedCached, storedStats.normalized, normalizedFallback],
+    {
+      context: context
+        ? { phase: 'relay-core-refs-merge', relayKey: previewValue(relayKey, 16), context, source: 'profile' }
+        : null,
+      log: console
+    }
+  )
+  updateRelayMirrorCoreRefs(relayKey, mergeStats.merged, {
+    context: context ? `${context}-resolve-profile` : null
+  })
+  if (context) {
+    console.log('[Worker] Relay core refs resolved from profile', {
+      relayKey,
+      publicIdentifier,
+      context,
+      cachedCount: normalizedCached.length,
+      storedCount: storedStats.normalized.length,
+      fallbackCount: normalizedFallback.length,
+      mergedCount: mergeStats.merged.length
+    })
+  }
+  return mergeStats.merged
 }
 
 async function mergeRelayCoreRefsFromInviteWriter({
@@ -466,7 +717,16 @@ async function mergeRelayCoreRefsFromInviteWriter({
   writerCoreRef = null,
   reason = 'invite-writer'
 } = {}) {
-  const writerRefs = normalizeCoreRefList(writerCoreRef ? [writerCoreRef] : [])
+  const writerStats = normalizeCoreRefListWithStats(writerCoreRef ? [writerCoreRef] : [], {
+    context: {
+      phase: 'invite-writer-core-ref',
+      relayKey: previewValue(relayKey, 16),
+      publicIdentifier,
+      reason
+    },
+    log: console
+  })
+  const writerRefs = writerStats.normalized
   if (!writerRefs.length) {
     return { status: 'skipped', reason: 'missing-writer-core-ref' }
   }
@@ -477,14 +737,34 @@ async function mergeRelayCoreRefsFromInviteWriter({
   }
 
   const resolvedRelayKey = normalizeRelayKeyHex(profile?.relay_key || profile?.relayKey || relayKey || null)
-  const existingCoreRefs = normalizeCoreRefList(profile?.core_refs || profile?.coreRefs || [])
-  const mergedCoreRefs = mergeCoreRefLists(existingCoreRefs, writerRefs)
+  const existingStats = normalizeCoreRefListWithStats(profile?.core_refs || profile?.coreRefs || [], {
+    context: {
+      phase: 'invite-writer-existing',
+      relayKey: previewValue(resolvedRelayKey || relayKey, 16),
+      publicIdentifier,
+      reason
+    },
+    log: console
+  })
+  const mergeStats = mergeCoreRefListsWithStats([existingStats.normalized, writerRefs], {
+    context: {
+      phase: 'invite-writer-merge',
+      relayKey: previewValue(resolvedRelayKey || relayKey, 16),
+      publicIdentifier,
+      reason
+    },
+    log: console
+  })
+  const existingCoreRefs = existingStats.normalized
+  const mergedCoreRefs = mergeStats.merged
   const existingFingerprint = coreRefsFingerprint(existingCoreRefs)
   const mergedFingerprint = coreRefsFingerprint(mergedCoreRefs)
   const changed = mergedFingerprint && mergedFingerprint !== existingFingerprint
 
   if (resolvedRelayKey && mergedCoreRefs.length) {
-    updateRelayMirrorCoreRefs(resolvedRelayKey, mergedCoreRefs)
+    updateRelayMirrorCoreRefs(resolvedRelayKey, mergedCoreRefs, {
+      context: 'invite-writer-merge'
+    })
   }
 
   if (!profile) {
@@ -815,12 +1095,16 @@ async function syncActiveRelayCoreRefs({
   coreRefs = [],
   reason = 'mirror-update'
 } = {}) {
-  const normalized = normalizeCoreRefList(coreRefs)
+  const normalizedStats = normalizeCoreRefListWithStats(coreRefs, {
+    context: { phase: 'sync-active-core-refs', relayKey: previewValue(relayKey, 16), reason },
+    log: console
+  })
+  const normalized = normalizedStats.normalized
   if (!relayKey || !normalized.length) {
     return { status: 'skipped', reason: 'missing-core-refs' }
   }
 
-  updateRelayMirrorCoreRefs(relayKey, normalized)
+  updateRelayMirrorCoreRefs(relayKey, normalized, { context: 'sync-active-core-refs' })
   const fingerprint = coreRefsFingerprint(normalized)
   if (relayMirrorSyncState.get(relayKey) === fingerprint) {
     return { status: 'skipped', reason: 'already-synced' }
@@ -1667,12 +1951,43 @@ async function appendClosedJoinMirrorCores({
   }
 
   const collectedKeys = coreEntries.map((entry) => entry?.key).filter(Boolean)
+  const collectedStats = normalizeCoreRefListWithStats(collectedKeys, {
+    context: {
+      phase: 'closed-join-collected',
+      relayKey: previewValue(relayIdentifier, 16),
+      publicIdentifier,
+      reason
+    },
+    log: console
+  })
   const storedRefs = await resolveRelayMirrorCoreRefs(
     relayKey || relayIdentifier,
     publicIdentifier || manager?.publicIdentifier || null,
-    writerKey ? [writerKey] : []
+    writerKey ? [writerKey] : [],
+    { context: 'closed-join-append' }
   )
-  const mergedRefs = mergeCoreRefLists(collectedKeys, storedRefs)
+  const storedStats = normalizeCoreRefListWithStats(storedRefs, {
+    context: {
+      phase: 'closed-join-stored',
+      relayKey: previewValue(relayIdentifier, 16),
+      publicIdentifier,
+      reason
+    },
+    log: console
+  })
+  const mergeStats = mergeCoreRefListsWithStats(
+    [collectedStats.normalized, storedStats.normalized],
+    {
+      context: {
+        phase: 'closed-join-merge',
+        relayKey: previewValue(relayIdentifier, 16),
+        publicIdentifier,
+        reason
+      },
+      log: console
+    }
+  )
+  const mergedRefs = mergeStats.merged
   const payloadCores = [...coreEntries]
   const seen = new Set(collectedKeys)
   for (const ref of mergedRefs) {
@@ -1680,6 +1995,53 @@ async function appendClosedJoinMirrorCores({
     seen.add(ref)
     payloadCores.push(ref)
   }
+  const payloadStats = normalizeCoreRefListWithStats(payloadCores, {
+    context: {
+      phase: 'closed-join-payload',
+      relayKey: previewValue(relayIdentifier, 16),
+      publicIdentifier,
+      reason
+    },
+    log: console
+  })
+  const coreEntriesDetailed = coreEntries
+    .map((entry) => {
+      const key = normalizeCoreRef(entry)
+      if (!key) return null
+      const role = entry && typeof entry === 'object' && !Array.isArray(entry)
+        && typeof entry.role === 'string' && entry.role.trim()
+        ? entry.role.trim()
+        : null
+      return role ? { key, role } : { key }
+    })
+    .filter(Boolean)
+  const roleByKey = new Map()
+  for (const entry of coreEntriesDetailed) {
+    roleByKey.set(entry.key, entry.role || null)
+  }
+  const storedKeySet = new Set(storedStats.normalized)
+  const payloadCoresDetailed = payloadCores
+    .map((entry) => {
+      const key = normalizeCoreRef(entry)
+      if (!key) return null
+      let role = null
+      if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+        if (typeof entry.role === 'string' && entry.role.trim()) {
+          role = entry.role.trim()
+        }
+      }
+      if (!role && roleByKey.has(key)) {
+        role = roleByKey.get(key)
+      }
+      const inCollected = roleByKey.has(key)
+      const inStored = storedKeySet.has(key)
+      let source = 'unknown'
+      if (inCollected && inStored) source = 'collected+stored'
+      else if (inCollected) source = 'collected'
+      else if (inStored) source = 'stored'
+      return role ? { key, role, source } : { key, source }
+    })
+    .filter(Boolean)
 
   if (!payloadCores.length) {
     return { status: 'skipped', reason: 'missing-cores' }
@@ -1703,9 +2065,16 @@ async function appendClosedJoinMirrorCores({
     relayKey: relayKey || relayIdentifier,
     publicIdentifier: profileIdentifier || publicIdentifier || null,
     coreRefsCount: payloadCores.length,
+    coreRefsNormalizedCount: payloadStats.normalizedCount,
+    coreRefsDropped: payloadStats.droppedCount,
+    coreRefsDetailed: payloadCoresDetailed,
+    coreRefsCollectedDetailed: coreEntriesDetailed,
     coreRefsPreview: summarizeCoreRefs(
       payloadCores.map((entry) => entry?.key || entry).filter(Boolean)
     ),
+    collectedCount: collectedStats.normalizedCount,
+    storedCount: storedStats.normalizedCount,
+    mergedCount: mergedRefs.length,
     reason
   })
 
@@ -1968,6 +2337,9 @@ async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mi
         resolvedRelayKey: previewValue(data.relayKey || data.relay_key, 16),
         publicIdentifier: data.publicIdentifier || data.public_identifier || null,
         coreRefsCount: Array.isArray(data.cores) ? data.cores.length : 0,
+        mirrorSource: data.mirrorSource || data.mirror_source || null,
+        closedJoin: data.closedJoin === true || data.closed_join === true,
+        updatedAt: data.updatedAt ?? null,
         blindPeerKey: previewValue(mirrorBlindPeer?.publicKey, 16),
         blindPeerHasEncryptionKey: !!mirrorBlindPeer?.encryptionKey
       })
@@ -2040,16 +2412,57 @@ async function applyMirrorMetadataToProfile({
   const rawCoreRefs = Array.isArray(profile.core_refs || profile.coreRefs)
     ? (profile.core_refs || profile.coreRefs)
     : []
-  const existingCoreRefs = normalizeCoreRefList(rawCoreRefs)
-  const mirrorCoreRefs = normalizeMirrorCoreRefs(mirrorData.cores)
-  const extraCoreRefs = normalizeCoreRefList([
+  const existingStats = normalizeCoreRefListWithStats(rawCoreRefs, {
+    context: {
+      phase: 'mirror-profile-existing',
+      relayKey: previewValue(relayKey, 16),
+      publicIdentifier,
+      reason
+    },
+    log: console
+  })
+  const mirrorStats = normalizeCoreRefListWithStats(mirrorData.cores, {
+    context: {
+      phase: 'mirror-profile-mirror',
+      relayKey: previewValue(relayKey, 16),
+      publicIdentifier,
+      origin,
+      reason
+    },
+    log: console
+  })
+  const extraStats = normalizeCoreRefListWithStats([
     profile.writer_core,
     profile.writerCore,
     profile.writer_core_hex,
     profile.autobase_local,
     profile.autobaseLocal
-  ])
-  const mergedCoreRefs = mergeCoreRefLists(existingCoreRefs, mirrorCoreRefs, extraCoreRefs)
+  ], {
+    context: {
+      phase: 'mirror-profile-extra',
+      relayKey: previewValue(relayKey, 16),
+      publicIdentifier,
+      reason
+    },
+    log: console
+  })
+  const mergeStats = mergeCoreRefListsWithStats(
+    [existingStats.normalized, mirrorStats.normalized, extraStats.normalized],
+    {
+      context: {
+        phase: 'mirror-profile-merge',
+        relayKey: previewValue(relayKey, 16),
+        publicIdentifier,
+        origin,
+        reason
+      },
+      log: console
+    }
+  )
+  const existingCoreRefs = existingStats.normalized
+  const mirrorCoreRefs = mirrorStats.normalized
+  const extraCoreRefs = extraStats.normalized
+  const mergedCoreRefs = mergeStats.merged
   const mergedFingerprint = coreRefsFingerprint(mergedCoreRefs)
   const existingFingerprint = coreRefsFingerprint(existingCoreRefs)
   const nextBlindPeer = sanitizeBlindPeerMeta(mirrorData.blindPeer)
@@ -2081,7 +2494,7 @@ async function applyMirrorMetadataToProfile({
     }
   }
 
-  updateRelayMirrorCoreRefs(resolvedRelayKey, mergedCoreRefs)
+  updateRelayMirrorCoreRefs(resolvedRelayKey, mergedCoreRefs, { context: 'mirror-metadata-apply' })
   const shouldSyncActive = !!resolvedRelayKey
     && mergedCoreRefs.length > 0
     && relayMirrorSyncState.get(resolvedRelayKey) !== mergedFingerprint
@@ -2283,7 +2696,9 @@ async function seedBlindPeeringMirrors(manager) {
     if (!relayManager?.relay) continue
     const storedCoreRefs = await resolveRelayMirrorCoreRefs(
       relayKey,
-      relayManager?.publicIdentifier || null
+      relayManager?.publicIdentifier || null,
+      [],
+      { context: 'blind-peering-seed' }
     )
     manager.ensureRelayMirror({
       relayKey,
@@ -2304,7 +2719,9 @@ function attachRelayMirrorHooks(relayKey, relayManager, manager) {
   const handler = () => {
     Promise.resolve(resolveRelayMirrorCoreRefs(
       relayKey,
-      relayManager?.publicIdentifier || null
+      relayManager?.publicIdentifier || null,
+      [],
+      { context: 'blind-peering-update' }
     ))
       .then((coreRefs) => {
         manager.ensureRelayMirror({
@@ -4241,7 +4658,17 @@ async function handleMessageObject(message) {
         const closedInvite = !openJoin && !!inviteToken
         try {
           let hostPeers = Array.isArray(data.hostPeers) ? data.hostPeers : []
-          let coreRefs = Array.isArray(data.cores) ? normalizeCoreRefList(data.cores) : []
+          const coreRefsInput = Array.isArray(data.cores) ? data.cores : []
+          const coreRefsInputStats = normalizeCoreRefListWithStats(coreRefsInput, {
+            context: {
+              phase: 'join-flow-input',
+              publicIdentifier,
+              openJoin,
+              closedInvite
+            },
+            log: console
+          })
+          let coreRefs = coreRefsInputStats.normalized
           let blindPeer = sanitizeBlindPeerMeta(data.blindPeer)
           let joinRelayKey = normalizeRelayKeyHex(data.relayKey)
           let joinRelayUrl = data.relayUrl || null
@@ -4271,6 +4698,10 @@ async function handleMessageObject(message) {
             hostPeersCount: hostPeers.length,
             hasBlindPeer: !!blindPeer?.publicKey,
             coreRefsCount: coreRefs.length,
+            coreRefsInputCount: coreRefsInputStats.inputCount,
+            coreRefsDropped: coreRefsInputStats.droppedCount,
+            coreRefsInvalid: coreRefsInputStats.invalidCount,
+            coreRefsDuplicates: coreRefsInputStats.duplicateCount,
             coreRefsPreview: summarizeCoreRefs(coreRefs),
             writerCorePrefix: previewValue(writerCore, 16),
             writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
@@ -4295,7 +4726,15 @@ async function handleMessageObject(message) {
                 if (bootstrapResult?.status === 'ok' && bootstrapResult.data) {
                   const bootstrapData = bootstrapResult.data
                   const bootstrapBlindPeer = sanitizeBlindPeerMeta(bootstrapData.blindPeer)
-                  const bootstrapCoreRefs = normalizeMirrorCoreRefs(bootstrapData.cores)
+                  const bootstrapCoreStats = normalizeCoreRefListWithStats(bootstrapData.cores, {
+                    context: {
+                      phase: 'open-join-bootstrap',
+                      relayIdentifier,
+                      publicIdentifier
+                    },
+                    log: console
+                  })
+                  const bootstrapCoreRefs = bootstrapCoreStats.normalized
                   const bootstrapRelayKey = normalizeRelayKeyHex(
                     bootstrapData.relayKey || bootstrapData.relay_key || null
                   )
@@ -4334,6 +4773,8 @@ async function handleMessageObject(message) {
                     relayKey: previewValue(joinRelayKey, 16),
                     relayUrl: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
                     coreRefsCount: coreRefs.length,
+                    bootstrapCoreRefsInput: bootstrapCoreStats.inputCount,
+                    bootstrapCoreRefsDropped: bootstrapCoreStats.droppedCount,
                     coreRefsPreview: summarizeCoreRefs(coreRefs),
                     writerCorePrefix: previewValue(writerCore, 16),
                     writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
@@ -4366,7 +4807,16 @@ async function handleMessageObject(message) {
                 if (mirrorResult?.status === 'ok' && mirrorResult.data) {
                   const mirrorData = mirrorResult.data
                   const mirrorBlindPeer = sanitizeBlindPeerMeta(mirrorData.blindPeer)
-                  const mirrorCoreRefs = normalizeMirrorCoreRefs(mirrorData.cores)
+                  const mirrorCoreStats = normalizeCoreRefListWithStats(mirrorData.cores, {
+                    context: {
+                      phase: 'join-flow-mirror',
+                      relayIdentifier,
+                      publicIdentifier,
+                      closedInvite
+                    },
+                    log: console
+                  })
+                  const mirrorCoreRefs = mirrorCoreStats.normalized
                   const mirrorRelayKey = normalizeRelayKeyHex(
                     mirrorData.relayKey || mirrorData.relay_key || null
                   )
@@ -4375,7 +4825,19 @@ async function handleMessageObject(message) {
                   const coreRefsBefore = coreRefs.length
                   if (mirrorCoreRefs.length) {
                     if (closedInvite) {
-                      coreRefs = mergeCoreRefLists(coreRefs, mirrorCoreRefs)
+                      const mergeStats = mergeCoreRefListsWithStats(
+                        [coreRefs, mirrorCoreRefs],
+                        {
+                          context: {
+                            phase: 'join-flow-mirror-merge',
+                            relayIdentifier,
+                            publicIdentifier,
+                            closedInvite
+                          },
+                          log: console
+                        }
+                      )
+                      coreRefs = mergeStats.merged
                     } else if (!coreRefs.length) {
                       coreRefs = mirrorCoreRefs
                     }
@@ -4402,6 +4864,8 @@ async function handleMessageObject(message) {
                     hasBlindPeer: !!blindPeer,
                     coreRefsCount: coreRefs.length,
                     mirrorCoreRefsCount: mirrorCoreRefs.length,
+                    mirrorCoreRefsInput: mirrorCoreStats.inputCount,
+                    mirrorCoreRefsDropped: mirrorCoreStats.droppedCount,
                     coreRefsAdded,
                     closedInvite,
                     relayKey: joinRelayKey ? String(joinRelayKey).slice(0, 16) : null,
@@ -4626,7 +5090,8 @@ async function handleMessageObject(message) {
               const storedCoreRefs = await resolveRelayMirrorCoreRefs(
                 relayKey,
                 publicIdentifier || relayManager?.publicIdentifier || null,
-                writerCoreRef ? [writerCoreRef] : []
+                writerCoreRef ? [writerCoreRef] : [],
+                { context: 'invite-writer-refresh' }
               )
               manager.ensureRelayMirror({
                 relayKey,
@@ -4908,7 +5373,11 @@ async function cleanup() {
 
   if (blindPeeringManager) {
     try {
-      await blindPeeringManager.clearAllMirrors({ reason: 'shutdown' })
+      await blindPeeringManager.clearAllMirrors({
+        reason: 'shutdown',
+        deleteRemote: false,
+        preserveMetadata: true
+      })
     } catch (err) {
       console.warn('[Worker] Failed to clear blind peering mirrors during shutdown:', err?.message || err)
     }

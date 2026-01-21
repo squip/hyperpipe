@@ -754,11 +754,19 @@ export class RelayManager {
 
     async addWriter(key) {
       const localKeyHex = this.relay?.local?.key ? b4a.toString(this.relay.local.key, 'hex') : null;
+      const localCore = this.relay?.local?.core || this.relay?.local || null;
+      const localCoreKey = localCore?.key || localCore?.core?.key || null;
+      const localCoreKeyHex = localCoreKey ? b4a.toString(localCoreKey, 'hex') : null;
+      const localCoreLength = Number.isFinite(localCore?.length)
+        ? localCore.length
+        : (Number.isFinite(localCore?.core?.length) ? localCore.core.length : null);
       console.log('[RelayManager] addWriter append requested', {
         relayKey: this.bootstrap,
         writer: String(key).slice(0, 16),
         writable: this.relay?.writable ?? null,
-        localKey: localKeyHex ? localKeyHex.slice(0, 16) : null
+        localKey: localKeyHex ? localKeyHex.slice(0, 16) : null,
+        writerCoreKey: localCoreKeyHex,
+        writerCoreLength: localCoreLength
       });
       const result = await this.relay.append({
         type: 'addWriter',

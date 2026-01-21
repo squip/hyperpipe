@@ -243,7 +243,10 @@ class MemoryRegistrationStore {
 
   async storeMirrorMetadata(relayKey, payload = {}) {
     if (!relayKey) return;
-    const ttlSeconds = Number.isFinite(this.mirrorTtlSeconds) ? this.mirrorTtlSeconds : this.ttlSeconds;
+    const isClosedJoin = payload?.closedJoin === true || payload?.mirrorSource === 'closed-join';
+    const ttlSeconds = isClosedJoin
+      ? null
+      : (Number.isFinite(this.mirrorTtlSeconds) ? this.mirrorTtlSeconds : this.ttlSeconds);
     const record = {
       payload,
       storedAt: Date.now(),
@@ -270,7 +273,6 @@ class MemoryRegistrationStore {
 
   async storeClosedJoinCoreRefs(relayKey, payload = {}) {
     if (!relayKey) return;
-    const ttlSeconds = Number.isFinite(this.mirrorTtlSeconds) ? this.mirrorTtlSeconds : this.ttlSeconds;
     const cores = Array.isArray(payload)
       ? payload
       : (Array.isArray(payload?.cores) ? payload.cores : []);
@@ -278,9 +280,7 @@ class MemoryRegistrationStore {
     const record = {
       payload: Array.isArray(payload) ? { cores, updatedAt: Date.now() } : { ...payload, cores },
       storedAt: Date.now(),
-      expiresAt: Number.isFinite(ttlSeconds) && ttlSeconds > 0
-        ? Date.now() + ttlSeconds * 1000
-        : null
+      expiresAt: null
     };
     this.closedJoinCoreRefs.set(relayKey, record);
   }

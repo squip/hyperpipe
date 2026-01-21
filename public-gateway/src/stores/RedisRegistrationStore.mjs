@@ -254,13 +254,14 @@ class RedisRegistrationStore {
   async storeMirrorMetadata(relayKey, payload = {}) {
     if (!relayKey) return;
     await this.#ensureConnected();
+    const isClosedJoin = payload?.closedJoin === true || payload?.mirrorSource === 'closed-join';
     const record = JSON.stringify({
       payload,
       storedAt: Date.now()
     });
-    const ttlSeconds = Number.isFinite(this.mirrorTtlSeconds)
-      ? this.mirrorTtlSeconds
-      : this.ttlSeconds;
+    const ttlSeconds = isClosedJoin
+      ? null
+      : (Number.isFinite(this.mirrorTtlSeconds) ? this.mirrorTtlSeconds : this.ttlSeconds);
     if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
       await this.client.set(this.#mirrorKey(relayKey), record, { EX: ttlSeconds });
     } else {
@@ -297,14 +298,7 @@ class RedisRegistrationStore {
       payload: Array.isArray(payload) ? { cores, updatedAt: Date.now() } : { ...payload, cores },
       storedAt: Date.now()
     });
-    const ttlSeconds = Number.isFinite(this.mirrorTtlSeconds)
-      ? this.mirrorTtlSeconds
-      : this.ttlSeconds;
-    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
-      await this.client.set(this.#closedJoinKey(relayKey), record, { EX: ttlSeconds });
-    } else {
-      await this.client.set(this.#closedJoinKey(relayKey), record);
-    }
+    await this.client.set(this.#closedJoinKey(relayKey), record);
   }
 
   async getClosedJoinCoreRefs(relayKey) {
