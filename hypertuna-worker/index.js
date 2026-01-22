@@ -77,6 +77,8 @@ const BLIND_PEER_REHYDRATION_RETRIES = 1
 const BLIND_PEER_REHYDRATION_BACKOFF_MS = 5000
 const BLIND_PEER_JOIN_REHYDRATION_RETRIES = 1
 const BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS = 7000
+const BLIND_PEER_INVITE_MIRROR_ATTEMPTS = 2
+const BLIND_PEER_INVITE_MIRROR_BACKOFF_MS = 3000
 const BLIND_PEER_MIRROR_METADATA_REFRESH_MS = 1 * 60 * 1000
 const BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS = 8000
 const RELAY_WRITER_SYNC_RETRY_TIMEOUT_MS = 30000
@@ -1261,6 +1263,89 @@ async function rehydrateMirrorsWithRetry(manager, {
     attempt += 1
   }
   return summary
+}
+
+async function ensureBlindPeerMirrorReady(manager, {
+  relayKey = null,
+  publicIdentifier = null,
+  coreRefs = [],
+  corestore = null,
+  reason = 'invite-writer',
+  attempts = BLIND_PEER_INVITE_MIRROR_ATTEMPTS,
+  backoffMs = BLIND_PEER_INVITE_MIRROR_BACKOFF_MS
+} = {}) {
+  if (!manager?.getRelayMirrorSyncSummary) {
+    return { status: 'skipped', reason: 'mirror-check-unavailable', ready: false }
+  }
+
+  let lastSummary = null
+  for (let attempt = 0; attempt <= attempts; attempt += 1) {
+    lastSummary = manager.getRelayMirrorSyncSummary({
+      relayKey,
+      publicIdentifier,
+      coreRefs,
+      corestore,
+      requirePeers: false
+    })
+    if (!lastSummary || lastSummary.status !== 'ok') {
+      return {
+        status: lastSummary?.status || 'error',
+        reason: lastSummary?.reason || 'mirror-check-failed',
+        ready: false,
+        summary: lastSummary
+      }
+    }
+
+    const ready = lastSummary.missing === 0 && lastSummary.notReady === 0
+    if (ready) {
+      return { status: 'ok', ready: true, summary: lastSummary }
+    }
+
+    if (attempt >= attempts) break
+
+    console.warn('[Worker] Blind-peer mirror incomplete; retry scheduled', {
+      relayKey,
+      publicIdentifier,
+      attempt: attempt + 1,
+      missing: lastSummary.missing,
+      notReady: lastSummary.notReady,
+      total: lastSummary.total
+    })
+
+    if (manager?.primeRelayCoreRefs) {
+      await manager.primeRelayCoreRefs({
+        relayKey,
+        publicIdentifier,
+        coreRefs,
+        corestore,
+        timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS,
+        reason: `${reason}-prime-${attempt + 1}`
+      })
+    }
+
+    if (manager?.refreshFromBlindPeers) {
+      await manager.refreshFromBlindPeers(`${reason}-refresh-${attempt + 1}`)
+    }
+
+    await rehydrateMirrorsWithRetry(manager, {
+      reason: `${reason}-rehydrate-${attempt + 1}`,
+      timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS,
+      retries: BLIND_PEER_REHYDRATION_RETRIES,
+      backoffMs: BLIND_PEER_REHYDRATION_BACKOFF_MS
+    })
+
+    const waitMs = backoffMs * Math.pow(2, attempt)
+    if (waitMs > 0) {
+      await delay(waitMs)
+    }
+  }
+
+  return {
+    status: 'incomplete',
+    reason: 'mirror-not-ready',
+    ready: false,
+    summary: lastSummary
+  }
 }
 
 function pruneOpenJoinPoolEntries(entries = [], now = Date.now()) {
@@ -5075,7 +5160,8 @@ async function handleMessageObject(message) {
             })
           }
         }
-        sendMessage({ type: 'provision-writer-for-invitee:result', requestId, data: result })
+        let mirrorReady = null
+        let mirrorCheck = null
         try {
           const writerCoreHex = result?.writerCoreHex || result?.autobaseLocal || null
           console.log('[Worker] Refreshing blind-peer mirrors after invite writer', {
@@ -5086,8 +5172,9 @@ async function handleMessageObject(message) {
           const manager = await ensureBlindPeeringManager()
           if (manager?.started) {
             const relayManager = relayKey ? activeRelays.get(relayKey) : null
+            let storedCoreRefs = null
             if (relayManager?.relay) {
-              const storedCoreRefs = await resolveRelayMirrorCoreRefs(
+              storedCoreRefs = await resolveRelayMirrorCoreRefs(
                 relayKey,
                 publicIdentifier || relayManager?.publicIdentifier || null,
                 writerCoreRef ? [writerCoreRef] : [],
@@ -5121,17 +5208,72 @@ async function handleMessageObject(message) {
               synced: summary?.synced ?? null,
               failed: summary?.failed ?? null
             })
+            if (relayManager?.relay && storedCoreRefs?.length) {
+              mirrorCheck = await ensureBlindPeerMirrorReady(manager, {
+                relayKey,
+                publicIdentifier: publicIdentifier || relayManager?.publicIdentifier || null,
+                coreRefs: storedCoreRefs,
+                corestore: relayManager.store || null,
+                reason: 'invite-writer'
+              })
+              mirrorReady = mirrorCheck?.ready === true
+              console.log('[Worker] Blind-peer mirror readiness check', {
+                relayKey,
+                ready: mirrorReady,
+                status: mirrorCheck?.status ?? null,
+                missing: mirrorCheck?.summary?.missing ?? null,
+                notReady: mirrorCheck?.summary?.notReady ?? null,
+                total: mirrorCheck?.summary?.total ?? null
+              })
+            }
           } else {
             console.log('[Worker] Blind-peer manager not started; skipping invite-writer refresh', {
               relayKey,
               enabled: manager?.enabled ?? null
             })
+            mirrorReady = false
+            mirrorCheck = {
+              status: 'skipped',
+              reason: 'blind-peer-not-started',
+              enabled: manager?.enabled ?? null
+            }
           }
         } catch (err) {
           console.warn('[Worker] Blind-peer refresh after invite writer failed', {
             error: err?.message || err
           })
+          mirrorReady = false
+          mirrorCheck = {
+            status: 'error',
+            reason: 'refresh-failed',
+            error: err?.message || err
+          }
         }
+        if (mirrorReady === null) {
+          mirrorReady = false
+          mirrorCheck = mirrorCheck || {
+            status: 'skipped',
+            reason: 'mirror-check-skipped'
+          }
+        }
+        if (mirrorReady === false) {
+          console.warn('[Worker] Blind-peer mirror not ready; blocking invite provision', {
+            relayKey,
+            publicIdentifier,
+            mirrorCheck
+          })
+          sendMessage({
+            type: 'provision-writer-for-invitee:error',
+            requestId,
+            error: 'Blind-peer mirror not ready for closed join invite'
+          })
+          break
+        }
+        if (result && typeof result === 'object') {
+          result.mirrorReady = mirrorReady
+          result.mirrorCheck = mirrorCheck
+        }
+        sendMessage({ type: 'provision-writer-for-invitee:result', requestId, data: result })
         if (mirrorUpdate?.mirrorUnioned === true) {
           refreshGatewayRelayRegistry('invite-writer').then(() => {
             return refreshRelayMirrorMetadata('invite-writer')

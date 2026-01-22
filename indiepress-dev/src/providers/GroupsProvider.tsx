@@ -1191,6 +1191,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               data: { relayKey: relayEntry?.relayKey, publicIdentifier: groupId, inviteePubkey: invitee }
             })
             if (res && typeof res === 'object') {
+              if ((res as any).mirrorReady === false) {
+                console.warn('[GroupsProvider] Blind-peer mirror not ready for invite', {
+                  groupId,
+                  invitee,
+                  relayKey: relayEntry?.relayKey,
+                  mirrorCheck: (res as any).mirrorCheck || null
+                })
+                throw new Error('Blind-peer mirror not ready for closed join invite')
+              }
               writerInfo = {
                 writerCore: (res as any).writerCore,
                 writerCoreHex: (res as any).writerCoreHex,
@@ -1209,6 +1218,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             })
           } catch (err) {
             console.warn('[GroupsProvider] Failed to provision writer for invitee', err)
+            if (!isOpenGroup) {
+              throw err
+            }
           }
         }
 
@@ -1363,6 +1375,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             data: { relayKey: relayEntry.relayKey, publicIdentifier: groupId, inviteePubkey: targetPubkey }
           })
           if (res && typeof res === 'object') {
+            if ((res as any).mirrorReady === false) {
+              console.warn('[GroupsProvider] Blind-peer mirror not ready for approval', {
+                groupId,
+                targetPubkey,
+                relayKey: relayEntry.relayKey,
+                mirrorCheck: (res as any).mirrorCheck || null
+              })
+              throw new Error('Blind-peer mirror not ready for closed join approval')
+            }
             writerInfo = {
               writerCore: (res as any).writerCore,
               writerCoreHex: (res as any).writerCoreHex,
@@ -1381,6 +1402,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           })
         } catch (err) {
           console.warn('[GroupsProvider] Failed to provision writer for approval', err)
+          throw err
         }
       }
 

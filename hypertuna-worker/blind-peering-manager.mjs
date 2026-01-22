@@ -457,6 +457,82 @@ export default class BlindPeeringManager extends EventEmitter {
     return summary;
   }
 
+  getRelayMirrorSyncSummary({
+    relayKey = null,
+    publicIdentifier = null,
+    coreRefs = [],
+    corestore = null,
+    requirePeers = false
+  } = {}) {
+    if (!this.started) {
+      return { status: 'skipped', reason: 'not-started' };
+    }
+    if (!this.blindPeering) {
+      return { status: 'skipped', reason: 'not-configured' };
+    }
+    const targetStore = corestore || this.runtime?.corestore;
+    if (!targetStore) {
+      return { status: 'skipped', reason: 'no-corestore' };
+    }
+
+    const uniqueRefs = Array.from(new Set(
+      (Array.isArray(coreRefs) ? coreRefs : [])
+        .map(normalizeCoreKey)
+        .filter(Boolean)
+    ));
+    if (!uniqueRefs.length) {
+      return { status: 'skipped', reason: 'no-cores' };
+    }
+
+    const labelBase = relayKey || publicIdentifier || 'mirror';
+    const summary = {
+      status: 'ok',
+      relayKey: relayKey || null,
+      publicIdentifier: publicIdentifier || null,
+      total: uniqueRefs.length,
+      ready: 0,
+      missing: 0,
+      notReady: 0,
+      requirePeers: !!requirePeers,
+      checkedAt: Date.now(),
+      states: []
+    };
+
+    for (const ref of uniqueRefs) {
+      const label = `${labelBase}:${ref.slice(0, 16)}`;
+      const core = this.#getMirrorCore(ref, label, targetStore);
+      if (!core) {
+        summary.missing += 1;
+        summary.states.push({
+          key: ref,
+          label,
+          ready: false,
+          missing: true
+        });
+        continue;
+      }
+      const state = this.#describeCoreSyncState(core, label) || { key: ref, label };
+      const remoteKnown = state.remoteLength !== null && state.remoteLength !== undefined;
+      const hasPeers = Number.isFinite(state.peerCount) ? state.peerCount > 0 : false;
+      const ready = remoteKnown && (!requirePeers || hasPeers);
+      if (!remoteKnown) {
+        summary.missing += 1;
+      } else if (!ready) {
+        summary.notReady += 1;
+      } else {
+        summary.ready += 1;
+      }
+      summary.states.push({
+        ...state,
+        ready,
+        missing: !remoteKnown,
+        hasPeers
+      });
+    }
+
+    return summary;
+  }
+
   ensureHyperdriveMirror(driveContext = {}) {
     if (!this.started) return;
     if (!this.blindPeering) return;

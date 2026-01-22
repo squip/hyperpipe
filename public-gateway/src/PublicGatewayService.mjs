@@ -957,6 +957,26 @@ class PublicGatewayService {
           closedJoinEnabled: closedJoinPayload?.closedJoin === true
         });
       }
+
+      const isClosedJoin = mergedPayload?.closedJoin === true || mergedPayload?.mirrorSource === 'closed-join';
+      if (isClosedJoin && mergedCores.length && this.blindPeerService?.pinMirrorCores) {
+        const pinIdentifier = mergedPayload.publicIdentifier || relayKey;
+        const pinResult = this.blindPeerService.pinMirrorCores(mergedCores, {
+          identifier: pinIdentifier,
+          reason: 'closed-join-mirror',
+          announce: true,
+          priority: 8,
+          type: 'closed-join'
+        });
+        this.logger?.info?.('[PublicGateway] Closed join mirror cores pinned', {
+          relayKey,
+          publicIdentifier: pinIdentifier,
+          requested: pinResult?.requested ?? mergedCores.length,
+          pinned: pinResult?.pinned ?? null,
+          invalid: pinResult?.invalid ?? null
+        });
+      }
+
       await this.registrationStore.storeMirrorMetadata(relayKey, mergedPayload);
     } catch (error) {
       this.logger?.warn?.('[PublicGateway] Failed to persist mirror metadata payload', {

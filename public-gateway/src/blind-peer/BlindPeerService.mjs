@@ -403,6 +403,69 @@ export default class BlindPeerService extends EventEmitter {
     }
   }
 
+  pinMirrorCores(coreRefs = [], options = {}) {
+    const refs = Array.isArray(coreRefs) ? coreRefs : [coreRefs];
+    if (!refs.length) {
+      return { status: 'skipped', reason: 'no-cores', pinned: 0 };
+    }
+
+    const identifier = typeof options.identifier === 'string' ? options.identifier.trim() : null;
+    const announce = options.announce === true;
+    const priority = Number.isFinite(options.priority) ? Math.trunc(options.priority) : 5;
+    const type = typeof options.type === 'string' && options.type.trim()
+      ? options.type.trim()
+      : 'closed-join';
+    const reason = typeof options.reason === 'string' && options.reason.trim()
+      ? options.reason.trim()
+      : 'manual';
+
+    let pinned = 0;
+    let invalid = 0;
+    const pinnedKeys = [];
+    for (const entry of refs) {
+      const keyInput = entry && typeof entry === 'object'
+        ? (entry.key || entry.core || entry)
+        : entry;
+      const decoded = decodeKey(keyInput);
+      if (!decoded) {
+        invalid += 1;
+        continue;
+      }
+      this.#recordCoreMetadata(decoded, {
+        identifier,
+        priority,
+        announce,
+        pinned: true,
+        type,
+        lastActive: Date.now()
+      });
+      pinned += 1;
+      pinnedKeys.push(toKeyString(decoded));
+    }
+
+    if (pinned > 0) {
+      this.logger?.info?.('[BlindPeer] Mirror cores pinned', {
+        identifier,
+        reason,
+        requested: refs.length,
+        pinned,
+        invalid,
+        priority,
+        announce
+      });
+      this.#updateMetrics();
+    }
+
+    return {
+      status: pinned > 0 ? 'ok' : 'skipped',
+      identifier,
+      requested: refs.length,
+      pinned,
+      invalid,
+      keys: pinnedKeys
+    };
+  }
+
   async runHygiene(reason = 'manual') {
     return this.#runHygieneCycle(reason);
   }
@@ -592,6 +655,7 @@ export default class BlindPeerService extends EventEmitter {
           lastUpdated: Number.isFinite(entry.lastUpdated) ? Math.trunc(entry.lastUpdated) : Date.now(),
           priority: this.#normalizeMetadataPriority(entry.priority),
           announce: entry.announce === true,
+          pinned: entry.pinned === true,
           lastActive: Number.isFinite(entry.lastActive) ? Math.trunc(entry.lastActive) : Date.now()
         };
         if (record.primaryIdentifier) {
@@ -627,6 +691,7 @@ export default class BlindPeerService extends EventEmitter {
           primaryIdentifier: entry.primaryIdentifier || null,
           type: entry.type || null,
           announce: entry.announce === true,
+          pinned: entry.pinned === true,
           priority: this.#normalizeMetadataPriority(entry.priority),
           firstSeen: entry.firstSeen || null,
           lastUpdated: entry.lastUpdated || null,
@@ -752,6 +817,9 @@ export default class BlindPeerService extends EventEmitter {
           if (!existing) {
             dedupeByIdentifier.set(candidate.identifier, candidate);
           } else {
+            if (existing.pinned && candidate.pinned) {
+              continue;
+            }
             const choice = this.#choosePreferredReplica(existing, candidate);
             if (choice === 'replace') {
               evictionPlans.set(existing.keyStr, {
@@ -884,12 +952,14 @@ export default class BlindPeerService extends EventEmitter {
     );
     const identifier = this.#selectMetadataIdentifier(metadata);
     const announced = (metadata?.announce === true) || (record?.announce === true);
+    const pinned = metadata?.pinned === true;
     return {
       keyStr,
       metadata,
       identifier,
       priority,
       announced,
+      pinned,
       lastActive: this.#extractLastActive(record, metadata),
       bytesAllocated: Number(record?.bytesAllocated) || 0
     };
@@ -926,6 +996,7 @@ export default class BlindPeerService extends EventEmitter {
   #isRecordStale(candidate, staleThreshold) {
     if (!candidate || !staleThreshold || staleThreshold <= 0) return false;
     if (candidate.announced) return false;
+    if (candidate.pinned) return false;
     const priority = Number(candidate.priority ?? 0);
     if (priority > 0) return false;
     if (!candidate.lastActive) return false;
@@ -935,6 +1006,9 @@ export default class BlindPeerService extends EventEmitter {
   #choosePreferredReplica(existing, challenger) {
     if (!existing) return 'replace';
     if (!challenger) return 'keep';
+
+    if (challenger.pinned && !existing.pinned) return 'replace';
+    if (!challenger.pinned && existing.pinned) return 'keep';
 
     if (challenger.announced && !existing.announced) return 'replace';
     if (!challenger.announced && existing.announced) return 'keep';
@@ -999,6 +1073,10 @@ export default class BlindPeerService extends EventEmitter {
       entry.priority = this.#normalizeMetadataPriority(entry.priority, metadata.priority);
     }
 
+    if (metadata.pinned === true) {
+      entry.pinned = true;
+    }
+
     entry.lastUpdated = Date.now();
     entry.lastActive = Date.now();
 
@@ -1021,6 +1099,9 @@ export default class BlindPeerService extends EventEmitter {
       }
       if (metadata.announce === true) {
         existing.announce = true;
+      }
+      if (metadata.pinned === true) {
+        existing.pinned = true;
       }
       if (typeof metadata.type === 'string' && metadata.type.trim()) {
         existing.type = metadata.type.trim();
@@ -1047,6 +1128,7 @@ export default class BlindPeerService extends EventEmitter {
       lastUpdated: now,
       priority: this.#normalizeMetadataPriority(metadata.priority),
       announce: metadata.announce === true,
+      pinned: metadata.pinned === true,
       lastActive: Number.isFinite(metadata.lastActive) ? Math.trunc(metadata.lastActive) : now
     };
     if (entry.primaryIdentifier) {
@@ -1426,6 +1508,7 @@ export default class BlindPeerService extends EventEmitter {
       primaryIdentifier: entry.primaryIdentifier || null,
       announce: entry.announce === true,
       priority: this.#normalizeMetadataPriority(entry.priority),
+      pinned: entry.pinned === true,
       lastActive: entry.lastActive || null,
       type: entry.type || null,
       ownerCount: entry.owners instanceof Map ? entry.owners.size : null
