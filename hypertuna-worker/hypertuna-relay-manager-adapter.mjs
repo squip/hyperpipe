@@ -1607,7 +1607,7 @@ export async function joinRelay(options = {}) {
             }
         }
 
-        if (profileInfo.isOpen === true && typeof global.appendOpenJoinMirrorCores === 'function') {
+        if (typeof global.appendOpenJoinMirrorCores === 'function') {
             global.appendOpenJoinMirrorCores({
                 relayKey,
                 publicIdentifier: profileInfo.public_identifier || publicIdentifier,

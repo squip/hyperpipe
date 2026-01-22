@@ -1919,13 +1919,16 @@ export class GatewayService extends EventEmitter {
       });
       return;
     }
-    if (!metadata || metadata.isOpen !== true) {
-      console.info('[PublicGateway] Open join pool sync skipped: relay not open', {
+    const isOpen = metadata?.isOpen === true;
+    const inviteOnly = metadata?.isOpen === false;
+    if (!metadata || (!isOpen && !inviteOnly)) {
+      console.info('[PublicGateway] Open join pool sync skipped: relay not eligible', {
         relayKey,
         isOpen: metadata?.isOpen ?? null,
         identifier: metadata?.identifier ?? null,
         isHosted: metadata?.isHosted ?? null,
         isJoined: metadata?.isJoined ?? null,
+        inviteOnly,
         metadataUpdatedAt: metadata?.metadataUpdatedAt ?? null
       });
       return;
@@ -1941,7 +1944,8 @@ export class GatewayService extends EventEmitter {
         relayKey,
         publicIdentifier: metadataIdentifier,
         metadata,
-        mode: 'target-only'
+        mode: 'target-only',
+        inviteOnly
       });
       const canonicalRelayKeyRaw = typeof targetResult?.relayKey === 'string'
         ? targetResult.relayKey.trim()
@@ -2033,7 +2037,8 @@ export class GatewayService extends EventEmitter {
           publicIdentifier: poolPublicIdentifier,
           metadata,
           needed,
-          targetSize
+          targetSize,
+          inviteOnly
         });
         const entries = Array.isArray(provision?.entries)
           ? provision.entries
@@ -2117,20 +2122,8 @@ export class GatewayService extends EventEmitter {
   }
 
   async appendClosedJoinMirrorCores(relayKey, relayCores = [], options = {}) {
-    if (!relayKey) {
-      throw new Error('relayKey is required');
-    }
-    const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
-    if (!enabled) {
-      this.log('debug', `[PublicGateway] Closed join core append skipped relay=${relayKey}`);
-      return { status: 'skipped', reason: 'gateway-disabled' };
-    }
-    try {
-      return await this.publicGatewayRegistrar.appendClosedJoinMirrorCores(relayKey, relayCores, options);
-    } catch (error) {
-      this.log('warn', `[PublicGateway] Closed join core append failed relay=${relayKey}: ${error?.message || error}`);
-      return { status: 'error', error: error?.message || String(error) };
-    }
+    this.log('warn', `[PublicGateway] Closed join core append disabled relay=${relayKey || 'unknown'}`);
+    return { status: 'skipped', reason: 'closed-join-disabled' };
   }
 
   async updatePublicGatewayConfig(rawConfig = {}) {

@@ -581,6 +581,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const inviteToken = inviteData?.token
   const hasInviteJoinData =
     !!inviteData?.token ||
+    !!inviteData?.inviteProof ||
     !!inviteData?.blindPeer?.publicKey ||
     (Array.isArray(inviteData?.cores) && inviteData.cores.length > 0) ||
     !!inviteData?.relayKey ||
@@ -778,11 +779,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       if (shouldUseWorkerJoin) {
         console.info('[GroupPage] Starting worker join with invite data', {
           groupId,
-          hasWriterCore: !!inviteData?.writerCore,
-          hasWriterCoreHex: !!inviteData?.writerCoreHex,
-          hasAutobaseLocal: !!inviteData?.autobaseLocal,
-          hasWriterSecret: !!inviteData?.writerSecret,
-          hasBlindPeer: !!inviteData?.blindPeer
+          hasInviteProof: !!inviteData?.inviteProof
         })
         await startJoinFlow(groupId, {
           fileSharing: isOpenGroup,
@@ -791,12 +788,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           token: inviteToken,
           relayKey,
           relayUrl: relayUrlForJoin,
-          blindPeer: inviteData?.blindPeer,
-          cores: inviteData?.cores,
-          writerCore: inviteData?.writerCore,
-          writerCoreHex: inviteData?.writerCoreHex,
-          autobaseLocal: inviteData?.autobaseLocal,
-          writerSecret: inviteData?.writerSecret
+          inviteProof: inviteData?.inviteProof
         })
         return
       }

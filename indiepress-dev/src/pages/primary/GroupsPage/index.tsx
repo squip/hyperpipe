@@ -263,12 +263,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         fileSharing: inv.fileSharing !== false,
         relayKey: relayKey ? String(relayKey).slice(0, 16) : null,
         relayUrl: relayUrl ? String(relayUrl).slice(0, 80) : null,
-        hasBlindPeer: !!inv.blindPeer?.publicKey,
-        coreRefsCount: Array.isArray(inv.cores) ? inv.cores.length : 0,
-        hasWriterCore: !!inv.writerCore,
-        hasWriterCoreHex: !!inv.writerCoreHex,
-        hasAutobaseLocal: !!inv.autobaseLocal,
-        writerSecretLen: inv.writerSecret ? String(inv.writerSecret).length : 0
+        hasInviteProof: !!inv.inviteProof
       })
       if (sendToWorker && pubkey && inv.token) {
         sendToWorker({
@@ -288,12 +283,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         token: inv.token,
         relayKey,
         relayUrl,
-        blindPeer: inv.blindPeer,
-        cores: inv.cores,
-        writerCore: inv.writerCore,
-        writerCoreHex: inv.writerCoreHex,
-        autobaseLocal: inv.autobaseLocal,
-        writerSecret: inv.writerSecret
+        inviteProof: inv.inviteProof
       })
 
       push(toGroup(inv.groupId, relayUrl || inv.relay))

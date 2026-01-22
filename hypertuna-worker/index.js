@@ -59,6 +59,7 @@ import {
   updatePublicGatewaySettings,
   getCachedPublicGatewaySettings
 } from '../shared/config/PublicGatewaySettings.mjs'
+import { createSignature } from '../shared/auth/PublicGatewayTokens.mjs'
 import {
   encryptSharedSecretToString,
   decryptSharedSecretFromString
@@ -713,112 +714,6 @@ async function resolveRelayMirrorCoreRefs(
   return mergeStats.merged
 }
 
-async function mergeRelayCoreRefsFromInviteWriter({
-  relayKey,
-  publicIdentifier = null,
-  writerCoreRef = null,
-  reason = 'invite-writer'
-} = {}) {
-  const writerStats = normalizeCoreRefListWithStats(writerCoreRef ? [writerCoreRef] : [], {
-    context: {
-      phase: 'invite-writer-core-ref',
-      relayKey: previewValue(relayKey, 16),
-      publicIdentifier,
-      reason
-    },
-    log: console
-  })
-  const writerRefs = writerStats.normalized
-  if (!writerRefs.length) {
-    return { status: 'skipped', reason: 'missing-writer-core-ref' }
-  }
-
-  let profile = relayKey ? await getRelayProfileByKey(relayKey) : null
-  if (!profile && publicIdentifier) {
-    profile = await getRelayProfileByPublicIdentifier(publicIdentifier)
-  }
-
-  const resolvedRelayKey = normalizeRelayKeyHex(profile?.relay_key || profile?.relayKey || relayKey || null)
-  const existingStats = normalizeCoreRefListWithStats(profile?.core_refs || profile?.coreRefs || [], {
-    context: {
-      phase: 'invite-writer-existing',
-      relayKey: previewValue(resolvedRelayKey || relayKey, 16),
-      publicIdentifier,
-      reason
-    },
-    log: console
-  })
-  const mergeStats = mergeCoreRefListsWithStats([existingStats.normalized, writerRefs], {
-    context: {
-      phase: 'invite-writer-merge',
-      relayKey: previewValue(resolvedRelayKey || relayKey, 16),
-      publicIdentifier,
-      reason
-    },
-    log: console
-  })
-  const existingCoreRefs = existingStats.normalized
-  const mergedCoreRefs = mergeStats.merged
-  const existingFingerprint = coreRefsFingerprint(existingCoreRefs)
-  const mergedFingerprint = coreRefsFingerprint(mergedCoreRefs)
-  const changed = mergedFingerprint && mergedFingerprint !== existingFingerprint
-
-  if (resolvedRelayKey && mergedCoreRefs.length) {
-    updateRelayMirrorCoreRefs(resolvedRelayKey, mergedCoreRefs, {
-      context: 'invite-writer-merge'
-    })
-  }
-
-  if (!profile) {
-    console.warn('[Worker] Invite writer core refs stored in cache only (profile missing)', {
-      relayKey: resolvedRelayKey || relayKey || null,
-      publicIdentifier,
-      reason,
-      coreRefsCount: mergedCoreRefs.length
-    })
-    return {
-      status: changed ? 'cached' : 'skipped',
-      reason: changed ? 'cached-only' : 'no-change',
-      relayKey: resolvedRelayKey || relayKey || null,
-      coreRefsCount: mergedCoreRefs.length,
-      added: Math.max(mergedCoreRefs.length - existingCoreRefs.length, 0)
-    }
-  }
-
-  if (!changed) {
-    return {
-      status: 'skipped',
-      reason: 'no-change',
-      relayKey: resolvedRelayKey || relayKey || null,
-      coreRefsCount: existingCoreRefs.length,
-      added: 0
-    }
-  }
-
-  const updatedProfile = {
-    ...profile,
-    core_refs: mergedCoreRefs,
-    updated_at: new Date().toISOString()
-  }
-  await saveRelayProfile(updatedProfile)
-
-  console.log('[Worker] Invite writer core refs merged into profile', {
-    relayKey: resolvedRelayKey || relayKey || null,
-    publicIdentifier: updatedProfile.public_identifier || publicIdentifier || null,
-    reason,
-    coreRefsCount: mergedCoreRefs.length,
-    added: Math.max(mergedCoreRefs.length - existingCoreRefs.length, 0),
-    coreRefsPreview: summarizeCoreRefs(mergedCoreRefs)
-  })
-
-  return {
-    status: 'updated',
-    relayKey: resolvedRelayKey || relayKey || null,
-    coreRefsCount: mergedCoreRefs.length,
-    added: Math.max(mergedCoreRefs.length - existingCoreRefs.length, 0)
-  }
-}
-
 function bufferListHas(buffers, candidate) {
   if (!candidate || !Array.isArray(buffers)) return false
   return buffers.some((entry) => entry && b4a.equals(entry, candidate))
@@ -1270,7 +1165,7 @@ async function ensureBlindPeerMirrorReady(manager, {
   publicIdentifier = null,
   coreRefs = [],
   corestore = null,
-  reason = 'invite-writer',
+  reason = 'mirror-ready',
   attempts = BLIND_PEER_INVITE_MIRROR_ATTEMPTS,
   backoffMs = BLIND_PEER_INVITE_MIRROR_BACKOFF_MS
 } = {}) {
@@ -1379,12 +1274,33 @@ function summarizeCoreRefs(coreRefs = [], limit = 3) {
   return coreRefs.slice(0, limit).map((ref) => previewValue(ref, 16))
 }
 
+function normalizeInviteProof(inviteProof) {
+  if (!inviteProof || typeof inviteProof !== 'object') return null
+  const payload = inviteProof.payload && typeof inviteProof.payload === 'object'
+    ? inviteProof.payload
+    : null
+  const signature = typeof inviteProof.signature === 'string' ? inviteProof.signature : null
+  if (!payload || !signature) return null
+  return { payload, signature, scheme: inviteProof.scheme || null }
+}
+
+function serializeInviteProof(inviteProof) {
+  const normalized = normalizeInviteProof(inviteProof)
+  if (!normalized) return null
+  try {
+    return Buffer.from(JSON.stringify(normalized)).toString('base64url')
+  } catch (_err) {
+    return null
+  }
+}
+
 async function ensureOpenJoinWriterPool({
   relayKey,
   publicIdentifier,
   needed = null,
   targetSize = OPEN_JOIN_POOL_TARGET_SIZE,
-  mode = 'provision'
+  mode = 'provision',
+  inviteOnly = false
 } = {}) {
   const normalizedRelayKey = normalizeRelayKeyHex(relayKey)
   const normalizedPublicIdentifier = typeof publicIdentifier === 'string' ? publicIdentifier.trim() : null
@@ -1402,6 +1318,7 @@ async function ensureOpenJoinWriterPool({
     relayKey: normalizedRelayKey || relayKey || null,
     publicIdentifier: normalizedPublicIdentifier || publicIdentifier || null,
     mode,
+    inviteOnly: inviteOnly === true,
     requestedCount,
     targetSize: resolvedTarget
   })
@@ -1468,11 +1385,15 @@ async function ensureOpenJoinWriterPool({
       })
       return null
     }
-    if (profile.isOpen !== true) {
+    const isOpen = profile.isOpen === true
+    const isClosed = profile.isOpen === false
+    const allowInviteOnly = inviteOnly === true && isClosed
+    if (!isOpen && !allowInviteOnly) {
       console.warn('[Worker] Open join pool skipped: relay not open', {
         relayKey: relayKeyForLog || null,
         publicIdentifier: publicIdentifierForLog || null,
-        isOpen: profile.isOpen
+        isOpen: profile.isOpen,
+        inviteOnly
       })
       return null
     }
@@ -1570,6 +1491,21 @@ async function ensureOpenJoinWriterPool({
       updatedAt,
       entryPreview: summarizeOpenJoinEntries(newEntries)
     })
+    if (newEntries.length) {
+      const mirrorRelayKey = canonicalRelayKey || normalizedRelayKey || null
+      appendOpenJoinMirrorCores({
+        relayKey: mirrorRelayKey,
+        publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || publicIdentifier || null,
+        relayManager: mirrorRelayKey ? activeRelays.get(mirrorRelayKey) : null,
+        reason: 'open-join-pool'
+      }).catch((error) => {
+        console.warn('[Worker] Open join pool mirror append failed', {
+          relayKey: relayKeyForLog ? previewValue(relayKeyForLog, 16) : null,
+          publicIdentifier: publicIdentifierForLog,
+          error: error?.message || error
+        })
+      })
+    }
     return {
       entries: newEntries,
       updatedAt,
@@ -2012,183 +1948,10 @@ async function appendOpenJoinMirrorCores({
   })
 }
 
-async function appendClosedJoinMirrorCores({
-  relayKey,
-  publicIdentifier = null,
-  relayManager = null,
-  writerCoreRef = null,
-  reason = 'invite-writer'
-} = {}) {
-  const relayIdentifier = relayKey || publicIdentifier
-  if (!relayIdentifier) {
-    return { status: 'skipped', reason: 'missing-relay-identifier' }
-  }
-  await ensurePublicGatewaySettingsLoaded()
-  if (!gatewayService?.appendClosedJoinMirrorCores) {
-    return { status: 'skipped', reason: 'gateway-unavailable' }
-  }
-
-  const manager = relayManager || (relayKey ? activeRelays.get(relayKey) : null)
-  const coreEntries = collectRelayCoreEntriesForAppend(manager)
-  const writerKey = normalizeCoreRef(writerCoreRef)
-  if (writerKey && !coreEntries.some((entry) => entry?.key === writerKey)) {
-    coreEntries.push({ key: writerKey, role: 'invite-writer' })
-  }
-
-  const collectedKeys = coreEntries.map((entry) => entry?.key).filter(Boolean)
-  const collectedStats = normalizeCoreRefListWithStats(collectedKeys, {
-    context: {
-      phase: 'closed-join-collected',
-      relayKey: previewValue(relayIdentifier, 16),
-      publicIdentifier,
-      reason
-    },
-    log: console
-  })
-  const storedRefs = await resolveRelayMirrorCoreRefs(
-    relayKey || relayIdentifier,
-    publicIdentifier || manager?.publicIdentifier || null,
-    writerKey ? [writerKey] : [],
-    { context: 'closed-join-append' }
-  )
-  const storedStats = normalizeCoreRefListWithStats(storedRefs, {
-    context: {
-      phase: 'closed-join-stored',
-      relayKey: previewValue(relayIdentifier, 16),
-      publicIdentifier,
-      reason
-    },
-    log: console
-  })
-  const mergeStats = mergeCoreRefListsWithStats(
-    [collectedStats.normalized, storedStats.normalized],
-    {
-      context: {
-        phase: 'closed-join-merge',
-        relayKey: previewValue(relayIdentifier, 16),
-        publicIdentifier,
-        reason
-      },
-      log: console
-    }
-  )
-  const mergedRefs = mergeStats.merged
-  const payloadCores = [...coreEntries]
-  const seen = new Set(collectedKeys)
-  for (const ref of mergedRefs) {
-    if (!ref || seen.has(ref)) continue
-    seen.add(ref)
-    payloadCores.push(ref)
-  }
-  const payloadStats = normalizeCoreRefListWithStats(payloadCores, {
-    context: {
-      phase: 'closed-join-payload',
-      relayKey: previewValue(relayIdentifier, 16),
-      publicIdentifier,
-      reason
-    },
-    log: console
-  })
-  const coreEntriesDetailed = coreEntries
-    .map((entry) => {
-      const key = normalizeCoreRef(entry)
-      if (!key) return null
-      const role = entry && typeof entry === 'object' && !Array.isArray(entry)
-        && typeof entry.role === 'string' && entry.role.trim()
-        ? entry.role.trim()
-        : null
-      return role ? { key, role } : { key }
-    })
-    .filter(Boolean)
-  const roleByKey = new Map()
-  for (const entry of coreEntriesDetailed) {
-    roleByKey.set(entry.key, entry.role || null)
-  }
-  const storedKeySet = new Set(storedStats.normalized)
-  const payloadCoresDetailed = payloadCores
-    .map((entry) => {
-      const key = normalizeCoreRef(entry)
-      if (!key) return null
-      let role = null
-      if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
-        if (typeof entry.role === 'string' && entry.role.trim()) {
-          role = entry.role.trim()
-        }
-      }
-      if (!role && roleByKey.has(key)) {
-        role = roleByKey.get(key)
-      }
-      const inCollected = roleByKey.has(key)
-      const inStored = storedKeySet.has(key)
-      let source = 'unknown'
-      if (inCollected && inStored) source = 'collected+stored'
-      else if (inCollected) source = 'collected'
-      else if (inStored) source = 'stored'
-      return role ? { key, role, source } : { key, source }
-    })
-    .filter(Boolean)
-
-  if (!payloadCores.length) {
-    return { status: 'skipped', reason: 'missing-cores' }
-  }
-
-  let profile = null
-  if (relayKey) {
-    profile = await getRelayProfileByKey(relayKey)
-  }
-  if (!profile && publicIdentifier) {
-    profile = await getRelayProfileByPublicIdentifier(publicIdentifier)
-  }
-  const profileIdentifier = profile?.public_identifier || profile?.publicIdentifier || null
-  const metadata = {
-    identifier: profileIdentifier || publicIdentifier || relayIdentifier,
-    isOpen: profile?.isOpen === true ? true : false,
-    isPublic: profile?.isPublic === true ? true : false
-  }
-
-  console.log('[Worker] Closed join core append start', {
-    relayKey: relayKey || relayIdentifier,
-    publicIdentifier: profileIdentifier || publicIdentifier || null,
-    coreRefsCount: payloadCores.length,
-    coreRefsNormalizedCount: payloadStats.normalizedCount,
-    coreRefsDropped: payloadStats.droppedCount,
-    coreRefsDetailed: payloadCoresDetailed,
-    coreRefsCollectedDetailed: coreEntriesDetailed,
-    coreRefsPreview: summarizeCoreRefs(
-      payloadCores.map((entry) => entry?.key || entry).filter(Boolean)
-    ),
-    collectedCount: collectedStats.normalizedCount,
-    storedCount: storedStats.normalizedCount,
-    mergedCount: mergedRefs.length,
-    reason
-  })
-
-  try {
-    const response = await gatewayService.appendClosedJoinMirrorCores(relayKey || relayIdentifier, payloadCores, {
-      publicIdentifier: profileIdentifier || publicIdentifier || null,
-      metadata,
-      reason
-    })
-    console.log('[Worker] Closed join core append response', {
-      relayKey: relayKey || relayIdentifier,
-      publicIdentifier: profileIdentifier || publicIdentifier || null,
-      status: response?.status ?? null,
-      added: response?.added ?? null,
-      ignored: response?.ignored ?? null,
-      rejected: response?.rejected ?? null,
-      total: response?.total ?? null
-    })
-    return response
-  } catch (error) {
-    console.warn('[Worker] Closed join core append failed', {
-      relayKey: relayKey || relayIdentifier,
-      error: error?.message || error
-    })
-    return { status: 'error', error: error?.message || String(error) }
-  }
-}
-
-async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason = 'open-join' } = {}) {
+async function fetchOpenJoinBootstrap(
+  relayIdentifier,
+  { origins = null, reason = 'open-join', inviteProof = null } = {}
+) {
   if (!relayIdentifier) {
     return { status: 'skipped', reason: 'missing-relay-identifier' }
   }
@@ -2219,6 +1982,8 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
     return { status: 'skipped', reason: 'nostr-pubkey-derivation-failed' }
   }
 
+  const inviteProofHeader = serializeInviteProof(inviteProof)
+
   for (const origin of originList) {
     if (!origin) continue
     const base = origin.replace(/\/$/, '')
@@ -2228,7 +1993,10 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
       : null
     try {
       const challengeUrl = `${base}/api/relays/${encodedRelay}/open-join/challenge`
-      const challengeResponse = await fetchImpl(challengeUrl, { signal: controller?.signal })
+      const challengeResponse = await fetchImpl(challengeUrl, {
+        signal: controller?.signal,
+        headers: inviteProofHeader ? { 'x-invite-proof': inviteProofHeader } : undefined
+      })
       if (!challengeResponse.ok) {
         let body = null
         try {
@@ -2318,8 +2086,10 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
       const joinUrl = `${base}/api/relays/${encodedRelay}/open-join`
       const joinResponse = await fetchImpl(joinUrl, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ authEvent })
+        headers: inviteProofHeader
+          ? { 'content-type': 'application/json', 'x-invite-proof': inviteProofHeader }
+          : { 'content-type': 'application/json' },
+        body: JSON.stringify(inviteProof ? { authEvent, inviteProof } : { authEvent })
       })
       if (!joinResponse.ok) {
         let body = null
@@ -2423,7 +2193,6 @@ async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mi
         publicIdentifier: data.publicIdentifier || data.public_identifier || null,
         coreRefsCount: Array.isArray(data.cores) ? data.cores.length : 0,
         mirrorSource: data.mirrorSource || data.mirror_source || null,
-        closedJoin: data.closedJoin === true || data.closed_join === true,
         updatedAt: data.updatedAt ?? null,
         blindPeerKey: previewValue(mirrorBlindPeer?.publicKey, 16),
         blindPeerHasEncryptionKey: !!mirrorBlindPeer?.encryptionKey
@@ -4732,18 +4501,23 @@ async function handleMessageObject(message) {
         const data = (message && typeof message === 'object' ? message.data : null) || {}
         const publicIdentifier = data.publicIdentifier
         const fileSharing = data.fileSharing
-        const openJoin = data.openJoin === true
+        const openJoinAllowed = data.openJoin === true
         const isOpen =
           typeof data.isOpen === 'boolean'
             ? data.isOpen
-            : openJoin
+            : openJoinAllowed
               ? true
               : undefined
         const inviteToken = typeof data.token === 'string' ? data.token.trim() : null
-        const closedInvite = !openJoin && !!inviteToken
+        const inviteProof = normalizeInviteProof(data.inviteProof)
+        const hasInviteProof = !!inviteProof
+        const closedInvite = !openJoinAllowed && !!inviteToken
+        const openJoin = openJoinAllowed || (closedInvite && hasInviteProof)
         try {
           let hostPeers = Array.isArray(data.hostPeers) ? data.hostPeers : []
-          const coreRefsInput = Array.isArray(data.cores) ? data.cores : []
+          const coreRefsInput = closedInvite
+            ? []
+            : (Array.isArray(data.cores) ? data.cores : [])
           const coreRefsInputStats = normalizeCoreRefListWithStats(coreRefsInput, {
             context: {
               phase: 'join-flow-input',
@@ -4754,18 +4528,21 @@ async function handleMessageObject(message) {
             log: console
           })
           let coreRefs = coreRefsInputStats.normalized
-          let blindPeer = sanitizeBlindPeerMeta(data.blindPeer)
+          let blindPeer = closedInvite ? null : sanitizeBlindPeerMeta(data.blindPeer)
           let joinRelayKey = normalizeRelayKeyHex(data.relayKey)
           let joinRelayUrl = data.relayUrl || null
-          let writerCore = data.writerCore || null
-          let writerSecret = data.writerSecret || null
-          let writerCoreHex =
-            data.writerCoreHex ||
-            data.writer_core_hex ||
-            data.autobaseLocal ||
-            data.autobase_local ||
-            null
-          let autobaseLocal = data.autobaseLocal || data.autobase_local || null
+          let writerCore = closedInvite ? null : (data.writerCore || null)
+          let writerSecret = closedInvite ? null : (data.writerSecret || null)
+          let writerCoreHex = closedInvite
+            ? null
+            : (data.writerCoreHex ||
+              data.writer_core_hex ||
+              data.autobaseLocal ||
+              data.autobase_local ||
+              null)
+          let autobaseLocal = closedInvite
+            ? null
+            : (data.autobaseLocal || data.autobase_local || null)
           if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
           if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
           hostPeers = hostPeers
@@ -4778,6 +4555,7 @@ async function handleMessageObject(message) {
             closedInvite,
             isOpen,
             hasInviteToken: !!inviteToken,
+            hasInviteProof,
             relayKey: previewValue(joinRelayKey, 16),
             relayUrl: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
             hostPeersCount: hostPeers.length,
@@ -4802,12 +4580,16 @@ async function handleMessageObject(message) {
             })
           }
 
-          if (openJoin && !inviteToken && (!writerCore || !writerSecret)) {
+          const shouldAttemptOpenJoinBootstrap = openJoin && (!writerCore || !writerSecret)
+          if (shouldAttemptOpenJoinBootstrap) {
             const relayIdentifier = joinRelayKey || publicIdentifier
             if (relayIdentifier) {
               try {
                 await ensurePublicGatewaySettingsLoaded()
-                const bootstrapResult = await fetchOpenJoinBootstrap(relayIdentifier, { reason: 'open-join' })
+                const bootstrapResult = await fetchOpenJoinBootstrap(relayIdentifier, {
+                  reason: closedInvite && hasInviteProof ? 'invite-join' : 'open-join',
+                  inviteProof
+                })
                 if (bootstrapResult?.status === 'ok' && bootstrapResult.data) {
                   const bootstrapData = bootstrapResult.data
                   const bootstrapBlindPeer = sanitizeBlindPeerMeta(bootstrapData.blindPeer)
@@ -4882,7 +4664,7 @@ async function handleMessageObject(message) {
           }
 
           const shouldFetchMirror = (!hostPeers || hostPeers.length === 0)
-            && (!blindPeer || !blindPeer.publicKey || closedInvite)
+            && (!blindPeer || !blindPeer.publicKey)
           if (shouldFetchMirror) {
             const relayIdentifier = joinRelayKey || publicIdentifier
             if (relayIdentifier) {
@@ -4908,24 +4690,8 @@ async function handleMessageObject(message) {
                   if (!joinRelayKey && mirrorRelayKey) joinRelayKey = mirrorRelayKey
                   if (!blindPeer && mirrorBlindPeer) blindPeer = mirrorBlindPeer
                   const coreRefsBefore = coreRefs.length
-                  if (mirrorCoreRefs.length) {
-                    if (closedInvite) {
-                      const mergeStats = mergeCoreRefListsWithStats(
-                        [coreRefs, mirrorCoreRefs],
-                        {
-                          context: {
-                            phase: 'join-flow-mirror-merge',
-                            relayIdentifier,
-                            publicIdentifier,
-                            closedInvite
-                          },
-                          log: console
-                        }
-                      )
-                      coreRefs = mergeStats.merged
-                    } else if (!coreRefs.length) {
-                      coreRefs = mirrorCoreRefs
-                    }
+                  if (mirrorCoreRefs.length && !coreRefs.length) {
+                    coreRefs = mirrorCoreRefs
                   }
                   const coreRefsAdded = Math.max(coreRefs.length - coreRefsBefore, 0)
                   if (!writerCore && mirrorData.writerCore) writerCore = String(mirrorData.writerCore)
@@ -5051,6 +4817,7 @@ async function handleMessageObject(message) {
             closedInvite,
             isOpen,
             hasInviteToken: !!inviteToken,
+            hasInviteProof,
             relayKey: previewValue(joinRelayKey, 16),
             relayUrl: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
             hostPeersCount: hostPeers.length,
@@ -5098,202 +4865,62 @@ async function handleMessageObject(message) {
       }
       break
 
-    case 'provision-writer-for-invitee':
+    case 'generate-invite-proof':
       try {
         const requestId = message?.requestId
-        if (!relayServer?.provisionWriterForInvitee) throw new Error('Relay server unavailable')
-        const result = await relayServer.provisionWriterForInvitee(message.data || {})
-        const relayKey = result?.relayKey || normalizeRelayKeyHex(message?.data?.relayKey) || null
-        const publicIdentifier = message?.data?.publicIdentifier || null
-        const writerCoreRef = result?.writerCoreHex || result?.autobaseLocal || result?.writerCore || null
-        let coreRefUpdate = null
-        let mirrorUpdate = null
-        if (writerCoreRef) {
-          try {
-            coreRefUpdate = await mergeRelayCoreRefsFromInviteWriter({
-              relayKey,
-              publicIdentifier,
-              writerCoreRef,
-              reason: 'invite-writer'
-            })
-            console.log('[Worker] Invite writer core refs update result', {
-              relayKey,
-              publicIdentifier,
-              status: coreRefUpdate?.status ?? null,
-              coreRefsCount: coreRefUpdate?.coreRefsCount ?? null,
-              added: coreRefUpdate?.added ?? null,
-              writerCorePreview: previewValue(writerCoreRef, 16)
-            })
-          } catch (error) {
-            console.warn('[Worker] Invite writer core refs update failed', {
-              relayKey,
-              publicIdentifier,
-              error: error?.message || error
-            })
-          }
+        const data = (message && typeof message === 'object' ? message.data : null) || {}
+        await ensurePublicGatewaySettingsLoaded()
+        const sharedSecret = publicGatewaySettings?.sharedSecret || null
+        if (!sharedSecret) throw new Error('Public gateway shared secret unavailable')
+
+        const relayKey = normalizeRelayKeyHex(data.relayKey) || null
+        const publicIdentifier = typeof data.publicIdentifier === 'string' ? data.publicIdentifier.trim() : null
+        const inviteePubkey = typeof data.inviteePubkey === 'string' ? data.inviteePubkey.trim() : null
+        const authToken = typeof data.authToken === 'string' ? data.authToken : null
+
+        if (!relayKey && !publicIdentifier) {
+          throw new Error('Missing relay identifier for invite proof')
         }
-        if (writerCoreRef) {
-          try {
-            const resolvedRelayKey = coreRefUpdate?.relayKey || relayKey
-            const relayManager = resolvedRelayKey
-              ? activeRelays.get(resolvedRelayKey)
-              : (relayKey ? activeRelays.get(relayKey) : null)
-            mirrorUpdate = await appendClosedJoinMirrorCores({
-              relayKey: resolvedRelayKey || relayKey,
-              publicIdentifier,
-              relayManager,
-              writerCoreRef,
-              reason: 'invite-writer'
-            })
-            console.log('[Worker] Closed join mirror core append result', {
-              relayKey: resolvedRelayKey || relayKey,
-              publicIdentifier,
-              status: mirrorUpdate?.status ?? null,
-              total: mirrorUpdate?.total ?? null,
-              added: mirrorUpdate?.added ?? null
-            })
-          } catch (error) {
-            console.warn('[Worker] Closed join mirror core append failed', {
-              relayKey,
-              publicIdentifier,
-              error: error?.message || error
-            })
-          }
+        if (!inviteePubkey) {
+          throw new Error('Missing invitee pubkey for invite proof')
         }
-        let mirrorReady = null
-        let mirrorCheck = null
-        try {
-          const writerCoreHex = result?.writerCoreHex || result?.autobaseLocal || null
-          console.log('[Worker] Refreshing blind-peer mirrors after invite writer', {
-            relayKey,
-            hasWriterCoreHex: !!writerCoreHex,
-            writerCorePreview: previewValue(writerCoreHex || writerCoreRef, 16)
-          })
-          const manager = await ensureBlindPeeringManager()
-          if (manager?.started) {
-            const relayManager = relayKey ? activeRelays.get(relayKey) : null
-            let storedCoreRefs = null
-            if (relayManager?.relay) {
-              storedCoreRefs = await resolveRelayMirrorCoreRefs(
-                relayKey,
-                publicIdentifier || relayManager?.publicIdentifier || null,
-                writerCoreRef ? [writerCoreRef] : [],
-                { context: 'invite-writer-refresh' }
-              )
-              manager.ensureRelayMirror({
-                relayKey,
-                publicIdentifier: publicIdentifier || relayManager?.publicIdentifier || null,
-                autobase: relayManager.relay,
-                coreRefs: storedCoreRefs,
-                corestore: relayManager.store || null
-              })
-              console.log('[Worker] Blind-peer ensure mirror after invite writer', {
-                relayKey,
-                coreRefsCount: storedCoreRefs.length,
-                coreRefsPreview: summarizeCoreRefs(storedCoreRefs)
-              })
-            } else {
-              await seedBlindPeeringMirrors(manager)
-            }
-            await manager.refreshFromBlindPeers('invite-writer')
-            const summary = await rehydrateMirrorsWithRetry(manager, {
-              reason: 'invite-writer',
-              timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS,
-              retries: BLIND_PEER_REHYDRATION_RETRIES,
-              backoffMs: BLIND_PEER_REHYDRATION_BACKOFF_MS
-            })
-            console.log('[Worker] Blind-peer refresh complete after invite writer', {
-              relayKey,
-              status: summary?.status ?? null,
-              synced: summary?.synced ?? null,
-              failed: summary?.failed ?? null
-            })
-            if (relayManager?.relay && storedCoreRefs?.length) {
-              mirrorCheck = await ensureBlindPeerMirrorReady(manager, {
-                relayKey,
-                publicIdentifier: publicIdentifier || relayManager?.publicIdentifier || null,
-                coreRefs: storedCoreRefs,
-                corestore: relayManager.store || null,
-                reason: 'invite-writer'
-              })
-              mirrorReady = mirrorCheck?.ready === true
-              console.log('[Worker] Blind-peer mirror readiness check', {
-                relayKey,
-                ready: mirrorReady,
-                status: mirrorCheck?.status ?? null,
-                missing: mirrorCheck?.summary?.missing ?? null,
-                notReady: mirrorCheck?.summary?.notReady ?? null,
-                total: mirrorCheck?.summary?.total ?? null
-              })
-            }
-          } else {
-            console.log('[Worker] Blind-peer manager not started; skipping invite-writer refresh', {
-              relayKey,
-              enabled: manager?.enabled ?? null
-            })
-            mirrorReady = false
-            mirrorCheck = {
-              status: 'skipped',
-              reason: 'blind-peer-not-started',
-              enabled: manager?.enabled ?? null
-            }
-          }
-        } catch (err) {
-          console.warn('[Worker] Blind-peer refresh after invite writer failed', {
-            error: err?.message || err
-          })
-          mirrorReady = false
-          mirrorCheck = {
-            status: 'error',
-            reason: 'refresh-failed',
-            error: err?.message || err
-          }
+
+        const payload = {
+          relayKey,
+          publicIdentifier,
+          inviteePubkey,
+          authToken: authToken || null,
+          issuedAt: Date.now(),
+          version: 1
         }
-        if (mirrorReady === null) {
-          mirrorReady = false
-          mirrorCheck = mirrorCheck || {
-            status: 'skipped',
-            reason: 'mirror-check-skipped'
-          }
+        const signature = createSignature(payload, sharedSecret)
+        const inviteProof = {
+          payload,
+          signature,
+          scheme: 'hmac-sha256'
         }
-        if (mirrorReady === false) {
-          console.warn('[Worker] Blind-peer mirror not ready; blocking invite provision', {
-            relayKey,
-            publicIdentifier,
-            mirrorCheck
-          })
-          sendMessage({
-            type: 'provision-writer-for-invitee:error',
-            requestId,
-            error: 'Blind-peer mirror not ready for closed join invite'
-          })
-          break
-        }
-        if (result && typeof result === 'object') {
-          result.mirrorReady = mirrorReady
-          result.mirrorCheck = mirrorCheck
-        }
-        sendMessage({ type: 'provision-writer-for-invitee:result', requestId, data: result })
-        if (mirrorUpdate?.mirrorUnioned === true) {
-          refreshGatewayRelayRegistry('invite-writer').then(() => {
-            return refreshRelayMirrorMetadata('invite-writer')
-          }).catch((error) => {
-            console.warn('[Worker] Gateway/mirror refresh failed after invite writer:', error?.message || error)
-          })
-        } else {
-          console.log('[Worker] Skipping gateway/mirror refresh after invite writer', {
-            relayKey,
-            mirrorUnioned: mirrorUpdate?.mirrorUnioned ?? null
-          })
-        }
-        return result
+        sendMessage({ type: 'generate-invite-proof:result', requestId, data: { inviteProof } })
       } catch (err) {
         sendMessage({
-          type: 'provision-writer-for-invitee:error',
+          type: 'generate-invite-proof:error',
           requestId: message?.requestId,
           error: err?.message || String(err)
         })
-        return { error: err?.message || String(err) }
+      }
+      break
+
+    case 'provision-writer-for-invitee':
+      {
+        const requestId = message?.requestId
+        console.warn('[Worker] Invite writer provisioning disabled; use open-join pool', {
+          relayKey: previewValue(message?.data?.relayKey, 16),
+          publicIdentifier: message?.data?.publicIdentifier || null
+        })
+        sendMessage({
+          type: 'provision-writer-for-invitee:error',
+          requestId,
+          error: 'invite-writer-disabled'
+        })
       }
       break
 

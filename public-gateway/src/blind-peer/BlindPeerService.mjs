@@ -414,7 +414,7 @@ export default class BlindPeerService extends EventEmitter {
     const priority = Number.isFinite(options.priority) ? Math.trunc(options.priority) : 5;
     const type = typeof options.type === 'string' && options.type.trim()
       ? options.type.trim()
-      : 'closed-join';
+      : 'relay-mirror';
     const reason = typeof options.reason === 'string' && options.reason.trim()
       ? options.reason.trim()
       : 'manual';

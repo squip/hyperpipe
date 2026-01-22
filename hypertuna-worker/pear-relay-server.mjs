@@ -2846,11 +2846,23 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
         resolvedIsPublic = true;
       }
 
+      const resolvedIsOpen = typeof relay.isOpen === 'boolean'
+        ? relay.isOpen
+        : (typeof profile?.isOpen === 'boolean'
+          ? profile.isOpen
+          : (typeof resolvedMetadata?.isOpen === 'boolean' ? resolvedMetadata.isOpen : null));
+      const resolvedIsHosted = typeof relay.isHosted === 'boolean'
+        ? relay.isHosted
+        : (profile?.created_at ? true : (profile?.joined_at ? false : null));
+      const resolvedIsJoined = typeof relay.isJoined === 'boolean'
+        ? relay.isJoined
+        : (profile?.joined_at && !profile?.created_at ? true : null);
+
       const identifierPath = publicIdentifier.includes(':')
         ? publicIdentifier.replace(':', '/')
         : publicIdentifier;
 
-      relayList.push({
+      const relayEntry = {
         identifier: publicIdentifier,
         name: resolvedName,
         description: resolvedDescription,
@@ -2859,7 +2871,17 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
         metadataUpdatedAt: resolvedMetadata?.updatedAt || toTimestamp(profile?.updated_at),
         metadataEventId: resolvedMetadata?.eventId || null,
         gatewayPath: identifierPath
-      });
+      };
+      if (typeof resolvedIsOpen === 'boolean') {
+        relayEntry.isOpen = resolvedIsOpen;
+      }
+      if (typeof resolvedIsHosted === 'boolean') {
+        relayEntry.isHosted = resolvedIsHosted;
+      }
+      if (typeof resolvedIsJoined === 'boolean') {
+        relayEntry.isJoined = resolvedIsJoined;
+      }
+      relayList.push(relayEntry);
     }
 
     const gatewayServiceInstance = global.gatewayService || null;
@@ -2998,11 +3020,17 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
         newRelayIsPublic = true;
       }
 
+      const newRelayIsOpen = typeof relayProfileInfo.isOpen === 'boolean'
+        ? relayProfileInfo.isOpen
+        : (typeof resolvedNewMetadata?.isOpen === 'boolean' ? resolvedNewMetadata.isOpen : null);
+      const newRelayIsHosted = !!relayProfileInfo.created_at;
+      const newRelayIsJoined = !!relayProfileInfo.joined_at && !relayProfileInfo.created_at;
+
       const identifierPath = newRelayIdentifier.includes(':')
         ? newRelayIdentifier.replace(':', '/')
         : newRelayIdentifier;
 
-      registrationData.newRelay = {
+      const newRelayEntry = {
         identifier: newRelayIdentifier,
         name: resolvedNewMetadata?.name || relayProfileInfo.name,
         description: resolvedNewMetadata?.description || relayProfileInfo.description || '',
@@ -3012,6 +3040,16 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
         metadataEventId: resolvedNewMetadata?.eventId || null,
         gatewayPath: identifierPath
       };
+      if (typeof newRelayIsOpen === 'boolean') {
+        newRelayEntry.isOpen = newRelayIsOpen;
+      }
+      if (typeof newRelayIsHosted === 'boolean') {
+        newRelayEntry.isHosted = newRelayIsHosted;
+      }
+      if (typeof newRelayIsJoined === 'boolean') {
+        newRelayEntry.isJoined = newRelayIsJoined;
+      }
+      registrationData.newRelay = newRelayEntry;
     }
 
     if (!gatewayConnection) {
@@ -3485,7 +3523,7 @@ export async function startJoinAuthentication(options) {
 
     if (!challengePayload || !relayPubkey || !joinProtocol) {
       // Offline/blind-peer fallback: if we have an invite token and relay info, finalize locally without a host handshake.
-      if (inviteToken && (inviteRelayKey || publicIdentifier)) {
+      if (!openJoin && inviteToken && (inviteRelayKey || publicIdentifier)) {
         let resolvedRelayKey = inviteRelayKey || null;
         if (!resolvedRelayKey && publicIdentifier) {
           resolvedRelayKey = await getRelayKeyFromPublicIdentifier(publicIdentifier);
@@ -3647,39 +3685,6 @@ export async function startJoinAuthentication(options) {
           });
         }
 
-        // If the invite provided a writer core, add it to Autobase.
-        const inviteWriterKey = expectedWriterKey || writerCore || null;
-        if (inviteWriterKey) {
-          try {
-            const { activeRelays } = await import('./hypertuna-relay-manager-adapter.mjs');
-            relayManager = relayManager || activeRelays.get(fallbackRelayKey);
-            if (relayManager) {
-              if (!relayWritable || !relayManager.relay?.writable) {
-                console.warn('[RelayServer] Skipping invite writer add (relay not writable)', {
-                  relayKey: fallbackRelayKey,
-                  relayWritable: relayManager.relay?.writable ?? null,
-                  expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
-                });
-              } else {
-              let writerHex = null;
-              try {
-                const decoded = HypercoreId.decode(String(inviteWriterKey));
-                writerHex = b4a.toString(decoded, 'hex');
-              } catch (_) {
-                if (/^[0-9a-fA-F]{64}$/.test(String(inviteWriterKey))) writerHex = String(inviteWriterKey);
-              }
-              if (writerHex && typeof relayManager.addWriter === 'function') {
-                await relayManager.addWriter(writerHex).catch((err) => {
-                  console.warn('[RelayServer] Failed to add invite writer core during fallback', err?.message || err);
-                });
-              }
-              }
-            }
-          } catch (err) {
-            console.warn('[RelayServer] Failed to add invite writer core during fallback', err?.message || err);
-          }
-        }
-
         try {
           const { activeRelays } = await import('./hypertuna-relay-manager-adapter.mjs');
           relayManager = relayManager || activeRelays.get(fallbackRelayKey);
@@ -3770,17 +3775,19 @@ export async function startJoinAuthentication(options) {
 
         const fallbackRelayKey = resolvedRelayKey;
         const challengeManager = getChallengeManager();
-        const provisionalToken = challengeManager.generateAuthToken(userPubkey);
+        const fallbackToken = inviteToken || challengeManager.generateAuthToken(userPubkey);
+        const tokenSource = inviteToken ? 'invite-token' : 'open-join';
         console.log('[RelayServer] Falling back to open join offline path', {
           relayKey: fallbackRelayKey,
-          publicIdentifier
+          publicIdentifier,
+          tokenSource
         });
 
         await preseedJoinMetadata({
           relayKey: fallbackRelayKey,
           publicIdentifier,
           userPubkey,
-          authToken: provisionalToken,
+          authToken: fallbackToken,
           storageDir: join(config.storage || './data', 'relays', fallbackRelayKey),
           reason: 'open-offline'
         });
@@ -3791,7 +3798,7 @@ export async function startJoinAuthentication(options) {
           fileSharing,
           isOpen,
           publicIdentifier,
-          authToken: provisionalToken,
+          authToken: fallbackToken,
           writerSecret,
           writerCore,
           writerCoreHex,
@@ -3810,7 +3817,7 @@ export async function startJoinAuthentication(options) {
           await saveRelayProfile(joinedProfile);
         }
 
-        await updateRelayAuthToken(fallbackRelayKey, userPubkey, provisionalToken);
+        await updateRelayAuthToken(fallbackRelayKey, userPubkey, fallbackToken);
 
         const relayWaitResult = await waitForRelayWriterActivation({
           relayKey: fallbackRelayKey,
@@ -3831,7 +3838,7 @@ export async function startJoinAuthentication(options) {
           : fallbackRelayKey;
         const gatewayBase = buildGatewayWebsocketBase(config);
         const baseUrl = `${gatewayBase}/${identifierPath}`;
-        const connectionUrl = provisionalToken ? `${baseUrl}?token=${provisionalToken}` : baseUrl;
+        const connectionUrl = fallbackToken ? `${baseUrl}?token=${fallbackToken}` : baseUrl;
         const resolvedRelayUrl = inviteRelayUrl || connectionUrl;
 
         if (relayWaitResult?.ok && global.sendMessage) {
@@ -3845,7 +3852,7 @@ export async function startJoinAuthentication(options) {
             relayKey: fallbackRelayKey,
             publicIdentifier,
             relayUrl: resolvedRelayUrl,
-            authToken: provisionalToken,
+            authToken: fallbackToken,
             mode: 'open-offline',
             writable: relayWaitResult?.writable ?? null,
             expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
@@ -3870,7 +3877,7 @@ export async function startJoinAuthentication(options) {
             relayKey: fallbackRelayKey,
             expectedWriterKey,
             publicIdentifier,
-            authToken: provisionalToken,
+            authToken: fallbackToken,
             relayUrl: resolvedRelayUrl,
             mode: 'open-offline',
             requireWritable: true,
@@ -3887,7 +3894,7 @@ export async function startJoinAuthentication(options) {
             connectionUrl: resolvedRelayUrl,
             alreadyActive: true,
             requiresAuth: true,
-            userAuthToken: provisionalToken,
+            userAuthToken: fallbackToken,
             writable: relayWaitResult?.writable ?? null,
             expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
             timestamp: new Date().toISOString()
@@ -3900,11 +3907,11 @@ export async function startJoinAuthentication(options) {
             data: {
               publicIdentifier,
               relayKey: fallbackRelayKey,
-              authToken: provisionalToken,
+              authToken: fallbackToken,
               relayUrl: resolvedRelayUrl || null,
               hostPeer: blindPeerKey || null,
               mode: 'open-offline',
-              provisional: true
+              provisional: !inviteToken
             }
           });
         }

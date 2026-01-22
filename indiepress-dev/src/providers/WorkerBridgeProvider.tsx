@@ -146,6 +146,19 @@ type RelayCreatedPayload = {
   members?: string[]
 }
 
+type InviteProof = {
+  payload?: {
+    relayKey?: string | null
+    publicIdentifier?: string | null
+    inviteePubkey?: string | null
+    authToken?: string | null
+    issuedAt?: number | null
+    version?: number | null
+  }
+  signature?: string | null
+  scheme?: string | null
+} | null
+
 type WorkerBridgeContextValue = {
   isElectron: boolean
   ready: boolean
@@ -181,17 +194,7 @@ type WorkerBridgeContextValue = {
       token?: string
       relayKey?: string | null
       relayUrl?: string | null
-      blindPeer?: {
-        publicKey?: string | null
-        encryptionKey?: string | null
-        replicationTopic?: string | null
-        maxBytes?: number | null
-      } | null
-      cores?: { key: string; role?: string | null }[]
-      writerCore?: string | null
-      writerCoreHex?: string | null
-      autobaseLocal?: string | null
-      writerSecret?: string | null
+      inviteProof?: InviteProof
       openJoin?: boolean
     }
   ) => Promise<void>
@@ -577,17 +580,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         token?: string
         relayKey?: string | null
         relayUrl?: string | null
-        blindPeer?: {
-          publicKey?: string | null
-          encryptionKey?: string | null
-          replicationTopic?: string | null
-          maxBytes?: number | null
-        } | null
-        cores?: { key: string; role?: string | null }[]
-        writerCore?: string | null
-        writerCoreHex?: string | null
-        autobaseLocal?: string | null
-        writerSecret?: string | null
+        inviteProof?: InviteProof
         openJoin?: boolean
       }
     ) => {
@@ -644,28 +637,17 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         token: opts?.token,
         relayKey: opts?.relayKey || undefined,
         relayUrl: opts?.relayUrl || undefined,
-        blindPeer: opts?.blindPeer,
-        cores: opts?.cores,
-        writerCore: opts?.writerCore,
-        writerCoreHex: opts?.writerCoreHex,
-        autobaseLocal: opts?.autobaseLocal,
-        writerSecret: opts?.writerSecret
+        inviteProof: opts?.inviteProof
       }
       if (hostPeers && hostPeers.length) data.hostPeers = hostPeers
 
       console.info('[WorkerBridge] startJoinFlow sending to worker', {
         publicIdentifier: identifier,
-        hasWriterSecret: !!opts?.writerSecret,
-        hasWriterCore: !!opts?.writerCore,
-        hasWriterCoreHex: !!opts?.writerCoreHex,
-        hasAutobaseLocal: !!opts?.autobaseLocal,
-        writerSecretLen: opts?.writerSecret ? String(opts.writerSecret).length : 0,
         hostPeersCount: hostPeers?.length || 0,
-        coreRefsCount: Array.isArray(opts?.cores) ? opts.cores.length : 0,
-        hasBlindPeer: !!opts?.blindPeer?.publicKey,
         relayKey: opts?.relayKey ? String(opts.relayKey).slice(0, 16) : null,
         relayUrl: opts?.relayUrl ? String(opts.relayUrl).slice(0, 80) : null,
         hasToken: !!opts?.token,
+        hasInviteProof: !!opts?.inviteProof,
         isOpen: typeof opts?.isOpen === 'boolean' ? opts.isOpen : null,
         openJoin: opts?.openJoin === true,
         fileSharing
@@ -967,6 +949,34 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   pending.resolve((msg as any).data ?? null)
                 } else {
                   pending.reject(new Error((msg as any)?.error || 'Worker provisioning failed'))
+                }
+              }
+            }
+            break
+          }
+          case 'generate-invite-proof:result':
+          case 'generate-invite-proof:error': {
+            const requestId = (msg as any)?.requestId
+            let matchedKey: string | null = null
+            if (requestId && pendingRepliesRef.current.has(requestId)) {
+              matchedKey = requestId
+            } else {
+              for (const [key, entry] of pendingRepliesRef.current.entries()) {
+                if (entry.type === 'generate-invite-proof') {
+                  matchedKey = key
+                  break
+                }
+              }
+            }
+            if (matchedKey) {
+              const pending = pendingRepliesRef.current.get(matchedKey)
+              pendingRepliesRef.current.delete(matchedKey)
+              if (pending) {
+                window.clearTimeout(pending.timeoutId)
+                if (msg.type === 'generate-invite-proof:result') {
+                  pending.resolve((msg as any).data ?? null)
+                } else {
+                  pending.reject(new Error((msg as any)?.error || 'Invite proof generation failed'))
                 }
               }
             }
@@ -1488,9 +1498,11 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           await startWorkerInternal({ resetRestartAttempts: false })
         }
         const msgType = (message as any)?.type
-        const expectsReply = msgType === 'provision-writer-for-invitee'
+        const expectsReply = msgType === 'provision-writer-for-invitee' || msgType === 'generate-invite-proof'
         if (expectsReply) {
-          const requestId = (message as any)?.requestId || makeRequestId('provision-writer')
+          const requestId =
+            (message as any)?.requestId ||
+            makeRequestId(msgType === 'generate-invite-proof' ? 'invite-proof' : 'provision-writer')
           const payload = { ...(message as any), requestId }
           const promise = new Promise((resolve, reject) => {
             const timeoutId = window.setTimeout(() => {
@@ -1519,20 +1531,15 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       },
       startJoinFlow: async (
         publicIdentifier: string,
-      opts?: {
-        fileSharing?: boolean
-        token?: string
-        relayKey?: string | null
-        relayUrl?: string | null
-        blindPeer?: {
-          publicKey?: string | null
-          encryptionKey?: string | null
-          replicationTopic?: string | null
-          maxBytes?: number | null
-        } | null
-        cores?: { key: string; role?: string | null }[]
-      }
-    ) => {
+        opts?: {
+          fileSharing?: boolean
+          token?: string
+          relayKey?: string | null
+          relayUrl?: string | null
+          inviteProof?: InviteProof
+          openJoin?: boolean
+        }
+      ) => {
         await startJoinFlowInternal(publicIdentifier, opts)
       },
       clearJoinFlow
