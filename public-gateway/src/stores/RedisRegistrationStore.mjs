@@ -1,5 +1,7 @@
 import { createClient } from 'redis';
 
+const CJTRACE_TAG = '[CJTRACE]';
+
 class RedisRegistrationStore {
   constructor({
     url,
@@ -255,6 +257,9 @@ class RedisRegistrationStore {
     if (!relayKey) return;
     await this.#ensureConnected();
     const isClosedJoin = payload?.closedJoin === true || payload?.mirrorSource === 'closed-join';
+    const coreCount = Array.isArray(payload?.cores)
+      ? payload.cores.length
+      : (Array.isArray(payload?.relayCores) ? payload.relayCores.length : 0);
     const record = JSON.stringify({
       payload,
       storedAt: Date.now()
@@ -267,6 +272,14 @@ class RedisRegistrationStore {
     } else {
       await this.client.set(this.#mirrorKey(relayKey), record);
     }
+    this.logger?.info?.(`${CJTRACE_TAG} mirror metadata stored`, {
+      relayKey,
+      closedJoin: isClosedJoin,
+      ttlSeconds,
+      coreCount,
+      mirrorSource: payload?.mirrorSource || null,
+      updatedAt: payload?.updatedAt ?? null
+    });
   }
 
   async getMirrorMetadata(relayKey) {
@@ -299,6 +312,11 @@ class RedisRegistrationStore {
       storedAt: Date.now()
     });
     await this.client.set(this.#closedJoinKey(relayKey), record);
+    this.logger?.info?.(`${CJTRACE_TAG} closed join cores stored`, {
+      relayKey,
+      coreCount: cores.length,
+      updatedAt: Array.isArray(payload) ? null : (payload?.updatedAt ?? null)
+    });
   }
 
   async getClosedJoinCoreRefs(relayKey) {

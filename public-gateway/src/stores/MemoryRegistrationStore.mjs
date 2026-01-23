@@ -1,8 +1,11 @@
+const CJTRACE_TAG = '[CJTRACE]';
+
 class MemoryRegistrationStore {
   constructor(options = 300) {
     const resolved = typeof options === 'object' && options !== null
       ? options
       : { ttlSeconds: options };
+    this.logger = resolved?.logger || null;
     this.ttlSeconds = Number.isFinite(resolved.ttlSeconds) ? resolved.ttlSeconds : 300;
     this.mirrorTtlSeconds = Number.isFinite(resolved.mirrorTtlSeconds) ? resolved.mirrorTtlSeconds : null;
     this.openJoinPoolTtlSeconds = Number.isFinite(resolved.openJoinPoolTtlSeconds)
@@ -247,6 +250,9 @@ class MemoryRegistrationStore {
     const ttlSeconds = isClosedJoin
       ? null
       : (Number.isFinite(this.mirrorTtlSeconds) ? this.mirrorTtlSeconds : this.ttlSeconds);
+    const coreCount = Array.isArray(payload?.cores)
+      ? payload.cores.length
+      : (Array.isArray(payload?.relayCores) ? payload.relayCores.length : 0);
     const record = {
       payload,
       storedAt: Date.now(),
@@ -255,6 +261,14 @@ class MemoryRegistrationStore {
         : null
     };
     this.mirrorMetadata.set(relayKey, record);
+    this.logger?.info?.(`${CJTRACE_TAG} mirror metadata stored`, {
+      relayKey,
+      closedJoin: isClosedJoin,
+      ttlSeconds,
+      coreCount,
+      mirrorSource: payload?.mirrorSource || null,
+      updatedAt: payload?.updatedAt ?? null
+    });
   }
 
   async getMirrorMetadata(relayKey) {
@@ -283,6 +297,11 @@ class MemoryRegistrationStore {
       expiresAt: null
     };
     this.closedJoinCoreRefs.set(relayKey, record);
+    this.logger?.info?.(`${CJTRACE_TAG} closed join cores stored`, {
+      relayKey,
+      coreCount: cores.length,
+      updatedAt: record.payload?.updatedAt ?? null
+    });
   }
 
   async getClosedJoinCoreRefs(relayKey) {

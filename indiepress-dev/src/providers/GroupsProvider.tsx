@@ -313,6 +313,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     async (args: { relayKey?: string | null; publicIdentifier: string; inviteePubkey: string; authToken?: string | null }) => {
       if (!sendToWorker) return null
       try {
+        console.info('[CJTRACE] invite proof request', {
+          relayKey: args.relayKey ? String(args.relayKey).slice(0, 16) : null,
+          publicIdentifier: args.publicIdentifier,
+          inviteePubkey: args.inviteePubkey ? String(args.inviteePubkey).slice(0, 16) : null,
+          hasAuthToken: !!args.authToken
+        })
         const res = await sendToWorker({
           type: 'generate-invite-proof',
           data: {
@@ -323,8 +329,25 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           }
         })
         if (res && typeof res === 'object' && 'inviteProof' in (res as any)) {
-          return (res as any).inviteProof || null
+          const inviteProof = (res as any).inviteProof || null
+          console.info('[CJTRACE] invite proof response', {
+            publicIdentifier: args.publicIdentifier,
+            relayKey: args.relayKey ? String(args.relayKey).slice(0, 16) : null,
+            inviteePubkey: args.inviteePubkey ? String(args.inviteePubkey).slice(0, 16) : null,
+            scheme: inviteProof?.scheme || null,
+            version: inviteProof?.payload?.version ?? null,
+            issuedAt: inviteProof?.payload?.issuedAt ?? null
+          })
+          return inviteProof
         }
+        console.info('[CJTRACE] invite proof response', {
+          publicIdentifier: args.publicIdentifier,
+          relayKey: args.relayKey ? String(args.relayKey).slice(0, 16) : null,
+          inviteePubkey: args.inviteePubkey ? String(args.inviteePubkey).slice(0, 16) : null,
+          scheme: null,
+          version: null,
+          issuedAt: null
+        })
         return (res as any) || null
       } catch (err) {
         console.warn('[GroupsProvider] Failed to generate invite proof', err)
@@ -1151,6 +1174,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           openInvite: isOpenGroup,
           hasToken: !!token,
           hasInviteProof: !!inviteProof,
+          inviteProofScheme: inviteProof?.scheme || null,
+          inviteProofVersion: inviteProof?.payload?.version ?? null,
+          inviteProofIssuedAt: inviteProof?.payload?.issuedAt ?? null,
           relayKey: relayEntry?.relayKey ? String(relayEntry.relayKey).slice(0, 16) : null,
           relayUrl: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 80) : null,
           fileSharing: resolvedIsOpen === false ? false : true

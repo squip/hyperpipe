@@ -86,6 +86,7 @@ const RELAY_WRITER_SYNC_RETRY_TIMEOUT_MS = 30000
 const OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores'
+const CJTRACE_TAG = '[CJTRACE]'
 
 global.userConfig = {
   storage: defaultStorageDir,
@@ -603,6 +604,7 @@ function updateRelayMirrorCoreRefs(relayKey, coreRefs, { persist = true, context
       nextCount: normalized.length,
       added: Math.max(normalized.length - existing.length, 0),
       removed: Math.max(existing.length - normalized.length, 0),
+      fingerprint: coreRefsFingerprint(normalized),
       coreRefsPreview: summarizeCoreRefs(normalized)
     })
   }
@@ -662,7 +664,9 @@ async function resolveRelayMirrorCoreRefs(
         cachedCount: normalizedCached.length,
         liveCount: liveStats.normalized.length,
         fallbackCount: normalizedFallback.length,
-        mergedCount: mergeStats.merged.length
+        mergedCount: mergeStats.merged.length,
+        mergedFingerprint: coreRefsFingerprint(mergeStats.merged),
+        coreRefsPreview: summarizeCoreRefs(mergeStats.merged)
       })
     }
     return mergeStats.merged
@@ -708,7 +712,9 @@ async function resolveRelayMirrorCoreRefs(
       cachedCount: normalizedCached.length,
       storedCount: storedStats.normalized.length,
       fallbackCount: normalizedFallback.length,
-      mergedCount: mergeStats.merged.length
+      mergedCount: mergeStats.merged.length,
+      mergedFingerprint: coreRefsFingerprint(mergeStats.merged),
+      coreRefsPreview: summarizeCoreRefs(mergeStats.merged)
     })
   }
   return mergeStats.merged
@@ -1004,13 +1010,47 @@ async function syncActiveRelayCoreRefs({
   updateRelayMirrorCoreRefs(relayKey, normalized, { context: 'sync-active-core-refs' })
   const fingerprint = coreRefsFingerprint(normalized)
   if (relayMirrorSyncState.get(relayKey) === fingerprint) {
+    console.info(`${CJTRACE_TAG} syncActiveRelayCoreRefs skip`, {
+      relayKey,
+      publicIdentifier,
+      reason,
+      status: 'already-synced',
+      coreRefsCount: normalized.length,
+      fingerprint,
+      coreRefsPreview: summarizeCoreRefs(normalized)
+    })
     return { status: 'skipped', reason: 'already-synced' }
   }
 
   const relayManager = activeRelays.get(relayKey)
   if (!relayManager?.relay) {
+    console.info(`${CJTRACE_TAG} syncActiveRelayCoreRefs skip`, {
+      relayKey,
+      publicIdentifier,
+      reason,
+      status: 'relay-not-active',
+      coreRefsCount: normalized.length,
+      fingerprint
+    })
     return { status: 'skipped', reason: 'relay-not-active' }
   }
+  const relay = relayManager.relay
+  const activeWriters = relay?.activeWriters
+  const writerCount = typeof activeWriters?.size === 'number'
+    ? activeWriters.size
+    : Array.isArray(activeWriters)
+      ? activeWriters.length
+      : null
+  console.info(`${CJTRACE_TAG} syncActiveRelayCoreRefs start`, {
+    relayKey,
+    publicIdentifier,
+    reason,
+    coreRefsCount: normalized.length,
+    fingerprint,
+    coreRefsPreview: summarizeCoreRefs(normalized),
+    viewVersion: relay?.viewVersion ?? relay?.view?.version ?? null,
+    writerCount
+  })
 
   const manager = await ensureBlindPeeringManager()
   if (!manager?.started) {
@@ -1067,6 +1107,21 @@ async function syncActiveRelayCoreRefs({
   if (writerSummary?.status === 'ok' || writerSummary?.status === 'read-only') {
     relayMirrorSyncState.set(relayKey, fingerprint)
   }
+  console.info(`${CJTRACE_TAG} syncActiveRelayCoreRefs done`, {
+    relayKey,
+    publicIdentifier: identifier,
+    reason,
+    status: 'ok',
+    fingerprint,
+    primeStatus: primeSummary?.status ?? null,
+    primeSynced: primeSummary?.synced ?? null,
+    primeFailed: primeSummary?.failed ?? null,
+    rehydrateStatus: rehydrateSummary?.status ?? null,
+    rehydrateSynced: rehydrateSummary?.synced ?? null,
+    rehydrateFailed: rehydrateSummary?.failed ?? null,
+    writerStatus: writerSummary?.status ?? null,
+    writerAdded: writerSummary?.added ?? null
+  })
   return { status: 'ok', primeSummary, rehydrateSummary, writerSummary }
 }
 
@@ -1348,6 +1403,14 @@ async function ensureOpenJoinWriterPool({
     profileIsHosted: profile?.isHosted ?? null,
     profileIsJoined: profile?.isJoined ?? null
   })
+  if (profile && profile?.isHosted === undefined) {
+    console.info(`${CJTRACE_TAG} open join pool profile host status unknown`, {
+      relayKey: previewValue(profile?.relay_key || profile?.relayKey || null, 16),
+      publicIdentifier: profile?.public_identifier || profile?.publicIdentifier || null,
+      createdAt: profile?.created_at ?? null,
+      joinedAt: profile?.joined_at ?? null
+    })
+  }
 
   if (canonicalRelayKey && requestIdentifier !== canonicalRelayKey) {
     console.info('[Worker] Open join pool canonicalized', {
@@ -1483,21 +1546,61 @@ async function ensureOpenJoinWriterPool({
 
     const updatedAt = Date.now()
     openJoinWriterPoolCache.set(poolKey, { entries, updatedAt })
+    const mirrorRelayKey = canonicalRelayKey || normalizedRelayKey || null
+    const mirrorPublicIdentifier =
+      canonicalPublicIdentifier || normalizedPublicIdentifier || publicIdentifier || null
+    let writerCoreRefs = []
+    if (newEntries.length) {
+      const writerCandidates = []
+      for (const entry of newEntries) {
+        if (entry?.writerCore) writerCandidates.push(entry.writerCore)
+        if (entry?.writerCoreHex) writerCandidates.push(entry.writerCoreHex)
+        if (entry?.autobaseLocal) writerCandidates.push(entry.autobaseLocal)
+      }
+      const writerStats = normalizeCoreRefListWithStats(writerCandidates, {
+        context: {
+          phase: 'open-join-pool-writer-refs',
+          relayKey: previewValue(mirrorRelayKey, 16),
+          publicIdentifier: mirrorPublicIdentifier
+        },
+        log: console
+      })
+      writerCoreRefs = writerStats.normalized
+      if (mirrorRelayKey && writerCoreRefs.length) {
+        const existingCoreRefs = relayMirrorCoreRefs.get(mirrorRelayKey) || []
+        const mergedCoreRefs = mergeCoreRefLists(existingCoreRefs, writerCoreRefs)
+        updateRelayMirrorCoreRefs(mirrorRelayKey, mergedCoreRefs, {
+          context: 'open-join-pool-writer-refs'
+        })
+      }
+    }
     console.log('[Worker] Open join pool provisioned', {
       relayKey: relayKeyForLog,
       publicIdentifier: publicIdentifierForLog,
       generated: newEntries.length,
       cached: entries.length,
       updatedAt,
-      entryPreview: summarizeOpenJoinEntries(newEntries)
+      entryPreview: summarizeOpenJoinEntries(newEntries),
+      writerCoreRefsCount: writerCoreRefs.length,
+      writerCoreRefsPreview: summarizeCoreRefs(writerCoreRefs)
     })
     if (newEntries.length) {
-      const mirrorRelayKey = canonicalRelayKey || normalizedRelayKey || null
       appendOpenJoinMirrorCores({
         relayKey: mirrorRelayKey,
-        publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || publicIdentifier || null,
+        publicIdentifier: mirrorPublicIdentifier,
         relayManager: mirrorRelayKey ? activeRelays.get(mirrorRelayKey) : null,
-        reason: 'open-join-pool'
+        reason: 'open-join-pool',
+        extraCoreRefs: writerCoreRefs,
+        requiredCoreRefs: writerCoreRefs
+      }).then((appendResult) => {
+        if (!mirrorRelayKey || appendResult?.status !== 'ok') return null
+        if (!Array.isArray(appendResult?.coreRefs) || !appendResult.coreRefs.length) return null
+        return syncActiveRelayCoreRefs({
+          relayKey: mirrorRelayKey,
+          publicIdentifier: mirrorPublicIdentifier,
+          coreRefs: appendResult.coreRefs,
+          reason: 'open-join-pool'
+        })
       }).catch((error) => {
         console.warn('[Worker] Open join pool mirror append failed', {
           relayKey: relayKeyForLog ? previewValue(relayKeyForLog, 16) : null,
@@ -1771,6 +1874,7 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
   if (!normalizedEntries.length) {
     return { status: 'skipped', reason: 'missing-cores' }
   }
+  const normalizedKeys = normalizedEntries.map((entry) => entry?.key).filter(Boolean)
 
   let authPubkey = null
   try {
@@ -1783,6 +1887,15 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
   }
 
   const originList = Array.isArray(origins) && origins.length ? origins : collectPublicGatewayOrigins()
+  console.info(`${CJTRACE_TAG} openJoinAppend payload`, {
+    relayIdentifier,
+    publicIdentifier,
+    reason,
+    originCount: originList.length,
+    coreRefsCount: normalizedEntries.length,
+    fingerprint: coreRefsFingerprint(normalizedKeys),
+    coreRefsPreview: summarizeCoreRefs(normalizedKeys)
+  })
   const encodedRelay = encodeURIComponent(relayIdentifier)
   let lastError = null
 
@@ -1919,7 +2032,9 @@ async function appendOpenJoinMirrorCores({
   relayKey,
   publicIdentifier = null,
   relayManager = null,
-  reason = 'open-join-append'
+  reason = 'open-join-append',
+  extraCoreRefs = [],
+  requiredCoreRefs = []
 } = {}) {
   const relayIdentifier = relayKey || publicIdentifier
   if (!relayIdentifier) {
@@ -1930,22 +2045,111 @@ async function appendOpenJoinMirrorCores({
   }
   const manager = relayManager || (relayKey ? activeRelays.get(relayKey) : null)
   const coreEntries = collectRelayCoreEntriesForAppend(manager)
-  if (!coreEntries.length) {
+  const activeKeys = coreEntries.map((entry) => entry?.key).filter(Boolean)
+  const activeKeySet = new Set(activeKeys)
+  const extraStats = normalizeCoreRefListWithStats(extraCoreRefs, {
+    context: {
+      phase: 'open-join-append-extra',
+      relayKey: previewValue(relayKey, 16),
+      reason
+    },
+    log: console
+  })
+  const extraCoreRefsNormalized = extraStats.normalized
+  const requiredStats = normalizeCoreRefListWithStats(requiredCoreRefs, {
+    context: {
+      phase: 'open-join-append-required',
+      relayKey: previewValue(relayKey, 16),
+      reason
+    },
+    log: console
+  })
+  const requiredCoreRefsNormalized = requiredStats.normalized
+  const requiredMissingActive = requiredCoreRefsNormalized.filter((ref) => !activeKeySet.has(ref))
+  const resolvedPublicIdentifier = publicIdentifier || manager?.publicIdentifier || null
+  const resolvedCoreRefs = await resolveRelayMirrorCoreRefs(
+    relayKey || null,
+    resolvedPublicIdentifier,
+    mergeCoreRefLists(activeKeys, extraCoreRefsNormalized),
+    { context: 'open-join-append' }
+  )
+  const mergedEntries = coreEntries.slice()
+  const seenKeys = new Set(activeKeys)
+  let extraAdded = 0
+  if (extraCoreRefsNormalized.length) {
+    for (const ref of extraCoreRefsNormalized) {
+      const normalized = normalizeCoreRef(ref)
+      if (!normalized || seenKeys.has(normalized)) continue
+      seenKeys.add(normalized)
+      mergedEntries.push({ key: normalized, role: 'invite-writer' })
+      extraAdded += 1
+    }
+  }
+  let resolvedAdded = 0
+  if (Array.isArray(resolvedCoreRefs) && resolvedCoreRefs.length) {
+    for (const ref of resolvedCoreRefs) {
+      const normalized = normalizeCoreRef(ref)
+      if (!normalized || seenKeys.has(normalized)) continue
+      seenKeys.add(normalized)
+      mergedEntries.push({ key: normalized, role: 'mirror-core' })
+      resolvedAdded += 1
+    }
+  }
+  if (!mergedEntries.length) {
+    console.info(`${CJTRACE_TAG} openJoinAppend skipped`, {
+      relayIdentifier,
+      reason: 'missing-cores',
+      activeCoreRefs: coreEntries.length,
+      resolvedCoreRefs: Array.isArray(resolvedCoreRefs) ? resolvedCoreRefs.length : 0,
+      extraCoreRefs: extraCoreRefsNormalized.length
+    })
     return { status: 'skipped', reason: 'missing-cores' }
   }
+
+  const relay = manager?.relay || null
+  const activeWriters = relay?.activeWriters
+  const writerCount = typeof activeWriters?.size === 'number'
+    ? activeWriters.size
+    : Array.isArray(activeWriters)
+      ? activeWriters.length
+      : null
+  const coreKeys = mergedEntries.map((entry) => entry?.key).filter(Boolean)
+  console.info(`${CJTRACE_TAG} openJoinAppend snapshot`, {
+    relayIdentifier,
+    publicIdentifier: resolvedPublicIdentifier,
+    reason,
+    coreRefsCount: coreKeys.length,
+    activeCoreRefsCount: coreEntries.length,
+    resolvedCoreRefsCount: Array.isArray(resolvedCoreRefs) ? resolvedCoreRefs.length : 0,
+    resolvedAdded,
+    extraCoreRefsCount: extraCoreRefsNormalized.length,
+    extraAdded,
+    requiredCoreRefsCount: requiredCoreRefsNormalized.length,
+    requiredMissingActiveCount: requiredMissingActive.length,
+    requiredMissingActivePreview: summarizeCoreRefs(requiredMissingActive),
+    fingerprint: coreRefsFingerprint(coreKeys),
+    coreRefsPreview: summarizeCoreRefs(coreKeys),
+    viewVersion: relay?.viewVersion ?? relay?.view?.version ?? null,
+    writerCount
+  })
 
   await ensurePublicGatewaySettingsLoaded()
   console.log('[Worker] Open join append start', {
     relayIdentifier,
-    coreRefsCount: coreEntries.length,
-    coreRefsPreview: summarizeCoreRefs(coreEntries.map((entry) => entry?.key).filter(Boolean))
+    coreRefsCount: coreKeys.length,
+    coreRefsPreview: summarizeCoreRefs(coreKeys)
   })
 
-  return submitOpenJoinAppendCores(relayIdentifier, {
-    publicIdentifier: publicIdentifier || manager?.publicIdentifier || null,
-    cores: coreEntries,
+  const appendResult = await submitOpenJoinAppendCores(relayIdentifier, {
+    publicIdentifier: resolvedPublicIdentifier,
+    cores: mergedEntries,
     reason
   })
+  return {
+    ...appendResult,
+    coreRefs: coreKeys,
+    requiredMissingActive
+  }
 }
 
 async function fetchOpenJoinBootstrap(
@@ -2186,12 +2390,18 @@ async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mi
         continue
       }
       const mirrorBlindPeer = data.blindPeer || data.blind_peer || null
+      const mirrorCorePreview = summarizeCoreRefs(
+        Array.isArray(data.cores)
+          ? data.cores.map((entry) => entry?.key || entry?.core || entry).filter(Boolean)
+          : []
+      )
       console.log('[Worker] Mirror metadata response', {
         relayKey,
         origin,
         resolvedRelayKey: previewValue(data.relayKey || data.relay_key, 16),
         publicIdentifier: data.publicIdentifier || data.public_identifier || null,
         coreRefsCount: Array.isArray(data.cores) ? data.cores.length : 0,
+        coreRefsPreview: mirrorCorePreview,
         mirrorSource: data.mirrorSource || data.mirror_source || null,
         updatedAt: data.updatedAt ?? null,
         blindPeerKey: previewValue(mirrorBlindPeer?.publicKey, 16),
@@ -2319,6 +2529,8 @@ async function applyMirrorMetadataToProfile({
   const mergedCoreRefs = mergeStats.merged
   const mergedFingerprint = coreRefsFingerprint(mergedCoreRefs)
   const existingFingerprint = coreRefsFingerprint(existingCoreRefs)
+  const mirrorFingerprint = coreRefsFingerprint(mirrorCoreRefs)
+  const extraFingerprint = coreRefsFingerprint(extraCoreRefs)
   const nextBlindPeer = sanitizeBlindPeerMeta(mirrorData.blindPeer)
   const updates = {}
   let coreRefsChanged = false
@@ -2330,6 +2542,27 @@ async function applyMirrorMetadataToProfile({
     if (typeof ref !== 'string') return true
     const normalized = normalizeCoreRef(ref)
     return normalized && normalized !== ref.trim()
+  })
+
+  console.info(`${CJTRACE_TAG} mirror metadata merge`, {
+    relayKey: resolvedRelayKey,
+    publicIdentifier: profile.public_identifier || publicIdentifier || null,
+    reason,
+    origin,
+    mirrorSource: mirrorData.mirrorSource || mirrorData.mirror_source || null,
+    mirrorUpdatedAt: mirrorData.updatedAt ?? null,
+    profileIsHosted: profile?.isHosted ?? null,
+    profileIsJoined: profile?.isJoined ?? null,
+    profileCreatedAt: profile?.created_at ?? null,
+    profileJoinedAt: profile?.joined_at ?? null,
+    existingCount: existingCoreRefs.length,
+    mirrorCount: mirrorCoreRefs.length,
+    extraCount: extraCoreRefs.length,
+    mergedCount: mergedCoreRefs.length,
+    existingFingerprint,
+    mirrorFingerprint,
+    extraFingerprint,
+    mergedFingerprint
   })
 
   if ((mergedFingerprint && mergedFingerprint !== existingFingerprint) || needsNormalization) {
@@ -2352,6 +2585,20 @@ async function applyMirrorMetadataToProfile({
   const shouldSyncActive = !!resolvedRelayKey
     && mergedCoreRefs.length > 0
     && relayMirrorSyncState.get(resolvedRelayKey) !== mergedFingerprint
+
+  console.info(`${CJTRACE_TAG} mirror metadata apply`, {
+    relayKey: resolvedRelayKey,
+    publicIdentifier: profile.public_identifier || publicIdentifier || null,
+    reason,
+    coreRefsChanged,
+    blindPeerChanged,
+    needsNormalization,
+    shouldSyncActive,
+    mergedCount: mergedCoreRefs.length,
+    mergedFingerprint,
+    mirrorSource: mirrorData.mirrorSource || mirrorData.mirror_source || null,
+    mirrorUpdatedAt: mirrorData.updatedAt ?? null
+  })
 
   if (!coreRefsChanged && !blindPeerChanged) {
     if (shouldSyncActive) {
@@ -2429,8 +2676,20 @@ async function refreshRelayMirrorMetadata(reason = 'periodic') {
     const relayKeys = Array.from(activeRelays.keys())
       .filter((key) => key && !virtualRelayKeys.has(key))
     if (!relayKeys.length) {
+      console.info(`${CJTRACE_TAG} mirror metadata refresh skip`, {
+        reason,
+        originCount: originList.length,
+        relayCount: 0
+      })
       return { status: 'skipped', reason: 'no-relays' }
     }
+    console.info(`${CJTRACE_TAG} mirror metadata refresh start`, {
+      reason,
+      originCount: originList.length,
+      relayCount: relayKeys.length,
+      startedAt,
+      lastRefreshAt: lastMirrorMetadataRefreshAt
+    })
 
     const summary = {
       reason,
@@ -2463,6 +2722,14 @@ async function refreshRelayMirrorMetadata(reason = 'periodic') {
 
     const elapsedMs = Date.now() - startedAt
     console.log('[Worker] Mirror metadata refresh complete', {
+      reason,
+      total: summary.total,
+      updated: summary.updated,
+      skipped: summary.skipped,
+      failed: summary.failed,
+      elapsedMs
+    })
+    console.info(`${CJTRACE_TAG} mirror metadata refresh done`, {
       reason,
       total: summary.total,
       updated: summary.updated,
@@ -2571,6 +2838,19 @@ function attachRelayMirrorHooks(relayKey, relayManager, manager) {
   if (!autobase || typeof autobase.on !== 'function') return
   if (relayMirrorSubscriptions.has(autobase)) return
   const handler = () => {
+    const relay = relayManager?.relay
+    const activeWriters = relay?.activeWriters
+    const writerCount = typeof activeWriters?.size === 'number'
+      ? activeWriters.size
+      : Array.isArray(activeWriters)
+        ? activeWriters.length
+        : null
+    console.info(`${CJTRACE_TAG} relay mirror update event`, {
+      relayKey,
+      publicIdentifier: relayManager?.publicIdentifier || null,
+      viewVersion: relay?.viewVersion ?? relay?.view?.version ?? null,
+      writerCount
+    })
     Promise.resolve(resolveRelayMirrorCoreRefs(
       relayKey,
       relayManager?.publicIdentifier || null,
@@ -4548,6 +4828,15 @@ async function handleMessageObject(message) {
           hostPeers = hostPeers
             .map((key) => String(key || '').trim().toLowerCase())
             .filter(Boolean)
+          let hostPeersSource = hostPeers.length ? 'input' : 'none'
+          let coreRefsSource = coreRefs.length ? 'input' : 'none'
+          const inviteProofMeta = inviteProof
+            ? {
+                scheme: inviteProof.scheme || null,
+                version: inviteProof.payload?.version ?? null,
+                issuedAt: inviteProof.payload?.issuedAt ?? null
+              }
+            : null
 
           console.info('[Worker] Start join flow input', {
             publicIdentifier,
@@ -4556,11 +4845,14 @@ async function handleMessageObject(message) {
             isOpen,
             hasInviteToken: !!inviteToken,
             hasInviteProof,
+            inviteProof: inviteProofMeta,
             relayKey: previewValue(joinRelayKey, 16),
             relayUrl: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
             hostPeersCount: hostPeers.length,
+            hostPeersSource,
             hasBlindPeer: !!blindPeer?.publicKey,
             coreRefsCount: coreRefs.length,
+            coreRefsSource,
             coreRefsInputCount: coreRefsInputStats.inputCount,
             coreRefsDropped: coreRefsInputStats.droppedCount,
             coreRefsInvalid: coreRefsInputStats.invalidCount,
@@ -4616,7 +4908,10 @@ async function handleMessageObject(message) {
                   }
                   if (!writerSecret && bootstrapData.writerSecret) writerSecret = String(bootstrapData.writerSecret)
                   if (!blindPeer && bootstrapBlindPeer) blindPeer = bootstrapBlindPeer
-                  if (!coreRefs.length && bootstrapCoreRefs.length) coreRefs = bootstrapCoreRefs
+                  if (!coreRefs.length && bootstrapCoreRefs.length) {
+                    coreRefs = bootstrapCoreRefs
+                    coreRefsSource = 'bootstrap'
+                  }
                   if (openJoin && publicIdentifier) {
                     recordOpenJoinContext({
                       publicIdentifier,
@@ -4665,6 +4960,18 @@ async function handleMessageObject(message) {
 
           const shouldFetchMirror = (!hostPeers || hostPeers.length === 0)
             && (!blindPeer || !blindPeer.publicKey)
+          console.info(`${CJTRACE_TAG} join flow mirror decision`, {
+            publicIdentifier,
+            relayIdentifier: joinRelayKey || publicIdentifier || null,
+            openJoin,
+            closedInvite,
+            hostPeersCount: hostPeers.length,
+            hostPeersSource,
+            hasBlindPeer: !!blindPeer?.publicKey,
+            coreRefsCount: coreRefs.length,
+            coreRefsSource,
+            shouldFetchMirror
+          })
           if (shouldFetchMirror) {
             const relayIdentifier = joinRelayKey || publicIdentifier
             if (relayIdentifier) {
@@ -4692,6 +4999,7 @@ async function handleMessageObject(message) {
                   const coreRefsBefore = coreRefs.length
                   if (mirrorCoreRefs.length && !coreRefs.length) {
                     coreRefs = mirrorCoreRefs
+                    coreRefsSource = 'mirror'
                   }
                   const coreRefsAdded = Math.max(coreRefs.length - coreRefsBefore, 0)
                   if (!writerCore && mirrorData.writerCore) writerCore = String(mirrorData.writerCore)
@@ -4794,6 +5102,7 @@ async function handleMessageObject(message) {
                   failed: rehydrateSummary?.failed ?? null
                 })
                 hostPeers = [String(blindPeer.publicKey).toLowerCase()]
+                hostPeersSource = 'blind-peer'
                 console.log('[Worker] Using blind-peer mirror as host peer for join flow', {
                   relayIdentifier,
                   coreRefsCount: coreRefs.length
@@ -4806,6 +5115,9 @@ async function handleMessageObject(message) {
 
           if (!hostPeers.length) {
             hostPeers = resolveHostPeersFromGatewayStatus(getGatewayStatus(), publicIdentifier)
+            if (hostPeers.length) {
+              hostPeersSource = 'gateway-status'
+            }
           }
 
           if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
@@ -4818,11 +5130,15 @@ async function handleMessageObject(message) {
             isOpen,
             hasInviteToken: !!inviteToken,
             hasInviteProof,
+            inviteProof: inviteProofMeta,
             relayKey: previewValue(joinRelayKey, 16),
+            relayIdentifier: joinRelayKey || publicIdentifier || null,
             relayUrl: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
             hostPeersCount: hostPeers.length,
+            hostPeersSource,
             hasBlindPeer: !!blindPeer?.publicKey,
             coreRefsCount: coreRefs.length,
+            coreRefsSource,
             coreRefsPreview: summarizeCoreRefs(coreRefs),
             writerCorePrefix: previewValue(writerCore, 16),
             writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
@@ -4885,6 +5201,13 @@ async function handleMessageObject(message) {
           throw new Error('Missing invitee pubkey for invite proof')
         }
 
+        console.info(`${CJTRACE_TAG} invite proof requested`, {
+          relayKey: previewValue(relayKey, 16),
+          publicIdentifier,
+          inviteePubkey: previewValue(inviteePubkey, 16),
+          hasAuthToken: !!authToken
+        })
+
         const payload = {
           relayKey,
           publicIdentifier,
@@ -4899,6 +5222,14 @@ async function handleMessageObject(message) {
           signature,
           scheme: 'hmac-sha256'
         }
+        console.info(`${CJTRACE_TAG} invite proof generated`, {
+          relayKey: previewValue(relayKey, 16),
+          publicIdentifier,
+          inviteePubkey: previewValue(inviteePubkey, 16),
+          version: payload.version,
+          issuedAt: payload.issuedAt,
+          scheme: inviteProof.scheme
+        })
         sendMessage({ type: 'generate-invite-proof:result', requestId, data: { inviteProof } })
       } catch (err) {
         sendMessage({

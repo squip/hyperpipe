@@ -6,6 +6,8 @@ import Hyperswarm from 'hyperswarm';
 import BlindPeering from 'blind-peering';
 import HypercoreId from 'hypercore-id-encoding';
 
+const CJTRACE_TAG = '[CJTRACE]';
+
 function sanitizeKey(value) {
   if (!value || typeof value !== 'string') return null;
   const trimmed = value.trim();
@@ -368,7 +370,20 @@ export default class BlindPeeringManager extends EventEmitter {
     this.#recordMirrorMetadata(entry);
     this.logger?.debug?.('[BlindPeering] Relay mirror scheduled', {
       identifier,
-      writers: coreRefs.length
+      writers: coreRefs.length,
+      coreRefsPreview: coreRefs.slice(0, 3).map((ref) => String(ref).slice(0, 16)),
+      corestoreId: entry.context?.corestoreId || null
+    });
+    this.logger?.info?.(`${CJTRACE_TAG} relay mirror scheduled`, {
+      identifier,
+      relayKey: entry.context?.relayKey || null,
+      publicIdentifier: entry.context?.publicIdentifier || null,
+      coreRefsCount: coreRefs.length,
+      coreRefsPreview: coreRefs.slice(0, 3).map((ref) => String(ref).slice(0, 16)),
+      corestoreId: entry.context?.corestoreId || null,
+      corestorePath: entry.context?.corestorePath || null,
+      ownerPeerKey: entry.ownerPeerKey ? String(entry.ownerPeerKey).slice(0, 16) : null,
+      priority: entry.priority
     });
     this.emit('mirror-requested', entry);
   }
@@ -410,6 +425,15 @@ export default class BlindPeeringManager extends EventEmitter {
     this.logger?.info?.('[BlindPeering] Relay core prefetch using corestore', {
       relayKey: summary.relayKey,
       reason,
+      corestoreId: storeInfo.corestoreId,
+      storagePath: storeInfo.storagePath
+    });
+    this.logger?.info?.(`${CJTRACE_TAG} relay core prefetch start`, {
+      relayKey: summary.relayKey,
+      publicIdentifier: publicIdentifier || null,
+      reason,
+      coreRefsCount: uniqueRefs.length,
+      coreRefsPreview: uniqueRefs.slice(0, 3).map((ref) => String(ref).slice(0, 16)),
       corestoreId: storeInfo.corestoreId,
       storagePath: storeInfo.storagePath
     });
@@ -790,6 +814,11 @@ export default class BlindPeeringManager extends EventEmitter {
         synced: 0,
         failed: 0
       };
+      this.logger?.info?.(`${CJTRACE_TAG} rehydration start`, {
+        reason,
+        targetCount: targets.size,
+        targetPreview: Array.from(targets.keys()).slice(0, 3)
+      });
 
       for (const [key, info] of targets) {
         const label = info.label || key;
@@ -827,6 +856,7 @@ export default class BlindPeeringManager extends EventEmitter {
       }
 
       this.logger?.info?.('[BlindPeering] Rehydration cycle completed', summary);
+      this.logger?.info?.(`${CJTRACE_TAG} rehydration done`, summary);
       this.rehydrationState.lastResult = summary;
       this.rehydrationState.lastCompletedAt = Date.now();
       return summary;
@@ -1207,6 +1237,12 @@ export default class BlindPeeringManager extends EventEmitter {
         reason,
         targets: this.mirrorTargets.size,
         attempt
+      });
+      this.logger?.info?.(`${CJTRACE_TAG} refresh requested`, {
+        reason,
+        targets: this.mirrorTargets.size,
+        attempt,
+        targetPreview: Array.from(this.mirrorTargets.keys()).slice(0, 3)
       });
       try {
         await this.blindPeering?.resume?.();

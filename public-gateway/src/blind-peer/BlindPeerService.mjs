@@ -4,6 +4,7 @@ import { resolve, dirname } from 'node:path';
 import HypercoreId from 'hypercore-id-encoding';
 
 const DEFAULT_STORAGE_SUBDIR = 'blind-peer-data';
+const CJTRACE_TAG = '[CJTRACE]';
 const DEFAULT_MIRROR_STALE_THRESHOLD_MS = 10 * 60 * 1000;
 
 async function loadBlindPeerModule() {
@@ -343,6 +344,14 @@ export default class BlindPeerService extends EventEmitter {
         announce: request.announce,
         priority: request.priority
       });
+      this.logger?.info?.(`${CJTRACE_TAG} blind peer mirror core`, {
+        key: toKeyString(key)?.slice(0, 16) || null,
+        announce: request.announce,
+        priority: request.priority,
+        hasMetadata: !!metadata,
+        metadataIdentifier: metadata?.identifier || null,
+        metadataType: metadata?.type || null
+      });
       if (metadata) {
         this.#recordCoreMetadata(key, {
           priority: request.priority,
@@ -381,6 +390,12 @@ export default class BlindPeerService extends EventEmitter {
       this.logger?.info?.('[BlindPeer] Autobase mirrored', {
         target: toKeyString(targetKey),
         writers: Array.isArray(autobase.writers) ? autobase.writers.length : null
+      });
+      this.logger?.info?.(`${CJTRACE_TAG} blind peer mirror autobase`, {
+        target: toKeyString(targetKey)?.slice(0, 16) || null,
+        writers: Array.isArray(autobase.writers) ? autobase.writers.length : null,
+        metadataIdentifier: metadata?.identifier || null,
+        metadataType: metadata?.type || null
       });
       if (metadata?.coreKey) {
         const resolvedKey = metadata.coreKey;

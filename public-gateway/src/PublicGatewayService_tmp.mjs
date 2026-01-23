@@ -86,7 +86,12 @@ class PublicGatewayService {
     this.config = config;
     this.logger = logger;
     this.tlsOptions = tlsOptions;
-    this.registrationStore = registrationStore || new MemoryRegistrationStore(config.registration?.cacheTtlSeconds);
+    this.registrationStore = registrationStore || new MemoryRegistrationStore({
+      ttlSeconds: config.registration?.cacheTtlSeconds,
+      mirrorTtlSeconds: config.registration?.mirrorTtlSeconds,
+      openJoinPoolTtlSeconds: config.registration?.openJoinPoolTtlSeconds,
+      logger
+    });
     this.sharedSecret = config.registration?.sharedSecret || null;
     this.openJoinConfig = this.#normalizeOpenJoinConfig(config?.openJoin);
     this.openJoinChallenges = new Map();

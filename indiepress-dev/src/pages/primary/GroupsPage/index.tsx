@@ -263,7 +263,10 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         fileSharing: inv.fileSharing !== false,
         relayKey: relayKey ? String(relayKey).slice(0, 16) : null,
         relayUrl: relayUrl ? String(relayUrl).slice(0, 80) : null,
-        hasInviteProof: !!inv.inviteProof
+        hasInviteProof: !!inv.inviteProof,
+        inviteProofScheme: inv.inviteProof?.scheme || null,
+        inviteProofVersion: inv.inviteProof?.payload?.version ?? null,
+        inviteProofIssuedAt: inv.inviteProof?.payload?.issuedAt ?? null
       })
       if (sendToWorker && pubkey && inv.token) {
         sendToWorker({

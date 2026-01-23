@@ -648,6 +648,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         relayUrl: opts?.relayUrl ? String(opts.relayUrl).slice(0, 80) : null,
         hasToken: !!opts?.token,
         hasInviteProof: !!opts?.inviteProof,
+        inviteProofScheme: opts?.inviteProof?.scheme || null,
+        inviteProofVersion: opts?.inviteProof?.payload?.version ?? null,
+        inviteProofIssuedAt: opts?.inviteProof?.payload?.issuedAt ?? null,
         isOpen: typeof opts?.isOpen === 'boolean' ? opts.isOpen : null,
         openJoin: opts?.openJoin === true,
         fileSharing
@@ -1001,6 +1004,18 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                 current?.expectedWriterActive ?? cachedWritable?.expectedWriterActive ?? null
               const stickyMode = current?.mode ?? cachedWritable?.mode ?? null
               const nextPhase = current?.phase === 'success' ? 'success' : progress
+              if (current?.phase !== nextPhase) {
+                console.info('[CJTRACE] join flow progress', {
+                  publicIdentifier: identifier,
+                  phase: nextPhase,
+                  previousPhase: current?.phase || null,
+                  relayKey: (msg?.data?.relayKey || current?.relayKey) ? String(msg?.data?.relayKey || current?.relayKey).slice(0, 16) : null,
+                  relayUrl: msg?.data?.relayUrl ? String(msg?.data?.relayUrl).slice(0, 80) : current?.relayUrl || null,
+                  writable: current?.writable ?? null,
+                  expectedWriterActive: stickyExpectedWriterActive ?? null,
+                  mode: stickyMode ?? null
+                })
+              }
               if (cachedWritable?.writable && !current?.writable) {
                 console.info('[WorkerBridge] join flow writable cache applied', {
                   publicIdentifier: identifier,
@@ -1058,6 +1073,15 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   mode: cachedWritable.mode ?? null
                 })
               }
+              console.info('[CJTRACE] join flow success', {
+                publicIdentifier: identifier,
+                relayKey: (msg?.data?.relayKey || current?.relayKey) ? String(msg?.data?.relayKey || current?.relayKey).slice(0, 16) : null,
+                relayUrl: msg?.data?.relayUrl ? String(msg?.data?.relayUrl).slice(0, 80) : current?.relayUrl || null,
+                writable: stickyWritable ? true : current?.writable ?? null,
+                writableAt: stickyWritable ? stickyWritableAt : current?.writableAt ?? null,
+                expectedWriterActive: stickyExpectedWriterActive ?? null,
+                mode: msg?.data?.mode ?? current?.mode ?? cachedWritable?.mode ?? null
+              })
               const startedAt = current?.startedAt ?? Date.now()
               return {
                 ...prev,
@@ -1088,6 +1112,12 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
             const identifier = msg?.data?.publicIdentifier
             const errorText = msg?.data?.error || 'Join authentication failed'
             if (!identifier) break
+            console.info('[CJTRACE] join flow error', {
+              publicIdentifier: identifier,
+              relayKey: msg?.data?.relayKey ? String(msg?.data?.relayKey).slice(0, 16) : null,
+              relayUrl: msg?.data?.relayUrl ? String(msg?.data?.relayUrl).slice(0, 80) : null,
+              error: errorText
+            })
             setJoinFlows((prev) => {
               const current = prev[identifier]
               const startedAt = current?.startedAt ?? Date.now()
@@ -1139,6 +1169,14 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
               mode: data.mode,
               writable: data.writable,
               expectedWriterActive: data.expectedWriterActive
+            })
+            console.info('[CJTRACE] relay writable', {
+              publicIdentifier: identifier,
+              relayKey: data.relayKey ? String(data.relayKey).slice(0, 16) : null,
+              relayUrl: data.relayUrl ? String(data.relayUrl).slice(0, 80) : null,
+              writable: data.writable === true,
+              expectedWriterActive: data.expectedWriterActive ?? null,
+              mode: data.mode ?? null
             })
             setJoinFlows((prev) => {
               const current = prev[identifier]

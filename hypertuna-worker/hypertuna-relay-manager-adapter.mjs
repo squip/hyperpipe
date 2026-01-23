@@ -36,6 +36,7 @@ const { DEFAULT_NAMESPACE } = hypercoreCaps;
 const activeRelays = new Map();
 const virtualRelayKeys = new Set();
 const AUTO_CONNECT_REHYDRATION_TIMEOUT_MS = 60000;
+const CJTRACE_TAG = '[CJTRACE]';
 
 // Store relay members keyed by relay key or public identifier
 const relayMembers = new Map();
@@ -504,6 +505,21 @@ function applyJoinMetadata(profile, {
                 resolvedCoreKeyHex,
                 localKeyHex
             }
+        });
+    }
+
+    if (mergedRefs.length || blindPeerMeta || shouldUpdateWriterMaterial) {
+        console.info(`${CJTRACE_TAG} join metadata applied`, {
+            relayKey: profile.relay_key || profile.relayKey || relayManager?.relay?.key || null,
+            publicIdentifier: profile.public_identifier || profile.publicIdentifier || null,
+            existingCoreRefs: existingRefs.length,
+            incomingCoreRefs: normalizedRefs.length,
+            mergedCoreRefs: mergedRefs.length,
+            coreRefsPreview: mergedRefs.slice(0, 3).map((ref) => String(ref).slice(0, 16)),
+            hasBlindPeer: !!blindPeerMeta?.publicKey,
+            writerUpdated: shouldUpdateWriterMaterial,
+            hasWriterSecret: !!writerSecret,
+            hasWriterCore: !!writerCore
         });
     }
 
@@ -1175,6 +1191,22 @@ export async function joinRelay(options = {}) {
         };
     }
 
+    const coreRefsList = Array.isArray(coreRefs) ? coreRefs : [];
+    console.info(`${CJTRACE_TAG} joinRelay start`, {
+        relayKey,
+        publicIdentifier: publicIdentifier || null,
+        fromAutoConnect,
+        isOpen,
+        hasWriterSecret: !!writerSecret,
+        hasWriterCore: !!writerCore,
+        hasWriterCoreHex: !!(writerCoreHex || autobaseLocal),
+        hasBlindPeer: !!blindPeer?.publicKey,
+        coreRefsCount: coreRefsList.length,
+        coreRefsPreview: coreRefsList.slice(0, 3).map((ref) => String(ref).slice(0, 16)),
+        useSharedCorestore,
+        corestoreId: corestore?.__ht_id || null
+    });
+
     let writerKeyPair = null;
     const writerSignerKey = decodeWriterKey(writerCore);
     const writerSignerHex = writerSignerKey ? b4a.toString(writerSignerKey, 'hex') : null;
@@ -1608,6 +1640,13 @@ export async function joinRelay(options = {}) {
         }
 
         if (typeof global.appendOpenJoinMirrorCores === 'function') {
+            console.info(`${CJTRACE_TAG} open join mirror append request`, {
+                relayKey,
+                publicIdentifier: profileInfo.public_identifier || publicIdentifier || null,
+                reason: 'post-join',
+                coreRefsCount: postJoinCoreRefs.length,
+                coreRefsPreview: postJoinCoreRefs.slice(0, 3).map((ref) => String(ref).slice(0, 16))
+            });
             global.appendOpenJoinMirrorCores({
                 relayKey,
                 publicIdentifier: profileInfo.public_identifier || publicIdentifier,
@@ -1868,6 +1907,22 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
     const publicIdentifier = profile.public_identifier || null;
     const displayName = profile.name || `Relay ${relayKey.substring(0, 8)}`;
     const isAlreadyActive = activeRelays.has(relayKey);
+    const storedCoreRefsPreview = Array.isArray(profile?.core_refs || profile?.coreRefs)
+        ? (profile.core_refs || profile.coreRefs)
+        : [];
+    const storedBlindPeer = profile?.blind_peer || profile?.blindPeer || null;
+    console.info(`${CJTRACE_TAG} auto-connect profile`, {
+        relayKey,
+        publicIdentifier,
+        isHosted: profile?.isHosted ?? null,
+        isJoined: profile?.isJoined ?? null,
+        isOpen: profile?.isOpen ?? null,
+        createdAt: profile?.created_at ?? null,
+        joinedAt: profile?.joined_at ?? null,
+        hasBlindPeer: !!storedBlindPeer?.publicKey,
+        coreRefsCount: storedCoreRefsPreview.length,
+        coreRefsPreview: storedCoreRefsPreview.slice(0, 3).map((ref) => String(ref).slice(0, 16))
+    });
 
     emitRelayLoadingEvent({
         relayKey,
@@ -2135,6 +2190,16 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
             : [];
         const allowPrefetch = !!storedBlindPeer
             && (mirrorFetchStatus === 'ok' || cachedCoreRefs.length > 0);
+        console.info(`${CJTRACE_TAG} auto-connect mirror state`, {
+            relayKey,
+            publicIdentifier,
+            mirrorFetchStatus,
+            storedCoreRefs: storedCoreRefs.length,
+            cachedCoreRefs: cachedCoreRefs.length,
+            mergedCoreRefs: mergedCoreRefs.length,
+            allowPrefetch,
+            hasBlindPeer: !!storedBlindPeer?.publicKey
+        });
 
         const prefersLocalCorestore = storedWriterValid && !!profile.relay_storage;
         let relayCorestore = null;

@@ -35,6 +35,7 @@ const DEFAULT_PORT = 8443;
 const PUBLIC_GATEWAY_RELAY_KEY = 'public-gateway:hyperbee';
 const PUBLIC_GATEWAY_RELAY_PATH = 'relay';
 const PUBLIC_GATEWAY_RELAY_PATH_ALIASES = ['public-gateway/hyperbee'];
+const CJTRACE_TAG = '[CJTRACE]';
 
 class MessageQueue {
   constructor() {
@@ -1536,6 +1537,13 @@ export class GatewayService extends EventEmitter {
       }
     }
 
+    this.log('debug', `${CJTRACE_TAG} handshake payload`, {
+      peerId,
+      relayCount,
+      isServer: !!isServer,
+      delegateReqToPeers: payload.delegateReqToPeers
+    });
+
     return payload;
   }
 
@@ -1546,6 +1554,15 @@ export class GatewayService extends EventEmitter {
     const handshakeKeys = handshake ? Object.keys(handshake) : [];
     const summary = `peer=${publicKey} stage=${stage} role=${handshake?.role ?? 'unknown'} isGateway=${handshake?.isGateway ?? 'unknown'}`;
     this.log('debug', `[PublicGateway] Hyperswarm handshake received (${summary})`);
+    this.log('info', `${CJTRACE_TAG} handshake received`, {
+      peer: publicKey,
+      stage,
+      role: handshake?.role ?? null,
+      isGateway: handshake?.isGateway ?? null,
+      blindPeerEnabled: handshake?.blindPeerEnabled ?? null,
+      blindPeerPublicKey: handshake?.blindPeerPublicKey ? String(handshake.blindPeerPublicKey).slice(0, 16) : null,
+      blindPeerMaxBytes: handshake?.blindPeerMaxBytes ?? null
+    });
 
     if (handshake) {
       let serialized = null;
@@ -1885,6 +1902,66 @@ export class GatewayService extends EventEmitter {
         expiresAt: entry?.expiresAt ?? null
       }));
     };
+    const normalizeRelayCoreKey = (candidate) => {
+      if (!candidate) return null;
+      if (Buffer.isBuffer(candidate)) {
+        try {
+          return HypercoreId.encode(candidate);
+        } catch (_) {
+          return null;
+        }
+      }
+      if (candidate instanceof Uint8Array) {
+        return normalizeRelayCoreKey(Buffer.from(candidate));
+      }
+      if (typeof candidate === 'string') {
+        const trimmed = candidate.trim();
+        if (!trimmed) return null;
+        try {
+          return HypercoreId.encode(HypercoreId.decode(trimmed));
+        } catch (_) {
+          if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+            try {
+              return HypercoreId.encode(Buffer.from(trimmed, 'hex'));
+            } catch (_) {
+              return null;
+            }
+          }
+          return null;
+        }
+      }
+      if (candidate && typeof candidate === 'object') {
+        if (candidate.key) return normalizeRelayCoreKey(candidate.key);
+        if (candidate.core) return normalizeRelayCoreKey(candidate.core);
+      }
+      return null;
+    };
+    const mergeRelayCoresWithInviteEntries = (relayCores, entries) => {
+      const base = Array.isArray(relayCores) ? relayCores : [];
+      if (!Array.isArray(entries) || entries.length === 0) {
+        return { merged: base, added: 0 };
+      }
+      const merged = base.slice();
+      const seen = new Set();
+      for (const entry of merged) {
+        const key = entry?.key || entry?.core || entry;
+        const normalized = normalizeRelayCoreKey(key);
+        if (normalized) seen.add(normalized);
+      }
+      let added = 0;
+      const addCore = (candidate) => {
+        const normalized = normalizeRelayCoreKey(candidate);
+        if (!normalized || seen.has(normalized)) return;
+        seen.add(normalized);
+        merged.push({ key: normalized, role: 'invite-writer' });
+        added += 1;
+      };
+      for (const entry of entries) {
+        addCore(entry?.writerCore);
+        addCore(entry?.writerCoreHex || entry?.autobaseLocal || entry?.writer_core_hex || entry?.autobase_local);
+      }
+      return { merged, added };
+    };
 
     if (!this.openJoinPoolProvider) {
       console.info('[PublicGateway] Open join pool sync skipped: missing provider', { relayKey });
@@ -1940,6 +2017,27 @@ export class GatewayService extends EventEmitter {
         : (typeof metadata?.relayUrl === 'string' ? metadata.relayUrl : null);
       const gatewayPath = this._normalizeGatewayPath(metadataIdentifier || relayKey, metadata?.gatewayPath, relayUrl);
       const relayCores = this.#collectRelayCoreMetadata(relayKey) || [];
+      const relayCoreSample = relayCores.slice(0, 3).map((entry) => {
+        const key = entry?.key || entry?.core || entry;
+        return previewValue(key, 16);
+      });
+      this.log('info', `${CJTRACE_TAG} open join pool relay cores`, {
+        relayKey,
+        publicIdentifier: metadataIdentifier || null,
+        coreCount: relayCores.length,
+        coreSample: relayCoreSample,
+        isOpen: metadata?.isOpen ?? null,
+        isHosted: metadata?.isHosted ?? null,
+        isJoined: metadata?.isJoined ?? null
+      });
+      if (metadata?.isHosted === null || metadata?.isHosted === undefined) {
+        this.log('info', `${CJTRACE_TAG} open join pool host status unknown`, {
+          relayKey,
+          publicIdentifier: metadataIdentifier || null,
+          isOpen: metadata?.isOpen ?? null,
+          isJoined: metadata?.isJoined ?? null
+        });
+      }
       const targetResult = await this.openJoinPoolProvider({
         relayKey,
         publicIdentifier: metadataIdentifier,
@@ -1974,7 +2072,7 @@ export class GatewayService extends EventEmitter {
       if (poolPublicIdentifier) aliasSet.add(poolPublicIdentifier);
       if (gatewayPath) aliasSet.add(gatewayPath);
       const aliases = Array.from(aliasSet);
-      const poolRelayCores = relayCores.length ? relayCores : null;
+      let poolRelayCores = relayCores.length ? relayCores : null;
       this.log('info', `[PublicGateway] Open join pool target resolved relay=${poolRelayKey}`, {
         requestRelay: relayKey,
         canonicalRelayKey: canonicalRelayKey ? previewValue(canonicalRelayKey, 16) : null,
@@ -2057,12 +2155,21 @@ export class GatewayService extends EventEmitter {
           return;
         }
         const updatedAt = provision.updatedAt || Date.now();
+        const mergeResult = mergeRelayCoresWithInviteEntries(poolRelayCores, entries);
+        const relayCoresForUpdate = mergeResult.added > 0 ? mergeResult.merged : poolRelayCores;
+        if (mergeResult.added > 0) {
+          poolRelayCores = relayCoresForUpdate;
+          this.log('info', `[PublicGateway] Open join pool relay cores extended relay=${poolRelayKey}`, {
+            added: mergeResult.added,
+            coreCount: poolRelayCores.length
+          });
+        }
         report = await this.publicGatewayRegistrar.updateOpenJoinPool(poolRelayKey, entries, {
           updatedAt,
           targetSize,
           publicIdentifier: poolPublicIdentifier || null,
           relayUrl,
-          relayCores: poolRelayCores,
+          relayCores: relayCoresForUpdate,
           metadata: poolMetadata,
           aliases
         });

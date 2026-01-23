@@ -23,7 +23,8 @@ async function createRegistrationStore(config = {}, logger) {
   return new MemoryRegistrationStore({
     ttlSeconds: config?.cacheTtlSeconds,
     mirrorTtlSeconds: config?.mirrorTtlSeconds,
-    openJoinPoolTtlSeconds: config?.openJoinPoolTtlSeconds
+    openJoinPoolTtlSeconds: config?.openJoinPoolTtlSeconds,
+    logger
   });
 }
 

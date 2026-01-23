@@ -402,6 +402,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     } as NostrEvent
   }, [reportTarget])
   const requestIdRef = useRef(0)
+  const lastJoinFlowSnapshotRef = useRef<{
+    phase?: string
+    writable?: boolean
+    expectedWriterActive?: boolean | null
+  } | null>(null)
 
   const myGroupRelay = useMemo(
     () => (groupId ? myGroupList.find((entry) => entry.groupId === groupId)?.relay : undefined),
@@ -597,6 +602,45 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     joinFlow?.relayKey || joinFlow?.publicIdentifier || groupId || null
 
   useEffect(() => {
+    if (!joinFlow) return
+    const snapshot = {
+      phase: joinFlow.phase,
+      writable: joinFlow.writable,
+      expectedWriterActive: joinFlow.expectedWriterActive ?? null
+    }
+    const prev = lastJoinFlowSnapshotRef.current
+    if (
+      prev &&
+      prev.phase === snapshot.phase &&
+      prev.writable === snapshot.writable &&
+      prev.expectedWriterActive === snapshot.expectedWriterActive
+    ) {
+      return
+    }
+    lastJoinFlowSnapshotRef.current = snapshot
+    console.info('[CJTRACE] join flow state', {
+      groupId,
+      phase: joinFlow.phase,
+      writable: joinFlow.writable,
+      expectedWriterActive: joinFlow.expectedWriterActive ?? null,
+      relayKey: joinFlow.relayKey ? String(joinFlow.relayKey).slice(0, 16) : null,
+      relayUrl: joinFlow.relayUrl ? String(joinFlow.relayUrl).slice(0, 80) : null,
+      mode: joinFlow.mode ?? null,
+      error: joinFlow.error ?? null
+    })
+  }, [
+    groupId,
+    joinFlow,
+    joinFlow?.phase,
+    joinFlow?.writable,
+    joinFlow?.expectedWriterActive,
+    joinFlow?.relayKey,
+    joinFlow?.relayUrl,
+    joinFlow?.mode,
+    joinFlow?.error
+  ])
+
+  useEffect(() => {
     if (!groupId) return
     if (!joinFlow?.writableAt || !joinFlow?.writable) return
     console.info('[GroupPage] relay writable: refreshing subscriptions', {
@@ -779,7 +823,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       if (shouldUseWorkerJoin) {
         console.info('[GroupPage] Starting worker join with invite data', {
           groupId,
-          hasInviteProof: !!inviteData?.inviteProof
+          hasInviteProof: !!inviteData?.inviteProof,
+          inviteProofScheme: inviteData?.inviteProof?.scheme || null,
+          inviteProofVersion: inviteData?.inviteProof?.payload?.version ?? null,
+          inviteProofIssuedAt: inviteData?.inviteProof?.payload?.issuedAt ?? null,
+          relayKey: relayKey ? String(relayKey).slice(0, 16) : null,
+          relayUrl: relayUrlForJoin ? String(relayUrlForJoin).slice(0, 80) : null
         })
         await startJoinFlow(groupId, {
           fileSharing: isOpenGroup,

@@ -53,6 +53,7 @@ import BlindPeerReplicaManager from './blind-peer/BlindPeerReplicaManager.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores';
+const CJTRACE_TAG = '[CJTRACE]';
 
 function safeString(value) {
   if (typeof value === 'string') return value;
@@ -81,7 +82,12 @@ class PublicGatewayService {
     this.config = config;
     this.logger = logger;
     this.tlsOptions = tlsOptions;
-    this.registrationStore = registrationStore || new MemoryRegistrationStore(config.registration?.cacheTtlSeconds);
+    this.registrationStore = registrationStore || new MemoryRegistrationStore({
+      ttlSeconds: config.registration?.cacheTtlSeconds,
+      mirrorTtlSeconds: config.registration?.mirrorTtlSeconds,
+      openJoinPoolTtlSeconds: config.registration?.openJoinPoolTtlSeconds,
+      logger
+    });
     this.sharedSecret = config.registration?.sharedSecret || null;
     this.openJoinConfig = this.#normalizeOpenJoinConfig(config?.openJoin);
     this.openJoinChallenges = new Map();
@@ -1061,6 +1067,7 @@ class PublicGatewayService {
       const mergedSample = mergedCores.slice(0, 3).map((entry) => entry.key);
       if (incomingCores.length || rawIncomingCores.length || context) {
         this.logger?.info?.('[PublicGateway] Mirror metadata store', {
+          trace: CJTRACE_TAG,
           relayKey,
           context,
           payloadRelayKey: payload?.relayKey || null,
@@ -3869,6 +3876,10 @@ class PublicGatewayService {
     }
     try {
       const trimmedIdentifier = typeof identifier === 'string' ? identifier.trim() : null;
+      this.logger?.info?.(`${CJTRACE_TAG} mirror metadata request`, {
+        identifier: trimmedIdentifier || null,
+        queryKeys: req?.query ? Object.keys(req.query) : []
+      });
       const resolved = trimmedIdentifier
         ? await this.#resolveOpenJoinRegistration(trimmedIdentifier)
         : null;
@@ -4062,6 +4073,20 @@ class PublicGatewayService {
     const payloadAliases = Array.isArray(payload?.aliases)
       ? payload.aliases
       : [];
+    const relayCoreSample = payloadRelayCores
+      .slice(0, 3)
+      .map((entry) => entry?.key || entry?.core || entry)
+      .map((value) => (value ? String(value).slice(0, 16) : null));
+    this.logger?.info?.(`${CJTRACE_TAG} open join pool update request`, {
+      relayKey,
+      payloadRelayKey: payload?.relayKey || null,
+      publicIdentifier: payloadPublicIdentifier || null,
+      relayCoresCount: payloadRelayCores.length,
+      relayCoreSample,
+      aliasesCount: payloadAliases.length,
+      isOpen: payloadMetadata?.isOpen ?? null,
+      isHosted: payloadMetadata?.isHosted ?? null
+    });
 
     const record = await this.registrationStore.getRelay(relayKey);
     const recordMetadata = record?.metadata && typeof record.metadata === 'object'
@@ -4543,6 +4568,13 @@ class PublicGatewayService {
     const maxAppend = this.openJoinConfig?.maxAppendCores || 64;
     const normalized = this.#normalizeOpenJoinCoreEntries(rawCores, { maxEntries: maxAppend });
     const rejected = normalized.rejected + normalized.truncated;
+    this.logger?.info?.(`${CJTRACE_TAG} open join append request`, {
+      relayKey: identifier,
+      received: rawCores.length,
+      normalized: normalized.entries.length,
+      rejected,
+      normalizedSample: normalized.entries.slice(0, 3).map((entry) => entry.key)
+    });
     if (rejected > 0) {
       this.logger?.warn?.('[PublicGateway] Open join core normalization dropped entries', {
         relayKey: identifier,
