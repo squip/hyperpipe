@@ -86,6 +86,7 @@ const RELAY_WRITER_SYNC_RETRY_TIMEOUT_MS = 30000
 const OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores'
+const OPEN_JOIN_APPEND_REHYDRATION_MAX_AGE_MS = 15000
 
 global.userConfig = {
   storage: defaultStorageDir,
@@ -1929,6 +1930,53 @@ async function appendOpenJoinMirrorCores({
     return { status: 'skipped', reason: 'missing-nostr-credentials' }
   }
   const manager = relayManager || (relayKey ? activeRelays.get(relayKey) : null)
+  let isClosed = false
+  try {
+    const profile = relayKey
+      ? await getRelayProfileByKey(relayKey)
+      : (publicIdentifier ? await getRelayProfileByPublicIdentifier(publicIdentifier) : null)
+    if (profile && typeof profile.isOpen === 'boolean') {
+      isClosed = profile.isOpen === false
+    }
+  } catch (error) {
+    console.warn('[Worker] Open join append profile lookup failed', {
+      relayIdentifier,
+      error: error?.message || error
+    })
+  }
+  if (isClosed) {
+    const blindPeeringManager = global.blindPeeringManager || null
+    if (blindPeeringManager?.rehydrateMirrors) {
+      const rehydrationStatus = blindPeeringManager.getStatus?.()?.rehydration || null
+      const lastCompletedAt = Number.isFinite(rehydrationStatus?.lastCompletedAt)
+        ? Math.trunc(rehydrationStatus.lastCompletedAt)
+        : null
+      const inflight = !!rehydrationStatus?.inflight
+      let rehydrateSummary = null
+      if (!lastCompletedAt || inflight || (Date.now() - lastCompletedAt) > OPEN_JOIN_APPEND_REHYDRATION_MAX_AGE_MS) {
+        rehydrateSummary = await rehydrateMirrorsWithRetry(blindPeeringManager, {
+          reason: 'open-join-append',
+          timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS,
+          retries: BLIND_PEER_REHYDRATION_RETRIES,
+          backoffMs: BLIND_PEER_REHYDRATION_BACKOFF_MS
+        })
+      }
+      if (rehydrateSummary) {
+        const failed = Number.isFinite(rehydrateSummary?.failed) ? Math.trunc(rehydrateSummary.failed) : 0
+        const status = rehydrateSummary?.status || null
+        const rehydrateOk = status === 'ok' ? failed === 0 : status === 'skipped'
+        if (!rehydrateOk) {
+          console.warn('[Worker] Open join append delayed pending rehydration', {
+            relayIdentifier,
+            status,
+            failed,
+            reason: rehydrateSummary?.reason || null
+          })
+          return { status: 'skipped', reason: 'rehydration-pending', rehydrateSummary }
+        }
+      }
+    }
+  }
   const coreEntries = collectRelayCoreEntriesForAppend(manager)
   if (!coreEntries.length) {
     return { status: 'skipped', reason: 'missing-cores' }

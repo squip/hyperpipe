@@ -937,7 +937,10 @@ class PublicGatewayService {
   #buildMirrorMetadataPayload(record, relayKey) {
     const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
     const cores = Array.isArray(record?.relayCores) ? record.relayCores : [];
-    return {
+    const relayViewVersion = Number.isFinite(record?.metadata?.relayViewVersion)
+      ? Math.trunc(record.metadata.relayViewVersion)
+      : (Number.isFinite(record?.metadata?.viewVersion) ? Math.trunc(record.metadata.viewVersion) : null);
+    const payload = {
       relayKey,
       publicIdentifier: record?.metadata?.identifier || relayKey,
       cores,
@@ -949,6 +952,10 @@ class PublicGatewayService {
           }
         : { enabled: false }
     };
+    if (Number.isFinite(relayViewVersion)) {
+      payload.relayViewVersion = relayViewVersion;
+    }
+    return payload;
   }
 
   #buildOpenJoinMirrorPayload(record, relayKey) {
@@ -966,7 +973,10 @@ class PublicGatewayService {
     const metadata = pool?.metadata && typeof pool.metadata === 'object' ? pool.metadata : null;
     const publicIdentifier = pool?.publicIdentifier || metadata?.identifier || relayKey;
     const relayUrl = pool?.relayUrl || metadata?.relayUrl || metadata?.connectionUrl || null;
-    return {
+    const relayViewVersion = Number.isFinite(metadata?.relayViewVersion)
+      ? Math.trunc(metadata.relayViewVersion)
+      : (Number.isFinite(metadata?.viewVersion) ? Math.trunc(metadata.viewVersion) : null);
+    const payload = {
       relayKey,
       publicIdentifier: publicIdentifier || relayKey,
       cores: relayCores,
@@ -979,6 +989,10 @@ class PublicGatewayService {
           }
         : { enabled: false }
     };
+    if (Number.isFinite(relayViewVersion)) {
+      payload.relayViewVersion = relayViewVersion;
+    }
+    return payload;
   }
 
   #normalizeMirrorCoreEntries(entries = []) {
@@ -1053,8 +1067,27 @@ class PublicGatewayService {
         ...(existing || {}),
         ...payload
       };
+      const existingViewVersion = Number.isFinite(existing?.relayViewVersion)
+        ? Math.trunc(existing.relayViewVersion)
+        : (Number.isFinite(existing?.viewVersion) ? Math.trunc(existing.viewVersion) : null);
+      const incomingViewVersion = Number.isFinite(payload?.relayViewVersion)
+        ? Math.trunc(payload.relayViewVersion)
+        : (Number.isFinite(payload?.viewVersion) ? Math.trunc(payload.viewVersion) : null);
+      let resolvedViewVersion = incomingViewVersion;
+      let viewVersionRegressed = false;
+      if (Number.isFinite(existingViewVersion)) {
+        if (!Number.isFinite(incomingViewVersion)) {
+          resolvedViewVersion = existingViewVersion;
+        } else if (incomingViewVersion < existingViewVersion) {
+          resolvedViewVersion = existingViewVersion;
+          viewVersionRegressed = true;
+        }
+      }
       if (mergedCores.length) {
         mergedPayload.cores = mergedCores;
+      }
+      if (Number.isFinite(resolvedViewVersion)) {
+        mergedPayload.relayViewVersion = resolvedViewVersion;
       }
       const dropped = Math.max(rawIncomingCores.length - incomingCores.length, 0);
       const incomingSample = incomingCores.slice(0, 3).map((entry) => entry.key);
@@ -1074,6 +1107,10 @@ class PublicGatewayService {
           mirrorSource: mergedPayload.mirrorSource || null,
           payloadMirrorSource: payload?.mirrorSource || null,
           closedJoin: payload?.closedJoin === true,
+          incomingViewVersion,
+          existingViewVersion,
+          resolvedViewVersion,
+          viewVersionRegressed,
           updatedAt: payload?.updatedAt ?? null,
           existingUpdatedAt: existing?.updatedAt ?? null,
           relayUrl: mergedPayload.relayUrl || null
@@ -4085,7 +4122,7 @@ class PublicGatewayService {
       ? Math.min(Math.trunc(targetSizeRaw), maxPool)
       : maxPool;
 
-    const poolMetadata = payloadMetadata || (recordMetadata
+    const basePoolMetadata = payloadMetadata || (recordMetadata
       ? {
           identifier: recordMetadata.identifier || null,
           isOpen: recordMetadata.isOpen ?? null,
@@ -4094,9 +4131,13 @@ class PublicGatewayService {
           isJoined: recordMetadata.isJoined ?? null,
           metadataUpdatedAt: recordMetadata.metadataUpdatedAt ?? null,
           gatewayPath: recordMetadata.gatewayPath || null,
-          relayUrl: recordMetadata.connectionUrl || recordMetadata.relayUrl || null
+          relayUrl: recordMetadata.connectionUrl || recordMetadata.relayUrl || null,
+          relayViewVersion: Number.isFinite(recordMetadata.relayViewVersion)
+            ? Math.trunc(recordMetadata.relayViewVersion)
+            : (Number.isFinite(recordMetadata.viewVersion) ? Math.trunc(recordMetadata.viewVersion) : null)
         }
       : null);
+    let poolMetadata = basePoolMetadata ? { ...basePoolMetadata } : null;
     const poolPublicIdentifier = payloadPublicIdentifier
       || poolMetadata?.identifier
       || recordMetadata?.identifier
@@ -4106,7 +4147,7 @@ class PublicGatewayService {
       || recordMetadata?.connectionUrl
       || recordMetadata?.relayUrl
       || null;
-    const poolRelayCores = payloadRelayCores.length
+    let poolRelayCores = payloadRelayCores.length
       ? payloadRelayCores
       : (Array.isArray(record?.relayCores) ? record.relayCores : []);
     const aliasSet = new Set();
@@ -4160,6 +4201,45 @@ class PublicGatewayService {
     };
 
     const existingPool = await this.registrationStore.getOpenJoinPool?.(relayKey);
+    const existingPoolMetadata = existingPool?.metadata && typeof existingPool.metadata === 'object'
+      ? existingPool.metadata
+      : null;
+    const existingRelayCores = Array.isArray(existingPool?.relayCores) ? existingPool.relayCores : [];
+    const normalizedExistingRelayCores = this.#normalizeMirrorCoreEntries(existingRelayCores);
+    const normalizedIncomingRelayCores = this.#normalizeMirrorCoreEntries(poolRelayCores);
+    const relayCoreMerge = this.#mergeOpenJoinCoreEntries(
+      existingRelayCores,
+      poolRelayCores,
+      { maxTotal: this.openJoinConfig?.maxRelayCores || null }
+    );
+    const mergedRelayCores = relayCoreMerge.merged;
+    const relayCoreRegressed = normalizedIncomingRelayCores.length < normalizedExistingRelayCores.length;
+    if (mergedRelayCores.length) {
+      poolRelayCores = mergedRelayCores;
+    }
+    const existingViewVersion = Number.isFinite(existingPoolMetadata?.relayViewVersion)
+      ? Math.trunc(existingPoolMetadata.relayViewVersion)
+      : (Number.isFinite(existingPoolMetadata?.viewVersion) ? Math.trunc(existingPoolMetadata.viewVersion) : null);
+    const incomingViewVersion = Number.isFinite(poolMetadata?.relayViewVersion)
+      ? Math.trunc(poolMetadata.relayViewVersion)
+      : (Number.isFinite(poolMetadata?.viewVersion) ? Math.trunc(poolMetadata.viewVersion) : null);
+    let resolvedViewVersion = incomingViewVersion;
+    let viewVersionRegressed = false;
+    if (Number.isFinite(existingViewVersion)) {
+      if (!Number.isFinite(incomingViewVersion)) {
+        resolvedViewVersion = existingViewVersion;
+      } else if (incomingViewVersion < existingViewVersion) {
+        resolvedViewVersion = existingViewVersion;
+        viewVersionRegressed = true;
+      }
+    }
+    if (Number.isFinite(resolvedViewVersion)) {
+      if (!poolMetadata) {
+        poolMetadata = { relayViewVersion: resolvedViewVersion };
+      } else {
+        poolMetadata.relayViewVersion = resolvedViewVersion;
+      }
+    }
     const existingEntries = sanitizeEntries(Array.isArray(existingPool?.entries) ? existingPool.entries : []);
     const incomingEntries = sanitizeEntries(entriesRaw);
     const existingCount = existingEntries.length;
@@ -4175,7 +4255,15 @@ class PublicGatewayService {
       publicIdentifier: poolPublicIdentifier || null,
       relayUrl: poolRelayUrl || null,
       relayCores: poolRelayCores.length,
+      relayCoreExisting: normalizedExistingRelayCores.length,
+      relayCoreIncoming: normalizedIncomingRelayCores.length,
+      relayCoreMerged: mergedRelayCores.length || poolRelayCores.length,
+      relayCoreRegressed,
       aliases: poolAliases.length,
+      incomingViewVersion,
+      existingViewVersion,
+      resolvedViewVersion,
+      viewVersionRegressed,
       metadataUpdatedAt: poolMetadata?.metadataUpdatedAt ?? null,
       recordFound: !!record,
       targetSize,

@@ -35,6 +35,10 @@ const DEFAULT_PORT = 8443;
 const PUBLIC_GATEWAY_RELAY_KEY = 'public-gateway:hyperbee';
 const PUBLIC_GATEWAY_RELAY_PATH = 'relay';
 const PUBLIC_GATEWAY_RELAY_PATH_ALIASES = ['public-gateway/hyperbee'];
+const OPEN_JOIN_POOL_REHYDRATION_TIMEOUT_MS = 30000;
+const OPEN_JOIN_POOL_REHYDRATION_MAX_AGE_MS = 15000;
+const OPEN_JOIN_POOL_REHYDRATION_RETRY_DELAY_MS = 5000;
+const OPEN_JOIN_POOL_REHYDRATION_MAX_ATTEMPTS = 3;
 
 class MessageQueue {
   constructor() {
@@ -198,6 +202,7 @@ export class GatewayService extends EventEmitter {
     this.isRunning = false;
     this.startedAt = null;
     this.config = null;
+    this.openJoinPoolRehydration = new Map();
     this.healthState = {
       startTime: null,
       lastCheck: null,
@@ -1869,6 +1874,102 @@ export class GatewayService extends EventEmitter {
     };
   }
 
+  #getRelayViewVersion(relayKey) {
+    if (!relayKey || !relayManagerMap?.get) return null;
+    const relayManager = relayManagerMap.get(relayKey);
+    const version = relayManager?.relay?.view?.version ?? null;
+    if (!Number.isFinite(version)) return null;
+    return Math.trunc(version);
+  }
+
+  #getBlindPeeringRehydrationStatus() {
+    const manager = global.blindPeeringManager || null;
+    if (!manager || typeof manager.getStatus !== 'function') return null;
+    return manager.getStatus();
+  }
+
+  async #ensureBlindPeeringRehydrated({ relayKey = null, inviteOnly = false } = {}) {
+    if (!inviteOnly) {
+      return { ok: true, reason: 'not-invite-only' };
+    }
+    const manager = global.blindPeeringManager || null;
+    if (!manager?.rehydrateMirrors) {
+      return { ok: true, reason: 'rehydration-unavailable' };
+    }
+    const status = this.#getBlindPeeringRehydrationStatus();
+    const rehydration = status?.rehydration || null;
+    const lastCompletedAt = Number.isFinite(rehydration?.lastCompletedAt)
+      ? Math.trunc(rehydration.lastCompletedAt)
+      : null;
+    const inflight = !!rehydration?.inflight;
+    if (lastCompletedAt && !inflight && (Date.now() - lastCompletedAt) <= OPEN_JOIN_POOL_REHYDRATION_MAX_AGE_MS) {
+      return { ok: true, reason: 'rehydration-recent', lastCompletedAt };
+    }
+
+    try {
+      const summary = await manager.rehydrateMirrors({
+        reason: `open-join-pool-${relayKey ? relayKey.slice(0, 12) : 'relay'}`,
+        timeoutMs: OPEN_JOIN_POOL_REHYDRATION_TIMEOUT_MS
+      });
+      const statusValue = summary?.status || null;
+      const failed = Number.isFinite(summary?.failed) ? Math.trunc(summary.failed) : 0;
+      const ok = statusValue === 'ok'
+        ? failed === 0
+        : statusValue === 'skipped';
+      return {
+        ok,
+        reason: ok ? 'rehydration-ok' : (summary?.reason || statusValue || 'rehydration-failed'),
+        summary
+      };
+    } catch (error) {
+      return { ok: false, reason: error?.message || error };
+    }
+  }
+
+  #scheduleOpenJoinPoolRetry(relayKey, metadata, { reason = null, delayMs = OPEN_JOIN_POOL_REHYDRATION_RETRY_DELAY_MS } = {}) {
+    if (!relayKey) return;
+    const entry = this.openJoinPoolRehydration.get(relayKey) || {
+      attempts: 0,
+      timer: null,
+      scheduledAt: null,
+      reason: null
+    };
+    if (entry.timer) {
+      return;
+    }
+    entry.attempts += 1;
+    if (entry.attempts > OPEN_JOIN_POOL_REHYDRATION_MAX_ATTEMPTS) {
+      this.log('warn', `[PublicGateway] Open join pool sync retry limit reached relay=${relayKey}`, {
+        attempts: entry.attempts,
+        reason: reason || entry.reason || null
+      });
+      this.openJoinPoolRehydration.delete(relayKey);
+      return;
+    }
+    const metadataCopy = metadata ? { ...metadata } : null;
+    entry.reason = reason || entry.reason || null;
+    entry.scheduledAt = Date.now();
+    entry.timer = setTimeout(() => {
+      const current = this.openJoinPoolRehydration.get(relayKey);
+      if (current) {
+        current.timer = null;
+        this.openJoinPoolRehydration.set(relayKey, current);
+      }
+      this.#syncOpenJoinPool(relayKey, metadataCopy).catch((error) => {
+        this.log('warn', `[PublicGateway] Open join pool retry failed relay=${relayKey}: ${error?.message || error}`);
+      });
+    }, delayMs);
+    if (typeof entry.timer?.unref === 'function') {
+      entry.timer.unref();
+    }
+    this.openJoinPoolRehydration.set(relayKey, entry);
+    this.log('info', `[PublicGateway] Open join pool sync retry scheduled relay=${relayKey}`, {
+      attempts: entry.attempts,
+      delayMs,
+      reason: entry.reason
+    });
+  }
+
   async #syncOpenJoinPool(relayKey, metadata) {
     const previewValue = (value, limit = 16) => {
       if (value === null || value === undefined) return null;
@@ -1908,7 +2009,8 @@ export class GatewayService extends EventEmitter {
       isHosted: metadata?.isHosted ?? null,
       isJoined: metadata?.isJoined ?? null,
       isPublic: metadata?.isPublic ?? null,
-      metadataUpdatedAt: metadata?.metadataUpdatedAt ?? null
+      metadataUpdatedAt: metadata?.metadataUpdatedAt ?? null,
+      relayViewVersion: this.#getRelayViewVersion(relayKey)
     });
 
     if (metadata?.isHosted === false || metadata?.isJoined === true) {
@@ -1933,6 +2035,19 @@ export class GatewayService extends EventEmitter {
       });
       return;
     }
+    if (inviteOnly) {
+      const rehydrationResult = await this.#ensureBlindPeeringRehydrated({ relayKey, inviteOnly });
+      if (!rehydrationResult?.ok) {
+        this.log('warn', `[PublicGateway] Open join pool sync delayed pending rehydration relay=${relayKey}`, {
+          reason: rehydrationResult?.reason || null,
+          summary: rehydrationResult?.summary || null
+        });
+        this.#scheduleOpenJoinPoolRetry(relayKey, metadata, {
+          reason: rehydrationResult?.reason || 'rehydration-pending'
+        });
+        return;
+      }
+    }
     try {
       const metadataIdentifier = typeof metadata?.identifier === 'string' ? metadata.identifier : null;
       const relayUrl = typeof metadata?.connectionUrl === 'string'
@@ -1940,6 +2055,7 @@ export class GatewayService extends EventEmitter {
         : (typeof metadata?.relayUrl === 'string' ? metadata.relayUrl : null);
       const gatewayPath = this._normalizeGatewayPath(metadataIdentifier || relayKey, metadata?.gatewayPath, relayUrl);
       const relayCores = this.#collectRelayCoreMetadata(relayKey) || [];
+      const relayViewVersion = this.#getRelayViewVersion(relayKey);
       const targetResult = await this.openJoinPoolProvider({
         relayKey,
         publicIdentifier: metadataIdentifier,
@@ -1968,7 +2084,8 @@ export class GatewayService extends EventEmitter {
         isJoined: metadata?.isJoined ?? null,
         metadataUpdatedAt: metadata?.metadataUpdatedAt ?? null,
         gatewayPath: gatewayPath || null,
-        relayUrl: relayUrl || null
+        relayUrl: relayUrl || null,
+        relayViewVersion: relayViewVersion ?? null
       };
       const aliasSet = new Set();
       if (poolPublicIdentifier) aliasSet.add(poolPublicIdentifier);
@@ -2080,6 +2197,7 @@ export class GatewayService extends EventEmitter {
         return;
       }
 
+      this.openJoinPoolRehydration.delete(relayKey);
       this.log('info', `[PublicGateway] Open join pool updated relay=${poolRelayKey}`, {
         total: report?.total ?? null,
         targetSize
