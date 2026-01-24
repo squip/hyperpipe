@@ -159,6 +159,22 @@ type InviteProof = {
   scheme?: string | null
 } | null
 
+type InviteMirrorSnapshot = {
+  relayKey?: string | null
+  publicIdentifier?: string | null
+  relayUrl?: string | null
+  mirrorSource?: string | null
+  updatedAt?: number | null
+  fetchedAt?: number | null
+  blindPeer?: {
+    publicKey?: string | null
+    encryptionKey?: string | null
+    replicationTopic?: string | null
+    maxBytes?: number | null
+  } | null
+  cores?: { key: string; role?: string | null }[]
+} | null
+
 type WorkerBridgeContextValue = {
   isElectron: boolean
   ready: boolean
@@ -195,6 +211,7 @@ type WorkerBridgeContextValue = {
       relayKey?: string | null
       relayUrl?: string | null
       inviteProof?: InviteProof
+      mirrorSnapshot?: InviteMirrorSnapshot
       openJoin?: boolean
     }
   ) => Promise<void>
@@ -581,6 +598,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         relayKey?: string | null
         relayUrl?: string | null
         inviteProof?: InviteProof
+        mirrorSnapshot?: InviteMirrorSnapshot
         openJoin?: boolean
       }
     ) => {
@@ -637,7 +655,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         token: opts?.token,
         relayKey: opts?.relayKey || undefined,
         relayUrl: opts?.relayUrl || undefined,
-        inviteProof: opts?.inviteProof
+        inviteProof: opts?.inviteProof,
+        mirrorSnapshot: opts?.mirrorSnapshot
       }
       if (hostPeers && hostPeers.length) data.hostPeers = hostPeers
 
@@ -651,6 +670,10 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         inviteProofScheme: opts?.inviteProof?.scheme || null,
         inviteProofVersion: opts?.inviteProof?.payload?.version ?? null,
         inviteProofIssuedAt: opts?.inviteProof?.payload?.issuedAt ?? null,
+        hasMirrorSnapshot: !!opts?.mirrorSnapshot,
+        mirrorSource: opts?.mirrorSnapshot?.mirrorSource || null,
+        mirrorUpdatedAt: opts?.mirrorSnapshot?.updatedAt ?? null,
+        mirrorCoreCount: Array.isArray(opts?.mirrorSnapshot?.cores) ? opts?.mirrorSnapshot?.cores.length : 0,
         isOpen: typeof opts?.isOpen === 'boolean' ? opts.isOpen : null,
         openJoin: opts?.openJoin === true,
         fileSharing

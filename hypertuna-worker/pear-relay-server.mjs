@@ -2582,6 +2582,11 @@ async function waitForRelayWriterActivation(options = {}) {
 
     timeoutId = setTimeout(() => {
       const snap = snapshot('timeout');
+      if (isReady(snap)) {
+        console.warn('[RelayServer] waitForRelayWriterActivation timeout but ready', snap);
+        cleanup({ ok: true, timeout: true, ...snap });
+        return;
+      }
       console.warn('[RelayServer] waitForRelayWriterActivation timeout', snap);
       cleanup({ ok: false, timeout: true, ...snap });
     }, timeoutMs);
@@ -3818,6 +3823,37 @@ export async function startJoinAuthentication(options) {
         }
 
         await updateRelayAuthToken(fallbackRelayKey, userPubkey, fallbackToken);
+
+        let openOfflineRelayManager = null;
+        try {
+          const { activeRelays } = await import('./hypertuna-relay-manager-adapter.mjs');
+          openOfflineRelayManager = activeRelays.get(fallbackRelayKey);
+          if (openOfflineRelayManager?.relay?.update) {
+            console.log('[RelayServer] Waiting for relay sync after open-offline join', {
+              relayKey: fallbackRelayKey,
+              reason: 'open-offline'
+            });
+            try {
+              await openOfflineRelayManager.relay.update({ wait: true });
+            } catch (error) {
+              console.warn('[RelayServer] Relay update({ wait: true }) failed; retrying without options', {
+                relayKey: fallbackRelayKey,
+                error: error?.message || error
+              });
+              await openOfflineRelayManager.relay.update();
+            }
+            console.log('[RelayServer] Relay sync complete after open-offline join', {
+              relayKey: fallbackRelayKey,
+              writable: openOfflineRelayManager.relay?.writable ?? null,
+              activeWriters: openOfflineRelayManager.relay?.activeWriters?.size ?? null
+            });
+          }
+        } catch (err) {
+          console.warn('[RelayServer] Relay sync wait failed after open-offline join', {
+            relayKey: fallbackRelayKey,
+            error: err?.message || err
+          });
+        }
 
         const relayWaitResult = await waitForRelayWriterActivation({
           relayKey: fallbackRelayKey,

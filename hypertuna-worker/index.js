@@ -80,8 +80,10 @@ const BLIND_PEER_JOIN_REHYDRATION_RETRIES = 1
 const BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS = 7000
 const BLIND_PEER_INVITE_MIRROR_ATTEMPTS = 2
 const BLIND_PEER_INVITE_MIRROR_BACKOFF_MS = 3000
+const INVITE_MIRROR_READY_MAX_AGE_MS = 2 * 60 * 1000
 const BLIND_PEER_MIRROR_METADATA_REFRESH_MS = 1 * 60 * 1000
 const BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS = 8000
+const CLOSED_JOIN_MIRROR_MIN_CORE_REFS = 3
 const RELAY_WRITER_SYNC_RETRY_TIMEOUT_MS = 30000
 const OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_TIMEOUT_MS = 8000
@@ -407,6 +409,97 @@ function normalizeOpenJoinCoreEntry(entry) {
     return role ? { key, role } : { key }
   }
   return { key }
+}
+
+function normalizeMirrorCoreEntries(entries = []) {
+  if (!Array.isArray(entries)) return []
+  const merged = []
+  const seen = new Set()
+  for (const entry of entries) {
+    const normalized = normalizeOpenJoinCoreEntry(entry)
+    if (!normalized?.key || seen.has(normalized.key)) continue
+    seen.add(normalized.key)
+    merged.push(normalized.role ? { key: normalized.key, role: normalized.role } : { key: normalized.key })
+  }
+  return merged
+}
+
+function mirrorEntriesHaveViewRole(entries = []) {
+  if (!Array.isArray(entries)) return false
+  return entries.some((entry) => {
+    const role = entry && typeof entry === 'object' ? entry.role : null
+    return typeof role === 'string' && role.includes('autobase-view')
+  })
+}
+
+function toNumber(value) {
+  if (Number.isFinite(value)) return Math.trunc(value)
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return Math.trunc(parsed)
+  }
+  return null
+}
+
+function buildInviteMirrorSnapshot(mirrorData) {
+  if (!mirrorData || typeof mirrorData !== 'object') return null
+  const snapshot = {
+    relayKey: normalizeRelayKeyHex(mirrorData.relayKey || mirrorData.relay_key || null),
+    publicIdentifier: typeof mirrorData.publicIdentifier === 'string'
+      ? mirrorData.publicIdentifier
+      : (typeof mirrorData.public_identifier === 'string' ? mirrorData.public_identifier : null),
+    relayUrl: typeof mirrorData.relayUrl === 'string' ? mirrorData.relayUrl : null,
+    mirrorSource: typeof (mirrorData.mirrorSource || mirrorData.mirror_source) === 'string'
+      ? (mirrorData.mirrorSource || mirrorData.mirror_source)
+      : null,
+    updatedAt: toNumber(mirrorData.updatedAt),
+    fetchedAt: Date.now(),
+    blindPeer: sanitizeBlindPeerMeta(mirrorData.blindPeer),
+    cores: normalizeMirrorCoreEntries(mirrorData.cores || mirrorData.relayCores || [])
+  }
+  if (!snapshot.relayKey) delete snapshot.relayKey
+  if (!snapshot.publicIdentifier) delete snapshot.publicIdentifier
+  if (!snapshot.relayUrl) delete snapshot.relayUrl
+  if (!snapshot.mirrorSource) delete snapshot.mirrorSource
+  if (!snapshot.updatedAt) delete snapshot.updatedAt
+  if (!snapshot.blindPeer) delete snapshot.blindPeer
+  if (!snapshot.cores?.length) delete snapshot.cores
+  return snapshot
+}
+
+function assessInviteMirrorReadiness(mirrorData, {
+  now = Date.now(),
+  maxAgeMs = INVITE_MIRROR_READY_MAX_AGE_MS,
+  minCoreRefs = CLOSED_JOIN_MIRROR_MIN_CORE_REFS
+} = {}) {
+  if (!mirrorData || typeof mirrorData !== 'object') {
+    return { ready: false, reason: 'missing-mirror-data' }
+  }
+  const mirrorSource = mirrorData.mirrorSource || mirrorData.mirror_source || null
+  const updatedAt = toNumber(mirrorData.updatedAt)
+  const ageMs = updatedAt ? Math.max(0, now - updatedAt) : null
+  const coreEntries = normalizeMirrorCoreEntries(mirrorData.cores || mirrorData.relayCores || [])
+  const coreRefs = coreEntries.map((entry) => entry.key)
+  const hasRoles = coreEntries.some((entry) => entry && entry.role)
+  const hasViewRole = mirrorEntriesHaveViewRole(coreEntries)
+  const hasBlindPeer = !!sanitizeBlindPeerMeta(mirrorData.blindPeer)?.publicKey
+  const hasCoreRefs = coreRefs.length >= minCoreRefs
+  const rolesReady = hasRoles ? hasViewRole : true
+  const ageReady = updatedAt ? ageMs <= maxAgeMs : false
+  const ready = hasBlindPeer && hasCoreRefs && rolesReady && ageReady
+  return {
+    ready,
+    mirrorSource,
+    updatedAt,
+    ageMs,
+    hasBlindPeer,
+    coreRefsCount: coreRefs.length,
+    hasViewRole,
+    hasRoles,
+    rolesReady,
+    ageReady,
+    coreRefsPreview: summarizeCoreRefs(coreRefs)
+  }
 }
 
 function collectRelayCoreEntriesForAppend(relayManager) {
@@ -996,8 +1089,19 @@ async function syncActiveRelayCoreRefs({
   relayKey,
   publicIdentifier = null,
   coreRefs = [],
-  reason = 'mirror-update'
+  reason = 'mirror-update',
+  syncPolicy = 'strict',
+  rehydrateTimeoutMs = null,
+  allowNoPeers = false
 } = {}) {
+  const policy = typeof syncPolicy === 'string' ? syncPolicy : 'strict'
+  const bestEffort = policy === 'best-effort' || policy === 'background'
+  const allowNoPeersSync = !!allowNoPeers
+  const effectiveTimeoutMs = Number.isFinite(rehydrateTimeoutMs)
+    ? rehydrateTimeoutMs
+    : bestEffort
+      ? BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS
+      : BLIND_PEER_REHYDRATION_TIMEOUT_MS
   const normalizedStats = normalizeCoreRefListWithStats(coreRefs, {
     context: { phase: 'sync-active-core-refs', relayKey: previewValue(relayKey, 16), reason },
     log: console
@@ -1045,6 +1149,8 @@ async function syncActiveRelayCoreRefs({
     relayKey,
     publicIdentifier,
     reason,
+    syncPolicy: policy,
+    rehydrateTimeoutMs: effectiveTimeoutMs,
     coreRefsCount: normalized.length,
     fingerprint,
     coreRefsPreview: summarizeCoreRefs(normalized),
@@ -1068,23 +1174,127 @@ async function syncActiveRelayCoreRefs({
   })
 
   let primeSummary = null
-  if (typeof manager.primeRelayCoreRefs === 'function') {
-    primeSummary = await manager.primeRelayCoreRefs({
+  let rehydrateSummary = null
+  let mirrorPeerSummary = null
+  let hasPeers = null
+  if (bestEffort && typeof manager.getRelayMirrorSyncSummary === 'function') {
+    mirrorPeerSummary = manager.getRelayMirrorSyncSummary({
       relayKey,
       publicIdentifier: identifier,
       coreRefs: normalized,
-      timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS,
+      corestore: relayCorestore,
+      requirePeers: true
+    })
+    if (Array.isArray(mirrorPeerSummary?.states)) {
+      hasPeers = mirrorPeerSummary.states.some((state) => state?.hasPeers)
+    }
+    console.info(`${CJTRACE_TAG} syncActiveRelayCoreRefs best-effort peers`, {
+      relayKey,
+      publicIdentifier: identifier,
       reason,
-      corestore: relayCorestore
+      hasPeers,
+      allowNoPeers: allowNoPeersSync,
+      total: mirrorPeerSummary?.total ?? null,
+      ready: mirrorPeerSummary?.ready ?? null,
+      missing: mirrorPeerSummary?.missing ?? null,
+      notReady: mirrorPeerSummary?.notReady ?? null
     })
   }
 
-  const rehydrateSummary = await rehydrateMirrorsWithRetry(manager, {
-    reason,
-    timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS,
-    retries: BLIND_PEER_REHYDRATION_RETRIES,
-    backoffMs: BLIND_PEER_REHYDRATION_BACKOFF_MS
-  })
+  if (bestEffort && hasPeers === false && !allowNoPeersSync) {
+    primeSummary = { status: 'skipped', reason: 'no-peers' }
+    rehydrateSummary = { status: 'skipped', reason: 'no-peers', synced: 0, failed: 0 }
+    console.info(`${CJTRACE_TAG} syncActiveRelayCoreRefs best-effort skip`, {
+      relayKey,
+      publicIdentifier: identifier,
+      reason,
+      allowNoPeers: allowNoPeersSync,
+      rehydrateStatus: rehydrateSummary.status,
+      primeStatus: primeSummary.status
+    })
+  } else if (bestEffort && hasPeers === false && allowNoPeersSync) {
+    console.info(`${CJTRACE_TAG} syncActiveRelayCoreRefs best-effort bypass`, {
+      relayKey,
+      publicIdentifier: identifier,
+      reason,
+      allowNoPeers: allowNoPeersSync,
+      hasPeers
+    })
+  } else if (bestEffort) {
+    const backgroundReason = `${reason}-best-effort`
+    if (typeof manager.primeRelayCoreRefs === 'function') {
+      const primeTask = manager.primeRelayCoreRefs({
+        relayKey,
+        publicIdentifier: identifier,
+        coreRefs: normalized,
+        timeoutMs: effectiveTimeoutMs,
+        reason: backgroundReason,
+        corestore: relayCorestore
+      })
+      primeSummary = { status: 'scheduled', reason: backgroundReason }
+      Promise.resolve(primeTask).then((summary) => {
+        console.info(`${CJTRACE_TAG} syncActiveRelayCoreRefs prime done`, {
+          relayKey,
+          publicIdentifier: identifier,
+          reason: backgroundReason,
+          status: summary?.status ?? null,
+          synced: summary?.synced ?? null,
+          failed: summary?.failed ?? null,
+          connected: summary?.connected ?? null
+        })
+      }).catch((error) => {
+        console.warn('[Worker] syncActiveRelayCoreRefs prime failed', {
+          relayKey,
+          publicIdentifier: identifier,
+          reason: backgroundReason,
+          error: error?.message || error
+        })
+      })
+    }
+
+    const rehydrateTask = rehydrateMirrorsWithRetry(manager, {
+      reason: backgroundReason,
+      timeoutMs: effectiveTimeoutMs,
+      retries: 0,
+      backoffMs: 0
+    })
+    rehydrateSummary = { status: 'scheduled', reason: backgroundReason }
+    Promise.resolve(rehydrateTask).then((summary) => {
+      console.info(`${CJTRACE_TAG} syncActiveRelayCoreRefs rehydrate done`, {
+        relayKey,
+        publicIdentifier: identifier,
+        reason: backgroundReason,
+        status: summary?.status ?? null,
+        synced: summary?.synced ?? null,
+        failed: summary?.failed ?? null
+      })
+    }).catch((error) => {
+      console.warn('[Worker] syncActiveRelayCoreRefs rehydrate failed', {
+        relayKey,
+        publicIdentifier: identifier,
+        reason: backgroundReason,
+        error: error?.message || error
+      })
+    })
+  } else {
+    if (typeof manager.primeRelayCoreRefs === 'function') {
+      primeSummary = await manager.primeRelayCoreRefs({
+        relayKey,
+        publicIdentifier: identifier,
+        coreRefs: normalized,
+        timeoutMs: effectiveTimeoutMs,
+        reason,
+        corestore: relayCorestore
+      })
+    }
+
+    rehydrateSummary = await rehydrateMirrorsWithRetry(manager, {
+      reason,
+      timeoutMs: effectiveTimeoutMs,
+      retries: BLIND_PEER_REHYDRATION_RETRIES,
+      backoffMs: BLIND_PEER_REHYDRATION_BACKOFF_MS
+    })
+  }
 
   const writerSummary = await ensureRelayWritersFromCoreRefs(relayManager, normalized, reason)
 
@@ -1337,6 +1547,35 @@ function normalizeInviteProof(inviteProof) {
   const signature = typeof inviteProof.signature === 'string' ? inviteProof.signature : null
   if (!payload || !signature) return null
   return { payload, signature, scheme: inviteProof.scheme || null }
+}
+
+function normalizeInviteMirrorSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return null
+  const relayKey = normalizeRelayKeyHex(snapshot.relayKey || snapshot.relay_key || null)
+  const publicIdentifier = typeof snapshot.publicIdentifier === 'string'
+    ? snapshot.publicIdentifier
+    : (typeof snapshot.public_identifier === 'string' ? snapshot.public_identifier : null)
+  const relayUrl = typeof snapshot.relayUrl === 'string' ? snapshot.relayUrl : null
+  const mirrorSource = typeof (snapshot.mirrorSource || snapshot.mirror_source) === 'string'
+    ? (snapshot.mirrorSource || snapshot.mirror_source)
+    : null
+  const updatedAt = toNumber(snapshot.updatedAt)
+  const fetchedAt = toNumber(snapshot.fetchedAt)
+  const blindPeer = sanitizeBlindPeerMeta(snapshot.blindPeer)
+  const cores = normalizeMirrorCoreEntries(snapshot.cores || snapshot.relayCores || [])
+  if (!relayKey && !publicIdentifier && !relayUrl && !blindPeer && !cores.length) {
+    return null
+  }
+  return {
+    relayKey: relayKey || undefined,
+    publicIdentifier: publicIdentifier || undefined,
+    relayUrl: relayUrl || undefined,
+    mirrorSource: mirrorSource || undefined,
+    updatedAt: updatedAt || undefined,
+    fetchedAt: fetchedAt || undefined,
+    blindPeer: blindPeer || undefined,
+    cores
+  }
 }
 
 function serializeInviteProof(inviteProof) {
@@ -2423,6 +2662,142 @@ async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mi
     })
   }
   return { status: 'error', reason: 'mirror-unavailable', error: lastError }
+}
+
+async function ensureInviteMirrorSnapshot({
+  relayKey = null,
+  publicIdentifier = null,
+  reason = 'invite-proof',
+  attempts = BLIND_PEER_INVITE_MIRROR_ATTEMPTS,
+  backoffMs = BLIND_PEER_INVITE_MIRROR_BACKOFF_MS
+} = {}) {
+  let resolvedRelayKey = normalizeRelayKeyHex(relayKey)
+  let resolvedPublicIdentifier = typeof publicIdentifier === 'string' ? publicIdentifier.trim() : null
+
+  if (!resolvedRelayKey && resolvedPublicIdentifier) {
+    resolvedRelayKey = normalizeRelayKeyHex(getRelayKeyFromPublicIdentifier(resolvedPublicIdentifier))
+  }
+  if (!resolvedRelayKey && resolvedPublicIdentifier) {
+    const profile = await getRelayProfileByPublicIdentifier(resolvedPublicIdentifier)
+    resolvedRelayKey = normalizeRelayKeyHex(profile?.relay_key || profile?.relayKey || null)
+    if (!resolvedPublicIdentifier && profile?.public_identifier) {
+      resolvedPublicIdentifier = profile.public_identifier
+    }
+  }
+  if (resolvedRelayKey && !resolvedPublicIdentifier) {
+    const profile = await getRelayProfileByKey(resolvedRelayKey)
+    if (profile?.public_identifier) {
+      resolvedPublicIdentifier = profile.public_identifier
+    }
+  }
+
+  const relayIdentifier = resolvedRelayKey || resolvedPublicIdentifier || null
+  if (!relayIdentifier) {
+    return { status: 'error', reason: 'missing-relay-identifier', ready: false }
+  }
+
+  const relayManager = resolvedRelayKey ? activeRelays.get(resolvedRelayKey) : null
+  const coreEntries = relayManager ? collectRelayCoreEntriesForAppend(relayManager) : []
+  const requiredCoreRefs = coreEntries.map((entry) => entry?.key).filter(Boolean)
+  const hasAppend = typeof appendOpenJoinMirrorCores === 'function'
+
+  let lastMirror = null
+  let lastReadiness = null
+
+  for (let attempt = 0; attempt <= attempts; attempt += 1) {
+    if (attempt > 0) {
+      if (relayManager && hasAppend) {
+        try {
+          const appendSummary = await appendOpenJoinMirrorCores({
+            relayKey: resolvedRelayKey || relayIdentifier,
+            publicIdentifier: resolvedPublicIdentifier || publicIdentifier || null,
+            relayManager,
+            reason: `${reason}-append-${attempt}`,
+            requiredCoreRefs
+          })
+          console.info(`${CJTRACE_TAG} invite mirror append`, {
+            relayIdentifier,
+            relayKey: previewValue(resolvedRelayKey || relayIdentifier, 16),
+            publicIdentifier: resolvedPublicIdentifier || publicIdentifier || null,
+            attempt,
+            status: appendSummary?.status ?? null,
+            added: appendSummary?.data?.added ?? null,
+            ignored: appendSummary?.data?.ignored ?? null,
+            rejected: appendSummary?.data?.rejected ?? null
+          })
+        } catch (error) {
+          console.warn('[Worker] Invite mirror append failed', {
+            relayIdentifier,
+            attempt,
+            error: error?.message || error
+          })
+        }
+      } else {
+        console.info(`${CJTRACE_TAG} invite mirror append skipped`, {
+          relayIdentifier,
+          relayKey: previewValue(resolvedRelayKey || relayIdentifier, 16),
+          attempt,
+          hasRelayManager: !!relayManager,
+          hasAppend
+        })
+      }
+      const waitMs = backoffMs * Math.pow(2, attempt - 1)
+      if (waitMs > 0) await delay(waitMs)
+    }
+
+    await ensurePublicGatewaySettingsLoaded()
+    const mirrorResult = await fetchRelayMirrorMetadata(relayIdentifier, { reason: `${reason}-fetch-${attempt}` })
+    lastMirror = mirrorResult
+    if (mirrorResult?.status !== 'ok' || !mirrorResult.data) {
+      console.warn('[Worker] Invite mirror fetch failed', {
+        relayIdentifier,
+        attempt,
+        status: mirrorResult?.status ?? null,
+        reason: mirrorResult?.reason ?? null
+      })
+      continue
+    }
+
+    lastReadiness = assessInviteMirrorReadiness(mirrorResult.data, {
+      maxAgeMs: INVITE_MIRROR_READY_MAX_AGE_MS,
+      minCoreRefs: CLOSED_JOIN_MIRROR_MIN_CORE_REFS
+    })
+    console.info(`${CJTRACE_TAG} invite mirror readiness`, {
+      relayIdentifier,
+      relayKey: previewValue(resolvedRelayKey || relayIdentifier, 16),
+      publicIdentifier: resolvedPublicIdentifier || publicIdentifier || null,
+      attempt,
+      ready: lastReadiness.ready,
+      mirrorSource: lastReadiness.mirrorSource || null,
+      updatedAt: lastReadiness.updatedAt ?? null,
+      ageMs: lastReadiness.ageMs ?? null,
+      hasBlindPeer: lastReadiness.hasBlindPeer,
+      coreRefsCount: lastReadiness.coreRefsCount,
+      hasRoles: lastReadiness.hasRoles,
+      hasViewRole: lastReadiness.hasViewRole,
+      coreRefsPreview: lastReadiness.coreRefsPreview,
+      origin: mirrorResult.origin || null
+    })
+
+    if (lastReadiness.ready) {
+      return {
+        status: 'ok',
+        ready: true,
+        snapshot: buildInviteMirrorSnapshot(mirrorResult.data),
+        readiness: lastReadiness,
+        origin: mirrorResult.origin || null
+      }
+    }
+  }
+
+  return {
+    status: 'error',
+    reason: lastReadiness?.reason || lastMirror?.reason || 'invite-mirror-not-ready',
+    ready: false,
+    snapshot: lastMirror?.data ? buildInviteMirrorSnapshot(lastMirror.data) : null,
+    readiness: lastReadiness,
+    origin: lastMirror?.origin || null
+  }
 }
 
 async function fetchAndApplyRelayMirrorMetadata({
@@ -4795,6 +5170,9 @@ async function handleMessageObject(message) {
         const openJoin = openJoinAllowed || (closedInvite && hasInviteProof)
         try {
           let hostPeers = Array.isArray(data.hostPeers) ? data.hostPeers : []
+          const inviteMirrorSnapshot = normalizeInviteMirrorSnapshot(
+            data.mirrorSnapshot || data.mirror_snapshot || data.inviteMirror || data.invite_mirror || data.mirror
+          )
           const coreRefsInput = closedInvite
             ? []
             : (Array.isArray(data.cores) ? data.cores : [])
@@ -4808,7 +5186,7 @@ async function handleMessageObject(message) {
             log: console
           })
           let coreRefs = coreRefsInputStats.normalized
-          let blindPeer = closedInvite ? null : sanitizeBlindPeerMeta(data.blindPeer)
+          let blindPeer = sanitizeBlindPeerMeta(data.blindPeer)
           let joinRelayKey = normalizeRelayKeyHex(data.relayKey)
           let joinRelayUrl = data.relayUrl || null
           let writerCore = closedInvite ? null : (data.writerCore || null)
@@ -4830,6 +5208,48 @@ async function handleMessageObject(message) {
             .filter(Boolean)
           let hostPeersSource = hostPeers.length ? 'input' : 'none'
           let coreRefsSource = coreRefs.length ? 'input' : 'none'
+          if (inviteMirrorSnapshot) {
+            const mirrorCoreStats = normalizeCoreRefListWithStats(inviteMirrorSnapshot.cores || [], {
+              context: {
+                phase: 'join-flow-invite',
+                publicIdentifier,
+                closedInvite
+              },
+              log: console
+            })
+            const mirrorCoreRefs = mirrorCoreStats.normalized
+            const mirrorRelayKey = normalizeRelayKeyHex(inviteMirrorSnapshot.relayKey || null)
+            const mirrorRelayUrl = inviteMirrorSnapshot.relayUrl || null
+            if (!joinRelayKey && mirrorRelayKey) joinRelayKey = mirrorRelayKey
+            if (!joinRelayUrl && mirrorRelayUrl) joinRelayUrl = mirrorRelayUrl
+            if (!blindPeer && inviteMirrorSnapshot.blindPeer) blindPeer = inviteMirrorSnapshot.blindPeer
+            const coreRefsBefore = coreRefs.length
+            const mergedCoreRefs = mirrorCoreRefs.length
+              ? mergeCoreRefLists(coreRefs, mirrorCoreRefs)
+              : coreRefs
+            const coreRefsAdded = Math.max(mergedCoreRefs.length - coreRefsBefore, 0)
+            if (coreRefsAdded > 0) {
+              coreRefs = mergedCoreRefs
+              coreRefsSource = coreRefsSource === 'none'
+                ? 'invite'
+                : `${coreRefsSource}+invite`
+            }
+            console.info(`${CJTRACE_TAG} join flow invite mirror`, {
+              publicIdentifier,
+              relayIdentifier: mirrorRelayKey || joinRelayKey || publicIdentifier || null,
+              mirrorSource: inviteMirrorSnapshot.mirrorSource || null,
+              updatedAt: inviteMirrorSnapshot.updatedAt ?? null,
+              fetchedAt: inviteMirrorSnapshot.fetchedAt ?? null,
+              hasBlindPeer: !!blindPeer?.publicKey,
+              mirrorCoreRefsCount: mirrorCoreRefs.length,
+              mirrorCoreRefsInput: mirrorCoreStats.inputCount,
+              mirrorCoreRefsDropped: mirrorCoreStats.droppedCount,
+              coreRefsAdded,
+              coreRefsCount: coreRefs.length,
+              coreRefsSource,
+              coreRefsPreview: summarizeCoreRefs(coreRefs)
+            })
+          }
           const inviteProofMeta = inviteProof
             ? {
                 scheme: inviteProof.scheme || null,
@@ -4958,8 +5378,13 @@ async function handleMessageObject(message) {
             }
           }
 
+          const closedInviteNeedsMirror = closedInvite
+            && (coreRefsSource === 'bootstrap' || coreRefs.length < CLOSED_JOIN_MIRROR_MIN_CORE_REFS)
           const shouldFetchMirror = (!hostPeers || hostPeers.length === 0)
-            && (!blindPeer || !blindPeer.publicKey)
+            && (!blindPeer || !blindPeer.publicKey || closedInviteNeedsMirror)
+          const mirrorFetchReason = closedInviteNeedsMirror
+            ? 'closed-invite-core-refs'
+            : (!blindPeer || !blindPeer.publicKey ? 'missing-blind-peer' : null)
           console.info(`${CJTRACE_TAG} join flow mirror decision`, {
             publicIdentifier,
             relayIdentifier: joinRelayKey || publicIdentifier || null,
@@ -4970,6 +5395,8 @@ async function handleMessageObject(message) {
             hasBlindPeer: !!blindPeer?.publicKey,
             coreRefsCount: coreRefs.length,
             coreRefsSource,
+            closedInviteNeedsMirror,
+            mirrorFetchReason,
             shouldFetchMirror
           })
           if (shouldFetchMirror) {
@@ -4997,11 +5424,16 @@ async function handleMessageObject(message) {
                   if (!joinRelayKey && mirrorRelayKey) joinRelayKey = mirrorRelayKey
                   if (!blindPeer && mirrorBlindPeer) blindPeer = mirrorBlindPeer
                   const coreRefsBefore = coreRefs.length
-                  if (mirrorCoreRefs.length && !coreRefs.length) {
-                    coreRefs = mirrorCoreRefs
-                    coreRefsSource = 'mirror'
+                  const mergedCoreRefs = mirrorCoreRefs.length
+                    ? mergeCoreRefLists(coreRefs, mirrorCoreRefs)
+                    : coreRefs
+                  const coreRefsAdded = Math.max(mergedCoreRefs.length - coreRefsBefore, 0)
+                  if (coreRefsAdded > 0) {
+                    coreRefs = mergedCoreRefs
+                    coreRefsSource = coreRefsSource === 'none'
+                      ? 'mirror'
+                      : `${coreRefsSource}+mirror`
                   }
-                  const coreRefsAdded = Math.max(coreRefs.length - coreRefsBefore, 0)
                   if (!writerCore && mirrorData.writerCore) writerCore = String(mirrorData.writerCore)
                   if (!writerCoreHex && (mirrorData.writerCoreHex || mirrorData.writer_core_hex)) {
                     writerCoreHex = String(mirrorData.writerCoreHex || mirrorData.writer_core_hex)
@@ -5029,6 +5461,7 @@ async function handleMessageObject(message) {
                     closedInvite,
                     relayKey: joinRelayKey ? String(joinRelayKey).slice(0, 16) : null,
                     coreRefsPreview: coreRefs.slice(0, 3),
+                    coreRefsSource,
                     hasWriterCore: !!writerCore,
                     hasWriterCoreHex: !!writerCoreHex,
                     hasAutobaseLocal: !!autobaseLocal,
@@ -5208,6 +5641,41 @@ async function handleMessageObject(message) {
           hasAuthToken: !!authToken
         })
 
+        let mirrorSnapshot = null
+        let mirrorReadiness = null
+        if (authToken) {
+          const mirrorGate = await ensureInviteMirrorSnapshot({
+            relayKey,
+            publicIdentifier,
+            reason: 'invite-proof'
+          })
+          mirrorSnapshot = mirrorGate?.snapshot || null
+          mirrorReadiness = mirrorGate?.readiness || null
+          if (!mirrorGate?.ready) {
+            console.warn('[Worker] Invite mirror gating failed', {
+              relayKey: previewValue(relayKey, 16),
+              publicIdentifier,
+              ready: mirrorGate?.ready ?? null,
+              reason: mirrorGate?.reason || null,
+              mirrorSource: mirrorReadiness?.mirrorSource || null,
+              updatedAt: mirrorReadiness?.updatedAt ?? null,
+              ageMs: mirrorReadiness?.ageMs ?? null,
+              coreRefsCount: mirrorReadiness?.coreRefsCount ?? null,
+              hasBlindPeer: mirrorReadiness?.hasBlindPeer ?? null
+            })
+            throw new Error(mirrorGate?.reason || 'invite-mirror-not-ready')
+          }
+          console.info(`${CJTRACE_TAG} invite mirror gating ready`, {
+            relayKey: previewValue(relayKey, 16),
+            publicIdentifier,
+            mirrorSource: mirrorReadiness?.mirrorSource || null,
+            updatedAt: mirrorReadiness?.updatedAt ?? null,
+            ageMs: mirrorReadiness?.ageMs ?? null,
+            coreRefsCount: mirrorReadiness?.coreRefsCount ?? null,
+            hasBlindPeer: mirrorReadiness?.hasBlindPeer ?? null
+          })
+        }
+
         const payload = {
           relayKey,
           publicIdentifier,
@@ -5230,7 +5698,15 @@ async function handleMessageObject(message) {
           issuedAt: payload.issuedAt,
           scheme: inviteProof.scheme
         })
-        sendMessage({ type: 'generate-invite-proof:result', requestId, data: { inviteProof } })
+        sendMessage({
+          type: 'generate-invite-proof:result',
+          requestId,
+          data: {
+            inviteProof,
+            mirrorSnapshot,
+            mirrorReadiness
+          }
+        })
       } catch (err) {
         sendMessage({
           type: 'generate-invite-proof:error',

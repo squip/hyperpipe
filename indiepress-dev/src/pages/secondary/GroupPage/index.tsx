@@ -827,6 +827,10 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           inviteProofScheme: inviteData?.inviteProof?.scheme || null,
           inviteProofVersion: inviteData?.inviteProof?.payload?.version ?? null,
           inviteProofIssuedAt: inviteData?.inviteProof?.payload?.issuedAt ?? null,
+          hasMirrorSnapshot: !!inviteData?.mirrorSnapshot,
+          mirrorSource: inviteData?.mirrorSnapshot?.mirrorSource || null,
+          mirrorUpdatedAt: inviteData?.mirrorSnapshot?.updatedAt ?? null,
+          mirrorCoreCount: Array.isArray(inviteData?.mirrorSnapshot?.cores) ? inviteData?.mirrorSnapshot?.cores.length : 0,
           relayKey: relayKey ? String(relayKey).slice(0, 16) : null,
           relayUrl: relayUrlForJoin ? String(relayUrlForJoin).slice(0, 80) : null
         })
@@ -837,7 +841,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           token: inviteToken,
           relayKey,
           relayUrl: relayUrlForJoin,
-          inviteProof: inviteData?.inviteProof
+          inviteProof: inviteData?.inviteProof,
+          mirrorSnapshot: inviteData?.mirrorSnapshot
         })
         return
       }

@@ -266,7 +266,11 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         hasInviteProof: !!inv.inviteProof,
         inviteProofScheme: inv.inviteProof?.scheme || null,
         inviteProofVersion: inv.inviteProof?.payload?.version ?? null,
-        inviteProofIssuedAt: inv.inviteProof?.payload?.issuedAt ?? null
+        inviteProofIssuedAt: inv.inviteProof?.payload?.issuedAt ?? null,
+        hasMirrorSnapshot: !!inv.mirrorSnapshot,
+        mirrorSource: inv.mirrorSnapshot?.mirrorSource || null,
+        mirrorUpdatedAt: inv.mirrorSnapshot?.updatedAt ?? null,
+        mirrorCoreCount: Array.isArray(inv.mirrorSnapshot?.cores) ? inv.mirrorSnapshot?.cores.length : 0
       })
       if (sendToWorker && pubkey && inv.token) {
         sendToWorker({
@@ -286,7 +290,8 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         token: inv.token,
         relayKey,
         relayUrl,
-        inviteProof: inv.inviteProof
+        inviteProof: inv.inviteProof,
+        mirrorSnapshot: inv.mirrorSnapshot
       })
 
       push(toGroup(inv.groupId, relayUrl || inv.relay))

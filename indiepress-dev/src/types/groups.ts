@@ -25,6 +25,22 @@ export type TGroupAdmin = {
 
 export type TGroupMembershipStatus = 'member' | 'not-member' | 'removed' | 'pending'
 
+export type TInviteMirrorSnapshot = {
+  relayKey?: string | null
+  publicIdentifier?: string | null
+  relayUrl?: string | null
+  mirrorSource?: string | null
+  updatedAt?: number | null
+  fetchedAt?: number | null
+  blindPeer?: {
+    publicKey?: string | null
+    encryptionKey?: string | null
+    replicationTopic?: string | null
+    maxBytes?: number | null
+  } | null
+  cores?: { key: string; role?: string | null }[]
+} | null
+
 export type TGroupMemberSnapshot = {
   pubkeys: string[]
   event: Event
@@ -66,6 +82,7 @@ export type TGroupInvite = {
     maxBytes?: number | null
   } | null
   cores?: { key: string; role?: string | null }[]
+  mirrorSnapshot?: TInviteMirrorSnapshot
   token?: string
   event: Event
 }

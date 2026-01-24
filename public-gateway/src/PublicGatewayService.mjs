@@ -965,18 +965,22 @@ class PublicGatewayService {
     };
   }
 
-  #buildOpenJoinMirrorPayloadFromPool(pool, relayKey) {
+  #buildOpenJoinMirrorPayloadFromPool(pool, relayKey, options = {}) {
     if (!pool || typeof pool !== 'object') return null;
     const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
     const relayCores = Array.isArray(pool?.relayCores) ? pool.relayCores : [];
     const metadata = pool?.metadata && typeof pool.metadata === 'object' ? pool.metadata : null;
     const publicIdentifier = pool?.publicIdentifier || metadata?.identifier || relayKey;
     const relayUrl = pool?.relayUrl || metadata?.relayUrl || metadata?.connectionUrl || null;
+    const updatedAt = Number.isFinite(pool?.updatedAt) ? Math.trunc(pool.updatedAt) : null;
+    const source = typeof options?.source === 'string' ? options.source : null;
     return {
       relayKey,
       publicIdentifier: publicIdentifier || relayKey,
       cores: relayCores,
       relayUrl,
+      mirrorSource: source || 'open-join-pool',
+      updatedAt: updatedAt || null,
       blindPeer: blindPeerInfo && blindPeerInfo.enabled
         ? {
             publicKey: blindPeerInfo.publicKey || null,
@@ -3898,7 +3902,8 @@ class PublicGatewayService {
           const poolRelayKey = poolResolved.relayKey || relayKey || trimmedIdentifier;
           const poolPayload = this.#buildOpenJoinMirrorPayloadFromPool(
             poolResolved.pool,
-            poolRelayKey || trimmedIdentifier
+            poolRelayKey || trimmedIdentifier,
+            { source: 'open-join-pool' }
           );
           if (poolPayload) {
             await this.#storeMirrorMetadataPayload(poolRelayKey || trimmedIdentifier, poolPayload, 'mirror-endpoint-pool');
@@ -4274,8 +4279,9 @@ class PublicGatewayService {
       publicIdentifier: poolPublicIdentifier || null,
       relayUrl: poolRelayUrl || null,
       relayCores: poolRelayCores,
-      metadata: poolMetadata
-    }, relayKey);
+      metadata: poolMetadata,
+      updatedAt
+    }, relayKey, { source: 'open-join-pool-update' });
     const mirrorCoreSample = Array.isArray(mirrorPayload?.cores)
       ? mirrorPayload.cores.slice(0, 3).map((entry) => entry?.key || entry?.core || entry)
       : [];
@@ -4656,7 +4662,11 @@ class PublicGatewayService {
         await this.registrationStore.storeOpenJoinAliases(relayKey, updatedPool.aliases);
       }
 
-      const mirrorPayload = this.#buildOpenJoinMirrorPayloadFromPool(updatedPool, relayKey);
+      const mirrorPayload = this.#buildOpenJoinMirrorPayloadFromPool(
+        updatedPool,
+        relayKey,
+        { source: 'open-join-append' }
+      );
       const mirrorCoreSample = Array.isArray(mirrorPayload?.cores)
         ? mirrorPayload.cores.slice(0, 3).map((entry) => entry?.key || entry?.core || entry)
         : [];

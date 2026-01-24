@@ -1590,7 +1590,9 @@ export async function joinRelay(options = {}) {
                     relayKey,
                     publicIdentifier: profileInfo.public_identifier || publicIdentifier,
                     coreRefs: postJoinCoreRefs,
-                    reason: 'post-join'
+                    reason: 'post-join',
+                    syncPolicy: 'best-effort',
+                    allowNoPeers: true
                 });
             } catch (error) {
                 console.warn('[RelayAdapter] Post-join writer sync failed', {

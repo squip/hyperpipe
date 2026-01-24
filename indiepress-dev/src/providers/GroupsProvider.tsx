@@ -26,6 +26,7 @@ import {
   TGroupListEntry,
   TGroupMembershipStatus,
   TGroupMetadata,
+  TInviteMirrorSnapshot,
   TJoinRequest
 } from '@/types/groups'
 import client from '@/services/client.service'
@@ -149,6 +150,11 @@ const defaultDiscoveryRelays = BIG_RELAY_URLS
 const toGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${groupId}` : groupId)
 
 type InviteProof = NonNullable<TGroupInvite['inviteProof']>
+type InviteMirrorSnapshot = NonNullable<TGroupInvite['mirrorSnapshot']>
+type InviteProofResponse = {
+  inviteProof: InviteProof | null
+  mirrorSnapshot?: InviteMirrorSnapshot | null
+}
 
 type SendInviteOptions = {
   isOpen?: boolean
@@ -162,6 +168,7 @@ const buildInvitePayload = (args: {
   relayKey?: string | null
   meta?: TGroupMetadata | null
   inviteProof?: InviteProof | null
+  mirrorSnapshot?: InviteMirrorSnapshot | null
 }) => ({
   relayUrl: args.relayUrl,
   token: args.token,
@@ -170,7 +177,8 @@ const buildInvitePayload = (args: {
   name: args.meta?.name,
   about: args.meta?.about,
   fileSharing: args.meta?.isOpen !== false,
-  inviteProof: args.inviteProof || null
+  inviteProof: args.inviteProof || null,
+  mirrorSnapshot: args.mirrorSnapshot || null
 })
 
 const buildOpenInvitePayload = (args: { relayUrl: string | null; relayKey?: string | null }) => ({
@@ -310,7 +318,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   )
 
   const requestInviteProof = useCallback(
-    async (args: { relayKey?: string | null; publicIdentifier: string; inviteePubkey: string; authToken?: string | null }) => {
+    async (args: {
+      relayKey?: string | null
+      publicIdentifier: string
+      inviteePubkey: string
+      authToken?: string | null
+    }): Promise<InviteProofResponse | null> => {
       if (!sendToWorker) return null
       try {
         console.info('[CJTRACE] invite proof request', {
@@ -330,15 +343,39 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         })
         if (res && typeof res === 'object' && 'inviteProof' in (res as any)) {
           const inviteProof = (res as any).inviteProof || null
+          const rawMirror = (res as any).mirrorSnapshot || (res as any).mirror_snapshot || null
+          const mirrorSnapshot =
+            rawMirror && typeof rawMirror === 'object' ? (rawMirror as InviteMirrorSnapshot) : null
+          const mirrorSource =
+            mirrorSnapshot && typeof mirrorSnapshot === 'object'
+              ? mirrorSnapshot.mirrorSource || null
+              : null
+          const mirrorUpdatedAt =
+            mirrorSnapshot && typeof mirrorSnapshot === 'object'
+              ? mirrorSnapshot.updatedAt ?? null
+              : null
+          const mirrorCoreCount =
+            mirrorSnapshot && typeof mirrorSnapshot === 'object' && Array.isArray(mirrorSnapshot.cores)
+              ? mirrorSnapshot.cores.length
+              : 0
+          const mirrorBlindPeerKey =
+            mirrorSnapshot && typeof mirrorSnapshot === 'object' && mirrorSnapshot.blindPeer?.publicKey
+              ? String(mirrorSnapshot.blindPeer.publicKey).slice(0, 16)
+              : null
           console.info('[CJTRACE] invite proof response', {
             publicIdentifier: args.publicIdentifier,
             relayKey: args.relayKey ? String(args.relayKey).slice(0, 16) : null,
             inviteePubkey: args.inviteePubkey ? String(args.inviteePubkey).slice(0, 16) : null,
             scheme: inviteProof?.scheme || null,
             version: inviteProof?.payload?.version ?? null,
-            issuedAt: inviteProof?.payload?.issuedAt ?? null
+            issuedAt: inviteProof?.payload?.issuedAt ?? null,
+            hasMirrorSnapshot: !!mirrorSnapshot,
+            mirrorSource,
+            mirrorUpdatedAt,
+            mirrorCoreCount,
+            mirrorBlindPeerKey
           })
-          return inviteProof
+          return { inviteProof, mirrorSnapshot }
         }
         console.info('[CJTRACE] invite proof response', {
           publicIdentifier: args.publicIdentifier,
@@ -346,9 +383,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           inviteePubkey: args.inviteePubkey ? String(args.inviteePubkey).slice(0, 16) : null,
           scheme: null,
           version: null,
-          issuedAt: null
+          issuedAt: null,
+          hasMirrorSnapshot: false
         })
-        return (res as any) || null
+        return { inviteProof: (res as any)?.inviteProof || null }
       } catch (err) {
         console.warn('[GroupsProvider] Failed to generate invite proof', err)
         return null
@@ -457,6 +495,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let inviteProof: InviteProof | null | undefined
             let blindPeer: TGroupInvite['blindPeer'] | null | undefined
             let cores: TGroupInvite['cores'] | undefined
+            let mirrorSnapshot: InviteMirrorSnapshot | null | undefined
             let writerCore: string | null | undefined
             let writerCoreHex: string | null | undefined
             let autobaseLocal: string | null | undefined
@@ -497,6 +536,50 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                     encryptionKey: payload.blindPeer.encryptionKey ?? payload.blindPeer.encryption_key ?? null,
                     replicationTopic: payload.blindPeer.replicationTopic ?? payload.blindPeer.replication_topic ?? null,
                     maxBytes: typeof payload.blindPeer.maxBytes === 'number' ? payload.blindPeer.maxBytes : null
+                  }
+                }
+                const mirrorPayload =
+                  payload.mirrorSnapshot || payload.mirror_snapshot || payload.mirror || payload.inviteMirror || null
+                if (mirrorPayload && typeof mirrorPayload === 'object') {
+                  const mirrorBlindPeer =
+                    mirrorPayload.blindPeer && typeof mirrorPayload.blindPeer === 'object'
+                      ? {
+                          publicKey: mirrorPayload.blindPeer.publicKey ?? mirrorPayload.blindPeer.public_key ?? null,
+                          encryptionKey:
+                            mirrorPayload.blindPeer.encryptionKey ?? mirrorPayload.blindPeer.encryption_key ?? null,
+                          replicationTopic:
+                            mirrorPayload.blindPeer.replicationTopic ??
+                            mirrorPayload.blindPeer.replication_topic ??
+                            null,
+                          maxBytes:
+                            typeof mirrorPayload.blindPeer.maxBytes === 'number'
+                              ? mirrorPayload.blindPeer.maxBytes
+                              : null
+                        }
+                      : null
+                  const mirrorCores = Array.isArray(mirrorPayload.cores)
+                    ? mirrorPayload.cores
+                        .filter((c: any) => c && typeof c === 'object' && c.key)
+                        .map((c: any) => ({
+                          key: String(c.key),
+                          role: typeof c.role === 'string' ? c.role : null
+                        }))
+                    : undefined
+                  mirrorSnapshot = {
+                    relayKey:
+                      typeof mirrorPayload.relayKey === 'string' ? mirrorPayload.relayKey : (relayKey ?? null),
+                    publicIdentifier:
+                      typeof mirrorPayload.publicIdentifier === 'string'
+                        ? mirrorPayload.publicIdentifier
+                        : (mirrorPayload.public_identifier ?? null),
+                    relayUrl: typeof mirrorPayload.relayUrl === 'string' ? mirrorPayload.relayUrl : null,
+                    mirrorSource:
+                      typeof mirrorPayload.mirrorSource === 'string' ? mirrorPayload.mirrorSource : null,
+                    updatedAt: typeof mirrorPayload.updatedAt === 'number' ? mirrorPayload.updatedAt : null,
+                    fetchedAt: typeof mirrorPayload.fetchedAt === 'number' ? mirrorPayload.fetchedAt : null,
+                    blindPeer: mirrorBlindPeer,
+                    cores: mirrorCores
+                  }
                 }
               }
               if (Array.isArray(payload.cores)) {
@@ -507,12 +590,19 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                     role: typeof c.role === 'string' ? c.role : null
                   }))
               }
-            }
             } catch {
               token = decrypted
             }
             if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
             if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
+            if (mirrorSnapshot) {
+              if (!blindPeer && mirrorSnapshot.blindPeer) blindPeer = mirrorSnapshot.blindPeer
+              if (!cores && Array.isArray(mirrorSnapshot.cores) && mirrorSnapshot.cores.length) {
+                cores = mirrorSnapshot.cores
+              }
+              if (!relayKey && mirrorSnapshot.relayKey) relayKey = mirrorSnapshot.relayKey
+              if (!relayUrl && mirrorSnapshot.relayUrl) relayUrl = mirrorSnapshot.relayUrl
+            }
             return {
               ...invite,
               token,
@@ -522,6 +612,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               inviteProof,
               blindPeer,
               cores,
+              mirrorSnapshot,
               writerCore,
               writerCoreHex,
               autobaseLocal,
@@ -536,7 +627,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         total: parsed.length,
         withWriterSecret: parsed.filter((p) => (p as any).writerSecret).length,
         withWriterCore: parsed.filter((p) => (p as any).writerCore).length,
-        withWriterCoreHex: parsed.filter((p) => (p as any).writerCoreHex).length
+        withWriterCoreHex: parsed.filter((p) => (p as any).writerCoreHex).length,
+        withMirrorSnapshot: parsed.filter((p) => (p as any).mirrorSnapshot).length
       })
       setInvites(parsed)
     } catch (error) {
@@ -1147,7 +1239,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       for (const invitee of invitees) {
         const token = isOpenGroup ? null : randomString(24)
-        const inviteProof = (!isOpenGroup && token)
+        const inviteContext = (!isOpenGroup && token)
           ? await requestInviteProof({
               relayKey: relayEntry?.relayKey || null,
               publicIdentifier: groupId,
@@ -1155,6 +1247,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               authToken: token
             })
           : null
+        const inviteProof = inviteContext?.inviteProof || null
+        const mirrorSnapshot = inviteContext?.mirrorSnapshot || null
+        if (!isOpenGroup && token && !inviteProof) {
+          throw new Error('Invite proof unavailable; mirror not ready')
+        }
         const payload = isOpenGroup
           ? buildOpenInvitePayload({
               relayUrl: inviteRelayUrl,
@@ -1165,7 +1262,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               relayUrl: inviteRelayUrl,
               relayKey: relayEntry?.relayKey || null,
               meta,
-              inviteProof
+              inviteProof,
+              mirrorSnapshot
             })
         const encryptedPayload = await nip04Encrypt(invitee, JSON.stringify(payload))
         console.info('[GroupsProvider] Invite payload built', {
@@ -1177,6 +1275,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           inviteProofScheme: inviteProof?.scheme || null,
           inviteProofVersion: inviteProof?.payload?.version ?? null,
           inviteProofIssuedAt: inviteProof?.payload?.issuedAt ?? null,
+          hasMirrorSnapshot: !!mirrorSnapshot,
+          mirrorSource: mirrorSnapshot?.mirrorSource || null,
+          mirrorUpdatedAt: mirrorSnapshot?.updatedAt ?? null,
+          mirrorCoreCount: Array.isArray(mirrorSnapshot?.cores) ? mirrorSnapshot?.cores.length : 0,
           relayKey: relayEntry?.relayKey ? String(relayEntry.relayKey).slice(0, 16) : null,
           relayUrl: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 80) : null,
           fileSharing: resolvedIsOpen === false ? false : true
@@ -1281,23 +1383,33 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const baseRelayUrl = resolved ? getBaseRelayUrl(resolved) : undefined
       const relayEntry = getRelayEntryForGroup(groupId)
 
-      const inviteProof = await requestInviteProof({
+      const inviteContext = await requestInviteProof({
         relayKey: relayEntry?.relayKey || null,
         publicIdentifier: groupId,
         inviteePubkey: targetPubkey,
         authToken: token
       })
+      const inviteProof = inviteContext?.inviteProof || null
+      const mirrorSnapshot = inviteContext?.mirrorSnapshot || null
+      if (!inviteProof) {
+        throw new Error('Invite proof unavailable; mirror not ready')
+      }
       const payload = buildInvitePayload({
         token,
         relayUrl: baseRelayUrl || resolved || relay || null,
         relayKey: relayEntry?.relayKey || null,
         meta,
-        inviteProof
+        inviteProof,
+        mirrorSnapshot
       })
       console.info('[GroupsProvider] Approval invite payload built', {
         groupId,
         targetPubkey,
-        hasInviteProof: !!inviteProof
+        hasInviteProof: !!inviteProof,
+        hasMirrorSnapshot: !!mirrorSnapshot,
+        mirrorSource: mirrorSnapshot?.mirrorSource || null,
+        mirrorUpdatedAt: mirrorSnapshot?.updatedAt ?? null,
+        mirrorCoreCount: Array.isArray(mirrorSnapshot?.cores) ? mirrorSnapshot?.cores.length : 0
       })
 
       // Build encrypted invite (9009)
