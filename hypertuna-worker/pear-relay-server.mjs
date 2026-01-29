@@ -1581,7 +1581,7 @@ function setupProtocolHandlers(protocol) {
           };
         }
         virtualRelay = true;
-        console.log(`[RelayServer] Handling virtual relay ${identifier} (resolved key: ${relayKey})`);
+        // console.log(`[RelayServer] Handling virtual relay ${identifier} (resolved key: ${relayKey})`);
       }
       
       // Parse the message (supports both string payloads and Buffer objects)
@@ -1612,8 +1612,8 @@ function setupProtocolHandlers(protocol) {
                           profile?.auth_config?.requiresAuth || 
                           false;
       
-      console.log(`[RelayServer] Relay ${identifier} requires auth: ${requiresAuth}${virtualRelay ? ' (virtual relay)' : ''}`);
-      console.log(`[RelayServer] Authorized pubkeys count: ${authorizedPubkeys.length}`);
+      // console.log(`[RelayServer] Relay ${identifier} requires auth: ${requiresAuth}${virtualRelay ? ' (virtual relay)' : ''}`);
+      // console.log(`[RelayServer] Authorized pubkeys count: ${authorizedPubkeys.length}`);
 
       // Handle authentication for protected relays
       if (requiresAuth) {
@@ -1809,9 +1809,9 @@ function setupProtocolHandlers(protocol) {
     let clientId = null;
     const connectionKey = request.params.connectionKey;
 
-    console.log(`[RelayServer] Checking subscriptions for identifier: ${rawIdentifier}, connectionKey: ${connectionKey}`);
+    // console.log(`[RelayServer] Checking subscriptions for identifier: ${rawIdentifier}, connectionKey: ${connectionKey}`);
     if (rawIdentifier !== identifier) {
-      console.log(`[RelayServer] Normalized identifier: ${identifier}`);
+      // console.log(`[RelayServer] Normalized identifier: ${identifier}`);
     }
     
     try {
@@ -1823,7 +1823,7 @@ function setupProtocolHandlers(protocol) {
 
         let virtualRelay = false;
         if (relayKey !== identifier) {
-            console.log(`[RelayServer] Resolved public identifier ${identifier} to relay key ${relayKeyPreview}`);
+            // console.log(`[RelayServer] Resolved public identifier ${identifier} to relay key ${relayKeyPreview}`);
         }
 
         if (!/^[a-f0-9]{64}$/i.test(relayKey)) {
@@ -1838,7 +1838,7 @@ function setupProtocolHandlers(protocol) {
                 };
             }
             virtualRelay = true;
-            console.log(`[RelayServer] Handling virtual relay ${identifier} (resolved key: ${relayKey})`);
+            // console.log(`[RelayServer] Handling virtual relay ${identifier} (resolved key: ${relayKey})`);
         }
 
         // Get auth store and check if relay is protected
@@ -1855,8 +1855,8 @@ function setupProtocolHandlers(protocol) {
                           profile?.auth_config?.requiresAuth ||
                           false;
 
-      console.log(`[RelayServer] Relay ${identifier} requires auth for read: ${requiresAuth}${virtualRelay ? ' (virtual relay)' : ''}`);
-      console.log(`[RelayServer] Authorized pubkeys count: ${authorizedPubkeys.length}`);
+      // console.log(`[RelayServer] Relay ${identifier} requires auth for read: ${requiresAuth}${virtualRelay ? ' (virtual relay)' : ''}`);
+      // console.log(`[RelayServer] Authorized pubkeys count: ${authorizedPubkeys.length}`);
 
       // Handle authentication for protected relays
       if (requiresAuth) {
@@ -1864,7 +1864,7 @@ function setupProtocolHandlers(protocol) {
         // Check if public read access is explicitly allowed
           if (profile?.auth_config?.publicRead !== true) {
             if (!authToken) {
-              console.warn(`[RelayServer] Missing auth token for read access on protected relay`);
+              // console.warn(`[RelayServer] Missing auth token for read access on protected relay`);
               updateMetrics(false);
               return {
                 statusCode: 200, // Return 200 for valid NOSTR NOTICE response
@@ -1878,7 +1878,7 @@ function setupProtocolHandlers(protocol) {
             // Verify auth
             auth = authStore.verifyAuth(relayKey, authToken);
             if (!auth) {
-              console.warn(`[RelayServer] Invalid auth for read access`);
+              // console.warn(`[RelayServer] Invalid auth for read access`);
               updateMetrics(false);
               return {
                 statusCode: 200, // Return 200 for valid NOSTR NOTICE response
@@ -1889,12 +1889,12 @@ function setupProtocolHandlers(protocol) {
               };
             }
 
-            console.log(`[RelayServer] Read access authenticated for ${auth.pubkey.substring(0, 8)}...`);
+            // console.log(`[RelayServer] Read access authenticated for ${auth.pubkey.substring(0, 8)}...`);
             clientId = authToken || auth.pubkey;
             // Update last used timestamp
             auth.lastUsed = Date.now();
           } else {
-            console.log(`[RelayServer] Relay ${identifier} allows public read access despite requiring auth.`);
+            // console.log(`[RelayServer] Relay ${identifier} allows public read access despite requiring auth.`);
           }
         }
         
@@ -2091,15 +2091,15 @@ function setupProtocolHandlers(protocol) {
         if (Array.isArray(events)) {
             const eventFrames = events.filter((frame) => Array.isArray(frame) && frame[0] === 'EVENT');
             const eoseFrames = events.filter((frame) => Array.isArray(frame) && frame[0] === 'EOSE');
-            console.log(`[RelayServer] Subscription replay for connectionKey: ${connectionKey}${virtualRelay ? ' [virtual relay]' : ''} events=${eventFrames.length} eose=${eoseFrames.length}`);
+            // console.log(`[RelayServer] Subscription replay for connectionKey: ${connectionKey}${virtualRelay ? ' [virtual relay]' : ''} events=${eventFrames.length} eose=${eoseFrames.length}`);
         } else {
-            console.log(`[RelayServer] Subscription replay produced unexpected payload for connectionKey: ${connectionKey}${virtualRelay ? ' [virtual relay]' : ''}`);
+            // console.log(`[RelayServer] Subscription replay produced unexpected payload for connectionKey: ${connectionKey}${virtualRelay ? ' [virtual relay]' : ''}`);
         }
         
         // Update subscriptions if needed
         if (activeSubscriptionsUpdated) {
             try {
-                console.log(`[RelayServer] Updating subscriptions for connectionKey: ${connectionKey}`);
+                // console.log(`[RelayServer] Updating subscriptions for connectionKey: ${connectionKey}`);
                 await updateRelaySubscriptions(relayKey, connectionKey, activeSubscriptionsUpdated);
                 if (clientId) {
                     await updateRelayClientSubscriptions(relayKey, clientId, {
@@ -2113,9 +2113,9 @@ function setupProtocolHandlers(protocol) {
                       });
                     }
                 }
-                console.log(`[RelayServer] Successfully updated subscriptions for connectionKey: ${connectionKey}`);
+                // console.log(`[RelayServer] Successfully updated subscriptions for connectionKey: ${connectionKey}`);
             } catch (updateError) {
-                console.log(`[RelayServer] Warning: Failed to update subscriptions for connectionKey: ${connectionKey}:`, updateError.message);
+                // console.log(`[RelayServer] Warning: Failed to update subscriptions for connectionKey: ${connectionKey}:`, updateError.message);
             }
         }
         
@@ -2410,6 +2410,28 @@ function resolveExpectedWriterKey({ writerCoreHex = null, autobaseLocal = null, 
 function resolveWriterKeyHex(candidate) {
   const normalized = normalizeWriterKey(candidate);
   return normalized ? b4a.toString(normalized, 'hex') : null;
+}
+
+async function withTimeout(promise, timeoutMs, label = null) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return promise;
+  }
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const message = label
+            ? `Operation timed out after ${timeoutMs}ms (${label})`
+            : `Operation timed out after ${timeoutMs}ms`;
+          reject(new Error(message));
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function deriveCoreKeyFromSignerKey(signerKey, manifestVersion = 0) {
@@ -3395,12 +3417,14 @@ export async function startJoinAuthentication(options) {
     writerSecret = null,
     writerCoreHex = null,
     autobaseLocal = null,
-    coreRefs = []
+    coreRefs = [],
+    inviteTraceId = null
   } = options;
   const expectedWriter = resolveExpectedWriterKey({ writerCoreHex, autobaseLocal, writerCore });
   const expectedWriterKey = expectedWriter.expectedWriterKey;
   const expectedWriterSource = expectedWriter.source;
   const expectedWriterKeyHex = resolveWriterKeyHex(expectedWriterKey);
+  const closedInvite = !openJoin && !!inviteToken;
   let resolvedCoreRefs = Array.isArray(coreRefs) ? [...coreRefs] : [];
   const expectedCoreRef = normalizeCoreRefString(expectedWriterKey);
   if (expectedCoreRef && !resolvedCoreRefs.includes(expectedCoreRef)) {
@@ -3419,7 +3443,9 @@ export async function startJoinAuthentication(options) {
     hostPeersCount: Array.isArray(hostPeerList) ? hostPeerList.length : 0,
     blindPeer: !!blindPeer,
     inviteRelayKey,
-    openJoin
+    openJoin,
+    closedInvite,
+    inviteTraceId: inviteTraceId || null
   });
   console.log('[RelayServer][WriterMaterial] Join auth writer material', {
     publicIdentifier,
@@ -3450,7 +3476,8 @@ export async function startJoinAuthentication(options) {
         type: 'join-auth-error',
         data: {
           publicIdentifier,
-          error: errorMsg
+          error: errorMsg,
+          inviteTraceId: inviteTraceId || null
         }
       });
     }
@@ -3464,7 +3491,8 @@ export async function startJoinAuthentication(options) {
         type: 'join-auth-progress',
         data: {
           publicIdentifier,
-          status: 'request'
+          status: 'request',
+          inviteTraceId: inviteTraceId || null
         }
       });
     }
@@ -3549,6 +3577,15 @@ export async function startJoinAuthentication(options) {
           throw new Error('Missing relay key for invite fallback; cannot join relay');
         }
         const fallbackRelayKey = resolvedRelayKey;
+        console.log('[CJTRACE] closed-invite offline join', {
+          publicIdentifier,
+          relayKey: fallbackRelayKey,
+          hasWriterSecret: !!writerSecret,
+          hasWriterCore: !!writerCore,
+          hasWriterCoreHex: !!writerCoreHex,
+          hasAutobaseLocal: !!autobaseLocal,
+          expectedWriterKey: expectedWriterKeyHex ? expectedWriterKeyHex.slice(0, 16) : null
+        });
         console.log('[RelayServer] Falling back to invite token path (no direct host)', {
           relayKey: fallbackRelayKey,
           publicIdentifier
@@ -3625,12 +3662,41 @@ export async function startJoinAuthentication(options) {
           });
         }
 
-        const relayWaitResult = await waitForRelayWriterActivation({
+        let relayWaitResult = await waitForRelayWriterActivation({
           relayKey: fallbackRelayKey,
           expectedWriterKey,
           timeoutMs: BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS,
           reason: 'blind-peer-fallback'
         });
+        if (!relayWaitResult?.ok || relayWaitResult?.expectedWriterActive === false) {
+          const manager = global.blindPeeringManager;
+          if (manager?.started) {
+            console.warn('[RelayServer] Writer activation stalled; retrying blind-peer refresh', {
+              relayKey: fallbackRelayKey,
+              expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
+            });
+            try {
+              await manager.refreshFromBlindPeers('join-flow-retry');
+              if (typeof manager.rehydrateMirrors === 'function') {
+                await manager.rehydrateMirrors({
+                  reason: 'join-flow-retry',
+                  timeoutMs: Math.min(BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS, 30000)
+                });
+              }
+              relayWaitResult = await waitForRelayWriterActivation({
+                relayKey: fallbackRelayKey,
+                expectedWriterKey,
+                timeoutMs: Math.min(BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS, 15000),
+                reason: 'blind-peer-retry'
+              });
+            } catch (error) {
+              console.warn('[RelayServer] Blind-peer refresh retry failed', {
+                relayKey: fallbackRelayKey,
+                error: error?.message || error
+              });
+            }
+          }
+        }
         console.log('[RelayServer] Blind-peer fallback writer wait result', {
           relayKey: fallbackRelayKey,
           ok: relayWaitResult?.ok ?? null,
@@ -3638,6 +3704,17 @@ export async function startJoinAuthentication(options) {
           expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
           elapsedMs: relayWaitResult?.elapsedMs ?? null
         });
+        if (closedInvite) {
+          const writerActivated = relayWaitResult?.expectedWriterActive === true || relayWaitResult?.writable === true;
+          const logFn = writerActivated ? console.log : console.warn;
+          logFn(`[CJTRACE] closed-invite writer ${writerActivated ? 'activated' : 'not-active'}`, {
+            relayKey: fallbackRelayKey,
+            publicIdentifier,
+            writable: relayWaitResult?.writable ?? null,
+            expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
+            elapsedMs: relayWaitResult?.elapsedMs ?? null
+          });
+        }
         const identifierPath = publicIdentifier
           ? publicIdentifier.replace(':', '/')
           : fallbackRelayKey;
@@ -3750,7 +3827,8 @@ export async function startJoinAuthentication(options) {
               relayUrl: inviteRelayUrl || null,
               hostPeer: blindPeerKey || null,
               mode: 'blind-peer-offline',
-              provisional: false
+              provisional: false,
+              inviteTraceId: inviteTraceId || null
             }
           });
         }
@@ -3829,14 +3907,20 @@ export async function startJoinAuthentication(options) {
           const { activeRelays } = await import('./hypertuna-relay-manager-adapter.mjs');
           openOfflineRelayManager = activeRelays.get(fallbackRelayKey);
           if (openOfflineRelayManager?.relay?.update) {
+            const relaySyncTimeoutMs = Math.min(BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS, 30000);
             console.log('[RelayServer] Waiting for relay sync after open-offline join', {
               relayKey: fallbackRelayKey,
-              reason: 'open-offline'
+              reason: 'open-offline',
+              timeoutMs: relaySyncTimeoutMs
             });
             try {
-              await openOfflineRelayManager.relay.update({ wait: true });
+              await withTimeout(
+                openOfflineRelayManager.relay.update({ wait: true }),
+                relaySyncTimeoutMs,
+                'open-offline-relay-sync'
+              );
             } catch (error) {
-              console.warn('[RelayServer] Relay update({ wait: true }) failed; retrying without options', {
+              console.warn('[RelayServer] Relay update({ wait: true }) failed or timed out; retrying without options', {
                 relayKey: fallbackRelayKey,
                 error: error?.message || error
               });
@@ -3947,7 +4031,8 @@ export async function startJoinAuthentication(options) {
               relayUrl: resolvedRelayUrl || null,
               hostPeer: blindPeerKey || null,
               mode: 'open-offline',
-              provisional: !inviteToken
+              provisional: !inviteToken,
+              inviteTraceId: inviteTraceId || null
             }
           });
         }
@@ -3971,7 +4056,11 @@ export async function startJoinAuthentication(options) {
     if (global.sendMessage) {
       global.sendMessage({
         type: 'join-auth-progress',
-        data: { publicIdentifier, status: 'verify' }
+        data: {
+          publicIdentifier,
+          status: 'verify',
+          inviteTraceId: inviteTraceId || null
+        }
       });
     }
 
@@ -4026,7 +4115,11 @@ export async function startJoinAuthentication(options) {
     if (global.sendMessage) {
       global.sendMessage({
         type: 'join-auth-progress',
-        data: { publicIdentifier, status: 'complete' }
+        data: {
+          publicIdentifier,
+          status: 'complete',
+          inviteTraceId: inviteTraceId || null
+        }
       });
     }
 
@@ -4194,7 +4287,8 @@ export async function startJoinAuthentication(options) {
           relayUrl,
           hostPeer: selectedPeerKey,
           mode: 'direct-join',
-          provisional: false
+          provisional: false,
+          inviteTraceId: inviteTraceId || null
         }
       });
     }
@@ -4208,7 +4302,8 @@ export async function startJoinAuthentication(options) {
         type: 'join-auth-error',
         data: {
           publicIdentifier,
-          error: error.message
+          error: error.message,
+          inviteTraceId: inviteTraceId || null
         }
       });
     }

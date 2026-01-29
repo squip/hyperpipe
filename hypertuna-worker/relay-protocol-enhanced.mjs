@@ -150,7 +150,7 @@ export class RelayProtocol extends EventEmitter {
   }
   
   _onrequest(message) {
-    console.log('[RelayProtocol] Received request:', message.method, message.path);
+    // console.log('[RelayProtocol] Received request:', message.method, message.path);
     
     // Convert the message to HTTP-like format
     const request = {

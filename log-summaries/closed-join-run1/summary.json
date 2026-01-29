@@ -1,0 +1,47 @@
+{
+  "runId": "closed-join-run1",
+  "generatedAt": "2026-01-28T22:32:11.910Z",
+  "inputFiles": [
+    "/Users/essorensen/hypertuna-electron/test-logs/CLOSED-JOIN-WORKFLOW/test4/worker1.log",
+    "/Users/essorensen/hypertuna-electron/test-logs/CLOSED-JOIN-WORKFLOW/test4/public-gateway1.log"
+  ],
+  "totals": {
+    "lines": 503331,
+    "jsonLines": 9779,
+    "keptLines": 48326,
+    "traces": 2,
+    "warnings": 135,
+    "errors": 3,
+    "untraced": 48318
+  },
+  "traces": [
+    {
+      "traceId": "ee8116fb-e54d-496c-be6d-41c695ff311e",
+      "publicIdentifier": "npub10e2jwsuw9hq3jqcpngxw87u6lt4lkt2dfv3sj3napkxq73ssgyesr36aw5:stretchyPussBoys",
+      "relayKey": "b1862e6011b77ae1",
+      "relayUrl": "ws://127.0.0.1:8443/npub10e2jwsuw9hq3jqcpngxw87u6lt4lkt2dfv3sj3napkxq73ssgyesr36",
+      "mirrorSource": "open-join-pool-update",
+      "mirrorSnapshotFingerprint": "15qwfyjfn5i3u9ytar73ipc5f4u8ufnakuq38neqa7xry4qd3xmy:invite-writer|4jxixxw6h1mgpknn5gqh651z395rdf7awtynuufcmaxe7borj8bo:invite-writer|6q77jyafnsijqf81ningjm7h7t8g48rrntc735axxaqwu767r18o:invite-writer|9co5pu6dbuxsgthwdoc4zww5w7878coy1usui3cyajbiygzwx7uo:mirror-core|9ircawgwhzu8aao5yhmk9jhxyedpfi99b3ge9pij5pdostuhpm7o:invite-writer|fsnbpwborwoumf65k48i5sirbir1jaaz6b3k6p1xc4i5po9zysso:autobase-view|g8nigjasg7igmursdq5133ox36ji8xho95tbe5mbxk33bofx7s5y:invite-writer|gxbnojd4yht545xqabepd7dw1ixi19yyxpz7c67gwefh3u3nbsky:invite-writer|hpzosffr667borgzn7tawsmc97qizc7ic9c8g3c9kni1j5bfgfto:invite-writer|sgdnhayts77qdda5dxpbf5fnqjz7oi3u7qaxqknrgg9oj15mpbpo:autobase|tio6p13nnxtdawgzmdgtdgq6fbt1w9o9w1cufer3te9uper4zruo:invite-writer|xweoywmfnwrmpzuodppn3msdm1n17bxohsw7pcixq6z4413hzudy:autobase-view|yyb3hfdffu8cs6ad8jdbt1hec8znx5mhokaa7ai1qm8e8ggm1thy:invite-writer",
+      "events": 4,
+      "start": "2026-01-28T22:04:23.419Z",
+      "end": "2026-01-28T22:07:04.474Z",
+      "hasJoinSuccess": true,
+      "hasJoinError": false,
+      "hasDowngradeAnnounce": false
+    },
+    {
+      "traceId": "6afced2d-93f6-407c-9be5-62e2a0e72cc5",
+      "publicIdentifier": "npub10e2jwsuw9hq3jqcpngxw87u6lt4lkt2dfv3sj3napkxq73ssgyesr36aw5:stretchyPussBoys",
+      "relayKey": "b1862e6011b77ae1",
+      "relayUrl": "ws://127.0.0.1:8443/npub10e2jwsuw9hq3jqcpngxw87u6lt4lkt2dfv3sj3napkxq73ssgyesr36",
+      "mirrorSource": "open-join-append",
+      "mirrorSnapshotFingerprint": "15qwfyjfn5i3u9ytar73ipc5f4u8ufnakuq38neqa7xry4qd3xmy:invite-writer|4jxixxw6h1mgpknn5gqh651z395rdf7awtynuufcmaxe7borj8bo:invite-writer|6q77jyafnsijqf81ningjm7h7t8g48rrntc735axxaqwu767r18o:invite-writer|9co5pu6dbuxsgthwdoc4zww5w7878coy1usui3cyajbiygzwx7uo:mirror-core|9ircawgwhzu8aao5yhmk9jhxyedpfi99b3ge9pij5pdostuhpm7o:invite-writer|fsnbpwborwoumf65k48i5sirbir1jaaz6b3k6p1xc4i5po9zysso:autobase-view|g8nigjasg7igmursdq5133ox36ji8xho95tbe5mbxk33bofx7s5y:invite-writer|gxbnojd4yht545xqabepd7dw1ixi19yyxpz7c67gwefh3u3nbsky:invite-writer|hpzosffr667borgzn7tawsmc97qizc7ic9c8g3c9kni1j5bfgfto:invite-writer|sgdnhayts77qdda5dxpbf5fnqjz7oi3u7qaxqknrgg9oj15mpbpo:autobase|tio6p13nnxtdawgzmdgtdgq6fbt1w9o9w1cufer3te9uper4zruo:invite-writer|tks3oatxfww4r5unaiznsota4b4mssrbsuw8ikxxdtgi9rpca4ty:invite-writer|wkz9q7muz8eqzftwyxfb1toa5w786ouq7gnrx5hcyy3bkyi5e6uo:autobase-view|xweoywmfnwrmpzuodppn3msdm1n17bxohsw7pcixq6z4413hzudy:autobase-view|yyb3hfdffu8cs6ad8jdbt1hec8znx5mhokaa7ai1qm8e8ggm1thy:invite-writer",
+      "events": 4,
+      "start": "2026-01-28T22:11:26.205Z",
+      "end": "2026-01-28T22:17:54.581Z",
+      "hasJoinSuccess": true,
+      "hasJoinError": false,
+      "hasDowngradeAnnounce": false
+    }
+  ]
+}

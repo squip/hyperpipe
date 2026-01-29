@@ -20,6 +20,8 @@ import {
 import { isElectron } from '@/lib/platform'
 import { useNostr } from '@/providers/NostrProvider'
 
+const WORKER_REPLY_TIMEOUT_MS = 60000
+
 type WorkerStatusPhase =
   | 'starting'
   | 'waiting-config'
@@ -100,6 +102,7 @@ type JoinFlowState = {
   phase: JoinFlowPhase
   startedAt: number
   updatedAt: number
+  inviteTraceId?: string | null
   hostPeers?: string[]
   hostPeer?: string | null
   relayKey?: string | null
@@ -152,6 +155,7 @@ type InviteProof = {
     publicIdentifier?: string | null
     inviteePubkey?: string | null
     authToken?: string | null
+    inviteTraceId?: string | null
     issuedAt?: number | null
     version?: number | null
   }
@@ -166,6 +170,7 @@ type InviteMirrorSnapshot = {
   mirrorSource?: string | null
   updatedAt?: number | null
   fetchedAt?: number | null
+  inviteTraceId?: string | null
   blindPeer?: {
     publicKey?: string | null
     encryptionKey?: string | null
@@ -238,6 +243,62 @@ function normalizeJoinFlowKey(value: unknown): string | null {
   const trimmed = value.trim()
   if (!trimmed) return null
   return isHex64(trimmed) ? trimmed.toLowerCase() : trimmed
+}
+
+function normalizeInviteTraceId(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed ? trimmed : null
+}
+
+function sanitizeInviteProof(input: InviteProof): InviteProof {
+  if (!input || typeof input !== 'object') return null
+  const payload = input.payload && typeof input.payload === 'object' ? input.payload : null
+  return {
+    payload: payload
+      ? {
+          relayKey: payload.relayKey ?? null,
+          publicIdentifier: payload.publicIdentifier ?? null,
+          inviteePubkey: payload.inviteePubkey ?? null,
+          authToken: payload.authToken ?? null,
+          inviteTraceId: normalizeInviteTraceId((payload as any).inviteTraceId),
+          issuedAt: typeof payload.issuedAt === 'number' ? payload.issuedAt : null,
+          version: typeof payload.version === 'number' ? payload.version : null
+        }
+      : undefined,
+    signature: typeof input.signature === 'string' ? input.signature : null,
+    scheme: typeof input.scheme === 'string' ? input.scheme : null
+  }
+}
+
+function sanitizeInviteMirrorSnapshot(input: InviteMirrorSnapshot): InviteMirrorSnapshot {
+  if (!input || typeof input !== 'object') return null
+  const cores = Array.isArray(input.cores)
+    ? input.cores
+        .filter((entry): entry is { key: string; role?: string | null } => typeof entry?.key === 'string')
+        .map((entry) => ({
+          key: entry.key,
+          role: typeof entry.role === 'string' ? entry.role : null
+        }))
+    : undefined
+  return {
+    relayKey: input.relayKey ?? null,
+    publicIdentifier: input.publicIdentifier ?? null,
+    relayUrl: input.relayUrl ?? null,
+    mirrorSource: input.mirrorSource ?? null,
+    updatedAt: typeof input.updatedAt === 'number' ? input.updatedAt : null,
+    fetchedAt: typeof input.fetchedAt === 'number' ? input.fetchedAt : null,
+    inviteTraceId: normalizeInviteTraceId((input as any).inviteTraceId),
+    blindPeer: input.blindPeer && typeof input.blindPeer === 'object'
+      ? {
+          publicKey: input.blindPeer.publicKey ?? null,
+          encryptionKey: input.blindPeer.encryptionKey ?? null,
+          replicationTopic: input.blindPeer.replicationTopic ?? null,
+          maxBytes: typeof input.blindPeer.maxBytes === 'number' ? input.blindPeer.maxBytes : null
+        }
+      : null,
+    cores
+  }
 }
 
 function readAutostartEnabled(): boolean {
@@ -608,6 +669,13 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         throw new Error('Expected a public identifier in the form npub:relayName')
       }
 
+      const safeInviteProof = sanitizeInviteProof(opts?.inviteProof || null)
+      const safeMirrorSnapshot = sanitizeInviteMirrorSnapshot(opts?.mirrorSnapshot || null)
+      const inviteTraceId =
+        normalizeInviteTraceId((safeInviteProof as any)?.payload?.inviteTraceId)
+        || normalizeInviteTraceId((safeMirrorSnapshot as any)?.inviteTraceId)
+        || undefined
+
       setJoinFlows((prev) => ({
         ...prev,
         [identifier]: {
@@ -615,7 +683,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           phase: 'starting',
           startedAt: Date.now(),
           updatedAt: Date.now(),
-          error: null
+          error: null,
+          inviteTraceId
         }
       }))
 
@@ -655,8 +724,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         token: opts?.token,
         relayKey: opts?.relayKey || undefined,
         relayUrl: opts?.relayUrl || undefined,
-        inviteProof: opts?.inviteProof,
-        mirrorSnapshot: opts?.mirrorSnapshot
+        inviteProof: safeInviteProof,
+        mirrorSnapshot: safeMirrorSnapshot,
+        inviteTraceId
       }
       if (hostPeers && hostPeers.length) data.hostPeers = hostPeers
 
@@ -666,14 +736,15 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         relayKey: opts?.relayKey ? String(opts.relayKey).slice(0, 16) : null,
         relayUrl: opts?.relayUrl ? String(opts.relayUrl).slice(0, 80) : null,
         hasToken: !!opts?.token,
-        hasInviteProof: !!opts?.inviteProof,
-        inviteProofScheme: opts?.inviteProof?.scheme || null,
-        inviteProofVersion: opts?.inviteProof?.payload?.version ?? null,
-        inviteProofIssuedAt: opts?.inviteProof?.payload?.issuedAt ?? null,
-        hasMirrorSnapshot: !!opts?.mirrorSnapshot,
-        mirrorSource: opts?.mirrorSnapshot?.mirrorSource || null,
-        mirrorUpdatedAt: opts?.mirrorSnapshot?.updatedAt ?? null,
-        mirrorCoreCount: Array.isArray(opts?.mirrorSnapshot?.cores) ? opts?.mirrorSnapshot?.cores.length : 0,
+        hasInviteProof: !!safeInviteProof,
+        inviteProofScheme: safeInviteProof?.scheme || null,
+        inviteProofVersion: safeInviteProof?.payload?.version ?? null,
+        inviteProofIssuedAt: safeInviteProof?.payload?.issuedAt ?? null,
+        hasMirrorSnapshot: !!safeMirrorSnapshot,
+        mirrorSource: safeMirrorSnapshot?.mirrorSource || null,
+        mirrorUpdatedAt: safeMirrorSnapshot?.updatedAt ?? null,
+        mirrorCoreCount: Array.isArray(safeMirrorSnapshot?.cores) ? safeMirrorSnapshot?.cores.length : 0,
+        inviteTraceId: inviteTraceId || null,
         isOpen: typeof opts?.isOpen === 'boolean' ? opts.isOpen : null,
         openJoin: opts?.openJoin === true,
         fileSharing
@@ -1000,6 +1071,18 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
               if (pending) {
                 window.clearTimeout(pending.timeoutId)
                 if (msg.type === 'generate-invite-proof:result') {
+                  const payload = (msg as any).data || null
+                  if (payload && typeof payload === 'object') {
+                    console.info('[WorkerBridge] invite proof generated', {
+                      inviteTraceId: payload.inviteTraceId || null,
+                      mirrorSnapshotFingerprint: payload.mirrorSnapshotFingerprint || null,
+                      mirrorSource: payload.mirrorSnapshot?.mirrorSource || null,
+                      mirrorUpdatedAt: payload.mirrorSnapshot?.updatedAt ?? null,
+                      mirrorCoreCount: Array.isArray(payload.mirrorSnapshot?.cores)
+                        ? payload.mirrorSnapshot.cores.length
+                        : 0
+                    })
+                  }
                   pending.resolve((msg as any).data ?? null)
                 } else {
                   pending.reject(new Error((msg as any)?.error || 'Invite proof generation failed'))
@@ -1036,7 +1119,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   relayUrl: msg?.data?.relayUrl ? String(msg?.data?.relayUrl).slice(0, 80) : current?.relayUrl || null,
                   writable: current?.writable ?? null,
                   expectedWriterActive: stickyExpectedWriterActive ?? null,
-                  mode: stickyMode ?? null
+                  mode: stickyMode ?? null,
+                  inviteTraceId: msg?.data?.inviteTraceId || null
                 })
               }
               if (cachedWritable?.writable && !current?.writable) {
@@ -1057,6 +1141,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   phase: nextPhase,
                   startedAt,
                   updatedAt: Date.now(),
+                  inviteTraceId: msg?.data?.inviteTraceId || current?.inviteTraceId || null,
                   hostPeers: current?.hostPeers,
                   hostPeer: current?.hostPeer ?? null,
                   relayKey: current?.relayKey ?? null,
@@ -1096,15 +1181,16 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   mode: cachedWritable.mode ?? null
                 })
               }
-              console.info('[CJTRACE] join flow success', {
-                publicIdentifier: identifier,
-                relayKey: (msg?.data?.relayKey || current?.relayKey) ? String(msg?.data?.relayKey || current?.relayKey).slice(0, 16) : null,
-                relayUrl: msg?.data?.relayUrl ? String(msg?.data?.relayUrl).slice(0, 80) : current?.relayUrl || null,
-                writable: stickyWritable ? true : current?.writable ?? null,
-                writableAt: stickyWritable ? stickyWritableAt : current?.writableAt ?? null,
-                expectedWriterActive: stickyExpectedWriterActive ?? null,
-                mode: msg?.data?.mode ?? current?.mode ?? cachedWritable?.mode ?? null
-              })
+            console.info('[CJTRACE] join flow success', {
+              publicIdentifier: identifier,
+              relayKey: (msg?.data?.relayKey || current?.relayKey) ? String(msg?.data?.relayKey || current?.relayKey).slice(0, 16) : null,
+              relayUrl: msg?.data?.relayUrl ? String(msg?.data?.relayUrl).slice(0, 80) : current?.relayUrl || null,
+              writable: stickyWritable ? true : current?.writable ?? null,
+              writableAt: stickyWritable ? stickyWritableAt : current?.writableAt ?? null,
+              expectedWriterActive: stickyExpectedWriterActive ?? null,
+              mode: msg?.data?.mode ?? current?.mode ?? cachedWritable?.mode ?? null,
+              inviteTraceId: msg?.data?.inviteTraceId || null
+            })
               const startedAt = current?.startedAt ?? Date.now()
               return {
                 ...prev,
@@ -1113,6 +1199,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   phase: 'success',
                   startedAt,
                   updatedAt: Date.now(),
+                  inviteTraceId: msg?.data?.inviteTraceId || current?.inviteTraceId || null,
                   hostPeers: current?.hostPeers,
                   hostPeer: msg?.data?.hostPeer || null,
                   relayKey: msg?.data?.relayKey || null,
@@ -1139,7 +1226,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
               publicIdentifier: identifier,
               relayKey: msg?.data?.relayKey ? String(msg?.data?.relayKey).slice(0, 16) : null,
               relayUrl: msg?.data?.relayUrl ? String(msg?.data?.relayUrl).slice(0, 80) : null,
-              error: errorText
+              error: errorText,
+              inviteTraceId: msg?.data?.inviteTraceId || null
             })
             setJoinFlows((prev) => {
               const current = prev[identifier]
@@ -1151,6 +1239,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   phase: 'error',
                   startedAt,
                   updatedAt: Date.now(),
+                  inviteTraceId: msg?.data?.inviteTraceId || current?.inviteTraceId || null,
                   hostPeers: current?.hostPeers,
                   hostPeer: current?.hostPeer ?? null,
                   relayKey: current?.relayKey ?? null,
@@ -1569,7 +1658,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
             const timeoutId = window.setTimeout(() => {
               pendingRepliesRef.current.delete(requestId)
               reject(new Error('Worker reply timeout'))
-            }, 15000)
+            }, WORKER_REPLY_TIMEOUT_MS)
             pendingRepliesRef.current.set(requestId, {
               resolve,
               reject,

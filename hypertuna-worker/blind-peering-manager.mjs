@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import Hyperswarm from 'hyperswarm';
+import HyperDHT from 'hyperdht';
 import BlindPeering from 'blind-peering';
 import HypercoreId from 'hypercore-id-encoding';
 
@@ -77,6 +78,40 @@ function decodeCoreKey(value) {
     return Buffer.from(candidate);
   }
   return null;
+}
+
+function toPeerKeyBuffer(value) {
+  if (!value) return null;
+  if (Buffer.isBuffer(value)) return Buffer.from(value);
+  if (value instanceof Uint8Array) return Buffer.from(value);
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+      return Buffer.from(HypercoreId.decode(trimmed));
+    } catch (_) {
+      if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+        return Buffer.from(trimmed, 'hex');
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+function encodePeerKey(value) {
+  const buf = toPeerKeyBuffer(value);
+  if (!buf) return null;
+  try {
+    return HypercoreId.encode(buf);
+  } catch (_) {
+    return buf.toString('hex');
+  }
+}
+
+function peerKeyHex(value) {
+  const buf = toPeerKeyBuffer(value);
+  return buf ? buf.toString('hex') : null;
 }
 
 let corestoreCounter = 0;
@@ -190,6 +225,16 @@ export default class BlindPeeringManager extends EventEmitter {
       return false;
     }
 
+    if (this.started) {
+      this.runtime = {
+        corestore: runtime.corestore || this.runtime.corestore,
+        wakeup: runtime.wakeup || this.runtime.wakeup,
+        swarmKeyPair: runtime.swarmKeyPair || this.runtime.swarmKeyPair || null
+      };
+      this.logger?.debug?.('[BlindPeering] Start skipped (already started)');
+      return true;
+    }
+
     this.runtime = {
       corestore: runtime.corestore || this.runtime.corestore,
       wakeup: runtime.wakeup || this.runtime.wakeup,
@@ -209,11 +254,66 @@ export default class BlindPeeringManager extends EventEmitter {
         const swarmOptions = {};
         if (this.runtime.swarmKeyPair?.publicKey && this.runtime.swarmKeyPair?.secretKey) {
           swarmOptions.keyPair = this.runtime.swarmKeyPair;
+          try {
+            swarmOptions.dht = new HyperDHT({ keyPair: this.runtime.swarmKeyPair });
+          } catch (error) {
+            this.logger?.warn?.('[BlindPeering] Failed to initialize custom DHT keypair', {
+              error: error?.message || error
+            });
+          }
         }
         this.swarm = new Hyperswarm(swarmOptions);
         this.ownsSwarm = true;
       }
     }
+
+    if (this.swarm && !this.swarm.__ht_blindpeer_conn_log) {
+      this.swarm.__ht_blindpeer_conn_log = true;
+      this.swarm.on('connection', (socket, details = {}) => {
+        const remoteKey = encodePeerKey(
+          details?.publicKey || details?.remotePublicKey || socket?.remotePublicKey || socket?.publicKey
+        );
+        this.logger?.info?.(`${CJTRACE_TAG} blind peering swarm connection`, {
+          remoteKey,
+          initiator: details?.initiator ?? null,
+          client: details?.client ?? null,
+          server: details?.server ?? null,
+          topic: details?.topic ? encodePeerKey(details.topic) : null
+        });
+      });
+    }
+
+    const configuredKey = this.runtime?.swarmKeyPair?.publicKey || null;
+    const existingDhtKey = this.swarm?.dht?.defaultKeyPair?.publicKey || null;
+    const configuredEnc = encodePeerKey(configuredKey);
+    const existingDhtEnc = encodePeerKey(existingDhtKey);
+    if (configuredEnc && existingDhtEnc && configuredEnc !== existingDhtEnc) {
+      this.logger?.warn?.('[BlindPeering] DHT default key mismatch; overriding to configured', {
+        configured: configuredEnc,
+        dhtDefault: existingDhtEnc
+      });
+      try {
+        this.swarm.dht.defaultKeyPair = this.runtime.swarmKeyPair;
+      } catch (error) {
+        this.logger?.warn?.('[BlindPeering] Failed to override DHT default key', {
+          error: error?.message || error
+        });
+      }
+    }
+
+    const dhtKey = this.swarm?.dht?.defaultKeyPair?.publicKey || null;
+    const swarmKey = this.swarm?.keyPair?.publicKey || null;
+    this.logger?.info?.(`${CJTRACE_TAG} blind peering swarm keys`, {
+      configured: encodePeerKey(configuredKey),
+      configuredHex: peerKeyHex(configuredKey),
+      dhtDefault: encodePeerKey(dhtKey),
+      dhtDefaultHex: peerKeyHex(dhtKey),
+      swarmKeyPair: encodePeerKey(swarmKey),
+      swarmKeyPairHex: peerKeyHex(swarmKey),
+      configuredMatchesDht: configuredKey && dhtKey
+        ? encodePeerKey(configuredKey) === encodePeerKey(dhtKey)
+        : null
+    });
 
     this.blindPeering = new BlindPeering(this.swarm, this.runtime.corestore, {
       mirrors: Array.from(this.trustedMirrors),
@@ -478,6 +578,114 @@ export default class BlindPeeringManager extends EventEmitter {
     }
 
     this.logger?.info?.('[BlindPeering] Relay core prefetch complete', summary);
+    return summary;
+  }
+
+  async announceRelayCoreRefs({
+    relayKey = null,
+    publicIdentifier = null,
+    coreRefs = [],
+    reason = 'manual',
+    corestore = null,
+    priority = 2,
+    pick = 2
+  } = {}) {
+    if (!this.started) {
+      return { status: 'skipped', reason: 'not-started' };
+    }
+    if (!this.blindPeering) {
+      return { status: 'skipped', reason: 'not-configured' };
+    }
+    const targetStore = corestore || this.runtime?.corestore;
+    if (!targetStore) {
+      return { status: 'skipped', reason: 'no-corestore' };
+    }
+    const uniqueRefs = Array.from(new Set(
+      (Array.isArray(coreRefs) ? coreRefs : [])
+        .map(normalizeCoreKey)
+        .filter(Boolean)
+    ));
+    if (!uniqueRefs.length) {
+      return { status: 'skipped', reason: 'no-cores' };
+    }
+
+    const storeInfo = describeCorestore(targetStore);
+    const mirrorKeys = Array.from(this.trustedMirrors || []);
+    const mirrorPreview = mirrorKeys.length
+      ? mirrorKeys.slice(0, 3).map((key) => String(key).slice(0, 16))
+      : [];
+    const summary = {
+      status: 'ok',
+      reason,
+      relayKey: relayKey || null,
+      total: uniqueRefs.length,
+      announced: 0,
+      failed: 0,
+      corestoreId: storeInfo.corestoreId,
+      storagePath: storeInfo.storagePath
+    };
+
+    this.logger?.info?.('[BlindPeering] Relay core announce start', {
+      relayKey: summary.relayKey,
+      reason,
+      coreRefsCount: uniqueRefs.length,
+      coreRefsPreview: uniqueRefs.slice(0, 3).map((ref) => String(ref).slice(0, 16)),
+      corestoreId: storeInfo.corestoreId,
+      storagePath: storeInfo.storagePath,
+      mirrorKeysCount: mirrorKeys.length,
+      mirrorKeysPreview: mirrorPreview,
+      mirrorKeys: mirrorKeys.length ? mirrorKeys : null
+    });
+
+    const labelBase = relayKey || publicIdentifier || 'unknown-relay';
+    for (const ref of uniqueRefs) {
+      const label = `${labelBase}:${ref.slice(0, 16)}`;
+      const core = this.#getMirrorCore(ref, label, targetStore);
+      if (!core) {
+        summary.failed += 1;
+        continue;
+      }
+      try {
+        this.logger?.info?.(`${CJTRACE_TAG} relay core announce request`, {
+          relayKey: summary.relayKey,
+          publicIdentifier: publicIdentifier || null,
+          ref: String(ref).slice(0, 16),
+          announce: true,
+          priority,
+          pick,
+          corestoreId: storeInfo.corestoreId,
+          storagePath: storeInfo.storagePath,
+          label,
+          mirrorKeysCount: mirrorKeys.length,
+          mirrorKeysPreview: mirrorPreview,
+          mirrorKeys: mirrorKeys.length ? mirrorKeys : null
+        });
+        if (typeof this.blindPeering.addCoreBackground === 'function') {
+          this.blindPeering.addCoreBackground(core, core.key, {
+            announce: true,
+            priority,
+            pick
+          });
+        } else if (typeof this.blindPeering.addCore === 'function') {
+          await this.blindPeering.addCore(core, core.key, {
+            announce: true,
+            priority,
+            pick
+          });
+        }
+        summary.announced += 1;
+      } catch (error) {
+        summary.failed += 1;
+        this.logger?.warn?.('[BlindPeering] Relay core announce failed', {
+          ref,
+          label,
+          reason,
+          error: error?.message || error
+        });
+      }
+    }
+
+    this.logger?.info?.('[BlindPeering] Relay core announce complete', summary);
     return summary;
   }
 
@@ -1069,6 +1277,10 @@ export default class BlindPeeringManager extends EventEmitter {
     if (!Array.isArray(coreRefs) || !coreRefs.length) return;
     const identifier = entry.identifier || entry.context?.relayKey || entry.context?.publicIdentifier || 'relay';
     const priority = Number.isFinite(entry.priority) ? entry.priority : 2;
+    const mirrorKeys = Array.from(this.trustedMirrors || []);
+    const mirrorPreview = mirrorKeys.length
+      ? mirrorKeys.slice(0, 3).map((key) => String(key).slice(0, 16))
+      : [];
     coreRefs
       .map(normalizeCoreKey)
       .filter(Boolean)
@@ -1076,6 +1288,20 @@ export default class BlindPeeringManager extends EventEmitter {
         const label = `relay-core:${identifier}:${index}`;
         const core = this.#getMirrorCore(ref, label, targetStore);
         if (!core) return;
+        this.logger?.info?.(`${CJTRACE_TAG} relay core prime request`, {
+          relayKey: entry.context?.relayKey || null,
+          publicIdentifier: entry.context?.publicIdentifier || null,
+          ref: String(ref).slice(0, 16),
+          announce: false,
+          priority,
+          pick: 2,
+          corestoreId: entry.context?.corestoreId || null,
+          corestorePath: entry.context?.corestorePath || null,
+          label,
+          mirrorKeysCount: mirrorKeys.length,
+          mirrorKeysPreview: mirrorPreview,
+          mirrorKeys: mirrorKeys.length ? mirrorKeys : null
+        });
         try {
           this.blindPeering.addCoreBackground(core, core.key, {
             announce: false,

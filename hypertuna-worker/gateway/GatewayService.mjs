@@ -256,8 +256,17 @@ export class GatewayService extends EventEmitter {
       lastErrorMessage: null
     };
     this.publicGatewayReplicaMetrics = null;
-    this.ownPeerPublicKey = typeof options.getOwnPeerPublicKey === 'function'
-      ? options.getOwnPeerPublicKey()
+    this.getOwnPeerPublicKeyFn = typeof options.getOwnPeerPublicKey === 'function'
+      ? options.getOwnPeerPublicKey
+      : null;
+    this.getBlindPeeringPublicKeyFn = typeof options.getBlindPeeringPublicKey === 'function'
+      ? options.getBlindPeeringPublicKey
+      : null;
+    this.getBlindPeeringDhtPublicKeyFn = typeof options.getBlindPeeringDhtPublicKey === 'function'
+      ? options.getBlindPeeringDhtPublicKey
+      : null;
+    this.ownPeerPublicKey = this.getOwnPeerPublicKeyFn
+      ? this.getOwnPeerPublicKeyFn()
       : (options.ownPeerPublicKey || null);
     this.publicGatewayWsBase = null;
     this.publicGatewayStatusUpdatedAt = null;
@@ -1151,12 +1160,39 @@ export class GatewayService extends EventEmitter {
 
     const relayCores = this.#collectRelayCoreMetadata(relayKey);
     if (relayCores?.length) {
+      const roleTally = new Map();
+      const coreSample = relayCores
+        .slice(0, 5)
+        .map((entry) => ({
+          key: typeof entry?.key === 'string' ? entry.key.slice(0, 16) : null,
+          role: typeof entry?.role === 'string' ? entry.role : null
+        }));
+      relayCores.forEach((entry) => {
+        if (entry?.role) {
+          roleTally.set(entry.role, (roleTally.get(entry.role) || 0) + 1);
+        }
+      });
       this.log('debug', `[PublicGateway] Collected relay core metadata for registration relay=${relayKey}`, {
-        cores: relayCores.length
+        cores: relayCores.length,
+        roleTally: roleTally.size ? Object.fromEntries(roleTally.entries()) : null,
+        coreSample
       });
     } else {
       this.log('debug', `[PublicGateway] No relay core metadata found for relay=${relayKey}`);
     }
+
+    const ownPeerKey = this.getOwnPeerPublicKey();
+    const blindPeeringKey = this.getBlindPeeringPublicKey();
+    const dhtBlindPeeringKey = this.getBlindPeeringDhtPublicKey();
+    const registrationBlindPeerKey = blindPeeringKey || ownPeerKey || null;
+    const matchesDht = registrationBlindPeerKey && dhtBlindPeeringKey
+      ? String(registrationBlindPeerKey === dhtBlindPeeringKey)
+      : 'null';
+    const relayKeyLogLine = `[CJTRACE] Relay registration peer keys relay=${relayKey} blindPeerKey=${registrationBlindPeerKey || 'null'} blindPeeringKey=${blindPeeringKey || 'null'} ownPeerKey=${ownPeerKey || 'null'} dhtDefaultKey=${dhtBlindPeeringKey || 'null'} matches=${!!blindPeeringKey && !!ownPeerKey ? String(blindPeeringKey === ownPeerKey) : 'null'} matchesDht=${matchesDht}`;
+    this.log('info', relayKeyLogLine);
+    try {
+      console.log(relayKeyLogLine);
+    } catch (_) {}
 
     if (!peers.length) {
       if (metadataCopy?.isOpen === true) {
@@ -1164,6 +1200,12 @@ export class GatewayService extends EventEmitter {
           peers,
           metadata: metadataCopy
         };
+        if (registrationBlindPeerKey) {
+          payload.blindPeerKey = registrationBlindPeerKey;
+        }
+        if (ownPeerKey) {
+          payload.ownerPeerKey = ownPeerKey;
+        }
         if (relayCores?.length) {
           payload.relayCores = relayCores;
         }
@@ -1254,6 +1296,12 @@ export class GatewayService extends EventEmitter {
       peers,
       metadata: metadataCopy
     };
+    if (registrationBlindPeerKey) {
+      payload.blindPeerKey = registrationBlindPeerKey;
+    }
+    if (ownPeerKey) {
+      payload.ownerPeerKey = ownPeerKey;
+    }
     if (relayCores?.length) {
       payload.relayCores = relayCores;
     }
@@ -1301,7 +1349,7 @@ export class GatewayService extends EventEmitter {
 
       const registrationBlindPeer = registrationResult?.blindPeer;
       if (registrationBlindPeer && typeof registrationBlindPeer === 'object') {
-        await this.#applyBlindPeerInfo(registrationBlindPeer, { persist: true }).catch((error) => {
+        await this.#applyBlindPeerInfo(registrationBlindPeer, { persist: true, source: 'registration' }).catch((error) => {
           this.log('warn', `[PublicGateway] Failed to persist blind peer announcement: ${error.message}`);
         });
       } else {
@@ -1580,7 +1628,7 @@ export class GatewayService extends EventEmitter {
         publicKey: handshake.blindPeerPublicKey || null,
         encryptionKey: handshake.blindPeerEncryptionKey || null,
         maxBytes: handshake.blindPeerMaxBytes ?? null
-      }, { persist: false }).then(() => {
+      }, { persist: false, source: 'handshake' }).then(() => {
         if ((!this.blindPeerSummary?.enabled || !this.blindPeerSummary?.publicKey)
           && (!Array.isArray(this.publicGatewaySettings?.blindPeerKeys) || !this.publicGatewaySettings.blindPeerKeys.length)) {
           this.#maybeFetchBlindPeerInfo({ reason: 'handshake-disabled' }).catch((error) => {
@@ -2604,7 +2652,43 @@ export class GatewayService extends EventEmitter {
   }
 
   getOwnPeerPublicKey() {
+    if (this.getOwnPeerPublicKeyFn) {
+      try {
+        const nextKey = this.getOwnPeerPublicKeyFn();
+        if (nextKey && nextKey !== this.ownPeerPublicKey) {
+          this.ownPeerPublicKey = nextKey;
+        }
+      } catch (error) {
+        this.log('warn', '[PublicGateway] Failed to resolve own peer public key', {
+          error: error?.message || error
+        });
+      }
+    }
     return this.ownPeerPublicKey || null;
+  }
+
+  getBlindPeeringPublicKey() {
+    if (!this.getBlindPeeringPublicKeyFn) return null;
+    try {
+      return this.getBlindPeeringPublicKeyFn() || null;
+    } catch (error) {
+      this.log('warn', '[PublicGateway] Failed to resolve blind peering public key', {
+        error: error?.message || error
+      });
+      return null;
+    }
+  }
+
+  getBlindPeeringDhtPublicKey() {
+    if (!this.getBlindPeeringDhtPublicKeyFn) return null;
+    try {
+      return this.getBlindPeeringDhtPublicKeyFn() || null;
+    } catch (error) {
+      this.log('warn', '[PublicGateway] Failed to resolve blind peering DHT public key', {
+        error: error?.message || error
+      });
+      return null;
+    }
   }
 
   setOwnPeerPublicKey(peerKey) {
@@ -4190,7 +4274,7 @@ export class GatewayService extends EventEmitter {
     return null;
   }
 
-  async #applyBlindPeerInfo(info = {}, { persist = false } = {}) {
+  async #applyBlindPeerInfo(info = {}, { persist = false, source = 'unknown' } = {}) {
     if (!info || typeof info !== 'object') {
       return false;
     }
@@ -4213,7 +4297,16 @@ export class GatewayService extends EventEmitter {
       || currentKeys.length !== nextKeys.length
       || currentKeys.some((value, index) => value !== nextKeys[index]);
 
-    if (!changed) return false;
+    if (!changed) {
+      this.log('debug', '[PublicGateway] Blind peer info unchanged', {
+        source,
+        enabled,
+        publicKey: publicKey ? publicKey.slice(0, 16) : null,
+        hasEncryptionKey: !!encryptionKey,
+        maxBytes
+      });
+      return false;
+    }
 
     this.publicGatewaySettings = {
       ...current,
@@ -4226,6 +4319,16 @@ export class GatewayService extends EventEmitter {
     if (persist) {
       await updatePublicGatewaySettings(this.publicGatewaySettings);
     }
+
+    this.log('info', '[CJTRACE] Blind peer info applied', {
+      source,
+      enabled,
+      publicKey: publicKey ? publicKey.slice(0, 16) : null,
+      hasEncryptionKey: !!encryptionKey,
+      maxBytes,
+      previousKeys: Array.isArray(currentKeys) ? currentKeys : [],
+      nextKeys
+    });
 
     return true;
   }
@@ -4277,7 +4380,7 @@ export class GatewayService extends EventEmitter {
           encryptionKey: summary?.encryptionKey || null,
           maxBytes: summary?.config?.maxBytes ?? status?.config?.maxBytes ?? null
         };
-        const changed = await this.#applyBlindPeerInfo(info, { persist: true });
+        const changed = await this.#applyBlindPeerInfo(info, { persist: true, source: `fallback:${reason}` });
         if (changed) {
           this.log('info', `[PublicGateway] Blind peer metadata refreshed via REST fallback (${reason})`);
         }

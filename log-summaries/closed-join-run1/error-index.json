@@ -1,0 +1,13 @@
+[
+  {
+    "id": "febdce9acdfb8e3a94e287e8d29e7dfaed568ed8",
+    "count": 1,
+    "error": {
+      "message": "Connection timeout"
+    },
+    "traces": [],
+    "files": [
+      "/Users/essorensen/hypertuna-electron/test-logs/CLOSED-JOIN-WORKFLOW/test4/public-gateway1.log"
+    ]
+  }
+]

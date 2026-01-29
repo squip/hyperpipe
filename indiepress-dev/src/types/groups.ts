@@ -32,6 +32,7 @@ export type TInviteMirrorSnapshot = {
   mirrorSource?: string | null
   updatedAt?: number | null
   fetchedAt?: number | null
+  inviteTraceId?: string | null
   blindPeer?: {
     publicKey?: string | null
     encryptionKey?: string | null
@@ -65,6 +66,7 @@ export type TGroupInvite = {
       publicIdentifier?: string | null
       inviteePubkey?: string | null
       authToken?: string | null
+      inviteTraceId?: string | null
       issuedAt?: number | null
       version?: number | null
     }

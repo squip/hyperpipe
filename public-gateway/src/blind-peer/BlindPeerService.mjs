@@ -1,6 +1,9 @@
 import { EventEmitter } from 'node:events';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
+import Corestore from 'corestore';
+import Hyperswarm from 'hyperswarm';
+import hypercoreCrypto from 'hypercore-crypto';
 import HypercoreId from 'hypercore-id-encoding';
 
 const DEFAULT_STORAGE_SUBDIR = 'blind-peer-data';
@@ -10,6 +13,27 @@ const DEFAULT_MIRROR_STALE_THRESHOLD_MS = 10 * 60 * 1000;
 async function loadBlindPeerModule() {
   const mod = await import('blind-peer');
   return mod?.default || mod;
+}
+
+async function loadBlindPeeringModule() {
+  const mod = await import('blind-peering');
+  return mod?.default || mod;
+}
+
+function serializeError(error) {
+  if (!error || typeof error !== 'object') {
+    return { message: error ? String(error) : null };
+  }
+  return {
+    message: error.message || String(error),
+    name: error.name || null,
+    code: error.code || null,
+    stack: error.stack || null,
+    cause: error.cause ? (error.cause.message || String(error.cause)) : null,
+    errors: Array.isArray(error.errors)
+      ? error.errors.map((entry) => entry?.message || String(entry))
+      : null
+  };
 }
 
 function toKeyString(value) {
@@ -106,6 +130,14 @@ export default class BlindPeerService extends EventEmitter {
       : null;
     this.trustedPeersLoaded = false;
     this.blindPeer = null;
+    this.blindPeering = null;
+    this.blindPeeringSwarm = null;
+    this.blindPeeringStore = null;
+    this.blindPeeringMirrorKey = null;
+    this.blindPeeringClientKey = null;
+    this.blindPeeringKeyPath = this.config?.blindPeeringKeyPath
+      ? resolve(this.config.blindPeeringKeyPath)
+      : null;
     this.cleanupInterval = null;
     this.hygieneInterval = null;
     this.hygieneRunning = false;
@@ -192,6 +224,38 @@ export default class BlindPeerService extends EventEmitter {
     }
 
     this.blindPeer = null;
+    if (this.blindPeering?.close) {
+      try {
+        await this.blindPeering.close();
+      } catch (error) {
+        this.logger?.warn?.('[BlindPeer] Failed to close blind-peering client', {
+          err: error?.message || error
+        });
+      }
+    }
+    this.blindPeering = null;
+    if (this.blindPeeringSwarm) {
+      try {
+        await this.blindPeeringSwarm.destroy();
+      } catch (error) {
+        this.logger?.warn?.('[BlindPeer] Failed to close blind-peering swarm', {
+          err: error?.message || error
+        });
+      }
+    }
+    this.blindPeeringSwarm = null;
+    if (this.blindPeeringStore) {
+      try {
+        await this.blindPeeringStore.close();
+      } catch (error) {
+        this.logger?.warn?.('[BlindPeer] Failed to close blind-peering corestore', {
+          err: error?.message || error
+        });
+      }
+    }
+    this.blindPeeringStore = null;
+    this.blindPeeringMirrorKey = null;
+    this.blindPeeringClientKey = null;
     this.#updateMetrics();
     this.metrics.setActive?.(0);
     for (const timer of this.dispatcherAssignmentTimers.values()) {
@@ -324,53 +388,105 @@ export default class BlindPeerService extends EventEmitter {
 
     const key = core ? core.key : decodeKey(coreOrKey);
     if (!key) {
+      this.logger?.warn?.({
+        inputType: typeof coreOrKey,
+        inputPreview: typeof coreOrKey === 'string' ? coreOrKey.slice(0, 64) : null
+      }, '[BlindPeer] mirrorCore invalid key');
       throw new Error('Invalid core key provided to mirrorCore');
     }
 
+    const announce = options.announce === true;
+    const priority = options.priority ?? 0;
+    const referrerKey = options.referrer ? decodeKey(options.referrer) : null;
+    const referrerString = options.referrer ? toKeyString(options.referrer) : null;
     const request = {
       key,
-      announce: options.announce === true,
-      priority: options.priority ?? 0,
-      referrer: options.referrer ? decodeKey(options.referrer) : null
+      announce,
+      priority,
+      referrer: referrerKey
     };
     const metadata = options.metadata && typeof options.metadata === 'object'
       ? { ...options.metadata }
       : null;
 
     try {
-      const record = await this.blindPeer.addCore(request);
-      this.logger?.info?.('[BlindPeer] Core mirror requested', {
+      let record = null;
+      const mode = typeof this.blindPeer?.addCore === 'function'
+        ? 'blindPeer.addCore'
+        : 'blindPeering.addCore';
+      if (typeof this.blindPeer?.addCore === 'function') {
+        record = await this.blindPeer.addCore(request);
+      } else {
+        const blindPeering = await this.#ensureBlindPeeringClient({ reason: 'mirror-core' });
+        if (!blindPeering || !this.blindPeeringStore) {
+          this.logger?.warn?.('[BlindPeer] mirrorCore skipped (blind-peering unavailable)', {
+            key: toKeyString(key),
+            announce,
+            priority,
+            mode
+          });
+          return { status: 'unavailable' };
+        }
+        const core = this.blindPeeringStore.get({ key });
+        await core.ready();
+        await blindPeering.addCore(core, core.key, {
+          announce,
+          priority,
+          referrer: referrerString || null,
+          pick: 1
+        });
+        if (this.config?.blindPeeringCloseCores !== false) {
+          core.close().catch(() => {});
+        }
+      }
+      this.logger?.info?.({
         key: toKeyString(key),
-        announce: request.announce,
-        priority: request.priority
-      });
-      this.logger?.info?.(`${CJTRACE_TAG} blind peer mirror core`, {
+        announce,
+        priority,
+        mirrorKey: this.blindPeeringMirrorKey || null,
+        clientKey: this.blindPeeringClientKey || null
+      }, '[BlindPeer] Core mirror requested');
+      this.logger?.info?.({
         key: toKeyString(key)?.slice(0, 16) || null,
-        announce: request.announce,
-        priority: request.priority,
+        announce,
+        priority,
         hasMetadata: !!metadata,
         metadataIdentifier: metadata?.identifier || null,
-        metadataType: metadata?.type || null
-      });
+        metadataType: metadata?.type || null,
+        metadataRole: metadata?.role || null,
+        metadataRoles: Array.isArray(metadata?.roles) ? metadata.roles.slice(0, 10) : null
+      }, `${CJTRACE_TAG} blind peer mirror core`);
       if (metadata) {
         this.#recordCoreMetadata(key, {
-          priority: request.priority,
-          announce: request.announce === true,
+          priority,
+          announce,
           ...metadata
         });
       } else {
         this.#touchCoreMetadata(key, {
-          priority: request.priority,
-          announce: request.announce === true
+          priority,
+          announce
         });
       }
       this.#updateMetrics();
       return { status: 'accepted', record };
     } catch (error) {
-      this.logger?.warn?.('[BlindPeer] Failed to mirror core', {
+      this.logger?.warn?.({
         key: toKeyString(key),
-        err: error?.message || error
-      });
+        announce,
+        priority,
+        mirrorKey: this.blindPeeringMirrorKey || null,
+        clientKey: this.blindPeeringClientKey || null,
+        mode: typeof this.blindPeer?.addCore === 'function'
+          ? 'blindPeer.addCore'
+          : 'blindPeering.addCore',
+        blindPeerMethods: {
+          addCore: typeof this.blindPeer?.addCore === 'function',
+          ready: typeof this.blindPeer?.ready === 'function',
+          listen: typeof this.blindPeer?.listen === 'function'
+        },
+        error: serializeError(error)
+      }, '[BlindPeer] Failed to mirror core');
       throw error;
     }
   }
@@ -410,10 +526,14 @@ export default class BlindPeerService extends EventEmitter {
       this.#updateMetrics();
       return { status: 'accepted', result };
     } catch (error) {
-      this.logger?.warn?.('[BlindPeer] Failed to mirror autobase', {
+      this.logger?.warn?.({
         target: toKeyString(targetKey),
-        err: error?.message || error
-      });
+        err: error?.message || error,
+        name: error?.name || null,
+        code: error?.code || null,
+        stack: error?.stack || null,
+        cause: error?.cause?.message || error?.cause || null
+      }, '[BlindPeer] Failed to mirror autobase');
       throw error;
     }
   }
@@ -437,10 +557,15 @@ export default class BlindPeerService extends EventEmitter {
     let pinned = 0;
     let invalid = 0;
     const pinnedKeys = [];
+    const pinnedEntries = [];
+    const roleTally = new Map();
     for (const entry of refs) {
       const keyInput = entry && typeof entry === 'object'
         ? (entry.key || entry.core || entry)
         : entry;
+      const role = entry && typeof entry === 'object' && typeof entry.role === 'string'
+        ? entry.role.trim()
+        : null;
       const decoded = decodeKey(keyInput);
       if (!decoded) {
         invalid += 1;
@@ -452,14 +577,33 @@ export default class BlindPeerService extends EventEmitter {
         announce,
         pinned: true,
         type,
+        role: role || null,
         lastActive: Date.now()
       });
       pinned += 1;
-      pinnedKeys.push(toKeyString(decoded));
+      const keyStr = toKeyString(decoded);
+      pinnedKeys.push(keyStr);
+      pinnedEntries.push({ key: keyStr, role: role || null });
+      if (role) {
+        roleTally.set(role, (roleTally.get(role) || 0) + 1);
+      }
     }
 
     if (pinned > 0) {
-      this.logger?.info?.('[BlindPeer] Mirror cores pinned', {
+      this.logger?.info?.({
+        identifier,
+        reason,
+        requested: refs.length,
+        pinned,
+        invalid,
+        priority,
+        announce,
+        roleTally: roleTally.size ? Object.fromEntries(roleTally.entries()) : null,
+        pinnedEntries
+      }, '[BlindPeer] Mirror cores pinned');
+      this.#updateMetrics();
+    } else if (invalid > 0) {
+      this.logger?.warn?.('[BlindPeer] Mirror cores pin skipped (invalid keys)', {
         identifier,
         reason,
         requested: refs.length,
@@ -468,7 +612,16 @@ export default class BlindPeerService extends EventEmitter {
         priority,
         announce
       });
-      this.#updateMetrics();
+    } else {
+      this.logger?.warn?.('[BlindPeer] Mirror cores pin skipped', {
+        identifier,
+        reason,
+        requested: refs.length,
+        pinned,
+        invalid,
+        priority,
+        announce
+      });
     }
 
     return {
@@ -477,7 +630,8 @@ export default class BlindPeerService extends EventEmitter {
       requested: refs.length,
       pinned,
       invalid,
-      keys: pinnedKeys
+      keys: pinnedKeys,
+      pinnedEntries
     };
   }
 
@@ -621,6 +775,67 @@ export default class BlindPeerService extends EventEmitter {
     };
   }
 
+  #ensureBlindPeeringKeyPath() {
+    if (this.blindPeeringKeyPath) return this.blindPeeringKeyPath;
+    if (!this.storageDir) return null;
+    this.blindPeeringKeyPath = resolve(this.storageDir, 'blind-peering-client-keypair.json');
+    return this.blindPeeringKeyPath;
+  }
+
+  async #loadBlindPeeringKeyPair() {
+    const keyPath = this.#ensureBlindPeeringKeyPath();
+    if (!keyPath) return null;
+    try {
+      const raw = await readFile(keyPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      const publicKey = parsed?.publicKey ? Buffer.from(parsed.publicKey, 'hex') : null;
+      const secretKey = parsed?.secretKey ? Buffer.from(parsed.secretKey, 'hex') : null;
+      if (publicKey && secretKey) {
+        const candidate = { publicKey, secretKey };
+        if (hypercoreCrypto?.validateKeyPair?.(candidate)) {
+          this.logger?.info?.('[BlindPeer] Loaded blind-peering client keypair', {
+            path: keyPath,
+            publicKey: toKeyString(publicKey)
+          });
+          return candidate;
+        }
+      }
+      this.logger?.warn?.('[BlindPeer] Invalid blind-peering keypair on disk, regenerating', {
+        path: keyPath
+      });
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        this.logger?.warn?.('[BlindPeer] Failed to read blind-peering keypair', {
+          path: keyPath,
+          err: error?.message || error
+        });
+      }
+    }
+
+    try {
+      const candidate = hypercoreCrypto?.keyPair ? hypercoreCrypto.keyPair() : null;
+      if (candidate?.publicKey && candidate?.secretKey) {
+        await mkdir(dirname(keyPath), { recursive: true });
+        await writeFile(keyPath, JSON.stringify({
+          publicKey: Buffer.from(candidate.publicKey).toString('hex'),
+          secretKey: Buffer.from(candidate.secretKey).toString('hex')
+        }), 'utf8');
+        this.logger?.info?.('[BlindPeer] Generated blind-peering client keypair', {
+          path: keyPath,
+          publicKey: toKeyString(candidate.publicKey)
+        });
+        return candidate;
+      }
+    } catch (error) {
+      this.logger?.warn?.('[BlindPeer] Failed to generate blind-peering keypair', {
+        path: keyPath,
+        err: error?.message || error
+      });
+    }
+
+    return null;
+  }
+
   #ensureMetadataPersistPath() {
     if (this.metadataPersistPath) return this.metadataPersistPath;
     if (!this.storageDir) return null;
@@ -666,6 +881,7 @@ export default class BlindPeerService extends EventEmitter {
           identifiers,
           primaryIdentifier: typeof entry.primaryIdentifier === 'string' ? entry.primaryIdentifier : null,
           type: typeof entry.type === 'string' ? entry.type : null,
+          roles: new Set(Array.isArray(entry.roles) ? entry.roles.filter((role) => typeof role === 'string' && role.trim()).map((role) => role.trim()) : []),
           firstSeen: Number.isFinite(entry.firstSeen) ? Math.trunc(entry.firstSeen) : Date.now(),
           lastUpdated: Number.isFinite(entry.lastUpdated) ? Math.trunc(entry.lastUpdated) : Date.now(),
           priority: this.#normalizeMetadataPriority(entry.priority),
@@ -705,6 +921,7 @@ export default class BlindPeerService extends EventEmitter {
           key: entry.key,
           primaryIdentifier: entry.primaryIdentifier || null,
           type: entry.type || null,
+          roles: Array.from(entry.roles || []),
           announce: entry.announce === true,
           pinned: entry.pinned === true,
           priority: this.#normalizeMetadataPriority(entry.priority),
@@ -1106,6 +1323,8 @@ export default class BlindPeerService extends EventEmitter {
     if (!keyStr) return null;
 
     const existing = this.coreMetadata.get(keyStr);
+    const roleValue = typeof metadata.role === 'string' ? metadata.role.trim() : null;
+    const rolesValue = Array.isArray(metadata.roles) ? metadata.roles : null;
     const now = Date.now();
     if (existing) {
       existing.lastUpdated = now;
@@ -1120,6 +1339,18 @@ export default class BlindPeerService extends EventEmitter {
       }
       if (typeof metadata.type === 'string' && metadata.type.trim()) {
         existing.type = metadata.type.trim();
+      }
+      if (roleValue) {
+        if (!existing.roles) existing.roles = new Set();
+        existing.roles.add(roleValue);
+      }
+      if (rolesValue) {
+        if (!existing.roles) existing.roles = new Set();
+        rolesValue.forEach((role) => {
+          if (typeof role === 'string' && role.trim()) {
+            existing.roles.add(role.trim());
+          }
+        });
       }
       if (Number.isFinite(metadata.lastActive)) {
         const activeVal = Math.trunc(metadata.lastActive);
@@ -1139,6 +1370,7 @@ export default class BlindPeerService extends EventEmitter {
       identifiers: new Set(),
       primaryIdentifier: typeof metadata.identifier === 'string' ? metadata.identifier.trim() || null : null,
       type: typeof metadata.type === 'string' ? metadata.type.trim() : null,
+      roles: new Set(),
       firstSeen: now,
       lastUpdated: now,
       priority: this.#normalizeMetadataPriority(metadata.priority),
@@ -1146,6 +1378,14 @@ export default class BlindPeerService extends EventEmitter {
       pinned: metadata.pinned === true,
       lastActive: Number.isFinite(metadata.lastActive) ? Math.trunc(metadata.lastActive) : now
     };
+    if (roleValue) entry.roles.add(roleValue);
+    if (rolesValue) {
+      rolesValue.forEach((role) => {
+        if (typeof role === 'string' && role.trim()) {
+          entry.roles.add(role.trim());
+        }
+      });
+    }
     if (entry.primaryIdentifier) {
       entry.identifiers.add(entry.primaryIdentifier);
     }
@@ -1166,7 +1406,14 @@ export default class BlindPeerService extends EventEmitter {
   }
 
   #onBlindPeerAddCore(record, stream, context = {}) {
-    if (!record?.key) return;
+    if (!record?.key) {
+      this.logger?.warn?.('[BlindPeer] add-core missing key', {
+        hasRecord: !!record,
+        sourceEvent: context?.event || null,
+        isTrusted: context?.isTrusted ?? null
+      });
+      return;
+    }
     const ownerPeerKey = stream?.remotePublicKey ? toKeyString(stream.remotePublicKey) : null;
     const identifier = record?.referrer ? toKeyString(record.referrer) : null;
 
@@ -1186,8 +1433,40 @@ export default class BlindPeerService extends EventEmitter {
         identifier,
         priority: record?.priority ?? null,
         announce: record?.announce === true,
-        sourceEvent: context?.event || null
+        sourceEvent: context?.event || null,
+        isTrusted: context?.isTrusted ?? null
       });
+    }
+
+    const roleList = metadataEntry?.roles instanceof Set
+      ? Array.from(metadataEntry.roles)
+      : Array.isArray(metadataEntry?.roles)
+        ? metadataEntry.roles
+        : [];
+    if (record?.announce === true && this.logger?.info) {
+      this.logger.info({
+        key: toKeyString(record.key)?.slice(0, 16) || null,
+        ownerPeerKey: ownerPeerKey ? ownerPeerKey.slice(0, 16) : null,
+        identifier: identifier ? identifier.slice(0, 16) : null,
+        priority: record?.priority ?? null,
+        announce: true,
+        roleCount: roleList.length || null,
+        roles: roleList.length ? roleList.slice(0, 10) : null,
+        sourceEvent: context?.event || null,
+        isTrusted: context?.isTrusted ?? null
+      }, `${CJTRACE_TAG} blind peer mirror add`);
+    } else if (this.logger?.info && (context?.isTrusted === false || record?.announce !== true)) {
+      this.logger.info({
+        key: toKeyString(record.key)?.slice(0, 16) || null,
+        ownerPeerKey: ownerPeerKey ? ownerPeerKey.slice(0, 16) : null,
+        identifier: identifier ? identifier.slice(0, 16) : null,
+        priority: record?.priority ?? null,
+        announce: record?.announce === true,
+        roleCount: roleList.length || null,
+        roles: roleList.length ? roleList.slice(0, 10) : null,
+        sourceEvent: context?.event || null,
+        isTrusted: context?.isTrusted ?? null
+      }, `${CJTRACE_TAG} blind peer add-core`);
     }
 
     this.emit('mirror-added', {
@@ -1519,6 +1798,11 @@ export default class BlindPeerService extends EventEmitter {
 
   #summarizeMetadata(entry) {
     if (!entry || typeof entry !== 'object') return null;
+    const roles = entry.roles instanceof Set
+      ? Array.from(entry.roles)
+      : Array.isArray(entry.roles)
+        ? entry.roles
+        : [];
     return {
       primaryIdentifier: entry.primaryIdentifier || null,
       announce: entry.announce === true,
@@ -1526,7 +1810,9 @@ export default class BlindPeerService extends EventEmitter {
       pinned: entry.pinned === true,
       lastActive: entry.lastActive || null,
       type: entry.type || null,
-      ownerCount: entry.owners instanceof Map ? entry.owners.size : null
+      ownerCount: entry.owners instanceof Map ? entry.owners.size : null,
+      roleCount: roles.length || null,
+      roles: roles.length ? roles.slice(0, 10) : null
     };
   }
 
@@ -1541,14 +1827,39 @@ export default class BlindPeerService extends EventEmitter {
       trustedPubKeys: Array.from(this.trustedPeers)
     });
 
-    this.blindPeer.on('add-core', (record, _isTrusted, stream) => {
-      this.#onBlindPeerAddCore(record, stream, { event: 'add-core' });
+    this.logger?.info?.('[BlindPeer] Capability snapshot', {
+      constructor: this.blindPeer?.constructor?.name || null,
+      hasAddCore: typeof this.blindPeer?.addCore === 'function',
+      hasReady: typeof this.blindPeer?.ready === 'function',
+      hasListen: typeof this.blindPeer?.listen === 'function',
+      hasClose: typeof this.blindPeer?.close === 'function',
+      hasDb: !!this.blindPeer?.db
+    });
+
+    this.blindPeer.on('add-core', (record, isTrusted, stream) => {
+      this.#onBlindPeerAddCore(record, stream, { event: 'add-core', isTrusted });
       this.#updateMetrics();
     });
-    this.blindPeer.on('add-new-core', (record, _isTrusted, stream) => {
-      this.#onBlindPeerAddCore(record, stream, { event: 'add-new-core', isNew: true });
+    this.blindPeer.on('add-new-core', (record, isTrusted, stream) => {
+      this.#onBlindPeerAddCore(record, stream, { event: 'add-new-core', isNew: true, isTrusted });
       this.#updateMetrics();
     });
+    this.blindPeer.on('downgrade-announce', ({ record, remotePublicKey } = {}) => {
+      if (!this.logger?.info) return;
+      this.logger.info({
+        key: record?.key ? toKeyString(record.key).slice(0, 16) : null,
+        ownerPeerKey: remotePublicKey ? toKeyString(remotePublicKey).slice(0, 16) : null,
+        announce: record?.announce === true,
+        priority: record?.priority ?? null
+      }, `${CJTRACE_TAG} blind peer downgrade announce`);
+    });
+    if (typeof this.blindPeer.on === 'function') {
+      this.blindPeer.on('error', (error) => {
+        this.logger?.warn?.('[BlindPeer] Underlying daemon error', {
+          error: serializeError(error)
+        });
+      });
+    }
     this.blindPeer.on('delete-core', (stream, info) => {
       this.#onBlindPeerDeleteCore(info, { stream });
       this.#updateMetrics();
@@ -1572,6 +1883,99 @@ export default class BlindPeerService extends EventEmitter {
     });
 
     return this.blindPeer;
+  }
+
+  async #ensureBlindPeeringClient({ reason = 'mirror-core' } = {}) {
+    if (this.blindPeering) return this.blindPeering;
+    if (!this.config.enabled) return null;
+    if (!this.blindPeer) {
+      this.logger?.warn?.('[BlindPeer] Blind-peering client init skipped (service not started)', { reason });
+      return null;
+    }
+
+    const mirrorKey = this.getPublicKeyHex();
+    if (!mirrorKey) {
+      this.logger?.warn?.('[BlindPeer] Blind-peering client init skipped (missing mirror key)', { reason });
+      return null;
+    }
+
+    let BlindPeering = null;
+    try {
+      BlindPeering = await loadBlindPeeringModule();
+    } catch (error) {
+      this.logger?.warn?.('[BlindPeer] Failed to load blind-peering module', {
+        err: error?.message || error,
+        reason
+      });
+      return null;
+    }
+    const clientStorageDir = this.config?.blindPeeringStorageDir
+      ? resolve(this.config.blindPeeringStorageDir)
+      : this.storageDir
+        ? resolve(this.storageDir, 'blind-peering-client')
+        : null;
+
+    const store = new Corestore(clientStorageDir || undefined);
+    try {
+      await store.ready();
+    } catch (error) {
+      this.logger?.warn?.('[BlindPeer] Failed to ready blind-peering corestore', {
+        err: error?.message || error,
+        storageDir: clientStorageDir
+      });
+    }
+
+    const persistedKeyPair = await this.#loadBlindPeeringKeyPair();
+    const swarmOptions = persistedKeyPair?.publicKey && persistedKeyPair?.secretKey
+      ? { keyPair: persistedKeyPair }
+      : {};
+    const swarm = new Hyperswarm(swarmOptions);
+
+    if (persistedKeyPair?.publicKey && swarm?.dht?.defaultKeyPair) {
+      const current = swarm.dht.defaultKeyPair?.publicKey || null;
+      const expected = persistedKeyPair.publicKey;
+      if (!current || !Buffer.from(current).equals(Buffer.from(expected))) {
+        try {
+          swarm.dht.defaultKeyPair = persistedKeyPair;
+          this.logger?.info?.('[BlindPeer] Blind-peering client DHT keypair overridden', {
+            publicKey: toKeyString(expected)
+          });
+        } catch (error) {
+          this.logger?.warn?.('[BlindPeer] Failed to override blind-peering DHT keypair', {
+            err: error?.message || error
+          });
+        }
+      }
+    }
+
+    const clientDhtKey = swarm?.dht?.defaultKeyPair?.publicKey || null;
+    const clientSwarmKey = swarm?.keyPair?.publicKey || null;
+    const clientKey = toKeyString(persistedKeyPair?.publicKey || clientDhtKey || clientSwarmKey);
+
+    if (clientKey) {
+      this.addTrustedPeer(clientKey);
+    } else {
+      this.logger?.warn?.('[BlindPeer] Unable to determine blind-peering client key for trust', { reason });
+    }
+
+    this.blindPeering = new BlindPeering(swarm, store, {
+      mirrors: [mirrorKey],
+      pick: 1
+    });
+
+    this.blindPeeringSwarm = swarm;
+    this.blindPeeringStore = store;
+    this.blindPeeringMirrorKey = mirrorKey;
+    this.blindPeeringClientKey = clientKey;
+
+    this.logger?.info?.('[BlindPeer] Blind-peering client ready', {
+      mirrorKey,
+      clientKey,
+      storageDir: clientStorageDir,
+      reason
+    });
+
+    return this.blindPeering;
   }
 
   async #ensureStorageDir() {

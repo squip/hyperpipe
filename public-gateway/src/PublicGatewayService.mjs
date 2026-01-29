@@ -64,6 +64,28 @@ function safeString(value) {
   }
 }
 
+function normalizeTraceId(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function serializeError(error) {
+  if (!error || typeof error !== 'object') {
+    return { message: error ? String(error) : null };
+  }
+  return {
+    message: error.message || String(error),
+    name: error.name || null,
+    code: error.code || null,
+    stack: error.stack || null,
+    cause: error.cause ? (error.cause.message || String(error.cause)) : null,
+    errors: Array.isArray(error.errors)
+      ? error.errors.map((entry) => entry?.message || String(entry))
+      : null
+  };
+}
+
 function hexToBytes(hex) {
   if (typeof hex !== 'string') return null;
   const normalized = hex.trim();
@@ -1026,6 +1048,194 @@ class PublicGatewayService {
     return merged;
   }
 
+  #pinRelayMirrorCores({
+    relayKey = null,
+    publicIdentifier = null,
+    coreEntries = [],
+    reason = 'manual',
+    traceId = null
+  } = {}) {
+    if (!this.blindPeerService?.pinMirrorCores) {
+      this.logger?.warn?.('[PublicGateway] Relay mirror core pin skipped (blind-peer unavailable)', {
+        relayKey,
+        publicIdentifier,
+        reason,
+        traceId: traceId || null
+      });
+      return { status: 'skipped', reason: 'blind-peer-unavailable', pinned: 0 };
+    }
+    const normalized = this.#normalizeMirrorCoreEntries(coreEntries);
+    if (!normalized.length) {
+      return { status: 'skipped', reason: 'no-cores', pinned: 0 };
+    }
+
+    const identifier = publicIdentifier || relayKey || null;
+    const roleTally = new Map();
+    normalized.forEach((entry) => {
+      if (entry?.role) {
+        roleTally.set(entry.role, (roleTally.get(entry.role) || 0) + 1);
+      }
+    });
+    this.logger?.info?.({
+      relayKey,
+      identifier,
+      reason,
+      coreEntriesCount: normalized.length,
+      roleTally: roleTally.size ? Object.fromEntries(roleTally.entries()) : null,
+      coreEntriesPreview: normalized.slice(0, 10),
+      traceId: traceId || null
+    }, '[CJTRACE] relay mirror pin request');
+    const result = this.blindPeerService.pinMirrorCores(normalized, {
+      identifier,
+      announce: true,
+      priority: 5,
+      type: 'relay-mirror',
+      reason
+    });
+
+    if (result?.pinned > 0) {
+      this.logger?.info?.({
+        relayKey,
+        identifier,
+        requested: normalized.length,
+        pinned: result.pinned,
+        reason,
+        traceId: traceId || null
+      }, '[PublicGateway] Relay mirror cores pinned');
+      if (this.blindPeerService?.mirrorCore) {
+        const mirrorReason = `pin:${reason}`;
+        this.#mirrorRelayCoreEntries({
+          relayKey,
+          publicIdentifier,
+          coreEntries: normalized,
+          reason: mirrorReason,
+          traceId
+        }).catch((error) => {
+          this.logger?.warn?.({
+            relayKey,
+            identifier,
+            reason: mirrorReason,
+            error: error?.message || error,
+            traceId: traceId || null,
+            stack: error?.stack || null,
+            name: error?.name || null
+          }, '[PublicGateway] Relay mirror core mirror task failed');
+        });
+      }
+    } else {
+      this.logger?.warn?.({
+        relayKey,
+        identifier,
+        reason,
+        requested: normalized.length,
+        pinned: result?.pinned ?? 0,
+        invalid: result?.invalid ?? null,
+        traceId: traceId || null
+      }, '[PublicGateway] Relay mirror cores pin skipped');
+    }
+
+    return result;
+  }
+
+  async #mirrorRelayCoreEntries({
+    relayKey = null,
+    publicIdentifier = null,
+    coreEntries = [],
+    reason = 'manual',
+    traceId = null
+  } = {}) {
+    if (!this.blindPeerService?.mirrorCore) {
+      return { status: 'skipped', reason: 'blind-peer-unavailable', mirrored: 0, requested: 0 };
+    }
+    const normalized = this.#normalizeMirrorCoreEntries(coreEntries);
+    if (!normalized.length) {
+      return { status: 'skipped', reason: 'no-cores', mirrored: 0, requested: 0 };
+    }
+
+    const identifier = publicIdentifier || relayKey || null;
+    const deduped = new Map();
+    for (const entry of normalized) {
+      if (!entry?.key) continue;
+      const existing = deduped.get(entry.key) || { key: entry.key, roles: new Set() };
+      if (entry.role) existing.roles.add(entry.role);
+      deduped.set(entry.key, existing);
+    }
+
+    const entries = Array.from(deduped.values());
+    let mirrored = 0;
+    let failed = 0;
+    const failures = [];
+    const roleTally = new Map();
+
+    for (const entry of entries) {
+      const roles = Array.from(entry.roles || []);
+      if (roles.length) {
+        roles.forEach((role) => {
+          roleTally.set(role, (roleTally.get(role) || 0) + 1);
+        });
+      }
+      const priority = roles.includes('relay-core')
+        ? 8
+        : roles.some((role) => role.includes('writer'))
+          ? 7
+          : 6;
+      try {
+        await this.blindPeerService.mirrorCore(entry.key, {
+          announce: true,
+          priority,
+          metadata: {
+            identifier,
+            relayKey,
+            publicIdentifier,
+            type: 'relay-mirror',
+            role: roles.length ? roles[0] : null,
+            roles: roles.length ? roles : null,
+            reason
+          }
+        });
+        mirrored += 1;
+      } catch (error) {
+        failed += 1;
+        failures.push({ key: entry.key, error: error?.message || error });
+        this.logger?.warn?.({
+          relayKey,
+          identifier,
+          reason,
+          coreKey: entry.key,
+          roles,
+          priority,
+          announce: true,
+          traceId: traceId || null,
+          error: serializeError(error)
+        }, '[PublicGateway] Relay mirror core failed');
+      }
+    }
+
+    if (mirrored > 0 || failed > 0) {
+      this.logger?.info?.({
+        relayKey,
+        identifier,
+        reason,
+        requested: entries.length,
+        mirrored,
+        failed,
+        roleTally: roleTally.size ? Object.fromEntries(roleTally.entries()) : null,
+        failures: failed ? failures.slice(0, 5) : null,
+        traceId: traceId || null
+      }, '[PublicGateway] Relay mirror cores mirrored');
+    }
+
+    return {
+      status: mirrored > 0 ? 'ok' : 'skipped',
+      relayKey,
+      identifier,
+      reason,
+      requested: entries.length,
+      mirrored,
+      failed
+    };
+  }
+
   #composeMirrorPayload({ relayKey = null, publicIdentifier = null, basePayload = null, cachedPayload = null } = {}) {
     const mergedCores = this.#mergeMirrorCoreEntries(
       this.#normalizeMirrorCoreEntries(cachedPayload?.cores || cachedPayload?.relayCores || []),
@@ -1103,7 +1313,7 @@ class PublicGatewayService {
     } catch (error) {
       this.logger?.warn?.('[PublicGateway] Failed to persist mirror metadata payload', {
         relayKey,
-        err: error?.message || error
+        error: serializeError(error)
       });
     }
   }
@@ -3818,6 +4028,44 @@ class PublicGatewayService {
     }
 
     try {
+      const blindPeerKey =
+        registration.blindPeerKey
+        || registration.ownerPeerKey
+        || registration.blindPeerPublicKey
+        || null;
+      const roleTally = new Map();
+      if (Array.isArray(relayCoreMetadata)) {
+        relayCoreMetadata.forEach((entry) => {
+          const role = typeof entry?.role === 'string' ? entry.role : null;
+          if (role) {
+            roleTally.set(role, (roleTally.get(role) || 0) + 1);
+          }
+        });
+      }
+      if (blindPeerKey) {
+        this.logger?.info?.('[PublicGateway] Registering trusted peer (relay registration)', {
+          relayKey: registration.relayKey,
+          blindPeerKey,
+          relayCores: relayCoreMetadata?.length ?? 0,
+          roleTally: roleTally.size ? Object.fromEntries(roleTally.entries()) : null
+        });
+        try {
+          this.blindPeerService?.addTrustedPeer(blindPeerKey);
+        } catch (error) {
+          this.logger?.warn?.('[PublicGateway] Failed to add trusted peer (relay registration)', {
+            relayKey: registration.relayKey,
+            blindPeerKey,
+            error: serializeError(error)
+          });
+        }
+      } else {
+        this.logger?.debug?.('[PublicGateway] Relay registration missing blind peer key', {
+          relayKey: registration.relayKey,
+          relayCores: relayCoreMetadata?.length ?? 0,
+          roleTally: roleTally.size ? Object.fromEntries(roleTally.entries()) : null
+        });
+      }
+
       const upsertPayload = relayCoreMetadata ? { ...registration, relayCores: relayCoreMetadata } : registration;
       await this.registrationStore.upsertRelay(registration.relayKey, upsertPayload);
       await this.#storeMirrorMetadataPayload(
@@ -3825,6 +4073,19 @@ class PublicGatewayService {
         this.#buildMirrorMetadataPayload(upsertPayload, registration.relayKey),
         'relay-registration'
       );
+      if (relayCoreMetadata?.length) {
+        const publicIdentifier =
+          registration?.publicIdentifier
+          || registration?.metadata?.identifier
+          || registration?.metadata?.publicIdentifier
+          || null;
+        this.#pinRelayMirrorCores({
+          relayKey: registration.relayKey,
+          publicIdentifier,
+          coreEntries: relayCoreMetadata,
+          reason: 'relay-registration'
+        });
+      }
       this.#storeRelayAliases(registration.relayKey, upsertPayload).catch((error) => {
         this.logger?.warn?.('[PublicGateway] Failed to store relay aliases', {
           relayKey: registration.relayKey,
@@ -3838,7 +4099,10 @@ class PublicGatewayService {
         hyperbee: hyperbeeInfo
       });
     } catch (error) {
-      this.logger.error?.('Failed to persist relay registration', { relayKey: registration.relayKey, error: error.message });
+      this.logger.error?.('Failed to persist relay registration', {
+        relayKey: registration.relayKey,
+        error: serializeError(error)
+      });
       return res.status(500).json({ error: 'Failed to persist registration' });
     }
   }
@@ -3880,9 +4144,20 @@ class PublicGatewayService {
     }
     try {
       const trimmedIdentifier = typeof identifier === 'string' ? identifier.trim() : null;
+      const inviteTraceId = normalizeTraceId(
+        req.get?.('x-invite-trace')
+        || req.get?.('x-invite-trace-id')
+        || req.get?.('x-trace-id')
+      );
+      const closedJoinRequested = req?.query?.closedJoin === '1'
+        || req?.query?.closed_join === '1'
+        || req?.query?.closedJoin === 'true'
+        || req?.query?.mode === 'closed-join';
       this.logger?.info?.(`${CJTRACE_TAG} mirror metadata request`, {
         identifier: trimmedIdentifier || null,
-        queryKeys: req?.query ? Object.keys(req.query) : []
+        queryKeys: req?.query ? Object.keys(req.query) : [],
+        closedJoinRequested,
+        traceId: inviteTraceId || null
       });
       const resolved = trimmedIdentifier
         ? await this.#resolveOpenJoinRegistration(trimmedIdentifier)
@@ -3894,19 +4169,23 @@ class PublicGatewayService {
         relayKey = trimmedIdentifier.toLowerCase();
       }
 
-      if (!record) {
-        const poolResolved = trimmedIdentifier
-          ? await this.#resolveOpenJoinPool(trimmedIdentifier)
-          : null;
-        if (poolResolved?.pool) {
-          const poolRelayKey = poolResolved.relayKey || relayKey || trimmedIdentifier;
-          const poolPayload = this.#buildOpenJoinMirrorPayloadFromPool(
-            poolResolved.pool,
-            poolRelayKey || trimmedIdentifier,
-            { source: 'open-join-pool' }
-          );
+        if (!record) {
+          const poolResolved = trimmedIdentifier
+            ? await this.#resolveOpenJoinPool(trimmedIdentifier)
+            : null;
+          if (!closedJoinRequested && poolResolved?.pool) {
+            const poolRelayKey = poolResolved.relayKey || relayKey || trimmedIdentifier;
+            const poolPayload = this.#buildOpenJoinMirrorPayloadFromPool(
+              poolResolved.pool,
+              poolRelayKey || trimmedIdentifier,
+              { source: 'open-join-pool' }
+            );
           if (poolPayload) {
-            await this.#storeMirrorMetadataPayload(poolRelayKey || trimmedIdentifier, poolPayload, 'mirror-endpoint-pool');
+            await this.#storeMirrorMetadataPayload(
+              poolRelayKey || trimmedIdentifier,
+              poolPayload,
+              { source: 'mirror-endpoint-pool', traceId: inviteTraceId || null }
+            );
             this.logger?.info?.('[PublicGateway] Relay mirror metadata response', {
               relayKey: poolRelayKey || trimmedIdentifier,
               publicIdentifier: poolPayload.publicIdentifier || null,
@@ -3914,7 +4193,8 @@ class PublicGatewayService {
               coreCount: Array.isArray(poolPayload?.cores) ? poolPayload.cores.length : 0,
               relayUrl: poolPayload.relayUrl || null,
               mirrorSource: poolPayload.mirrorSource || null,
-              updatedAt: poolPayload.updatedAt ?? null
+              updatedAt: poolPayload.updatedAt ?? null,
+              traceId: inviteTraceId || null
             });
             return res.json(poolPayload);
           }
@@ -3937,7 +4217,7 @@ class PublicGatewayService {
             cached = await this.registrationStore.getMirrorMetadata(trimmedIdentifier);
           }
         }
-        if (cached && (cached.closedJoin === true || cached.mirrorSource === 'closed-join')) {
+        if (cached && (cached.closedJoin === true || cached.mirrorSource === 'closed-join') && !closedJoinRequested) {
           this.logger?.info?.('[PublicGateway] Closed join mirror cache ignored', {
             relayKey: relayKey || trimmedIdentifier,
             mirrorSource: cached?.mirrorSource || null,
@@ -3972,7 +4252,11 @@ class PublicGatewayService {
             publicIdentifier,
             cachedPayload
           });
-          await this.#storeMirrorMetadataPayload(storeKey, payload, 'mirror-endpoint-cache');
+          await this.#storeMirrorMetadataPayload(
+            storeKey,
+            payload,
+            { source: 'mirror-endpoint-cache', traceId: inviteTraceId || null }
+          );
           this.logger?.info?.('[PublicGateway] Relay mirror metadata merged', {
             relayKey: storeKey,
             publicIdentifier,
@@ -3981,7 +4265,8 @@ class PublicGatewayService {
             cachedMirrorSource: cached?.mirrorSource || null,
             cachedUpdatedAt: cached?.updatedAt ?? null,
             responseMirrorSource: payload?.mirrorSource || null,
-            responseUpdatedAt: payload?.updatedAt ?? null
+            responseUpdatedAt: payload?.updatedAt ?? null,
+            traceId: inviteTraceId || null
           });
           this.logger?.info?.('[PublicGateway] Relay mirror metadata response', {
             relayKey: storeKey,
@@ -3989,7 +4274,8 @@ class PublicGatewayService {
             source: 'cache',
             coreCount: Array.isArray(payload?.cores) ? payload.cores.length : 0,
             mirrorSource: payload?.mirrorSource || null,
-            updatedAt: payload?.updatedAt ?? null
+            updatedAt: payload?.updatedAt ?? null,
+            traceId: inviteTraceId || null
           });
           return res.json(payload);
         }
@@ -4015,7 +4301,11 @@ class PublicGatewayService {
         basePayload,
         cachedPayload: cached
       });
-      await this.#storeMirrorMetadataPayload(relayKey || trimmedIdentifier, payload, 'mirror-endpoint-record');
+      await this.#storeMirrorMetadataPayload(
+        relayKey || trimmedIdentifier,
+        payload,
+        { source: 'mirror-endpoint-record', traceId: inviteTraceId || null }
+      );
       this.logger?.info?.('[PublicGateway] Relay mirror metadata merged', {
         relayKey: relayKey || trimmedIdentifier,
         publicIdentifier,
@@ -4025,7 +4315,8 @@ class PublicGatewayService {
         cachedMirrorSource: cached?.mirrorSource || null,
         cachedUpdatedAt: cached?.updatedAt ?? null,
         responseMirrorSource: payload?.mirrorSource || null,
-        responseUpdatedAt: payload?.updatedAt ?? null
+        responseUpdatedAt: payload?.updatedAt ?? null,
+        traceId: inviteTraceId || null
       });
       this.logger?.info?.('[PublicGateway] Relay mirror metadata response', {
         relayKey: relayKey || trimmedIdentifier,
@@ -4033,13 +4324,14 @@ class PublicGatewayService {
         source: 'record',
         coreCount: Array.isArray(payload?.cores) ? payload.cores.length : 0,
         mirrorSource: payload?.mirrorSource || null,
-        updatedAt: payload?.updatedAt ?? null
+        updatedAt: payload?.updatedAt ?? null,
+        traceId: inviteTraceId || null
       });
       return res.json(payload);
     } catch (error) {
       this.logger?.warn?.('[PublicGateway] Failed to fetch relay mirror metadata', {
         relayKey: identifier,
-        err: error?.message || error
+        error: serializeError(error)
       });
       return res.status(500).json({ error: 'relay-mirror-metadata-unavailable' });
     }
@@ -4287,6 +4579,12 @@ class PublicGatewayService {
       : [];
     if (mirrorPayload) {
       await this.#storeMirrorMetadataPayload(relayKey, mirrorPayload, 'open-join-pool-update');
+      this.#pinRelayMirrorCores({
+        relayKey,
+        publicIdentifier: poolPublicIdentifier || null,
+        coreEntries: poolRelayCores,
+        reason: 'open-join-pool-update'
+      });
     } else {
       this.logger?.warn?.('[PublicGateway] Open join pool mirror payload missing', {
         relayKey,
@@ -4672,6 +4970,12 @@ class PublicGatewayService {
         : [];
       if (mirrorPayload) {
         await this.#storeMirrorMetadataPayload(relayKey, mirrorPayload, 'open-join-append');
+        this.#pinRelayMirrorCores({
+          relayKey,
+          publicIdentifier,
+          coreEntries: mergeResult.merged,
+          reason: 'open-join-append'
+        });
       } else {
         this.logger?.warn?.('[PublicGateway] Open join append mirror payload missing', {
           relayKey,

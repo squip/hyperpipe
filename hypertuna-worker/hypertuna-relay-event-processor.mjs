@@ -367,7 +367,7 @@ export default class NostrRelay extends Autobee {
   }
 
   static async apply(batch, view, base) {
-    logWithTimestamp('NostrRelay.apply: Applying batch');
+    // logWithTimestamp('NostrRelay.apply: Applying batch');
     const b = view.batch({ update: false })
   
     for (const node of batch) {
@@ -380,20 +380,20 @@ export default class NostrRelay extends Autobee {
             if (validateEvent(event)) {
                 // Store the full event under its ID
                 const eventKey = b4a.from(event.id, 'hex');
-                logWithTimestamp(`NostrRelay.apply: Storing event with ID: ${event.id}`);
+                // logWithTimestamp(`NostrRelay.apply: Storing event with ID: ${event.id}`);
                 await b.put(eventKey, op.event);
 
                 // Store index references - store just the event ID
                 const kindKey = NostrRelay.constructIndexKeyKind(event);
-                logWithTimestamp(`NostrRelay.apply: Storing kind index for event ${event.id} under key: ${kindKey}`);
+                // logWithTimestamp(`NostrRelay.apply: Storing kind index for event ${event.id} under key: ${kindKey}`);
                 await b.put(b4a.from(kindKey, 'utf8'), event.id);
 
                 const pubkeyKey = NostrRelay.constructIndexKeyPubkey(event);
-                logWithTimestamp(`NostrRelay.apply: Storing pubkey index for event ${event.id} under key: ${pubkeyKey}`);
+                // logWithTimestamp(`NostrRelay.apply: Storing pubkey index for event ${event.id} under key: ${pubkeyKey}`);
                 await b.put(b4a.from(pubkeyKey, 'utf8'), event.id);
 
                 const createdAtKey = NostrRelay.constructIndexKeyCreatedAt(event);
-                logWithTimestamp(`NostrRelay.apply: Storing created_at index for event ${event.id} under key: ${createdAtKey}`);
+                // logWithTimestamp(`NostrRelay.apply: Storing created_at index for event ${event.id} under key: ${createdAtKey}`);
                 await b.put(b4a.from(createdAtKey, 'utf8'), event.id);
 
                 // Store tag references
@@ -403,7 +403,7 @@ export default class NostrRelay extends Autobee {
                 for (const tag of event.tags) {
                     if (tag.length >= 2 && /^[a-zA-Z]$/.test(tag[0])) {
                         const tagKey = NostrRelay.constructIndexKeyTagKey(event, tag[0], tag[1]);
-                        logWithTimestamp(`NostrRelay.apply: Storing tag index for event ${event.id} under key: ${tagKey}`);
+                        // logWithTimestamp(`NostrRelay.apply: Storing tag index for event ${event.id} under key: ${tagKey}`);
                         await b.put(b4a.from(tagKey, 'utf8'), event.id);
                     }
 
@@ -413,7 +413,7 @@ export default class NostrRelay extends Autobee {
 
                 if (fileKeyHash && driveKey) {
                     const fileKey = NostrRelay.constructIndexKeyFilekey(event, fileKeyHash, driveKey)
-                    logWithTimestamp(`NostrRelay.apply: Storing filekey index for event ${event.id} under key: ${fileKey}`)
+                    // logWithTimestamp(`NostrRelay.apply: Storing filekey index for event ${event.id} under key: ${fileKey}`)
                     const fileKeyValue = {
                         filekey: fileKeyHash,
                         drivekey: driveKey,
@@ -425,23 +425,23 @@ export default class NostrRelay extends Autobee {
                     )
                 }
             } else {
-                logWithTimestamp(`NostrRelay.apply: Invalid event, not storing. ID: ${event.id}`);
+                // logWithTimestamp(`NostrRelay.apply: Invalid event, not storing. ID: ${event.id}`);
             }
         } else if (op.type === 'subscriptions') {
             const subscriptionData = JSON.parse(op.subscriptions);
             // logWithTimestamp('NostrRelay.apply: Processing subscription data:', subscriptionData);
             const key = b4a.from(subscriptionData.connection, 'hex');
-            logWithTimestamp(`NostrRelay.apply: Storing subscription data for connection: ${subscriptionData.connection}`);
+            // logWithTimestamp(`NostrRelay.apply: Storing subscription data for connection: ${subscriptionData.connection}`);
             await b.put(key, op.subscriptions);
         } else if (op.type === 'client-subscriptions') {
             const subscriptionData = JSON.parse(op.subscriptions);
             const clientId = subscriptionData.clientId || op.clientId;
             if (!clientId) {
-                logWithTimestamp('NostrRelay.apply: Missing clientId for client-subscriptions');
+                // logWithTimestamp('NostrRelay.apply: Missing clientId for client-subscriptions');
                 continue;
             }
             const key = b4a.from(`client:${clientId}`, 'utf8');
-            logWithTimestamp(`NostrRelay.apply: Storing client subscription data for client: ${clientId}`);
+            // logWithTimestamp(`NostrRelay.apply: Storing client subscription data for client: ${clientId}`);
             await b.put(key, op.subscriptions);
         }
     }
@@ -569,27 +569,27 @@ export default class NostrRelay extends Autobee {
   /////////////////////////////////////////////////////////////////////////////////////////////////////////  
 
   async getEvent(id) {
-    logWithTimestamp(`getEvent: Attempting to retrieve event with ID: ${id}`);
+    // logWithTimestamp(`getEvent: Attempting to retrieve event with ID: ${id}`);
     const key = b4a.from(id, 'hex');  // Direct conversion of ID to buffer
-    logWithTimestamp(`getEvent: Converted key: ${key.toString('hex')}`);
+    // logWithTimestamp(`getEvent: Converted key: ${key.toString('hex')}`);
     
     try {
         const event = await this.view.get(key);
         if (event) {
-            logWithTimestamp(`getEvent: Event found for ID ${id}`);
+            // logWithTimestamp(`getEvent: Event found for ID ${id}`);
             try {
                 return typeof event.value === 'string' ? 
                        JSON.parse(event.value) : 
                        event.value;
             } catch (error) {
-                logWithTimestamp('getEvent: Error parsing event:', error.message);
+                // logWithTimestamp('getEvent: Error parsing event:', error.message);
                 return null;
             }
         }
-        logWithTimestamp(`getEvent: No event found for ID ${id}`);
+        // logWithTimestamp(`getEvent: No event found for ID ${id}`);
         return null;
     } catch (error) {
-        logWithTimestamp('getEvent: Error retrieving event:', error.message);
+        // logWithTimestamp('getEvent: Error retrieving event:', error.message);
         return null;
     }
 }
@@ -610,7 +610,7 @@ export default class NostrRelay extends Autobee {
   }
   
   async executeIdQueries(filter, last_returned_event_timestamp) {
-    logWithTimestamp(`executeIdQueries: Processing ${filter.ids.length} IDs`);
+    // logWithTimestamp(`executeIdQueries: Processing ${filter.ids.length} IDs`);
     const results = [];
     const since = last_returned_event_timestamp || filter.since
 
@@ -618,13 +618,13 @@ export default class NostrRelay extends Autobee {
       const event = await this.getEvent(id);
       
       if (!event) {
-        logWithTimestamp(`executeIdQueries: Event not found for ID ${id}`);
+        // logWithTimestamp(`executeIdQueries: Event not found for ID ${id}`);
         continue;
       }
   
       // Skip events older than last_returned_event_timestamp if it exists
       if (last_returned_event_timestamp && event.created_at < last_returned_event_timestamp) {
-        logWithTimestamp(`executeIdQueries: Event ${id} skipped due to timestamp`);
+        // logWithTimestamp(`executeIdQueries: Event ${id} skipped due to timestamp`);
         continue;
       }
   
@@ -668,25 +668,25 @@ export default class NostrRelay extends Autobee {
 
     if (filter.limit && !last_returned_event_timestamp) {
         results.splice(filter.limit);
-        logWithTimestamp(`queryEvents: Results truncated to limit:`, filter.limit);
+        //logWithTimestamp(`queryEvents: Results truncated to limit:`, filter.limit);
       }
   
-    logWithTimestamp(`executeIdQueries: Found ${results.length} matching events`);
+    // logWithTimestamp(`executeIdQueries: Found ${results.length} matching events`);
     return results;
   }
 
   async queryEvents(filter, last_returned_event_timestamp) {
     // logWithTimestamp(`queryEvents: Starting query with filter:`, JSON.stringify(filter, null, 2));
-    logWithTimestamp(`queryEvents: Last returned event timestamp:`, last_returned_event_timestamp);
+    // logWithTimestamp(`queryEvents: Last returned event timestamp:`, last_returned_event_timestamp);
     const queries = this.constructQueries(filter, last_returned_event_timestamp);
     // logWithTimestamp(`queryEvents: Constructed query groups:`, JSON.stringify(queries, null, 2));
     
     const results = await this.executeQueries(queries);
-    logWithTimestamp(`queryEvents: Raw query results count:`, results.length);
+    // logWithTimestamp(`queryEvents: Raw query results count:`, results.length);
     
     if (filter.limit && !last_returned_event_timestamp) {
       results.splice(filter.limit);
-      logWithTimestamp(`queryEvents: Results truncated to limit:`, filter.limit);
+      // logWithTimestamp(`queryEvents: Results truncated to limit:`, filter.limit);
     }
     
     return results;
@@ -697,12 +697,12 @@ export default class NostrRelay extends Autobee {
     //   `constructQueries: Constructing queries for filter:`,
     //   JSON.stringify(filter, null, 2)
     // );
-    logWithTimestamp(
-      `constructQueries: Using timestamp:`,
-      last_returned_event_timestamp
-        ? `last_returned_event_timestamp: ${last_returned_event_timestamp}`
-        : `filter.since: ${filter.since || 0}`
-    );
+    // logWithTimestamp(
+    //   `constructQueries: Using timestamp:`,
+    //   last_returned_event_timestamp
+    //     ? `last_returned_event_timestamp: ${last_returned_event_timestamp}`
+    //     : `filter.since: ${filter.since || 0}`
+    // );
 
     const groups = [];
 
@@ -756,15 +756,15 @@ export default class NostrRelay extends Autobee {
     // Case 4: Tag-based queries (union within each tag key)
     const tagGroups = this.constructTagQueries(filter, since, until);
     if (tagGroups.length > 0) {
-      logWithTimestamp(
-        `constructQueries: Adding ${tagGroups.length} tag-based query groups`
-      );
+      // logWithTimestamp(
+      //   `constructQueries: Adding ${tagGroups.length} tag-based query groups`
+      // );
       groups.push(...tagGroups);
     }
 
-    logWithTimestamp(
-      `constructQueries: Constructed ${groups.length} query groups`
-    );
+    // logWithTimestamp(
+    //   `constructQueries: Constructed ${groups.length} query groups`
+    // );
     return groups;
   }
   
@@ -840,7 +840,7 @@ export default class NostrRelay extends Autobee {
         try {
           return [JSON.parse(node.value.toString())];
         } catch (err) {
-          logWithTimestamp('executeFilekeyQuery: Error parsing entry', err);
+          // logWithTimestamp('executeFilekeyQuery: Error parsing entry', err);
           return [];
         }
       }
@@ -877,7 +877,7 @@ export default class NostrRelay extends Autobee {
         sample.push({ fileHash: fh, drives: Array.from(dm.keys()) });
         if (sample.length >= 5) break;
       }
-      logWithTimestamp(`queryFilekeyIndex: entries=${entries.length}, uniqueFilekeys=${filekeyMap.size}, sample=${JSON.stringify(sample)}`);
+      // logWithTimestamp(`queryFilekeyIndex: entries=${entries.length}, uniqueFilekeys=${filekeyMap.size}, sample=${JSON.stringify(sample)}`);
     } catch (_) {}
 
     return filekeyMap;
@@ -907,9 +907,9 @@ export default class NostrRelay extends Autobee {
       }
     }
 
-    logWithTimestamp(
-      `constructTagQueries: Constructed ${tagGroups.reduce((a, g) => a + g.length, 0)} tag queries in ${tagGroups.length} groups`
-    );
+    // logWithTimestamp(
+    //   `constructTagQueries: Constructed ${tagGroups.reduce((a, g) => a + g.length, 0)} tag queries in ${tagGroups.length} groups`
+    // );
     return tagGroups;
   }
 
@@ -927,10 +927,10 @@ export default class NostrRelay extends Autobee {
 
 
 async executeQueries(queryGroups) {
-    logWithTimestamp(`executeQueries: Starting execution of ${queryGroups.length} query groups`);
+    // logWithTimestamp(`executeQueries: Starting execution of ${queryGroups.length} query groups`);
 
     if (!queryGroups || queryGroups.length === 0) {
-        logWithTimestamp('executeQueries: No queries to execute');
+        // logWithTimestamp('executeQueries: No queries to execute');
         return [];
     }
 
@@ -939,24 +939,24 @@ async executeQueries(queryGroups) {
     try {
         for (let i = 0; i < queryGroups.length; i++) {
             const group = queryGroups[i];
-            logWithTimestamp(`executeQueries: Processing group ${i + 1}/${queryGroups.length}`);
+            // logWithTimestamp(`executeQueries: Processing group ${i + 1}/${queryGroups.length}`);
 
             const unionIds = new Set();
             for (let j = 0; j < group.length; j++) {
                 const query = group[j];
-                logWithTimestamp(`executeQueries:  Query ${j + 1}/${group.length} in group ${i + 1}`);
+                // logWithTimestamp(`executeQueries:  Query ${j + 1}/${group.length} in group ${i + 1}`);
                 for await (const entry of this.view.createReadStream(query)) {
                     if (!entry || !entry.value) continue;
                     const eventId = entry.value; // direct event ID
                     unionIds.add(eventId);
                 }
             }
-            logWithTimestamp(`executeQueries: Group ${i + 1} produced ${unionIds.size} unique IDs`);
+            // logWithTimestamp(`executeQueries: Group ${i + 1} produced ${unionIds.size} unique IDs`);
             groupResultSets.push(unionIds);
         }
 
         const commonIds = this.findCommonIds(groupResultSets);
-        logWithTimestamp(`executeQueries: Found ${commonIds.size} common IDs across all groups`);
+        // logWithTimestamp(`executeQueries: Found ${commonIds.size} common IDs across all groups`);
 
         const results = [];
         for (const id of commonIds) {
@@ -966,30 +966,30 @@ async executeQueries(queryGroups) {
                     results.push(event);
                 }
             } catch (error) {
-                logWithTimestamp(`executeQueries: Error fetching event for ID ${id}:`, error.message);
+                // logWithTimestamp(`executeQueries: Error fetching event for ID ${id}:`, error.message);
             }
         }
 
-        logWithTimestamp(`executeQueries: Successfully retrieved ${results.length} full events`);
+        // logWithTimestamp(`executeQueries: Successfully retrieved ${results.length} full events`);
         return results;
 
     } catch (error) {
-        logWithTimestamp('executeQueries: Error during query execution:', error.message);
+        // logWithTimestamp('executeQueries: Error during query execution:', error.message);
         throw error;
     }
 }
 
 findCommonIds(resultSets) {
-    logWithTimestamp(`findCommonIds: Starting to process ${resultSets.length} result sets`);
+    // logWithTimestamp(`findCommonIds: Starting to process ${resultSets.length} result sets`);
 
     if (!resultSets || resultSets.length === 0) {
-        logWithTimestamp('findCommonIds: No result sets to process');
+        // logWithTimestamp('findCommonIds: No result sets to process');
         return new Set();
     }
 
     const commonIds = new Set(resultSets[0]);
     if (commonIds.size === 0) {
-        logWithTimestamp('findCommonIds: No IDs in first result set');
+        // logWithTimestamp('findCommonIds: No IDs in first result set');
         return commonIds;
     }
 
@@ -1016,10 +1016,10 @@ findCommonIds(resultSets) {
 }
 
 async handleSubscription(connectionKey) {
-    logWithTimestamp(`handleSubscription: Handling subscription for connection: ${connectionKey}`);
+    // logWithTimestamp(`handleSubscription: Handling subscription for connection: ${connectionKey}`);
     const activeSubscriptions = await this.getSubscriptions(connectionKey);
     if (!activeSubscriptions) {
-        logWithTimestamp(`handleSubscription: No active subscriptions for connection: ${connectionKey}`);
+        // logWithTimestamp(`handleSubscription: No active subscriptions for connection: ${connectionKey}`);
         return [[], null];
     }
 
@@ -1040,10 +1040,10 @@ async handleSubscription(connectionKey) {
 
     for (const [subscriptionId, subscription] of Object.entries(activeSubscriptions.subscriptions)) {
         const last_returned_event_timestamp = subscription.last_returned_event_timestamp;
-        logWithTimestamp(`handleSubscription: Processing subscription ${subscriptionId} with last timestamp: ${last_returned_event_timestamp}`);
+        // logWithTimestamp(`handleSubscription: Processing subscription ${subscriptionId} with last timestamp: ${last_returned_event_timestamp}`);
         
         for (const filter of subscription.filters) {
-            logWithTimestamp(`handleSubscription: Processing filter with last_returned_event_timestamp:`, last_returned_event_timestamp);
+            // logWithTimestamp(`handleSubscription: Processing filter with last_returned_event_timestamp:`, last_returned_event_timestamp);
             
             let events;
             if (filter.ids && filter.ids.length > 0) {
@@ -1079,7 +1079,7 @@ async handleSubscription(connectionKey) {
         eventsForClient.push(['EOSE', subscriptionId]);
     }
     
-    logWithTimestamp(`handleSubscription: Total events and EOSE messages for client:`, eventsForClient.length);
+    // logWithTimestamp(`handleSubscription: Total events and EOSE messages for client:`, eventsForClient.length);
     return [eventsForClient, activeSubscriptionsUpdated];
 }
 
@@ -1091,9 +1091,9 @@ async handleSubscription(connectionKey) {
   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
   async getSubscriptions(connectionKey) {
-    logWithTimestamp(`getSubscriptions: Attempting to retrieve subscriptions for connectionKey: ${connectionKey}`);
+    // logWithTimestamp(`getSubscriptions: Attempting to retrieve subscriptions for connectionKey: ${connectionKey}`);
     const key = b4a.from(connectionKey, 'hex');
-    logWithTimestamp(`getSubscriptions: Converted key: ${key.toString('hex')}`);
+    // logWithTimestamp(`getSubscriptions: Converted key: ${key.toString('hex')}`);
     logWithTimestamp('getSubscriptions: View state', {
       viewVersion: this.view?.version ?? null,
       relayVersion: this.version ?? null,
@@ -1102,7 +1102,7 @@ async handleSubscription(connectionKey) {
     const subscriptionData = await this.view.get(key);
     const pendingSnapshot = this.pendingSubscriptions.get(connectionKey) || null;
     if (subscriptionData) {
-      logWithTimestamp(`getSubscriptions: Subscriptions found for connection ${connectionKey}: ${JSON.stringify(subscriptionData)}`);
+      // logWithTimestamp(`getSubscriptions: Subscriptions found for connection ${connectionKey}: ${JSON.stringify(subscriptionData)}`);
       try {
         const parsed = typeof subscriptionData.value === 'string' ? JSON.parse(subscriptionData.value) : subscriptionData.value;
         if (pendingSnapshot) {
@@ -1116,7 +1116,7 @@ async handleSubscription(connectionKey) {
         }
         return parsed;
       } catch (error) {
-        logWithTimestamp('getSubscriptions: Error parsing subscriptions:', error.message);
+        // logWithTimestamp('getSubscriptions: Error parsing subscriptions:', error.message);
         if (pendingSnapshot) {
           logWithTimestamp('getSubscriptions: Returning pending snapshot after parse failure', {
             connectionKey,
@@ -1134,7 +1134,7 @@ async handleSubscription(connectionKey) {
         });
         return pendingSnapshot;
       }
-      logWithTimestamp(`getSubscriptions: No subscriptions found for connection: ${connectionKey}`);
+      // logWithTimestamp(`getSubscriptions: No subscriptions found for connection: ${connectionKey}`);
       return null;
     }
   }

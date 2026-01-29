@@ -1,6 +1,22 @@
 import { EventEmitter } from 'node:events';
 import HypercoreId from 'hypercore-id-encoding';
 
+function serializeError(error) {
+  if (!error || typeof error !== 'object') {
+    return { message: error ? String(error) : null };
+  }
+  return {
+    message: error.message || String(error),
+    name: error.name || null,
+    code: error.code || null,
+    stack: error.stack || null,
+    cause: error.cause ? (error.cause.message || String(error.cause)) : null,
+    errors: Array.isArray(error.errors)
+      ? error.errors.map((entry) => entry?.message || String(entry))
+      : null
+  };
+}
+
 function toKeyString(value) {
   if (!value) return null;
   if (typeof value === 'string') return value;
@@ -247,16 +263,23 @@ export default class BlindPeerReplicaManager extends EventEmitter {
         if (Number.isFinite(info.length) && Number.isFinite(info.contiguousLength)) {
           replica.lagMs = Math.max(0, info.length - info.contiguousLength);
         }
+      } else {
+        this.logger?.warn?.('[BlindPeerReplicaManager] Core info unavailable', {
+          identifier: replica.identifier,
+          ownerPeerKey: replica.ownerPeerKey,
+          coreKey
+        });
       }
       core.once?.('close', () => {
         replica.core = null;
       });
       return core;
     } catch (error) {
-      this.logger?.debug?.('[BlindPeerReplicaManager] Failed to open replica core', {
+      this.logger?.warn?.('[BlindPeerReplicaManager] Failed to open replica core', {
         identifier: replica.identifier,
         ownerPeerKey: replica.ownerPeerKey,
-        error: error?.message || error
+        coreKey,
+        error: serializeError(error)
       });
       return null;
     }
