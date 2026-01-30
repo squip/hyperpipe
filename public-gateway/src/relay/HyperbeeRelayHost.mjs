@@ -92,11 +92,11 @@ export class HyperbeeRelayHost extends EventEmitter {
     await this.db.ready();
     this.initialized = true;
 
-    this.logger.info?.('[HyperbeeRelayHost] Initialized', {
+    this.logger.info?.({
       namespace: this.core.id,
       writable: this.db?.writable,
       key: this.getPublicKey()
-    });
+    }, '[HyperbeeRelayHost] Initialized');
   }
 
   async start() {
@@ -156,15 +156,15 @@ export class HyperbeeRelayHost extends EventEmitter {
       }
 
       await batch.flush();
-      this.logger?.info?.('[HyperbeeRelayHost] Event stored', {
+      this.logger?.info?.({
         id: event.id,
         kind: event.kind,
         created_at: event.created_at
-      });
+      }, '[HyperbeeRelayHost] Event stored');
       this.#emitTelemetry('hyperbee-append', { id: event.id, kind: event.kind, created_at: event.created_at });
       return { id: event.id, status: 'accepted' };
     } catch (error) {
-      this.logger.error?.('[HyperbeeRelayHost] Failed to append event', { error: error?.message });
+      this.logger.error?.({ error: error?.message }, '[HyperbeeRelayHost] Failed to append event');
       this.#emitTelemetry('hyperbee-error', { id: event.id, error: error?.message || error });
       return { id: event.id, status: 'rejected', reason: error?.message || 'append-failed' };
     }
@@ -174,7 +174,7 @@ export class HyperbeeRelayHost extends EventEmitter {
     if (!this.core) {
       throw new Error('HyperbeeRelayHost core not initialized');
     }
-    this.logger.debug?.('[HyperbeeRelayHost] Replication requested', { peer });
+    this.logger.debug?.({ peer }, '[HyperbeeRelayHost] Replication requested');
     // Placeholder for replication stream wiring; to be implemented in dispatcher phase.
   }
 
@@ -269,7 +269,7 @@ export class HyperbeeRelayHost extends EventEmitter {
         const stats = await this.getStats();
         this.#emitTelemetry('replication', { stats });
       } catch (error) {
-        this.logger.error?.('[HyperbeeRelayHost] Failed to collect stats', { error: error?.message });
+        this.logger.error?.({ error: error?.message }, '[HyperbeeRelayHost] Failed to collect stats');
         this.#emitTelemetry('hyperbee-error', { error: error?.message || error });
       }
     }, interval);
@@ -286,7 +286,7 @@ export class HyperbeeRelayHost extends EventEmitter {
       try {
         sink(event);
       } catch (error) {
-        this.logger.warn?.('[HyperbeeRelayHost] Telemetry sink failed', { error: error?.message });
+        this.logger.warn?.({ error: error?.message }, '[HyperbeeRelayHost] Telemetry sink failed');
       }
     }
     this.emit('telemetry', event);

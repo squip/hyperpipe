@@ -147,7 +147,7 @@ export default class BlindPeerService extends EventEmitter {
     this.#ensureMetadataPersistPath();
     await this.#loadCoreMetadataFromDisk();
     this.initialized = true;
-    this.logger?.info?.('[BlindPeer] Initialized', this.getStatus());
+    this.logger?.info?.(this.getStatus(), '[BlindPeer] Initialized');
   }
 
   async start() {
@@ -158,7 +158,7 @@ export default class BlindPeerService extends EventEmitter {
     await this.#createBlindPeer();
     this.running = true;
     this.metrics.setActive?.(1);
-    this.logger?.info?.('[BlindPeer] Service started', this.getAnnouncementInfo());
+    this.logger?.info?.(this.getAnnouncementInfo(), '[BlindPeer] Service started');
     this.cleanupInterval = setInterval(() => this.#updateMetrics(), 30000).unref();
     // TODO: allow dynamic tuning once session bridging supplements the hygiene scheduler.
     this.#startHygieneLoop();
@@ -184,9 +184,9 @@ export default class BlindPeerService extends EventEmitter {
       try {
         await this.blindPeer.close();
       } catch (error) {
-        this.logger?.warn?.('[BlindPeer] Error while stopping blind-peer instance', {
+        this.logger?.warn?.({
           err: error?.message || error
-        });
+        }, '[BlindPeer] Error while stopping blind-peer instance');
       }
     }
 
@@ -210,13 +210,13 @@ export default class BlindPeerService extends EventEmitter {
     const sanitized = sanitizePeerKey(peerKey);
     if (!sanitized) return false;
     if (this.trustedPeers.has(sanitized)) {
-      this.logger?.debug?.('[BlindPeer] Trusted peer add skipped (already trusted)', { peerKey: sanitized });
+      this.logger?.debug?.({ peerKey: sanitized }, '[BlindPeer] Trusted peer add skipped (already trusted)');
       return false;
     }
-    this.logger?.info?.('[BlindPeer] Adding trusted peer', {
+    this.logger?.info?.({
       inputType: peerKey instanceof Uint8Array ? 'uint8array' : Buffer.isBuffer(peerKey) ? 'buffer' : typeof peerKey,
       peerKey: sanitized
-    });
+    }, '[BlindPeer] Adding trusted peer');
     this.trustedPeers.add(sanitized);
     const now = Date.now();
     this.trustedPeerMeta.set(sanitized, {
@@ -226,22 +226,22 @@ export default class BlindPeerService extends EventEmitter {
     if (this.blindPeer?.addTrustedPubKey) {
       try {
         this.blindPeer.addTrustedPubKey(sanitized);
-        this.logger?.debug?.('[BlindPeer] Delegated peer to blind-peer instance', { peerKey: sanitized });
+        this.logger?.debug?.({ peerKey: sanitized }, '[BlindPeer] Delegated peer to blind-peer instance');
       } catch (error) {
-        this.logger?.warn?.('[BlindPeer] Failed to add trusted peer to running service', {
+        this.logger?.warn?.({
           peerKey: sanitized,
           err: error?.message || error
-        });
+        }, '[BlindPeer] Failed to add trusted peer to running service');
       }
     }
 
-    this.logger?.debug?.('[BlindPeer] Trusted peer added', { peerKey: sanitized });
+    this.logger?.debug?.({ peerKey: sanitized }, '[BlindPeer] Trusted peer added');
     this.#updateTrustedPeers();
     if (this.trustedPeersPersistPath) {
       this.#persistTrustedPeers().catch((error) => {
-        this.logger?.warn?.('[BlindPeer] Failed to persist trusted peers', {
+        this.logger?.warn?.({
           err: error?.message || error
-        });
+        }, '[BlindPeer] Failed to persist trusted peers');
       });
     }
     return true;
@@ -252,14 +252,14 @@ export default class BlindPeerService extends EventEmitter {
     if (!sanitized) return false;
     const removed = this.trustedPeers.delete(sanitized);
     if (removed) {
-      this.logger?.info?.('[BlindPeer] Removing trusted peer', { peerKey: sanitized });
+      this.logger?.info?.({ peerKey: sanitized }, '[BlindPeer] Removing trusted peer');
       this.trustedPeerMeta.delete(sanitized);
       this.#updateTrustedPeers();
       if (this.trustedPeersPersistPath) {
         this.#persistTrustedPeers().catch((error) => {
-          this.logger?.warn?.('[BlindPeer] Failed to persist trusted peers', {
+          this.logger?.warn?.({
             err: error?.message || error
-          });
+          }, '[BlindPeer] Failed to persist trusted peers');
         });
       }
     }
@@ -313,7 +313,7 @@ export default class BlindPeerService extends EventEmitter {
 
   async mirrorCore(coreOrKey, options = {}) {
     if (!this.running || !this.blindPeer) {
-      this.logger?.debug?.('[BlindPeer] mirrorCore skipped (service inactive)', { core: !!coreOrKey });
+      this.logger?.debug?.({ core: !!coreOrKey }, '[BlindPeer] mirrorCore skipped (service inactive)');
       return { status: 'inactive' };
     }
 
@@ -338,11 +338,11 @@ export default class BlindPeerService extends EventEmitter {
 
     try {
       const record = await this.blindPeer.addCore(request);
-      this.logger?.info?.('[BlindPeer] Core mirror requested', {
+      this.logger?.info?.({
         key: toKeyString(key),
         announce: request.announce,
         priority: request.priority
-      });
+      }, '[BlindPeer] Core mirror requested');
       if (metadata) {
         this.#recordCoreMetadata(key, {
           priority: request.priority,
@@ -358,10 +358,10 @@ export default class BlindPeerService extends EventEmitter {
       this.#updateMetrics();
       return { status: 'accepted', record };
     } catch (error) {
-      this.logger?.warn?.('[BlindPeer] Failed to mirror core', {
+      this.logger?.warn?.({
         key: toKeyString(key),
         err: error?.message || error
-      });
+      }, '[BlindPeer] Failed to mirror core');
       throw error;
     }
   }
@@ -378,10 +378,10 @@ export default class BlindPeerService extends EventEmitter {
       : null;
     try {
       const result = await this.blindPeer.addAutobase(autobase, targetKey);
-      this.logger?.info?.('[BlindPeer] Autobase mirrored', {
+      this.logger?.info?.({
         target: toKeyString(targetKey),
         writers: Array.isArray(autobase.writers) ? autobase.writers.length : null
-      });
+      }, '[BlindPeer] Autobase mirrored');
       if (metadata?.coreKey) {
         const resolvedKey = metadata.coreKey;
         this.#recordCoreMetadata(resolvedKey, {
@@ -395,10 +395,10 @@ export default class BlindPeerService extends EventEmitter {
       this.#updateMetrics();
       return { status: 'accepted', result };
     } catch (error) {
-      this.logger?.warn?.('[BlindPeer] Failed to mirror autobase', {
+      this.logger?.warn?.({
         target: toKeyString(targetKey),
         err: error?.message || error
-      });
+      }, '[BlindPeer] Failed to mirror autobase');
       throw error;
     }
   }
@@ -425,22 +425,22 @@ export default class BlindPeerService extends EventEmitter {
       try {
         await this.blindPeer.flush();
       } catch (flushError) {
-        this.logger?.debug?.('[BlindPeer] Flush after delete failed', {
+        this.logger?.debug?.({
           err: flushError?.message || flushError
-        });
+        }, '[BlindPeer] Flush after delete failed');
       }
-      this.logger?.info?.('[BlindPeer] Mirror deleted via admin request', {
+      this.logger?.info?.({
         key: toKeyString(decoded),
         reason
-      });
+      }, '[BlindPeer] Mirror deleted via admin request');
       this.#updateMetrics();
       return true;
     } catch (error) {
-      this.logger?.warn?.('[BlindPeer] Failed to delete mirror via admin request', {
+      this.logger?.warn?.({
         key: toKeyString(decoded) || keyInput,
         reason,
         err: error?.message || error
-      });
+      }, '[BlindPeer] Failed to delete mirror via admin request');
       throw error;
     }
   }
@@ -600,16 +600,16 @@ export default class BlindPeerService extends EventEmitter {
         this.coreMetadata.set(record.key, record);
       }
       this.metadataDirty = false;
-      this.logger?.debug?.('[BlindPeer] Loaded metadata snapshot', {
+      this.logger?.debug?.({
         entries: this.coreMetadata.size,
         path
-      });
+      }, '[BlindPeer] Loaded metadata snapshot');
     } catch (error) {
       if (error?.code !== 'ENOENT') {
-        this.logger?.warn?.('[BlindPeer] Failed to load metadata snapshot', {
+        this.logger?.warn?.({
           path,
           err: error?.message || error
-        });
+        }, '[BlindPeer] Failed to load metadata snapshot');
       }
     }
   }
@@ -646,10 +646,10 @@ export default class BlindPeerService extends EventEmitter {
       await writeFile(path, payload, 'utf8');
       this.metadataDirty = false;
     } catch (error) {
-      this.logger?.warn?.('[BlindPeer] Failed to persist metadata snapshot', {
+      this.logger?.warn?.({
         path,
         err: error?.message || error
-      });
+      }, '[BlindPeer] Failed to persist metadata snapshot');
     }
   }
 
@@ -658,9 +658,9 @@ export default class BlindPeerService extends EventEmitter {
     this.metadataSaveTimer = setTimeout(() => {
       this.metadataSaveTimer = null;
       this.#persistCoreMetadata().catch((error) => {
-        this.logger?.warn?.('[BlindPeer] Metadata snapshot task failed', {
+        this.logger?.warn?.({
           err: error?.message || error
-        });
+        }, '[BlindPeer] Metadata snapshot task failed');
       });
     }, 5000);
     this.metadataSaveTimer.unref?.();
@@ -697,9 +697,9 @@ export default class BlindPeerService extends EventEmitter {
     const runner = () => {
       if (!this.running) return;
       this.#runHygieneCycle('timer').catch((error) => {
-        this.logger?.warn?.('[BlindPeer] Hygiene cycle threw', {
+        this.logger?.warn?.({
           err: error?.message || error
-        });
+        }, '[BlindPeer] Hygiene cycle threw');
       });
     };
 
@@ -710,9 +710,9 @@ export default class BlindPeerService extends EventEmitter {
     setTimeout(() => {
       if (!this.running) return;
       this.#runHygieneCycle('startup').catch((error) => {
-        this.logger?.warn?.('[BlindPeer] Initial hygiene run failed', {
+        this.logger?.warn?.({
           err: error?.message || error
-        });
+        }, '[BlindPeer] Initial hygiene run failed');
       });
     }, initialDelay).unref?.();
   }
@@ -722,7 +722,7 @@ export default class BlindPeerService extends EventEmitter {
       return { status: 'inactive' };
     }
     if (this.hygieneRunning) {
-      this.logger?.debug?.('[BlindPeer] Hygiene run skipped (already running)', { reason });
+      this.logger?.debug?.({ reason }, '[BlindPeer] Hygiene run skipped (already running)');
       return { status: 'skipped', reason: 'running' };
     }
 
@@ -779,10 +779,10 @@ export default class BlindPeerService extends EventEmitter {
         }
       }
     } catch (error) {
-      this.logger?.warn?.('[BlindPeer] Hygiene scan failed', {
+      this.logger?.warn?.({
         reason,
         err: error?.message || error
-      });
+      }, '[BlindPeer] Hygiene scan failed');
       this.hygieneStats.totalRuns += 1;
       this.hygieneStats.lastRunAt = startedAt;
       this.hygieneStats.lastDurationMs = Date.now() - startedAt;
@@ -809,27 +809,27 @@ export default class BlindPeerService extends EventEmitter {
         const label = plan.reason || 'unknown';
         reasonTally.set(label, (reasonTally.get(label) || 0) + 1);
         this.#removeCoreMetadata(keyBuf);
-        this.logger?.info?.('[BlindPeer] Hygiene eviction applied', {
+        this.logger?.info?.({
           key: keyStr,
           reason: label,
           bytesFreed: plan.bytesAllocated ?? null
-        });
+        }, '[BlindPeer] Hygiene eviction applied');
       } catch (error) {
-        this.logger?.warn?.('[BlindPeer] Hygiene eviction failed', {
+        this.logger?.warn?.({
           key: keyStr,
           reason: plan.reason,
           err: error?.message || error
-        });
+        }, '[BlindPeer] Hygiene eviction failed');
       }
     }
 
     try {
       await this.blindPeer.flush();
     } catch (error) {
-      this.logger?.warn?.('[BlindPeer] Hygiene flush failed', {
+      this.logger?.warn?.({
         reason,
         err: error?.message || error
-      });
+      }, '[BlindPeer] Hygiene flush failed');
     }
 
     this.hygieneStats.totalRuns += 1;
@@ -854,7 +854,7 @@ export default class BlindPeerService extends EventEmitter {
     }
     this.#updateMetrics();
 
-    this.logger?.info?.('[BlindPeer] Hygiene cycle completed', {
+    this.logger?.info?.({
       reason,
       scanned,
       totalEvictions,
@@ -863,7 +863,7 @@ export default class BlindPeerService extends EventEmitter {
       staleCandidates,
       ownersTracked: this.coreMetadata.size,
       evictionReasons: Object.fromEntries(reasonTally)
-    });
+    }, '[BlindPeer] Hygiene cycle completed');
 
     this.hygieneRunning = false;
     return { status: 'ok', ...this.hygieneStats.lastResult };
@@ -1083,14 +1083,14 @@ export default class BlindPeerService extends EventEmitter {
     });
 
     if (this.logger?.debug) {
-      this.logger.debug('[BlindPeer] Mirror recorded', {
+      this.logger.debug({
         key: toKeyString(record.key),
         ownerPeerKey,
         identifier,
         priority: record?.priority ?? null,
         announce: record?.announce === true,
         sourceEvent: context?.event || null
-      });
+      }, '[BlindPeer] Mirror recorded');
     }
 
     this.emit('mirror-added', {
@@ -1112,11 +1112,11 @@ export default class BlindPeerService extends EventEmitter {
     const metadataEntry = this.coreMetadata.get(keyStr) || null;
     this.#removeCoreMetadata(info.key);
     if (this.logger?.debug) {
-      this.logger.debug('[BlindPeer] Mirror removed', {
+      this.logger.debug({
         key: keyStr,
         ownerPeerKey: stream?.remotePublicKey ? toKeyString(stream.remotePublicKey) : null,
         existing: info?.existing ?? null
-      });
+      }, '[BlindPeer] Mirror removed');
     }
 
     this.emit('mirror-removed', {
@@ -1456,9 +1456,9 @@ export default class BlindPeerService extends EventEmitter {
       this.#updateMetrics();
     });
     this.blindPeer.on('gc-done', (stats) => {
-      this.logger?.debug?.('[BlindPeer] Underlying daemon GC completed', {
+      this.logger?.debug?.({
         bytesCleared: stats?.bytesCleared ?? null
-      });
+      }, '[BlindPeer] Underlying daemon GC completed');
       this.#updateMetrics();
     });
 
@@ -1468,10 +1468,10 @@ export default class BlindPeerService extends EventEmitter {
       await this.blindPeer.ready();
     }
 
-    this.logger?.info?.('[BlindPeer] Listening', {
+    this.logger?.info?.({
       publicKey: this.getPublicKeyHex(),
       encryptionKey: this.getEncryptionKeyHex()
-    });
+    }, '[BlindPeer] Listening');
 
     return this.blindPeer;
   }
@@ -1515,16 +1515,16 @@ export default class BlindPeerService extends EventEmitter {
           });
         }
       }
-      this.logger?.info?.('[BlindPeer] Loaded trusted peers from disk', {
+      this.logger?.info?.({
         count: this.trustedPeers.size,
         path: this.trustedPeersPersistPath
-      });
+      }, '[BlindPeer] Loaded trusted peers from disk');
     } catch (error) {
       if (error?.code !== 'ENOENT') {
-        this.logger?.warn?.('[BlindPeer] Failed to load trusted peers from disk', {
+        this.logger?.warn?.({
           path: this.trustedPeersPersistPath,
           err: error?.message || error
-        });
+        }, '[BlindPeer] Failed to load trusted peers from disk');
       }
     } finally {
       this.trustedPeersLoaded = true;

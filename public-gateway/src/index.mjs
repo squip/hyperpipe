@@ -4,9 +4,17 @@ import { loadConfig, loadTlsOptions } from './config.mjs';
 import { createLogger } from './logger.mjs';
 import PublicGatewayService from './PublicGatewayService.mjs';
 import { createRegistrationStore } from './stores/index.mjs';
+import { installStdoutLogRotation } from './utils/stdout-log-rotator.mjs';
 
 async function main() {
   loadEnv();
+
+  installStdoutLogRotation({
+    logDir: process.env.GATEWAY_LOG_DIR || null,
+    rotateMs: process.env.GATEWAY_LOG_ROTATE_MS || null,
+    retentionMs: process.env.GATEWAY_LOG_RETENTION_MS || null,
+    prefix: process.env.GATEWAY_LOG_PREFIX || null
+  });
 
   const logger = createLogger();
 

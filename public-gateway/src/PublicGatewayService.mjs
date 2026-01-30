@@ -401,7 +401,7 @@ class PublicGatewayService {
       try {
         const target = await this.#resolveRelayTarget(identifier);
         if (!target) {
-          this.logger.warn?.('Drive request for unknown relay identifier', { identifier, file });
+          this.logger.warn?.({ identifier, file }, 'Drive request for unknown relay identifier');
           return res.status(404).json({ error: 'Relay not registered with gateway' });
         }
 
@@ -429,7 +429,7 @@ class PublicGatewayService {
 
         const { stream: bodyStream, peerKey } = streamResult;
         if (!bodyStream) {
-          this.logger.warn?.('Peer returned empty stream for drive request', { identifier, file, peerKey });
+          this.logger.warn?.({ identifier, file, peerKey }, 'Peer returned empty stream for drive request');
           return res.status(404).json({ error: 'File not found' });
         }
 
@@ -1307,11 +1307,11 @@ class PublicGatewayService {
 
   #handleWebSocket(ws, req) {
     this.#initializeSession(ws, req).catch((error) => {
-      this.logger.error?.('Failed to initialize websocket session', {
+      this.logger.error?.({
         error: error?.message || 'unknown error',
         stack: error?.stack || null,
         relayKey: error?.relayKey || null
-      });
+      }, 'Failed to initialize websocket session');
       try {
         ws.close(1011, 'Internal error');
       } catch (_) {}
@@ -1330,9 +1330,9 @@ class PublicGatewayService {
     const { relayKey, token } = this.#parseWebSocketRequest(req);
 
     if (!relayKey) {
-      this.logger.warn?.('WebSocket rejected: invalid relay key', {
+      this.logger.warn?.({
         url: req?.url || null
-      });
+      }, 'WebSocket rejected: invalid relay key');
       ws.close(4404, 'Invalid relay key');
       ws.terminate();
       return;
@@ -1340,7 +1340,7 @@ class PublicGatewayService {
 
     const registration = await this.registrationStore.getRelay(relayKey);
     if (!registration) {
-      this.logger.warn?.('WebSocket rejected: relay not registered', { relayKey });
+      this.logger.warn?.({ relayKey }, 'WebSocket rejected: relay not registered');
       ws.close(4404, 'Relay not registered');
       ws.terminate();
       return;
@@ -1351,7 +1351,7 @@ class PublicGatewayService {
     let tokenValidation = null;
     if (requiresAuth) {
       if (!token) {
-        this.logger.warn?.('WebSocket rejected: token missing', { relayKey });
+        this.logger.warn?.({ relayKey }, 'WebSocket rejected: token missing');
         ws.close(4403, 'Token required');
         ws.terminate();
         return;
@@ -1359,7 +1359,7 @@ class PublicGatewayService {
 
       tokenValidation = await this.#validateToken(token, relayKey);
       if (!tokenValidation) {
-        this.logger.warn?.('WebSocket rejected: token validation failed', { relayKey });
+        this.logger.warn?.({ relayKey }, 'WebSocket rejected: token validation failed');
         ws.close(4403, 'Invalid token');
         ws.terminate();
         return;
@@ -1373,11 +1373,11 @@ class PublicGatewayService {
       || registration?.gatewayReplica?.delegateReqToPeers === true;
 
     const availablePeers = this.#getUsablePeersFromRegistration(registration);
-    this.logger.info?.('Initializing websocket session - relay registration fetched', {
+    this.logger.info?.({
       relayKey,
       peerCount: availablePeers.length,
       peers: availablePeers
-    });
+    }, 'Initializing websocket session - relay registration fetched');
 
     const selection = this.#selectPeer({ ...registration, peers: availablePeers });
     const supportsLocal = this.#supportsLocalRelay(registration);
@@ -1392,7 +1392,7 @@ class PublicGatewayService {
       peers = selection.peers;
       peerIndex = selection.index >= 0 ? selection.index : 0;
     } else if (!localOnly) {
-      this.logger.warn?.('WebSocket rejected: no peers available', { relayKey });
+      this.logger.warn?.({ relayKey }, 'WebSocket rejected: no peers available');
       ws.close(1013, 'No peers available');
       ws.terminate();
       return;
@@ -1400,26 +1400,26 @@ class PublicGatewayService {
 
     if (!localOnly && peerKey) {
       try {
-        this.logger.info?.('Attempting hyperswarm connection for websocket session', {
+        this.logger.info?.({
           relayKey,
           peerKey
-        });
+        }, 'Attempting hyperswarm connection for websocket session');
         await this.connectionPool.getConnection(peerKey);
-        this.logger.info?.('Hyperswarm connection established for websocket session', {
+        this.logger.info?.({
           relayKey,
           peerKey
-        });
+        }, 'Hyperswarm connection established for websocket session');
       } catch (err) {
         err.relayKey = relayKey;
-        this.logger.error?.('WebSocket rejected: failed to connect to peer', {
+        this.logger.error?.({
           relayKey,
           peerKey,
           error: err?.message || 'unknown error'
-        });
+        }, 'WebSocket rejected: failed to connect to peer');
         throw err;
       }
     } else if (localOnly) {
-      this.logger.info?.('WebSocket session using local Hyperbee host', { relayKey });
+      this.logger.info?.({ relayKey }, 'WebSocket session using local Hyperbee host');
     }
 
     const connectionKey = this.#generateConnectionKey();
@@ -1465,7 +1465,7 @@ class PublicGatewayService {
       });
     }
 
-    this.logger.info?.('WebSocket session established', { relayKey, connectionKey, peerKey });
+    this.logger.info?.({ relayKey, connectionKey, peerKey }, 'WebSocket session established');
   }
 
   #generateConnectionKey() {
@@ -1524,7 +1524,7 @@ class PublicGatewayService {
     const { allowQueue = true, subscriptionId = null, storePending = false } = options || {};
     const serialized = typeof msg === 'string' ? msg : safeString(msg);
     if (!serialized) {
-      this.logger.warn?.('Failed to serialize legacy message', { relayKey: session.relayKey });
+      this.logger.warn?.({ relayKey: session.relayKey }, 'Failed to serialize legacy message');
       return;
     }
 
@@ -1600,11 +1600,11 @@ class PublicGatewayService {
             reason: 'no-peers-available'
           }, 'DelegationDebug: queueing delegated message while peers unavailable');
         }
-        this.logger.debug?.('Queued delegated relay message pending peer availability', {
+        this.logger.debug?.({
           relayKey: session?.relayKey,
           connectionKey: session?.connectionKey,
           queueLength: session.pendingDelegatedMessages.length
-        });
+        }, 'Queued delegated relay message pending peer availability');
         if (session.delegationReady) {
           this.#scheduleDelegationFallback(session);
         }
@@ -1636,11 +1636,11 @@ class PublicGatewayService {
             reason: 'no-peers-available'
           }, 'DelegationDebug: re-queueing delegated message without peers');
         }
-        this.logger.debug?.('Re-queued delegated relay message while peers unavailable', {
+        this.logger.debug?.({
           relayKey: session?.relayKey,
           connectionKey: session?.connectionKey,
           queueLength: session.pendingDelegatedMessages.length
-        });
+        }, 'Re-queued delegated relay message while peers unavailable');
         if (session.delegationReady) {
           this.#scheduleDelegationFallback(session);
         }
@@ -1656,9 +1656,9 @@ class PublicGatewayService {
             delegateReqToPeers: session?.delegateReqToPeers === true
           }, 'DelegationDebug: skipping delegation - peers unavailable and queue disabled');
         }
-        this.logger.debug?.('Legacy forward skipped - no peers available for relay', {
+        this.logger.debug?.({
           relayKey: session?.relayKey
-        });
+        }, 'Legacy forward skipped - no peers available for relay');
       }
       return;
     }
@@ -1753,18 +1753,18 @@ class PublicGatewayService {
           });
           pendingEntry = session.pendingDelegatedMessages[session.pendingDelegatedMessages.length - 1];
         }
-        this.logger.debug?.('Queued delegated relay message while awaiting peer', {
+        this.logger.debug?.({
           relayKey: session?.relayKey,
           connectionKey: session?.connectionKey,
           queueLength: session.pendingDelegatedMessages.length
-        });
+        }, 'Queued delegated relay message while awaiting peer');
         if (session.delegationReady) {
           this.#scheduleDelegationFallback(session);
         }
         return;
       }
 
-      this.logger.warn?.('Forwarding message failed', { relayKey: session.relayKey, error: error.message });
+      this.logger.warn?.({ relayKey: session.relayKey, error: error.message }, 'Forwarding message failed');
       if (session.ws.readyState === WebSocket.OPEN) {
         session.ws.send(JSON.stringify(['NOTICE', `Error: ${error.message}`]));
       } else {
@@ -1797,22 +1797,22 @@ class PublicGatewayService {
           break;
         }
       } catch (error) {
-        this.logger.debug?.('Failed to flush delegated message to peer', {
+        this.logger.debug?.({
           relayKey: session?.relayKey,
           connectionKey: session?.connectionKey,
           error: error?.message || error
-        });
+        }, 'Failed to flush delegated message to peer');
         if (entry) {
           entry.retryCount = (entry.retryCount || 0) + 1;
           const maxRetries = 5;
           if (entry.retryCount <= maxRetries) {
             session.pendingDelegatedMessages.unshift(entry);
           } else {
-            this.logger.warn?.('Dropping delegated message after max retries', {
+            this.logger.warn?.({
               relayKey: session?.relayKey,
               connectionKey: session?.connectionKey,
               subscriptionId: entry?.subscriptionId || null
-            });
+            }, 'Dropping delegated message after max retries');
           }
         }
         this.#scheduleDelegationFallback(session);
@@ -1867,7 +1867,7 @@ class PublicGatewayService {
           }
         }
       } catch (error) {
-        this.logger.debug?.('Event polling error', { relayKey: session.relayKey, error: error.message });
+        this.logger.debug?.({ relayKey: session.relayKey, error: error.message }, 'Event polling error');
       } finally {
         const timer = setTimeout(run, 1000);
         timer.unref?.();
@@ -1922,11 +1922,11 @@ class PublicGatewayService {
           this.relayWebsocketController?.updateSubscriptionCursor?.(session.connectionKey, subscriptionId, newestTimestamp);
         }
       } catch (error) {
-        this.logger.debug?.('Local Hyperbee poll failed', {
+        this.logger.debug?.({
           relayKey: session.relayKey,
           subscriptionId,
           error: error?.message || error
-        });
+        }, 'Local Hyperbee poll failed');
       }
     }
   }
@@ -2099,11 +2099,11 @@ class PublicGatewayService {
         return handler(peerKey, registration);
       } catch (error) {
         lastError = error;
-        this.logger.warn?.('Failed to use peer for drive request', {
+        this.logger.warn?.({
           relayKey,
           peerKey,
           error: error?.message || error
-        });
+        }, 'Failed to use peer for drive request');
         this.#markPeerUnreachable(peerKey, {
           reason: 'get-connection-failed',
           error: error?.message || error
@@ -2313,10 +2313,10 @@ class PublicGatewayService {
         const result = await handler(peerKey);
         session.peerKey = peerKey;
         this.#markPeerReachable(peerKey, { relayKey: session.relayKey, timestamp: Date.now() });
-        this.logger.info?.('Peer operation succeeded', {
+        this.logger.info?.({
           relayKey: session.relayKey,
           peerKey
-        });
+        }, 'Peer operation succeeded');
         if (session.delegateReqToPeers) {
           session.localOnly = false;
           this.#cancelDelegationFallback(session);
@@ -2324,15 +2324,15 @@ class PublicGatewayService {
         return result;
       } catch (error) {
         lastError = error;
-        this.logger.warn?.('Peer operation failed', {
+        this.logger.warn?.({
           relayKey: session.relayKey,
           peerKey,
           error: error.message
-        });
-        this.logger.info?.('Advancing to next peer after failure', {
+        }, 'Peer operation failed');
+        this.logger.info?.({
           relayKey: session.relayKey,
           previousPeer: peerKey
-        });
+        }, 'Advancing to next peer after failure');
         this.#advancePeer(session);
         attempts += 1;
       }
@@ -2737,11 +2737,11 @@ class PublicGatewayService {
       }
     })();
 
-    this.logger.debug('[PublicGateway] Replica status updated', {
+    this.logger.debug({
       relayCount,
       peerCount,
       updatedAt: this.publicGatewayStatusUpdatedAt
-    });
+    }, '[PublicGateway] Replica status updated');
   }
 
   #handleDispatcherAssignment({ jobId, peerId, assignedAt, job }) {
@@ -3118,10 +3118,10 @@ class PublicGatewayService {
       try {
         payload = JSON.parse(Buffer.from(request.body).toString());
       } catch (error) {
-        this.logger.warn?.('Failed to parse Hyperswarm registration payload', {
+        this.logger.warn?.({
           peer: peerKey,
           error: error?.message || error
-        });
+        }, 'Failed to parse Hyperswarm registration payload');
         return {
           statusCode: 400,
           headers: { 'content-type': 'application/json' },
@@ -3153,11 +3153,11 @@ class PublicGatewayService {
       try {
         await this.#mergeRelayRegistration(relayKey, peerKey, relayPayload, payload.gatewayReplica, now);
       } catch (error) {
-        this.logger.error?.('Failed to merge relay registration from peer', {
+        this.logger.error?.({
           relayKey,
           peer: peerKey,
           error: error?.message || error
-        });
+        }, 'Failed to merge relay registration from peer');
       }
     }
 
@@ -3519,19 +3519,19 @@ class PublicGatewayService {
         this.#buildMirrorMetadataPayload(upsertPayload, registration.relayKey)
       );
       this.#storeRelayAliases(registration.relayKey, upsertPayload).catch((error) => {
-        this.logger?.warn?.('[PublicGateway] Failed to store relay aliases', {
+        this.logger?.warn?.({
           relayKey: registration.relayKey,
           error: error?.message || error
-        });
+        }, '[PublicGateway] Failed to store relay aliases');
       });
-      this.logger.info?.('Relay registration accepted', { relayKey: registration.relayKey });
+      this.logger.info?.({ relayKey: registration.relayKey }, 'Relay registration accepted');
       const hyperbeeInfo = this.#getRelayHostInfo();
       return res.json({
         status: 'ok',
         hyperbee: hyperbeeInfo
       });
     } catch (error) {
-      this.logger.error?.('Failed to persist relay registration', { relayKey: registration.relayKey, error: error.message });
+      this.logger.error?.({ relayKey: registration.relayKey, error: error.message }, 'Failed to persist relay registration');
       return res.status(500).json({ error: 'Failed to persist registration' });
     }
   }
@@ -3558,10 +3558,10 @@ class PublicGatewayService {
 
     try {
       await this.registrationStore.removeRelay(relayKey);
-      this.logger.info?.('Relay unregistered', { relayKey });
+      this.logger.info?.({ relayKey }, 'Relay unregistered');
       return res.json({ status: 'ok' });
     } catch (error) {
-      this.logger.error?.('Failed to unregister relay', { relayKey, error: error.message });
+      this.logger.error?.({ relayKey, error: error.message }, 'Failed to unregister relay');
       return res.status(500).json({ error: 'Failed to unregister relay' });
     }
   }
@@ -4242,38 +4242,38 @@ class PublicGatewayService {
       try {
         return await this.tokenService.verifyToken(token, relayKey);
       } catch (error) {
-        this.logger.warn?.('Token verification failed', {
+        this.logger.warn?.({
           relayKey,
           error: error?.message || error
-        });
+        }, 'Token verification failed');
         return null;
       }
     }
 
     const payload = verifyClientToken(token, this.sharedSecret);
     if (!payload) {
-      this.logger.warn?.('Token verification failed - signature mismatch', { relayKey });
+      this.logger.warn?.({ relayKey }, 'Token verification failed - signature mismatch');
       return null;
     }
 
     if (payload.relayKey && payload.relayKey !== relayKey) {
-      this.logger.warn?.('Token verification failed - relay mismatch', {
+      this.logger.warn?.({
         relayKey,
         tokenRelayKey: payload.relayKey
-      });
+      }, 'Token verification failed - relay mismatch');
       return null;
     }
 
     if (payload.expiresAt && payload.expiresAt < Date.now()) {
-      this.logger.warn?.('Token verification failed - token expired', {
+      this.logger.warn?.({
         relayKey,
         expiresAt: payload.expiresAt
-      });
+      }, 'Token verification failed - token expired');
       return null;
     }
 
     if (!payload.relayAuthToken || typeof payload.relayAuthToken !== 'string') {
-      this.logger.warn?.('Token verification failed - missing relay auth token', { relayKey });
+      this.logger.warn?.({ relayKey }, 'Token verification failed - missing relay auth token');
       return null;
     }
 
@@ -4341,10 +4341,10 @@ class PublicGatewayService {
       try {
         return await this.#handleGatewayHyperswarmRegistration(publicKey, request);
       } catch (error) {
-        this.logger.error?.('Hyperswarm registration handler failed', {
+        this.logger.error?.({
           peer: publicKey,
           error: error?.message || error
-        });
+        }, 'Hyperswarm registration handler failed');
         return {
           statusCode: 500,
           headers: { 'content-type': 'application/json' },
@@ -4410,12 +4410,12 @@ class PublicGatewayService {
   #onProtocolHandshake({ publicKey, protocol, handshake, stage = 'open' }) {
     if (!publicKey || !handshake) return;
 
-    this.logger.debug?.('[PublicGateway] Hyperswarm handshake event', {
+    this.logger.debug?.({
       peer: publicKey,
       stage,
       role: handshake?.role ?? 'unknown',
       isGateway: handshake?.isGateway ?? 'unknown'
-    });
+    }, '[PublicGateway] Hyperswarm handshake event');
 
     const entry = this.peerMetadata.get(publicKey) || {};
     entry.handshake = handshake;
