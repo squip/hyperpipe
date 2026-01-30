@@ -1,0 +1,33 @@
+{
+  "runId": "closed-join-run5",
+  "generatedAt": "2026-01-29T05:56:18.571Z",
+  "inputFiles": [
+    "/Users/essorensen/hypertuna-electron/test-logs/CLOSED-JOIN-WORKFLOW/test9/worker.log",
+    "/Users/essorensen/hypertuna-electron/test-logs/CLOSED-JOIN-WORKFLOW/test9/public-gateway.log"
+  ],
+  "totals": {
+    "lines": 214742,
+    "jsonLines": 7601,
+    "keptLines": 18858,
+    "traces": 1,
+    "warnings": 88,
+    "errors": 0,
+    "untraced": 18854
+  },
+  "traces": [
+    {
+      "traceId": "c76804f3-542a-4082-9981-8c02334068e6",
+      "publicIdentifier": "npub162jn9nqeaj9xg3fmvkwdc9znfjykngl0wwphcrrfahk80z30vngsap232p:hotboyFudge",
+      "relayKey": "5cec96eeb2ea0a63",
+      "relayUrl": "ws://127.0.0.1:8443/npub162jn9nqeaj9xg3fmvkwdc9znfjykngl0wwphcrrfahk80z30vngsap2",
+      "mirrorSource": "closed-join",
+      "mirrorSnapshotFingerprint": "8jmcqgcswdapydtog1hrhayk1pnmgs6zjbxhs6na7efy15jjbz7y:mirror-core|eb9n6a94bx346j7uzxoqzxp78x93su7ik69p5b7d6wnt1ngeqkco:mirror-core|ewrxboou6goha7uoon37w3d4gigys5r9nz4ziib1jh7dxoqx5i8y:mirror-core|gsbxuqpqskbsxc8ax63nhybt1g9q854haecz83a9ba618trouoio:mirror-core|idna5beuwcwgi7sqx7seyid8ia5bu4z5h7kh96in63zd875i54oo:mirror-core|iyw7sqhmiq3uenhqh44sqfcw9d6ir381d38ibp1iu6nzrdxiisuy:autobase-view|musjp5i17efg896n4xdc9ews5ffr5r8s8kjgctp7ffbg1kswgqho:autobase|rtyw9fuemp6idn5oe84ac7korfeiwj1j1d8zbt59aws73gecpxiy:mirror-core|tomtb1r8zb7rzx77685hacs167n8765js79d6zs5q1ywz3t9cx5y:mirror-core|uxh9gyxr6hpfiuqquc8xkui8xju7qnxuckpipo6k9ghfbho89gpy:mirror-core|ybp68hscmjibiogjy6t3ituz7c8xjdhg9y8fxwuwk44947j97udo:mirror-core",
+      "events": 4,
+      "start": "2026-01-29T05:47:58.007Z",
+      "end": "2026-01-29T05:51:16.453Z",
+      "hasJoinSuccess": true,
+      "hasJoinError": false,
+      "hasDowngradeAnnounce": false
+    }
+  ]
+}

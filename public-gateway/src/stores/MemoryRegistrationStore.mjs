@@ -261,14 +261,14 @@ class MemoryRegistrationStore {
         : null
     };
     this.mirrorMetadata.set(relayKey, record);
-    this.logger?.info?.(`${CJTRACE_TAG} mirror metadata stored`, {
+    this.logger?.info?.( {
       relayKey,
       closedJoin: isClosedJoin,
       ttlSeconds,
       coreCount,
       mirrorSource: payload?.mirrorSource || null,
       updatedAt: payload?.updatedAt ?? null
-    });
+    }, `${CJTRACE_TAG} mirror metadata stored`);
   }
 
   async getMirrorMetadata(relayKey) {
@@ -297,11 +297,11 @@ class MemoryRegistrationStore {
       expiresAt: null
     };
     this.closedJoinCoreRefs.set(relayKey, record);
-    this.logger?.info?.(`${CJTRACE_TAG} closed join cores stored`, {
+    this.logger?.info?.( {
       relayKey,
       coreCount: cores.length,
       updatedAt: record.payload?.updatedAt ?? null
-    });
+    }, `${CJTRACE_TAG} closed join cores stored`);
   }
 
   async getClosedJoinCoreRefs(relayKey) {

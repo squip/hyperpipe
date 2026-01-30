@@ -77,11 +77,11 @@ export default class RelayDispatcherService {
       job
     });
 
-    this.logger?.debug?.('[RelayDispatcher] Job scheduled', {
+    this.logger?.debug?.( {
       jobId,
       peerId: best.peerId,
       score: best.score
-    });
+    }, '[RelayDispatcher] Job scheduled');
 
     this.events.emit('assignment', {
       jobId,
@@ -110,11 +110,11 @@ export default class RelayDispatcherService {
     }
 
     this.jobAssignments.delete(jobId);
-    this.logger?.debug?.('[RelayDispatcher] Job acknowledged', {
+    this.logger?.debug?.( {
       jobId,
       peerId: assignment.peerId,
       deliveredCount: outcome.deliveredCount || 0
-    });
+    }, '[RelayDispatcher] Job acknowledged');
 
     this.events.emit('acknowledge', {
       jobId,
@@ -135,10 +135,10 @@ export default class RelayDispatcherService {
       state.failureRate = this.#decayFailureRate(state.failureRate, true);
       if (state.consecutiveFailures >= this.policy.circuitBreakerThreshold) {
         state.circuitBrokenUntil = now() + this.policy.circuitBreakerDurationMs;
-        this.logger?.warn?.('[RelayDispatcher] Peer circuit broken', {
+        this.logger?.warn?.( {
           peerId: assignment.peerId,
           reason: reason?.error || 'consecutive-failures'
-        });
+        }, '[RelayDispatcher] Peer circuit broken');
       }
     }
 
@@ -167,7 +167,7 @@ export default class RelayDispatcherService {
     if (state.circuitBrokenUntil && state.metrics.failureRate < this.policy.maxFailureRate) {
       state.circuitBrokenUntil = null;
       state.consecutiveFailures = 0;
-      this.logger?.info?.('[RelayDispatcher] Peer circuit restored via heartbeat', { peerId });
+      this.logger?.info?.( { peerId }, '[RelayDispatcher] Peer circuit restored via heartbeat');
     }
   }
 

@@ -696,7 +696,8 @@ export class RelayManager {
     setupSwarmListeners() {
       this.swarm.on('connection', async (connection, peerInfo) => {
         const peerKey = b4a.toString(peerInfo.publicKey, 'hex');
-        console.log('\rPeer joined', peerKey.substring(0, 16));
+        const peerKeyPreview = peerKey.substring(0, 16);
+        console.log('\rPeer joined', peerKeyPreview);
         
         // Track peer
         this.peers.set(peerKey, {
@@ -708,13 +709,26 @@ export class RelayManager {
         const mux = new Protomux(connection);
         console.log('Initialized Protomux on the connection');
         
+        let addWriterOpenedAt = null;
         const addWriterProtocol = mux.createChannel({
           protocol: 'add-writer',
           onopen: () => {
+            addWriterOpenedAt = Date.now();
             console.log('add-writer protocol opened!');
+            console.info('[CJTRACE] add-writer protocol opened', {
+              peer: peerKeyPreview
+            });
           },
-          onclose: () => {
+          onclose: (err) => {
+            const durationMs = addWriterOpenedAt ? Date.now() - addWriterOpenedAt : null;
             console.log('add-writer protocol closed!');
+            console.info('[CJTRACE] add-writer protocol closed', {
+              peer: peerKeyPreview,
+              durationMs,
+              closeCode: err?.code ?? null,
+              closeReason: err?.reason ?? err?.message ?? null,
+              error: err?.message || err || null
+            });
             // Remove peer on disconnect
             this.peers.delete(peerKey);
           }

@@ -326,7 +326,7 @@ class PublicGatewayService {
       try {
         await this.relayHost.stop();
       } catch (error) {
-        this.logger?.error?.('Failed to stop Hyperbee relay host', { error: error?.message });
+        this.logger?.error?.( { error: error?.message }, 'Failed to stop Hyperbee relay host');
       }
       if (this.relayTelemetryUnsub) {
         this.relayTelemetryUnsub();
@@ -411,7 +411,7 @@ class PublicGatewayService {
       try {
         const target = await this.#resolveRelayTarget(identifier);
         if (!target) {
-          this.logger.warn?.('Drive request for unknown relay identifier', { identifier, file });
+          this.logger.warn?.( { identifier, file }, 'Drive request for unknown relay identifier');
           return res.status(404).json({ error: 'Relay not registered with gateway' });
         }
 
@@ -439,7 +439,7 @@ class PublicGatewayService {
 
         const { stream: bodyStream, peerKey } = streamResult;
         if (!bodyStream) {
-          this.logger.warn?.('Peer returned empty stream for drive request', { identifier, file, peerKey });
+          this.logger.warn?.( { identifier, file, peerKey }, 'Peer returned empty stream for drive request');
           return res.status(404).json({ error: 'File not found' });
         }
 
@@ -506,9 +506,9 @@ class PublicGatewayService {
         blindPeerService: this.blindPeerService
       });
     } catch (error) {
-      this.logger?.warn?.('[PublicGateway] Failed to initialize BlindPeerReplicaManager', {
+      this.logger?.warn?.( {
         error: error?.message || error
-      });
+      }, '[PublicGateway] Failed to initialize BlindPeerReplicaManager');
     }
   }
 
@@ -823,10 +823,10 @@ class PublicGatewayService {
     }
 
     if (!schnorr?.verify) {
-      this.logger?.warn?.('[PublicGateway] Schnorr verify unavailable for open join', {
+      this.logger?.warn?.( {
         relayKey,
         publicIdentifier
-      });
+      }, '[PublicGateway] Schnorr verify unavailable for open join');
       return { ok: false, error: 'auth-signature-invalid' };
     }
 
@@ -834,33 +834,33 @@ class PublicGatewayService {
     const pubkeyBytes = typeof pubkey === 'string' ? hexToBytes(pubkey) : pubkey;
     const msgBytes = typeof computedId === 'string' ? hexToBytes(computedId) : computedId;
     if (!sigBytes || !pubkeyBytes || !msgBytes) {
-      this.logger?.warn?.('[PublicGateway] Open join auth signature decode failed', {
+      this.logger?.warn?.( {
         relayKey,
         publicIdentifier,
         pubkeyPrefix: pubkey ? pubkey.slice(0, 12) : null,
         sigLength: typeof sig === 'string' ? sig.length : null,
         idPrefix: computedId ? computedId.slice(0, 12) : null
-      });
+      }, '[PublicGateway] Open join auth signature decode failed');
       return { ok: false, error: 'auth-signature-invalid' };
     }
 
     try {
       const ok = await schnorr.verify(sigBytes, msgBytes, pubkeyBytes);
       if (!ok) {
-        this.logger?.warn?.('[PublicGateway] Open join auth signature invalid', {
+        this.logger?.warn?.( {
           relayKey,
           publicIdentifier,
           pubkeyPrefix: pubkey ? pubkey.slice(0, 12) : null,
           idPrefix: computedId ? computedId.slice(0, 12) : null
-        });
+        }, '[PublicGateway] Open join auth signature invalid');
         return { ok: false, error: 'auth-signature-invalid' };
       }
     } catch (error) {
-      this.logger?.warn?.('[PublicGateway] Open join auth signature verify error', {
+      this.logger?.warn?.( {
         relayKey,
         publicIdentifier,
         error: error?.message || error
-      });
+      }, '[PublicGateway] Open join auth signature verify error');
       return { ok: false, error: 'auth-signature-invalid' };
     }
 
@@ -925,13 +925,13 @@ class PublicGatewayService {
     });
 
     this.relayTelemetryUnsub = host.registerTelemetrySink((event) => {
-      this.logger?.debug?.('[HyperbeeRelayHost] Telemetry', event);
+      this.logger?.info?.(event, '[HyperbeeRelayHost] Telemetry');
     });
 
     try {
       await host.start();
     } catch (error) {
-      this.logger?.error?.('Failed to start Hyperbee relay host', { error: error?.message });
+      this.logger?.error?.( { error: error?.message }, 'Failed to start Hyperbee relay host');
       if (this.relayTelemetryUnsub) {
         this.relayTelemetryUnsub();
         this.relayTelemetryUnsub = null;
@@ -947,9 +947,9 @@ class PublicGatewayService {
         getCore: () => this.relayHost?.getCore?.()
       }
     });
-    this.logger?.info?.('Hyperbee relay host ready', {
+    this.logger?.info?.( {
       relayKey: host.getPublicKey()
-    });
+    }, 'Hyperbee relay host ready');
 
     this.relayWebsocketController = new RelayWebsocketController({
       relayHost: host,
@@ -971,9 +971,9 @@ class PublicGatewayService {
     const refreshIntervalMs = Math.max(60000, Math.floor((ttlSeconds * 1000) / 2));
     this.internalRegistrationInterval = setInterval(() => {
       this.#ensureInternalRelayRegistration().catch((error) => {
-        this.logger?.debug?.('Failed to refresh internal relay registration', {
+        this.logger?.debug?.( {
           error: error?.message || error
-        });
+        }, 'Failed to refresh internal relay registration');
       });
     }, refreshIntervalMs);
     this.internalRegistrationInterval.unref?.();
@@ -1023,18 +1023,18 @@ class PublicGatewayService {
       if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
       else if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
       else if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
-        this.logger?.warn?.('Unsupported protocol for public gateway base URL', {
+        this.logger?.warn?.( {
           protocol: parsed.protocol,
           baseUrl
-        });
+        }, 'Unsupported protocol for public gateway base URL');
         return '';
       }
       return parsed.toString().replace(/\/$/, '');
     } catch (error) {
-      this.logger?.warn?.('Failed to compute websocket base from public URL', {
+      this.logger?.warn?.( {
         baseUrl,
         error: error?.message || error
-      });
+      }, 'Failed to compute websocket base from public URL');
       return '';
     }
   }
@@ -1050,10 +1050,10 @@ class PublicGatewayService {
         return parsed.pathname || '/.well-known/hypertuna-gateway-secret';
       }
     } catch (error) {
-      this.logger?.warn?.('Failed to parse discovery secret path as URL', {
+      this.logger?.warn?.( {
         secretPath,
         error: error?.message || error
-      });
+      }, 'Failed to parse discovery secret path as URL');
     }
     return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
   }
@@ -1098,11 +1098,11 @@ class PublicGatewayService {
 
   #handleWebSocket(ws, req) {
     this.#initializeSession(ws, req).catch((error) => {
-      this.logger.error?.('Failed to initialize websocket session', {
+      this.logger.error?.( {
         error: error?.message || 'unknown error',
         stack: error?.stack || null,
         relayKey: error?.relayKey || null
-      });
+      }, 'Failed to initialize websocket session');
       try {
         ws.close(1011, 'Internal error');
       } catch (_) {}
@@ -1121,9 +1121,9 @@ class PublicGatewayService {
     const { relayKey, token } = this.#parseWebSocketRequest(req);
 
     if (!relayKey) {
-      this.logger.warn?.('WebSocket rejected: invalid relay key', {
+      this.logger.warn?.( {
         url: req?.url || null
-      });
+      }, 'WebSocket rejected: invalid relay key');
       ws.close(4404, 'Invalid relay key');
       ws.terminate();
       return;
@@ -1131,7 +1131,7 @@ class PublicGatewayService {
 
     const registration = await this.registrationStore.getRelay(relayKey);
     if (!registration) {
-      this.logger.warn?.('WebSocket rejected: relay not registered', { relayKey });
+      this.logger.warn?.( { relayKey }, 'WebSocket rejected: relay not registered');
       ws.close(4404, 'Relay not registered');
       ws.terminate();
       return;
@@ -1142,7 +1142,7 @@ class PublicGatewayService {
     let tokenValidation = null;
     if (requiresAuth) {
       if (!token) {
-        this.logger.warn?.('WebSocket rejected: token missing', { relayKey });
+        this.logger.warn?.( { relayKey }, 'WebSocket rejected: token missing');
         ws.close(4403, 'Token required');
         ws.terminate();
         return;
@@ -1150,7 +1150,7 @@ class PublicGatewayService {
 
       tokenValidation = await this.#validateToken(token, relayKey);
       if (!tokenValidation) {
-        this.logger.warn?.('WebSocket rejected: token validation failed', { relayKey });
+        this.logger.warn?.( { relayKey }, 'WebSocket rejected: token validation failed');
         ws.close(4403, 'Invalid token');
         ws.terminate();
         return;
@@ -1164,11 +1164,11 @@ class PublicGatewayService {
       || registration?.gatewayReplica?.delegateReqToPeers === true;
 
     const availablePeers = this.#getUsablePeersFromRegistration(registration);
-    this.logger.info?.('Initializing websocket session - relay registration fetched', {
+    this.logger.info?.( {
       relayKey,
       peerCount: availablePeers.length,
       peers: availablePeers
-    });
+    }, 'Initializing websocket session - relay registration fetched');
 
     const selection = this.#selectPeer({ ...registration, peers: availablePeers });
     const supportsLocal = this.#supportsLocalRelay(registration);
@@ -1183,7 +1183,7 @@ class PublicGatewayService {
       peers = selection.peers;
       peerIndex = selection.index >= 0 ? selection.index : 0;
     } else if (!localOnly) {
-      this.logger.warn?.('WebSocket rejected: no peers available', { relayKey });
+      this.logger.warn?.( { relayKey }, 'WebSocket rejected: no peers available');
       ws.close(1013, 'No peers available');
       ws.terminate();
       return;
@@ -1191,26 +1191,26 @@ class PublicGatewayService {
 
     if (!localOnly && peerKey) {
       try {
-        this.logger.info?.('Attempting hyperswarm connection for websocket session', {
+        this.logger.info?.( {
           relayKey,
           peerKey
-        });
+        }, 'Attempting hyperswarm connection for websocket session');
         await this.connectionPool.getConnection(peerKey);
-        this.logger.info?.('Hyperswarm connection established for websocket session', {
+        this.logger.info?.( {
           relayKey,
           peerKey
-        });
+        }, 'Hyperswarm connection established for websocket session');
       } catch (err) {
         err.relayKey = relayKey;
-        this.logger.error?.('WebSocket rejected: failed to connect to peer', {
+        this.logger.error?.( {
           relayKey,
           peerKey,
           error: err?.message || 'unknown error'
-        });
+        }, 'WebSocket rejected: failed to connect to peer');
         throw err;
       }
     } else if (localOnly) {
-      this.logger.info?.('WebSocket session using local Hyperbee host', { relayKey });
+      this.logger.info?.( { relayKey }, 'WebSocket session using local Hyperbee host');
     }
 
     const connectionKey = this.#generateConnectionKey();
@@ -1256,7 +1256,7 @@ class PublicGatewayService {
       });
     }
 
-    this.logger.info?.('WebSocket session established', { relayKey, connectionKey, peerKey });
+    this.logger.info?.( { relayKey, connectionKey, peerKey }, 'WebSocket session established');
   }
 
   #generateConnectionKey() {
@@ -1315,7 +1315,7 @@ class PublicGatewayService {
     const { allowQueue = true, subscriptionId = null, storePending = false } = options || {};
     const serialized = typeof msg === 'string' ? msg : safeString(msg);
     if (!serialized) {
-      this.logger.warn?.('Failed to serialize legacy message', { relayKey: session.relayKey });
+      this.logger.warn?.( { relayKey: session.relayKey }, 'Failed to serialize legacy message');
       return;
     }
 
@@ -1391,11 +1391,11 @@ class PublicGatewayService {
             reason: 'no-peers-available'
           }, 'DelegationDebug: queueing delegated message while peers unavailable');
         }
-        this.logger.debug?.('Queued delegated relay message pending peer availability', {
+        this.logger.debug?.( {
           relayKey: session?.relayKey,
           connectionKey: session?.connectionKey,
           queueLength: session.pendingDelegatedMessages.length
-        });
+        }, 'Queued delegated relay message pending peer availability');
         if (session.delegationReady) {
           this.#scheduleDelegationFallback(session);
         }
@@ -1427,11 +1427,11 @@ class PublicGatewayService {
             reason: 'no-peers-available'
           }, 'DelegationDebug: re-queueing delegated message without peers');
         }
-        this.logger.debug?.('Re-queued delegated relay message while peers unavailable', {
+        this.logger.debug?.( {
           relayKey: session?.relayKey,
           connectionKey: session?.connectionKey,
           queueLength: session.pendingDelegatedMessages.length
-        });
+        }, 'Re-queued delegated relay message while peers unavailable');
         if (session.delegationReady) {
           this.#scheduleDelegationFallback(session);
         }
@@ -1447,9 +1447,9 @@ class PublicGatewayService {
             delegateReqToPeers: session?.delegateReqToPeers === true
           }, 'DelegationDebug: skipping delegation - peers unavailable and queue disabled');
         }
-        this.logger.debug?.('Legacy forward skipped - no peers available for relay', {
+        this.logger.debug?.( {
           relayKey: session?.relayKey
-        });
+        }, 'Legacy forward skipped - no peers available for relay');
       }
       return;
     }
@@ -1544,18 +1544,18 @@ class PublicGatewayService {
           });
           pendingEntry = session.pendingDelegatedMessages[session.pendingDelegatedMessages.length - 1];
         }
-        this.logger.debug?.('Queued delegated relay message while awaiting peer', {
+        this.logger.debug?.( {
           relayKey: session?.relayKey,
           connectionKey: session?.connectionKey,
           queueLength: session.pendingDelegatedMessages.length
-        });
+        }, 'Queued delegated relay message while awaiting peer');
         if (session.delegationReady) {
           this.#scheduleDelegationFallback(session);
         }
         return;
       }
 
-      this.logger.warn?.('Forwarding message failed', { relayKey: session.relayKey, error: error.message });
+      this.logger.warn?.( { relayKey: session.relayKey, error: error.message }, 'Forwarding message failed');
       if (session.ws.readyState === WebSocket.OPEN) {
         session.ws.send(JSON.stringify(['NOTICE', `Error: ${error.message}`]));
       } else {
@@ -1588,22 +1588,22 @@ class PublicGatewayService {
           break;
         }
       } catch (error) {
-        this.logger.debug?.('Failed to flush delegated message to peer', {
+        this.logger.debug?.( {
           relayKey: session?.relayKey,
           connectionKey: session?.connectionKey,
           error: error?.message || error
-        });
+        }, 'Failed to flush delegated message to peer');
         if (entry) {
           entry.retryCount = (entry.retryCount || 0) + 1;
           const maxRetries = 5;
           if (entry.retryCount <= maxRetries) {
             session.pendingDelegatedMessages.unshift(entry);
           } else {
-            this.logger.warn?.('Dropping delegated message after max retries', {
+            this.logger.warn?.( {
               relayKey: session?.relayKey,
               connectionKey: session?.connectionKey,
               subscriptionId: entry?.subscriptionId || null
-            });
+            }, 'Dropping delegated message after max retries');
           }
         }
         this.#scheduleDelegationFallback(session);
@@ -1658,7 +1658,7 @@ class PublicGatewayService {
           }
         }
       } catch (error) {
-        this.logger.debug?.('Event polling error', { relayKey: session.relayKey, error: error.message });
+        this.logger.debug?.( { relayKey: session.relayKey, error: error.message }, 'Event polling error');
       } finally {
         const timer = setTimeout(run, 1000);
         timer.unref?.();
@@ -1713,11 +1713,11 @@ class PublicGatewayService {
           this.relayWebsocketController?.updateSubscriptionCursor?.(session.connectionKey, subscriptionId, newestTimestamp);
         }
       } catch (error) {
-        this.logger.debug?.('Local Hyperbee poll failed', {
+        this.logger.debug?.( {
           relayKey: session.relayKey,
           subscriptionId,
           error: error?.message || error
-        });
+        }, 'Local Hyperbee poll failed');
       }
     }
   }
@@ -1793,11 +1793,11 @@ class PublicGatewayService {
         if (Array.isArray(session.pendingDelegatedMessages) && session.pendingDelegatedMessages.length) {
           this.#cancelDelegationFallback(session);
           this.#flushPendingDelegatedMessages(session).catch((error) => {
-            this.logger?.debug?.('Failed to flush pending messages after peer sync', {
+            this.logger?.debug?.( {
               relayKey,
               connectionKey: session.connectionKey,
               error: error?.message || error
-            });
+            }, 'Failed to flush pending messages after peer sync');
           });
         }
       } else {
@@ -1876,10 +1876,10 @@ class PublicGatewayService {
       const peerKey = peers[index];
 
       if (!this.#isPeerUsable(peerKey)) {
-        this.logger?.debug?.('Skipping unreachable peer for relay request', {
+        this.logger?.debug?.( {
           relayKey,
           peerKey
-        });
+        }, 'Skipping unreachable peer for relay request');
         continue;
       }
 
@@ -1890,11 +1890,11 @@ class PublicGatewayService {
         return handler(peerKey, registration);
       } catch (error) {
         lastError = error;
-        this.logger.warn?.('Failed to use peer for drive request', {
+        this.logger.warn?.( {
           relayKey,
           peerKey,
           error: error?.message || error
-        });
+        }, 'Failed to use peer for drive request');
         this.#markPeerUnreachable(peerKey, {
           reason: 'get-connection-failed',
           error: error?.message || error
@@ -2068,10 +2068,10 @@ class PublicGatewayService {
 
     if (!session.peers?.length) {
       if (sessionSupportsDelegation) {
-        this.logger?.debug?.('Delegated session waiting for peer availability', {
+        this.logger?.debug?.( {
           relayKey: session?.relayKey,
           connectionKey: session?.connectionKey
-        });
+        }, 'Delegated session waiting for peer availability');
         throw new Error('delegated-session-awaiting-peer');
       }
       throw new Error('No peers registered for relay');
@@ -2091,10 +2091,10 @@ class PublicGatewayService {
       if (!peerKey) break;
 
       if (!this.#isPeerUsable(peerKey)) {
-        this.logger?.debug?.('Skipping unreachable peer for session', {
+        this.logger?.debug?.( {
           relayKey: session.relayKey,
           peerKey
-        });
+        }, 'Skipping unreachable peer for session');
         this.#advancePeer(session);
         attempts += 1;
         continue;
@@ -2104,10 +2104,10 @@ class PublicGatewayService {
         const result = await handler(peerKey);
         session.peerKey = peerKey;
         this.#markPeerReachable(peerKey, { relayKey: session.relayKey, timestamp: Date.now() });
-        this.logger.info?.('Peer operation succeeded', {
+        this.logger.info?.( {
           relayKey: session.relayKey,
           peerKey
-        });
+        }, 'Peer operation succeeded');
         if (session.delegateReqToPeers) {
           session.localOnly = false;
           this.#cancelDelegationFallback(session);
@@ -2115,15 +2115,15 @@ class PublicGatewayService {
         return result;
       } catch (error) {
         lastError = error;
-        this.logger.warn?.('Peer operation failed', {
+        this.logger.warn?.( {
           relayKey: session.relayKey,
           peerKey,
           error: error.message
-        });
-        this.logger.info?.('Advancing to next peer after failure', {
+        }, 'Peer operation failed');
+        this.logger.info?.( {
           relayKey: session.relayKey,
           previousPeer: peerKey
-        });
+        }, 'Advancing to next peer after failure');
         this.#advancePeer(session);
         attempts += 1;
       }
@@ -2202,10 +2202,10 @@ class PublicGatewayService {
         });
         this.#emitPublicGatewayStatus();
       } catch (error) {
-        this.logger?.warn?.('Failed to update replica telemetry for peer', {
+        this.logger?.warn?.( {
           peer: publicKey,
           error: error?.message || error
-        });
+        }, 'Failed to update replica telemetry for peer');
       }
     }
   }
@@ -2300,9 +2300,9 @@ class PublicGatewayService {
           return keys;
         }
       } catch (error) {
-        this.logger?.debug?.('Failed to list relay keys via store implementation', {
+        this.logger?.debug?.( {
           error: error?.message || error
-        });
+        }, 'Failed to list relay keys via store implementation');
       }
     }
 
@@ -2328,11 +2328,11 @@ class PublicGatewayService {
     for (const relayKey of relayKeys) {
       const metadataEntry = this.peerMetadata.get(peerKey);
       if (!metadataEntry?.unreachableSince) {
-        this.logger?.debug?.('Peer removal aborted – peer reachable again', {
+        this.logger?.debug?.( {
           peer: peerKey,
           relayKey,
           reason
-        });
+        }, 'Peer removal aborted – peer reachable again');
         break;
       }
 
@@ -2369,18 +2369,18 @@ class PublicGatewayService {
           this.relayPeerIndex.set(relayKey, nextIndex);
         }
 
-        this.logger?.info?.('Removed unreachable peer from relay registration', {
+        this.logger?.info?.( {
           relayKey,
           peer: peerKey,
           reason
-        });
+        }, 'Removed unreachable peer from relay registration');
         removedRelays.push(relayKey);
       } catch (removalError) {
-        this.logger?.warn?.('Failed to remove unreachable peer from relay registration', {
+        this.logger?.warn?.( {
           relayKey,
           peer: peerKey,
           error: removalError?.message || removalError
-        });
+        }, 'Failed to remove unreachable peer from relay registration');
       }
     }
 
@@ -2527,11 +2527,11 @@ class PublicGatewayService {
       }
     })();
 
-    this.logger.debug('[PublicGateway] Replica status updated', {
+    this.logger.info({
       relayCount,
       peerCount,
       updatedAt: this.publicGatewayStatusUpdatedAt
-    });
+    }, '[PublicGateway] Replica status updated');
   }
 
   #handleDispatcherAssignment({ jobId, peerId, assignedAt, job }) {
@@ -2665,9 +2665,9 @@ class PublicGatewayService {
 
       res.json(response);
     } catch (error) {
-      this.logger?.error?.('[PublicGateway] Failed to compose blind-peer status response', {
+      this.logger?.error?.( {
         err: error?.message || error
-      });
+      }, '[PublicGateway] Failed to compose blind-peer status response');
       res.status(500).json({ error: 'blind-peer-status-unavailable' });
     }
   }
@@ -2703,9 +2703,9 @@ class PublicGatewayService {
       }
       res.json({ replicas });
     } catch (error) {
-      this.logger?.error?.('[PublicGateway] Failed to compose blind-peer replica response', {
+      this.logger?.error?.( {
         err: error?.message || error
-      });
+      }, '[PublicGateway] Failed to compose blind-peer replica response');
       res.status(500).json({ error: 'blind-peer-replicas-unavailable' });
     }
   }
@@ -2722,9 +2722,9 @@ class PublicGatewayService {
       const result = await this.blindPeerService.runHygiene(reason);
       res.json({ ok: true, result });
     } catch (error) {
-      this.logger?.error?.('[PublicGateway] Manual blind peer GC failed', {
+      this.logger?.error?.( {
         err: error?.message || error
-      });
+      }, '[PublicGateway] Manual blind peer GC failed');
       res.status(500).json({ error: 'blind-peer-gc-failed', message: error?.message || String(error) });
     }
   }
@@ -2748,11 +2748,11 @@ class PublicGatewayService {
       if (isInputError) {
         return res.status(400).json({ error: 'invalid-core-key', message: 'Provided blind peer core key is invalid' });
       }
-      this.logger?.warn?.('[PublicGateway] Blind peer mirror deletion failed', {
+      this.logger?.warn?.( {
         key: keyParam,
         reason,
         err: error?.message || error
-      });
+      }, '[PublicGateway] Blind peer mirror deletion failed');
       res.status(500).json({ error: 'blind-peer-delete-failed', message: error?.message || String(error) });
     }
   }
@@ -2763,7 +2763,7 @@ class PublicGatewayService {
     try {
       return verifySignature(payload, signature, this.sharedSecret);
     } catch (error) {
-      this.logger?.warn?.('Signed payload verification failed', { error: error?.message || error });
+      this.logger?.warn?.( { error: error?.message || error }, 'Signed payload verification failed');
       return false;
     }
   }
@@ -2793,10 +2793,10 @@ class PublicGatewayService {
       this.tokenMetrics.issueCounter.inc({ result: 'success' });
       return res.json(result);
     } catch (error) {
-      this.logger?.error?.('Failed to issue relay token', {
+      this.logger?.error?.( {
         relayKey,
         error: error?.message || error
-      });
+      }, 'Failed to issue relay token');
       this.tokenMetrics.issueCounter.inc({ result: 'error' });
       return res.status(400).json({ error: error?.message || 'Failed to issue token' });
     }
@@ -2825,10 +2825,10 @@ class PublicGatewayService {
       this.tokenMetrics.refreshCounter.inc({ result: 'success' });
       return res.json(result);
     } catch (error) {
-      this.logger?.warn?.('Failed to refresh relay token', {
+      this.logger?.warn?.( {
         relayKey,
         error: error?.message || error
-      });
+      }, 'Failed to refresh relay token');
       this.tokenMetrics.refreshCounter.inc({ result: 'error' });
       return res.status(400).json({ error: error?.message || 'Failed to refresh token' });
     }
@@ -2857,10 +2857,10 @@ class PublicGatewayService {
       });
       return res.json({ status: 'revoked', disconnected, sequence: result?.sequence || null });
     } catch (error) {
-      this.logger?.warn?.('Failed to revoke relay token', {
+      this.logger?.warn?.( {
         relayKey,
         error: error?.message || error
-      });
+      }, 'Failed to revoke relay token');
       this.tokenMetrics.revokeCounter.inc({ result: 'error' });
       return res.status(400).json({ error: error?.message || 'Failed to revoke token' });
     }
@@ -2879,10 +2879,10 @@ class PublicGatewayService {
         try {
           session.ws.send(JSON.stringify(controlFrame));
         } catch (error) {
-          this.logger?.debug?.('Failed to send token revocation control frame', {
+          this.logger?.debug?.( {
             relayKey,
             error: error?.message || error
-          });
+          }, 'Failed to send token revocation control frame');
         }
         try {
           session.ws.close(4403, 'Token revoked');
@@ -2908,10 +2908,10 @@ class PublicGatewayService {
       try {
         payload = JSON.parse(Buffer.from(request.body).toString());
       } catch (error) {
-        this.logger.warn?.('Failed to parse Hyperswarm registration payload', {
+        this.logger.warn?.( {
           peer: peerKey,
           error: error?.message || error
-        });
+        }, 'Failed to parse Hyperswarm registration payload');
         return {
           statusCode: 400,
           headers: { 'content-type': 'application/json' },
@@ -2943,11 +2943,11 @@ class PublicGatewayService {
       try {
         await this.#mergeRelayRegistration(relayKey, peerKey, relayPayload, payload.gatewayReplica, now);
       } catch (error) {
-        this.logger.error?.('Failed to merge relay registration from peer', {
+        this.logger.error?.( {
           relayKey,
           peer: peerKey,
           error: error?.message || error
-        });
+        }, 'Failed to merge relay registration from peer');
       }
     }
 
@@ -2990,15 +2990,15 @@ class PublicGatewayService {
     const rawPeerKey = this.#getPeerRawKey(peerKey);
     const trustedInput = rawPeerKey || peerKey;
     if (!trustedInput) {
-      this.logger?.warn?.('[PublicGateway] Unable to add trusted peer (no key resolved)', {
+      this.logger?.warn?.( {
         peer: peerKey,
         payloadKeys: Object.keys(payload || {})
-      });
+      }, '[PublicGateway] Unable to add trusted peer (no key resolved)');
     } else {
-      this.logger?.info?.('[PublicGateway] Registering trusted peer', {
+      this.logger?.info?.( {
         peer: peerKey,
         usedRawKey: Buffer.isBuffer(trustedInput)
-      });
+      }, '[PublicGateway] Registering trusted peer');
       this.blindPeerService?.addTrustedPeer(trustedInput);
     }
 
@@ -3225,26 +3225,26 @@ class PublicGatewayService {
     record.blindPeer = this.#getBlindPeerSummary();
     await this.registrationStore.upsertRelay(relayKey, record);
     this.#storeRelayAliases(relayKey, record).catch((error) => {
-      this.logger?.warn?.('[PublicGateway] Failed to store relay aliases', {
+      this.logger?.warn?.( {
         relayKey,
         error: error?.message || error
-      });
+      }, '[PublicGateway] Failed to store relay aliases');
     });
     this.#syncSessionsWithRelay(relayKey, record);
     this.#markPeerReachable(peerKey, { relayKey, timestamp: now });
     const rawPeerKey = this.#getPeerRawKey(peerKey);
     const trustedInput = rawPeerKey || peerKey;
     if (!trustedInput) {
-      this.logger?.warn?.('[PublicGateway] Unable to trust relay peer (missing key)', {
+      this.logger?.warn?.( {
         peer: peerKey,
         relayKey
-      });
+      }, '[PublicGateway] Unable to trust relay peer (missing key)');
     } else {
-      this.logger?.info?.('[PublicGateway] Trusting relay peer for registration record', {
+      this.logger?.info?.( {
         peer: peerKey,
         relayKey,
         usedRawKey: Buffer.isBuffer(trustedInput)
-      });
+      }, '[PublicGateway] Trusting relay peer for registration record');
       this.blindPeerService?.addTrustedPeer(trustedInput);
     }
   }
@@ -3304,19 +3304,19 @@ class PublicGatewayService {
       const upsertPayload = relayCoreMetadata ? { ...registration, relayCores: relayCoreMetadata } : registration;
       await this.registrationStore.upsertRelay(registration.relayKey, upsertPayload);
       this.#storeRelayAliases(registration.relayKey, upsertPayload).catch((error) => {
-        this.logger?.warn?.('[PublicGateway] Failed to store relay aliases', {
+        this.logger?.warn?.( {
           relayKey: registration.relayKey,
           error: error?.message || error
-        });
+        }, '[PublicGateway] Failed to store relay aliases');
       });
-      this.logger.info?.('Relay registration accepted', { relayKey: registration.relayKey });
+      this.logger.info?.( { relayKey: registration.relayKey }, 'Relay registration accepted');
       const hyperbeeInfo = this.#getRelayHostInfo();
       return res.json({
         status: 'ok',
         hyperbee: hyperbeeInfo
       });
     } catch (error) {
-      this.logger.error?.('Failed to persist relay registration', { relayKey: registration.relayKey, error: error.message });
+      this.logger.error?.( { relayKey: registration.relayKey, error: error.message }, 'Failed to persist relay registration');
       return res.status(500).json({ error: 'Failed to persist registration' });
     }
   }
@@ -3343,10 +3343,10 @@ class PublicGatewayService {
 
     try {
       await this.registrationStore.removeRelay(relayKey);
-      this.logger.info?.('Relay unregistered', { relayKey });
+      this.logger.info?.( { relayKey }, 'Relay unregistered');
       return res.json({ status: 'ok' });
     } catch (error) {
-      this.logger.error?.('Failed to unregister relay', { relayKey, error: error.message });
+      this.logger.error?.( { relayKey, error: error.message }, 'Failed to unregister relay');
       return res.status(500).json({ error: 'Failed to unregister relay' });
     }
   }
@@ -3377,10 +3377,10 @@ class PublicGatewayService {
       };
       return res.json(payload);
     } catch (error) {
-      this.logger?.warn?.('[PublicGateway] Failed to fetch relay mirror metadata', {
+      this.logger?.warn?.( {
         relayKey,
         err: error?.message || error
-      });
+      }, '[PublicGateway] Failed to fetch relay mirror metadata');
       return res.status(500).json({ error: 'relay-mirror-metadata-unavailable' });
     }
   }
@@ -3444,11 +3444,11 @@ class PublicGatewayService {
       updatedAt: payload?.updatedAt || now
     });
 
-    this.logger?.info?.('[PublicGateway] Open join pool updated', {
+    this.logger?.info?.( {
       relayKey,
       received: entriesRaw.length,
       stored: sanitized.length
-    });
+    }, '[PublicGateway] Open join pool updated');
 
     return res.json({
       status: 'ok',
@@ -3478,10 +3478,10 @@ class PublicGatewayService {
 
       const publicIdentifier = record?.metadata?.identifier || relayKey;
       const { challenge, expiresAt } = this.#issueOpenJoinChallenge({ relayKey, publicIdentifier });
-      this.logger?.info?.('[PublicGateway] Open join challenge issued', {
+      this.logger?.info?.( {
         relayKey,
         publicIdentifier
-      });
+      }, '[PublicGateway] Open join challenge issued');
       return res.json({
         relayKey,
         publicIdentifier,
@@ -3490,10 +3490,10 @@ class PublicGatewayService {
         gateway: this.config?.publicBaseUrl || null
       });
     } catch (error) {
-      this.logger?.warn?.('[PublicGateway] Failed to issue open join challenge', {
+      this.logger?.warn?.( {
         identifier,
         err: error?.message || error
-      });
+      }, '[PublicGateway] Failed to issue open join challenge');
       return res.status(500).json({ error: 'open-join-challenge-unavailable' });
     }
   }
@@ -3554,22 +3554,22 @@ class PublicGatewayService {
       }
 
       if (!lease) {
-        this.logger?.warn?.('[PublicGateway] Open join lease unavailable', {
+        this.logger?.warn?.( {
           relayKey,
           publicIdentifier,
           identifier
-        });
+        }, '[PublicGateway] Open join lease unavailable');
         return res.status(409).json({ error: 'open-join-empty' });
       }
 
       const mirrorPayload = this.#buildOpenJoinMirrorPayload(record, relayKey);
       const writerCoreHex = normalizeHexKey(lease?.writerCoreHex || lease?.writer_core_hex || null);
       const autobaseLocal = normalizeHexKey(lease?.autobaseLocal || lease?.autobase_local || null);
-      this.logger?.info?.('[PublicGateway] Open join lease issued', {
+      this.logger?.info?.( {
         relayKey,
         publicIdentifier,
         writerCore: lease.writerCore ? lease.writerCore.slice(0, 16) : null
-      });
+      }, '[PublicGateway] Open join lease issued');
       return res.json({
         relayKey,
         publicIdentifier,
@@ -3582,10 +3582,10 @@ class PublicGatewayService {
         ...mirrorPayload
       });
     } catch (error) {
-      this.logger?.warn?.('[PublicGateway] Open join request failed', {
+      this.logger?.warn?.( {
         identifier,
         err: error?.message || error
-      });
+      }, '[PublicGateway] Open join request failed');
       return res.status(500).json({ error: 'open-join-failed' });
     }
   }
@@ -3607,38 +3607,38 @@ class PublicGatewayService {
       try {
         return await this.tokenService.verifyToken(token, relayKey);
       } catch (error) {
-        this.logger.warn?.('Token verification failed', {
+        this.logger.warn?.( {
           relayKey,
           error: error?.message || error
-        });
+        }, 'Token verification failed');
         return null;
       }
     }
 
     const payload = verifyClientToken(token, this.sharedSecret);
     if (!payload) {
-      this.logger.warn?.('Token verification failed - signature mismatch', { relayKey });
+      this.logger.warn?.( { relayKey }, 'Token verification failed - signature mismatch');
       return null;
     }
 
     if (payload.relayKey && payload.relayKey !== relayKey) {
-      this.logger.warn?.('Token verification failed - relay mismatch', {
+      this.logger.warn?.( {
         relayKey,
         tokenRelayKey: payload.relayKey
-      });
+      }, 'Token verification failed - relay mismatch');
       return null;
     }
 
     if (payload.expiresAt && payload.expiresAt < Date.now()) {
-      this.logger.warn?.('Token verification failed - token expired', {
+      this.logger.warn?.( {
         relayKey,
         expiresAt: payload.expiresAt
-      });
+      }, 'Token verification failed - token expired');
       return null;
     }
 
     if (!payload.relayAuthToken || typeof payload.relayAuthToken !== 'string') {
-      this.logger.warn?.('Token verification failed - missing relay auth token', { relayKey });
+      this.logger.warn?.( { relayKey }, 'Token verification failed - missing relay auth token');
       return null;
     }
 
@@ -3676,11 +3676,11 @@ class PublicGatewayService {
     const normalized = this.#normalizePeerRawKey(rawValue) || this.#normalizePeerRawKey(peerKey);
     if (!normalized) return;
     this.peerRawPublicKeys.set(peerKey, normalized);
-    this.logger?.debug?.('[PublicGateway] Remembered peer raw key', {
+    this.logger?.debug?.( {
       peer: peerKey,
       sourceType: rawValue ? (Buffer.isBuffer(rawValue) ? 'buffer' : rawValue instanceof Uint8Array ? 'uint8array' : typeof rawValue) : 'string',
       byteLength: normalized.length
-    });
+    }, '[PublicGateway] Remembered peer raw key');
   }
 
   #getPeerRawKey(peerKey) {
@@ -3706,10 +3706,10 @@ class PublicGatewayService {
       try {
         return await this.#handleGatewayHyperswarmRegistration(publicKey, request);
       } catch (error) {
-        this.logger.error?.('Hyperswarm registration handler failed', {
+        this.logger.error?.( {
           peer: publicKey,
           error: error?.message || error
-        });
+        }, 'Hyperswarm registration handler failed');
         return {
           statusCode: 500,
           headers: { 'content-type': 'application/json' },
@@ -3775,12 +3775,12 @@ class PublicGatewayService {
   #onProtocolHandshake({ publicKey, protocol, handshake, stage = 'open' }) {
     if (!publicKey || !handshake) return;
 
-    this.logger.debug?.('[PublicGateway] Hyperswarm handshake event', {
+    this.logger.debug?.( {
       peer: publicKey,
       stage,
       role: handshake?.role ?? 'unknown',
       isGateway: handshake?.isGateway ?? 'unknown'
-    });
+    }, '[PublicGateway] Hyperswarm handshake event');
 
     const entry = this.peerMetadata.get(publicKey) || {};
     entry.handshake = handshake;
@@ -3820,17 +3820,17 @@ class PublicGatewayService {
       }).then(() => {
         this.#emitPublicGatewayStatus();
       }).catch((error) => {
-        this.logger?.warn?.('Failed to apply replica data from handshake', {
+        this.logger?.warn?.( {
           peer: publicKey,
           error: error?.message || error
-        });
+        }, 'Failed to apply replica data from handshake');
       });
 
       this.#attachHyperbeeReplication(publicKey, protocol, handshake).catch((error) => {
-        this.logger?.warn?.('[PublicGateway] Failed to initialise replication channel', {
+        this.logger?.warn?.( {
           peer: publicKey,
           error: error?.message || error
-        });
+        }, '[PublicGateway] Failed to initialise replication channel');
       });
 
       if (delegateReqToPeers === true) {
@@ -3841,10 +3841,10 @@ class PublicGatewayService {
       }
 
       this.#promoteDelegatedSessions(publicKey).catch((error) => {
-        this.logger?.warn?.('Failed to promote delegated sessions to peer', {
+        this.logger?.warn?.( {
           peer: publicKey,
           error: error?.message || error
-        });
+        }, 'Failed to promote delegated sessions to peer');
       });
 
       this.dispatcher?.reportPeerMetrics(publicKey, {
@@ -3905,13 +3905,13 @@ class PublicGatewayService {
           });
           session.assignPeer?.(peerKey, snapshot.subscriptionId);
         } catch (error) {
-          this.logger?.warn?.('Failed to delegate subscription to peer', {
+          this.logger?.warn?.( {
             relayKey: session.relayKey,
             connectionKey: session.connectionKey,
             subscriptionId: snapshot.subscriptionId,
             peerKey,
             error: error?.message || error
-          });
+          }, 'Failed to delegate subscription to peer');
         }
       }
     }
@@ -3970,10 +3970,10 @@ class PublicGatewayService {
         connectionKey,
         pendingDelegatedMessages: session.pendingDelegatedMessages.length
       }, 'DelegationDebug: delegation fallback timer firing');
-      this.logger?.debug?.('[PublicGateway] Delegation fallback triggered', {
+      this.logger?.debug?.( {
         relayKey: session.relayKey,
         connectionKey
-      });
+      }, '[PublicGateway] Delegation fallback triggered');
       await this.#fallbackToLocal(session);
     }, DELEGATION_FALLBACK_MS);
     timer.unref?.();
@@ -4000,22 +4000,22 @@ class PublicGatewayService {
     const originalLength = session.pendingDelegatedMessages.length;
     session.pendingDelegatedMessages = session.pendingDelegatedMessages.filter((entry) => entry?.subscriptionId !== subscriptionId);
     if (session.pendingDelegatedMessages.length !== originalLength) {
-      this.logger?.debug?.('[PublicGateway] Removed pending delegated message after peer ack', {
+      this.logger?.debug?.( {
         relayKey: session.relayKey,
         connectionKey: session.connectionKey,
         subscriptionId
-      });
+      }, '[PublicGateway] Removed pending delegated message after peer ack');
     }
   }
 
   #handlePeerAck(session, subscriptionId = null, ackPayload = []) {
     if (!session) return;
-    this.logger?.debug?.('[PublicGateway] Received delegated subscription ACK from peer', {
+    this.logger?.debug?.( {
       relayKey: session.relayKey,
       connectionKey: session.connectionKey,
       subscriptionId,
       payload: ackPayload
-    });
+    }, '[PublicGateway] Received delegated subscription ACK from peer');
     this.logger.info?.({
       tag: 'DelegationDebug',
       stage: 'peer-ack',
@@ -4033,11 +4033,11 @@ class PublicGatewayService {
     this.#cancelDelegationFallback(session);
     if (Array.isArray(session.pendingDelegatedMessages) && session.pendingDelegatedMessages.length) {
       this.#flushPendingDelegatedMessages(session).catch((error) => {
-        this.logger?.debug?.('[PublicGateway] Failed to flush pending delegated messages after ack', {
+        this.logger?.debug?.( {
           relayKey: session.relayKey,
           connectionKey: session.connectionKey,
           error: error?.message || error
-        });
+        }, '[PublicGateway] Failed to flush pending delegated messages after ack');
       });
     }
   }
@@ -4046,22 +4046,22 @@ class PublicGatewayService {
     if (!session) return;
     if (!Array.isArray(session.pendingDelegatedMessages) || !session.pendingDelegatedMessages.length) return;
     this.#cancelDelegationFallback(session);
-    this.logger?.info?.('[PublicGateway] Delegation fallback to local processing', {
+    this.logger?.info?.( {
       relayKey: session.relayKey,
       connectionKey: session.connectionKey,
       queued: session.pendingDelegatedMessages.length
-    });
+    }, '[PublicGateway] Delegation fallback to local processing');
     const pending = session.pendingDelegatedMessages.splice(0);
     session.localOnly = true;
     for (const entry of pending) {
       try {
         await this.relayWebsocketController?.handleMessage(session, entry.message);
       } catch (error) {
-        this.logger?.warn?.('[PublicGateway] Delegation fallback handling failed', {
+        this.logger?.warn?.( {
           relayKey: session.relayKey,
           connectionKey: session.connectionKey,
           error: error?.message || error
-        });
+        }, '[PublicGateway] Delegation fallback handling failed');
       }
     }
   }
@@ -4099,11 +4099,11 @@ class PublicGatewayService {
         this.#cancelDelegationFallback(session);
         if (!wasReady) {
           this.#flushPendingDelegatedMessages(session, peerKey).catch((error) => {
-            this.logger?.debug?.('[PublicGateway] Failed to flush pending delegated messages after enabling delegation', {
+            this.logger?.debug?.( {
               relayKey: session.relayKey,
               connectionKey: session.connectionKey,
               error: error?.message || error
-            });
+            }, '[PublicGateway] Failed to flush pending delegated messages after enabling delegation');
           });
         }
       } else {
@@ -4118,22 +4118,22 @@ class PublicGatewayService {
 
     const hostKey = this.relayHost.getPublicKey?.();
     if (hostKey && handshake?.hyperbeeKey && handshake.hyperbeeKey !== hostKey) {
-      this.logger?.debug?.('[PublicGateway] Replica handshake hyperbee key mismatch, skipping replication', {
+      this.logger?.debug?.( {
         peer: publicKey,
         expected: hostKey,
         received: handshake.hyperbeeKey
-      });
+      }, '[PublicGateway] Replica handshake hyperbee key mismatch, skipping replication');
       return;
     }
 
     const core = this.relayHost.getCore();
     if (!core) {
-      this.logger?.warn?.('[PublicGateway] Hyperbee relay core unavailable for replication', { peer: publicKey });
+      this.logger?.warn?.( { peer: publicKey }, '[PublicGateway] Hyperbee relay core unavailable for replication');
       return;
     }
 
     if (this.peerHyperbeeReplications.has(publicKey)) {
-      this.logger?.debug?.('[PublicGateway] Replication already active for peer', { peer: publicKey });
+      this.logger?.debug?.( { peer: publicKey }, '[PublicGateway] Replication already active for peer');
       return;
     }
 
@@ -4151,19 +4151,19 @@ class PublicGatewayService {
         logger: this.logger
       });
 
-      this.logger?.info?.('[PublicGateway] Outbound Hyperbee replication channel ready', {
+      this.logger?.info?.( {
         peer: publicKey,
         hyperbeeKey: hostKey,
         isInitiator,
         remoteHandshake
-      });
+      }, '[PublicGateway] Outbound Hyperbee replication channel ready');
 
       if (remoteHandshake?.version && remoteHandshake.version !== 1) {
-        this.logger?.warn?.('[PublicGateway] Remote replication channel version mismatch', {
+        this.logger?.warn?.( {
           peer: publicKey,
           expected: 1,
           received: remoteHandshake.version
-        });
+        }, '[PublicGateway] Remote replication channel version mismatch');
       }
 
       let replication;
@@ -4181,25 +4181,25 @@ class PublicGatewayService {
       }
 
       replication.on('handshake', () => {
-        this.logger?.debug?.('[PublicGateway] Hyperbee replication handshake (outbound)', {
+        this.logger?.debug?.( {
           peer: publicKey,
           isInitiator,
           localLength: core.length,
           remoteLength: core.remoteLength
-        });
+        }, '[PublicGateway] Hyperbee replication handshake (outbound)');
       });
 
       replication.on('error', (error) => {
-        this.logger?.warn?.('[PublicGateway] Hyperbee replication error (outbound)', {
+        this.logger?.warn?.( {
           peer: publicKey,
           error: error?.message || error
-        });
+        }, '[PublicGateway] Hyperbee replication error (outbound)');
       });
       replication.once('close', () => {
-        this.logger?.debug?.('[PublicGateway] Hyperbee replication stream closed (outbound)', {
+        this.logger?.debug?.( {
           peer: publicKey,
           isInitiator
-        });
+        }, '[PublicGateway] Hyperbee replication stream closed (outbound)');
       });
 
       stream.pipe(replication).pipe(stream);
@@ -4213,10 +4213,10 @@ class PublicGatewayService {
         }
       }).catch(() => {});
     } catch (error) {
-      this.logger?.warn?.('[PublicGateway] Failed to attach Hyperbee replication stream', {
+      this.logger?.warn?.( {
         peer: publicKey,
         error: error?.message || error
-      });
+      }, '[PublicGateway] Failed to attach Hyperbee replication stream');
     }
   }
 

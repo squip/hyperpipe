@@ -16,7 +16,7 @@ async function createRegistrationStore(config = {}, logger) {
       logger?.info?.('Using Redis registration store');
       return store;
     } catch (error) {
-      logger?.error?.('Failed to initialize Redis registration store, falling back to memory cache', { error: error.message });
+      logger?.error?.( { error: error.message }, 'Failed to initialize Redis registration store, falling back to memory cache');
     }
   }
 

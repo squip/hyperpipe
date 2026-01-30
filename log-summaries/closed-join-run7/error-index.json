@@ -1,0 +1,35 @@
+[
+  {
+    "id": "5f1636483ccf2c142257483222bf02cf74092fb6",
+    "count": 2,
+    "error": {
+      "message": "Peer returned status 500"
+    },
+    "traces": [],
+    "files": [
+      "/Users/essorensen/hypertuna-electron/test-logs/CLOSED-JOIN-WORKFLOW/test12/public-gateway.log"
+    ]
+  },
+  {
+    "id": "3e9b32a44a93120a50dd132b7a72b9b6a69e1104",
+    "count": 10,
+    "error": {
+      "message": "Peer returned status 404"
+    },
+    "traces": [],
+    "files": [
+      "/Users/essorensen/hypertuna-electron/test-logs/CLOSED-JOIN-WORKFLOW/test12/public-gateway.log"
+    ]
+  },
+  {
+    "id": "90c70ac3158655af9440e2e589303c1e52674aea",
+    "count": 2,
+    "error": {
+      "message": "Channel closed"
+    },
+    "traces": [],
+    "files": [
+      "/Users/essorensen/hypertuna-electron/test-logs/CLOSED-JOIN-WORKFLOW/test12/public-gateway.log"
+    ]
+  }
+]

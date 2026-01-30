@@ -27,7 +27,7 @@ class RedisRegistrationStore {
     this.client = createClient({ url: this.url });
     this.readyPromise = null;
     this.client.on('error', (err) => {
-      this.logger?.error?.('Redis registration store error', { error: err?.message || err });
+      this.logger?.error?.( { error: err?.message || err }, 'Redis registration store error');
     });
   }
 
@@ -88,7 +88,7 @@ class RedisRegistrationStore {
     try {
       return JSON.parse(value);
     } catch (error) {
-      this.logger?.warn?.('Failed to parse redis registration payload', { relayKey, error: error.message });
+      this.logger?.warn?.( { relayKey, error: error.message }, 'Failed to parse redis registration payload');
       return null;
     }
   }
@@ -127,7 +127,7 @@ class RedisRegistrationStore {
     try {
       return JSON.parse(value);
     } catch (error) {
-      this.logger?.warn?.('Failed to parse redis token metadata', { relayKey, error: error.message });
+      this.logger?.warn?.( { relayKey, error: error.message }, 'Failed to parse redis token metadata');
       return null;
     }
   }
@@ -166,7 +166,7 @@ class RedisRegistrationStore {
     try {
       return JSON.parse(value);
     } catch (error) {
-      this.logger?.warn?.('Failed to parse redis open-join pool payload', { relayKey, error: error.message });
+      this.logger?.warn?.( { relayKey, error: error.message }, 'Failed to parse redis open-join pool payload');
       return null;
     }
   }
@@ -272,14 +272,14 @@ class RedisRegistrationStore {
     } else {
       await this.client.set(this.#mirrorKey(relayKey), record);
     }
-    this.logger?.info?.(`${CJTRACE_TAG} mirror metadata stored`, {
+    this.logger?.info?.( {
       relayKey,
       closedJoin: isClosedJoin,
       ttlSeconds,
       coreCount,
       mirrorSource: payload?.mirrorSource || null,
       updatedAt: payload?.updatedAt ?? null
-    });
+    }, `${CJTRACE_TAG} mirror metadata stored`);
   }
 
   async getMirrorMetadata(relayKey) {
@@ -290,7 +290,7 @@ class RedisRegistrationStore {
       const parsed = JSON.parse(value);
       return parsed?.payload || null;
     } catch (error) {
-      this.logger?.warn?.('Failed to parse redis mirror metadata payload', { relayKey, error: error.message });
+      this.logger?.warn?.( { relayKey, error: error.message }, 'Failed to parse redis mirror metadata payload');
       return null;
     }
   }
@@ -312,11 +312,11 @@ class RedisRegistrationStore {
       storedAt: Date.now()
     });
     await this.client.set(this.#closedJoinKey(relayKey), record);
-    this.logger?.info?.(`${CJTRACE_TAG} closed join cores stored`, {
+    this.logger?.info?.( {
       relayKey,
       coreCount: cores.length,
       updatedAt: Array.isArray(payload) ? null : (payload?.updatedAt ?? null)
-    });
+    }, `${CJTRACE_TAG} closed join cores stored`);
   }
 
   async getClosedJoinCoreRefs(relayKey) {
@@ -327,10 +327,10 @@ class RedisRegistrationStore {
       const parsed = JSON.parse(value);
       return parsed?.payload || null;
     } catch (error) {
-      this.logger?.warn?.('Failed to parse redis closed-join core payload', {
+      this.logger?.warn?.( {
         relayKey,
         error: error.message
-      });
+      }, 'Failed to parse redis closed-join core payload');
       return null;
     }
   }

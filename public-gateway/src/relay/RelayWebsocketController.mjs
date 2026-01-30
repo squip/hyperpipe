@@ -108,10 +108,10 @@ export default class RelayWebsocketController {
       this.#sendOk(session, event.id || null, success, success ? 'stored' : result?.reason || 'rejected');
     } catch (error) {
       this.#incrementEvent('error');
-      this.logger.error?.('[RelayWebsocketController] Failed to persist event', {
+      this.logger.error?.( {
         error: error?.message || error,
         eventId: event?.id || null
-      });
+      }, '[RelayWebsocketController] Failed to persist event');
       this.#sendOk(session, event?.id || null, false, error?.message || 'append-error');
     }
   }
@@ -210,22 +210,22 @@ export default class RelayWebsocketController {
           } catch (error) {
             this.dispatcher.fail(subscriptionId, { peerId: decision.assignedPeer, error: error?.message || error });
             this.#incrementError('dispatch-forward');
-            this.logger.error?.('[RelayWebsocketController] Assigned peer forwarding failed', {
+            this.logger.error?.( {
               relayKey: session.relayKey,
               subscriptionId,
               peerId: decision.assignedPeer,
               error: error?.message || error
-            });
+            }, '[RelayWebsocketController] Assigned peer forwarding failed');
             await this.#forwardLegacy(session, rawMessage, null, { subscriptionId, storePending: true });
           }
           return;
         }
       } catch (error) {
         this.#incrementReq('schedule-error');
-        this.logger.error?.('[RelayWebsocketController] Dispatcher scheduling failed', {
+        this.logger.error?.( {
           error: error?.message || error,
           relayKey: session.relayKey
-        });
+        }, '[RelayWebsocketController] Dispatcher scheduling failed');
         await this.#forwardLegacy(session, rawMessage, null, { subscriptionId, storePending: true });
       }
       return;
@@ -254,11 +254,11 @@ export default class RelayWebsocketController {
           queuedAt: Date.now(),
           subscriptionId
         });
-        this.logger.debug?.('[RelayWebsocketController] Queued delegated frame while session is local-only', {
+        this.logger.debug?.( {
           relayKey: session.relayKey,
           connectionKey: session.connectionKey,
           queueLength: session.pendingDelegatedMessages.length
-        });
+        }, '[RelayWebsocketController] Queued delegated frame while session is local-only');
       }
       return;
     }
@@ -267,10 +267,10 @@ export default class RelayWebsocketController {
       await this.legacyForward(session, rawMessage, targetPeer, context);
     } catch (error) {
       this.#incrementError('legacy-forward');
-      this.logger.warn?.('[RelayWebsocketController] Legacy forward failed', {
+      this.logger.warn?.( {
         error: error?.message || error,
         relayKey: session.relayKey
-      });
+      }, '[RelayWebsocketController] Legacy forward failed');
       this.#sendNotice(session, `Legacy forwarding error: ${error?.message || error}`);
     }
   }
@@ -350,10 +350,10 @@ export default class RelayWebsocketController {
     }
 
     if (session?.delegateReqToPeers === true && session?.localOnly !== true) {
-      this.logger.debug?.('[RelayWebsocketController] Skipping local serve due to delegation preference', {
+      this.logger.debug?.( {
         relayKey: session.relayKey,
         subscriptionId
-      });
+      }, '[RelayWebsocketController] Skipping local serve due to delegation preference');
       return null;
     }
 
@@ -394,11 +394,11 @@ export default class RelayWebsocketController {
         delivered: filteredEvents.length
       };
     } catch (error) {
-      this.logger.warn?.('[RelayWebsocketController] Hyperbee query failed, falling back to peers', {
+      this.logger.warn?.( {
         error: error?.message || error,
         relayKey: session.relayKey,
         subscriptionId
-      });
+      }, '[RelayWebsocketController] Hyperbee query failed, falling back to peers');
       this.#incrementError('hyperbee-query');
       return null;
     }

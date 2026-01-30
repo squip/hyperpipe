@@ -83,9 +83,9 @@ export default class BlindPeerReplicaManager extends EventEmitter {
         this.#upsertFromReadiness(record);
       }
     } catch (error) {
-      this.logger?.debug?.('[BlindPeerReplicaManager] Failed to seed replica snapshot', {
+      this.logger?.debug?.( {
         error: error?.message || error
-      });
+      }, '[BlindPeerReplicaManager] Failed to seed replica snapshot');
     }
   }
 
@@ -145,9 +145,9 @@ export default class BlindPeerReplicaManager extends EventEmitter {
       try {
         await store.ready();
       } catch (error) {
-        this.logger?.debug?.('[BlindPeerReplicaManager] Failed to ready blind-peer corestore', {
+        this.logger?.debug?.( {
           error: error?.message || error
-        });
+        }, '[BlindPeerReplicaManager] Failed to ready blind-peer corestore');
       }
     }
     if (typeof store.namespace === 'function') {
@@ -226,9 +226,9 @@ export default class BlindPeerReplicaManager extends EventEmitter {
     if (replica.totalCores === 0) {
       this.replicas.delete(replicaKey);
       this.#closeReplica(replica).catch((error) => {
-        this.logger?.debug?.('[BlindPeerReplicaManager] Failed to close replica core', {
+        this.logger?.debug?.( {
           error: error?.message || error
-        });
+        }, '[BlindPeerReplicaManager] Failed to close replica core');
       });
       this.emit('replica-removed', {
         identifier: replica.identifier,
@@ -264,23 +264,23 @@ export default class BlindPeerReplicaManager extends EventEmitter {
           replica.lagMs = Math.max(0, info.length - info.contiguousLength);
         }
       } else {
-        this.logger?.warn?.('[BlindPeerReplicaManager] Core info unavailable', {
+        this.logger?.warn?.( {
           identifier: replica.identifier,
           ownerPeerKey: replica.ownerPeerKey,
           coreKey
-        });
+        }, '[BlindPeerReplicaManager] Core info unavailable');
       }
       core.once?.('close', () => {
         replica.core = null;
       });
       return core;
     } catch (error) {
-      this.logger?.warn?.('[BlindPeerReplicaManager] Failed to open replica core', {
+      this.logger?.warn?.( {
         identifier: replica.identifier,
         ownerPeerKey: replica.ownerPeerKey,
         coreKey,
         error: serializeError(error)
-      });
+      }, '[BlindPeerReplicaManager] Failed to open replica core');
       return null;
     }
   }
@@ -290,10 +290,10 @@ export default class BlindPeerReplicaManager extends EventEmitter {
       try {
         await replica.core.close();
       } catch (error) {
-        this.logger?.debug?.('[BlindPeerReplicaManager] Replica core close failed', {
+        this.logger?.debug?.( {
           identifier: replica?.identifier,
           error: error?.message || error
-        });
+        }, '[BlindPeerReplicaManager] Replica core close failed');
       }
     }
     replica.core = null;
@@ -354,9 +354,9 @@ export default class BlindPeerReplicaManager extends EventEmitter {
       const [key, replica] = entries.shift();
       this.replicas.delete(key);
       this.#closeReplica(replica).catch((error) => {
-        this.logger?.debug?.('[BlindPeerReplicaManager] Failed to close LRU replica', {
+        this.logger?.debug?.( {
           error: error?.message || error
-        });
+        }, '[BlindPeerReplicaManager] Failed to close LRU replica');
       });
     }
   }

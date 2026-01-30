@@ -47,13 +47,13 @@ class GatewayAdvertiser {
     this.cachedAnnouncement = null;
     this.cachedBuffer = null;
     this.cachedAt = 0;
-    this.logger?.debug?.('[GatewayAdvertiser] Initialized discovery advertiser', {
+    this.logger?.debug?.( {
       enabled: !!this.config.enabled,
       openAccess: !!this.config.openAccess,
       secretUrl: this.secretUrl,
       ttl: this.ttl,
       refreshInterval: this.refreshInterval
-    });
+    }, '[GatewayAdvertiser] Initialized discovery advertiser');
   }
 
   isEnabled() {
@@ -73,28 +73,28 @@ class GatewayAdvertiser {
       this.swarm = new Hyperswarm({ keyPair: this.keyPair });
       this.swarm.on('connection', (socket) => {
         this.#handleConnection(socket).catch((error) => {
-          this.logger?.warn?.('[GatewayAdvertiser] Failed to handle discovery connection', {
+          this.logger?.warn?.( {
             error: error?.message || error
-          });
+          }, '[GatewayAdvertiser] Failed to handle discovery connection');
         });
       });
       this.swarm.on('error', (error) => {
-        this.logger?.error?.('[GatewayAdvertiser] Hyperswarm error', {
+        this.logger?.error?.( {
           error: error?.message || error
-        });
+        }, '[GatewayAdvertiser] Hyperswarm error');
       });
       this.discovery = this.swarm.join(DISCOVERY_TOPIC, { server: true, client: false });
       await this.discovery.flushed();
-      this.logger?.info?.('[GatewayAdvertiser] Discovery topic joined', {
+      this.logger?.info?.( {
         topic: Buffer.from(DISCOVERY_TOPIC).toString('hex')
-      });
+      }, '[GatewayAdvertiser] Discovery topic joined');
       this.running = true;
       await this.#refreshAnnouncement();
       this.refreshTimer = setInterval(() => {
         this.#refreshAnnouncement().catch((error) => {
-          this.logger?.warn?.('[GatewayAdvertiser] Failed to refresh announcement', {
+          this.logger?.warn?.( {
             error: error?.message || error
-          });
+          }, '[GatewayAdvertiser] Failed to refresh announcement');
         });
       }, this.refreshInterval).unref();
     } catch (error) {
@@ -115,9 +115,9 @@ class GatewayAdvertiser {
       try {
         await this.discovery.destroy?.();
       } catch (error) {
-        this.logger?.debug?.('[GatewayAdvertiser] Failed to destroy discovery handle', {
+        this.logger?.debug?.( {
           error: error?.message || error
-        });
+        }, '[GatewayAdvertiser] Failed to destroy discovery handle');
       }
       this.discovery = null;
     }
@@ -125,9 +125,9 @@ class GatewayAdvertiser {
       try {
         await this.swarm.destroy();
       } catch (error) {
-        this.logger?.debug?.('[GatewayAdvertiser] Failed to destroy hyperswarm', {
+        this.logger?.debug?.( {
           error: error?.message || error
-        });
+        }, '[GatewayAdvertiser] Failed to destroy hyperswarm');
       }
       this.swarm = null;
     }
@@ -229,10 +229,10 @@ class GatewayAdvertiser {
       const normalizedPath = secretPath.startsWith('/') ? secretPath : `/${secretPath}`;
       return new URL(normalizedPath, this.publicUrl).toString();
     } catch (error) {
-      this.logger?.warn?.('[GatewayAdvertiser] Failed to resolve secret URL', {
+      this.logger?.warn?.( {
         secretPath,
         error: error?.message || error
-      });
+      }, '[GatewayAdvertiser] Failed to resolve secret URL');
       return '';
     }
   }

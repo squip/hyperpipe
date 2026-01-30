@@ -66,11 +66,11 @@ export default class RelayTokenService {
       lastValidatedAt: issuedAt
     });
 
-    this.logger?.info?.('[RelayTokenService] Token issued', {
+    this.logger?.info?.( {
       relayKey,
       expiresAt,
       sequence
-    });
+    }, '[RelayTokenService] Token issued');
 
     return {
       token,
@@ -118,10 +118,10 @@ export default class RelayTokenService {
       revocationReason: reason || null
     });
 
-    this.logger?.warn?.('[RelayTokenService] Token revoked', {
+    this.logger?.warn?.( {
       relayKey,
       reason: reason || 'unspecified'
-    });
+    }, '[RelayTokenService] Token revoked');
 
     return { sequence: nextSequence };
   }

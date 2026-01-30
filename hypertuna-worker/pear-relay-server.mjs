@@ -2462,6 +2462,7 @@ function normalizeCoreRefString(candidate) {
 
 function previewWriterKey(writerKey) {
   if (!writerKey) return null;
+  if (typeof writerKey === 'string') return writerKey.slice(0, 16);
   try {
     return b4a.toString(writerKey, 'hex').slice(0, 16);
   } catch (_) {
@@ -2485,19 +2486,42 @@ function sampleActiveWriterKeys(relay, limit = 4) {
   return sample;
 }
 
+function collectActiveWriterKeys(relay, limit = 32) {
+  const writers = relay?.activeWriters;
+  if (!writers || typeof writers[Symbol.iterator] !== 'function') {
+    return { total: writers?.size ?? null, preview: [], truncated: false };
+  }
+  const preview = [];
+  let total = 0;
+  for (const writer of writers) {
+    total += 1;
+    if (preview.length < limit) {
+      const key = writer?.core?.key || writer?.key || writer;
+      const keyPreview = previewWriterKey(key);
+      if (keyPreview) preview.push(keyPreview);
+    }
+  }
+  return { total, preview, truncated: preview.length < total };
+}
+
 async function waitForRelayWriterActivation(options = {}) {
   const {
     relayKey,
     expectedWriterKey = null,
     timeoutMs = 10000,
-    reason = 'unknown'
+    reason = 'unknown',
+    inviteTraceId = null
   } = options;
   if (!relayKey) return { ok: false, reason, relayKey: null };
 
   const { activeRelays } = await import('./hypertuna-relay-manager-adapter.mjs');
   const relayManager = activeRelays.get(relayKey);
   if (!relayManager?.relay) {
-    console.warn('[RelayServer] waitForRelayWriterActivation: relay manager missing', { relayKey, reason });
+    console.warn('[RelayServer] waitForRelayWriterActivation: relay manager missing', {
+      relayKey,
+      reason,
+      inviteTraceId
+    });
     return { ok: false, reason, relayKey };
   }
 
@@ -2515,6 +2539,7 @@ async function waitForRelayWriterActivation(options = {}) {
       console.warn('[RelayServer] waitForRelayWriterActivation: relay.ready() failed', {
         relayKey,
         reason,
+        inviteTraceId,
         error: error?.message || error
       });
     }
@@ -2525,16 +2550,27 @@ async function waitForRelayWriterActivation(options = {}) {
     const expectedActive = expectedKey && relay?.activeWriters?.has
       ? relay.activeWriters.has(expectedKey)
       : null;
+    const viewCore = relay?.view?.core || null;
+    const viewPeers = Array.isArray(viewCore?.peers)
+      ? viewCore.peers
+      : (viewCore?.peers && typeof viewCore.peers[Symbol.iterator] === 'function'
+        ? Array.from(viewCore.peers)
+        : []);
     return {
       relayKey,
       reason,
       context,
+      inviteTraceId,
       writable: relay?.writable ?? null,
       activeWriters: relay?.activeWriters?.size ?? null,
       writerSample: sampleActiveWriterKeys(relay),
       localKey: localKey ? localKey.slice(0, 16) : null,
       expectedWriter: expectedHex,
       expectedWriterActive: expectedActive,
+      viewVersion: relay?.view?.version ?? null,
+      viewCoreLength: Number.isFinite(viewCore?.length) ? viewCore.length : null,
+      viewCoreRemoteLength: Number.isFinite(viewCore?.remoteLength) ? viewCore.remoteLength : null,
+      viewCorePeerCount: viewCore ? viewPeers.length : null,
       elapsedMs: Date.now() - start
     };
   };
@@ -2610,6 +2646,25 @@ async function waitForRelayWriterActivation(options = {}) {
         return;
       }
       console.warn('[RelayServer] waitForRelayWriterActivation timeout', snap);
+      const writerSet = collectActiveWriterKeys(relay, 32);
+      const expectedPresent = expectedKey && relay?.activeWriters?.has
+        ? relay.activeWriters.has(expectedKey)
+        : null;
+      const writerSetPayload = {
+        relayKey,
+        reason,
+        inviteTraceId,
+        expectedWriter: expectedHex,
+        expectedWriterPresent: expectedPresent,
+        viewVersion: snap.viewVersion ?? null,
+        viewCoreLength: snap.viewCoreLength ?? null,
+        viewCoreRemoteLength: snap.viewCoreRemoteLength ?? null,
+        activeWritersTotal: writerSet.total ?? null,
+        activeWritersPreview: writerSet.preview,
+        activeWritersTruncated: writerSet.truncated
+      };
+      console.warn('[RelayServer] waitForRelayWriterActivation writer set', writerSetPayload);
+      console.warn('[CJTRACE] relay writer set at timeout', writerSetPayload);
       cleanup({ ok: false, timeout: true, ...snap });
     }, timeoutMs);
   });
@@ -2625,7 +2680,8 @@ function scheduleLateWriterRecovery(options = {}) {
     mode = 'unknown',
     timeoutMs = LATE_WRITER_RECOVERY_TIMEOUT_MS,
     requireWritable = true,
-    reason = 'unknown'
+    reason = 'unknown',
+    inviteTraceId = null
   } = options;
   if (!relayKey) return null;
   if (lateWriterRecoveryTasks.has(relayKey)) {
@@ -2638,7 +2694,8 @@ function scheduleLateWriterRecovery(options = {}) {
     mode,
     requireWritable,
     timeoutMs,
-    expectedWriter: previewWriterKey(normalizeWriterKey(expectedWriterKey))
+    expectedWriter: previewWriterKey(normalizeWriterKey(expectedWriterKey)),
+    inviteTraceId
   });
 
   const waitKey = requireWritable ? null : expectedWriterKey;
@@ -2646,7 +2703,8 @@ function scheduleLateWriterRecovery(options = {}) {
     relayKey,
     expectedWriterKey: waitKey,
     timeoutMs,
-    reason: `${reason}-late`
+    reason: `${reason}-late`,
+    inviteTraceId
   }).then((result) => {
     lateWriterRecoveryTasks.delete(relayKey);
     if (result?.ok) {
@@ -3487,13 +3545,27 @@ export async function startJoinAuthentication(options) {
   try {
     // Send initial progress message to the desktop UI
     if (global.sendMessage) {
+      const progressPayload = {
+        publicIdentifier,
+        status: 'request',
+        inviteTraceId: inviteTraceId || null,
+        relayKey: inviteRelayKey || null,
+        relayUrl: inviteRelayUrl || null,
+        openJoin,
+        closedInvite
+      };
       global.sendMessage({
         type: 'join-auth-progress',
-        data: {
-          publicIdentifier,
-          status: 'request',
-          inviteTraceId: inviteTraceId || null
-        }
+        data: progressPayload
+      });
+      console.info('[CJTRACE] join-auth-progress emit', {
+        publicIdentifier,
+        status: 'request',
+        relayKey: inviteRelayKey || null,
+        relayUrl: inviteRelayUrl || null,
+        openJoin,
+        closedInvite,
+        inviteTraceId: inviteTraceId || null
       });
     }
     
@@ -3507,6 +3579,13 @@ export async function startJoinAuthentication(options) {
     : [];
 
   const blindPeerKey = blindPeer?.publicKey ? String(blindPeer.publicKey).trim().toLowerCase() : null;
+  console.log('[RelayServer] Join host peers resolved', {
+    publicIdentifier,
+    hostPeers,
+    hostPeersCount: hostPeers.length,
+    blindPeerKey: blindPeerKey ? blindPeerKey.slice(0, 16) : null,
+    inviteTraceId: inviteTraceId || null
+  });
 
   if (!hostPeers.length && !inviteToken && !openJoin) {
     throw new Error('No hosting peers discovered for this relay');
@@ -3520,7 +3599,12 @@ export async function startJoinAuthentication(options) {
 
     for (const hostPeerKey of hostPeers) {
       if (blindPeerKey && hostPeerKey === blindPeerKey) {
-        console.log('[RelayServer] Skipping direct join attempt for blind-peer host', hostPeerKey.substring(0, 8));
+        console.log('[RelayServer] Skipping direct join attempt', {
+          hostPeer: hostPeerKey.substring(0, 16),
+          reason: 'blind-peer-host',
+          blindPeerKey: blindPeerKey ? blindPeerKey.slice(0, 16) : null,
+          inviteTraceId: inviteTraceId || null
+        });
         continue;
       }
       try {
@@ -3666,7 +3750,8 @@ export async function startJoinAuthentication(options) {
           relayKey: fallbackRelayKey,
           expectedWriterKey,
           timeoutMs: BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS,
-          reason: 'blind-peer-fallback'
+          reason: 'blind-peer-fallback',
+          inviteTraceId
         });
         if (!relayWaitResult?.ok || relayWaitResult?.expectedWriterActive === false) {
           const manager = global.blindPeeringManager;
@@ -3687,7 +3772,8 @@ export async function startJoinAuthentication(options) {
                 relayKey: fallbackRelayKey,
                 expectedWriterKey,
                 timeoutMs: Math.min(BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS, 15000),
-                reason: 'blind-peer-retry'
+                reason: 'blind-peer-retry',
+                inviteTraceId
               });
             } catch (error) {
               console.warn('[RelayServer] Blind-peer refresh retry failed', {
@@ -3763,7 +3849,8 @@ export async function startJoinAuthentication(options) {
             relayUrl: inviteRelayUrl,
             mode: 'blind-peer-offline',
             requireWritable: true,
-            reason: 'blind-peer-fallback'
+            reason: 'blind-peer-fallback',
+            inviteTraceId
           });
         }
 
@@ -3818,18 +3905,26 @@ export async function startJoinAuthentication(options) {
         }
 
         if (global.sendMessage) {
+          const successPayload = {
+            publicIdentifier,
+            relayKey: fallbackRelayKey,
+            authToken: inviteToken,
+            relayUrl: inviteRelayUrl || null,
+            hostPeer: blindPeerKey || null,
+            mode: 'blind-peer-offline',
+            provisional: false,
+            inviteTraceId: inviteTraceId || null
+          };
+          console.info('[CJTRACE] join-auth-success emit', {
+            publicIdentifier,
+            relayKey: fallbackRelayKey,
+            relayUrl: inviteRelayUrl || null,
+            mode: 'blind-peer-offline',
+            inviteTraceId: inviteTraceId || null
+          });
           global.sendMessage({
             type: 'join-auth-success',
-            data: {
-              publicIdentifier,
-              relayKey: fallbackRelayKey,
-              authToken: inviteToken,
-              relayUrl: inviteRelayUrl || null,
-              hostPeer: blindPeerKey || null,
-              mode: 'blind-peer-offline',
-              provisional: false,
-              inviteTraceId: inviteTraceId || null
-            }
+            data: successPayload
           });
         }
         return;
@@ -3943,7 +4038,8 @@ export async function startJoinAuthentication(options) {
           relayKey: fallbackRelayKey,
           expectedWriterKey,
           timeoutMs: BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS,
-          reason: 'open-offline'
+          reason: 'open-offline',
+          inviteTraceId
         });
         console.log('[RelayServer] Open join offline writer wait result', {
           relayKey: fallbackRelayKey,
@@ -4001,7 +4097,8 @@ export async function startJoinAuthentication(options) {
             relayUrl: resolvedRelayUrl,
             mode: 'open-offline',
             requireWritable: true,
-            reason: 'open-offline'
+            reason: 'open-offline',
+            inviteTraceId
           });
         }
 
@@ -4022,18 +4119,26 @@ export async function startJoinAuthentication(options) {
         }
 
         if (global.sendMessage) {
+          const successPayload = {
+            publicIdentifier,
+            relayKey: fallbackRelayKey,
+            authToken: fallbackToken,
+            relayUrl: resolvedRelayUrl || null,
+            hostPeer: blindPeerKey || null,
+            mode: 'open-offline',
+            provisional: !inviteToken,
+            inviteTraceId: inviteTraceId || null
+          };
+          console.info('[CJTRACE] join-auth-success emit', {
+            publicIdentifier,
+            relayKey: fallbackRelayKey,
+            relayUrl: resolvedRelayUrl || null,
+            mode: 'open-offline',
+            inviteTraceId: inviteTraceId || null
+          });
           global.sendMessage({
             type: 'join-auth-success',
-            data: {
-              publicIdentifier,
-              relayKey: fallbackRelayKey,
-              authToken: fallbackToken,
-              relayUrl: resolvedRelayUrl || null,
-              hostPeer: blindPeerKey || null,
-              mode: 'open-offline',
-              provisional: !inviteToken,
-              inviteTraceId: inviteTraceId || null
-            }
+            data: successPayload
           });
         }
         return;
@@ -4054,13 +4159,25 @@ export async function startJoinAuthentication(options) {
 
     // Send 'verify' progress update to the desktop UI
     if (global.sendMessage) {
+      const progressPayload = {
+        publicIdentifier,
+        status: 'verify',
+        inviteTraceId: inviteTraceId || null,
+        relayKey: inviteRelayKey || null,
+        relayUrl: inviteRelayUrl || null,
+        hostPeer: selectedPeerKey || null
+      };
       global.sendMessage({
         type: 'join-auth-progress',
-        data: {
-          publicIdentifier,
-          status: 'verify',
-          inviteTraceId: inviteTraceId || null
-        }
+        data: progressPayload
+      });
+      console.info('[CJTRACE] join-auth-progress emit', {
+        publicIdentifier,
+        status: 'verify',
+        relayKey: inviteRelayKey || null,
+        relayUrl: inviteRelayUrl || null,
+        hostPeer: selectedPeerKey || null,
+        inviteTraceId: inviteTraceId || null
       });
     }
 
@@ -4113,13 +4230,25 @@ export async function startJoinAuthentication(options) {
 
     // Treat verify response as the final result
     if (global.sendMessage) {
+      const progressPayload = {
+        publicIdentifier,
+        status: 'complete',
+        inviteTraceId: inviteTraceId || null,
+        relayKey: inviteRelayKey || null,
+        relayUrl: inviteRelayUrl || null,
+        hostPeer: selectedPeerKey || null
+      };
       global.sendMessage({
         type: 'join-auth-progress',
-        data: {
-          publicIdentifier,
-          status: 'complete',
-          inviteTraceId: inviteTraceId || null
-        }
+        data: progressPayload
+      });
+      console.info('[CJTRACE] join-auth-progress emit', {
+        publicIdentifier,
+        status: 'complete',
+        relayKey: inviteRelayKey || null,
+        relayUrl: inviteRelayUrl || null,
+        hostPeer: selectedPeerKey || null,
+        inviteTraceId: inviteTraceId || null
       });
     }
 
@@ -4213,7 +4342,8 @@ export async function startJoinAuthentication(options) {
       relayKey,
       expectedWriterKey: finalExpectedWriterKey,
       timeoutMs: DIRECT_JOIN_WRITABLE_TIMEOUT_MS,
-      reason: 'direct-join'
+      reason: 'direct-join',
+      inviteTraceId
     });
     console.log('[RelayServer] Direct join writer wait result', {
       relayKey,
@@ -4267,7 +4397,8 @@ export async function startJoinAuthentication(options) {
           relayUrl,
           mode: 'direct-join',
           requireWritable: true,
-          reason: 'direct-join'
+          reason: 'direct-join',
+          inviteTraceId
         });
       }
     }
@@ -4278,18 +4409,26 @@ export async function startJoinAuthentication(options) {
 
     // Notify the desktop UI of success
     if (global.sendMessage) {
+      const successPayload = {
+        publicIdentifier: finalIdentifier,
+        relayKey,
+        authToken,
+        relayUrl,
+        hostPeer: selectedPeerKey,
+        mode: 'direct-join',
+        provisional: false,
+        inviteTraceId: inviteTraceId || null
+      };
+      console.info('[CJTRACE] join-auth-success emit', {
+        publicIdentifier: finalIdentifier,
+        relayKey,
+        relayUrl,
+        mode: 'direct-join',
+        inviteTraceId: inviteTraceId || null
+      });
       global.sendMessage({
         type: 'join-auth-success',
-        data: {
-          publicIdentifier: finalIdentifier,
-          relayKey,
-          authToken,
-          relayUrl,
-          hostPeer: selectedPeerKey,
-          mode: 'direct-join',
-          provisional: false,
-          inviteTraceId: inviteTraceId || null
-        }
+        data: successPayload
       });
     }
 

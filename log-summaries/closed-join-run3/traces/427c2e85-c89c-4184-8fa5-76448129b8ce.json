@@ -1,0 +1,24 @@
+{
+  "traceId": "427c2e85-c89c-4184-8fa5-76448129b8ce",
+  "publicIdentifier": "npub13gqkad4hsdplrz3ntpd9ygc72j3s2zq7wv64fnmkjqk3v2wglktqqg5lcp:slimeyCitySlickers",
+  "relayKey": "43b2be5517b191bb",
+  "relayUrl": "ws://127.0.0.1:8443/npub13gqkad4hsdplrz3ntpd9ygc72j3s2zq7wv64fnmkjqk3v2wglktqqg5",
+  "mirrorSource": "closed-join",
+  "mirrorSnapshotFingerprint": "4nrso9zwmef1se5hznni4kesiqzinbj73fjr8pm8d4g6a6hfywsy:autobase-view|8ugbhob5xomzioa14b665aexx4hk54gkbwoyjpq59bw493yauzay:mirror-core|eq3mhiezsge5sshgk8usyjjwmw853effiuexjpxm1xrjzy8noxpo:autobase|jcqih9sgjxf8z6zpa9zg9h81zr3bsexzjzcat53pzkbdb5tt99wy:mirror-core|mffjsitxdohpfnx11xdtyqr8ye77i69ke65mxxjearkjhqqudx3o:mirror-core|o6enuai89k54ij11miwbucjz6zneduzxnn5mm8txug6scmdk9k7y:mirror-core|ptob6acsbi1yb47x94gh8ckwubi4dcutyqqcpde6nh389499e4ty:mirror-core|tsoiwzwyiqsogecmjfrwoe65bfaisumogtz6rif48zpri6dsurcy:mirror-core|xos6idoqgd1wbe5pbzytyjb6m97x16pdt6b8kwn1ipotfcxi8hyy:mirror-core|xxuh4881kszwdwpb8wek6j38swzgqoe5hj8k6jx7ddj4e3fhixco:mirror-core|zknaxzs3i8eawf8o1b7mnwgg8ftaohzjcrsd78mnewysnqxrct8y:mirror-core",
+  "files": [
+    "/Users/essorensen/hypertuna-electron/test-logs/CLOSED-JOIN-WORKFLOW/test7/worker.log"
+  ],
+  "events": 4,
+  "milestones": [
+    {
+      "type": "invite-proof-generated",
+      "ts": 1769659032830,
+      "iso": "2026-01-29T03:57:12.830Z"
+    },
+    {
+      "type": "join-auth-success",
+      "ts": 1769659314691,
+      "iso": "2026-01-29T04:01:54.691Z"
+    }
+  ]
+}

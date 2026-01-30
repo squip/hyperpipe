@@ -133,6 +133,15 @@ function describeCorestore(store) {
   };
 }
 
+function summarizeMirrorKeys(manager) {
+  const keys = Array.from(manager?.trustedMirrors || []);
+  return {
+    mirrorKeyCount: keys.length,
+    mirrorKeys: keys,
+    mirrorKeysPreview: keys.slice(0, 3).map((key) => String(key).slice(0, 16))
+  };
+}
+
 export default class BlindPeeringManager extends EventEmitter {
   constructor({ logger, settingsProvider } = {}) {
     super();
@@ -270,16 +279,38 @@ export default class BlindPeeringManager extends EventEmitter {
     if (this.swarm && !this.swarm.__ht_blindpeer_conn_log) {
       this.swarm.__ht_blindpeer_conn_log = true;
       this.swarm.on('connection', (socket, details = {}) => {
-        const remoteKey = encodePeerKey(
-          details?.publicKey || details?.remotePublicKey || socket?.remotePublicKey || socket?.publicKey
-        );
+        const remotePublicKey = details?.publicKey || details?.remotePublicKey || socket?.remotePublicKey || socket?.publicKey;
+        const remoteKey = encodePeerKey(remotePublicKey);
+        const remoteKeyHex = peerKeyHex(remotePublicKey);
+        const topicKey = details?.topic ? encodePeerKey(details.topic) : null;
+        const topicHex = details?.topic ? peerKeyHex(details.topic) : null;
         this.logger?.info?.(`${CJTRACE_TAG} blind peering swarm connection`, {
           remoteKey,
+          remoteKeyHex,
           initiator: details?.initiator ?? null,
           client: details?.client ?? null,
           server: details?.server ?? null,
-          topic: details?.topic ? encodePeerKey(details.topic) : null
+          topic: topicKey,
+          topicHex
         });
+        if (socket && !socket.__ht_blindpeer_disconnect_log) {
+          socket.__ht_blindpeer_disconnect_log = true;
+          const logDisconnect = (event, error) => {
+            if (socket.__ht_blindpeer_disconnected) return;
+            socket.__ht_blindpeer_disconnected = true;
+            this.logger?.info?.(`${CJTRACE_TAG} blind peering swarm disconnect`, {
+              remoteKey,
+              remoteKeyHex,
+              topic: topicKey,
+              topicHex,
+              event,
+              error: error?.message || error || null
+            });
+          };
+          socket.on('close', () => logDisconnect('close'));
+          socket.on('end', () => logDisconnect('end'));
+          socket.on('error', (error) => logDisconnect('error', error));
+        }
       });
     }
 
@@ -545,7 +576,32 @@ export default class BlindPeeringManager extends EventEmitter {
         summary.failed += 1;
         continue;
       }
+      const beforeState = this.#describeCoreSyncState(core, label);
+      if (beforeState) {
+        this.logger?.info?.('[BlindPeering] Mirror core sync state', {
+          phase: 'prefetch-before',
+          reason,
+          targetKey: ref,
+          ...beforeState
+        });
+        this.logger?.info?.(`${CJTRACE_TAG} relay core prefetch state`, {
+          phase: 'before',
+          reason,
+          targetKey: ref,
+          ...beforeState
+        });
+      }
       try {
+        const mirrorSummary = summarizeMirrorKeys(this);
+        this.logger?.info?.(`${CJTRACE_TAG} blind peering addCore request`, {
+          reason,
+          targetKey: ref,
+          label,
+          announce: false,
+          priority: 2,
+          pick: 2,
+          ...mirrorSummary
+        });
         await this.blindPeering.addCore(core, core.key, {
           announce: false,
           priority: 2,
@@ -574,6 +630,22 @@ export default class BlindPeeringManager extends EventEmitter {
           reason,
           err: error?.message || error
         });
+      } finally {
+        const afterState = this.#describeCoreSyncState(core, label);
+        if (afterState) {
+          this.logger?.info?.('[BlindPeering] Mirror core sync state', {
+            phase: 'prefetch-after',
+            reason,
+            targetKey: ref,
+            ...afterState
+          });
+          this.logger?.info?.(`${CJTRACE_TAG} relay core prefetch state`, {
+            phase: 'after',
+            reason,
+            targetKey: ref,
+            ...afterState
+          });
+        }
       }
     }
 
@@ -809,12 +881,32 @@ export default class BlindPeeringManager extends EventEmitter {
 
     try {
       if (drive.core) {
+        const mirrorSummary = summarizeMirrorKeys(this);
+        this.logger?.info?.(`${CJTRACE_TAG} blind peering addCore request`, {
+          reason: 'drive-mirror',
+          targetKey: normalizeCoreKey(drive.core.key),
+          label: 'drive-core',
+          announce: true,
+          priority: 1,
+          pick: 1,
+          ...mirrorSummary
+        });
         this.blindPeering.addCoreBackground(drive.core, drive.core.key, {
           announce: true,
           priority: 1
         });
       }
       if (drive.blobs?.core) {
+        const mirrorSummary = summarizeMirrorKeys(this);
+        this.logger?.info?.(`${CJTRACE_TAG} blind peering addCore request`, {
+          reason: 'drive-blobs-mirror',
+          targetKey: normalizeCoreKey(drive.blobs.core.key),
+          label: 'drive-blobs-core',
+          announce: false,
+          priority: 0,
+          pick: 1,
+          ...mirrorSummary
+        });
         this.blindPeering.addCoreBackground(drive.blobs.core, drive.blobs.core.key, {
           announce: false,
           priority: 0
@@ -1038,6 +1130,12 @@ export default class BlindPeeringManager extends EventEmitter {
             targetKey: key,
             ...beforeState
           });
+          this.logger?.info?.(`${CJTRACE_TAG} mirror core sync state`, {
+            phase: 'before',
+            reason,
+            targetKey: key,
+            ...beforeState
+          });
         }
         try {
           await this.#waitForCoreSync(info.core, timeoutMs, label);
@@ -1054,6 +1152,12 @@ export default class BlindPeeringManager extends EventEmitter {
           const afterState = this.#describeCoreSyncState(info.core, label);
           if (afterState) {
             this.logger?.info?.('[BlindPeering] Mirror core sync state', {
+              phase: 'after',
+              reason,
+              targetKey: key,
+              ...afterState
+            });
+            this.logger?.info?.(`${CJTRACE_TAG} mirror core sync state`, {
               phase: 'after',
               reason,
               targetKey: key,
@@ -1405,6 +1509,36 @@ export default class BlindPeeringManager extends EventEmitter {
 
   async #waitForCoreSync(core, timeoutMs, label) {
     if (!core || typeof core.update !== 'function') return false;
+    const start = Date.now();
+    const key = normalizeCoreKey(core.key || core.discoveryKey || null);
+    const initialLength = Number.isFinite(core.length) ? core.length : null;
+    let sawAppend = false;
+    let firstAppendLength = null;
+    const onAppend = () => {
+      if (sawAppend) return;
+      sawAppend = true;
+      firstAppendLength = Number.isFinite(core.length) ? core.length : null;
+      const snap = this.#describeCoreSyncState(core, label);
+      this.logger?.info?.('[BlindPeering] Mirror core download started', {
+        key,
+        label,
+        initialLength,
+        firstAppendLength,
+        elapsedMs: Date.now() - start,
+        ...snap
+      });
+      this.logger?.info?.(`${CJTRACE_TAG} mirror core download started`, {
+        key,
+        label,
+        initialLength,
+        firstAppendLength,
+        elapsedMs: Date.now() - start,
+        ...snap
+      });
+    };
+    if (typeof core.on === 'function') {
+      core.on('append', onAppend);
+    }
     try {
       if (typeof core.ready === 'function') {
         await this.#withTimeout(core.ready(), timeoutMs, label ? `${label}:ready` : null);
@@ -1415,7 +1549,35 @@ export default class BlindPeeringManager extends EventEmitter {
         err: error?.message || error
       });
     }
-    await this.#withTimeout(core.update({ wait: true }), timeoutMs, label ? `${label}:update` : null);
+    try {
+      await this.#withTimeout(core.update({ wait: true }), timeoutMs, label ? `${label}:update` : null);
+    } finally {
+      if (typeof core.off === 'function') {
+        core.off('append', onAppend);
+      } else if (typeof core.removeListener === 'function') {
+        core.removeListener('append', onAppend);
+      }
+      if (!sawAppend) {
+        const finalLength = Number.isFinite(core.length) ? core.length : null;
+        const snap = this.#describeCoreSyncState(core, label);
+        this.logger?.info?.('[BlindPeering] Mirror core download not observed', {
+          key,
+          label,
+          initialLength,
+          finalLength,
+          elapsedMs: Date.now() - start,
+          ...snap
+        });
+        this.logger?.info?.(`${CJTRACE_TAG} mirror core download not observed`, {
+          key,
+          label,
+          initialLength,
+          finalLength,
+          elapsedMs: Date.now() - start,
+          ...snap
+        });
+      }
+    }
     return true;
   }
 

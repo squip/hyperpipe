@@ -1161,6 +1161,14 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           case 'join-auth-success': {
             const identifier = msg?.data?.publicIdentifier
             if (!identifier) break
+            console.info('[CJTRACE] join-auth-success received', {
+              publicIdentifier: identifier,
+              relayKey: msg?.data?.relayKey ? String(msg?.data?.relayKey).slice(0, 16) : null,
+              relayUrl: msg?.data?.relayUrl ? String(msg?.data?.relayUrl).slice(0, 80) : null,
+              mode: msg?.data?.mode ?? null,
+              provisional: msg?.data?.provisional ?? null,
+              inviteTraceId: msg?.data?.inviteTraceId || null
+            })
             setJoinFlows((prev) => {
               const current = prev[identifier]
               const cachedWritable = readJoinFlowWritableCache(
