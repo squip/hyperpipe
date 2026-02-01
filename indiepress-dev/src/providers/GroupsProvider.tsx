@@ -199,6 +199,25 @@ const buildOpenInvitePayload = (args: { relayUrl: string | null; relayKey?: stri
   relayKey: args.relayKey ?? null
 })
 
+const extractRelayKeyFromUrl = (value?: string | null) => {
+  if (!value) return null
+  try {
+    const parsed = new URL(value)
+    const parts = parsed.pathname.split('/').filter(Boolean)
+    const maybeKey = parts[0] || null
+    if (maybeKey && /^[0-9a-fA-F]{64}$/.test(maybeKey)) {
+      return maybeKey.toLowerCase()
+    }
+  } catch (_err) {
+    const parts = String(value).split('/').filter(Boolean)
+    const maybeKey = parts[0] || null
+    if (maybeKey && /^[0-9a-fA-F]{64}$/.test(maybeKey)) {
+      return maybeKey.toLowerCase()
+    }
+  }
+  return null
+}
+
 export function GroupsProvider({ children }: { children: ReactNode }) {
   const { pubkey, publish, relayList, nip04Decrypt, nip04Encrypt } = useNostr()
   const { relays: workerRelays, joinFlows, createRelay, sendToWorker } = useWorkerBridge()
@@ -1164,71 +1183,88 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const inviteName = options?.name ?? meta?.name
       const inviteAbout = options?.about ?? meta?.about
 
-      let writerInfo: {
-        writerCore?: string
-        writerCoreHex?: string
-        autobaseLocal?: string
-        writerSecret?: string
-      } | null = null
-      if (!isOpenGroup && sendToWorker && relayEntry?.relayKey && invitees.length === 1) {
+      const inviteRelayUrl = getBaseRelayUrl(resolved || relay || '') || resolved || relay || null
+      const inviteRelayKey =
+        relayEntry?.relayKey || extractRelayKeyFromUrl(inviteRelayUrl) || null
+      if (!isOpenGroup && !inviteRelayKey) {
+        console.warn('[GroupsProvider] Missing relayKey for closed invite payload', {
+          groupId,
+          relayUrl: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 80) : null
+        })
+      }
+
+      const provisionWriterInfo = async (invitee: string) => {
+        if (isOpenGroup) return null
+        if (!sendToWorker || !relayEntry?.relayKey) return null
         try {
           const res = await sendToWorker({
             type: 'provision-writer-for-invitee',
-            data: { relayKey: relayEntry.relayKey, publicIdentifier: groupId, inviteePubkey: invitees[0] }
+            data: { relayKey: relayEntry.relayKey, publicIdentifier: groupId, inviteePubkey: invitee }
           })
           if (res && typeof res === 'object') {
-            writerInfo = {
+            const writerInfo = {
               writerCore: (res as any).writerCore,
               writerCoreHex: (res as any).writerCoreHex,
               autobaseLocal: (res as any).autobaseLocal,
               writerSecret: (res as any).writerSecret
             }
+            console.info('[GroupsProvider] Writer provisioning result (invite)', {
+              groupId,
+              invitee,
+              relayKey: relayEntry.relayKey,
+              hasWriterCore: !!writerInfo?.writerCore,
+              hasWriterCoreHex: !!writerInfo?.writerCoreHex,
+              hasAutobaseLocal: !!writerInfo?.autobaseLocal,
+              hasWriterSecret: !!writerInfo?.writerSecret
+            })
+            return writerInfo
           }
-          console.info('[GroupsProvider] Writer provisioning result (invite)', {
-            groupId,
-            invitee: invitees[0],
-            relayKey: relayEntry.relayKey,
-            hasWriterCore: !!writerInfo?.writerCore,
-            hasWriterCoreHex: !!writerInfo?.writerCoreHex,
-            hasAutobaseLocal: !!writerInfo?.autobaseLocal,
-            hasWriterSecret: !!writerInfo?.writerSecret
-          })
         } catch (err) {
           console.warn('[GroupsProvider] Failed to provision writer for invitee', err)
         }
+        return null
       }
 
-      let mirrorMetadata: InviteMirrorMetadata = null
-      if (!isOpenGroup) {
-        mirrorMetadata = await fetchInviteMirrorMetadata(relayEntry?.relayKey || groupId, resolved)
+      const baseMirrorMetadata: InviteMirrorMetadata = !isOpenGroup
+        ? await fetchInviteMirrorMetadata(inviteRelayKey || relayEntry?.relayKey || groupId, resolved)
+        : null
 
-        // If we created a writer core for this invite, include it in cores so it gets mirrored.
+      const buildInviteMirrorMetadata = (writerInfo: {
+        writerCore?: string
+        writerCoreHex?: string
+        autobaseLocal?: string
+        writerSecret?: string
+      } | null) => {
+        if (isOpenGroup) return null
         const writerCoreKey =
           writerInfo?.writerCoreHex || writerInfo?.autobaseLocal || writerInfo?.writerCore
-        if (writerCoreKey) {
-          if (!mirrorMetadata) mirrorMetadata = {}
-          const cores = Array.isArray(mirrorMetadata.cores) ? [...mirrorMetadata.cores] : []
-          cores.push({ key: writerCoreKey, role: 'autobase-writer' })
-          mirrorMetadata.cores = cores
-        }
-      }
+        if (!writerCoreKey) return baseMirrorMetadata
 
-      const inviteRelayUrl = getBaseRelayUrl(resolved || relay || '') || resolved || relay || null
+        const next: InviteMirrorMetadata = baseMirrorMetadata ? { ...baseMirrorMetadata } : {}
+        const cores = Array.isArray(baseMirrorMetadata?.cores) ? [...baseMirrorMetadata.cores] : []
+        if (!cores.some((entry) => entry.key === writerCoreKey)) {
+          cores.push({ key: writerCoreKey, role: 'autobase-writer' })
+        }
+        next.cores = cores
+        return next
+      }
 
       await Promise.all(
         invitees.map(async (invitee) => {
+          const writerInfo = await provisionWriterInfo(invitee)
+          const inviteMirrorMetadata = buildInviteMirrorMetadata(writerInfo)
           const token = isOpenGroup ? null : randomString(24)
           const payload = isOpenGroup
             ? buildOpenInvitePayload({
                 relayUrl: inviteRelayUrl,
-                relayKey: relayEntry?.relayKey || null
+                relayKey: inviteRelayKey
               })
             : buildInvitePayload({
                 token: token as string,
                 relayUrl: inviteRelayUrl,
-                relayKey: relayEntry?.relayKey || null,
+                relayKey: inviteRelayKey,
                 meta,
-                mirrorMetadata,
+                mirrorMetadata: inviteMirrorMetadata,
                 writerInfo
               })
           const encryptedPayload = await nip04Encrypt(
@@ -1244,9 +1280,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             hasAutobaseLocal: !!writerInfo?.autobaseLocal,
             hasWriterSecret: !!writerInfo?.writerSecret,
             writerSecretLen: writerInfo?.writerSecret ? String(writerInfo.writerSecret).length : 0,
-            relayKey: relayEntry?.relayKey ? String(relayEntry.relayKey).slice(0, 16) : null,
+            relayKey: inviteRelayKey ? String(inviteRelayKey).slice(0, 16) : null,
             relayUrl: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 80) : null,
-            mirrorCoresCount: Array.isArray(mirrorMetadata?.cores) ? mirrorMetadata.cores.length : 0,
+            mirrorCoresCount: Array.isArray(inviteMirrorMetadata?.cores) ? inviteMirrorMetadata.cores.length : 0,
             fileSharing: resolvedIsOpen === false ? false : true
           })
           const inviteTags: string[][] = [
@@ -1349,6 +1385,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       const baseRelayUrl = resolved ? getBaseRelayUrl(resolved) : undefined
       const relayEntry = getRelayEntryForGroup(groupId)
+      const inviteRelayUrl = baseRelayUrl || resolved || relay || null
+      const inviteRelayKey =
+        relayEntry?.relayKey || extractRelayKeyFromUrl(inviteRelayUrl) || null
+      if (!inviteRelayKey) {
+        console.warn('[GroupsProvider] Missing relayKey for approval invite payload', {
+          groupId,
+          relayUrl: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 80) : null
+        })
+      }
 
       let writerInfo: {
         writerCore?: string
@@ -1384,7 +1429,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      let mirrorMetadata = await fetchInviteMirrorMetadata(relayEntry?.relayKey || groupId, resolved)
+      let mirrorMetadata = await fetchInviteMirrorMetadata(
+        inviteRelayKey || relayEntry?.relayKey || groupId,
+        resolved
+      )
       const writerCoreKey =
         writerInfo?.writerCoreHex || writerInfo?.autobaseLocal || writerInfo?.writerCore
       if (writerCoreKey) {
@@ -1395,8 +1443,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       }
       const payload = buildInvitePayload({
         token,
-        relayUrl: baseRelayUrl || resolved || relay || null,
-        relayKey: relayEntry?.relayKey || null,
+        relayUrl: inviteRelayUrl,
+        relayKey: inviteRelayKey,
         meta,
         mirrorMetadata,
         writerInfo

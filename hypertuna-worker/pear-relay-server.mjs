@@ -302,6 +302,138 @@ function buildGatewayWebsocketBase(cfg = config) {
   return `${protocol}://${host}`;
 }
 
+function previewValue(value, limit = 16) {
+  if (!value) return null;
+  const str = String(value);
+  return str.length > limit ? `${str.slice(0, limit)}...` : str;
+}
+
+function toHttpOrigin(value) {
+  if (!value || typeof value !== 'string') return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'ws:') url.protocol = 'http:';
+    if (url.protocol === 'wss:') url.protocol = 'https:';
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return null;
+    }
+    return url.origin;
+  } catch (_err) {
+    if (/^wss?:\/\//i.test(value)) {
+      return value.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://').replace(/\/$/, '');
+    }
+    if (/^https?:\/\//i.test(value)) {
+      try {
+        return new URL(value).origin;
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+function extractIdentifierFromRelayUrl(relayUrl) {
+  if (!relayUrl || typeof relayUrl !== 'string') return null;
+  try {
+    const parsed = new URL(relayUrl);
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    if (!parts.length) return null;
+    if (parts.length >= 2 && parts[0].startsWith('npub')) {
+      return `${parts[0]}:${parts[1]}`;
+    }
+    return parts[0] || null;
+  } catch (_err) {
+    const parts = relayUrl.split('/').filter(Boolean);
+    if (!parts.length) return null;
+    if (parts.length >= 2 && parts[0].startsWith('npub')) {
+      return `${parts[0]}:${parts[1]}`;
+    }
+    return parts[0] || null;
+  }
+}
+
+async function collectGatewayHttpOrigins() {
+  const origins = new Set();
+  const cachedSettings = getCachedGatewaySettings();
+  const cachedOrigin = toHttpOrigin(cachedSettings?.gatewayUrl);
+  if (cachedOrigin) origins.add(cachedOrigin);
+
+  const configOrigin = toHttpOrigin(config?.gatewayUrl);
+  if (configOrigin) origins.add(configOrigin);
+
+  try {
+    const loaded = await loadGatewaySettings();
+    const loadedOrigin = toHttpOrigin(loaded?.gatewayUrl);
+    if (loadedOrigin) origins.add(loadedOrigin);
+  } catch (_err) {
+    // ignore load failures; fall back to cached
+  }
+
+  if (!origins.size) {
+    origins.add('https://hypertuna.com');
+  }
+
+  return Array.from(origins);
+}
+
+async function fetchMirrorMetadataFromGateway(identifier, { reason = 'join-fallback' } = {}) {
+  if (!identifier) return { status: 'skipped', reason: 'missing-identifier' };
+  const fetchImpl = globalThis.fetch;
+  if (typeof fetchImpl !== 'function') {
+    return { status: 'skipped', reason: 'fetch-unavailable' };
+  }
+
+  const origins = await collectGatewayHttpOrigins();
+  let lastError = null;
+
+  for (const origin of origins) {
+    if (!origin) continue;
+    const url = `${origin.replace(/\/$/, '')}/api/relays/${encodeURIComponent(identifier)}/mirror`;
+    try {
+      console.log('[RelayServer] Mirror metadata request', {
+        identifier,
+        origin,
+        reason
+      });
+      const response = await fetchImpl(url);
+      if (!response.ok) {
+        lastError = new Error(`status ${response.status}`);
+        continue;
+      }
+      const data = await response.json().catch(() => null);
+      if (!data || typeof data !== 'object') {
+        lastError = new Error('invalid-payload');
+        continue;
+      }
+      const mirrorRelayKey = data.relayKey || data.relay_key || null;
+      const mirrorBlindPeer = data.blindPeer || data.blind_peer || null;
+      console.log('[RelayServer] Mirror metadata response', {
+        identifier,
+        origin,
+        relayKey: previewValue(mirrorRelayKey, 16),
+        publicIdentifier: data.publicIdentifier || data.public_identifier || null,
+        coreRefsCount: Array.isArray(data.cores) ? data.cores.length : 0,
+        blindPeerKey: previewValue(mirrorBlindPeer?.publicKey, 16),
+        blindPeerHasEncryptionKey: !!mirrorBlindPeer?.encryptionKey
+      });
+      return { status: 'ok', origin, data };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (lastError) {
+    console.warn('[RelayServer] Mirror metadata lookup failed', {
+      identifier,
+      reason,
+      error: lastError?.message || lastError
+    });
+  }
+
+  return { status: 'error', reason: 'mirror-unavailable', error: lastError };
+}
+
 // Initialize with enhanced config
 export async function initializeRelayServer(customConfig = {}) {
   console.log('[RelayServer] ========================================');
@@ -3468,6 +3600,14 @@ export async function startJoinAuthentication(options) {
         }
 
         const parsed = parseJsonBody(joinResponse.body) || {};
+        if (parsed.status === 'pending') {
+          console.log('[RelayServer] Join request pending (closed relay)', {
+            publicIdentifier,
+            hostPeer: hostPeerKey.substring(0, 8)
+          });
+          lastJoinError = new Error('closed-join-pending');
+          continue;
+        }
         if (!parsed.challenge || !parsed.relayPubkey) {
           throw new Error('Invalid join response from peer');
         }
@@ -3487,8 +3627,10 @@ export async function startJoinAuthentication(options) {
       // Offline/blind-peer fallback: if we have an invite token and relay info, finalize locally without a host handshake.
       if (inviteToken && (inviteRelayKey || publicIdentifier)) {
         let resolvedRelayKey = inviteRelayKey || null;
+        let relayKeySource = resolvedRelayKey ? 'invite' : null;
         if (!resolvedRelayKey && publicIdentifier) {
           resolvedRelayKey = await getRelayKeyFromPublicIdentifier(publicIdentifier);
+          if (resolvedRelayKey) relayKeySource = 'local-profile';
         }
         if (!resolvedRelayKey && inviteRelayUrl) {
           try {
@@ -3497,10 +3639,29 @@ export async function startJoinAuthentication(options) {
             const maybeKey = parts[0] || null;
             if (maybeKey && /^[0-9a-fA-F]{64}$/.test(maybeKey)) {
               resolvedRelayKey = maybeKey;
+              relayKeySource = 'relay-url';
             }
           } catch (_) {
             // ignore
           }
+        }
+        if (!resolvedRelayKey) {
+          const mirrorIdentifier = publicIdentifier || extractIdentifierFromRelayUrl(inviteRelayUrl);
+          if (mirrorIdentifier) {
+            const mirrorResult = await fetchMirrorMetadataFromGateway(mirrorIdentifier, {
+              reason: 'invite-fallback'
+            });
+            if (mirrorResult?.status === 'ok' && mirrorResult.data) {
+              const mirrorRelayKey = mirrorResult.data.relayKey || mirrorResult.data.relay_key || null;
+              if (mirrorRelayKey && /^[0-9a-fA-F]{64}$/.test(String(mirrorRelayKey))) {
+                resolvedRelayKey = String(mirrorRelayKey);
+                relayKeySource = 'gateway-mirror';
+              }
+            }
+          }
+        }
+        if (resolvedRelayKey && /^[0-9a-fA-F]{64}$/.test(String(resolvedRelayKey))) {
+          resolvedRelayKey = String(resolvedRelayKey).toLowerCase();
         }
         if (!resolvedRelayKey) {
           throw new Error('Missing relay key for invite fallback; cannot join relay');
@@ -3508,7 +3669,8 @@ export async function startJoinAuthentication(options) {
         const fallbackRelayKey = resolvedRelayKey;
         console.log('[RelayServer] Falling back to invite token path (no direct host)', {
           relayKey: fallbackRelayKey,
-          publicIdentifier
+          publicIdentifier,
+          relayKeySource
         });
 
         if (!writerSecret) {

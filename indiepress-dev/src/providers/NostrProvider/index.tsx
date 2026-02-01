@@ -701,6 +701,19 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
   }
 
   const promptDecryptNcryptsec = async (ncrypt: string): Promise<Uint8Array | null> => {
+    const e2ePassword =
+      import.meta.env.DEV && import.meta.env.VITE_E2E_NCRYPT_PASSWORD
+        ? String(import.meta.env.VITE_E2E_NCRYPT_PASSWORD)
+        : null
+    if (e2ePassword) {
+      try {
+        return nip49.decrypt(ncrypt, e2ePassword)
+      } catch (err) {
+        toast.error(t('Failed to decrypt ncryptsec'))
+        return null
+      }
+    }
+
     const password = await new Promise<string | null>((resolve) => {
       setNcryptPassword('')
       setNcryptPrompt({ token: ncrypt, resolve })

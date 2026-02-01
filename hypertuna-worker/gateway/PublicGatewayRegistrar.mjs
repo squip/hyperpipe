@@ -18,9 +18,21 @@ class PublicGatewayRegistrar {
     return this.enabled;
   }
 
+  #classifyRelayKey(value) {
+    if (typeof value !== 'string') return 'unknown';
+    const trimmed = value.trim();
+    if (!trimmed) return 'unknown';
+    return /^[0-9a-fA-F]{64}$/.test(trimmed) ? 'hex' : 'alias';
+  }
+
   async registerRelay(relayKey, payload = {}) {
     if (!this.isEnabled()) return { success: false };
     if (!relayKey) throw new Error('relayKey is required');
+
+    this.logger?.info?.('[PublicGatewayRegistrar] Relay registration request', {
+      relayKey,
+      relayKeyType: this.#classifyRelayKey(relayKey)
+    });
 
     const registration = createRelayRegistration(relayKey, payload);
     const signature = createSignature(registration, this.sharedSecret);
@@ -86,16 +98,28 @@ class PublicGatewayRegistrar {
   }
 
   async issueGatewayToken(relayKey, payload = {}) {
+    this.logger?.info?.('[PublicGatewayRegistrar] Relay token issue request', {
+      relayKey,
+      relayKeyType: this.#classifyRelayKey(relayKey)
+    });
     const body = await this.#signedPayload({ relayKey, ...payload });
     return this.#postJson('/api/relay-tokens/issue', body);
   }
 
   async refreshGatewayToken(relayKey, payload = {}) {
+    this.logger?.info?.('[PublicGatewayRegistrar] Relay token refresh request', {
+      relayKey,
+      relayKeyType: this.#classifyRelayKey(relayKey)
+    });
     const body = await this.#signedPayload({ relayKey, ...payload });
     return this.#postJson('/api/relay-tokens/refresh', body);
   }
 
   async revokeGatewayToken(relayKey, payload = {}) {
+    this.logger?.info?.('[PublicGatewayRegistrar] Relay token revoke request', {
+      relayKey,
+      relayKeyType: this.#classifyRelayKey(relayKey)
+    });
     const body = await this.#signedPayload({ relayKey, ...payload });
     return this.#postJson('/api/relay-tokens/revoke', body);
   }
@@ -103,6 +127,11 @@ class PublicGatewayRegistrar {
   async updateOpenJoinPool(relayKey, entries = [], options = {}) {
     if (!this.isEnabled()) return { success: false };
     if (!relayKey) throw new Error('relayKey is required');
+    this.logger?.info?.('[PublicGatewayRegistrar] Open join pool update request', {
+      relayKey,
+      relayKeyType: this.#classifyRelayKey(relayKey),
+      entriesCount: Array.isArray(entries) ? entries.length : 0
+    });
     const metadata = options?.metadata && typeof options.metadata === 'object' ? options.metadata : null;
     const relayCores = Array.isArray(options?.relayCores)
       ? options.relayCores

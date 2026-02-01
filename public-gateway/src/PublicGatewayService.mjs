@@ -2992,6 +2992,11 @@ class PublicGatewayService {
     if (!relayKey || !relayAuthToken) {
       return res.status(400).json({ error: 'relayKey and relayAuthToken are required' });
     }
+    const relayKeyType = this.#isHexRelayKey(relayKey) ? 'hex' : 'alias';
+    this.logger?.info?.('[PublicGateway] Relay token issue request', {
+      relayKey,
+      relayKeyType
+    });
 
     try {
       const result = await this.tokenService.issueToken(relayKey, {
@@ -3005,6 +3010,7 @@ class PublicGatewayService {
     } catch (error) {
       this.logger?.error?.('Failed to issue relay token', {
         relayKey,
+        relayKeyType,
         error: error?.message || error
       });
       this.tokenMetrics.issueCounter.inc({ result: 'error' });
@@ -3026,6 +3032,11 @@ class PublicGatewayService {
     if (!relayKey || !token) {
       return res.status(400).json({ error: 'relayKey and token are required' });
     }
+    const relayKeyType = this.#isHexRelayKey(relayKey) ? 'hex' : 'alias';
+    this.logger?.info?.('[PublicGateway] Relay token refresh request', {
+      relayKey,
+      relayKeyType
+    });
 
     try {
       const result = await this.tokenService.refreshToken(relayKey, {
@@ -3037,6 +3048,7 @@ class PublicGatewayService {
     } catch (error) {
       this.logger?.warn?.('Failed to refresh relay token', {
         relayKey,
+        relayKeyType,
         error: error?.message || error
       });
       this.tokenMetrics.refreshCounter.inc({ result: 'error' });
@@ -3057,6 +3069,11 @@ class PublicGatewayService {
     if (!relayKey) {
       return res.status(400).json({ error: 'relayKey is required' });
     }
+    const relayKeyType = this.#isHexRelayKey(relayKey) ? 'hex' : 'alias';
+    this.logger?.info?.('[PublicGateway] Relay token revoke request', {
+      relayKey,
+      relayKeyType
+    });
 
     try {
       const result = await this.tokenService.revokeToken(relayKey, { reason: payload?.reason });
@@ -3069,6 +3086,7 @@ class PublicGatewayService {
     } catch (error) {
       this.logger?.warn?.('Failed to revoke relay token', {
         relayKey,
+        relayKeyType,
         error: error?.message || error
       });
       this.tokenMetrics.revokeCounter.inc({ result: 'error' });
@@ -3496,6 +3514,7 @@ class PublicGatewayService {
     if (!registration.relayKey) {
       return res.status(400).json({ error: 'relayKey is required' });
     }
+    const relayKeyType = this.#isHexRelayKey(registration.relayKey) ? 'hex' : 'alias';
 
     const relayCoreMetadata = Array.isArray(registration.relayCores)
       ? registration.relayCores
@@ -3524,7 +3543,7 @@ class PublicGatewayService {
           error: error?.message || error
         }, '[PublicGateway] Failed to store relay aliases');
       });
-      this.logger.info?.({ relayKey: registration.relayKey }, 'Relay registration accepted');
+      this.logger.info?.({ relayKey: registration.relayKey, relayKeyType }, 'Relay registration accepted');
       const hyperbeeInfo = this.#getRelayHostInfo();
       return res.json({
         status: 'ok',
@@ -3573,6 +3592,13 @@ class PublicGatewayService {
     }
     try {
       const trimmedIdentifier = typeof identifier === 'string' ? identifier.trim() : null;
+      const identifierType = this.#isHexRelayKey(trimmedIdentifier)
+        ? 'hex'
+        : (trimmedIdentifier ? 'alias' : 'unknown');
+      this.logger?.info?.('[PublicGateway] Mirror metadata request', {
+        identifier: trimmedIdentifier,
+        identifierType
+      });
       const resolved = trimmedIdentifier
         ? await this.#resolveOpenJoinRegistration(trimmedIdentifier)
         : null;
@@ -3594,6 +3620,11 @@ class PublicGatewayService {
             poolRelayKey || trimmedIdentifier
           );
           if (poolPayload) {
+            this.logger?.info?.('[PublicGateway] Mirror metadata resolved from open join pool', {
+              identifier: trimmedIdentifier,
+              relayKey: poolRelayKey || trimmedIdentifier,
+              coreCount: Array.isArray(poolPayload.cores) ? poolPayload.cores.length : 0
+            });
             await this.#storeMirrorMetadataPayload(poolRelayKey || trimmedIdentifier, poolPayload);
             return res.json(poolPayload);
           }
@@ -3634,16 +3665,33 @@ class PublicGatewayService {
                 }
               : (cached.blindPeer || { enabled: false })
           };
+          this.logger?.info?.('[PublicGateway] Mirror metadata resolved from cache', {
+            identifier: trimmedIdentifier,
+            relayKey: payload.relayKey,
+            publicIdentifier,
+            coreCount: Array.isArray(payload.cores) ? payload.cores.length : 0,
+            blindPeerEnabled: !!payload.blindPeer?.publicKey || payload.blindPeer?.enabled === true
+          });
           const storeKey = canonicalRelayKey || relayKey || cached.relayKey || trimmedIdentifier;
           await this.#storeMirrorMetadataPayload(storeKey, payload);
           return res.json(payload);
         }
+        this.logger?.info?.('[PublicGateway] Mirror metadata not found', {
+          identifier: trimmedIdentifier
+        });
         return res.status(404).json({ error: 'relay-not-found' });
       }
       const payload = this.#buildMirrorMetadataPayload(record, relayKey || trimmedIdentifier);
       if (relayKey) {
         payload.relayKey = relayKey;
       }
+      this.logger?.info?.('[PublicGateway] Mirror metadata resolved from registration', {
+        identifier: trimmedIdentifier,
+        relayKey: payload.relayKey || relayKey || trimmedIdentifier,
+        publicIdentifier: payload.publicIdentifier || null,
+        coreCount: Array.isArray(payload.cores) ? payload.cores.length : 0,
+        blindPeerEnabled: !!payload.blindPeer?.publicKey || payload.blindPeer?.enabled === true
+      });
       await this.#storeMirrorMetadataPayload(relayKey || trimmedIdentifier, payload);
       return res.json(payload);
     } catch (error) {
@@ -3672,6 +3720,11 @@ class PublicGatewayService {
     if (!relayKey) {
       return res.status(400).json({ error: 'relayKey is required' });
     }
+    const relayKeyType = this.#isHexRelayKey(relayKey) ? 'hex' : 'alias';
+    this.logger?.info?.('[PublicGateway] Open join pool update request', {
+      relayKey,
+      relayKeyType
+    });
 
     const payloadMetadata = payload?.metadata && typeof payload.metadata === 'object'
       ? payload.metadata
@@ -3929,6 +3982,8 @@ class PublicGatewayService {
         return res.status(404).json({ error: 'relay-not-found' });
       }
       const { relayKey, record, pool } = resolved;
+      const relayKeyType = this.#isHexRelayKey(relayKey) ? 'hex' : 'alias';
+      const identifierType = this.#isHexRelayKey(identifier) ? 'hex' : 'alias';
       const isAllowed = record ? this.#isOpenJoinAllowed(record) : this.#isOpenJoinPoolAllowed(pool);
       if (!isAllowed) {
         return res.status(403).json({ error: 'relay-not-open' });
@@ -4026,6 +4081,8 @@ class PublicGatewayService {
       if (this.openJoinLeaseLocks.has(relayKey)) {
         this.logger?.warn?.('[PublicGateway] Open join lease busy', {
           relayKey,
+          relayKeyType,
+          identifierType,
           publicIdentifier,
           poolBefore: poolBeforeCount
         });
@@ -4050,6 +4107,8 @@ class PublicGatewayService {
       if (!lease) {
         this.logger?.warn?.('[PublicGateway] Open join lease unavailable', {
           relayKey,
+          relayKeyType,
+          identifierType,
           publicIdentifier,
           identifier,
           poolBefore: poolBeforeCount,
@@ -4070,6 +4129,8 @@ class PublicGatewayService {
       const resolvedAutobaseLocal = autobaseLocal || writerCoreHex || null;
       this.logger?.info?.('[PublicGateway] Open join lease issued', {
         relayKey,
+        relayKeyType,
+        identifierType,
         publicIdentifier,
         source: record ? 'registration' : 'pool',
         poolBefore: poolBeforeCount,

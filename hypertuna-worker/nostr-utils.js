@@ -11,6 +11,83 @@ import b4a from 'b4a';
 
 export class NostrUtils {
     /**
+     * Bech32 helpers (minimal BIP-173 implementation)
+     */
+    static bech32Charset() {
+        return 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+    }
+
+    static bech32Polymod(values) {
+        const GENERATOR = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+        let chk = 1;
+        for (const value of values) {
+            const top = chk >> 25;
+            chk = ((chk & 0x1ffffff) << 5) ^ value;
+            for (let i = 0; i < 5; i += 1) {
+                if ((top >> i) & 1) chk ^= GENERATOR[i];
+            }
+        }
+        return chk;
+    }
+
+    static bech32HrpExpand(hrp) {
+        const ret = [];
+        for (let i = 0; i < hrp.length; i += 1) {
+            ret.push(hrp.charCodeAt(i) >> 5);
+        }
+        ret.push(0);
+        for (let i = 0; i < hrp.length; i += 1) {
+            ret.push(hrp.charCodeAt(i) & 31);
+        }
+        return ret;
+    }
+
+    static bech32CreateChecksum(hrp, data) {
+        const values = this.bech32HrpExpand(hrp).concat(data);
+        values.push(0, 0, 0, 0, 0, 0);
+        const mod = this.bech32Polymod(values) ^ 1;
+        const ret = [];
+        for (let p = 0; p < 6; p += 1) {
+            ret.push((mod >> (5 * (5 - p))) & 31);
+        }
+        return ret;
+    }
+
+    static bech32Encode(hrp, data) {
+        const combined = data.concat(this.bech32CreateChecksum(hrp, data));
+        const charset = this.bech32Charset();
+        let ret = `${hrp}1`;
+        for (const value of combined) {
+            ret += charset[value];
+        }
+        return ret;
+    }
+
+    static convertBits(data, from, to, pad) {
+        let acc = 0;
+        let bits = 0;
+        const ret = [];
+        const maxv = (1 << to) - 1;
+        for (const value of data) {
+            if (value < 0 || (value >> from) !== 0) return null;
+            acc = (acc << from) | value;
+            bits += from;
+            while (bits >= to) {
+                bits -= to;
+                ret.push((acc >> bits) & maxv);
+            }
+        }
+        if (pad) {
+            if (bits > 0) {
+                ret.push((acc << (to - bits)) & maxv);
+            }
+        } else if (bits >= from || ((acc << (to - bits)) & maxv)) {
+            return null;
+        }
+        return ret;
+    }
+
+    /**
      * Convert hex string to Uint8Array
      * @param {string} hex - Hex string
      * @returns {Uint8Array}
@@ -30,6 +107,40 @@ export class NostrUtils {
         return Array.from(bytes)
             .map(byte => byte.toString(16).padStart(2, '0'))
             .join('');
+    }
+
+    /**
+     * Convert hex public key to npub format
+     * @param {string} hex - Hex encoded public key
+     * @returns {string} - Bech32 encoded npub string
+     */
+    static hexToNpub(hex) {
+        try {
+            const bytes = this.hexToBytes(hex);
+            const words = this.convertBits(bytes, 8, 5, true);
+            if (!words) throw new Error('Invalid hex for npub');
+            return this.bech32Encode('npub', words);
+        } catch (e) {
+            console.error('Error encoding npub:', e);
+            return null;
+        }
+    }
+
+    /**
+     * Convert hex private key to nsec format
+     * @param {string} hex - Hex encoded private key
+     * @returns {string} - Bech32 encoded nsec string
+     */
+    static hexToNsec(hex) {
+        try {
+            const bytes = this.hexToBytes(hex);
+            const words = this.convertBits(bytes, 8, 5, true);
+            if (!words) throw new Error('Invalid hex for nsec');
+            return this.bech32Encode('nsec', words);
+        } catch (e) {
+            console.error('Error encoding nsec:', e);
+            return null;
+        }
     }
     
     /**

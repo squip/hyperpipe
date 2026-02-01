@@ -60,6 +60,7 @@ import { SimpleUsername } from '@/components/Username'
 import { generateImageByPubkey } from '@/lib/pubkey'
 import React from 'react'
 import { TJoinRequest } from '@/types/groups'
+import { registerClosedJoinSimulator } from '@/devtools/closedJoinSimulator'
 // import { registerJoinWorkflowSimulator } from '@/devtools/joinWorkflowSimulator'
 
 type MemberActionsMenuProps = {
@@ -737,10 +738,40 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     if (!groupId) return
     try {
       const relayUrlForJoin = resolvedGroupRelay || effectiveGroupRelay || null
-      const relayKey = relayKeyForGroup || null
+      const inviteRelayKey = inviteData?.relayKey || null
+      const relayKey = relayKeyForGroup || inviteRelayKey || null
       const shouldUseWorkerJoin =
         isElectron() &&
         (isHypertunaGroup || hasInviteJoinData || !!relayKeyForGroup || !!groupId?.includes(':'))
+
+      if (inviteRelayKey && relayKeyForGroup && inviteRelayKey !== relayKeyForGroup) {
+        console.warn('[GroupPage] Invite relayKey differs from resolved relay key', {
+          groupId,
+          inviteRelayKey: String(inviteRelayKey).slice(0, 16),
+          relayKeyForGroup: String(relayKeyForGroup).slice(0, 16)
+        })
+      }
+      if (isOpenGroup === false && !inviteToken) {
+        if (membershipStatus !== 'pending') {
+          console.info('[GroupPage] Closed join without invite; publishing join request', {
+            groupId,
+            relayUrl: relayUrlForJoin ? String(relayUrlForJoin).slice(0, 80) : null,
+            relayKey: relayKey ? String(relayKey).slice(0, 16) : null,
+            shouldUseWorkerJoin
+          })
+          await sendJoinRequest(groupId, effectiveGroupRelay)
+          setDetail((prev) =>
+            prev
+              ? { ...prev, membershipStatus: 'pending' }
+              : prev
+          )
+        } else {
+          console.info('[GroupPage] Closed join already pending; skipping duplicate request', {
+            groupId
+          })
+        }
+        return
+      }
 
       if (shouldUseWorkerJoin && inviteToken && sendToWorker && pubkey) {
         sendToWorker({
@@ -954,6 +985,39 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     )
     return match?.relayKey
   }, [groupId, relays])
+
+  useEffect(() => {
+    if (process.env.NODE_ENV !== 'development') return
+    if (typeof window === 'undefined') return
+    if (!groupId) return
+    const params = new URLSearchParams(window.location.search)
+    if (!params.has('closedJoinSim')) return
+    registerClosedJoinSimulator({
+      groupId,
+      relay: effectiveGroupRelay || null,
+      relayUrl: resolvedGroupRelay || effectiveGroupRelay || null,
+      relayKeyForGroup: relayKeyForGroup || null,
+      inviteData,
+      isOpenGroup,
+      startJoinFlow,
+      sendJoinRequest,
+      loadJoinRequests,
+      approveJoinRequest,
+      sendInvites
+    })
+  }, [
+    approveJoinRequest,
+    effectiveGroupRelay,
+    groupId,
+    inviteData,
+    isOpenGroup,
+    loadJoinRequests,
+    relayKeyForGroup,
+    resolvedGroupRelay,
+    sendInvites,
+    sendJoinRequest,
+    startJoinFlow
+  ])
 
   const groupDisplayName =
     effectiveDetail?.metadata?.name || fallbackMeta?.name || groupId || t('Group')

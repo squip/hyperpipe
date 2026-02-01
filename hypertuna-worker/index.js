@@ -163,6 +163,14 @@ function normalizeRelayKeyHex(value) {
   return trimmed.toLowerCase()
 }
 
+function describeRelayIdentifierType(value) {
+  const trimmed = typeof value === 'string' ? value.trim() : ''
+  if (!trimmed) return 'unknown'
+  if (isHex64(trimmed)) return 'hex'
+  if (trimmed.includes(':') || trimmed.includes('/')) return 'alias'
+  return 'alias'
+}
+
 function resolveRelayIdentifierPath(identifier) {
   if (!identifier || typeof identifier !== 'string') return null
   return identifier.includes(':') ? identifier.replace(':', '/') : identifier
@@ -1421,6 +1429,7 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
   const originList = Array.isArray(origins) && origins.length ? origins : collectPublicGatewayOrigins()
   console.log('[Worker] Open join bootstrap start', {
     relayIdentifier,
+    relayIdentifierType: describeRelayIdentifierType(relayIdentifier),
     origins: originList,
     reason
   })
@@ -1485,6 +1494,7 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
         relayIdentifier,
         origin: base,
         relayKey: challengeData?.relayKey ? String(challengeData.relayKey).slice(0, 16) : null,
+        relayKeyType: describeRelayIdentifierType(challengeData?.relayKey),
         publicIdentifier,
         expiresAt: challengeData?.expiresAt || null
       })
@@ -1567,6 +1577,7 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
         relayIdentifier,
         origin: base,
         relayKey: previewValue(data.relayKey || data.relay_key, 16),
+        relayKeyType: describeRelayIdentifierType(data.relayKey || data.relay_key),
         publicIdentifier: data.publicIdentifier || data.public_identifier || null,
         hasWriterCore: !!data.writerCore,
         hasWriterCoreHex: !!(data.writerCoreHex || data.writer_core_hex),
@@ -1606,6 +1617,7 @@ async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mi
   if (!relayKey) {
     return { status: 'skipped', reason: 'missing-relay-key' }
   }
+  const relayKeyType = describeRelayIdentifierType(relayKey)
   const fetchImpl = globalThis.fetch
   if (typeof fetchImpl !== 'function') {
     return { status: 'skipped', reason: 'fetch-unavailable' }
@@ -1623,6 +1635,12 @@ async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mi
       ? setTimeout(() => controller.abort(), BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS)
       : null
     try {
+      console.log('[Worker] Mirror metadata request', {
+        relayKey,
+        relayKeyType,
+        origin,
+        reason
+      })
       const response = await fetchImpl(url, { signal: controller?.signal })
       if (!response.ok) {
         lastError = new Error(`status ${response.status}`)
@@ -3527,6 +3545,29 @@ async function handleMessageObject(message) {
       break
     }
 
+    case 'get-worker-identity': {
+      const pubkeyHex =
+        typeof config?.nostr_pubkey_hex === 'string'
+          ? config.nostr_pubkey_hex
+          : typeof storedParentConfig?.nostr_pubkey_hex === 'string'
+            ? storedParentConfig.nostr_pubkey_hex
+            : null
+      const userKey =
+        typeof config?.userKey === 'string'
+          ? config.userKey
+          : typeof storedParentConfig?.userKey === 'string'
+            ? storedParentConfig.userKey
+            : null
+      sendMessage({
+        type: 'worker-identity',
+        data: {
+          pubkeyHex: pubkeyHex ? String(pubkeyHex) : null,
+          userKey: userKey || null
+        }
+      })
+      break
+    }
+
     case 'get-public-gateway-config': {
       await ensurePublicGatewaySettingsLoaded()
       sendMessage({ type: 'public-gateway-config', config: publicGatewaySettings })
@@ -4029,6 +4070,14 @@ async function handleMessageObject(message) {
             const relayIdentifier = joinRelayKey || publicIdentifier
             if (relayIdentifier) {
               try {
+                console.log('[Worker] Join flow missing host peers/blind peer; attempting mirror metadata', {
+                  publicIdentifier,
+                  relayIdentifier,
+                  relayKey: previewValue(joinRelayKey, 16),
+                  hasInviteToken: !!inviteToken,
+                  openJoin,
+                  isOpen
+                })
                 await ensurePublicGatewaySettingsLoaded()
                 const mirrorResult = await fetchRelayMirrorMetadata(relayIdentifier, { reason: 'join-flow' })
                 if (mirrorResult?.status === 'ok' && mirrorResult.data) {
@@ -4207,6 +4256,12 @@ async function handleMessageObject(message) {
 
     case 'provision-writer-for-invitee':
       try {
+        const requestData = message?.data || {}
+        console.log('[Worker] Provision writer requested', {
+          relayKey: previewValue(requestData.relayKey, 16),
+          publicIdentifier: requestData.publicIdentifier || null,
+          invitee: previewValue(requestData.inviteePubkey, 16)
+        })
         const requestId = message?.requestId
         if (!relayServer?.provisionWriterForInvitee) throw new Error('Relay server unavailable')
         const result = await relayServer.provisionWriterForInvitee(message.data || {})
