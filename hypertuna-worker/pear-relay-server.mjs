@@ -18,6 +18,13 @@ import { updateRelayAuthToken } from './hypertuna-relay-profile-manager-bare.mjs
 import { applyPendingAuthUpdates } from './pending-auth.mjs';
 import HypercoreId from 'hypercore-id-encoding';
 import {
+  collectRelayCoreRefsFromAutobase,
+  mergeCoreRefLists,
+  normalizeCoreRefList,
+  resolveRelayMirrorCoreRefs,
+  updateRelayMirrorCoreRefs
+} from './relay-core-refs-store.mjs';
+import {
   createRelay as createRelayManager,
   joinRelay as joinRelayManager,
   disconnectRelay as disconnectRelayManager,
@@ -4402,6 +4409,48 @@ export async function provisionWriterForInvitee(options = {}) {
     activeWriters: relayManager.relay?.activeWriters?.size ?? null,
     viewVersion: relayManager.relay?.view?.version ?? null
   });
+
+  try {
+    if (typeof relayManager.relay?.update === 'function') {
+      try {
+        await relayManager.relay.update({ wait: true });
+      } catch (_) {
+        await relayManager.relay.update();
+      }
+    }
+  } catch (error) {
+    console.warn('[RelayServer] Relay update failed after invite writer add', {
+      relayKey: resolvedRelayKey,
+      error: error?.message || error
+    });
+  }
+
+  try {
+    const relayIdentifier = publicIdentifier || relayManager?.publicIdentifier || null;
+    const autobaseEntries = collectRelayCoreRefsFromAutobase(relayManager.relay);
+    const autobaseRefs = normalizeCoreRefList(autobaseEntries);
+    const inviteRefs = normalizeCoreRefList([writerCore, writerCoreHex, writerAddHex]);
+    const storedRefs = await resolveRelayMirrorCoreRefs(resolvedRelayKey, relayIdentifier, autobaseEntries);
+    const mergedCoreRefs = mergeCoreRefLists(storedRefs, autobaseRefs, inviteRefs);
+    updateRelayMirrorCoreRefs(resolvedRelayKey, mergedCoreRefs);
+    if (typeof global.syncActiveRelayCoreRefs === 'function') {
+      await global.syncActiveRelayCoreRefs({
+        relayKey: resolvedRelayKey,
+        publicIdentifier: relayIdentifier,
+        coreRefs: mergedCoreRefs,
+        reason: 'invite-writer'
+      });
+    }
+    console.log('[RelayServer] Persisted invite writer core refs', {
+      relayKey: resolvedRelayKey,
+      coreRefs: mergedCoreRefs.length
+    });
+  } catch (error) {
+    console.warn('[RelayServer] Failed to persist invite writer core refs', {
+      relayKey: resolvedRelayKey,
+      error: error?.message || error
+    });
+  }
 
   console.log('[RelayServer][WriterMaterial] Invite writer material', {
     relayKey: resolvedRelayKey,

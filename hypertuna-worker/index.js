@@ -9,7 +9,6 @@ import { join } from 'node:path'
 import nodeCrypto from 'node:crypto'
 import swarmCrypto from 'hypercore-crypto'
 import b4a from 'b4a'
-import HypercoreId from 'hypercore-id-encoding'
 import GatewayService from './gateway/GatewayService.mjs'
 import {
   getAllRelayProfiles,
@@ -64,13 +63,24 @@ import {
   decryptSharedSecretFromString
 } from './challenge-manager.mjs'
 import BlindPeeringManager from './blind-peering-manager.mjs'
+import {
+  configureRelayCoreRefsStore,
+  normalizeCoreRef,
+  decodeCoreRef,
+  normalizeCoreRefList,
+  normalizeMirrorCoreRefs,
+  mergeCoreRefLists,
+  coreRefsFingerprint,
+  getRelayMirrorCoreRefsCache,
+  updateRelayMirrorCoreRefs,
+  resolveRelayMirrorCoreRefs
+} from './relay-core-refs-store.mjs'
 
 const pearRuntime = globalThis?.Pear
 const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd()
 const defaultStorageDir = process.env.STORAGE_DIR || pearRuntime?.config?.storage || join(process.cwd(), 'data')
 const userKey = process.env.USER_KEY || null
 const BLIND_PEERING_METADATA_FILENAME = 'blind-peering-metadata.json'
-const RELAY_CORE_REFS_CACHE_FILENAME = 'relay-core-refs-cache.json'
 const BLIND_PEER_REHYDRATION_TIMEOUT_MS = 60000
 const BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS = 90000
 const BLIND_PEER_REHYDRATION_RETRIES = 1
@@ -88,9 +98,9 @@ global.userConfig = {
   userKey: userKey || null
 }
 
+configureRelayCoreRefsStore({ storageBase: defaultStorageDir, logger: console })
+
 const relayMirrorSubscriptions = new Map()
-const relayMirrorCoreRefs = new Map()
-const relayMirrorCoreRefsCache = new Map()
 const relayMirrorSyncState = new Map()
 let lastBlindPeerFingerprint = null
 let lastDispatcherAssignmentFingerprint = null
@@ -98,9 +108,6 @@ let pendingRelayRegistryRefresh = false
 let gatewayWasRunning = false
 let lastMirrorMetadataRefreshAt = 0
 let mirrorMetadataRefreshInFlight = null
-let relayCoreRefsCacheLoaded = false
-let relayCoreRefsCacheDirty = false
-let relayCoreRefsCacheTimer = null
 const openJoinContexts = new Map()
 const pendingOpenJoinReauth = new Map()
 const OPEN_JOIN_REAUTH_MIN_INTERVAL_MS = 30000
@@ -200,83 +207,6 @@ function resolveHostPeersFromGatewayStatus(status, identifier) {
   return []
 }
 
-function normalizeCoreRef(value) {
-  if (!value) return null
-  if (Buffer.isBuffer(value)) {
-    try {
-      return HypercoreId.encode(value)
-    } catch (_) {
-      return null
-    }
-  }
-  if (value instanceof Uint8Array) {
-    return normalizeCoreRef(Buffer.from(value))
-  }
-  if (typeof value === 'string') {
-    const trimmed = value.trim()
-    if (!trimmed) return null
-    try {
-      const decoded = HypercoreId.decode(trimmed)
-      return HypercoreId.encode(decoded)
-    } catch (_) {
-      if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
-        try {
-          return HypercoreId.encode(Buffer.from(trimmed, 'hex'))
-        } catch (_) {
-          return null
-        }
-      }
-      return null
-    }
-  }
-  if (value && typeof value === 'object') {
-    if (value.key) return normalizeCoreRef(value.key)
-    if (value.core) return normalizeCoreRef(value.core)
-  }
-  return null
-}
-
-function decodeCoreRef(value) {
-  if (!value) return null
-  if (Buffer.isBuffer(value)) return Buffer.from(value)
-  if (value instanceof Uint8Array) return Buffer.from(value)
-  if (typeof value === 'string') {
-    const trimmed = value.trim()
-    if (!trimmed) return null
-    try {
-      return HypercoreId.decode(trimmed)
-    } catch (_) {
-      if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
-        return Buffer.from(trimmed, 'hex')
-      }
-      return null
-    }
-  }
-  if (value && typeof value === 'object') {
-    if (value.key) return decodeCoreRef(value.key)
-    if (value.core) return decodeCoreRef(value.core)
-  }
-  return null
-}
-
-function normalizeCoreRefList(refs) {
-  if (!Array.isArray(refs)) return []
-  const seen = new Set()
-  const result = []
-  for (const ref of refs) {
-    const normalized = normalizeCoreRef(ref)
-    if (!normalized || seen.has(normalized)) continue
-    seen.add(normalized)
-    result.push(normalized)
-  }
-  return result
-}
-
-function normalizeMirrorCoreRefs(cores) {
-  if (!Array.isArray(cores)) return []
-  return normalizeCoreRefList(cores)
-}
-
 function normalizeOpenJoinCoreEntry(entry) {
   const key = normalizeCoreRef(entry)
   if (!key) return null
@@ -321,149 +251,6 @@ function collectRelayCoreEntriesForAppend(relayManager) {
     addCore(autobase.writer.core || autobase.writer, 'autobase-writer')
   }
   return entries
-}
-
-function mergeCoreRefLists(...lists) {
-  const merged = []
-  const seen = new Set()
-  for (const list of lists) {
-    if (!Array.isArray(list)) continue
-    for (const ref of list) {
-      if (!ref || seen.has(ref)) continue
-      seen.add(ref)
-      merged.push(ref)
-    }
-  }
-  return merged
-}
-
-function coreRefsFingerprint(coreRefs = []) {
-  return Array.isArray(coreRefs) ? coreRefs.join('|') : ''
-}
-
-function getRelayCoreRefsCachePath() {
-  return join(defaultStorageDir, RELAY_CORE_REFS_CACHE_FILENAME)
-}
-
-async function loadRelayCoreRefsCache() {
-  if (relayCoreRefsCacheLoaded) return
-  relayCoreRefsCacheLoaded = true
-  const cachePath = getRelayCoreRefsCachePath()
-  try {
-    const payload = await fs.readFile(cachePath, 'utf8')
-    const parsed = JSON.parse(payload)
-    const relays = parsed?.relays && typeof parsed.relays === 'object'
-      ? parsed.relays
-      : parsed
-    if (!relays || typeof relays !== 'object') return
-    for (const [relayKey, entry] of Object.entries(relays)) {
-      const coreRefs = Array.isArray(entry) ? entry : entry?.coreRefs
-      const normalized = normalizeCoreRefList(coreRefs)
-      if (!normalized.length) continue
-      relayMirrorCoreRefsCache.set(relayKey, normalized)
-      const existing = relayMirrorCoreRefs.get(relayKey) || []
-      const merged = mergeCoreRefLists(existing, normalized)
-      if (merged.length && coreRefsFingerprint(existing) !== coreRefsFingerprint(merged)) {
-        relayMirrorCoreRefs.set(relayKey, merged)
-      }
-    }
-  } catch (error) {
-    if (error?.code !== 'ENOENT') {
-      console.warn('[Worker] Failed to load relay core refs cache', {
-        path: cachePath,
-        error: error?.message || error
-      })
-    }
-  }
-}
-
-function scheduleRelayCoreRefsCachePersist() {
-  if (relayCoreRefsCacheTimer) return
-  relayCoreRefsCacheTimer = setTimeout(() => {
-    relayCoreRefsCacheTimer = null
-    persistRelayCoreRefsCache().catch((error) => {
-      console.warn('[Worker] Failed to persist relay core refs cache', {
-        error: error?.message || error
-      })
-    })
-  }, 2000)
-  relayCoreRefsCacheTimer.unref?.()
-}
-
-async function persistRelayCoreRefsCache(force = false) {
-  await loadRelayCoreRefsCache()
-  if (!force && !relayCoreRefsCacheDirty) return
-  const relays = {}
-  for (const [relayKey, coreRefs] of relayMirrorCoreRefs.entries()) {
-    const normalized = normalizeCoreRefList(coreRefs)
-    if (!normalized.length) continue
-    relays[relayKey] = { coreRefs: normalized }
-  }
-  const payload = JSON.stringify({
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    relays
-  }, null, 2)
-  const cachePath = getRelayCoreRefsCachePath()
-  try {
-    await fs.mkdir(defaultStorageDir, { recursive: true })
-    await fs.writeFile(cachePath, payload, 'utf8')
-    relayMirrorCoreRefsCache.clear()
-    for (const [relayKey, entry] of Object.entries(relays)) {
-      relayMirrorCoreRefsCache.set(relayKey, entry.coreRefs)
-    }
-    relayCoreRefsCacheDirty = false
-  } catch (error) {
-    console.warn('[Worker] Failed to persist relay core refs cache', {
-      path: cachePath,
-      error: error?.message || error
-    })
-  }
-}
-
-async function getRelayMirrorCoreRefsCache(relayKey) {
-  await loadRelayCoreRefsCache()
-  if (!relayKey) return []
-  return relayMirrorCoreRefsCache.get(relayKey) || []
-}
-
-function updateRelayMirrorCoreRefs(relayKey, coreRefs, { persist = true } = {}) {
-  if (!relayKey || !Array.isArray(coreRefs) || !coreRefs.length) return
-  const normalized = normalizeCoreRefList(coreRefs)
-  if (!normalized.length) return
-  const existing = relayMirrorCoreRefs.get(relayKey) || []
-  if (coreRefsFingerprint(existing) === coreRefsFingerprint(normalized)) {
-    return
-  }
-  relayMirrorCoreRefs.set(relayKey, normalized)
-  if (persist) {
-    relayCoreRefsCacheDirty = true
-    scheduleRelayCoreRefsCachePersist()
-  }
-}
-
-async function resolveRelayMirrorCoreRefs(relayKey, publicIdentifier = null, fallbackRefs = []) {
-  const normalizedFallback = normalizeCoreRefList(fallbackRefs)
-  await loadRelayCoreRefsCache()
-  const cachedRefs = relayKey ? (relayMirrorCoreRefsCache.get(relayKey) || []) : []
-  if (relayKey && relayMirrorCoreRefs.has(relayKey)) {
-    const cached = relayMirrorCoreRefs.get(relayKey) || []
-    const merged = mergeCoreRefLists(cachedRefs, cached, normalizedFallback)
-    updateRelayMirrorCoreRefs(relayKey, merged)
-    return merged
-  }
-
-  let profile = null
-  if (relayKey) {
-    profile = await getRelayProfileByKey(relayKey)
-  }
-  if (!profile && publicIdentifier) {
-    profile = await getRelayProfileByPublicIdentifier(publicIdentifier)
-  }
-  const storedRefs = normalizeCoreRefList(profile?.core_refs || profile?.coreRefs)
-  const merged = mergeCoreRefLists(cachedRefs, storedRefs, normalizedFallback)
-  updateRelayMirrorCoreRefs(relayKey, merged)
-  return merged
 }
 
 function bufferListHas(buffers, candidate) {

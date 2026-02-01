@@ -3355,14 +3355,32 @@ class PublicGatewayService {
     };
     metadata.peerStates = peerStates;
 
-    const relayCores = Array.isArray(relayPayload?.relayCores)
+    const relayCoreModeRaw = typeof relayPayload?.relayCoresMode === 'string'
+      ? relayPayload.relayCoresMode.trim().toLowerCase()
+      : null;
+    const mergeRelayCores = relayCoreModeRaw === 'merge'
+      || relayCoreModeRaw === 'append'
+      || relayPayload?.mergeRelayCores === true;
+    const incomingRelayCores = Array.isArray(relayPayload?.relayCores)
       ? relayPayload.relayCores
           .filter((entry) => entry && typeof entry === 'object' && entry.key)
           .map((entry) => ({
             key: entry.key,
             role: typeof entry.role === 'string' ? entry.role : null
           }))
-      : (existing?.relayCores || null);
+      : [];
+    let relayCores = null;
+    if (mergeRelayCores) {
+      const existingRelayCores = Array.isArray(existing?.relayCores) ? existing.relayCores : [];
+      const mergeResult = this.#mergeOpenJoinCoreEntries(existingRelayCores, incomingRelayCores, {
+        maxTotal: this.openJoinConfig?.maxRelayCores || null
+      });
+      relayCores = mergeResult.merged;
+    } else if (incomingRelayCores.length) {
+      relayCores = incomingRelayCores;
+    } else {
+      relayCores = existing?.relayCores || null;
+    }
 
     const record = {
       relayKey,
@@ -3531,7 +3549,26 @@ class PublicGatewayService {
     }
 
     try {
-      const upsertPayload = relayCoreMetadata ? { ...registration, relayCores: relayCoreMetadata } : registration;
+      const relayCoreModeRaw = typeof registration?.relayCoresMode === 'string'
+        ? registration.relayCoresMode.trim().toLowerCase()
+        : null;
+      const mergeRelayCores = relayCoreModeRaw === 'merge'
+        || relayCoreModeRaw === 'append'
+        || registration?.mergeRelayCores === true;
+      const existing = mergeRelayCores
+        ? await this.registrationStore.getRelay(registration.relayKey)
+        : null;
+      const upsertPayload = relayCoreMetadata
+        ? { ...registration, relayCores: relayCoreMetadata }
+        : { ...registration };
+      if (mergeRelayCores) {
+        const existingRelayCores = Array.isArray(existing?.relayCores) ? existing.relayCores : [];
+        const incomingRelayCores = relayCoreMetadata || [];
+        const mergeResult = this.#mergeOpenJoinCoreEntries(existingRelayCores, incomingRelayCores, {
+          maxTotal: this.openJoinConfig?.maxRelayCores || null
+        });
+        upsertPayload.relayCores = mergeResult.merged;
+      }
       await this.registrationStore.upsertRelay(registration.relayKey, upsertPayload);
       await this.#storeMirrorMetadataPayload(
         registration.relayKey,

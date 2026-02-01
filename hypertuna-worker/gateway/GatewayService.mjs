@@ -29,6 +29,7 @@ import { activeRelays as relayManagerMap } from '../hypertuna-relay-manager-adap
 import { getRelayAuthStore } from '../relay-auth-store.mjs';
 import { updatePublicGatewaySettings } from '../../shared/config/PublicGatewaySettings.mjs';
 import HypercoreId from 'hypercore-id-encoding';
+import { resolveRelayMirrorCoreRefs } from '../relay-core-refs-store.mjs';
 
 const MAX_LOG_ENTRIES = 500;
 const DEFAULT_PORT = 8443;
@@ -1148,7 +1149,7 @@ export class GatewayService extends EventEmitter {
 
     const now = Date.now();
 
-    const relayCores = this.#collectRelayCoreMetadata(relayKey);
+    const relayCores = await this.#collectRelayCoreMetadata(relayKey, metadataCopy?.identifier || null);
     if (relayCores?.length) {
       this.log('debug', `[PublicGateway] Collected relay core metadata for registration relay=${relayKey}`, {
         cores: relayCores.length
@@ -1165,6 +1166,7 @@ export class GatewayService extends EventEmitter {
         };
         if (relayCores?.length) {
           payload.relayCores = relayCores;
+          payload.relayCoresMode = 'merge';
         }
         try {
           const registrationResult = await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
@@ -1255,6 +1257,7 @@ export class GatewayService extends EventEmitter {
     };
     if (relayCores?.length) {
       payload.relayCores = relayCores;
+      payload.relayCoresMode = 'merge';
     }
 
     try {
@@ -1936,7 +1939,7 @@ export class GatewayService extends EventEmitter {
         ? metadata.connectionUrl
         : (typeof metadata?.relayUrl === 'string' ? metadata.relayUrl : null);
       const gatewayPath = this._normalizeGatewayPath(metadataIdentifier || relayKey, metadata?.gatewayPath, relayUrl);
-      const relayCores = this.#collectRelayCoreMetadata(relayKey) || [];
+      const relayCores = await this.#collectRelayCoreMetadata(relayKey, metadataIdentifier || null) || [];
       const targetResult = await this.openJoinPoolProvider({
         relayKey,
         publicIdentifier: metadataIdentifier,
@@ -2350,12 +2353,11 @@ export class GatewayService extends EventEmitter {
     };
   }
 
-  #collectRelayCoreMetadata(relayKey) {
-    if (!relayKey || !relayManagerMap?.get) return [];
-    const relayManager = relayManagerMap.get(relayKey);
+  async #collectRelayCoreMetadata(relayKey, publicIdentifier = null) {
+    if (!relayKey) return [];
+    const relayManager = relayManagerMap?.get ? relayManagerMap.get(relayKey) : null;
     const autobase = relayManager?.relay || null;
-    if (!autobase) return [];
-
+    const cached = this.relayCoreCache.get(relayKey) || [];
     const seen = new Set();
     const cores = [];
 
@@ -2398,48 +2400,53 @@ export class GatewayService extends EventEmitter {
       arr.forEach((entry, index) => addCore(entry?.core || entry, prefix ? `${prefix}-${index}` : null));
     };
 
-    addCore(autobase, 'autobase');
-    addCore(autobase?.core, 'autobase-core');
-    addCore(autobase?.local || autobase?.local?.core, 'autobase-local');
-    addCore(autobase?.localInput || autobase?.localInput?.core, 'autobase-local');
-    addCore(autobase?.localWriter || autobase?.localWriter?.core, 'autobase-local');
-    addCore(autobase?.defaultWriter || autobase?.defaultWriter?.core, 'autobase-writer');
-    addCore(autobase?.view || autobase?.view?.core, 'autobase-view');
-    addArray(autobase?.activeWriters, 'autobase-writer');
-    addArray(autobase?.writers, 'autobase-writer');
-    addArray(Array.isArray(autobase?.inputs) ? autobase.inputs : (autobase?.inputs ? Array.from(autobase.inputs) : []), 'autobase-writer');
-    if (autobase?.writer && typeof autobase.writer === 'object') {
-      addCore(autobase.writer.core || autobase.writer, 'autobase-writer');
+    if (autobase) {
+      addCore(autobase, 'autobase');
+      addCore(autobase?.core, 'autobase-core');
+      addCore(autobase?.local || autobase?.local?.core, 'autobase-local');
+      addCore(autobase?.localInput || autobase?.localInput?.core, 'autobase-local');
+      addCore(autobase?.localWriter || autobase?.localWriter?.core, 'autobase-local');
+      addCore(autobase?.defaultWriter || autobase?.defaultWriter?.core, 'autobase-writer');
+      addCore(autobase?.view || autobase?.view?.core, 'autobase-view');
+      addArray(autobase?.activeWriters, 'autobase-writer');
+      addArray(autobase?.writers, 'autobase-writer');
+      addArray(Array.isArray(autobase?.inputs) ? autobase.inputs : (autobase?.inputs ? Array.from(autobase.inputs) : []), 'autobase-writer');
+      if (autobase?.writer && typeof autobase.writer === 'object') {
+        addCore(autobase.writer.core || autobase.writer, 'autobase-writer');
+      }
     }
 
-    const cached = this.relayCoreCache.get(relayKey) || [];
-    if (!cores.length) {
-      return cached;
+    const mergedEntries = [];
+    const indexByKey = new Map();
+    const addEntry = (entry) => {
+      if (!entry || !entry.key) return;
+      const existingIndex = indexByKey.get(entry.key);
+      if (existingIndex === undefined) {
+        indexByKey.set(entry.key, mergedEntries.length);
+        mergedEntries.push({ key: entry.key, role: entry.role ?? null });
+        return;
+      }
+      if (!mergedEntries[existingIndex].role && entry.role) {
+        mergedEntries[existingIndex] = { ...mergedEntries[existingIndex], role: entry.role };
+      }
+    };
+
+    if (cached.length) cached.forEach(addEntry);
+    if (cores.length) cores.forEach(addEntry);
+
+    const persistedRefs = await resolveRelayMirrorCoreRefs(relayKey, publicIdentifier, mergedEntries);
+    if (Array.isArray(persistedRefs) && persistedRefs.length) {
+      for (const ref of persistedRefs) {
+        addEntry({ key: ref });
+      }
     }
 
-    if (cached.length) {
-      const merged = [];
-      const indexByKey = new Map();
-      const addEntry = (entry) => {
-        if (!entry || !entry.key) return;
-        const existingIndex = indexByKey.get(entry.key);
-        if (existingIndex === undefined) {
-          indexByKey.set(entry.key, merged.length);
-          merged.push({ key: entry.key, role: entry.role ?? null });
-          return;
-        }
-        if (!merged[existingIndex].role && entry.role) {
-          merged[existingIndex] = { ...merged[existingIndex], role: entry.role };
-        }
-      };
-      cached.forEach(addEntry);
-      cores.forEach(addEntry);
-      this.relayCoreCache.set(relayKey, merged);
-      return merged;
+    if (mergedEntries.length) {
+      this.relayCoreCache.set(relayKey, mergedEntries);
+      return mergedEntries;
     }
 
-    this.relayCoreCache.set(relayKey, cores);
-    return cores;
+    return cached;
   }
 
   getStatus() {
