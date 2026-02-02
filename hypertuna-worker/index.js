@@ -71,6 +71,7 @@ import {
   normalizeMirrorCoreRefs,
   mergeCoreRefLists,
   coreRefsFingerprint,
+  collectRelayCoreRefsFromAutobase,
   getRelayMirrorCoreRefsCache,
   updateRelayMirrorCoreRefs,
   resolveRelayMirrorCoreRefs
@@ -403,6 +404,47 @@ async function syncActiveRelayCoreRefs({
   const relayManager = activeRelays.get(relayKey)
   if (!relayManager?.relay) {
     return { status: 'skipped', reason: 'relay-not-active' }
+  }
+
+  try {
+    const entries = collectRelayCoreRefsFromAutobase(relayManager.relay)
+    if (Array.isArray(entries) && entries.length) {
+      const roleMap = new Map()
+      for (const entry of entries) {
+        const key = normalizeCoreRef(entry?.key)
+        if (!key) continue
+        const role = entry?.role || 'unlabeled'
+        const existing = roleMap.get(key)
+        if (existing) {
+          existing.add(role)
+        } else {
+          roleMap.set(key, new Set([role]))
+        }
+      }
+      const mapped = normalized
+        .map((ref) => {
+          const roles = roleMap.get(ref)
+          if (!roles) return null
+          return { key: ref, roles: Array.from(roles) }
+        })
+        .filter(Boolean)
+      if (mapped.length) {
+        const rolesPayload = {
+          relayKey,
+          reason,
+          total: normalized.length,
+          mapped: mapped.length,
+          roles: mapped.length <= 20 ? mapped : mapped.slice(0, 20)
+        }
+        console.log('[Worker] Core ref role map', JSON.stringify(rolesPayload))
+      }
+    }
+  } catch (error) {
+    console.warn('[Worker] Failed to resolve core ref role map', {
+      relayKey,
+      reason,
+      error: error?.message || error
+    })
   }
 
   const manager = await ensureBlindPeeringManager()

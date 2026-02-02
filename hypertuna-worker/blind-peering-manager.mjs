@@ -221,8 +221,17 @@ export default class BlindPeeringManager extends EventEmitter {
     await this.#loadMetadata();
 
     this.started = true;
+    const blindPeerKeyBuffer = this.swarm?.dht?.defaultKeyPair?.publicKey || null;
+    const blindPeerKey = normalizeCoreKey(blindPeerKeyBuffer);
+    const blindPeerKeyHex = blindPeerKeyBuffer ? Buffer.from(blindPeerKeyBuffer).toString('hex') : null;
+    const swarmPublicKeyHex = this.runtime?.swarmKeyPair?.publicKey
+      ? Buffer.from(this.runtime.swarmKeyPair.publicKey).toString('hex')
+      : null;
     this.logger?.info?.('[BlindPeering] Manager started', {
-      mirrors: this.trustedMirrors.size
+      mirrors: this.trustedMirrors.size,
+      blindPeerKey,
+      blindPeerKeyHex,
+      swarmPublicKeyHex
     });
     this.emit('started', this.getStatus());
     return true;
@@ -686,11 +695,16 @@ export default class BlindPeeringManager extends EventEmitter {
         reason,
         total: targets.size,
         synced: 0,
-        failed: 0
+        failed: 0,
+        skipped: 0
       };
 
       for (const [key, info] of targets) {
         const label = info.label || key;
+        if (label && (label === 'autobase-view' || label.startsWith('autobase-view-'))) {
+          summary.skipped += 1;
+          continue;
+        }
         try {
           await this.#waitForCoreSync(info.core, timeoutMs, label);
           summary.synced += 1;
@@ -983,8 +997,70 @@ export default class BlindPeeringManager extends EventEmitter {
         err: error?.message || error
       });
     }
-    await this.#withTimeout(core.update({ wait: true }), timeoutMs, label ? `${label}:update` : null);
+    try {
+      await this.#withTimeout(core.update({ wait: true }), timeoutMs, label ? `${label}:update` : null);
+    } catch (error) {
+      const message = error?.message || error;
+      if (message && String(message).includes('Operation timed out')) {
+        this.logger?.warn?.('[BlindPeering] Core sync timeout', {
+          label,
+          timeoutMs,
+          ...this.#describeCoreState(core),
+          err: message
+        });
+      }
+      throw error;
+    }
     return true;
+  }
+
+  #describeCoreState(core) {
+    if (!core) return { key: null };
+    const state = {};
+    const key = core.key || null;
+    const discoveryKey = core.discoveryKey || null;
+    const normalizedKey = normalizeCoreKey(key);
+    const normalizedDiscovery = normalizeCoreKey(discoveryKey);
+    if (normalizedKey) state.key = normalizedKey;
+    if (normalizedDiscovery) state.discoveryKey = normalizedDiscovery;
+    if (key) {
+      try {
+        const keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
+        state.keyHex = keyBuf.toString('hex');
+      } catch (_) {
+        state.keyHex = null;
+      }
+    }
+    if (discoveryKey) {
+      try {
+        const keyBuf = Buffer.isBuffer(discoveryKey) ? discoveryKey : Buffer.from(discoveryKey);
+        state.discoveryKeyHex = keyBuf.toString('hex');
+      } catch (_) {
+        state.discoveryKeyHex = null;
+      }
+    }
+    const maybeNumber = (value) => (Number.isFinite(value) ? value : null);
+    state.length = maybeNumber(core.length);
+    state.contiguousLength = maybeNumber(core.contiguousLength);
+    state.remoteLength = maybeNumber(core.remoteLength);
+    state.byteLength = maybeNumber(core.byteLength);
+    state.downloaded = maybeNumber(core.downloaded);
+    state.uploaded = maybeNumber(core.uploaded);
+    state.fork = maybeNumber(core.fork);
+    if (typeof core.opened === 'boolean') state.opened = core.opened;
+    if (typeof core.closed === 'boolean') state.closed = core.closed;
+    if (typeof core.writable === 'boolean') state.writable = core.writable;
+    if (typeof core.readable === 'boolean') state.readable = core.readable;
+    if (typeof core.peerCount === 'number') {
+      state.peers = core.peerCount;
+    } else if (Array.isArray(core.peers)) {
+      state.peers = core.peers.length;
+    } else if (core.peers && typeof core.peers.size === 'number') {
+      state.peers = core.peers.size;
+    } else {
+      state.peers = null;
+    }
+    return state;
   }
 
   async #withTimeout(promise, timeoutMs, label) {
