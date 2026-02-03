@@ -135,6 +135,24 @@ export default class NostrRelay extends Autobee {
       this.executeIdQueries = this.executeIdQueries.bind(this);
       this.findCommonIds = this.findCommonIds.bind(this);
       this.subscriptionWriteQueue = new Map();
+      this.pendingSubscriptionWrites = [];
+      this.pendingSubscriptionMax = 250;
+      this.pendingSubscriptionFlushActive = false;
+      this.pendingSubscriptionFlushScheduled = false;
+      this.pendingEventWrites = [];
+      this.pendingEventMax = 250;
+      this.pendingEventFlushActive = false;
+      this.pendingEventFlushScheduled = false;
+      if (typeof this.on === 'function') {
+        this.on('writable', () => {
+          this._flushPendingSubscriptionWrites('writable').catch((error) => {
+            logWithTimestamp('pendingSubscriptionWrites: flush failed after writable', error?.message || error);
+          });
+          this._flushPendingEventWrites('writable').catch((error) => {
+            logWithTimestamp('pendingEventWrites: flush failed after writable', error?.message || error);
+          });
+        });
+      }
       logWithTimestamp('NostrRelay: Initialized');
     }
 
@@ -148,6 +166,158 @@ export default class NostrRelay extends Autobee {
       }
     }));
     return next;
+  }
+
+  _enqueuePendingSubscriptionWrite(entry) {
+    if (!entry) return;
+    if (this.pendingSubscriptionWrites.length >= this.pendingSubscriptionMax) {
+      const dropped = this.pendingSubscriptionWrites.shift();
+      logWithTimestamp('pendingSubscriptionWrites: dropped oldest entry', {
+        connectionKey: dropped?.connectionKey ?? null,
+        subscriptionId: dropped?.subscriptionId ?? null,
+        queuedAt: dropped?.queuedAt ?? null,
+        max: this.pendingSubscriptionMax
+      });
+    }
+    this.pendingSubscriptionWrites.push(entry);
+  }
+
+  _schedulePendingSubscriptionFlush(reason = 'scheduled') {
+    if (this.pendingSubscriptionFlushScheduled) return;
+    this.pendingSubscriptionFlushScheduled = true;
+    setTimeout(() => {
+      this.pendingSubscriptionFlushScheduled = false;
+      this._flushPendingSubscriptionWrites(`timer:${reason}`).catch((error) => {
+        logWithTimestamp('pendingSubscriptionWrites: flush failed on timer', error?.message || error);
+      });
+    }, 1000);
+  }
+
+  async _flushPendingSubscriptionWrites(reason = 'flush') {
+    if (!this.writable) {
+      logWithTimestamp('pendingSubscriptionWrites: flush skipped (not writable)', {
+        reason,
+        pending: this.pendingSubscriptionWrites.length
+      });
+      return;
+    }
+    if (this.pendingSubscriptionFlushActive) return;
+    if (this.pendingSubscriptionWrites.length === 0) return;
+
+    this.pendingSubscriptionFlushActive = true;
+    const startCount = this.pendingSubscriptionWrites.length;
+    logWithTimestamp('pendingSubscriptionWrites: flushing', {
+      reason,
+      pending: startCount
+    });
+
+    try {
+      while (this.pendingSubscriptionWrites.length > 0) {
+        if (!this.writable) {
+          logWithTimestamp('pendingSubscriptionWrites: flush paused (lost writable)', {
+            remaining: this.pendingSubscriptionWrites.length
+          });
+          break;
+        }
+        const entry = this.pendingSubscriptionWrites.shift();
+        if (!entry?.connectionKey || !entry?.reqMessage) {
+          continue;
+        }
+        try {
+          const activeSubscriptions = await this.getSubscriptions(entry.connectionKey);
+          await this.publishSubscription(entry.connectionKey, entry.reqMessage, activeSubscriptions, entry.clientId);
+          logWithTimestamp('pendingSubscriptionWrites: flushed entry', {
+            connectionKey: entry.connectionKey,
+            subscriptionId: entry.subscriptionId ?? null
+          });
+        } catch (error) {
+          logWithTimestamp('pendingSubscriptionWrites: flush entry failed', {
+            connectionKey: entry.connectionKey,
+            subscriptionId: entry.subscriptionId ?? null,
+            error: error?.message || error
+          });
+        }
+      }
+    } finally {
+      this.pendingSubscriptionFlushActive = false;
+      if (this.pendingSubscriptionWrites.length > 0) {
+        this._schedulePendingSubscriptionFlush('drain');
+      }
+    }
+  }
+
+  _enqueuePendingEventWrite(entry) {
+    if (!entry) return;
+    if (this.pendingEventWrites.length >= this.pendingEventMax) {
+      const dropped = this.pendingEventWrites.shift();
+      logWithTimestamp('pendingEventWrites: dropped oldest entry', {
+        eventId: dropped?.eventId ?? null,
+        queuedAt: dropped?.queuedAt ?? null,
+        max: this.pendingEventMax
+      });
+    }
+    this.pendingEventWrites.push(entry);
+  }
+
+  _schedulePendingEventFlush(reason = 'scheduled') {
+    if (this.pendingEventFlushScheduled) return;
+    this.pendingEventFlushScheduled = true;
+    setTimeout(() => {
+      this.pendingEventFlushScheduled = false;
+      this._flushPendingEventWrites(`timer:${reason}`).catch((error) => {
+        logWithTimestamp('pendingEventWrites: flush failed on timer', error?.message || error);
+      });
+    }, 1000);
+  }
+
+  async _flushPendingEventWrites(reason = 'flush') {
+    if (!this.writable) {
+      logWithTimestamp('pendingEventWrites: flush skipped (not writable)', {
+        reason,
+        pending: this.pendingEventWrites.length
+      });
+      return;
+    }
+    if (this.pendingEventFlushActive) return;
+    if (this.pendingEventWrites.length === 0) return;
+
+    this.pendingEventFlushActive = true;
+    const startCount = this.pendingEventWrites.length;
+    logWithTimestamp('pendingEventWrites: flushing', {
+      reason,
+      pending: startCount
+    });
+
+    try {
+      while (this.pendingEventWrites.length > 0) {
+        if (!this.writable) {
+          logWithTimestamp('pendingEventWrites: flush paused (lost writable)', {
+            remaining: this.pendingEventWrites.length
+          });
+          break;
+        }
+        const entry = this.pendingEventWrites.shift();
+        if (!entry?.event) {
+          continue;
+        }
+        try {
+          await this.publishEvent(entry.event);
+          logWithTimestamp('pendingEventWrites: flushed entry', {
+            eventId: entry.eventId ?? entry.event?.id ?? null
+          });
+        } catch (error) {
+          logWithTimestamp('pendingEventWrites: flush entry failed', {
+            eventId: entry.eventId ?? entry.event?.id ?? null,
+            error: error?.message || error
+          });
+        }
+      }
+    } finally {
+      this.pendingEventFlushActive = false;
+      if (this.pendingEventWrites.length > 0) {
+        this._schedulePendingEventFlush('drain');
+      }
+    }
   }
 
   _isEphemeralSubscriptionId(subscriptionId) {
@@ -347,8 +517,27 @@ export default class NostrRelay extends Autobee {
     // logWithTimestamp('publishEvent: Attempting to publish event:', JSON.stringify(event, null, 2));
     
     if (!this.writable) {
-      logWithTimestamp('publishEvent: Error - Not writable');
-      throw new Error('Not writable');
+      if (!event.id) {
+        event.id = await getEventHash(event);
+        logWithTimestamp('publishEvent: Generated event ID:', event.id);
+      }
+      const isValid = await this.verifyEvent(event);
+      logWithTimestamp('publishEvent: Event verification result:', isValid);
+      if (!isValid) {
+        logWithTimestamp('publishEvent: Event failed verification');
+        return ["OK", event.id, false, "invalid: event failed verification"];
+      }
+      this._enqueuePendingEventWrite({
+        event,
+        eventId: event.id,
+        queuedAt: Date.now()
+      });
+      logWithTimestamp('publishEvent: Not writable; queued event', {
+        eventId: event.id,
+        pending: this.pendingEventWrites.length
+      });
+      this._schedulePendingEventFlush('not-writable');
+      return ["OK", event.id, false, "Relay initializing; event queued"];
     }
     
     if (!event.id) {
@@ -978,8 +1167,21 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
 
     return this._queueSubscriptionWrite(connectionKey, async () => {
       if (!this.writable) {
-        logWithTimestamp('publishSubscription: Error - Not writable');
-        throw new Error('Not writable');
+        const subscriptionId = Array.isArray(reqMessage) ? reqMessage[1] : null;
+        this._enqueuePendingSubscriptionWrite({
+          connectionKey,
+          reqMessage,
+          clientId,
+          subscriptionId,
+          queuedAt: Date.now()
+        });
+        logWithTimestamp('publishSubscription: Not writable; queued subscription write', {
+          connectionKey,
+          subscriptionId,
+          pending: this.pendingSubscriptionWrites.length
+        });
+        this._schedulePendingSubscriptionFlush('not-writable');
+        return ['NOTICE', 'Relay initializing; subscription queued'];
       }
 
       const [, subscriptionId, ...filters] = reqMessage;

@@ -1404,7 +1404,11 @@ class PublicGatewayService {
           relayKey,
           peerKey
         }, 'Attempting hyperswarm connection for websocket session');
-        await this.connectionPool.getConnection(peerKey);
+        await this.connectionPool.getConnection(peerKey, {
+          reason: 'websocket-session',
+          relayKey,
+          peerKey
+        });
         this.logger.info?.({
           relayKey,
           peerKey
@@ -2093,7 +2097,11 @@ class PublicGatewayService {
       }
 
       try {
-        await this.connectionPool.getConnection(peerKey);
+        await this.connectionPool.getConnection(peerKey, {
+          reason: 'drive-request',
+          relayKey,
+          peerKey
+        });
         this.relayPeerIndex.set(relayKey, (index + 1) % peers.length);
         this.#markPeerReachable(peerKey, { relayKey, timestamp: Date.now() });
         return handler(peerKey, registration);

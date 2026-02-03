@@ -429,11 +429,30 @@ async function syncActiveRelayCoreRefs({
         })
         .filter(Boolean)
       if (mapped.length) {
+        const viewCore = relayManager?.relay?.view?.core || null
+        const viewKeyHex = viewCore?.key ? b4a.toString(viewCore.key, 'hex') : null
+        const viewCoreRef = viewCore?.key ? normalizeCoreRef(viewCore.key) : null
+        const viewRoles = viewCoreRef ? Array.from(roleMap.get(viewCoreRef) || []) : []
+        const viewCandidates = mapped
+          .filter((entry) => entry.roles?.some((role) => role === 'autobase-view' || role.startsWith('autobase-view-')))
+          .map((entry) => ({
+            key: entry.key.slice(0, 16),
+            roles: entry.roles
+          }))
+          .slice(0, 10)
         const rolesPayload = {
           relayKey,
           reason,
           total: normalized.length,
           mapped: mapped.length,
+          viewCore: viewKeyHex
+            ? {
+              keyShort: viewKeyHex.slice(0, 16),
+              coreRef: viewCoreRef ? viewCoreRef.slice(0, 16) : null,
+              roles: viewRoles
+            }
+            : null,
+          viewCandidates,
           roles: mapped.length <= 20 ? mapped : mapped.slice(0, 20)
         }
         console.log('[Worker] Core ref role map', JSON.stringify(rolesPayload))
@@ -3780,6 +3799,8 @@ async function handleMessageObject(message) {
               ? true
               : undefined
         const inviteToken = typeof data.token === 'string' ? data.token.trim() : null
+        let joinBlindPeeringManager = null
+        let joinRelayIdentifierForTracking = null
         try {
           let hostPeers = Array.isArray(data.hostPeers) ? data.hostPeers : []
           let coreRefs = Array.isArray(data.cores) ? normalizeCoreRefList(data.cores) : []
@@ -3963,6 +3984,15 @@ async function handleMessageObject(message) {
               if (manager) {
                 manager.markTrustedMirrors([blindPeer.publicKey])
                 const relayIdentifier = joinRelayKey || publicIdentifier
+                joinBlindPeeringManager = manager
+                joinRelayIdentifierForTracking = relayIdentifier
+                if (typeof manager.markJoinStart === 'function') {
+                  manager.markJoinStart({
+                    relayKey: relayIdentifier,
+                    publicIdentifier,
+                    reason: 'join-flow'
+                  })
+                }
                 const relayCorestore = getRelayCorestore(relayIdentifier, {
                   storageBase: config?.storage || defaultStorageDir
                 })
@@ -3974,6 +4004,7 @@ async function handleMessageObject(message) {
                 manager.ensureRelayMirror({
                   relayKey: relayIdentifier,
                   publicIdentifier,
+                  reason: 'join-flow',
                   coreRefs,
                   corestore: relayCorestore
                 })
@@ -4063,7 +4094,27 @@ async function handleMessageObject(message) {
             autobaseLocal,
             writerSecret
           })
+          if (joinBlindPeeringManager && joinRelayIdentifierForTracking && typeof joinBlindPeeringManager.markJoinEnd === 'function') {
+            joinBlindPeeringManager.markJoinEnd({
+              relayKey: joinRelayIdentifierForTracking,
+              publicIdentifier,
+              reason: 'join-flow',
+              status: 'ok'
+            })
+            joinBlindPeeringManager = null
+            joinRelayIdentifierForTracking = null
+          }
         } catch (err) {
+          if (joinBlindPeeringManager && joinRelayIdentifierForTracking && typeof joinBlindPeeringManager.markJoinEnd === 'function') {
+            joinBlindPeeringManager.markJoinEnd({
+              relayKey: joinRelayIdentifierForTracking,
+              publicIdentifier,
+              reason: 'join-flow',
+              status: 'error'
+            })
+            joinBlindPeeringManager = null
+            joinRelayIdentifierForTracking = null
+          }
           sendMessage({
             type: 'join-auth-error',
             data: {

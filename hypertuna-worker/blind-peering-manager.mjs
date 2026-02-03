@@ -127,6 +127,8 @@ export default class BlindPeeringManager extends EventEmitter {
     this.metadataSaveTimer = null;
     this.ownerPeerKey = null;
     this.mirrorCoreCache = new Map();
+    this.joinTracking = new Map();
+    this.coreTransferMonitors = new Map();
 
     this.backoffConfig = {
       initialDelayMs: 1000,
@@ -260,6 +262,10 @@ export default class BlindPeeringManager extends EventEmitter {
       clearTimeout(this.metadataSaveTimer);
       this.metadataSaveTimer = null;
     }
+    for (const key of Array.from(this.coreTransferMonitors.keys())) {
+      this.#stopCoreTransferMonitor(key, { reason: 'manager-stop' });
+    }
+    this.joinTracking.clear();
     await this.#persistMetadata(true);
     this.logger?.info?.('[BlindPeering] Manager stopped');
     this.emit('stopped', this.getStatus());
@@ -287,6 +293,45 @@ export default class BlindPeeringManager extends EventEmitter {
       }
       this.emit('trusted-peers-changed', Array.from(this.trustedMirrors));
     }
+  }
+
+  markJoinStart({ relayKey = null, publicIdentifier = null, reason = 'join-flow' } = {}) {
+    const identifier = sanitizeKey(relayKey || publicIdentifier);
+    if (!identifier) return false;
+    const now = Date.now();
+    const existing = this.joinTracking.get(identifier) || null;
+    const attempts = existing ? (existing.attempts || 0) + 1 : 1;
+    this.joinTracking.set(identifier, {
+      relayKey: identifier,
+      publicIdentifier: publicIdentifier || null,
+      reason,
+      attempts,
+      startedAt: existing?.startedAt || now,
+      updatedAt: now
+    });
+    this.logger?.info?.('[BlindPeering] Join tracking start', {
+      relayKey: identifier,
+      publicIdentifier: publicIdentifier || null,
+      reason,
+      attempts
+    });
+    return true;
+  }
+
+  markJoinEnd({ relayKey = null, publicIdentifier = null, reason = 'join-flow', status = 'ok' } = {}) {
+    const identifier = sanitizeKey(relayKey || publicIdentifier);
+    if (!identifier) return false;
+    const existing = this.joinTracking.get(identifier) || null;
+    this.joinTracking.delete(identifier);
+    const elapsedMs = existing?.startedAt ? Math.max(0, Date.now() - existing.startedAt) : null;
+    this.logger?.info?.('[BlindPeering] Join tracking end', {
+      relayKey: identifier,
+      publicIdentifier: existing?.publicIdentifier || publicIdentifier || null,
+      reason,
+      status,
+      elapsedMs
+    });
+    return true;
   }
 
   ensureRelayMirror(relayContext = {}) {
@@ -375,9 +420,15 @@ export default class BlindPeeringManager extends EventEmitter {
     entry.context.priority = entry.priority;
     this.mirrorTargets.set(`relay:${identifier}`, entry);
     this.#recordMirrorMetadata(entry);
+    const join = this.joinTracking.get(identifier) || null;
+    const now = Date.now();
     this.logger?.debug?.('[BlindPeering] Relay mirror scheduled', {
       identifier,
-      writers: coreRefs.length
+      writers: coreRefs.length,
+      reason: entry.context?.reason || null,
+      joinActive: !!join,
+      joinAgeMs: join?.startedAt ? Math.max(0, now - join.startedAt) : null,
+      coreRefsPreview: coreRefs.slice(0, 3)
     });
     this.emit('mirror-requested', entry);
   }
@@ -932,6 +983,8 @@ export default class BlindPeeringManager extends EventEmitter {
     if (!Array.isArray(coreRefs) || !coreRefs.length) return;
     const identifier = entry.identifier || entry.context?.relayKey || entry.context?.publicIdentifier || 'relay';
     const priority = Number.isFinite(entry.priority) ? entry.priority : 2;
+    const storeInfo = describeCorestore(targetStore);
+    const reason = entry?.context?.reason || null;
     coreRefs
       .map(normalizeCoreKey)
       .filter(Boolean)
@@ -944,6 +997,16 @@ export default class BlindPeeringManager extends EventEmitter {
             announce: false,
             priority,
             pick: 2
+          });
+          this.#trackCoreTransfer(core, {
+            label,
+            ref,
+            identifier,
+            reason,
+            priority,
+            source: 'prime-core-refs',
+            corestoreId: storeInfo.corestoreId,
+            storagePath: storeInfo.storagePath
           });
         } catch (error) {
           this.logger?.warn?.('[BlindPeering] Failed to prime relay core mirror', {
@@ -987,6 +1050,13 @@ export default class BlindPeeringManager extends EventEmitter {
 
   async #waitForCoreSync(core, timeoutMs, label) {
     if (!core || typeof core.update !== 'function') return false;
+    const syncStart = Date.now();
+    const startState = this.#describeCoreState(core);
+    this.logger?.info?.('[BlindPeering] Core sync start', {
+      label,
+      timeoutMs,
+      state: startState
+    });
     try {
       if (typeof core.ready === 'function') {
         await this.#withTimeout(core.ready(), timeoutMs, label ? `${label}:ready` : null);
@@ -997,19 +1067,49 @@ export default class BlindPeeringManager extends EventEmitter {
         err: error?.message || error
       });
     }
+    let status = 'ok';
+    let errorMessage = null;
     try {
       await this.#withTimeout(core.update({ wait: true }), timeoutMs, label ? `${label}:update` : null);
     } catch (error) {
-      const message = error?.message || error;
-      if (message && String(message).includes('Operation timed out')) {
+      status = 'error';
+      errorMessage = error?.message || String(error);
+      if (errorMessage && String(errorMessage).includes('Operation timed out')) {
         this.logger?.warn?.('[BlindPeering] Core sync timeout', {
           label,
           timeoutMs,
           ...this.#describeCoreState(core),
-          err: message
+          err: errorMessage
         });
       }
       throw error;
+    } finally {
+      const endState = this.#describeCoreState(core);
+      const elapsedMs = Date.now() - syncStart;
+      const deltaBytes = Number.isFinite(startState.byteLength) && Number.isFinite(endState.byteLength)
+        ? Math.max(0, endState.byteLength - startState.byteLength)
+        : null;
+      const deltaDownloaded = Number.isFinite(startState.downloaded) && Number.isFinite(endState.downloaded)
+        ? Math.max(0, endState.downloaded - startState.downloaded)
+        : null;
+      const bytesPerSec = deltaBytes !== null && elapsedMs > 0
+        ? Math.round((deltaBytes / (elapsedMs / 1000)) * 100) / 100
+        : null;
+      const downloadedPerSec = deltaDownloaded !== null && elapsedMs > 0
+        ? Math.round((deltaDownloaded / (elapsedMs / 1000)) * 100) / 100
+        : null;
+      this.logger?.info?.('[BlindPeering] Core sync end', {
+        label,
+        status,
+        elapsedMs,
+        bytesDelta: deltaBytes,
+        bytesPerSec,
+        downloadedDelta: deltaDownloaded,
+        downloadedPerSec,
+        error: errorMessage,
+        start: startState,
+        end: endState
+      });
     }
     return true;
   }
@@ -1063,6 +1163,189 @@ export default class BlindPeeringManager extends EventEmitter {
     return state;
   }
 
+  #trackCoreTransfer(core, meta = {}) {
+    if (!core || typeof core.update !== 'function') return;
+    const normalizedKey = normalizeCoreKey(core.key);
+    if (!normalizedKey) return;
+    const storeId = meta.corestoreId || ensureCorestoreId(meta.corestore || this.runtime?.corestore) || 'unknown-store';
+    const monitorKey = `${storeId}:${normalizedKey}`;
+    const existing = this.coreTransferMonitors.get(monitorKey);
+    if (existing) {
+      if (meta.label) existing.labels.add(meta.label);
+      if (meta.source) existing.sources.add(meta.source);
+      return;
+    }
+
+    const startedAt = Date.now();
+    const startState = this.#describeCoreState(core);
+    const labels = new Set();
+    if (meta.label) labels.add(meta.label);
+    const sources = new Set();
+    if (meta.source) sources.add(meta.source);
+
+    const monitor = {
+      core,
+      startedAt,
+      startState,
+      lastState: startState,
+      lastSampleAt: startedAt,
+      lastProgressLogAt: null,
+      firstPeerAt: null,
+      firstProgressAt: null,
+      lastProgressAt: null,
+      labels,
+      sources,
+      meta,
+      interval: null,
+      timeout: null
+    };
+
+    this.coreTransferMonitors.set(monitorKey, monitor);
+
+    this.logger?.debug?.('[BlindPeering] Core transfer monitor start', {
+      monitorKey,
+      key: normalizedKey,
+      label: meta.label || null,
+      source: meta.source || null,
+      identifier: meta.identifier || null,
+      reason: meta.reason || null,
+      corestoreId: meta.corestoreId || storeId,
+      storagePath: meta.storagePath || null,
+      state: startState
+    });
+
+    const intervalMs = 1000;
+    monitor.interval = setInterval(() => {
+      const now = Date.now();
+      const current = this.#describeCoreState(core);
+      const prev = monitor.lastState || {};
+      const elapsedMs = Math.max(0, now - startedAt);
+
+      if (current.peers !== prev.peers && current.peers != null) {
+        if (monitor.firstPeerAt == null && typeof current.peers === 'number' && current.peers > 0) {
+          monitor.firstPeerAt = now;
+        }
+        this.logger?.debug?.('[BlindPeering] Core transfer peers changed', {
+          monitorKey,
+          key: normalizedKey,
+          label: meta.label || null,
+          source: meta.source || null,
+          identifier: meta.identifier || null,
+          reason: meta.reason || null,
+          elapsedMs,
+          peers: current.peers,
+          prevPeers: prev.peers ?? null
+        });
+      }
+
+      const byteDelta = Number.isFinite(prev.byteLength) && Number.isFinite(current.byteLength)
+        ? current.byteLength - prev.byteLength
+        : null;
+      const downloadedDelta = Number.isFinite(prev.downloaded) && Number.isFinite(current.downloaded)
+        ? current.downloaded - prev.downloaded
+        : null;
+      const lengthDelta = Number.isFinite(prev.length) && Number.isFinite(current.length)
+        ? current.length - prev.length
+        : null;
+
+      const hasProgress = (byteDelta != null && byteDelta > 0)
+        || (downloadedDelta != null && downloadedDelta > 0)
+        || (lengthDelta != null && lengthDelta > 0);
+
+      if (hasProgress) {
+        if (monitor.firstProgressAt == null) monitor.firstProgressAt = now;
+        monitor.lastProgressAt = now;
+
+        const dtSec = Math.max(0.001, (now - (monitor.lastSampleAt || now)) / 1000);
+        const bytesPerSec = byteDelta != null && byteDelta > 0
+          ? Math.round((byteDelta / dtSec) * 100) / 100
+          : null;
+        const downloadedPerSec = downloadedDelta != null && downloadedDelta > 0
+          ? Math.round((downloadedDelta / dtSec) * 100) / 100
+          : null;
+
+        const shouldLog = monitor.lastProgressLogAt == null || (now - monitor.lastProgressLogAt) >= 2000;
+        if (shouldLog) {
+          monitor.lastProgressLogAt = now;
+          this.logger?.info?.('[BlindPeering] Core transfer progress', {
+            monitorKey,
+            key: normalizedKey,
+            label: meta.label || null,
+            source: meta.source || null,
+            identifier: meta.identifier || null,
+            reason: meta.reason || null,
+            elapsedMs,
+            byteDelta: byteDelta != null && byteDelta > 0 ? byteDelta : null,
+            bytesPerSec,
+            downloadedDelta: downloadedDelta != null && downloadedDelta > 0 ? downloadedDelta : null,
+            downloadedPerSec,
+            lengthDelta: lengthDelta != null && lengthDelta > 0 ? lengthDelta : null,
+            peers: current.peers ?? null,
+            state: {
+              length: current.length ?? null,
+              contiguousLength: current.contiguousLength ?? null,
+              remoteLength: current.remoteLength ?? null,
+              byteLength: current.byteLength ?? null
+            }
+          });
+        }
+      }
+
+      monitor.lastState = current;
+      monitor.lastSampleAt = now;
+    }, intervalMs);
+    monitor.interval.unref?.();
+
+    const ttlMs = 10 * 60 * 1000;
+    monitor.timeout = setTimeout(() => {
+      this.#stopCoreTransferMonitor(monitorKey, { reason: 'ttl' });
+    }, ttlMs);
+    monitor.timeout.unref?.();
+
+    const closeHandler = () => this.#stopCoreTransferMonitor(monitorKey, { reason: 'close' });
+    try {
+      core.once?.('close', closeHandler);
+    } catch (_) {
+      try {
+        core.on?.('close', closeHandler);
+      } catch (_) {
+        // ignore
+      }
+    }
+  }
+
+  #stopCoreTransferMonitor(monitorKey, { reason = null } = {}) {
+    const monitor = this.coreTransferMonitors.get(monitorKey);
+    if (!monitor) return;
+    this.coreTransferMonitors.delete(monitorKey);
+    if (monitor.interval) clearInterval(monitor.interval);
+    if (monitor.timeout) clearTimeout(monitor.timeout);
+
+    const now = Date.now();
+    const elapsedMs = Math.max(0, now - monitor.startedAt);
+    const endState = this.#describeCoreState(monitor.core);
+
+    this.logger?.debug?.('[BlindPeering] Core transfer monitor end', {
+      monitorKey,
+      reason,
+      elapsedMs,
+      firstPeerMs: monitor.firstPeerAt ? Math.max(0, monitor.firstPeerAt - monitor.startedAt) : null,
+      firstProgressMs: monitor.firstProgressAt ? Math.max(0, monitor.firstProgressAt - monitor.startedAt) : null,
+      lastProgressAgoMs: monitor.lastProgressAt ? Math.max(0, now - monitor.lastProgressAt) : null,
+      labels: Array.from(monitor.labels).slice(0, 3),
+      sources: Array.from(monitor.sources).slice(0, 3),
+      meta: {
+        identifier: monitor.meta?.identifier || null,
+        ref: monitor.meta?.ref || null,
+        reason: monitor.meta?.reason || null,
+        source: monitor.meta?.source || null,
+        corestoreId: monitor.meta?.corestoreId || null
+      },
+      start: monitor.startState,
+      end: endState
+    });
+  }
+
   async #withTimeout(promise, timeoutMs, label) {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       return promise;
@@ -1103,20 +1386,50 @@ export default class BlindPeeringManager extends EventEmitter {
     }
     const attempt = Math.max(0, this.refreshBackoff.attempt);
     const promise = (async () => {
-      this.logger?.info?.('[BlindPeering] Refresh requested', {
+      const refreshStartedAt = Date.now();
+      const targetKeys = Array.from(this.mirrorTargets.keys());
+      const joinKeys = Array.from(this.joinTracking.keys());
+      const touchesJoinRelays = joinKeys.filter((key) => this.mirrorTargets.has(`relay:${key}`));
+      this.logger?.info?.('[BlindPeering] Refresh start', {
         reason,
+        attempt,
         targets: this.mirrorTargets.size,
-        attempt
+        targetPreview: targetKeys.slice(0, 8),
+        joinRelays: joinKeys.length,
+        joinRelaysPreview: joinKeys.slice(0, 3),
+        touchesJoinRelays: touchesJoinRelays.length,
+        touchesJoinRelaysPreview: touchesJoinRelays.slice(0, 3)
       });
       try {
         await this.blindPeering?.resume?.();
+        const elapsedMs = Math.max(0, Date.now() - refreshStartedAt);
         this.refreshBackoff.attempt = 0;
         this.refreshBackoff.nextDelayMs = null;
         this.refreshBackoff.nextReason = null;
         this.refreshBackoff.nextScheduledAt = null;
-        this.emit('refresh-requested', { reason, targets: Array.from(this.mirrorTargets.values()) });
+        this.logger?.info?.('[BlindPeering] Refresh complete', {
+          reason,
+          attempt,
+          elapsedMs,
+          targets: this.mirrorTargets.size,
+          touchesJoinRelays: touchesJoinRelays.length
+        });
+        this.emit('refresh-requested', {
+          reason,
+          targets: Array.from(this.mirrorTargets.values()),
+          elapsedMs,
+          touchesJoinRelays
+        });
       } catch (error) {
+        const elapsedMs = Math.max(0, Date.now() - refreshStartedAt);
+        this.logger?.warn?.('[BlindPeering] Refresh failed', {
+          reason,
+          attempt: attempt + 1,
+          elapsedMs,
+          error: error?.message || error
+        });
         const attemptNext = attempt + 1;
+        // Keep the legacy log line for quick grepability.
         this.logger?.warn?.('[BlindPeering] Failed to resume blind-peering activity', {
           error: error?.message || error,
           reason,

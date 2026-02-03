@@ -19,7 +19,9 @@ import { applyPendingAuthUpdates } from './pending-auth.mjs';
 import HypercoreId from 'hypercore-id-encoding';
 import {
   collectRelayCoreRefsFromAutobase,
+  decodeCoreRef,
   mergeCoreRefLists,
+  normalizeCoreRef,
   normalizeCoreRefList,
   resolveRelayMirrorCoreRefs,
   updateRelayMirrorCoreRefs
@@ -40,7 +42,8 @@ import {
   updateRelayClientSubscriptions,
   rehydrateRelaySubscriptions,
   getRelayMembers,
-  getRelayMetadata
+  getRelayMetadata,
+  activeRelays
 } from './hypertuna-relay-manager-adapter.mjs';
 
 import {
@@ -82,6 +85,18 @@ function parseNostrMessagePayload(message) {
   }
 
   return message;
+}
+
+function getRelayWritableGate(relayKey) {
+  if (!relayKey || !activeRelays?.get) {
+    return { available: false, writable: null };
+  }
+  const relayManager = activeRelays.get(relayKey);
+  if (!relayManager) {
+    return { available: false, writable: null };
+  }
+  const writable = relayManager?.relay?.writable === true;
+  return { available: true, writable };
 }
 
 
@@ -273,6 +288,9 @@ export async function requestRelaySubscriptionRefresh(relayKey, { reason = 'writ
 }
 const lateWriterRecoveryTasks = new Map();
 const BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS = 90000;
+// NOTE: We previously experimented with a "join sync gate" that delayed calling
+// relay.update({ wait: true }) during cold-sync, but it commonly timed out and
+// only added latency. The logic has been removed; keep only cheap snapshot logs.
 const DIRECT_JOIN_WRITABLE_TIMEOUT_MS = 15000;
 const LATE_WRITER_RECOVERY_TIMEOUT_MS = 180000;
 let pendingPeerProtocols = new Map(); // Awaiters for outbound connections
@@ -1882,6 +1900,23 @@ function setupProtocolHandlers(protocol) {
         clientId = authToken;
       }
 
+      if (nostrMessage[0] === 'REQ' && !virtualRelay) {
+        const gate = getRelayWritableGate(relayKey);
+        if (gate.available && !gate.writable) {
+          console.log('[RelayServer] Deferring REQ (relay not writable)', {
+            relayKey: relayKeyPreview,
+            connectionKey,
+            writable: gate.writable
+          });
+          updateMetrics(true);
+          return {
+            statusCode: 200,
+            headers: { 'content-type': 'application/json' },
+            body: b4a.from(JSON.stringify([['NOTICE', 'Relay initializing; read deferred']]))
+          };
+        }
+      }
+
       if (clientId) {
         const previousKey = setRelayClientConnectionKey(relayKey, clientId, connectionKey);
         if (previousKey && previousKey !== connectionKey) {
@@ -2042,6 +2077,23 @@ function setupProtocolHandlers(protocol) {
         }
 
         const stableClientId = auth?.pubkey || null;
+
+        if (!virtualRelay) {
+          const gate = getRelayWritableGate(relayKey);
+          if (gate.available && !gate.writable) {
+            console.log('[RelayServer] Deferring subscription replay (relay not writable)', {
+              relayKey: relayKeyPreview,
+              connectionKey,
+              writable: gate.writable
+            });
+            updateMetrics(true);
+            return {
+              statusCode: 200,
+              headers: { 'content-type': 'application/json' },
+              body: b4a.from(JSON.stringify([['NOTICE', 'Relay initializing; read deferred']]))
+            };
+          }
+        }
 
         if (clientId) {
           const previousKey = getRelayClientConnectionKey(relayKey, clientId);
@@ -2600,6 +2652,518 @@ function sampleActiveWriterKeys(relay, limit = 4) {
     if (sample.length >= limit) break;
   }
   return sample;
+}
+
+function collectRelayUpdateStats(relay) {
+  if (!relay) {
+    return { hasRelay: false };
+  }
+
+  const view = relay.view || null;
+  const viewCore = view?.core || null;
+  const local = relay.local || null;
+
+  return {
+    hasRelay: true,
+    writable: relay.writable ?? null,
+    activeWriters: relay.activeWriters?.size ?? null,
+    writerSample: sampleActiveWriterKeys(relay),
+    viewVersion: typeof view?.version === 'number' ? view.version : null,
+    viewLength: typeof view?.length === 'number' ? view.length : null,
+    viewCoreLength: typeof viewCore?.length === 'number' ? viewCore.length : null,
+    viewCoreByteLength: typeof viewCore?.byteLength === 'number' ? viewCore.byteLength : null,
+    viewKey: viewCore?.key ? b4a.toString(viewCore.key, 'hex').slice(0, 16) : null,
+    localLength: typeof local?.length === 'number' ? local.length : null,
+    localByteLength: typeof local?.byteLength === 'number' ? local.byteLength : null,
+    localKey: local?.key ? b4a.toString(local.key, 'hex').slice(0, 16) : null
+  };
+}
+
+function collectRelayProgressSnapshot(relay) {
+  if (!relay) {
+    return { hasRelay: false };
+  }
+
+  const resolveCore = (candidate) => {
+    if (!candidate) return null;
+    if (candidate?.core) return candidate.core;
+    return candidate;
+  };
+
+  const decodeCoreRef = (ref) => {
+    if (!ref) return null;
+    if (Buffer.isBuffer(ref)) return Buffer.from(ref);
+    if (ref instanceof Uint8Array) return Buffer.from(ref);
+    const trimmed = String(ref).trim();
+    if (!trimmed) return null;
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+      return Buffer.from(trimmed, 'hex');
+    }
+    try {
+      const decoded = HypercoreId.decode(trimmed);
+      if (decoded && decoded.length === 32) {
+        return Buffer.from(decoded);
+      }
+    } catch (_) {
+      // ignore
+    }
+    return null;
+  };
+
+  const toList = (candidate) => {
+    if (!candidate) return [];
+    if (Array.isArray(candidate)) return candidate;
+    if (candidate[Symbol.iterator]) return Array.from(candidate);
+    return [];
+  };
+
+  const getPeerCount = (core) => {
+    if (!core) return null;
+    if (typeof core.peerCount === 'number') return core.peerCount;
+    if (Array.isArray(core.peers)) return core.peers.length;
+    if (typeof core.peers?.size === 'number') return core.peers.size;
+    return null;
+  };
+
+  const getRemoteLength = (core) => {
+    if (!core) return null;
+    if (typeof core.remoteLength === 'number') return core.remoteLength;
+    if (!core.peers) return null;
+    const peers = Array.isArray(core.peers)
+      ? core.peers
+      : core.peers[Symbol.iterator]
+        ? Array.from(core.peers)
+        : [];
+    let max = null;
+    for (const peer of peers) {
+      const value = typeof peer?.remoteLength === 'number' ? peer.remoteLength : null;
+      if (value === null) continue;
+      max = max === null ? value : Math.max(max, value);
+    }
+    return max;
+  };
+
+  const summarizeCore = (core) => {
+    if (!core) return null;
+    return {
+      key: core.key ? b4a.toString(core.key, 'hex').slice(0, 16) : null,
+      length: typeof core.length === 'number' ? core.length : null,
+      contiguousLength: typeof core.contiguousLength === 'number' ? core.contiguousLength : null,
+      remoteLength: getRemoteLength(core),
+      byteLength: typeof core.byteLength === 'number' ? core.byteLength : null,
+      fork: typeof core.fork === 'number' ? core.fork : null,
+      peers: getPeerCount(core)
+    };
+  };
+
+  const summarizeCoreList = (cores, previewCount = 6) => {
+    const stats = {
+      count: cores.length,
+      minLength: null,
+      maxLength: null,
+      minContiguousLength: null,
+      maxContiguousLength: null,
+      minRemoteLength: null,
+      maxRemoteLength: null,
+      minByteLength: null,
+      maxByteLength: null,
+      minFork: null,
+      maxFork: null,
+      keysPreview: [],
+      slowest: null
+    };
+    if (!cores.length) return stats;
+    const chooseSlowest = (current, candidate) => {
+      if (!candidate) return current;
+      if (!current) return candidate;
+      const cContig = candidate.contiguousLength;
+      const pContig = current.contiguousLength;
+      if (typeof cContig === 'number' && typeof pContig === 'number') {
+        if (cContig !== pContig) return cContig < pContig ? candidate : current;
+      } else if (typeof cContig === 'number' && typeof pContig !== 'number') {
+        return candidate;
+      } else if (typeof cContig !== 'number' && typeof pContig === 'number') {
+        return current;
+      }
+      const cLen = candidate.length;
+      const pLen = current.length;
+      if (typeof cLen === 'number' && typeof pLen === 'number') {
+        if (cLen !== pLen) return cLen < pLen ? candidate : current;
+      } else if (typeof cLen === 'number' && typeof pLen !== 'number') {
+        return candidate;
+      } else if (typeof cLen !== 'number' && typeof pLen === 'number') {
+        return current;
+      }
+      const cRemote = candidate.remoteLength;
+      const pRemote = current.remoteLength;
+      if (typeof cRemote === 'number' && typeof pRemote === 'number') {
+        if (cRemote !== pRemote) return cRemote < pRemote ? candidate : current;
+      }
+      return current;
+    };
+    for (const core of cores) {
+      const summary = summarizeCore(core);
+      if (!summary) continue;
+      if (summary.key && stats.keysPreview.length < previewCount) {
+        stats.keysPreview.push(summary.key);
+      }
+      const applyRange = (value, minKey, maxKey) => {
+        if (typeof value !== 'number') return;
+        stats[minKey] = stats[minKey] === null ? value : Math.min(stats[minKey], value);
+        stats[maxKey] = stats[maxKey] === null ? value : Math.max(stats[maxKey], value);
+      };
+      applyRange(summary.length, 'minLength', 'maxLength');
+      applyRange(summary.contiguousLength, 'minContiguousLength', 'maxContiguousLength');
+      applyRange(summary.remoteLength, 'minRemoteLength', 'maxRemoteLength');
+      applyRange(summary.byteLength, 'minByteLength', 'maxByteLength');
+      applyRange(summary.fork, 'minFork', 'maxFork');
+      stats.slowest = chooseSlowest(stats.slowest, summary);
+    }
+    return stats;
+  };
+
+  const viewCore = resolveCore(relay?.view?.core || null);
+  const localCore = resolveCore(relay?.local || relay?.localInput || relay?.localWriter || relay?.defaultWriter || null);
+  const autobaseCore = resolveCore(relay?.core || null);
+  const writerRefs = [];
+  const writerRefSet = new Set();
+  const coreRefEntries = collectRelayCoreRefsFromAutobase(relay);
+  for (const entry of coreRefEntries) {
+    const role = entry?.role || '';
+    if (!role || !role.startsWith('autobase-writer')) continue;
+    const ref = entry?.key || null;
+    if (!ref) continue;
+    const key = typeof ref === 'string' ? ref : Buffer.isBuffer(ref) || ref instanceof Uint8Array ? b4a.toString(ref, 'hex') : null;
+    const dedupe = key || ref;
+    if (dedupe && writerRefSet.has(dedupe)) continue;
+    if (dedupe) writerRefSet.add(dedupe);
+    writerRefs.push(ref);
+  }
+
+  const relayCorestore = relay?.corestore || relay?.store || relay?.session?.corestore || relay?.session?.store || null;
+  const writerCores = [];
+  if (relayCorestore && typeof relayCorestore.get === 'function') {
+    for (const ref of writerRefs) {
+      const keyBuffer = decodeCoreRef(ref);
+      if (!keyBuffer) continue;
+      try {
+        const core = relayCorestore.get({ key: keyBuffer });
+        if (core) writerCores.push(core);
+      } catch (_) {
+        // ignore
+      }
+    }
+  }
+
+  const viewSummary = summarizeCore(viewCore);
+  const localSummary = summarizeCore(localCore);
+  const autobaseSummary = summarizeCore(autobaseCore);
+  const writersSummary = summarizeCoreList(writerCores);
+  const writerRefsPreview = writerRefs.slice(0, 8).map((ref) => {
+    if (typeof ref === 'string') return ref.slice(0, 16);
+    if (Buffer.isBuffer(ref) || ref instanceof Uint8Array) return b4a.toString(ref, 'hex').slice(0, 16);
+    return null;
+  }).filter(Boolean);
+  writersSummary.refsCount = writerRefs.length;
+  writersSummary.refsPreview = writerRefsPreview;
+  writersSummary.resolved = writerCores.length;
+  writersSummary.keysPreviewText = writersSummary.keysPreview.length
+    ? JSON.stringify(writersSummary.keysPreview)
+    : '[]';
+  writersSummary.refsPreviewText = writerRefsPreview.length
+    ? JSON.stringify(writerRefsPreview)
+    : '[]';
+  writersSummary.slowestText = writersSummary.slowest
+    ? JSON.stringify(writersSummary.slowest)
+    : 'null';
+
+  return {
+    hasRelay: true,
+    writable: relay?.writable ?? null,
+    activeWriters: relay?.activeWriters?.size ?? null,
+    view: viewSummary,
+    local: localSummary,
+    autobase: autobaseSummary,
+    writers: writersSummary
+  };
+}
+
+function prehydrateRelayCoreRefs({ relay, coreRefs, relayKey, reason, context } = {}) {
+  const relayCorestore = relay?.corestore
+    || relay?.store
+    || relay?.session?.corestore
+    || relay?.session?.store
+    || null;
+  if (!relayCorestore || typeof relayCorestore.get !== 'function') {
+    console.warn('[RelayServer] Prehydrate core refs skipped (corestore unavailable)', {
+      relayKey,
+      reason,
+      context
+    });
+    return { ok: false, reason: 'missing-corestore' };
+  }
+
+  const autobaseEntries = collectRelayCoreRefsFromAutobase(relay);
+  const autobaseRefs = normalizeCoreRefList(autobaseEntries);
+  const inputRefs = normalizeCoreRefList(coreRefs || []);
+  const mergedRefs = mergeCoreRefLists(autobaseRefs, inputRefs);
+  const writerEntries = autobaseEntries.filter((entry) => entry?.role && entry.role.startsWith('autobase-writer'));
+  const writerRefs = normalizeCoreRefList(writerEntries);
+
+  let opened = 0;
+  let errors = 0;
+  const preview = [];
+  for (const ref of mergedRefs) {
+    const keyBuffer = decodeCoreRef(ref);
+    if (!keyBuffer) continue;
+    try {
+      const core = relayCorestore.get({ key: keyBuffer });
+      opened += 1;
+      if (core?.key && preview.length < 8) {
+        preview.push(b4a.toString(core.key, 'hex').slice(0, 16));
+      }
+      if (typeof core?.ready === 'function') {
+        core.ready().catch(() => {});
+      }
+    } catch (_) {
+      errors += 1;
+    }
+  }
+
+  const summary = {
+    ok: true,
+    relayKey,
+    reason,
+    context,
+    mergedCount: mergedRefs.length,
+    autobaseCount: autobaseRefs.length,
+    inputCount: inputRefs.length,
+    writerCount: writerRefs.length,
+    opened,
+    errors,
+    openedPreview: preview
+  };
+
+  console.log('[RelayServer] Prehydrated core refs', summary);
+  return summary;
+}
+
+function collectRelayGateSnapshot(relay) {
+  if (!relay) return { hasRelay: false };
+  const viewCore = relay?.view?.core || null;
+  const peerCount = typeof viewCore?.peerCount === 'number'
+    ? viewCore.peerCount
+    : Array.isArray(viewCore?.peers)
+      ? viewCore.peers.length
+      : typeof viewCore?.peers?.size === 'number'
+        ? viewCore.peers.size
+        : null;
+  const activeWriters = relay?.activeWriters;
+  const activeWritersCount = typeof activeWriters?.size === 'number'
+    ? activeWriters.size
+    : Array.isArray(activeWriters)
+      ? activeWriters.length
+      : null;
+  return {
+    hasRelay: true,
+    viewLength: typeof viewCore?.length === 'number' ? viewCore.length : null,
+    viewKey: viewCore?.key ? b4a.toString(viewCore.key, 'hex').slice(0, 16) : null,
+    peerCount,
+    activeWriters: activeWritersCount
+  };
+}
+
+function resolveRelaySyncGateReason(initial, current) {
+  if (!current) return null;
+  if (typeof current.peerCount === 'number' && current.peerCount > 0) return 'peer';
+  if (
+    typeof current.viewLength === 'number'
+    && typeof initial?.viewLength === 'number'
+    && current.viewLength > initial.viewLength
+  ) return 'view-advanced';
+  if (typeof current.activeWriters === 'number' && current.activeWriters >= 2) return 'writers';
+  if (initial?.viewLength == null && typeof current.viewLength === 'number') return 'view-available';
+  return null;
+}
+
+const relayViewCoreSnapshots = new WeakMap();
+const relayWriterRefSnapshots = new WeakMap();
+
+function collectViewCoreIdentity(relay) {
+  const viewCore = relay?.view?.core || null;
+  const keyBuffer = viewCore?.key || null;
+  const keyHex = keyBuffer ? b4a.toString(keyBuffer, 'hex') : null;
+  const peerCount = typeof viewCore?.peerCount === 'number'
+    ? viewCore.peerCount
+    : Array.isArray(viewCore?.peers)
+      ? viewCore.peers.length
+      : typeof viewCore?.peers?.size === 'number'
+        ? viewCore.peers.size
+        : null;
+  return {
+    keyHex,
+    keyShort: keyHex ? keyHex.slice(0, 16) : null,
+    coreRef: keyBuffer ? normalizeCoreRef(keyBuffer) : null,
+    length: typeof viewCore?.length === 'number' ? viewCore.length : null,
+    contiguousLength: typeof viewCore?.contiguousLength === 'number' ? viewCore.contiguousLength : null,
+    byteLength: typeof viewCore?.byteLength === 'number' ? viewCore.byteLength : null,
+    fork: typeof viewCore?.fork === 'number' ? viewCore.fork : null,
+    peerCount
+  };
+}
+
+function collectCoreRefRoles(relay) {
+  const entries = collectRelayCoreRefsFromAutobase(relay);
+  const roleMap = new Map();
+  const viewCandidates = [];
+
+  for (const entry of entries) {
+    const key = entry?.key || null;
+    if (!key) continue;
+    const role = entry?.role || null;
+    let roles = roleMap.get(key);
+    if (!roles) {
+      roles = new Set();
+      roleMap.set(key, roles);
+    }
+    if (role) {
+      roles.add(role);
+      if (role === 'autobase-view' || role.startsWith('autobase-view-')) {
+        viewCandidates.push({ key: key.slice(0, 16), role });
+      }
+    }
+  }
+
+  return {
+    roleMap,
+    viewCandidates,
+    coreRefsCount: entries.length
+  };
+}
+
+function collectWriterRefRoles(relay) {
+  const entries = collectRelayCoreRefsFromAutobase(relay);
+  const roleMap = new Map();
+  for (const entry of entries) {
+    const role = entry?.role || '';
+    if (!role || !role.startsWith('autobase-writer')) continue;
+    const key = normalizeCoreRef(entry?.key);
+    if (!key) continue;
+    const roles = roleMap.get(key);
+    if (roles) {
+      roles.add(role);
+    } else {
+      roleMap.set(key, new Set([role]));
+    }
+  }
+  const writerRefs = Array.from(roleMap.keys());
+  return { writerRefs, roleMap };
+}
+
+function logRelayViewCoreIdentity(relay, { relayKey, reason, context, force = false } = {}) {
+  if (!relay) return;
+  const current = collectViewCoreIdentity(relay);
+  const previous = relayViewCoreSnapshots.get(relay) || null;
+  const changed = !previous || previous.keyHex !== current.keyHex;
+  if (!changed && !force) return;
+
+  const { roleMap, viewCandidates, coreRefsCount } = collectCoreRefRoles(relay);
+  const roles = current.coreRef ? Array.from(roleMap.get(current.coreRef) || []) : [];
+  const previousRoles = previous?.coreRef ? Array.from(roleMap.get(previous.coreRef) || []) : [];
+
+  console.log('[RelayServer] View core identity', {
+    relayKey,
+    reason,
+    context,
+    changed,
+    previous: previous
+      ? {
+        keyShort: previous.keyShort,
+        coreRef: previous.coreRef ? previous.coreRef.slice(0, 16) : null,
+        roles: previousRoles,
+        length: previous.length,
+        byteLength: previous.byteLength,
+        contiguousLength: previous.contiguousLength,
+        peerCount: previous.peerCount,
+        fork: previous.fork
+      }
+      : null,
+    current: {
+      keyShort: current.keyShort,
+      coreRef: current.coreRef ? current.coreRef.slice(0, 16) : null,
+      roles,
+      length: current.length,
+      byteLength: current.byteLength,
+      contiguousLength: current.contiguousLength,
+      peerCount: current.peerCount,
+      fork: current.fork
+    },
+    coreRefsCount,
+    viewCandidates: viewCandidates.length <= 10 ? viewCandidates : viewCandidates.slice(0, 10)
+  });
+
+  relayViewCoreSnapshots.set(relay, { ...current, roles });
+}
+
+function startRelayUpdateProgressLogger({ relay, relayKey, reason, intervalMs = 5000, coreRefs = null, expectedWriterKey = null }) {
+  if (!relay) return () => {};
+  const start = Date.now();
+  const normalizedInputRefs = normalizeCoreRefList(coreRefs || []);
+  const expectedWriterRef = expectedWriterKey ? normalizeCoreRef(expectedWriterKey) || normalizeCoreRefString(expectedWriterKey) : null;
+  const logSnapshot = (context) => {
+    logRelayViewCoreIdentity(relay, { relayKey, reason, context });
+    const { writerRefs, roleMap } = collectWriterRefRoles(relay);
+    const previous = relayWriterRefSnapshots.get(relay) || { count: 0, refs: [] };
+    const countChanged = writerRefs.length !== previous.count;
+    const becameVisible = previous.count === 0 && writerRefs.length > 0;
+    if (countChanged) {
+      relayWriterRefSnapshots.set(relay, { count: writerRefs.length, refs: writerRefs });
+    }
+    if (becameVisible || (countChanged && writerRefs.length > previous.count)) {
+      const inInput = normalizedInputRefs.length
+        ? writerRefs.filter((ref) => normalizedInputRefs.includes(ref))
+        : [];
+      const expectedMatch = expectedWriterRef ? writerRefs.includes(expectedWriterRef) : false;
+      const source = inInput.length
+        ? 'coreRefs'
+        : expectedMatch
+          ? 'expected-writer'
+          : 'autobase';
+      const writerPreview = writerRefs.slice(0, 5).map((ref) => ref.slice(0, 16));
+      const rolesPreview = writerRefs.slice(0, 5).map((ref) => ({
+        key: ref.slice(0, 16),
+        roles: Array.from(roleMap.get(ref) || [])
+      }));
+      console.log('[RelayServer] Writer refs became visible', {
+        relayKey,
+        reason,
+        context,
+        count: writerRefs.length,
+        added: writerRefs.length - previous.count,
+        source,
+        inputRefsCount: normalizedInputRefs.length,
+        inInputCount: inInput.length,
+        expectedWriterMatch: expectedMatch,
+        writerPreview,
+        rolesPreview
+      });
+    }
+    console.log('[RelayServer] Relay update wait progress', {
+      relayKey,
+      reason,
+      context,
+      elapsedMs: Date.now() - start,
+      stats: collectRelayProgressSnapshot(relay)
+    });
+  };
+
+  logSnapshot('start');
+  const interval = setInterval(() => logSnapshot('tick'), intervalMs);
+  interval.unref?.();
+  return () => {
+    clearInterval(interval);
+    logSnapshot('end');
+  };
 }
 
 async function waitForRelayWriterActivation(options = {}) {
@@ -3725,23 +4289,88 @@ export async function startJoinAuthentication(options) {
           const { activeRelays } = await import('./hypertuna-relay-manager-adapter.mjs');
           relayManager = activeRelays.get(fallbackRelayKey);
           if (relayManager?.relay?.update) {
+            const updateStart = Date.now();
+            const preUpdateStats = collectRelayUpdateStats(relayManager.relay);
+            if (typeof global.syncActiveRelayCoreRefs === 'function' && coreRefsForJoin?.length) {
+              try {
+                const syncSummary = await global.syncActiveRelayCoreRefs({
+                  relayKey: fallbackRelayKey,
+                  publicIdentifier,
+                  coreRefs: coreRefsForJoin,
+                  reason: 'pre-wait'
+                });
+                console.log('[RelayServer] Pre-wait writer sync', {
+                  relayKey: fallbackRelayKey,
+                  status: syncSummary?.status ?? null,
+                  writerAdded: syncSummary?.writerSummary?.added ?? null,
+                  writerStatus: syncSummary?.writerSummary?.status ?? null
+                });
+              } catch (error) {
+                console.warn('[RelayServer] Pre-wait writer sync failed', {
+                  relayKey: fallbackRelayKey,
+                  error: error?.message || error
+                });
+              }
+            }
+            // NOTE: We previously attempted a short "sync gate" delay here to avoid waiting too early
+            // during cold-sync, but logs showed it commonly times out and only adds latency. Keep a
+            // cheap snapshot for debugging and proceed directly to relay.update({ wait: true }).
+            try {
+              const snapshot = collectRelayGateSnapshot(relayManager.relay);
+              const gate = resolveRelaySyncGateReason(snapshot, snapshot);
+              const writerSummary = collectRelayProgressSnapshot(relayManager.relay)?.writers || null;
+              console.log('[RelayServer] Relay sync gate snapshot', {
+                relayKey: fallbackRelayKey,
+                reason: 'blind-peer-fallback',
+                gate,
+                snapshot,
+                writerSummary
+              });
+              prehydrateRelayCoreRefs({
+                relay: relayManager.relay,
+                coreRefs: coreRefsForJoin,
+                relayKey: fallbackRelayKey,
+                reason: 'blind-peer-fallback',
+                context: 'pre-update'
+              });
+            } catch (error) {
+              console.warn('[RelayServer] Failed to collect relay sync gate snapshot', {
+                relayKey: fallbackRelayKey,
+                reason: 'blind-peer-fallback',
+                error: error?.message || error
+              });
+            }
+            const stopProgressLog = startRelayUpdateProgressLogger({
+              relay: relayManager.relay,
+              relayKey: fallbackRelayKey,
+              reason: 'blind-peer-fallback',
+              coreRefs: coreRefsForJoin,
+              expectedWriterKey
+            });
             console.log('[RelayServer] Waiting for relay sync after join', {
               relayKey: fallbackRelayKey,
-              reason: 'blind-peer-fallback'
+              reason: 'blind-peer-fallback',
+              stats: preUpdateStats
             });
             try {
               await relayManager.relay.update({ wait: true });
             } catch (error) {
               console.warn('[RelayServer] Relay update({ wait: true }) failed; retrying without options', {
                 relayKey: fallbackRelayKey,
-                error: error?.message || error
+                error: error?.message || error,
+                elapsedMs: Date.now() - updateStart,
+                stats: collectRelayUpdateStats(relayManager.relay)
               });
               await relayManager.relay.update();
+            } finally {
+              stopProgressLog();
             }
             console.log('[RelayServer] Relay sync complete after join', {
               relayKey: fallbackRelayKey,
+              elapsedMs: Date.now() - updateStart,
               writable: relayManager.relay?.writable ?? null,
-              activeWriters: relayManager.relay?.activeWriters?.size ?? null
+              activeWriters: relayManager.relay?.activeWriters?.size ?? null,
+              stats: collectRelayUpdateStats(relayManager.relay)
             });
           }
         } catch (err) {
@@ -4412,10 +5041,17 @@ export async function provisionWriterForInvitee(options = {}) {
 
   try {
     if (typeof relayManager.relay?.update === 'function') {
+      const stopProgressLog = startRelayUpdateProgressLogger({
+        relay: relayManager.relay,
+        relayKey: resolvedRelayKey,
+        reason: 'invite-writer'
+      });
       try {
         await relayManager.relay.update({ wait: true });
       } catch (_) {
         await relayManager.relay.update();
+      } finally {
+        stopProgressLog();
       }
     }
   } catch (error) {

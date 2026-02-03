@@ -2987,7 +2987,11 @@ export class GatewayService extends EventEmitter {
 
     const connectAndCheck = async () => {
       try {
-        await this.connectionPool.getConnection(publicKey);
+        await this.connectionPool.getConnection(publicKey, {
+          reason: 'peer-register-connect',
+          peerKey: publicKey,
+          source
+        });
         peer.status = 'connected';
         await this.peerHealthManager.checkPeerHealth(peer, this.connectionPool);
         this.emit('status', this.getStatus());

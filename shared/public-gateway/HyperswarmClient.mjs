@@ -4,6 +4,67 @@ import * as c from 'compact-encoding';
 import { Readable } from 'node:stream';
 import RelayProtocol from './RelayProtocol.mjs';
 
+const GET_CONN_TRACE_WINDOW_MS = 5000;
+const GET_CONN_TRACE_THRESHOLDS = new Set([1, 2, 5, 10, 20, 50, 100, 200, 500]);
+
+const formatGetConnectionContext = (context) => {
+  if (!context) return null;
+  if (typeof context === 'string') {
+    return { reason: context };
+  }
+  if (typeof context === 'object') {
+    const {
+      reason,
+      method,
+      path,
+      relayKey,
+      identifier,
+      peerKey,
+      ...rest
+    } = context;
+    const trimmed = {};
+    if (reason) trimmed.reason = reason;
+    if (method) trimmed.method = method;
+    if (path) trimmed.path = path;
+    if (relayKey) trimmed.relayKey = relayKey;
+    if (identifier) trimmed.identifier = identifier;
+    if (peerKey) trimmed.peerKey = peerKey;
+    if (Object.keys(rest).length) {
+      trimmed.meta = rest;
+    }
+    return trimmed;
+  }
+  return { reason: String(context) };
+};
+
+const buildConnectionState = (connection, now = Date.now()) => {
+  if (!connection) {
+    return {
+      hasConnection: false
+    };
+  }
+
+  const stream = connection.stream;
+  return {
+    hasConnection: true,
+    connected: connection.connected,
+    connecting: connection.connecting,
+    hasProtocol: Boolean(connection.protocol),
+    streamClosed: stream?.closed === true,
+    streamDestroyed: stream?.destroyed === true,
+    lastUsedAgoMs: Number.isFinite(connection.lastUsed) ? Math.max(0, now - connection.lastUsed) : null,
+    lastHealthyAgoMs: Number.isFinite(connection.lastHealthyAt) && connection.lastHealthyAt > 0
+      ? Math.max(0, now - connection.lastHealthyAt)
+      : null,
+    failureCount: connection.failureCount ?? 0,
+    connectionAttempts: connection.connectionAttempts ?? 0,
+    lastDisconnectAgoMs: Number.isFinite(connection.lastDisconnectAt) && connection.lastDisconnectAt > 0
+      ? Math.max(0, now - connection.lastDisconnectAt)
+      : null,
+    lastError: connection.lastError ? (connection.lastError.message || String(connection.lastError)) : null
+  };
+};
+
 class HyperswarmConnection {
   constructor(publicKey, swarm, pool, logger = console) {
     this.publicKey = publicKey;
@@ -452,6 +513,7 @@ class EnhancedHyperswarmPool {
     this.healthIntervalMs = Number.isFinite(rawInterval) && rawInterval > 0 ? rawInterval : 30000;
     this._healthTimer = null;
     this._healthSweepRunning = false;
+    this._getConnectionStats = new Map();
   }
 
   async initialize() {
@@ -528,19 +590,77 @@ class EnhancedHyperswarmPool {
     }
   }
   
-  async getConnection(publicKey) {
+  async getConnection(publicKey, context = null) {
     if (!this.initialized) await this.initialize();
-    this.logger?.info?.('Requesting hyperswarm connection', { peer: publicKey });
+    const now = Date.now();
+    const contextInfo = formatGetConnectionContext(context);
     let connection = this.connections.get(publicKey);
+    const state = buildConnectionState(connection, now);
+
+    const stats = this._getConnectionStats.get(publicKey) || {
+      windowStart: now,
+      count: 0,
+      lastLogAt: 0,
+      loopLogged: false
+    };
+    if (now - stats.windowStart > GET_CONN_TRACE_WINDOW_MS) {
+      stats.windowStart = now;
+      stats.count = 0;
+      stats.lastLogAt = 0;
+      stats.loopLogged = false;
+    }
+    stats.count += 1;
+    this._getConnectionStats.set(publicKey, stats);
+
+    if (GET_CONN_TRACE_THRESHOLDS.has(stats.count)) {
+      this.logger?.info?.('Hyperswarm getConnection trace', {
+        peer: publicKey,
+        count: stats.count,
+        windowMs: now - stats.windowStart,
+        context: contextInfo,
+        state
+      });
+    }
+
+    if (!stats.loopLogged && stats.count >= 20) {
+      stats.loopLogged = true;
+      const stack = new Error().stack
+        ?.split('\n')
+        .slice(1, 6)
+        .map(line => line.trim())
+        .join(' | ');
+      this.logger?.warn?.('Hyperswarm getConnection loop detected', {
+        peer: publicKey,
+        count: stats.count,
+        windowMs: now - stats.windowStart,
+        context: contextInfo,
+        state,
+        stack
+      });
+    }
+
+    this.logger?.info?.('Requesting hyperswarm connection', {
+      peer: publicKey,
+      context: contextInfo,
+      state: {
+        connected: state.connected,
+        connecting: state.connecting,
+        hasConnection: state.hasConnection
+      }
+    });
     if (!connection) {
-      this.logger?.info?.('Creating new connection wrapper for peer', { peer: publicKey });
+      this.logger?.info?.('Creating new connection wrapper for peer', {
+        peer: publicKey,
+        context: contextInfo
+      });
       connection = new HyperswarmConnection(publicKey, this.swarm, this, this.logger);
       this.connections.set(publicKey, connection);
     }
     await connection.connect();
     this.logger?.info?.('Hyperswarm connection ready', {
       peer: publicKey,
-      connected: connection.connected
+      connected: connection.connected,
+      context: contextInfo
     });
     return connection;
   }
@@ -762,7 +882,9 @@ class EnhancedHyperswarmPool {
 
 async function checkPeerHealthWithHyperswarm(peer, connectionPool) {
   try {
-    const connection = await connectionPool.getConnection(peer.publicKey);
+    const connection = await connectionPool.getConnection(peer.publicKey, {
+      reason: 'check-peer-health'
+    });
     const response = await connection.healthCheck();
     return response?.status === 'healthy';
   } catch (err) {
@@ -771,13 +893,22 @@ async function checkPeerHealthWithHyperswarm(peer, connectionPool) {
 }
 
 async function forwardRequestToPeer(peer, request, connectionPool) {
-  const connection = await connectionPool.getConnection(peer.publicKey);
+  const connection = await connectionPool.getConnection(peer.publicKey, {
+    reason: 'forward-request',
+    method: request?.method,
+    path: request?.path
+  });
   const response = await connection.sendRequest(request);
   return response;
 }
 
 async function forwardMessageToPeerHyperswarm(peerPublicKey, identifier, message, connectionKey, connectionPool, authToken) {
-  const connection = await connectionPool.getConnection(peerPublicKey);
+  const connection = await connectionPool.getConnection(peerPublicKey, {
+    reason: 'forward-message',
+    method: 'POST',
+    path: `/post/relay/${identifier}`,
+    identifier
+  });
   const headers = { 'content-type': 'application/json' };
   if (authToken) {
     headers['x-auth-token'] = authToken;
@@ -798,7 +929,12 @@ async function forwardMessageToPeerHyperswarm(peerPublicKey, identifier, message
 }
 
 async function forwardJoinRequestToPeer(peer, identifier, requestData, connectionPool) {
-  const connection = await connectionPool.getConnection(peer.publicKey);
+  const connection = await connectionPool.getConnection(peer.publicKey, {
+    reason: 'forward-join',
+    method: 'POST',
+    path: `/post/join/${identifier}`,
+    identifier
+  });
   const response = await connection.sendRequest({
     method: 'POST',
     path: `/post/join/${identifier}`,
@@ -815,7 +951,11 @@ async function forwardJoinRequestToPeer(peer, identifier, requestData, connectio
 }
 
 async function forwardCallbackToPeer(peer, path, requestData, connectionPool) {
-  const connection = await connectionPool.getConnection(peer.publicKey);
+  const connection = await connectionPool.getConnection(peer.publicKey, {
+    reason: 'forward-callback',
+    method: 'POST',
+    path
+  });
   const response = await connection.sendRequest({
     method: 'POST',
     path,
@@ -831,7 +971,12 @@ async function forwardCallbackToPeer(peer, path, requestData, connectionPool) {
 }
 
 async function requestFileFromPeer(peer, identifier, file, connectionPool) {
-  const connection = await connectionPool.getConnection(peer.publicKey);
+  const connection = await connectionPool.getConnection(peer.publicKey, {
+    reason: 'request-file',
+    method: 'GET',
+    path: `/drive/${identifier}/${file}`,
+    identifier
+  });
   const response = await connection.sendRequest({
     method: 'GET',
     path: `/drive/${identifier}/${file}`
@@ -844,7 +989,11 @@ async function requestFileFromPeer(peer, identifier, file, connectionPool) {
 }
 
 async function requestPfpFromPeer(peer, owner, file, connectionPool) {
-  const connection = await connectionPool.getConnection(peer.publicKey);
+  const connection = await connectionPool.getConnection(peer.publicKey, {
+    reason: 'request-pfp',
+    method: 'GET',
+    path: `/pfp${owner ? `/${encodeURIComponent(owner)}` : ''}/${encodeURIComponent(file)}`
+  });
   const ownerSegment = owner ? `/${encodeURIComponent(owner)}` : '';
   const response = await connection.sendRequest({
     method: 'GET',
@@ -858,7 +1007,12 @@ async function requestPfpFromPeer(peer, owner, file, connectionPool) {
 }
 
 async function getEventsFromPeerHyperswarm(peerPublicKey, relayKey, connectionKey, connectionPool, authToken = null) {
-  const connection = await connectionPool.getConnection(peerPublicKey);
+  const connection = await connectionPool.getConnection(peerPublicKey, {
+    reason: 'get-events',
+    method: 'GET',
+    path: `/get/relay/${relayKey}/${connectionKey}`,
+    relayKey
+  });
 
   const headers = { accept: 'application/json' };
   if (authToken) {
