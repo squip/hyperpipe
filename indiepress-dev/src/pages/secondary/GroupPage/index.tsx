@@ -787,7 +787,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           hasWriterCoreHex: !!inviteData?.writerCoreHex,
           hasAutobaseLocal: !!inviteData?.autobaseLocal,
           hasWriterSecret: !!inviteData?.writerSecret,
-          hasBlindPeer: !!inviteData?.blindPeer
+          hasBlindPeer: !!inviteData?.blindPeer,
+          hasFastForward: !!inviteData?.fastForward
         })
         await startJoinFlow(groupId, {
           fileSharing: isOpenGroup,
@@ -801,7 +802,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           writerCore: inviteData?.writerCore,
           writerCoreHex: inviteData?.writerCoreHex,
           autobaseLocal: inviteData?.autobaseLocal,
-          writerSecret: inviteData?.writerSecret
+          writerSecret: inviteData?.writerSecret,
+          fastForward: inviteData?.fastForward || undefined
         })
         return
       }

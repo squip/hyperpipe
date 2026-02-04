@@ -172,6 +172,12 @@ const buildInvitePayload = (args: {
   relayKey?: string | null
   meta?: TGroupMetadata | null
   mirrorMetadata?: InviteMirrorMetadata
+  fastForward?: {
+    key?: string | null
+    length?: number | null
+    signedLength?: number | null
+    timeoutMs?: number | null
+  } | null
   writerInfo?: {
     writerCore?: string
     writerCoreHex?: string
@@ -188,6 +194,7 @@ const buildInvitePayload = (args: {
   fileSharing: args.meta?.isOpen !== false,
   blindPeer: args.mirrorMetadata?.blindPeer,
   cores: args.mirrorMetadata?.cores,
+  fastForward: args.fastForward ?? null,
   writerCore: args.writerInfo?.writerCore || null,
   writerCoreHex: args.writerInfo?.writerCoreHex || args.writerInfo?.autobaseLocal || null,
   autobaseLocal: args.writerInfo?.autobaseLocal || args.writerInfo?.writerCoreHex || null,
@@ -507,6 +514,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let writerCoreHex: string | null | undefined
             let autobaseLocal: string | null | undefined
             let writerSecret: string | null | undefined
+            let fastForward: { key?: string | null; length?: number | null; signedLength?: number | null; timeoutMs?: number | null } | null | undefined
             try {
               const payload = JSON.parse(decrypted)
               if (payload && typeof payload === 'object') {
@@ -531,6 +539,24 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 }
                 if (typeof payload.writerSecret === 'string') {
                   writerSecret = payload.writerSecret
+                }
+                const fastForwardPayload =
+                  (payload.fastForward && typeof payload.fastForward === 'object')
+                    ? payload.fastForward
+                    : (payload.fast_forward && typeof payload.fast_forward === 'object')
+                      ? payload.fast_forward
+                      : null
+                if (fastForwardPayload) {
+                  fastForward = {
+                    key: typeof fastForwardPayload.key === 'string' ? fastForwardPayload.key : null,
+                    length: typeof fastForwardPayload.length === 'number' ? fastForwardPayload.length : null,
+                    signedLength: typeof fastForwardPayload.signedLength === 'number' ? fastForwardPayload.signedLength : null,
+                    timeoutMs: typeof fastForwardPayload.timeoutMs === 'number'
+                      ? fastForwardPayload.timeoutMs
+                      : typeof fastForwardPayload.timeout === 'number'
+                        ? fastForwardPayload.timeout
+                        : null
+                  }
                 }
                 if (payload.blindPeer && typeof payload.blindPeer === 'object') {
                   blindPeer = {
@@ -565,7 +591,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               writerCore,
               writerCoreHex,
               autobaseLocal,
-              writerSecret
+              writerSecret,
+              fastForward
             }
           } catch (_err) {
             return invite
@@ -576,7 +603,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         total: parsed.length,
         withWriterSecret: parsed.filter((p) => (p as any).writerSecret).length,
         withWriterCore: parsed.filter((p) => (p as any).writerCore).length,
-        withWriterCoreHex: parsed.filter((p) => (p as any).writerCoreHex).length
+        withWriterCoreHex: parsed.filter((p) => (p as any).writerCoreHex).length,
+        withFastForward: parsed.filter((p) => (p as any).fastForward).length
       })
       setInvites(parsed)
     } catch (error) {
@@ -1199,14 +1227,21 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         try {
           const res = await sendToWorker({
             type: 'provision-writer-for-invitee',
-            data: { relayKey: relayEntry.relayKey, publicIdentifier: groupId, inviteePubkey: invitee }
+            data: {
+              relayKey: relayEntry.relayKey,
+              publicIdentifier: groupId,
+              inviteePubkey: invitee,
+              useWriterPool: true
+            }
           })
           if (res && typeof res === 'object') {
             const writerInfo = {
               writerCore: (res as any).writerCore,
               writerCoreHex: (res as any).writerCoreHex,
               autobaseLocal: (res as any).autobaseLocal,
-              writerSecret: (res as any).writerSecret
+              writerSecret: (res as any).writerSecret,
+              poolCoreRefs: Array.isArray((res as any).poolCoreRefs) ? (res as any).poolCoreRefs : undefined,
+              fastForward: (res as any).fastForward || null
             }
             console.info('[GroupsProvider] Writer provisioning result (invite)', {
               groupId,
@@ -1215,7 +1250,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               hasWriterCore: !!writerInfo?.writerCore,
               hasWriterCoreHex: !!writerInfo?.writerCoreHex,
               hasAutobaseLocal: !!writerInfo?.autobaseLocal,
-              hasWriterSecret: !!writerInfo?.writerSecret
+              hasWriterSecret: !!writerInfo?.writerSecret,
+              hasPoolCoreRefs: Array.isArray(writerInfo?.poolCoreRefs) && writerInfo.poolCoreRefs.length > 0,
+              hasFastForward: !!writerInfo?.fastForward
             })
             return writerInfo
           }
@@ -1234,17 +1271,25 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         writerCoreHex?: string
         autobaseLocal?: string
         writerSecret?: string
+        poolCoreRefs?: string[]
       } | null) => {
         if (isOpenGroup) return null
         const writerCoreKey =
           writerInfo?.writerCoreHex || writerInfo?.autobaseLocal || writerInfo?.writerCore
-        if (!writerCoreKey) return baseMirrorMetadata
+        const extraRefs = [
+          ...(Array.isArray(writerInfo?.poolCoreRefs) ? writerInfo.poolCoreRefs : []),
+          writerCoreKey
+        ].filter(Boolean) as string[]
+
+        if (!extraRefs.length) return baseMirrorMetadata
 
         const next: InviteMirrorMetadata = baseMirrorMetadata ? { ...baseMirrorMetadata } : {}
         const cores = Array.isArray(baseMirrorMetadata?.cores) ? [...baseMirrorMetadata.cores] : []
-        if (!cores.some((entry) => entry.key === writerCoreKey)) {
-          cores.push({ key: writerCoreKey, role: 'autobase-writer' })
-        }
+        extraRefs.forEach((ref) => {
+          if (!cores.some((entry) => entry.key === ref)) {
+            cores.push({ key: ref, role: 'autobase-writer' })
+          }
+        })
         next.cores = cores
         return next
       }
@@ -1265,7 +1310,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 relayKey: inviteRelayKey,
                 meta,
                 mirrorMetadata: inviteMirrorMetadata,
-                writerInfo
+                writerInfo,
+                fastForward: writerInfo?.fastForward || null
               })
           const encryptedPayload = await nip04Encrypt(
             invitee,
@@ -1280,6 +1326,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             hasAutobaseLocal: !!writerInfo?.autobaseLocal,
             hasWriterSecret: !!writerInfo?.writerSecret,
             writerSecretLen: writerInfo?.writerSecret ? String(writerInfo.writerSecret).length : 0,
+            hasFastForward: !!writerInfo?.fastForward,
             relayKey: inviteRelayKey ? String(inviteRelayKey).slice(0, 16) : null,
             relayUrl: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 80) : null,
             mirrorCoresCount: Array.isArray(inviteMirrorMetadata?.cores) ? inviteMirrorMetadata.cores.length : 0,
@@ -1400,19 +1447,33 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         writerCoreHex?: string
         autobaseLocal?: string
         writerSecret?: string
+        poolCoreRefs?: string[]
+        fastForward?: {
+          key?: string | null
+          length?: number | null
+          signedLength?: number | null
+          timeoutMs?: number | null
+        } | null
       } | null = null
       if (sendToWorker && relayEntry?.relayKey) {
         try {
           const res = await sendToWorker({
             type: 'provision-writer-for-invitee',
-            data: { relayKey: relayEntry.relayKey, publicIdentifier: groupId, inviteePubkey: targetPubkey }
+            data: {
+              relayKey: relayEntry.relayKey,
+              publicIdentifier: groupId,
+              inviteePubkey: targetPubkey,
+              useWriterPool: true
+            }
           })
           if (res && typeof res === 'object') {
             writerInfo = {
               writerCore: (res as any).writerCore,
               writerCoreHex: (res as any).writerCoreHex,
               autobaseLocal: (res as any).autobaseLocal,
-              writerSecret: (res as any).writerSecret
+              writerSecret: (res as any).writerSecret,
+              poolCoreRefs: Array.isArray((res as any).poolCoreRefs) ? (res as any).poolCoreRefs : undefined,
+              fastForward: (res as any).fastForward || null
             }
           }
           console.info('[GroupsProvider] Writer provisioning result (approval)', {
@@ -1422,7 +1483,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             hasWriterCore: !!writerInfo?.writerCore,
             hasWriterCoreHex: !!writerInfo?.writerCoreHex,
             hasAutobaseLocal: !!writerInfo?.autobaseLocal,
-            hasWriterSecret: !!writerInfo?.writerSecret
+            hasWriterSecret: !!writerInfo?.writerSecret,
+            hasPoolCoreRefs: Array.isArray(writerInfo?.poolCoreRefs) && writerInfo.poolCoreRefs.length > 0,
+            hasFastForward: !!writerInfo?.fastForward
           })
         } catch (err) {
           console.warn('[GroupsProvider] Failed to provision writer for approval', err)
@@ -1435,10 +1498,18 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       )
       const writerCoreKey =
         writerInfo?.writerCoreHex || writerInfo?.autobaseLocal || writerInfo?.writerCore
-      if (writerCoreKey) {
+      const extraCoreRefs = [
+        ...(Array.isArray(writerInfo?.poolCoreRefs) ? writerInfo.poolCoreRefs : []),
+        writerCoreKey
+      ].filter(Boolean) as string[]
+      if (extraCoreRefs.length) {
         if (!mirrorMetadata) mirrorMetadata = {}
         const cores = Array.isArray(mirrorMetadata.cores) ? [...mirrorMetadata.cores] : []
-        cores.push({ key: writerCoreKey, role: 'autobase-writer' })
+        extraCoreRefs.forEach((ref) => {
+          if (!cores.some((entry) => entry.key === ref)) {
+            cores.push({ key: ref, role: 'autobase-writer' })
+          }
+        })
         mirrorMetadata.cores = cores
       }
       const payload = buildInvitePayload({
@@ -1447,7 +1518,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         relayKey: inviteRelayKey,
         meta,
         mirrorMetadata,
-        writerInfo
+        writerInfo,
+        fastForward: writerInfo?.fastForward || null
       })
       console.info('[GroupsProvider] Approval invite payload built', {
         groupId,
@@ -1455,7 +1527,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         hasWriterCore: !!writerInfo?.writerCore,
         hasWriterCoreHex: !!writerInfo?.writerCoreHex,
         hasAutobaseLocal: !!writerInfo?.autobaseLocal,
-        hasWriterSecret: !!writerInfo?.writerSecret
+        hasWriterSecret: !!writerInfo?.writerSecret,
+        hasFastForward: !!writerInfo?.fastForward
       })
 
       // Build encrypted invite (9009)

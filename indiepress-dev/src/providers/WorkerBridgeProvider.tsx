@@ -185,6 +185,12 @@ type WorkerBridgeContextValue = {
       autobaseLocal?: string | null
       writerSecret?: string | null
       openJoin?: boolean
+      fastForward?: {
+        key?: string | null
+        length?: number | null
+        signedLength?: number | null
+        timeoutMs?: number | null
+      } | null
     }
   ) => Promise<void>
   clearJoinFlow: (publicIdentifier: string) => void
@@ -587,7 +593,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         writerCore: opts?.writerCore,
         writerCoreHex: opts?.writerCoreHex,
         autobaseLocal: opts?.autobaseLocal,
-        writerSecret: opts?.writerSecret
+        writerSecret: opts?.writerSecret,
+        fastForward: opts?.fastForward || undefined
       }
       if (hostPeers && hostPeers.length) data.hostPeers = hostPeers
 
@@ -606,7 +613,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         hasToken: !!opts?.token,
         isOpen: typeof opts?.isOpen === 'boolean' ? opts.isOpen : null,
         openJoin: opts?.openJoin === true,
-        fileSharing
+        fileSharing,
+        hasFastForward: !!opts?.fastForward
       })
 
       await electronIpc.sendToWorker({ type: 'start-join-flow', data })

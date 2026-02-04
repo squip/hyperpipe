@@ -67,6 +67,17 @@ import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/
 const PUBLIC_GATEWAY_REPLICA_IDENTIFIER = 'public-gateway:hyperbee';
 const { DEFAULT_NAMESPACE } = hypercoreCaps;
 
+function isHex64(value) {
+  return typeof value === 'string' && /^[0-9a-fA-F]{64}$/.test(value.trim());
+}
+
+function normalizeRelayKeyHex(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed || !isHex64(trimmed)) return null;
+  return trimmed.toLowerCase();
+}
+
 function parseNostrMessagePayload(message) {
   if (typeof message === 'string') {
     const trimmed = message.trim();
@@ -2888,7 +2899,7 @@ function collectRelayProgressSnapshot(relay) {
   };
 }
 
-function prehydrateRelayCoreRefs({ relay, coreRefs, relayKey, reason, context } = {}) {
+function prehydrateRelayCoreRefs({ relay, coreRefs, writerRefsHint = [], relayKey, reason, context } = {}) {
   const relayCorestore = relay?.corestore
     || relay?.store
     || relay?.session?.corestore
@@ -2906,9 +2917,10 @@ function prehydrateRelayCoreRefs({ relay, coreRefs, relayKey, reason, context } 
   const autobaseEntries = collectRelayCoreRefsFromAutobase(relay);
   const autobaseRefs = normalizeCoreRefList(autobaseEntries);
   const inputRefs = normalizeCoreRefList(coreRefs || []);
-  const mergedRefs = mergeCoreRefLists(autobaseRefs, inputRefs);
+  const writerHintRefs = normalizeCoreRefList(writerRefsHint || []);
+  const mergedRefs = mergeCoreRefLists(autobaseRefs, inputRefs, writerHintRefs);
   const writerEntries = autobaseEntries.filter((entry) => entry?.role && entry.role.startsWith('autobase-writer'));
-  const writerRefs = normalizeCoreRefList(writerEntries);
+  const writerRefs = mergeCoreRefLists(normalizeCoreRefList(writerEntries), writerHintRefs);
 
   let opened = 0;
   let errors = 0;
@@ -2939,6 +2951,7 @@ function prehydrateRelayCoreRefs({ relay, coreRefs, relayKey, reason, context } 
     autobaseCount: autobaseRefs.length,
     inputCount: inputRefs.length,
     writerCount: writerRefs.length,
+    writerHintCount: writerHintRefs.length,
     opened,
     errors,
     openedPreview: preview
@@ -3110,6 +3123,65 @@ function startRelayUpdateProgressLogger({ relay, relayKey, reason, intervalMs = 
   const start = Date.now();
   const normalizedInputRefs = normalizeCoreRefList(coreRefs || []);
   const expectedWriterRef = expectedWriterKey ? normalizeCoreRef(expectedWriterKey) || normalizeCoreRefString(expectedWriterKey) : null;
+  const baseline = { view: null };
+  const previous = { view: null };
+
+  const summarizeView = (view) => ({
+    key: view?.key || null,
+    length: typeof view?.length === 'number' ? view.length : null,
+    contiguousLength: typeof view?.contiguousLength === 'number' ? view.contiguousLength : null,
+    remoteLength: typeof view?.remoteLength === 'number' ? view.remoteLength : null,
+    byteLength: typeof view?.byteLength === 'number' ? view.byteLength : null,
+    fork: typeof view?.fork === 'number' ? view.fork : null,
+    peers: typeof view?.peers === 'number' ? view.peers : null
+  });
+
+  const logViewDelta = (stats, context) => {
+    const view = stats?.view || null;
+    if (!view) return;
+    const current = summarizeView(view);
+    if (!baseline.view) baseline.view = current;
+    if (!previous.view) previous.view = current;
+
+    const changed =
+      current.length !== previous.view.length ||
+      current.contiguousLength !== previous.view.contiguousLength ||
+      current.remoteLength !== previous.view.remoteLength ||
+      current.byteLength !== previous.view.byteLength ||
+      current.fork !== previous.view.fork ||
+      current.peers !== previous.view.peers;
+
+    if (!changed) return;
+
+    const delta = {
+      length: (typeof current.length === 'number' && typeof baseline.view.length === 'number')
+        ? current.length - baseline.view.length
+        : null,
+      contiguousLength: (typeof current.contiguousLength === 'number' && typeof baseline.view.contiguousLength === 'number')
+        ? current.contiguousLength - baseline.view.contiguousLength
+        : null,
+      remoteLength: (typeof current.remoteLength === 'number' && typeof baseline.view.remoteLength === 'number')
+        ? current.remoteLength - baseline.view.remoteLength
+        : null,
+      byteLength: (typeof current.byteLength === 'number' && typeof baseline.view.byteLength === 'number')
+        ? current.byteLength - baseline.view.byteLength
+        : null
+    };
+
+    console.log('[RelayServer] View length delta', {
+      relayKey,
+      reason,
+      context,
+      elapsedMs: Date.now() - start,
+      baseline: baseline.view,
+      previous: previous.view,
+      current,
+      delta
+    });
+
+    previous.view = current;
+  };
+
   const logSnapshot = (context) => {
     logRelayViewCoreIdentity(relay, { relayKey, reason, context });
     const { writerRefs, roleMap } = collectWriterRefRoles(relay);
@@ -3148,12 +3220,14 @@ function startRelayUpdateProgressLogger({ relay, relayKey, reason, intervalMs = 
         rolesPreview
       });
     }
+    const stats = collectRelayProgressSnapshot(relay);
+    logViewDelta(stats, context);
     console.log('[RelayServer] Relay update wait progress', {
       relayKey,
       reason,
       context,
       elapsedMs: Date.now() - start,
-      stats: collectRelayProgressSnapshot(relay)
+      stats
     });
   };
 
@@ -3171,7 +3245,8 @@ async function waitForRelayWriterActivation(options = {}) {
     relayKey,
     expectedWriterKey = null,
     timeoutMs = 10000,
-    reason = 'unknown'
+    reason = 'unknown',
+    pollMs = 500
   } = options;
   if (!relayKey) return { ok: false, reason, relayKey: null };
 
@@ -3187,6 +3262,7 @@ async function waitForRelayWriterActivation(options = {}) {
   const expectedHex = previewWriterKey(expectedKey);
   const start = Date.now();
   let timeoutId = null;
+  let pollId = null;
   let lastSnapshot = null;
 
   if (typeof relay.ready === 'function') {
@@ -3242,6 +3318,7 @@ async function waitForRelayWriterActivation(options = {}) {
   return await new Promise((resolve) => {
     const cleanup = (result) => {
       if (timeoutId) clearTimeout(timeoutId);
+      if (pollId) clearInterval(pollId);
       if (typeof relay.off === 'function') {
         relay.off('update', onUpdate);
         relay.off('writable', onWritable);
@@ -3253,21 +3330,22 @@ async function waitForRelayWriterActivation(options = {}) {
     };
 
     const onUpdate = () => {
-      const snap = snapshot('update');
-      logState(snap);
-      if (isReady(snap)) {
-        console.log('[RelayServer] waitForRelayWriterActivation resolved on update', snap);
-        cleanup({ ok: true, ...snap });
-      }
+      if (checkReady('update')) return;
     };
 
     const onWritable = () => {
-      const snap = snapshot('writable');
+      if (checkReady('writable')) return;
+    };
+
+    const checkReady = (context) => {
+      const snap = snapshot(context);
       logState(snap);
       if (isReady(snap)) {
-        console.log('[RelayServer] waitForRelayWriterActivation resolved on writable', snap);
+        console.log(`[RelayServer] waitForRelayWriterActivation resolved on ${context}`, snap);
         cleanup({ ok: true, ...snap });
+        return true;
       }
+      return false;
     };
 
     if (typeof relay.on === 'function') {
@@ -3275,19 +3353,27 @@ async function waitForRelayWriterActivation(options = {}) {
       relay.on('writable', onWritable);
     }
 
-    const initial = snapshot('initial');
-    logState(initial);
-    if (isReady(initial)) {
-      console.log('[RelayServer] waitForRelayWriterActivation already satisfied', initial);
-      cleanup({ ok: true, ...initial });
+    if (checkReady('initial')) {
       return;
     }
 
     timeoutId = setTimeout(() => {
       const snap = snapshot('timeout');
+      if (isReady(snap)) {
+        console.warn('[RelayServer] waitForRelayWriterActivation timeout but ready', snap);
+        cleanup({ ok: true, timeout: true, ...snap });
+        return;
+      }
       console.warn('[RelayServer] waitForRelayWriterActivation timeout', snap);
       cleanup({ ok: false, timeout: true, ...snap });
     }, timeoutMs);
+
+    if (pollMs > 0) {
+      pollId = setInterval(() => {
+        checkReady('poll');
+      }, pollMs);
+      pollId.unref?.();
+    }
   });
 }
 
@@ -3340,18 +3426,26 @@ function scheduleLateWriterRecovery(options = {}) {
           writable: true,
           expectedWriterActive: result?.expectedWriterActive ?? null
         });
+        const relayWritablePayload = {
+          relayKey,
+          publicIdentifier,
+          relayUrl,
+          authToken,
+          mode,
+          writable: true,
+          expectedWriterActive: result?.expectedWriterActive ?? null
+        };
         global.sendMessage({
           type: 'relay-writable',
-          data: {
-            relayKey,
-            publicIdentifier,
-            relayUrl,
-            authToken,
-            mode,
-            writable: true,
-            expectedWriterActive: result?.expectedWriterActive ?? null
-          }
+          data: relayWritablePayload
         });
+        if (typeof global.onRelayWritable === 'function') {
+          try {
+            global.onRelayWritable(relayWritablePayload);
+          } catch (error) {
+            console.warn('[RelayServer] Failed to invoke relay-writable hook:', error?.message || error);
+          }
+        }
       }
     } else {
       console.warn('[RelayServer] Late writer recovery timed out', {
@@ -4055,31 +4149,108 @@ export async function startJoinAuthentication(options) {
     writerSecret = null,
     writerCoreHex = null,
     autobaseLocal = null,
-    coreRefs = []
+    coreRefs = [],
+    writerCoreRefs = [],
+    fastForward = null
   } = options;
   const expectedWriter = resolveExpectedWriterKey({ writerCoreHex, autobaseLocal, writerCore });
   const expectedWriterKey = expectedWriter.expectedWriterKey;
   const expectedWriterSource = expectedWriter.source;
   const expectedWriterKeyHex = resolveWriterKeyHex(expectedWriterKey);
   let resolvedCoreRefs = Array.isArray(coreRefs) ? [...coreRefs] : [];
+  let resolvedWriterCoreRefs = Array.isArray(writerCoreRefs) ? writerCoreRefs.filter(Boolean) : [];
   const expectedCoreRef = normalizeCoreRefString(expectedWriterKey);
   if (expectedCoreRef && !resolvedCoreRefs.includes(expectedCoreRef)) {
     resolvedCoreRefs.push(expectedCoreRef);
   }
-  const coreRefsForJoin = resolvedCoreRefs;
+  if (expectedCoreRef && !resolvedWriterCoreRefs.includes(expectedCoreRef)) {
+    resolvedWriterCoreRefs.push(expectedCoreRef);
+  }
+  let coreRefsForJoin = resolvedCoreRefs;
+  let writerCoreRefsForJoin = Array.from(new Set(resolvedWriterCoreRefs));
+  const relayKeyHint = normalizeRelayKeyHex(inviteRelayKey) || inviteRelayKey || null;
+  const publicIdentifierHint = publicIdentifier || null;
+  let resolvedCoreRefsSource = 'invite';
+  if (typeof global.resolveRelayMirrorCoreRefs === 'function' && (relayKeyHint || publicIdentifierHint)) {
+    try {
+      const merged = await global.resolveRelayMirrorCoreRefs(
+        relayKeyHint,
+        publicIdentifierHint,
+        coreRefsForJoin
+      );
+      if (Array.isArray(merged) && merged.length) {
+        coreRefsForJoin = merged;
+        resolvedCoreRefsSource = 'cache';
+      }
+    } catch (error) {
+      console.warn('[RelayServer] Failed to resolve relay core refs from cache', {
+        relayKey: relayKeyHint,
+        publicIdentifier: publicIdentifierHint,
+        error: error?.message || error
+      });
+    }
+  }
+
+  const checkpointRefForJoin = fastForward?.key ? normalizeCoreRef(fastForward.key) : null;
+  let checkpointInJoinRefs = checkpointRefForJoin
+    ? normalizeCoreRefList(coreRefsForJoin).includes(checkpointRefForJoin)
+    : null;
+  if (!checkpointInJoinRefs && typeof global.fetchAndApplyRelayMirrorMetadata === 'function' && (relayKeyHint || publicIdentifierHint)) {
+    try {
+      const mirrorResult = await global.fetchAndApplyRelayMirrorMetadata({
+        relayKey: relayKeyHint || publicIdentifierHint,
+        publicIdentifier: publicIdentifierHint,
+        reason: 'join-refresh'
+      });
+      const merged = typeof global.resolveRelayMirrorCoreRefs === 'function'
+        ? await global.resolveRelayMirrorCoreRefs(
+          relayKeyHint,
+          publicIdentifierHint,
+          coreRefsForJoin
+        )
+        : null;
+      if (Array.isArray(merged) && merged.length) {
+        coreRefsForJoin = merged;
+        resolvedCoreRefsSource = 'mirror';
+        checkpointInJoinRefs = checkpointRefForJoin
+          ? normalizeCoreRefList(coreRefsForJoin).includes(checkpointRefForJoin)
+          : checkpointInJoinRefs;
+      }
+      console.log('[RelayServer] Join mirror refresh result', {
+        relayKey: relayKeyHint,
+        publicIdentifier: publicIdentifierHint,
+        status: mirrorResult?.status ?? null,
+        checkpointInJoinRefs,
+        coreRefsCount: Array.isArray(coreRefsForJoin) ? coreRefsForJoin.length : 0
+      });
+    } catch (error) {
+      console.warn('[RelayServer] Mirror refresh failed during join', {
+        relayKey: relayKeyHint,
+        publicIdentifier: publicIdentifierHint,
+        error: error?.message || error
+      });
+    }
+  }
+
+  writerCoreRefsForJoin = Array.from(new Set(writerCoreRefsForJoin));
   console.log('[RelayServer] startJoinAuthentication payload', {
     publicIdentifier,
     hasWriterSecret: !!writerSecret,
     hasWriterCore: !!writerCore,
     hasWriterCoreHex: !!writerCoreHex,
     hasAutobaseLocal: !!autobaseLocal,
+    hasFastForward: !!fastForward,
     expectedWriterSource,
     expectedWriterKeyHex,
     coreRefsCount: resolvedCoreRefs.length,
+    writerCoreRefsCount: writerCoreRefsForJoin.length,
     hostPeersCount: Array.isArray(hostPeerList) ? hostPeerList.length : 0,
     blindPeer: !!blindPeer,
     inviteRelayKey,
-    openJoin
+    openJoin,
+    resolvedCoreRefsSource,
+    resolvedCoreRefsCount: coreRefsForJoin.length,
+    checkpointInJoinRefs
   });
   console.log('[RelayServer][WriterMaterial] Join auth writer material', {
     publicIdentifier,
@@ -4090,7 +4261,8 @@ export async function startJoinAuthentication(options) {
     expectedWriterKey,
     expectedWriterSource,
     expectedWriterKeyHex,
-    coreRefs: resolvedCoreRefs
+    coreRefs: resolvedCoreRefs,
+    writerCoreRefs: writerCoreRefsForJoin
   });
   const userNsec = config.nostr_nsec_hex;
   const userPubkey = NostrUtils.getPublicKey(userNsec);
@@ -4270,6 +4442,7 @@ export async function startJoinAuthentication(options) {
           autobaseLocal,
           blindPeer,
           coreRefs: coreRefsForJoin,
+          fastForward,
           expectedWriterKey,
           suppressInitMessage: true,
           useSharedCorestore: true
@@ -4293,18 +4466,24 @@ export async function startJoinAuthentication(options) {
             const preUpdateStats = collectRelayUpdateStats(relayManager.relay);
             if (typeof global.syncActiveRelayCoreRefs === 'function' && coreRefsForJoin?.length) {
               try {
-                const syncSummary = await global.syncActiveRelayCoreRefs({
+              const syncSummary = await global.syncActiveRelayCoreRefs({
                   relayKey: fallbackRelayKey,
                   publicIdentifier,
                   coreRefs: coreRefsForJoin,
+                  writerCoreRefs: writerCoreRefsForJoin,
                   reason: 'pre-wait'
                 });
-                console.log('[RelayServer] Pre-wait writer sync', {
+              const checkpointRef = fastForward?.key ? normalizeCoreRef(fastForward.key) : null;
+              const checkpointInMirror = checkpointRef
+                ? normalizeCoreRefList(coreRefsForJoin).includes(checkpointRef)
+                : null;
+              console.log('[RelayServer] Pre-wait writer sync', {
                   relayKey: fallbackRelayKey,
                   status: syncSummary?.status ?? null,
                   writerAdded: syncSummary?.writerSummary?.added ?? null,
-                  writerStatus: syncSummary?.writerSummary?.status ?? null
-                });
+                  writerStatus: syncSummary?.writerSummary?.status ?? null,
+                  checkpointInMirror
+              });
               } catch (error) {
                 console.warn('[RelayServer] Pre-wait writer sync failed', {
                   relayKey: fallbackRelayKey,
@@ -4329,6 +4508,7 @@ export async function startJoinAuthentication(options) {
               prehydrateRelayCoreRefs({
                 relay: relayManager.relay,
                 coreRefs: coreRefsForJoin,
+                writerRefsHint: writerCoreRefsForJoin,
                 relayKey: fallbackRelayKey,
                 reason: 'blind-peer-fallback',
                 context: 'pre-update'
@@ -4347,30 +4527,29 @@ export async function startJoinAuthentication(options) {
               coreRefs: coreRefsForJoin,
               expectedWriterKey
             });
-            console.log('[RelayServer] Waiting for relay sync after join', {
+            console.log('[RelayServer] Starting relay update after join (background)', {
               relayKey: fallbackRelayKey,
               reason: 'blind-peer-fallback',
               stats: preUpdateStats
             });
-            try {
-              await relayManager.relay.update({ wait: true });
-            } catch (error) {
-              console.warn('[RelayServer] Relay update({ wait: true }) failed; retrying without options', {
+            const updateTask = relayManager.relay.update().catch((error) => {
+              console.warn('[RelayServer] Relay update failed (background)', {
                 relayKey: fallbackRelayKey,
                 error: error?.message || error,
                 elapsedMs: Date.now() - updateStart,
                 stats: collectRelayUpdateStats(relayManager.relay)
               });
-              await relayManager.relay.update();
-            } finally {
+            }).finally(() => {
               stopProgressLog();
-            }
-            console.log('[RelayServer] Relay sync complete after join', {
-              relayKey: fallbackRelayKey,
-              elapsedMs: Date.now() - updateStart,
-              writable: relayManager.relay?.writable ?? null,
-              activeWriters: relayManager.relay?.activeWriters?.size ?? null,
-              stats: collectRelayUpdateStats(relayManager.relay)
+            });
+            updateTask.then(() => {
+              console.log('[RelayServer] Relay update complete after join (background)', {
+                relayKey: fallbackRelayKey,
+                elapsedMs: Date.now() - updateStart,
+                writable: relayManager.relay?.writable ?? null,
+                activeWriters: relayManager.relay?.activeWriters?.size ?? null,
+                stats: collectRelayUpdateStats(relayManager.relay)
+              });
             });
           }
         } catch (err) {
@@ -4380,18 +4559,46 @@ export async function startJoinAuthentication(options) {
           });
         }
 
-        const relayWaitResult = await waitForRelayWriterActivation({
-          relayKey: fallbackRelayKey,
-          expectedWriterKey,
-          timeoutMs: BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS,
-          reason: 'blind-peer-fallback'
-        });
+        let relayWaitResult = null;
+        const canBypassWait = Boolean(writerSecret && (expectedWriterKey || writerCore || writerCoreHex));
+        if (canBypassWait) {
+          let expectedWriterActive = null;
+          try {
+            const activeWriters = relayManager?.relay?.activeWriters;
+            if (expectedWriterKey && activeWriters?.has) {
+              expectedWriterActive = activeWriters.has(expectedWriterKey);
+            }
+          } catch (_) {
+            expectedWriterActive = null;
+          }
+          relayWaitResult = {
+            ok: true,
+            writable: relayManager?.relay?.writable ?? false,
+            expectedWriterActive,
+            elapsedMs: 0,
+            bypassed: true
+          };
+          console.log('[RelayServer] Bypassing relay-writable wait (writer secret present)', {
+            relayKey: fallbackRelayKey,
+            publicIdentifier,
+            expectedWriterActive,
+            writable: relayWaitResult.writable
+          });
+        } else {
+          relayWaitResult = await waitForRelayWriterActivation({
+            relayKey: fallbackRelayKey,
+            expectedWriterKey,
+            timeoutMs: BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS,
+            reason: 'blind-peer-fallback'
+          });
+        }
         console.log('[RelayServer] Blind-peer fallback writer wait result', {
           relayKey: fallbackRelayKey,
           ok: relayWaitResult?.ok ?? null,
           writable: relayWaitResult?.writable ?? null,
           expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
-          elapsedMs: relayWaitResult?.elapsedMs ?? null
+          elapsedMs: relayWaitResult?.elapsedMs ?? null,
+          bypassed: relayWaitResult?.bypassed ?? false
         });
         const identifierPath = publicIdentifier
           ? publicIdentifier.replace(':', '/')
@@ -4596,6 +4803,7 @@ export async function startJoinAuthentication(options) {
           autobaseLocal,
           blindPeer,
           coreRefs: coreRefsForJoin,
+          fastForward,
           expectedWriterKey,
           suppressInitMessage: true,
           useSharedCorestore: true
@@ -4855,6 +5063,7 @@ export async function startJoinAuthentication(options) {
       autobaseLocal: finalWriterCoreHex,
       blindPeer,
       coreRefs: directCoreRefs,
+      fastForward,
       expectedWriterKey: finalExpectedWriterKey
     });
     await applyPendingAuthUpdates(updateRelayAuthToken, relayKey, finalIdentifier);
@@ -4971,7 +5180,7 @@ export async function startJoinAuthentication(options) {
 }
 
 export async function provisionWriterForInvitee(options = {}) {
-  const { relayKey, publicIdentifier } = options;
+  const { relayKey, publicIdentifier, skipUpdateWait = false, reason = 'invite-writer' } = options;
   const resolvedRelayKey = relayKey || (publicIdentifier ? await getRelayKeyFromPublicIdentifier(publicIdentifier) : null);
   if (!resolvedRelayKey) {
     throw new Error('relayKey or publicIdentifier is required to provision writer');
@@ -5029,7 +5238,8 @@ export async function provisionWriterForInvitee(options = {}) {
     writer: writerAddHex.slice(0, 16),
     writerSigner: writerHex.slice(0, 16),
     writerCoreHex: writerCoreHex ? writerCoreHex.slice(0, 16) : null,
-    writable: relayManager.relay?.writable ?? null
+    writable: relayManager.relay?.writable ?? null,
+    skipUpdateWait
   });
   await relayManager.addWriter(writerAddHex);
   console.log('[RelayServer] Invite writer add committed', {
@@ -5044,14 +5254,25 @@ export async function provisionWriterForInvitee(options = {}) {
       const stopProgressLog = startRelayUpdateProgressLogger({
         relay: relayManager.relay,
         relayKey: resolvedRelayKey,
-        reason: 'invite-writer'
+        reason
       });
-      try {
-        await relayManager.relay.update({ wait: true });
-      } catch (_) {
-        await relayManager.relay.update();
-      } finally {
-        stopProgressLog();
+      if (skipUpdateWait) {
+        relayManager.relay.update().catch((error) => {
+          console.warn('[RelayServer] Relay update failed after invite writer (background)', {
+            relayKey: resolvedRelayKey,
+            error: error?.message || error
+          });
+        }).finally(() => {
+          stopProgressLog();
+        });
+      } else {
+        try {
+          await relayManager.relay.update({ wait: true });
+        } catch (_) {
+          await relayManager.relay.update();
+        } finally {
+          stopProgressLog();
+        }
       }
     }
   } catch (error) {
@@ -5065,16 +5286,23 @@ export async function provisionWriterForInvitee(options = {}) {
     const relayIdentifier = publicIdentifier || relayManager?.publicIdentifier || null;
     const autobaseEntries = collectRelayCoreRefsFromAutobase(relayManager.relay);
     const autobaseRefs = normalizeCoreRefList(autobaseEntries);
+    const autobaseWriterRefs = normalizeCoreRefList(
+      autobaseEntries.filter((entry) => entry?.role && entry.role.startsWith('autobase-writer'))
+    );
     const inviteRefs = normalizeCoreRefList([writerCore, writerCoreHex, writerAddHex]);
     const storedRefs = await resolveRelayMirrorCoreRefs(resolvedRelayKey, relayIdentifier, autobaseEntries);
     const mergedCoreRefs = mergeCoreRefLists(storedRefs, autobaseRefs, inviteRefs);
-    updateRelayMirrorCoreRefs(resolvedRelayKey, mergedCoreRefs);
+    const mergedWriterRefs = mergeCoreRefLists(autobaseWriterRefs, inviteRefs);
+    await updateRelayMirrorCoreRefs(resolvedRelayKey, mergedCoreRefs, {
+      publicIdentifier: relayIdentifier
+    });
     if (typeof global.syncActiveRelayCoreRefs === 'function') {
       await global.syncActiveRelayCoreRefs({
         relayKey: resolvedRelayKey,
         publicIdentifier: relayIdentifier,
         coreRefs: mergedCoreRefs,
-        reason: 'invite-writer'
+        writerCoreRefs: mergedWriterRefs,
+        reason
       });
     }
     console.log('[RelayServer] Persisted invite writer core refs', {

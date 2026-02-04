@@ -268,7 +268,8 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         hasWriterCore: !!inv.writerCore,
         hasWriterCoreHex: !!inv.writerCoreHex,
         hasAutobaseLocal: !!inv.autobaseLocal,
-        writerSecretLen: inv.writerSecret ? String(inv.writerSecret).length : 0
+        writerSecretLen: inv.writerSecret ? String(inv.writerSecret).length : 0,
+        hasFastForward: !!inv.fastForward
       })
       if (sendToWorker && pubkey && inv.token) {
         sendToWorker({
@@ -293,7 +294,8 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         writerCore: inv.writerCore,
         writerCoreHex: inv.writerCoreHex,
         autobaseLocal: inv.autobaseLocal,
-        writerSecret: inv.writerSecret
+        writerSecret: inv.writerSecret,
+        fastForward: inv.fastForward || undefined
       })
 
       push(toGroup(inv.groupId, relayUrl || inv.relay))

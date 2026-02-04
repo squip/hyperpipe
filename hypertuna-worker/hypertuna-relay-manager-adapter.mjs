@@ -31,6 +31,7 @@ import { ChallengeManager } from './challenge-manager.mjs';
 import { normalizeRelayIdentifier } from './relay-identifier-utils.mjs';
 
 const { DEFAULT_NAMESPACE } = hypercoreCaps;
+const FAST_FORWARD_JOIN_TIMEOUT_MS = 30000;
 
 // Store active relay managers
 const activeRelays = new Map();
@@ -96,6 +97,104 @@ function decodeWriterKey(value) {
         }
     }
     return null;
+}
+
+function normalizeFastForwardCheckpoint(checkpoint) {
+    if (!checkpoint || typeof checkpoint !== 'object') return null;
+    const key = decodeWriterKey(
+        checkpoint.key ||
+        checkpoint.coreKey ||
+        checkpoint.relayKey ||
+        checkpoint.bootstrapKey ||
+        null
+    );
+    if (!key) return null;
+    const timeout =
+        Number.isFinite(checkpoint.timeoutMs)
+            ? checkpoint.timeoutMs
+            : Number.isFinite(checkpoint.timeout)
+                ? checkpoint.timeout
+                : null;
+    const length = Number.isFinite(checkpoint.length) ? checkpoint.length : null;
+    const signedLength = Number.isFinite(checkpoint.signedLength) ? checkpoint.signedLength : null;
+    return {
+        key,
+        timeout: timeout ?? undefined,
+        length,
+        signedLength,
+        source: checkpoint.source || null
+    };
+}
+
+async function applyFastForwardCheckpoint({ relayManager, relayKey, checkpoint, reason = 'join' } = {}) {
+    const relay = relayManager?.relay || null;
+    if (!relay) {
+        return { status: 'skipped', reason: 'missing-relay' };
+    }
+    if (!checkpoint?.key) {
+        return { status: 'skipped', reason: 'missing-checkpoint' };
+    }
+
+    const supportsFastForward = typeof relay.initialFastForward === 'function';
+    const systemKey = relay?.system?.core?.key || null;
+    const checkpointKeyHex = b4a.toString(checkpoint.key, 'hex');
+    const systemKeyHex = systemKey ? b4a.toString(systemKey, 'hex') : null;
+    const keyMatchesSystem = systemKey ? b4a.equals(systemKey, checkpoint.key) : null;
+    const fastForwarding = typeof relay.fastForwarding === 'number' ? relay.fastForwarding : null;
+    const fastForwardTo = relay.fastForwardTo ? b4a.toString(relay.fastForwardTo.key, 'hex') : null;
+
+    console.log('[RelayAdapter] Fast-forward checkpoint request', {
+        relayKey,
+        reason,
+        checkpointKey: checkpointKeyHex ? checkpointKeyHex.slice(0, 16) : null,
+        systemKey: systemKeyHex ? systemKeyHex.slice(0, 16) : null,
+        keyMatchesSystem,
+        hasMethod: supportsFastForward,
+        fastForwarding,
+        fastForwardTo: fastForwardTo ? fastForwardTo.slice(0, 16) : null,
+        length: checkpoint.length ?? null,
+        signedLength: checkpoint.signedLength ?? null
+    });
+
+    if (!supportsFastForward) {
+        return { status: 'skipped', reason: 'unsupported' };
+    }
+
+    if (systemKey && keyMatchesSystem === false) {
+        const pendingFastForward = relay.fastForwardTo?.key ? b4a.toString(relay.fastForwardTo.key, 'hex').slice(0, 16) : null;
+        console.warn('[RelayAdapter] Fast-forward checkpoint mismatch (deferring)', {
+            relayKey,
+            reason,
+            checkpointKey: checkpointKeyHex ? checkpointKeyHex.slice(0, 16) : null,
+            systemKey: systemKeyHex ? systemKeyHex.slice(0, 16) : null,
+            length: checkpoint.length ?? null,
+            signedLength: checkpoint.signedLength ?? null,
+            fastForwardTo: pendingFastForward
+        });
+        return {
+            status: 'skipped',
+            reason: 'key-mismatch',
+            keyMatchesSystem: false
+        };
+    }
+
+    const timeoutMs = Number.isFinite(checkpoint.timeout) ? checkpoint.timeout : FAST_FORWARD_JOIN_TIMEOUT_MS;
+    const start = Date.now();
+    try {
+        await relay.initialFastForward(checkpoint.key, timeoutMs);
+        return {
+            status: 'ok',
+            elapsedMs: Date.now() - start,
+            keyMatchesSystem
+        };
+    } catch (error) {
+        return {
+            status: 'error',
+            elapsedMs: Date.now() - start,
+            keyMatchesSystem,
+            error: error?.message || error
+        };
+    }
 }
 
 function deriveCoreKeyFromSignerKey(signerKey, manifestVersion = 0) {
@@ -1155,6 +1254,7 @@ export async function joinRelay(options = {}) {
         writerCoreHex = null,
         autobaseLocal = null,
         expectedWriterKey: expectedWriterOverride = null,
+        fastForward = null,
         blindPeer = null,
         coreRefs = null,
         suppressInitMessage = false,
@@ -1194,6 +1294,10 @@ export async function joinRelay(options = {}) {
         expectedWriterSource = 'writerCore';
     }
     const expectsCoreKey = expectedWriterSource && expectedWriterSource !== 'writerCore';
+    const fastForwardCheckpoint = normalizeFastForwardCheckpoint(fastForward);
+    const fastForwardKeyHex = fastForwardCheckpoint?.key
+        ? b4a.toString(fastForwardCheckpoint.key, 'hex').slice(0, 16)
+        : null;
 
     console.log('[RelayAdapter][WriterMaterial] Join relay writer expectations', {
         relayKey,
@@ -1204,7 +1308,11 @@ export async function joinRelay(options = {}) {
         expectedWriterOverride,
         writerSignerHex,
         expectedWriterKey: expectedWriterHex,
-        expectedWriterSource
+        expectedWriterSource,
+        hasFastForward: !!fastForwardCheckpoint,
+        fastForwardKey: fastForwardKeyHex,
+        fastForwardLength: fastForwardCheckpoint?.length ?? null,
+        fastForwardSignedLength: fastForwardCheckpoint?.signedLength ?? null
     });
     if (!expectedWriterKey && (writerCoreHex || autobaseLocal || expectedWriterOverride)) {
         console.warn('[RelayAdapter][WriterMaterial] Failed to decode expected writer key', {
@@ -1455,9 +1563,27 @@ export async function joinRelay(options = {}) {
         const relayManager = new RelayManager(defaultStorageDir, relayKey, {
             keyPair: writerKeyPair,
             expectedWriterKey,
-            corestore: relayCorestore
+            corestore: relayCorestore,
+            fastForward: fastForwardCheckpoint
         });
         await relayManager.initialize();
+
+        if (fastForwardCheckpoint) {
+            const fastForwardResult = await applyFastForwardCheckpoint({
+                relayManager,
+                relayKey,
+                checkpoint: fastForwardCheckpoint,
+                reason: 'join-relay'
+            });
+            console.log('[RelayAdapter] Fast-forward checkpoint applied', {
+                relayKey,
+                status: fastForwardResult?.status || null,
+                reason: fastForwardResult?.reason || null,
+                elapsedMs: fastForwardResult?.elapsedMs ?? null,
+                keyMatchesSystem: fastForwardResult?.keyMatchesSystem ?? null,
+                error: fastForwardResult?.error || null
+            });
+        }
         
         activeRelays.set(relayKey, relayManager);
         

@@ -5,6 +5,7 @@ import {
   getRelayProfileByKey,
   getRelayProfileByPublicIdentifier
 } from './hypertuna-relay-profile-manager-bare.mjs';
+import { normalizeRelayIdentifier } from './relay-identifier-utils.mjs';
 
 const RELAY_CORE_REFS_CACHE_FILENAME = 'relay-core-refs-cache.json';
 
@@ -16,6 +17,58 @@ const relayMirrorCoreRefsCache = new Map();
 let relayCoreRefsCacheLoaded = false;
 let relayCoreRefsCacheDirty = false;
 let relayCoreRefsCacheTimer = null;
+
+function isHex64(value) {
+  return typeof value === 'string' && /^[0-9a-fA-F]{64}$/.test(value.trim());
+}
+
+function normalizeRelayKeyHex(value) {
+  if (!value || typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed || !isHex64(trimmed)) return null;
+  return trimmed.toLowerCase();
+}
+
+async function resolveCanonicalRelayKeys(relayKey, publicIdentifier) {
+  const relayKeyHex = normalizeRelayKeyHex(relayKey);
+  const publicKeyHex = normalizeRelayKeyHex(publicIdentifier);
+  const normalizedAlias = normalizeRelayIdentifier(publicIdentifier || relayKey || '');
+
+  if (relayKeyHex) {
+    return {
+      canonicalKey: relayKeyHex,
+      aliasKey: normalizedAlias && normalizedAlias !== relayKeyHex ? normalizedAlias : null
+    };
+  }
+
+  if (publicKeyHex) {
+    return {
+      canonicalKey: publicKeyHex,
+      aliasKey: normalizedAlias && normalizedAlias !== publicKeyHex ? normalizedAlias : null
+    };
+  }
+
+  let profile = null;
+  if (relayKey && typeof relayKey === 'string') {
+    profile = await getRelayProfileByPublicIdentifier(relayKey);
+  }
+  if (!profile && publicIdentifier) {
+    profile = await getRelayProfileByPublicIdentifier(publicIdentifier);
+  }
+
+  const canonicalKey = normalizeRelayKeyHex(profile?.relay_key || profile?.relayKey || null);
+  const aliasKey = normalizeRelayIdentifier(
+    profile?.public_identifier
+      || profile?.publicIdentifier
+      || normalizedAlias
+      || ''
+  );
+
+  return {
+    canonicalKey: canonicalKey || null,
+    aliasKey: aliasKey && aliasKey !== canonicalKey ? aliasKey : null
+  };
+}
 
 export function configureRelayCoreRefsStore({ storageBase = null, logger = null } = {}) {
   if (typeof storageBase === 'string' && storageBase.trim()) {
@@ -112,6 +165,22 @@ export function normalizeMirrorCoreRefs(cores) {
   return normalizeCoreRefList(cores);
 }
 
+export function normalizeMirrorWriterCoreRefs(cores) {
+  if (!Array.isArray(cores)) return [];
+  const writerRefs = [];
+  for (const entry of cores) {
+    if (!entry || typeof entry !== 'object') continue;
+    const roles = [];
+    if (typeof entry.role === 'string') roles.push(entry.role);
+    if (Array.isArray(entry.roles)) roles.push(...entry.roles);
+    const isWriter = roles.some((role) => role && (role === 'autobase-writer' || role.startsWith('autobase-writer-')));
+    if (!isWriter) continue;
+    const normalized = normalizeCoreRef(entry.key || entry.core || entry);
+    if (normalized) writerRefs.push(normalized);
+  }
+  return normalizeCoreRefList(writerRefs);
+}
+
 export function mergeCoreRefLists(...lists) {
   const merged = [];
   const seen = new Set();
@@ -151,6 +220,8 @@ export function collectRelayCoreRefsFromAutobase(autobase) {
   };
 
   addCore(autobase, 'autobase');
+  addCore(autobase?.system || autobase?.system?.core, 'autobase-system');
+  addCore(autobase?.system?.core, 'autobase-system-core');
   addCore(autobase?.core, 'autobase-core');
   addCore(autobase?.local || autobase?.local?.core, 'autobase-local');
   addCore(autobase?.localInput || autobase?.localInput?.core, 'autobase-local');
@@ -251,18 +322,34 @@ export async function persistRelayCoreRefsCache(force = false) {
 export async function getRelayMirrorCoreRefsCache(relayKey) {
   await loadRelayCoreRefsCache();
   if (!relayKey) return [];
-  return relayMirrorCoreRefsCache.get(relayKey) || [];
+  const { canonicalKey, aliasKey } = await resolveCanonicalRelayKeys(relayKey, null);
+  const direct = relayMirrorCoreRefsCache.get(relayKey) || [];
+  const canonical = canonicalKey ? (relayMirrorCoreRefsCache.get(canonicalKey) || []) : [];
+  const alias = aliasKey ? (relayMirrorCoreRefsCache.get(aliasKey) || []) : [];
+  return mergeCoreRefLists(direct, canonical, alias);
 }
 
-export function updateRelayMirrorCoreRefs(relayKey, coreRefs, { persist = true } = {}) {
+export async function updateRelayMirrorCoreRefs(relayKey, coreRefs, { persist = true, publicIdentifier = null, updateAlias = true } = {}) {
   if (!relayKey || !Array.isArray(coreRefs) || !coreRefs.length) return;
   const normalized = normalizeCoreRefList(coreRefs);
   if (!normalized.length) return;
-  const existing = relayMirrorCoreRefs.get(relayKey) || [];
-  if (coreRefsFingerprint(existing) === coreRefsFingerprint(normalized)) {
-    return;
+
+  const { canonicalKey, aliasKey } = await resolveCanonicalRelayKeys(relayKey, publicIdentifier);
+  const targets = new Set();
+  if (canonicalKey) targets.add(canonicalKey);
+  if (!canonicalKey) targets.add(relayKey);
+  if (updateAlias && aliasKey) targets.add(aliasKey);
+
+  let changed = false;
+  for (const key of targets) {
+    const existing = relayMirrorCoreRefs.get(key) || [];
+    if (coreRefsFingerprint(existing) === coreRefsFingerprint(normalized)) {
+      continue;
+    }
+    relayMirrorCoreRefs.set(key, normalized);
+    changed = true;
   }
-  relayMirrorCoreRefs.set(relayKey, normalized);
+  if (!changed) return;
   if (persist) {
     relayCoreRefsCacheDirty = true;
     scheduleRelayCoreRefsCachePersist();
@@ -272,11 +359,30 @@ export function updateRelayMirrorCoreRefs(relayKey, coreRefs, { persist = true }
 export async function resolveRelayMirrorCoreRefs(relayKey, publicIdentifier = null, fallbackRefs = []) {
   const normalizedFallback = normalizeCoreRefList(fallbackRefs);
   await loadRelayCoreRefsCache();
-  const cachedRefs = relayKey ? (relayMirrorCoreRefsCache.get(relayKey) || []) : [];
+
+  const { canonicalKey, aliasKey } = await resolveCanonicalRelayKeys(relayKey, publicIdentifier);
+  const cachedRefs = mergeCoreRefLists(
+    relayKey ? (relayMirrorCoreRefsCache.get(relayKey) || []) : [],
+    canonicalKey ? (relayMirrorCoreRefsCache.get(canonicalKey) || []) : [],
+    aliasKey ? (relayMirrorCoreRefsCache.get(aliasKey) || []) : []
+  );
+
+  if (canonicalKey && relayMirrorCoreRefs.has(canonicalKey)) {
+    const cached = relayMirrorCoreRefs.get(canonicalKey) || [];
+    const merged = mergeCoreRefLists(cachedRefs, cached, normalizedFallback);
+    await updateRelayMirrorCoreRefs(canonicalKey, merged, {
+      publicIdentifier,
+      updateAlias: true
+    });
+    return merged;
+  }
   if (relayKey && relayMirrorCoreRefs.has(relayKey)) {
     const cached = relayMirrorCoreRefs.get(relayKey) || [];
     const merged = mergeCoreRefLists(cachedRefs, cached, normalizedFallback);
-    updateRelayMirrorCoreRefs(relayKey, merged);
+    await updateRelayMirrorCoreRefs(relayKey, merged, {
+      publicIdentifier,
+      updateAlias: true
+    });
     return merged;
   }
 
@@ -289,7 +395,10 @@ export async function resolveRelayMirrorCoreRefs(relayKey, publicIdentifier = nu
   }
   const storedRefs = normalizeCoreRefList(profile?.core_refs || profile?.coreRefs);
   const merged = mergeCoreRefLists(cachedRefs, storedRefs, normalizedFallback);
-  updateRelayMirrorCoreRefs(relayKey, merged);
+  await updateRelayMirrorCoreRefs(relayKey || canonicalKey || aliasKey, merged, {
+    publicIdentifier,
+    updateAlias: true
+  });
   return merged;
 }
 

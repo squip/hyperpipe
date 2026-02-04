@@ -131,6 +131,7 @@ export class RelayManager {
       this.bootstrap = bootstrap;
       this.keyPair = options?.keyPair || null;
       this.expectedWriterKey = options?.expectedWriterKey || null;
+      this.fastForward = options?.fastForward || null;
       this.corestore = options?.corestore || null;
       this.store = null;  // Initialize in the initialize method
       this.relay = null;
@@ -191,6 +192,7 @@ export class RelayManager {
         }
 
         this.relay = new NostrRelay(this.store, this.bootstrap, {
+          ...(this.fastForward ? { fastForward: this.fastForward } : {}),
           apply: async (batch, view, base) => {
             const kvOps = []
             const eventOps = []

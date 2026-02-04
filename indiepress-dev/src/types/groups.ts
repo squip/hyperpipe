@@ -47,6 +47,12 @@ export type TGroupInvite = {
   writerCoreHex?: string | null
   autobaseLocal?: string | null
   writerSecret?: string | null
+  fastForward?: {
+    key?: string | null
+    length?: number | null
+    signedLength?: number | null
+    timeoutMs?: number | null
+  } | null
   blindPeer?: {
     publicKey?: string | null
     encryptionKey?: string | null
