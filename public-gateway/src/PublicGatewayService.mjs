@@ -779,10 +779,12 @@ class PublicGatewayService {
   #buildMirrorMetadataPayload(record, relayKey) {
     const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
     const cores = Array.isArray(record?.relayCores) ? record.relayCores : [];
+    const fastForward = record?.metadata?.fastForward || record?.metadata?.fast_forward || null;
     return {
       relayKey,
       publicIdentifier: record?.metadata?.identifier || relayKey,
       cores,
+      fastForward,
       blindPeer: blindPeerInfo && blindPeerInfo.enabled
         ? {
             publicKey: blindPeerInfo.publicKey || null,

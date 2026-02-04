@@ -2247,6 +2247,7 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
         }
 
         const storedCoreRefs = normalizeCoreRefs(profile.core_refs || profile.coreRefs);
+        const storedFastForward = profile.fast_forward || profile.fastForward || null;
         let mergedCoreRefs = storedCoreRefs;
         if (typeof global.resolveRelayMirrorCoreRefs === 'function') {
             mergedCoreRefs = await global.resolveRelayMirrorCoreRefs(
@@ -2346,6 +2347,7 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
             expectedWriterKey: storedExpectedWriter,
             blindPeer: storedBlindPeer,
             coreRefs: mergedCoreRefs,
+            fastForward: storedFastForward,
             useSharedCorestore: !prefersLocalCorestore && !!relayCorestore,
             corestore: relayCorestore
         });

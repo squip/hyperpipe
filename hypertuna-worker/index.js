@@ -2101,6 +2101,7 @@ async function applyMirrorMetadataToProfile({
   const mergedFingerprint = coreRefsFingerprint(mergedCoreRefs)
   const existingFingerprint = coreRefsFingerprint(existingCoreRefs)
   const nextBlindPeer = sanitizeBlindPeerMeta(mirrorData.blindPeer)
+  const nextFastForward = mirrorData.fastForward || mirrorData.fast_forward || null
   const updates = {}
   let coreRefsChanged = false
   let blindPeerChanged = false
@@ -2116,6 +2117,14 @@ async function applyMirrorMetadataToProfile({
   if ((mergedFingerprint && mergedFingerprint !== existingFingerprint) || needsNormalization) {
     updates.core_refs = mergedCoreRefs
     coreRefsChanged = true
+  }
+
+  if (nextFastForward && typeof nextFastForward === 'object') {
+    updates.fast_forward = nextFastForward
+  }
+
+  if (nextFastForward && typeof nextFastForward === 'object') {
+    updates.fast_forward = nextFastForward
   }
 
   if (nextBlindPeer?.publicKey) {
