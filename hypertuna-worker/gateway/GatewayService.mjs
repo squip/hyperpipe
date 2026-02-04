@@ -1969,6 +1969,10 @@ export class GatewayService extends EventEmitter {
         gatewayPath: gatewayPath || null,
         relayUrl: relayUrl || null
       };
+      const fastForward = targetResult?.fastForward || metadata?.fastForward || null;
+      if (fastForward) {
+        poolMetadata.fastForward = fastForward;
+      }
       const aliasSet = new Set();
       if (poolPublicIdentifier) aliasSet.add(poolPublicIdentifier);
       if (gatewayPath) aliasSet.add(gatewayPath);

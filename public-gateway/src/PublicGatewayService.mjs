@@ -810,10 +810,12 @@ class PublicGatewayService {
     const metadata = pool?.metadata && typeof pool.metadata === 'object' ? pool.metadata : null;
     const publicIdentifier = pool?.publicIdentifier || metadata?.identifier || relayKey;
     const relayUrl = pool?.relayUrl || metadata?.relayUrl || metadata?.connectionUrl || null;
+    const fastForward = metadata?.fastForward || metadata?.fast_forward || null;
     return {
       relayKey,
       publicIdentifier: publicIdentifier || relayKey,
       cores: relayCores,
+      fastForward,
       relayUrl,
       blindPeer: blindPeerInfo && blindPeerInfo.enabled
         ? {
@@ -4088,6 +4090,8 @@ class PublicGatewayService {
         return res.status(404).json({ error: 'relay-not-found' });
       }
       const { relayKey, record, pool } = resolved;
+      const relayKeyType = this.#isHexRelayKey(relayKey) ? 'hex' : 'alias';
+      const identifierType = this.#isHexRelayKey(identifier) ? 'hex' : 'alias';
       const isAllowed = record ? this.#isOpenJoinAllowed(record) : this.#isOpenJoinPoolAllowed(pool);
       if (!isAllowed) {
         return res.status(403).json({ error: 'relay-not-open' });

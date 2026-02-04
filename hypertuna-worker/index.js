@@ -889,6 +889,9 @@ async function ensureOpenJoinWriterPool({
   const canonicalPublicIdentifier =
     profile?.public_identifier || profile?.publicIdentifier || normalizedPublicIdentifier || null
   const poolKey = canonicalRelayKey || canonicalPublicIdentifier || requestIdentifier
+  const fastForward = canonicalRelayKey
+    ? buildFastForwardCheckpoint(canonicalRelayKey)
+    : (normalizedRelayKey ? buildFastForwardCheckpoint(normalizedRelayKey) : null)
 
   console.info('[Worker] Open join pool resolved', {
     requestIdentifier,
@@ -914,7 +917,8 @@ async function ensureOpenJoinWriterPool({
     return {
       targetSize: resolvedTarget,
       relayKey: canonicalRelayKey || normalizedRelayKey || null,
-      publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || null
+      publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || null,
+      fastForward
     }
   }
   if (!relayServer?.provisionWriterForInvitee) return null
@@ -985,7 +989,8 @@ async function ensureOpenJoinWriterPool({
         updatedAt: cached.updatedAt || null,
         targetSize: resolvedTarget,
         relayKey: canonicalRelayKey || normalizedRelayKey || null,
-        publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || null
+        publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || null,
+        fastForward
       }
     }
 
@@ -1026,7 +1031,8 @@ async function ensureOpenJoinWriterPool({
         updatedAt: cached.updatedAt || null,
         targetSize: resolvedTarget,
         relayKey: canonicalRelayKey || normalizedRelayKey || null,
-        publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || null
+        publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || null,
+        fastForward
       }
     }
 
@@ -1045,7 +1051,8 @@ async function ensureOpenJoinWriterPool({
       updatedAt,
       targetSize: resolvedTarget,
       relayKey: canonicalRelayKey || normalizedRelayKey || null,
-      publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || null
+      publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || null,
+      fastForward
     }
   } catch (error) {
     console.warn('[Worker] Failed to provision open-join writer pool', {
