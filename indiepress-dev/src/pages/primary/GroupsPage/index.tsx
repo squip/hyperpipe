@@ -14,9 +14,9 @@ import GroupCreateDialog from '@/components/GroupCreateDialog'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { SimpleUserAvatar } from '@/components/UserAvatar'
-import { SimpleUsername } from '@/components/Username'
-import { HoverCard, HoverCardContent, HoverCardTrigger } from '@/components/ui/hover-card'
+import { FormattedTimestamp } from '@/components/FormattedTimestamp'
 import { useNostr } from '@/providers/NostrProvider'
+import { useFetchProfile } from '@/hooks'
 import { toast } from 'sonner'
 
 type TTab = 'discover' | 'my' | 'invites'
@@ -165,6 +165,13 @@ function InviteMembersBadge({ memberPubkeys }: { memberPubkeys?: string[] }) {
       <div className="text-xs font-medium whitespace-nowrap truncate">{label}</div>
     </div>
   )
+}
+
+function InviteSenderLabel({ userId }: { userId: string }) {
+  const { profile } = useFetchProfile(userId)
+  const fallback = `${userId.slice(0, 8)}...${userId.slice(-4)}`
+  const label = profile?.shortName || profile?.metadata?.name || fallback
+  return <span className="text-xs font-medium truncate max-w-[220px]">{label}</span>
 }
 
 const GroupsPage = forwardRef<TPageRef>((_, ref) => {
@@ -359,59 +366,58 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         </div>
         {invitesError && <div className="text-sm text-red-500">{invitesError}</div>}
         {invites.map((inv) => (
-          <Card key={inv.event.id} className="overflow-hidden">
-            <CardContent className="p-4 space-y-3">
-              <div className="flex items-start justify-between gap-3">
-                <div className="flex items-start gap-3 min-w-0">
-                  <Avatar className="h-10 w-10 shrink-0">
-                    {inv.groupPicture && <AvatarImage src={inv.groupPicture} alt={inv.groupName || inv.name || inv.groupId} />}
-                    <AvatarFallback className="text-xs font-semibold">
-                      {(inv.groupName || inv.name || inv.groupId || 'GR').slice(0, 2).toUpperCase()}
-                    </AvatarFallback>
-                  </Avatar>
-                  <div className="min-w-0">
-                    <div className="font-semibold truncate max-w-[260px]">
-                      {inv.groupName || inv.name || inv.groupId}
-                    </div>
-                    {inv.relay && (
-                      <div className="text-xs text-muted-foreground truncate max-w-[260px]">
-                        {inv.relay}
+          <div key={inv.event.id} className="space-y-1">
+            <div className="flex items-center justify-between gap-3 rounded-md bg-muted/70 px-2 py-1">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-xs text-muted-foreground shrink-0">{t('from')}</span>
+                <div className="h-7 w-7 rounded-full overflow-hidden shrink-0">
+                  <SimpleUserAvatar userId={inv.event.pubkey} size="small" className="h-7 w-7 rounded-full" />
+                </div>
+                <InviteSenderLabel userId={inv.event.pubkey} />
+              </div>
+              <FormattedTimestamp timestamp={inv.event.created_at} className="text-xs text-muted-foreground shrink-0" />
+            </div>
+            <Card className="overflow-hidden">
+              <CardContent className="p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-3 min-w-0">
+                    <Avatar className="h-10 w-10 shrink-0">
+                      {inv.groupPicture && <AvatarImage src={inv.groupPicture} alt={inv.groupName || inv.name || inv.groupId} />}
+                      <AvatarFallback className="text-xs font-semibold">
+                        {(inv.groupName || inv.name || inv.groupId || 'GR').slice(0, 2).toUpperCase()}
+                      </AvatarFallback>
+                    </Avatar>
+                    <div className="min-w-0">
+                      <div className="font-semibold truncate max-w-[260px]">
+                        {inv.groupName || inv.name || inv.groupId}
                       </div>
-                    )}
+                      <div className="mt-1">
+                        <InviteMembersBadge memberPubkeys={inv.authorizedMemberPubkeys} />
+                      </div>
+                      {inv.relay && (
+                        <div className="text-xs text-muted-foreground truncate max-w-[260px] mt-1">
+                          {inv.relay}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-end gap-2 ml-auto shrink-0 flex-wrap">
+                    <Button variant="outline" size="sm" onClick={() => handleDismissInvite(inv)}>
+                      <X className="w-4 h-4 mr-1" />
+                      {t('Dismiss')}
+                    </Button>
+                    <Button
+                      size="sm"
+                      disabled={joiningInviteId === inv.event.id}
+                      onClick={() => handleUseInvite(inv)}
+                    >
+                      {joiningInviteId === inv.event.id ? t('Joining…') : t('Use invite')}
+                    </Button>
                   </div>
                 </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  <span className="text-xs text-muted-foreground">{t('from')}</span>
-                  <HoverCard>
-                    <HoverCardTrigger asChild>
-                      <div className="h-7 w-7 rounded-full overflow-hidden cursor-default">
-                        <SimpleUserAvatar userId={inv.event.pubkey} size="small" className="h-7 w-7 rounded-full" />
-                      </div>
-                    </HoverCardTrigger>
-                    <HoverCardContent className="w-auto px-3 py-2">
-                      <SimpleUsername userId={inv.event.pubkey} />
-                    </HoverCardContent>
-                  </HoverCard>
-                </div>
-              </div>
-              <div className="flex items-center justify-between gap-2">
-                <InviteMembersBadge memberPubkeys={inv.authorizedMemberPubkeys} />
-                <div className="flex items-center gap-2 ml-auto">
-                  <Button variant="outline" size="sm" onClick={() => handleDismissInvite(inv)}>
-                    <X className="w-4 h-4 mr-1" />
-                    {t('Dismiss')}
-                  </Button>
-                  <Button
-                    size="sm"
-                    disabled={joiningInviteId === inv.event.id}
-                    onClick={() => handleUseInvite(inv)}
-                  >
-                    {joiningInviteId === inv.event.id ? t('Joining…') : t('Use invite')}
-                  </Button>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
+              </CardContent>
+            </Card>
+          </div>
         ))}
       </div>
     )
