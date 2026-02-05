@@ -80,7 +80,7 @@ const DEFAULT_CONFIG = {
   },
   openJoin: {
     enabled: process.env.GATEWAY_OPEN_JOIN_ENABLED !== 'false',
-    poolEntryTtlMs: Number(process.env.GATEWAY_OPEN_JOIN_POOL_TTL_MS) || (6 * 60 * 60 * 1000),
+    poolEntryTtlMs: Number(process.env.GATEWAY_OPEN_JOIN_POOL_TTL_MS) || (30 * 24 * 60 * 60 * 1000),
     challengeTtlMs: Number(process.env.GATEWAY_OPEN_JOIN_CHALLENGE_TTL_MS) || (2 * 60 * 1000),
     authWindowSeconds: Number(process.env.GATEWAY_OPEN_JOIN_AUTH_WINDOW || 300),
     maxPoolSize: Number(process.env.GATEWAY_OPEN_JOIN_MAX_POOL || 100)
@@ -157,6 +157,11 @@ function loadConfig(overrides = {}) {
 
   merged.relay = normalizeRelaySettings(merged.relay);
   merged.blindPeer = normalizeBlindPeerSettings(merged.blindPeer);
+
+  if (Number.isFinite(merged.openJoin?.poolEntryTtlMs)) {
+    const derivedPoolTtlSeconds = Math.ceil(merged.openJoin.poolEntryTtlMs / 1000);
+    merged.registration.openJoinPoolTtlSeconds = derivedPoolTtlSeconds;
+  }
 
   return merged;
 }

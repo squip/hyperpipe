@@ -4044,13 +4044,18 @@ class PublicGatewayService {
         || pool?.metadata?.identifier
         || relayKey;
       const { challenge, expiresAt } = this.#issueOpenJoinChallenge({ relayKey, publicIdentifier, purpose });
+      const poolTtlSeconds = Number.isFinite(this.registrationStore?.openJoinPoolTtlSeconds)
+        ? this.registrationStore.openJoinPoolTtlSeconds
+        : (Number.isFinite(this.registrationStore?.ttlSeconds) ? this.registrationStore.ttlSeconds : null);
       this.logger?.info?.('[PublicGateway] Open join challenge issued', {
         relayKey,
         publicIdentifier,
         expiresAt,
         source: record ? 'registration' : 'pool',
         purpose,
-        challengePrefix: challenge ? challenge.slice(0, 12) : null
+        challengePrefix: challenge ? challenge.slice(0, 12) : null,
+        poolTtlSeconds,
+        poolEntryTtlMs: this.openJoinConfig?.poolEntryTtlMs ?? null
       });
       return res.json({
         relayKey,
