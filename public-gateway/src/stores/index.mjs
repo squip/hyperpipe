@@ -7,6 +7,9 @@ async function createRegistrationStore(config = {}, logger) {
       const store = new RedisRegistrationStore({
         url: config.redisUrl,
         ttlSeconds: config.cacheTtlSeconds,
+        relayTtlSeconds: config.relayTtlSeconds,
+        aliasTtlSeconds: config.aliasTtlSeconds,
+        tokenTtlSeconds: config.tokenTtlSeconds,
         mirrorTtlSeconds: config.mirrorTtlSeconds,
         openJoinPoolTtlSeconds: config.openJoinPoolTtlSeconds,
         prefix: config.redisPrefix,
@@ -22,6 +25,9 @@ async function createRegistrationStore(config = {}, logger) {
 
   return new MemoryRegistrationStore({
     ttlSeconds: config?.cacheTtlSeconds,
+    relayTtlSeconds: config?.relayTtlSeconds,
+    aliasTtlSeconds: config?.aliasTtlSeconds,
+    tokenTtlSeconds: config?.tokenTtlSeconds,
     mirrorTtlSeconds: config?.mirrorTtlSeconds,
     openJoinPoolTtlSeconds: config?.openJoinPoolTtlSeconds
   });

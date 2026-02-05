@@ -6,6 +6,9 @@ class RedisRegistrationStore {
     ttlSeconds = 300,
     mirrorTtlSeconds = null,
     openJoinPoolTtlSeconds = null,
+    relayTtlSeconds = null,
+    aliasTtlSeconds = null,
+    tokenTtlSeconds = null,
     prefix = 'gateway:registrations:',
     logger
   } = {}) {
@@ -14,6 +17,9 @@ class RedisRegistrationStore {
     this.ttlSeconds = ttlSeconds;
     this.mirrorTtlSeconds = Number.isFinite(mirrorTtlSeconds) ? mirrorTtlSeconds : null;
     this.openJoinPoolTtlSeconds = Number.isFinite(openJoinPoolTtlSeconds) ? openJoinPoolTtlSeconds : null;
+    this.relayTtlSeconds = Number.isFinite(relayTtlSeconds) ? relayTtlSeconds : null;
+    this.aliasTtlSeconds = Number.isFinite(aliasTtlSeconds) ? aliasTtlSeconds : null;
+    this.tokenTtlSeconds = Number.isFinite(tokenTtlSeconds) ? tokenTtlSeconds : null;
     this.prefix = prefix.endsWith(':') ? prefix : `${prefix}:`;
     this.tokenPrefix = `${this.prefix}tokens:`;
     this.openJoinPrefix = `${this.prefix}open-join:`;
@@ -71,7 +77,14 @@ class RedisRegistrationStore {
     await this.#ensureConnected();
     const data = JSON.stringify({ ...payload, relayKey, updatedAt: Date.now() });
     const key = this.#key(relayKey);
-    await this.client.set(key, data, { EX: this.ttlSeconds });
+    const ttlSeconds = Number.isFinite(this.relayTtlSeconds)
+      ? this.relayTtlSeconds
+      : this.ttlSeconds;
+    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+      await this.client.set(key, data, { EX: ttlSeconds });
+    } else {
+      await this.client.set(key, data);
+    }
   }
 
   async getRelay(relayKey) {
@@ -110,7 +123,14 @@ class RedisRegistrationStore {
       relayKey,
       recordedAt: Date.now()
     });
-    await this.client.set(this.#tokenKey(relayKey), payload, { EX: this.ttlSeconds });
+    const ttlSeconds = Number.isFinite(this.tokenTtlSeconds)
+      ? this.tokenTtlSeconds
+      : this.ttlSeconds;
+    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+      await this.client.set(this.#tokenKey(relayKey), payload, { EX: ttlSeconds });
+    } else {
+      await this.client.set(this.#tokenKey(relayKey), payload);
+    }
   }
 
   async getTokenMetadata(relayKey) {
@@ -286,7 +306,14 @@ class RedisRegistrationStore {
     await this.#ensureConnected();
     const alias = typeof identifier === 'string' ? identifier.trim() : null;
     if (!alias) return;
-    await this.client.set(this.#aliasKey(alias), relayKey, { EX: this.ttlSeconds });
+    const ttlSeconds = Number.isFinite(this.aliasTtlSeconds)
+      ? this.aliasTtlSeconds
+      : this.ttlSeconds;
+    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+      await this.client.set(this.#aliasKey(alias), relayKey, { EX: ttlSeconds });
+    } else {
+      await this.client.set(this.#aliasKey(alias), relayKey);
+    }
   }
 
   async resolveRelayAlias(identifier) {
@@ -304,6 +331,42 @@ class RedisRegistrationStore {
     const alias = typeof identifier === 'string' ? identifier.trim() : null;
     if (!alias) return;
     await this.client.del(this.#aliasKey(alias));
+  }
+
+  async listRelays() {
+    await this.#ensureConnected();
+    const relays = [];
+    const excludePrefixes = [
+      this.tokenPrefix,
+      this.openJoinPrefix,
+      this.openJoinAliasPrefix,
+      this.mirrorPrefix,
+      this.aliasPrefix
+    ];
+    let cursor = '0';
+    do {
+      const result = await this.client.scan(cursor, { MATCH: `${this.prefix}*`, COUNT: 100 });
+      cursor = result.cursor;
+      const keys = result.keys || [];
+      const relayKeys = keys.filter((key) => !excludePrefixes.some((prefix) => key.startsWith(prefix)));
+      if (relayKeys.length === 0) continue;
+      const values = await this.client.mGet(relayKeys);
+      for (let i = 0; i < relayKeys.length; i += 1) {
+        const value = values[i];
+        if (!value) continue;
+        try {
+          const record = JSON.parse(value);
+          const relayKey = relayKeys[i].slice(this.prefix.length);
+          relays.push({ relayKey, record });
+        } catch (error) {
+          this.logger?.warn?.('Failed to parse redis relay record during listRelays', {
+            relayKey: relayKeys[i],
+            error: error?.message || error
+          });
+        }
+      }
+    } while (cursor !== '0');
+    return relays;
   }
 }
 

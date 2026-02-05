@@ -4,6 +4,9 @@ class MemoryRegistrationStore {
       ? options
       : { ttlSeconds: options };
     this.ttlSeconds = Number.isFinite(resolved.ttlSeconds) ? resolved.ttlSeconds : 300;
+    this.relayTtlSeconds = Number.isFinite(resolved.relayTtlSeconds) ? resolved.relayTtlSeconds : null;
+    this.aliasTtlSeconds = Number.isFinite(resolved.aliasTtlSeconds) ? resolved.aliasTtlSeconds : null;
+    this.tokenTtlSeconds = Number.isFinite(resolved.tokenTtlSeconds) ? resolved.tokenTtlSeconds : null;
     this.mirrorTtlSeconds = Number.isFinite(resolved.mirrorTtlSeconds) ? resolved.mirrorTtlSeconds : null;
     this.openJoinPoolTtlSeconds = Number.isFinite(resolved.openJoinPoolTtlSeconds)
       ? resolved.openJoinPoolTtlSeconds
@@ -19,9 +22,14 @@ class MemoryRegistrationStore {
   }
 
   async upsertRelay(relayKey, payload) {
+    const ttlSeconds = Number.isFinite(this.relayTtlSeconds)
+      ? this.relayTtlSeconds
+      : this.ttlSeconds;
     const record = {
       payload,
-      expiresAt: Date.now() + this.ttlSeconds * 1000
+      expiresAt: Number.isFinite(ttlSeconds) && ttlSeconds > 0
+        ? Date.now() + ttlSeconds * 1000
+        : null
     };
     this.items.set(relayKey, record);
   }
@@ -29,7 +37,7 @@ class MemoryRegistrationStore {
   async getRelay(relayKey) {
     const record = this.items.get(relayKey);
     if (!record) return null;
-    if (record.expiresAt < Date.now()) {
+    if (record.expiresAt && record.expiresAt < Date.now()) {
       this.items.delete(relayKey);
       return null;
     }
@@ -47,7 +55,7 @@ class MemoryRegistrationStore {
   pruneExpired() {
     const now = Date.now();
     for (const [key, record] of this.items.entries()) {
-      if (record.expiresAt < now) {
+      if (record.expiresAt && record.expiresAt < now) {
         this.items.delete(key);
       }
     }
@@ -110,9 +118,15 @@ class MemoryRegistrationStore {
   }
 
   async storeTokenMetadata(relayKey, metadata = {}) {
+    const ttlSeconds = Number.isFinite(this.tokenTtlSeconds)
+      ? this.tokenTtlSeconds
+      : this.ttlSeconds;
     const record = {
       ...metadata,
-      recordedAt: Date.now()
+      recordedAt: Date.now(),
+      expiresAt: Number.isFinite(ttlSeconds) && ttlSeconds > 0
+        ? Date.now() + ttlSeconds * 1000
+        : null
     };
     this.tokenMetadata.set(relayKey, record);
   }
@@ -265,9 +279,14 @@ class MemoryRegistrationStore {
     if (!identifier || !relayKey) return;
     const alias = typeof identifier === 'string' ? identifier.trim() : null;
     if (!alias) return;
+    const ttlSeconds = Number.isFinite(this.aliasTtlSeconds)
+      ? this.aliasTtlSeconds
+      : this.ttlSeconds;
     const record = {
       relayKey,
-      expiresAt: Date.now() + this.ttlSeconds * 1000
+      expiresAt: Number.isFinite(ttlSeconds) && ttlSeconds > 0
+        ? Date.now() + ttlSeconds * 1000
+        : null
     };
     this.relayAliases.set(alias, record);
     const existing = this.relayAliasIndex.get(relayKey) || new Set();
@@ -281,7 +300,7 @@ class MemoryRegistrationStore {
     if (!alias) return null;
     const record = this.relayAliases.get(alias);
     if (!record) return null;
-    if (record.expiresAt < Date.now()) {
+    if (record.expiresAt && record.expiresAt < Date.now()) {
       this.relayAliases.delete(alias);
       const aliasSet = this.relayAliasIndex.get(record.relayKey);
       if (aliasSet) {
@@ -302,6 +321,16 @@ class MemoryRegistrationStore {
       this.relayAliases.delete(alias);
     }
     this.relayAliasIndex.delete(relayKey);
+  }
+
+  async listRelays() {
+    const relays = [];
+    const now = Date.now();
+    for (const [relayKey, record] of this.items.entries()) {
+      if (record?.expiresAt && record.expiresAt < now) continue;
+      relays.push({ relayKey, record: record?.payload || null });
+    }
+    return relays;
   }
 }
 

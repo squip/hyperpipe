@@ -214,6 +214,23 @@ class PublicGatewayService {
   async init() {
     this.#setupHttpServer();
     await this.connectionPool.initialize();
+    if (Number.isFinite(this.config?.registration?.relayGcAfterMs) && this.config.registration.relayGcAfterMs > 0) {
+      this.logger?.info?.('[PublicGateway] Relay GC policy enabled', {
+        relayGcAfterMs: this.config.registration.relayGcAfterMs,
+        relayGcAfterDays: Math.round(this.config.registration.relayGcAfterMs / (24 * 60 * 60 * 1000)),
+        ttlDisabled: {
+          relay: this.config?.registration?.relayTtlSeconds === 0,
+          mirror: this.config?.registration?.mirrorTtlSeconds === 0,
+          openJoinPool: this.config?.registration?.openJoinPoolTtlSeconds === 0,
+          alias: this.config?.registration?.aliasTtlSeconds === 0
+        },
+        blindPeerStaleCoreTtlMs: this.config?.blindPeer?.staleCoreTtlMs ?? null
+      });
+    } else {
+      this.logger?.info?.('[PublicGateway] Relay GC policy disabled', {
+        relayGcAfterMs: this.config?.registration?.relayGcAfterMs ?? null
+      });
+    }
     if (this.featureFlags.tokenEnforcementEnabled && this.sharedSecret) {
       this.tokenService = new RelayTokenService({
         registrationStore: this.registrationStore,
@@ -270,6 +287,13 @@ class PublicGatewayService {
 
     this.healthInterval = setInterval(() => this.#collectMetrics(), 10000).unref();
     this.pruneInterval = setInterval(() => this.registrationStore.pruneExpired?.(), 60000).unref();
+    this.relayGcInterval = setInterval(() => {
+      this.#runRelayGarbageCollection().catch((error) => {
+        this.logger?.warn?.('[PublicGateway] Relay GC failed', {
+          error: error?.message || error
+        });
+      });
+    }, 6 * 60 * 60 * 1000).unref();
 
     await this.blindPeerService?.start();
   }
@@ -283,6 +307,11 @@ class PublicGatewayService {
     if (this.pruneInterval) {
       clearInterval(this.pruneInterval);
       this.pruneInterval = null;
+    }
+
+    if (this.relayGcInterval) {
+      clearInterval(this.relayGcInterval);
+      this.relayGcInterval = null;
     }
 
     for (const timer of this.eventCheckTimers.values()) {
@@ -554,6 +583,65 @@ class PublicGatewayService {
       maxAppendCores: Number.isFinite(maxAppendCores) && maxAppendCores > 0 ? Math.trunc(maxAppendCores) : 64,
       maxRelayCores: Number.isFinite(maxRelayCores) && maxRelayCores > 0 ? Math.trunc(maxRelayCores) : 1024
     };
+  }
+
+  #resolveRelayPeerCount(record) {
+    if (!record || typeof record !== 'object') return 0;
+    if (Number.isFinite(record.peerCount)) return Math.max(Math.trunc(record.peerCount), 0);
+    const peers = this.#getPeersFromRegistration(record);
+    return Array.isArray(peers) ? peers.length : 0;
+  }
+
+  #stampRelayActivity(record, peerCountOverride = null) {
+    const now = Date.now();
+    const peerCount = Number.isFinite(peerCountOverride)
+      ? Math.max(Math.trunc(peerCountOverride), 0)
+      : this.#resolveRelayPeerCount(record);
+    const next = {
+      ...record,
+      firstSeenAt: record?.firstSeenAt || record?.registeredAt || now,
+      lastActiveAt: now,
+      peerCount
+    };
+    if (peerCount > 0) {
+      next.lastPeerSeenAt = now;
+    }
+    return next;
+  }
+
+  async #runRelayGarbageCollection() {
+    const gcAfterMs = Number(this.config?.registration?.relayGcAfterMs);
+    if (!Number.isFinite(gcAfterMs) || gcAfterMs <= 0) return;
+    if (!this.registrationStore?.listRelays) return;
+    const now = Date.now();
+    const relays = await this.registrationStore.listRelays();
+    if (!Array.isArray(relays) || relays.length === 0) return;
+    let removed = 0;
+    for (const entry of relays) {
+      const relayKey = entry?.relayKey;
+      const record = entry?.record || null;
+      if (!relayKey || !record) continue;
+      if (relayKey === this.internalRelayKey) continue;
+      const peerCount = this.#resolveRelayPeerCount(record);
+      if (peerCount > 0) continue;
+      const lastSeen = record.lastPeerSeenAt
+        || record.firstSeenAt
+        || record.registeredAt
+        || record.updatedAt
+        || record?.metadata?.metadataUpdatedAt
+        || null;
+      if (!Number.isFinite(lastSeen) || (now - lastSeen) <= gcAfterMs) continue;
+      await this.registrationStore.removeRelay(relayKey);
+      await this.registrationStore.clearMirrorMetadata?.(relayKey);
+      await this.registrationStore.clearOpenJoinPool?.(relayKey);
+      removed += 1;
+    }
+    if (removed > 0) {
+      this.logger?.info?.('[PublicGateway] Relay GC completed', {
+        removed,
+        gcAfterMs
+      });
+    }
   }
 
   #isHexRelayKey(value) {
@@ -1226,7 +1314,8 @@ class PublicGatewayService {
       }
     };
 
-    await this.registrationStore.upsertRelay(this.internalRelayKey, registration);
+    const stamped = this.#stampRelayActivity(registration, 0);
+    await this.registrationStore.upsertRelay(this.internalRelayKey, stamped);
   }
 
   #computeWsBase(baseUrl) {
@@ -2579,10 +2668,11 @@ class PublicGatewayService {
           metadata,
           updatedAt: Date.now()
         };
+        const stamped = this.#stampRelayActivity(record, updatedPeers.length);
 
-        await this.registrationStore.upsertRelay(relayKey, record);
-        await this.#storeMirrorMetadataPayload(relayKey, this.#buildMirrorMetadataPayload(record, relayKey));
-        this.#syncSessionsWithRelay(relayKey, record);
+        await this.registrationStore.upsertRelay(relayKey, stamped);
+        await this.#storeMirrorMetadataPayload(relayKey, this.#buildMirrorMetadataPayload(stamped, relayKey));
+        this.#syncSessionsWithRelay(relayKey, stamped);
 
         if (!updatedPeers.length) {
           this.relayPeerIndex.delete(relayKey);
@@ -3481,15 +3571,16 @@ class PublicGatewayService {
     }
 
     record.blindPeer = this.#getBlindPeerSummary();
-    await this.registrationStore.upsertRelay(relayKey, record);
-    await this.#storeMirrorMetadataPayload(relayKey, this.#buildMirrorMetadataPayload(record, relayKey));
-    this.#storeRelayAliases(relayKey, record).catch((error) => {
+    const stamped = this.#stampRelayActivity(record, this.#resolveRelayPeerCount(record));
+    await this.registrationStore.upsertRelay(relayKey, stamped);
+    await this.#storeMirrorMetadataPayload(relayKey, this.#buildMirrorMetadataPayload(stamped, relayKey));
+    this.#storeRelayAliases(relayKey, stamped).catch((error) => {
       this.logger?.warn?.('[PublicGateway] Failed to store relay aliases', {
         relayKey,
         error: error?.message || error
       });
     });
-    this.#syncSessionsWithRelay(relayKey, record);
+    this.#syncSessionsWithRelay(relayKey, stamped);
     this.#markPeerReachable(peerKey, { relayKey, timestamp: now });
     const rawPeerKey = this.#getPeerRawKey(peerKey);
     const trustedInput = rawPeerKey || peerKey;
@@ -3581,12 +3672,13 @@ class PublicGatewayService {
         });
         upsertPayload.relayCores = mergeResult.merged;
       }
-      await this.registrationStore.upsertRelay(registration.relayKey, upsertPayload);
+      const stamped = this.#stampRelayActivity(upsertPayload, this.#resolveRelayPeerCount(upsertPayload));
+      await this.registrationStore.upsertRelay(registration.relayKey, stamped);
       await this.#storeMirrorMetadataPayload(
         registration.relayKey,
-        this.#buildMirrorMetadataPayload(upsertPayload, registration.relayKey)
+        this.#buildMirrorMetadataPayload(stamped, registration.relayKey)
       );
-      this.#storeRelayAliases(registration.relayKey, upsertPayload).catch((error) => {
+      this.#storeRelayAliases(registration.relayKey, stamped).catch((error) => {
         this.logger?.warn?.({
           relayKey: registration.relayKey,
           error: error?.message || error

@@ -25,6 +25,7 @@ const DEFAULT_CONFIG = {
     cacheTtlSeconds: Number(process.env.GATEWAY_REGISTRATION_TTL || 1800),
     mirrorTtlSeconds: Number(process.env.GATEWAY_MIRROR_METADATA_TTL || 86400),
     openJoinPoolTtlSeconds: Number(process.env.GATEWAY_OPEN_JOIN_POOL_TTL || 21600),
+    relayGcAfterMs: Number(process.env.GATEWAY_RELAY_GC_AFTER_MS || (90 * 24 * 60 * 60 * 1000)),
     defaultTokenTtl: Number(process.env.GATEWAY_DEFAULT_TOKEN_TTL || 3600),
     tokenRefreshWindowSeconds: Number(process.env.GATEWAY_TOKEN_REFRESH_WINDOW || 300)
   },
@@ -158,9 +159,28 @@ function loadConfig(overrides = {}) {
   merged.relay = normalizeRelaySettings(merged.relay);
   merged.blindPeer = normalizeBlindPeerSettings(merged.blindPeer);
 
+  if (!Number.isFinite(merged.registration.tokenTtlSeconds)) {
+    merged.registration.tokenTtlSeconds = merged.registration.defaultTokenTtl;
+  }
+
   if (Number.isFinite(merged.openJoin?.poolEntryTtlMs)) {
     const derivedPoolTtlSeconds = Math.ceil(merged.openJoin.poolEntryTtlMs / 1000);
     merged.registration.openJoinPoolTtlSeconds = derivedPoolTtlSeconds;
+  }
+
+  if (Number.isFinite(merged.registration?.relayGcAfterMs) && merged.registration.relayGcAfterMs > 0) {
+    merged.registration.cacheTtlSeconds = 0;
+    merged.registration.mirrorTtlSeconds = 0;
+    merged.registration.openJoinPoolTtlSeconds = 0;
+    merged.registration.relayTtlSeconds = 0;
+    merged.registration.aliasTtlSeconds = 0;
+  }
+
+  if (Number.isFinite(merged.registration?.relayGcAfterMs)
+    && merged.registration.relayGcAfterMs > 0
+    && Number.isFinite(merged.blindPeer?.staleCoreTtlMs)
+    && merged.blindPeer.staleCoreTtlMs < merged.registration.relayGcAfterMs) {
+    merged.blindPeer.staleCoreTtlMs = merged.registration.relayGcAfterMs;
   }
 
   return merged;

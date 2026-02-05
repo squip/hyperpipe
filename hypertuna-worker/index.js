@@ -122,15 +122,36 @@ let mirrorMetadataRefreshInFlight = null
 const openJoinContexts = new Map()
 const pendingOpenJoinReauth = new Map()
 const OPEN_JOIN_REAUTH_MIN_INTERVAL_MS = 30000
-const OPEN_JOIN_POOL_TARGET_SIZE = 8
+const OPEN_JOIN_POOL_TARGET_SIZE = 10
 const OPEN_JOIN_POOL_ENTRY_TTL_MS = 6 * 60 * 60 * 1000
 const OPEN_JOIN_POOL_REFRESH_MS = 30 * 60 * 1000
-const CLOSED_JOIN_POOL_TARGET_SIZE = 8
-const CLOSED_JOIN_POOL_ENTRY_TTL_MS = 6 * 60 * 60 * 1000
+const CLOSED_JOIN_POOL_TARGET_SIZE = 10
+const DEFAULT_CLOSED_JOIN_POOL_ENTRY_TTL_MS = 90 * 24 * 60 * 60 * 1000
+let CLOSED_JOIN_POOL_ENTRY_TTL_MS = DEFAULT_CLOSED_JOIN_POOL_ENTRY_TTL_MS
 const CLOSED_JOIN_POOL_REFRESH_MS = 30 * 60 * 1000
 const openJoinWriterPoolCache = new Map()
 const openJoinWriterPoolLocks = new Set()
 const closedJoinWriterPoolLocks = new Set()
+
+function resolveClosedJoinPoolEntryTtlMs(config) {
+  const fromConfig =
+    config?.closedJoinPoolEntryTtlMs ??
+    config?.closed_join_pool_entry_ttl_ms ??
+    config?.closedJoin?.poolEntryTtlMs ??
+    config?.closed_join?.pool_entry_ttl_ms ??
+    null
+  const fromEnv = process.env.CLOSED_JOIN_POOL_TTL_MS || process.env.CLOSED_JOIN_POOL_ENTRY_TTL_MS || null
+  const parsedEnv = fromEnv ? Number(fromEnv) : null
+  const candidate = Number.isFinite(fromConfig) ? Number(fromConfig) : (Number.isFinite(parsedEnv) ? parsedEnv : null)
+  return Number.isFinite(candidate) && candidate > 0 ? candidate : DEFAULT_CLOSED_JOIN_POOL_ENTRY_TTL_MS
+}
+
+function applyClosedJoinPoolConfig(config) {
+  CLOSED_JOIN_POOL_ENTRY_TTL_MS = resolveClosedJoinPoolEntryTtlMs(config)
+  console.info('[Worker] Closed join pool TTL configured', {
+    closedJoinPoolEntryTtlMs: CLOSED_JOIN_POOL_ENTRY_TTL_MS
+  })
+}
 
 function getGatewayWebsocketProtocol(config) {
   return config?.proxy_websocket_protocol === 'ws' ? 'ws' : 'wss'
@@ -5198,6 +5219,8 @@ async function main() {
         config = await loadOrCreateConfig()
         expectedRelayCount = Array.isArray(config.relays) ? config.relays.length : 0
       }
+
+    applyClosedJoinPoolConfig(config)
 
     await initializeGatewayOptionsFromSettings()
 
