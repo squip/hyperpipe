@@ -1076,7 +1076,9 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       await sendInvites(groupId, selectedInvitees, effectiveGroupRelay, {
         isOpen: isOpenGroup,
         name: effectiveDetail?.metadata?.name,
-        about: effectiveDetail?.metadata?.about
+        about: effectiveDetail?.metadata?.about,
+        picture: effectiveDetail?.metadata?.picture,
+        authorizedMemberPubkeys: effectiveDetail?.members || []
       })
       toast.success(t('Invites sent'))
       setSelectedInvitees([])

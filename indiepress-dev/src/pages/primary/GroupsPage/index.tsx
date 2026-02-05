@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useTranslation } from 'react-i18next'
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
-import { Loader2, Users } from 'lucide-react'
+import { Loader2, Users, X } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { useSecondaryPage } from '@/PageManager'
 import { toGroup } from '@/lib/link'
@@ -14,6 +14,8 @@ import GroupCreateDialog from '@/components/GroupCreateDialog'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { SimpleUserAvatar } from '@/components/UserAvatar'
+import { SimpleUsername } from '@/components/Username'
+import { HoverCard, HoverCardContent, HoverCardTrigger } from '@/components/ui/hover-card'
 import { useNostr } from '@/providers/NostrProvider'
 import { toast } from 'sonner'
 
@@ -137,6 +139,34 @@ function GroupFacepile({ groupId, relay, show }: { groupId: string; relay?: stri
   )
 }
 
+function InviteMembersBadge({ memberPubkeys }: { memberPubkeys?: string[] }) {
+  const { t } = useTranslation()
+  const normalized = useMemo(
+    () =>
+      Array.from(
+        new Set((Array.isArray(memberPubkeys) ? memberPubkeys : []).map((pk) => String(pk || '').trim()).filter(Boolean))
+      ),
+    [memberPubkeys]
+  )
+
+  if (!normalized.length) return null
+  const preview = normalized.slice(0, 3)
+  const label = `${new Intl.NumberFormat(undefined, { notation: 'compact' }).format(normalized.length)} ${t('Members')}`
+
+  return (
+    <div className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-1">
+      <div className="flex -space-x-2">
+        {preview.map((pubkey) => (
+          <div key={pubkey} className="h-5 w-5 rounded-full ring-2 ring-background overflow-hidden bg-muted">
+            <SimpleUserAvatar userId={pubkey} size="small" className="h-full w-full rounded-full" />
+          </div>
+        ))}
+      </div>
+      <div className="text-xs font-medium whitespace-nowrap truncate">{label}</div>
+    </div>
+  )
+}
+
 const GroupsPage = forwardRef<TPageRef>((_, ref) => {
   const layoutRef = useRef<TPageRef>(null)
   useImperativeHandle(ref, () => layoutRef.current!)
@@ -147,6 +177,8 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     myGroupList,
     refreshDiscovery,
     refreshInvites,
+    dismissInvite,
+    markInviteAccepted,
     isLoadingDiscovery,
     discoveryError,
     invitesError,
@@ -298,6 +330,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         fastForward: inv.fastForward || undefined
       })
 
+      markInviteAccepted(inv.event.id, inv.groupId)
       push(toGroup(inv.groupId, relayUrl || inv.relay))
     } catch (err) {
       console.error('Failed to start join flow from invite', err)
@@ -305,6 +338,11 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     } finally {
       setJoiningInviteId(null)
     }
+  }
+
+  const handleDismissInvite = (inv: (typeof invites)[number]) => {
+    if (!inv?.event?.id) return
+    dismissInvite(inv.event.id)
   }
 
   const renderInvites = () => {
@@ -322,22 +360,56 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
         {invitesError && <div className="text-sm text-red-500">{invitesError}</div>}
         {invites.map((inv) => (
           <Card key={inv.event.id} className="overflow-hidden">
-            <CardContent className="p-4 flex items-center justify-between gap-3">
-              <div>
-                <div className="font-semibold">{inv.groupId}</div>
-                {inv.relay && (
-                  <div className="text-xs text-muted-foreground truncate max-w-[200px]">
-                    {inv.relay}
+            <CardContent className="p-4 space-y-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-3 min-w-0">
+                  <Avatar className="h-10 w-10 shrink-0">
+                    {inv.groupPicture && <AvatarImage src={inv.groupPicture} alt={inv.groupName || inv.name || inv.groupId} />}
+                    <AvatarFallback className="text-xs font-semibold">
+                      {(inv.groupName || inv.name || inv.groupId || 'GR').slice(0, 2).toUpperCase()}
+                    </AvatarFallback>
+                  </Avatar>
+                  <div className="min-w-0">
+                    <div className="font-semibold truncate max-w-[260px]">
+                      {inv.groupName || inv.name || inv.groupId}
+                    </div>
+                    {inv.relay && (
+                      <div className="text-xs text-muted-foreground truncate max-w-[260px]">
+                        {inv.relay}
+                      </div>
+                    )}
                   </div>
-                )}
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="text-xs text-muted-foreground">{t('from')}</span>
+                  <HoverCard>
+                    <HoverCardTrigger asChild>
+                      <div className="h-7 w-7 rounded-full overflow-hidden cursor-default">
+                        <SimpleUserAvatar userId={inv.event.pubkey} size="small" className="h-7 w-7 rounded-full" />
+                      </div>
+                    </HoverCardTrigger>
+                    <HoverCardContent className="w-auto px-3 py-2">
+                      <SimpleUsername userId={inv.event.pubkey} />
+                    </HoverCardContent>
+                  </HoverCard>
+                </div>
               </div>
-              <Button
-                size="sm"
-                disabled={joiningInviteId === inv.event.id}
-                onClick={() => handleUseInvite(inv)}
-              >
-                {joiningInviteId === inv.event.id ? t('Joining…') : t('Use invite')}
-              </Button>
+              <div className="flex items-center justify-between gap-2">
+                <InviteMembersBadge memberPubkeys={inv.authorizedMemberPubkeys} />
+                <div className="flex items-center gap-2 ml-auto">
+                  <Button variant="outline" size="sm" onClick={() => handleDismissInvite(inv)}>
+                    <X className="w-4 h-4 mr-1" />
+                    {t('Dismiss')}
+                  </Button>
+                  <Button
+                    size="sm"
+                    disabled={joiningInviteId === inv.event.id}
+                    onClick={() => handleUseInvite(inv)}
+                  >
+                    {joiningInviteId === inv.event.id ? t('Joining…') : t('Use invite')}
+                  </Button>
+                </div>
+              </div>
             </CardContent>
           </Card>
         ))}

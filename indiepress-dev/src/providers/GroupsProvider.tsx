@@ -30,7 +30,7 @@ import {
 } from '@/types/groups'
 import client from '@/services/client.service'
 import localStorageService from '@/services/local-storage.service'
-import { createContext, ReactNode, useCallback, useContext, useEffect, useMemo, useState } from 'react'
+import { createContext, ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { useNostr } from './NostrProvider'
 import { randomString } from '@/lib/random'
 import { useWorkerBridge } from './WorkerBridgeProvider'
@@ -40,6 +40,9 @@ import * as nip19 from '@nostr/tools/nip19'
 // Prevent repeated bootstrap publishes per group/relay when admin snapshots are missing.
 const adminRecoveryAttempts = new Set<string>()
 const DEFAULT_PUBLIC_GATEWAY_BASE = 'https://hypertuna.com'
+const INVITE_DISMISSED_STORAGE_PREFIX = 'hypertuna_group_invites_dismissed_v1'
+const INVITE_ACCEPTED_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_v1'
+const INVITE_ACCEPTED_GROUPS_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_groups_v1'
 
 type TGroupsContext = {
   discoveryGroups: TGroupMetadata[]
@@ -53,6 +56,8 @@ type TGroupsContext = {
   joinRequestsError: string | null
   refreshDiscovery: () => Promise<void>
   refreshInvites: () => Promise<void>
+  dismissInvite: (inviteId: string) => void
+  markInviteAccepted: (inviteId: string, groupId?: string) => void
   loadJoinRequests: (groupId: string, relay?: string) => Promise<void>
   resolveRelayUrl: (relay?: string) => string | undefined
   toggleFavorite: (groupKey: string) => void
@@ -114,6 +119,8 @@ export const useGroups = () => {
       joinRequestsError: null,
       refreshDiscovery: async () => {},
       refreshInvites: async () => {},
+      dismissInvite: () => {},
+      markInviteAccepted: () => {},
       loadJoinRequests: async () => {},
       resolveRelayUrl: (r?: string) => r,
       toggleFavorite: () => {},
@@ -164,6 +171,30 @@ type SendInviteOptions = {
   isOpen?: boolean
   name?: string
   about?: string
+  picture?: string
+  authorizedMemberPubkeys?: string[]
+}
+
+const normalizePubkeyList = (values?: string[] | null) =>
+  Array.from(
+    new Set(
+      (Array.isArray(values) ? values : [])
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    )
+  )
+
+const readInviteCache = (key: string): Set<string> => {
+  if (typeof window === 'undefined') return new Set()
+  try {
+    const raw = window.localStorage.getItem(key)
+    if (!raw) return new Set()
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return new Set()
+    return new Set(parsed.map((entry) => String(entry || '').trim()).filter(Boolean))
+  } catch (_err) {
+    return new Set()
+  }
 }
 
 const buildInvitePayload = (args: {
@@ -171,6 +202,9 @@ const buildInvitePayload = (args: {
   relayUrl: string | null
   relayKey?: string | null
   meta?: TGroupMetadata | null
+  groupName?: string
+  groupPicture?: string
+  authorizedMemberPubkeys?: string[]
   mirrorMetadata?: InviteMirrorMetadata
   fastForward?: {
     key?: string | null
@@ -189,7 +223,10 @@ const buildInvitePayload = (args: {
   token: args.token,
   relayKey: args.relayKey ?? null,
   isPublic: args.meta?.isPublic !== false,
-  name: args.meta?.name,
+  groupName: args.groupName || args.meta?.name,
+  groupPicture: args.groupPicture || args.meta?.picture || null,
+  authorizedMemberPubkeys: normalizePubkeyList(args.authorizedMemberPubkeys),
+  name: args.groupName || args.meta?.name,
   about: args.meta?.about,
   fileSharing: args.meta?.isOpen !== false,
   blindPeer: args.mirrorMetadata?.blindPeer,
@@ -201,9 +238,18 @@ const buildInvitePayload = (args: {
   writerSecret: args.writerInfo?.writerSecret || null
 })
 
-const buildOpenInvitePayload = (args: { relayUrl: string | null; relayKey?: string | null }) => ({
+const buildOpenInvitePayload = (args: {
+  relayUrl: string | null
+  relayKey?: string | null
+  groupName?: string
+  groupPicture?: string
+  authorizedMemberPubkeys?: string[]
+}) => ({
   relayUrl: args.relayUrl,
-  relayKey: args.relayKey ?? null
+  relayKey: args.relayKey ?? null,
+  groupName: args.groupName || null,
+  groupPicture: args.groupPicture || null,
+  authorizedMemberPubkeys: normalizePubkeyList(args.authorizedMemberPubkeys)
 })
 
 const extractRelayKeyFromUrl = (value?: string | null) => {
@@ -256,6 +302,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       return {}
     }
   })
+  const [dismissedInviteIds, setDismissedInviteIds] = useState<Set<string>>(new Set())
+  const [acceptedInviteIds, setAcceptedInviteIds] = useState<Set<string>>(new Set())
+  const [acceptedInviteGroupIds, setAcceptedInviteGroupIds] = useState<Set<string>>(new Set())
+  const dismissedInviteIdsRef = useRef<Set<string>>(new Set())
+  const acceptedInviteIdsRef = useRef<Set<string>>(new Set())
+  const acceptedInviteGroupIdsRef = useRef<Set<string>>(new Set())
 
   const workerRelayUrlMap = useMemo(() => {
     const map = new Map<string, string>()
@@ -356,7 +408,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [workerRelays]
   )
 
-  const fetchInviteMirrorMetadata = useCallback(async (relayIdentifier: string, resolved?: string | null) => {
+  const fetchInviteMirrorMetadata = useCallback(async (relayIdentifier: string, resolved?: string | null): Promise<InviteMirrorMetadata> => {
     const origins: string[] = [DEFAULT_PUBLIC_GATEWAY_BASE]
     if (resolved) {
       try {
@@ -414,6 +466,68 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     setFavoriteGroups(localStorageService.getFavoriteGroups(pubkey))
   }, [pubkey])
+
+  useEffect(() => {
+    if (!pubkey || typeof window === 'undefined') {
+      const empty = new Set<string>()
+      setDismissedInviteIds(empty)
+      dismissedInviteIdsRef.current = empty
+      setAcceptedInviteIds(empty)
+      acceptedInviteIdsRef.current = empty
+      setAcceptedInviteGroupIds(empty)
+      acceptedInviteGroupIdsRef.current = empty
+      return
+    }
+
+    const dismissed = readInviteCache(`${INVITE_DISMISSED_STORAGE_PREFIX}:${pubkey}`)
+    const accepted = readInviteCache(`${INVITE_ACCEPTED_STORAGE_PREFIX}:${pubkey}`)
+    const acceptedGroups = readInviteCache(`${INVITE_ACCEPTED_GROUPS_STORAGE_PREFIX}:${pubkey}`)
+    setDismissedInviteIds(dismissed)
+    dismissedInviteIdsRef.current = dismissed
+    setAcceptedInviteIds(accepted)
+    acceptedInviteIdsRef.current = accepted
+    setAcceptedInviteGroupIds(acceptedGroups)
+    acceptedInviteGroupIdsRef.current = acceptedGroups
+  }, [pubkey])
+
+  useEffect(() => {
+    dismissedInviteIdsRef.current = dismissedInviteIds
+    if (!pubkey || typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(
+        `${INVITE_DISMISSED_STORAGE_PREFIX}:${pubkey}`,
+        JSON.stringify(Array.from(dismissedInviteIds))
+      )
+    } catch (_err) {
+      // best effort
+    }
+  }, [dismissedInviteIds, pubkey])
+
+  useEffect(() => {
+    acceptedInviteIdsRef.current = acceptedInviteIds
+    if (!pubkey || typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(
+        `${INVITE_ACCEPTED_STORAGE_PREFIX}:${pubkey}`,
+        JSON.stringify(Array.from(acceptedInviteIds))
+      )
+    } catch (_err) {
+      // best effort
+    }
+  }, [acceptedInviteIds, pubkey])
+
+  useEffect(() => {
+    acceptedInviteGroupIdsRef.current = acceptedInviteGroupIds
+    if (!pubkey || typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(
+        `${INVITE_ACCEPTED_GROUPS_STORAGE_PREFIX}:${pubkey}`,
+        JSON.stringify(Array.from(acceptedInviteGroupIds))
+      )
+    } catch (_err) {
+      // best effort
+    }
+  }, [acceptedInviteGroupIds, pubkey])
 
   useEffect(() => {
     // Clear per-account volatile state on account switch
@@ -487,6 +601,46 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     }
   }, [discoveryRelays])
 
+  const dismissInvite = useCallback((inviteId: string) => {
+    const normalizedInviteId = String(inviteId || '').trim()
+    if (!normalizedInviteId) return
+    setDismissedInviteIds((prev) => {
+      if (prev.has(normalizedInviteId)) return prev
+      const next = new Set(prev)
+      next.add(normalizedInviteId)
+      return next
+    })
+    setInvites((prev) => prev.filter((invite) => invite.event?.id !== normalizedInviteId))
+  }, [])
+
+  const markInviteAccepted = useCallback((inviteId: string, groupId?: string) => {
+    const normalizedInviteId = String(inviteId || '').trim()
+    const normalizedGroupId = String(groupId || '').trim()
+    if (normalizedInviteId) {
+      setAcceptedInviteIds((prev) => {
+        if (prev.has(normalizedInviteId)) return prev
+        const next = new Set(prev)
+        next.add(normalizedInviteId)
+        return next
+      })
+    }
+    if (normalizedGroupId) {
+      setAcceptedInviteGroupIds((prev) => {
+        if (prev.has(normalizedGroupId)) return prev
+        const next = new Set(prev)
+        next.add(normalizedGroupId)
+        return next
+      })
+    }
+    setInvites((prev) =>
+      prev.filter((invite) => {
+        if (normalizedInviteId && invite.event?.id === normalizedInviteId) return false
+        if (normalizedGroupId && invite.groupId === normalizedGroupId) return false
+        return true
+      })
+    )
+  }, [])
+
   const refreshInvites = useCallback(async () => {
     if (!pubkey) {
       setInvites([])
@@ -507,6 +661,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let token: string | undefined
             let relayUrl: string | null | undefined
             let relayKey: string | null | undefined
+            let groupName: string | undefined = invite.groupName || invite.name
+            let groupPicture: string | undefined = invite.groupPicture
+            let authorizedMemberPubkeys: string[] | undefined
             let fileSharing: boolean | undefined = invite.fileSharing
             let blindPeer: TGroupInvite['blindPeer'] | null | undefined
             let cores: TGroupInvite['cores'] | undefined
@@ -521,6 +678,26 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 token = typeof payload.token === 'string' ? payload.token : undefined
                 relayUrl = typeof payload.relayUrl === 'string' ? payload.relayUrl : null
                 relayKey = typeof payload.relayKey === 'string' ? payload.relayKey : null
+                if (typeof payload.groupName === 'string') {
+                  groupName = payload.groupName
+                } else if (typeof payload.name === 'string') {
+                  groupName = payload.name
+                }
+                if (typeof payload.groupPicture === 'string') {
+                  groupPicture = payload.groupPicture
+                } else if (typeof payload.picture === 'string') {
+                  groupPicture = payload.picture
+                }
+                const payloadAuthorizedMembers = Array.isArray(payload.authorizedMemberPubkeys)
+                  ? payload.authorizedMemberPubkeys
+                  : Array.isArray(payload.authorizedMembers)
+                    ? payload.authorizedMembers
+                    : Array.isArray(payload.memberPubkeys)
+                      ? payload.memberPubkeys
+                      : null
+                if (payloadAuthorizedMembers) {
+                  authorizedMemberPubkeys = normalizePubkeyList(payloadAuthorizedMembers)
+                }
                 if (typeof payload.fileSharing === 'boolean') {
                   fileSharing = payload.fileSharing
                 }
@@ -582,6 +759,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
             return {
               ...invite,
+              groupName,
+              groupPicture,
+              authorizedMemberPubkeys,
               token,
               relayUrl,
               relayKey,
@@ -601,17 +781,29 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       )
       console.info('[GroupsProvider] Refreshed invites writer stats', {
         total: parsed.length,
+        withGroupName: parsed.filter((p) => (p as any).groupName || (p as any).name).length,
+        withGroupPicture: parsed.filter((p) => (p as any).groupPicture).length,
+        withAuthorizedMembers: parsed.filter((p) => Array.isArray((p as any).authorizedMemberPubkeys) && (p as any).authorizedMemberPubkeys.length > 0).length,
         withWriterSecret: parsed.filter((p) => (p as any).writerSecret).length,
         withWriterCore: parsed.filter((p) => (p as any).writerCore).length,
         withWriterCoreHex: parsed.filter((p) => (p as any).writerCoreHex).length,
         withFastForward: parsed.filter((p) => (p as any).fastForward).length
       })
-      setInvites(parsed)
+      const joinedGroupIds = new Set(myGroupList.map((entry) => entry.groupId))
+      const filtered = parsed.filter((invite) => {
+        const inviteId = invite.event?.id
+        if (inviteId && dismissedInviteIdsRef.current.has(inviteId)) return false
+        if (inviteId && acceptedInviteIdsRef.current.has(inviteId)) return false
+        if (acceptedInviteGroupIdsRef.current.has(invite.groupId)) return false
+        if (joinedGroupIds.has(invite.groupId)) return false
+        return true
+      })
+      setInvites(filtered)
     } catch (error) {
       console.warn('Failed to refresh group invites', error)
       setInvitesError((error as Error).message)
     }
-  }, [discoveryRelays, nip04Decrypt, pubkey])
+  }, [discoveryRelays, myGroupList, nip04Decrypt, pubkey])
 
   const loadJoinRequests = useCallback(
     async (groupId: string, relay?: string) => {
@@ -699,6 +891,20 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     loadMyGroupList()
   }, [loadMyGroupList])
+
+  useEffect(() => {
+    const joinedGroupIds = new Set(myGroupList.map((entry) => entry.groupId))
+    setInvites((prev) =>
+      prev.filter((invite) => {
+        const inviteId = invite.event?.id
+        if (inviteId && dismissedInviteIdsRef.current.has(inviteId)) return false
+        if (inviteId && acceptedInviteIdsRef.current.has(inviteId)) return false
+        if (acceptedInviteGroupIdsRef.current.has(invite.groupId)) return false
+        if (joinedGroupIds.has(invite.groupId)) return false
+        return true
+      })
+    )
+  }, [myGroupList])
 
   useEffect(() => {
     localStorageService.setGroupDiscoveryRelays(discoveryRelays)
@@ -1210,6 +1416,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const isOpenGroup = resolvedIsOpen === true
       const inviteName = options?.name ?? meta?.name
       const inviteAbout = options?.about ?? meta?.about
+      const invitePicture = options?.picture ?? meta?.picture
+      const baseAuthorizedMemberPubkeys = normalizePubkeyList(options?.authorizedMemberPubkeys)
 
       const inviteRelayUrl = getBaseRelayUrl(resolved || relay || '') || resolved || relay || null
       const inviteRelayKey =
@@ -1302,13 +1510,19 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           const payload = isOpenGroup
             ? buildOpenInvitePayload({
                 relayUrl: inviteRelayUrl,
-                relayKey: inviteRelayKey
+                relayKey: inviteRelayKey,
+                groupName: inviteName,
+                groupPicture: invitePicture,
+                authorizedMemberPubkeys: baseAuthorizedMemberPubkeys
               })
             : buildInvitePayload({
                 token: token as string,
                 relayUrl: inviteRelayUrl,
                 relayKey: inviteRelayKey,
                 meta,
+                groupName: inviteName,
+                groupPicture: invitePicture,
+                authorizedMemberPubkeys: normalizePubkeyList([...baseAuthorizedMemberPubkeys, invitee]),
                 mirrorMetadata: inviteMirrorMetadata,
                 writerInfo,
                 fastForward: writerInfo?.fastForward || null
@@ -1339,6 +1553,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           ]
           if (inviteName) inviteTags.push(['name', inviteName])
           if (inviteAbout) inviteTags.push(['about', inviteAbout])
+          if (invitePicture) inviteTags.push(['picture', invitePicture])
           inviteTags.push([resolvedIsOpen === false ? 'file-sharing-off' : 'file-sharing-on'])
 
           if (!isOpenGroup && token) {
@@ -1429,6 +1644,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           // ignore
         }
       }
+      let detailMembers: string[] = []
+      try {
+        const detail = await fetchGroupDetail(groupId, relay, { preferRelay: true })
+        detailMembers = normalizePubkeyList(detail?.members || [])
+      } catch (_err) {
+        detailMembers = []
+      }
+      const invitePicture = meta?.picture
+      const authorizedMemberPubkeys = normalizePubkeyList([...detailMembers, targetPubkey])
 
       const baseRelayUrl = resolved ? getBaseRelayUrl(resolved) : undefined
       const relayEntry = getRelayEntryForGroup(groupId)
@@ -1492,7 +1716,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      let mirrorMetadata = await fetchInviteMirrorMetadata(
+      let mirrorMetadata: InviteMirrorMetadata = await fetchInviteMirrorMetadata(
         inviteRelayKey || relayEntry?.relayKey || groupId,
         resolved
       )
@@ -1503,20 +1727,26 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         writerCoreKey
       ].filter(Boolean) as string[]
       if (extraCoreRefs.length) {
-        if (!mirrorMetadata) mirrorMetadata = {}
-        const cores = Array.isArray(mirrorMetadata.cores) ? [...mirrorMetadata.cores] : []
+        const nextMirrorMetadata: NonNullable<InviteMirrorMetadata> = mirrorMetadata
+          ? { ...mirrorMetadata }
+          : { blindPeer: undefined, cores: [] }
+        const cores = Array.isArray(nextMirrorMetadata.cores) ? [...nextMirrorMetadata.cores] : []
         extraCoreRefs.forEach((ref) => {
           if (!cores.some((entry) => entry.key === ref)) {
             cores.push({ key: ref, role: 'autobase-writer' })
           }
         })
-        mirrorMetadata.cores = cores
+        nextMirrorMetadata.cores = cores
+        mirrorMetadata = nextMirrorMetadata
       }
       const payload = buildInvitePayload({
         token,
         relayUrl: inviteRelayUrl,
         relayKey: inviteRelayKey,
         meta,
+        groupName: meta?.name,
+        groupPicture: invitePicture,
+        authorizedMemberPubkeys,
         mirrorMetadata,
         writerInfo,
         fastForward: writerInfo?.fastForward || null
@@ -1539,6 +1769,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       ]
       if (meta?.name) tags.push(['name', meta.name])
       if (meta?.about) tags.push(['about', meta.about])
+      if (invitePicture) tags.push(['picture', invitePicture])
       tags.push([payload.fileSharing === false ? 'file-sharing-off' : 'file-sharing-on'])
 
       const encryptedPayload = await nip04Encrypt(targetPubkey, JSON.stringify(payload))
@@ -1798,6 +2029,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       joinRequestsError,
       refreshDiscovery,
       refreshInvites,
+      dismissInvite,
+      markInviteAccepted,
       loadJoinRequests,
       resolveRelayUrl,
       toggleFavorite,
@@ -1913,6 +2146,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       joinRequestsError,
       refreshDiscovery,
       refreshInvites,
+      dismissInvite,
+      markInviteAccepted,
       loadJoinRequests,
       saveMyGroupList,
       sendJoinRequest,

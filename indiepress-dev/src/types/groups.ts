@@ -38,8 +38,11 @@ export type TGroupRoles = {
 export type TGroupInvite = {
   groupId: string
   relay?: string
+  groupName?: string
+  groupPicture?: string
   name?: string
   about?: string
+  authorizedMemberPubkeys?: string[]
   fileSharing?: boolean
   relayUrl?: string | null
   relayKey?: string | null

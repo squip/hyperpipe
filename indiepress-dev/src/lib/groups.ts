@@ -69,11 +69,14 @@ export function parseGroupRolesEvent(event: Event): TGroupRoles {
 export function parseGroupInviteEvent(event: Event, relay?: string): TGroupInvite {
   const groupId = event.tags.find((t) => t[0] === 'h')?.[1] || ''
   const name = event.tags.find((t) => t[0] === 'name')?.[1]
+  const picture = event.tags.find((t) => t[0] === 'picture')?.[1]
   const about = event.tags.find((t) => t[0] === 'about')?.[1]
   const fileSharingOn = event.tags.some((t) => t[0] === 'file-sharing-on')
   return {
     groupId,
     relay,
+    groupName: name,
+    groupPicture: picture,
     name,
     about,
     fileSharing: fileSharingOn,
