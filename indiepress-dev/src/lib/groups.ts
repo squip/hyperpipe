@@ -58,6 +58,77 @@ export function parseGroupMembersEvent(event: Event): string[] {
   return event.tags.filter((t) => t[0] === 'p' && t[1]).map((t) => t[1])
 }
 
+type MembershipAction = 'member' | 'removed'
+
+type MembershipState = {
+  action: MembershipAction
+  createdAt: number
+}
+
+const membershipActionForKind = (kind: number): MembershipAction | null => {
+  if (kind === 9000) return 'member'
+  if (kind === 9001) return 'removed'
+  return null
+}
+
+const shouldReplaceMembershipState = (
+  existing: MembershipState | undefined,
+  nextAction: MembershipAction,
+  nextCreatedAt: number
+) => {
+  if (!existing) return true
+  if (nextCreatedAt > existing.createdAt) return true
+  if (nextCreatedAt < existing.createdAt) return false
+  // If timestamps are identical, prefer removal to avoid false-positive membership.
+  if (nextAction === 'removed' && existing.action !== 'removed') return true
+  return false
+}
+
+export function resolveGroupMembersFromSnapshotAndOps(args: {
+  snapshotMembers?: string[]
+  snapshotCreatedAt?: number | null
+  membershipEvents?: Event[]
+}): string[] {
+  const {
+    snapshotMembers = [],
+    snapshotCreatedAt = null,
+    membershipEvents = []
+  } = args
+
+  const stateByPubkey = new Map<string, MembershipState>()
+  const snapshotTs = Number.isFinite(snapshotCreatedAt as number)
+    ? Number(snapshotCreatedAt)
+    : Number.NEGATIVE_INFINITY
+
+  for (const member of snapshotMembers) {
+    if (!member) continue
+    if (!stateByPubkey.has(member)) {
+      stateByPubkey.set(member, {
+        action: 'member',
+        createdAt: snapshotTs
+      })
+    }
+  }
+
+  for (const evt of membershipEvents) {
+    const action = membershipActionForKind(evt.kind)
+    if (!action) continue
+    const createdAt = Number.isFinite(evt.created_at) ? evt.created_at : 0
+    const targets = evt.tags.filter((t) => t[0] === 'p' && t[1]).map((t) => t[1])
+    for (const target of targets) {
+      const existing = stateByPubkey.get(target)
+      if (!shouldReplaceMembershipState(existing, action, createdAt)) continue
+      stateByPubkey.set(target, { action, createdAt })
+    }
+  }
+
+  const members: string[] = []
+  stateByPubkey.forEach((state, pubkey) => {
+    if (state.action === 'member') members.push(pubkey)
+  })
+  return members
+}
+
 export function parseGroupRolesEvent(event: Event): TGroupRoles {
   const roles = event.tags
     .filter((t) => t[0] === 'role' && t[1])
@@ -135,12 +206,28 @@ export function deriveMembershipStatus(
   events: Event[],
   joinRequests: Event[] = []
 ): TGroupMembershipStatus {
-  const relevant = events
-    .filter((evt) => evt.kind === 9000 || evt.kind === 9001)
-    .sort((a, b) => b.created_at - a.created_at)
-  if (relevant[0]) {
-    if (relevant[0].kind === 9000) return 'member'
-    if (relevant[0].kind === 9001) return 'removed'
+  let latestMembershipEvent: Event | null = null
+  for (const evt of events) {
+    if (evt.kind !== 9000 && evt.kind !== 9001) continue
+    const targetsPubkey = evt.tags.some((tag) => tag[0] === 'p' && tag[1] === pubkey)
+    if (!targetsPubkey) continue
+    if (!latestMembershipEvent || evt.created_at > latestMembershipEvent.created_at) {
+      latestMembershipEvent = evt
+      continue
+    }
+    if (
+      latestMembershipEvent &&
+      evt.created_at === latestMembershipEvent.created_at &&
+      evt.kind === 9001 &&
+      latestMembershipEvent.kind !== 9001
+    ) {
+      latestMembershipEvent = evt
+    }
+  }
+
+  if (latestMembershipEvent) {
+    if (latestMembershipEvent.kind === 9000) return 'member'
+    if (latestMembershipEvent.kind === 9001) return 'removed'
   }
 
   const latestRequest = joinRequests

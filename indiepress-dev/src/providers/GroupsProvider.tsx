@@ -8,6 +8,7 @@ import {
   parseGroupListEvent,
   parseGroupMembersEvent,
   parseGroupMetadataEvent,
+  resolveGroupMembersFromSnapshotAndOps,
   buildGroupIdForCreation
 } from '@/lib/groups'
 import {
@@ -829,26 +830,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             .catch(() => [])
         ])
 
-        // Compute membership from 9000/9001 sets
-        const memberAdds = new Map<string, number>()
-        const memberRemoves = new Map<string, number>()
-        membershipEvents.forEach((evt) => {
-          evt.tags
-            .filter((t) => t[0] === 'p' && t[1])
-            .forEach((t) => {
-              const pk = t[1]
-              if (evt.kind === 9000) {
-                memberAdds.set(pk, evt.created_at)
-              } else if (evt.kind === 9001) {
-                memberRemoves.set(pk, evt.created_at)
-              }
-            })
-        })
-        const currentMembers = new Set<string>()
-        memberAdds.forEach((ts, pk) => {
-          const removedAt = memberRemoves.get(pk)
-          if (!removedAt || removedAt < ts) currentMembers.add(pk)
-        })
+        const currentMembers = new Set(
+          resolveGroupMembersFromSnapshotAndOps({
+            membershipEvents
+          })
+        )
 
         const rejected = rejectedJoinRequests[groupKey] || new Set<string>()
         const parsed = joinEvents
@@ -1077,8 +1063,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         ? deriveMembershipStatus(pubkey, membershipEvents, joinRequests)
         : 'not-member'
 
-      // Fallback: if membership events are missing but the member list includes the user, treat as member
+      // Resolve current member set from snapshot + membership ops.
       const membersFromEvent = membersEvt ? parseGroupMembersEvent(membersEvt) : []
+      const resolvedMembers = resolveGroupMembersFromSnapshotAndOps({
+        snapshotMembers: membersFromEvent,
+        snapshotCreatedAt: membersEvt?.created_at,
+        membershipEvents
+      })
       const groupIdPubkey = (() => {
         try {
           if (groupId?.startsWith('npub')) {
@@ -1100,7 +1091,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         !!pubkey &&
         ((!!creatorPubkey && creatorPubkey === pubkey) || (!!groupIdPubkey && groupIdPubkey === pubkey))
       let coercedMembershipStatus =
-        membershipStatus === 'not-member' && pubkey && membersFromEvent.includes(pubkey)
+        membershipStatus === 'not-member' && pubkey && resolvedMembers.includes(pubkey)
           ? 'member'
           : membershipStatus
 
@@ -1113,7 +1104,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       }
 
       // If we believe we're a member but members list is empty, include self so UI doesn't zero out
-      let members = membersFromEvent
+      let members = resolvedMembers
       if (coercedMembershipStatus === 'member' && pubkey) {
         if (!members.includes(pubkey)) members = [...members, pubkey]
       }
@@ -1156,6 +1147,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         joinRequestsCount: joinRequests.length,
         initialStatus: membershipStatus,
         membersFromEventCount: membersFromEvent.length,
+        resolvedMembersCount: resolvedMembers.length,
         isInMyGroups,
         isCreator,
         creatorPubkey,
