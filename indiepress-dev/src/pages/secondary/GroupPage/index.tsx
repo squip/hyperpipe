@@ -296,8 +296,8 @@ const MemoizedMemberRow = React.memo(
 
 type JoinRequestRowProps = {
   request: TJoinRequest
-  onApprove: (pubkey: string) => void
-  onReject: (pubkey: string) => void
+  onApprove: (request: TJoinRequest) => void
+  onReject: (request: TJoinRequest) => void
   approving?: boolean
   rejecting?: boolean
   t: (key: string, opts?: any) => string
@@ -318,7 +318,7 @@ function JoinRequestRow({ request, onApprove, onReject, approving, rejecting, t 
         <Button
           size="sm"
           variant="secondary"
-          onClick={() => onReject(request.pubkey)}
+          onClick={() => onReject(request)}
           disabled={rejecting || approving}
           className="rounded-full"
         >
@@ -327,12 +327,12 @@ function JoinRequestRow({ request, onApprove, onReject, approving, rejecting, t 
         </Button>
         <Button
           size="sm"
-          onClick={() => onApprove(request.pubkey)}
+          onClick={() => onApprove(request)}
           disabled={approving || rejecting}
           className="rounded-full"
         >
           <Check className="w-4 h-4 mr-1" />
-          {approving ? t('Approving...') : t('Approve')}
+          {approving ? t('Sending invite...') : t('Send invite')}
         </Button>
       </div>
     </div>
@@ -1340,15 +1340,16 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   )
 
   const handleApproveJoinRequest = React.useCallback(
-    async (targetPubkey: string) => {
+    async (request: TJoinRequest) => {
       if (!groupId) return
+      const targetPubkey = request.pubkey
       setJoinRequestAction({ pubkey: targetPubkey, action: 'approve' })
       try {
-        await approveJoinRequest(groupId, targetPubkey, effectiveGroupRelay)
-        toast.success(t('Join request approved'))
+        await approveJoinRequest(groupId, targetPubkey, effectiveGroupRelay, request.created_at)
+        toast.success(t('Invite sent'))
         await loadJoinRequests(groupId, effectiveGroupRelay)
       } catch (err) {
-        toast.error(t('Failed to approve join request'))
+        toast.error(t('Failed to send invite'))
         setError((err as Error).message)
       } finally {
         setJoinRequestAction(null)
@@ -1358,11 +1359,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   )
 
   const handleRejectJoinRequest = React.useCallback(
-    async (targetPubkey: string) => {
+    async (request: TJoinRequest) => {
       if (!groupId) return
+      const targetPubkey = request.pubkey
       setJoinRequestAction({ pubkey: targetPubkey, action: 'reject' })
       try {
-        await rejectJoinRequest(groupId, targetPubkey, effectiveGroupRelay)
+        await rejectJoinRequest(groupId, targetPubkey, effectiveGroupRelay, request.created_at)
         toast.success(t('Join request rejected'))
         await loadJoinRequests(groupId, effectiveGroupRelay)
       } catch (err) {
@@ -1592,7 +1594,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                   <Button size="sm" onClick={handleJoin} disabled={joinFlow?.phase === 'starting' || joinFlow?.phase === 'request' || joinFlow?.phase === 'verify' || joinFlow?.phase === 'complete'}>
                     {joinFlow?.phase && joinFlow.phase !== 'idle' && joinFlow.phase !== 'error'
                       ? t('Joining…')
-                      : t('Join')}
+                      : (!inviteToken && !isOpenGroup ? t('Request invite') : t('Join'))}
                   </Button>
                 )}
                 

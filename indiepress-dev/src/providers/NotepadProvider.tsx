@@ -28,6 +28,20 @@ export function NotepadProvider({ children }: { children: React.ReactNode }) {
   const [notes, setNotes] = useState<Map<string, CachedNotepadNote>>(new Map())
   const serviceRef = useRef<NotepadService | null>(null)
   const relayUrlsRef = useRef<string[]>([])
+  const discoveryRelay = import.meta.env.VITE_DISCOVERY_RELAY as string | undefined
+  const relayUrls = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          [...(relayList?.read || []), ...(relayList?.write || []), discoveryRelay].filter(
+            (u): u is string => !!u
+          )
+        )
+      ),
+    [discoveryRelay, relayList?.read, relayList?.write]
+  )
+  const relaySignature = useMemo(() => relayUrls.slice().sort().join('|'), [relayUrls])
+  const stableRelayUrls = useMemo(() => relayUrls, [relaySignature])
 
   useEffect(() => {
     return () => {
@@ -42,17 +56,9 @@ export function NotepadProvider({ children }: { children: React.ReactNode }) {
       serviceRef.current?.stop()
       serviceRef.current = null
 
-      if (!isReady || !pubkey || !relayList) return
+      if (!isReady || !pubkey || stableRelayUrls.length === 0) return
 
-      const discoveryRelay = import.meta.env.VITE_DISCOVERY_RELAY as string | undefined
-      const relayUrls = Array.from(
-        new Set(
-          [...(relayList.read || []), ...(relayList.write || []), discoveryRelay].filter(
-            (u): u is string => !!u
-          )
-        )
-      )
-      relayUrlsRef.current = relayUrls
+      relayUrlsRef.current = stableRelayUrls
 
       let ndk: NDK | null = null
       let cacheAdapter: any = null
@@ -64,7 +70,7 @@ export function NotepadProvider({ children }: { children: React.ReactNode }) {
 
       try {
         if (nsec) {
-          ndk = createNDKWithSigner(nsec, relayUrls, discoveryRelay, cacheAdapter)
+          ndk = createNDKWithSigner(nsec, stableRelayUrls, discoveryRelay, cacheAdapter)
         } else if (ncryptsec) {
           const password = typeof window !== 'undefined' ? window.prompt('Enter the password to decrypt your ncryptsec for notepad') : null
           if (!password) {
@@ -72,11 +78,11 @@ export function NotepadProvider({ children }: { children: React.ReactNode }) {
             return
           }
           const privkey = nip49.decrypt(ncryptsec, password)
-          ndk = createNDKWithSigner(privkey, relayUrls, discoveryRelay, cacheAdapter)
+          ndk = createNDKWithSigner(privkey, stableRelayUrls, discoveryRelay, cacheAdapter)
         } else if (typeof window !== 'undefined' && (window as any).nostr) {
           const signer = new NDKNip07Signer(10_000)
           ndk = new NDK({
-            explicitRelayUrls: relayUrls,
+            explicitRelayUrls: stableRelayUrls,
             signer
           })
           if (signer.blockUntilReady) {
@@ -98,7 +104,7 @@ export function NotepadProvider({ children }: { children: React.ReactNode }) {
         const service = new NotepadService(ndk, cache, pubkey)
         service.onNotesUpdated = (map) => setNotes(new Map(map))
         serviceRef.current = service
-        await service.start(relayUrls)
+        await service.start(stableRelayUrls)
         setNotes(new Map(service.latestNotes))
         setReady(true)
 
@@ -121,7 +127,7 @@ export function NotepadProvider({ children }: { children: React.ReactNode }) {
         if (typeof cleanup === 'function') cleanup()
       })
     }
-  }, [isReady, pubkey, relayList, nsec, ncryptsec])
+  }, [isReady, pubkey, relaySignature, stableRelayUrls, nsec, ncryptsec])
 
   const value = useMemo(
     () => ({

@@ -36,6 +36,18 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
   const ready = useRef(false)
   const [readyFlag, setReadyFlag] = useState(false)
   const messageBufferRef = useRef<Map<string, DMMessage[]>>(new Map())
+  const discoveryRelay = import.meta.env.VITE_DISCOVERY_RELAY as string | undefined
+  const relayUrls = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          [...(relayList?.read || []), ...(relayList?.write || []), discoveryRelay].filter(Boolean)
+        )
+      ) as string[],
+    [discoveryRelay, relayList?.read, relayList?.write]
+  )
+  const relaySignature = useMemo(() => relayUrls.slice().sort().join('|'), [relayUrls])
+  const stableRelayUrls = useMemo(() => relayUrls, [relaySignature])
 
   useEffect(() => {
     debug('ready state', { readyFlag, hasMessenger: !!messenger })
@@ -43,22 +55,13 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const init = async () => {
-      if (!isReady || !pubkey || !relayList) return
-      debug('init start', { isReady, pubkey, relays: relayList })
+      if (!isReady || !pubkey || stableRelayUrls.length === 0) return
+      debug('init start', { isReady, pubkey, relays: stableRelayUrls })
       setUnsupportedReason(undefined)
       setReadyFlag(false)
 
       const primaryDbName = 'fevela-nip17'
       const fallbackDbName = `fevela-nip17-v2-${Date.now()}`
-
-      const discoveryRelay = import.meta.env.VITE_DISCOVERY_RELAY as string | undefined
-      const relayUrls = Array.from(
-        new Set([
-          ...((relayList.read || []) as string[]),
-          ...((relayList.write || []) as string[]),
-          discoveryRelay
-        ].filter(Boolean))
-      ) as string[]
 
       let mp: MultiPartyMessenger | null = null
       let off: (() => void) | null = null
@@ -68,7 +71,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
         let ndk: NDK | null = null
 
         if (nsec) {
-          ndk = createNDKWithSigner(nsec, relayUrls, discoveryRelay, cacheAdapter)
+          ndk = createNDKWithSigner(nsec, stableRelayUrls, discoveryRelay, cacheAdapter)
         } else if (ncryptsec) {
           const password = typeof window !== 'undefined' ? window.prompt(PASSWORD_PROMPT) : null
           if (!password) {
@@ -77,11 +80,11 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
             return
           }
           const privkey = nip49.decrypt(ncryptsec, password)
-          ndk = createNDKWithSigner(privkey, relayUrls, discoveryRelay, cacheAdapter)
+          ndk = createNDKWithSigner(privkey, stableRelayUrls, discoveryRelay, cacheAdapter)
         } else if (typeof window !== 'undefined' && (window as any).nostr) {
           const signer = new NDKNip07Signer(10_000)
           ndk = new NDK({
-            explicitRelayUrls: relayUrls,
+            explicitRelayUrls: stableRelayUrls,
             signer
           })
           if (signer.blockUntilReady) {
@@ -96,7 +99,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
         ndk.cacheAdapter = cacheAdapter as any
 
         await ndk.connect()
-        debug('NDK connected', { relays: relayUrls.length })
+        debug('NDK connected', { relays: stableRelayUrls.length })
 
         const buildStorage = async (dbName: string) => {
           const adapter = dbName === primaryDbName ? cacheAdapter : new NDKCacheAdapterDexie({ dbName })
@@ -148,7 +151,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
           }
         }
 
-        mp = new MultiPartyMessenger(ndk, { storage, explicitRelayUrls: relayUrls })
+        mp = new MultiPartyMessenger(ndk, { storage, explicitRelayUrls: stableRelayUrls })
         await mp.start()
         debug('messenger started')
         ready.current = true
@@ -214,7 +217,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     return () => {
       cleanupPromise?.then((cleanup) => cleanup?.())
     }
-  }, [isReady, pubkey, relayList, nsec, ncryptsec])
+  }, [isReady, pubkey, relaySignature, stableRelayUrls, nsec, ncryptsec])
 
   const value = useMemo(
     () => ({

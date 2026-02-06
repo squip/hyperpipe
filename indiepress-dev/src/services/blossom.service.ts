@@ -3,6 +3,8 @@ import { getHashFromURL } from 'blossom-client-sdk'
 
 class BlossomService {
   static instance: BlossomService
+  private invalidImageUrlLogged = new Set<string>()
+  private invalidServerUrlLogged = new Set<string>()
   private cacheMap = new Map<
     string,
     {
@@ -11,6 +13,7 @@ class BlossomService {
       promise: Promise<string>
       tried: Set<string>
       validUrl?: string
+      invalid?: boolean
     }
   >()
 
@@ -43,6 +46,10 @@ class BlossomService {
       return null
     }
 
+    if (entry.invalid) {
+      return null
+    }
+
     if (entry.validUrl) {
       return entry.validUrl
     }
@@ -54,7 +61,11 @@ class BlossomService {
       oldImageUrl = new URL(originalUrl)
       hash = getHashFromURL(oldImageUrl)
     } catch (error) {
-      console.error('Invalid image URL:', error)
+      if (!this.invalidImageUrlLogged.has(originalUrl)) {
+        this.invalidImageUrlLogged.add(originalUrl)
+        console.warn('Invalid image URL:', originalUrl, error)
+      }
+      entry.invalid = true
     }
     if (!pubkey || !hash || !oldImageUrl) {
       resolve(originalUrl)
@@ -69,7 +80,10 @@ class BlossomService {
         try {
           return new URL(server)
         } catch (error) {
-          console.error('Invalid Blossom server URL:', server, error)
+          if (!this.invalidServerUrlLogged.has(server)) {
+            this.invalidServerUrlLogged.add(server)
+            console.warn('Invalid Blossom server URL:', server, error)
+          }
           return undefined
         }
       })

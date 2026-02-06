@@ -202,6 +202,7 @@ const MAX_LOGS = 500
 const MAX_OUTPUT_LINES = 250
 const AUTOSTART_KEY = 'hypertuna_worker_autostart_enabled'
 const RESTART_DELAYS_MS = [1000, 3000, 10000, 30000]
+const EMPTY_RELAY_UPDATE_GRACE_MS = 2500
 
 function makeRequestId(prefix = 'req') {
   return `${prefix}-${Math.random().toString(16).slice(2)}-${Date.now().toString(16)}`
@@ -394,6 +395,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       }
     >
   >(new Map())
+  const transientEmptyRelayTimeoutRef = useRef<number | null>(null)
+  const pendingEmptyRelayUpdateRef = useRef<RelayEntry[] | null>(null)
 
   useEffect(() => {
     autostartEnabledRef.current = autostartEnabled
@@ -411,6 +414,14 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     if (restartTimeoutRef.current == null) return
     window.clearTimeout(restartTimeoutRef.current)
     restartTimeoutRef.current = null
+  }, [])
+
+  const clearPendingEmptyRelayUpdate = useCallback(() => {
+    if (transientEmptyRelayTimeoutRef.current != null) {
+      window.clearTimeout(transientEmptyRelayTimeoutRef.current)
+      transientEmptyRelayTimeoutRef.current = null
+    }
+    pendingEmptyRelayUpdateRef.current = null
   }, [])
 
   const applyPeerTelemetry = useCallback((status: GatewayStatus | null | undefined) => {
@@ -796,6 +807,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       setPublicGatewayStatus(null)
       setPublicGatewayToken(null)
       setJoinFlows({})
+      clearPendingEmptyRelayUpdate()
       applyPeerTelemetry(null)
       relayCreateResolversRef.current.forEach(({ reject, timeoutId }) => {
         window.clearTimeout(timeoutId)
@@ -804,7 +816,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       relayCreateResolversRef.current = []
       setLifecycle('stopped')
     },
-    [applyPeerTelemetry, clearRestartTimeout]
+    [applyPeerTelemetry, clearPendingEmptyRelayUpdate, clearRestartTimeout]
   )
 
   const scheduleAutoRestart = useCallback(() => {
@@ -867,6 +879,32 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
               })))
               setRelays((prev) => {
                 const next = msg.relays as RelayEntry[]
+                if (next.length === 0 && prev.length > 0) {
+                  pendingEmptyRelayUpdateRef.current = next
+                  if (transientEmptyRelayTimeoutRef.current == null) {
+                    transientEmptyRelayTimeoutRef.current = window.setTimeout(() => {
+                      transientEmptyRelayTimeoutRef.current = null
+                      const pending = pendingEmptyRelayUpdateRef.current
+                      pendingEmptyRelayUpdateRef.current = null
+                      if (!pending) return
+                      setRelays((current) => {
+                        if (current.length === 0) return current
+                        console.info('[WorkerBridge] relay-update empty applied after grace window', {
+                          previousCount: current.length,
+                          graceMs: EMPTY_RELAY_UPDATE_GRACE_MS
+                        })
+                        return pending
+                      })
+                    }, EMPTY_RELAY_UPDATE_GRACE_MS)
+                  }
+                  console.info('[WorkerBridge] relay-update empty suppressed (transient)', {
+                    previousCount: prev.length,
+                    graceMs: EMPTY_RELAY_UPDATE_GRACE_MS
+                  })
+                  electronIpc.sendToWorker({ type: 'get-relays' }).catch(() => {})
+                  return prev
+                }
+                clearPendingEmptyRelayUpdate()
                 if (areRelayListsEquivalent(prev, next)) {
                   console.info('[WorkerBridge] relay-update deduped (unchanged)', {
                     count: next.length
@@ -1125,6 +1163,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     unsubscribers.push(
       electronIpc.onWorkerExit((code) => {
         warmSessionIdsRef.current.clear()
+        clearPendingEmptyRelayUpdate()
         setStatusV1(null)
         setConfigAppliedV1(null)
         setRelays([])
@@ -1198,14 +1237,15 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         }
       })
     }
-  }, [scheduleAutoRestart, warmWorkerState])
+  }, [clearPendingEmptyRelayUpdate, scheduleAutoRestart, warmWorkerState])
 
   useEffect(() => {
     return () => {
+      clearPendingEmptyRelayUpdate()
       pendingRepliesRef.current.forEach(({ timeoutId }) => window.clearTimeout(timeoutId))
       pendingRepliesRef.current.clear()
     }
-  }, [])
+  }, [clearPendingEmptyRelayUpdate])
 
   useEffect(() => {
     if (!isElectron()) {

@@ -44,6 +44,7 @@ const DEFAULT_PUBLIC_GATEWAY_BASE = 'https://hypertuna.com'
 const INVITE_DISMISSED_STORAGE_PREFIX = 'hypertuna_group_invites_dismissed_v1'
 const INVITE_ACCEPTED_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_v1'
 const INVITE_ACCEPTED_GROUPS_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_groups_v1'
+const JOIN_REQUESTS_HANDLED_STORAGE_KEY = 'hypertuna_join_requests_handled_v1'
 const GROUP_MEMBER_PREVIEW_TTL_MS = 2 * 60 * 1000
 
 type GroupMemberPreviewEntry = {
@@ -103,8 +104,18 @@ type TGroupsContext = {
   sendInvites: (groupId: string, invitees: string[], relay?: string, options?: SendInviteOptions) => Promise<void>
   updateMetadata: (groupId: string, data: Partial<{ name: string; about: string; picture: string; isPublic: boolean; isOpen: boolean }>, relay?: string) => Promise<void>
   grantAdmin: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
-  approveJoinRequest: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
-  rejectJoinRequest: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
+  approveJoinRequest: (
+    groupId: string,
+    targetPubkey: string,
+    relay?: string,
+    requestCreatedAt?: number
+  ) => Promise<void>
+  rejectJoinRequest: (
+    groupId: string,
+    targetPubkey: string,
+    relay?: string,
+    requestCreatedAt?: number
+  ) => Promise<void>
   addUser: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
   removeUser: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
   deleteGroup: (groupId: string, relay?: string) => Promise<void>
@@ -192,6 +203,7 @@ export const useGroups = () => {
 const defaultDiscoveryRelays = BIG_RELAY_URLS
 
 const toGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${groupId}` : groupId)
+const toJoinRequestHandledKey = (pubkey: string, createdAt: number) => `${pubkey}:${createdAt}`
 const toGroupMemberPreviewKey = (groupId: string, relay?: string) =>
   `${relay ? getBaseRelayUrl(relay) : ''}|${groupId}`
 
@@ -337,10 +349,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     const stored = localStorageService.getGroupDiscoveryRelays()
     return stored.length ? stored : defaultDiscoveryRelays
   })
-  const [rejectedJoinRequests, setRejectedJoinRequests] = useState<Record<string, Set<string>>>(() => {
+  const [handledJoinRequests, setHandledJoinRequests] = useState<Record<string, Set<string>>>(() => {
     if (typeof window === 'undefined') return {}
     try {
-      const raw = window.localStorage.getItem('hypertuna_join_rejections')
+      const raw = window.localStorage.getItem(JOIN_REQUESTS_HANDLED_STORAGE_KEY)
       if (!raw) return {}
       const parsed = JSON.parse(raw) as Record<string, string[]>
       const asSets: Record<string, Set<string>> = {}
@@ -597,21 +609,21 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     // Clear per-account volatile state on account switch
     setJoinRequests({})
-    setRejectedJoinRequests({})
+    setHandledJoinRequests({})
   }, [pubkey])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
     const serialized: Record<string, string[]> = {}
-    Object.entries(rejectedJoinRequests).forEach(([k, v]) => {
+    Object.entries(handledJoinRequests).forEach(([k, v]) => {
       serialized[k] = Array.from(v)
     })
     try {
-      window.localStorage.setItem('hypertuna_join_rejections', JSON.stringify(serialized))
+      window.localStorage.setItem(JOIN_REQUESTS_HANDLED_STORAGE_KEY, JSON.stringify(serialized))
     } catch (_err) {
       // best effort
     }
-  }, [rejectedJoinRequests])
+  }, [handledJoinRequests])
 
   const refreshDiscovery = useCallback(async () => {
     setIsLoadingDiscovery(true)
@@ -876,8 +888,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       setJoinRequestsError(null)
       const groupKey = toGroupKey(groupId, relay)
       try {
-        const resolved = relay ? resolveRelayUrl(relay) : undefined
-        const relayUrls = resolved ? [resolved] : discoveryRelays
+        const relayUrls = discoveryRelays
+        console.info('[GroupsProvider] Fetching join requests', {
+          groupId,
+          relay,
+          relayUrlsCount: relayUrls.length,
+          relayUrlsPreview: relayUrls.slice(0, 4)
+        })
 
         const [joinEvents, membershipEvents] = await Promise.all([
           client.fetchEvents(relayUrls, {
@@ -900,16 +917,40 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           })
         )
 
-        const rejected = rejectedJoinRequests[groupKey] || new Set<string>()
-        const parsed = joinEvents
+        const handled = handledJoinRequests[groupKey] || new Set<string>()
+        const dedupedLatestByPubkey = new Map<string, TJoinRequest>()
+        joinEvents
           .map(parseGroupJoinRequestEvent)
-          .filter((jr) => !currentMembers.has(jr.pubkey) && !rejected.has(jr.pubkey))
+          .forEach((jr) => {
+            const existing = dedupedLatestByPubkey.get(jr.pubkey)
+            if (!existing || jr.created_at > existing.created_at) {
+              dedupedLatestByPubkey.set(jr.pubkey, jr)
+            }
+          })
+        const parsed = Array.from(dedupedLatestByPubkey.values()).filter((jr) => {
+          if (currentMembers.has(jr.pubkey)) return false
+          const handledKey = toJoinRequestHandledKey(jr.pubkey, jr.created_at)
+          if (handled.has(handledKey)) return false
+          return true
+        })
+        console.info('[GroupsProvider] Join requests resolved', {
+          groupId,
+          fetched: joinEvents.length,
+          deduped: dedupedLatestByPubkey.size,
+          filteredCurrentMembers: Array.from(dedupedLatestByPubkey.values()).filter((jr) =>
+            currentMembers.has(jr.pubkey)
+          ).length,
+          filteredHandled: Array.from(dedupedLatestByPubkey.values()).filter((jr) =>
+            handled.has(toJoinRequestHandledKey(jr.pubkey, jr.created_at))
+          ).length,
+          finalCount: parsed.length
+        })
         setJoinRequests((prev) => ({ ...prev, [groupKey]: parsed }))
       } catch (error) {
         setJoinRequestsError((error as Error).message)
       }
     },
-    [discoveryRelays, rejectedJoinRequests, resolveRelayUrl]
+    [discoveryRelays, handledJoinRequests]
   )
 
   const loadMyGroupList = useCallback(async () => {
@@ -2152,10 +2193,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         content: reason ?? ''
       }
 
-      const resolved = relay ? resolveRelayUrl(relay) : undefined
-      await publish(draftEvent, { specifiedRelayUrls: resolved ? [resolved] : undefined })
+      const relayUrls = discoveryRelays
+      console.info('[GroupsProvider] Publishing join request', {
+        groupId,
+        relay,
+        relayUrlsCount: relayUrls.length,
+        relayUrlsPreview: relayUrls.slice(0, 4),
+        hasInviteCode: !!code
+      })
+      await publish(draftEvent, { specifiedRelayUrls: relayUrls })
     },
-    [pubkey, publish, resolveRelayUrl]
+    [discoveryRelays, pubkey, publish]
   )
 
   const sendLeaveRequest = useCallback(
@@ -2180,8 +2228,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       if (!invitees.length) return
 
       const resolved = relay ? resolveRelayUrl(relay) : null
-      // Send invites to both the group relay (if provided) and discovery relays so non-members can see them.
-      const relayUrls = Array.from(new Set([...(resolved ? [resolved] : []), ...defaultDiscoveryRelays]))
+      // Publish invite envelopes to discovery relays only.
+      const relayUrls = defaultDiscoveryRelays
       let meta =
         discoveryGroups.find(
           (g) => g.id === groupId && (!relay || !g.relay || g.relay === relay || g.relay === resolved)
@@ -2420,258 +2468,104 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   )
 
   const approveJoinRequest = useCallback(
-    async (groupId: string, targetPubkey: string, relay?: string) => {
+    async (groupId: string, targetPubkey: string, relay?: string, requestCreatedAt?: number) => {
       if (!pubkey) throw new Error('Not logged in')
       const groupKey = toGroupKey(groupId, relay)
-      const token = randomString(24)
       const resolved = relay ? resolveRelayUrl(relay) : undefined
-      const inviteRelayUrls = resolved ? [resolved] : discoveryRelays
-      const timestamp = Math.floor(Date.now() / 1000)
 
-      // Resolve metadata for invite tags/payload
-      let meta =
-        discoveryGroups.find(
-          (g) => g.id === groupId && (!relay || !g.relay || g.relay === relay || g.relay === resolved)
-        ) || null
-      if (!meta) {
-        try {
-          const detail = await fetchGroupDetail(groupId, relay, { preferRelay: true })
-          meta = detail?.metadata || null
-        } catch (_err) {
-          // ignore
-        }
-      }
       let detailMembers: string[] = []
+      let detailName: string | undefined
+      let detailPicture: string | undefined
+      let detailAbout: string | undefined
       try {
         const detail = await fetchGroupDetail(groupId, relay, { preferRelay: true })
         detailMembers = normalizePubkeyList(detail?.members || [])
+        detailName = detail?.metadata?.name
+        detailPicture = detail?.metadata?.picture
+        detailAbout = detail?.metadata?.about
       } catch (_err) {
         detailMembers = []
       }
-      const isPublicGroup = meta?.isPublic !== false
-      const membershipRelayUrls = buildMembershipPublishTargets(resolved, isPublicGroup)
 
-      // Build put-user (9000) with token.
-      const putUser: TDraftEvent = {
-        kind: 9000,
-        created_at: timestamp,
-        tags: [
-          ['h', groupId],
-          ['p', targetPubkey, 'member', token]
-        ],
-        content: ''
-      }
-      if (membershipRelayUrls.length) {
-        await publish(putUser, { specifiedRelayUrls: membershipRelayUrls })
-      }
-      const invitePicture = meta?.picture
       const authorizedMemberPubkeys = normalizePubkeyList([...detailMembers, targetPubkey])
-
-      const baseRelayUrl = resolved ? getBaseRelayUrl(resolved) : undefined
-      const relayEntry = getRelayEntryForGroup(groupId)
-      const inviteRelayUrl = baseRelayUrl || resolved || relay || null
-      const inviteRelayKey =
-        relayEntry?.relayKey || extractRelayKeyFromUrl(inviteRelayUrl) || null
-      if (!inviteRelayKey) {
-        console.warn('[GroupsProvider] Missing relayKey for approval invite payload', {
-          groupId,
-          relayUrl: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 80) : null
-        })
-      }
-
-      let writerInfo: {
-        writerCore?: string
-        writerCoreHex?: string
-        autobaseLocal?: string
-        writerSecret?: string
-        poolCoreRefs?: string[]
-        fastForward?: {
-          key?: string | null
-          length?: number | null
-          signedLength?: number | null
-          timeoutMs?: number | null
-        } | null
-      } | null = null
-      if (sendToWorker && relayEntry?.relayKey) {
-        try {
-          const res = await sendToWorker({
-            type: 'provision-writer-for-invitee',
-            data: {
-              relayKey: relayEntry.relayKey,
-              publicIdentifier: groupId,
-              inviteePubkey: targetPubkey,
-              useWriterPool: true
-            }
-          })
-          if (res && typeof res === 'object') {
-            writerInfo = {
-              writerCore: (res as any).writerCore,
-              writerCoreHex: (res as any).writerCoreHex,
-              autobaseLocal: (res as any).autobaseLocal,
-              writerSecret: (res as any).writerSecret,
-              poolCoreRefs: Array.isArray((res as any).poolCoreRefs) ? (res as any).poolCoreRefs : undefined,
-              fastForward: (res as any).fastForward || null
-            }
-          }
-          console.info('[GroupsProvider] Writer provisioning result (approval)', {
-            groupId,
-            targetPubkey,
-            relayKey: relayEntry.relayKey,
-            hasWriterCore: !!writerInfo?.writerCore,
-            hasWriterCoreHex: !!writerInfo?.writerCoreHex,
-            hasAutobaseLocal: !!writerInfo?.autobaseLocal,
-            hasWriterSecret: !!writerInfo?.writerSecret,
-            hasPoolCoreRefs: Array.isArray(writerInfo?.poolCoreRefs) && writerInfo.poolCoreRefs.length > 0,
-            hasFastForward: !!writerInfo?.fastForward
-          })
-        } catch (err) {
-          console.warn('[GroupsProvider] Failed to provision writer for approval', err)
-        }
-      }
-
-      let mirrorMetadata: InviteMirrorMetadata = await fetchInviteMirrorMetadata(
-        inviteRelayKey || relayEntry?.relayKey || groupId,
-        resolved
-      )
-      const writerCoreKey =
-        writerInfo?.writerCoreHex || writerInfo?.autobaseLocal || writerInfo?.writerCore
-      const extraCoreRefs = [
-        ...(Array.isArray(writerInfo?.poolCoreRefs) ? writerInfo.poolCoreRefs : []),
-        writerCoreKey
-      ].filter(Boolean) as string[]
-      if (extraCoreRefs.length) {
-        const nextMirrorMetadata: NonNullable<InviteMirrorMetadata> = mirrorMetadata
-          ? { ...mirrorMetadata }
-          : { blindPeer: undefined, cores: [] }
-        const cores = Array.isArray(nextMirrorMetadata.cores) ? [...nextMirrorMetadata.cores] : []
-        extraCoreRefs.forEach((ref) => {
-          if (!cores.some((entry) => entry.key === ref)) {
-            cores.push({ key: ref, role: 'autobase-writer' })
-          }
-        })
-        nextMirrorMetadata.cores = cores
-        mirrorMetadata = nextMirrorMetadata
-      }
-      const payload = buildInvitePayload({
-        token,
-        relayUrl: inviteRelayUrl,
-        relayKey: inviteRelayKey,
-        meta,
-        groupName: meta?.name,
-        groupPicture: invitePicture,
-        authorizedMemberPubkeys,
-        mirrorMetadata,
-        writerInfo,
-        fastForward: writerInfo?.fastForward || null
-      })
-      console.info('[GroupsProvider] Approval invite payload built', {
+      console.info('[GroupsProvider] Join request approval handoff to sendInvites', {
         groupId,
         targetPubkey,
-        hasWriterCore: !!writerInfo?.writerCore,
-        hasWriterCoreHex: !!writerInfo?.writerCoreHex,
-        hasAutobaseLocal: !!writerInfo?.autobaseLocal,
-        hasWriterSecret: !!writerInfo?.writerSecret,
-        hasFastForward: !!writerInfo?.fastForward
+        relay,
+        resolved,
+        requestCreatedAt: requestCreatedAt ?? null,
+        authorizedMemberPubkeysCount: authorizedMemberPubkeys.length
       })
 
-      // Build encrypted invite (9009)
-      const tags: string[][] = [
-        ['h', groupId],
-        ['p', targetPubkey],
-        ['i', 'hypertuna']
-      ]
-      if (meta?.name) tags.push(['name', meta.name])
-      if (meta?.about) tags.push(['about', meta.about])
-      if (invitePicture) tags.push(['picture', invitePicture])
-      tags.push([payload.fileSharing === false ? 'file-sharing-off' : 'file-sharing-on'])
-
-      const encryptedPayload = await nip04Encrypt(targetPubkey, JSON.stringify(payload))
-      const inviteEvent: TDraftEvent = {
-        kind: 9009,
-        created_at: timestamp,
-        tags,
-        content: encryptedPayload
-      }
-      await publish(inviteEvent, { specifiedRelayUrls: inviteRelayUrls })
-
-      // Notify worker about auth/membership so relay profile is synced
-      try {
-        if (sendToWorker) {
-          const memberTs = Date.now()
-          await sendToWorker({
-            type: 'update-auth-data',
-            data: {
-              relayKey: relayEntry?.relayKey,
-              publicIdentifier: groupId,
-              pubkey: targetPubkey,
-              token
-            }
-          })
-          await sendToWorker({
-            type: 'update-members',
-            data: {
-              relayKey: relayEntry?.relayKey,
-              publicIdentifier: groupId,
-              member_adds: [{ pubkey: targetPubkey, ts: memberTs }]
-            }
-          })
-        }
-      } catch (_err) {
-        // best effort; worker may not be available in web mode
-      }
-
-      setJoinRequests((prev) => {
-        const next = { ...prev }
-        next[groupKey] = (prev[groupKey] || []).filter((req) => req.pubkey !== targetPubkey)
-        return next
+      await sendInvites(groupId, [targetPubkey], relay, {
+        isOpen: false,
+        name: detailName,
+        about: detailAbout,
+        picture: detailPicture,
+        authorizedMemberPubkeys
       })
-      setRejectedJoinRequests((prev) => {
+
+      const requestsForGroup = joinRequests[groupKey] || []
+      const matchingRequests = requestsForGroup.filter((req) =>
+        req.pubkey === targetPubkey &&
+        (typeof requestCreatedAt !== 'number' || req.created_at === requestCreatedAt)
+      )
+      const handledKeys = matchingRequests.map((req) => toJoinRequestHandledKey(req.pubkey, req.created_at))
+      if (typeof requestCreatedAt === 'number' && handledKeys.length === 0) {
+        handledKeys.push(toJoinRequestHandledKey(targetPubkey, requestCreatedAt))
+      }
+
+      setHandledJoinRequests((prev) => {
         const next = { ...prev }
         const set = new Set(next[groupKey] || [])
-        set.delete(targetPubkey)
+        handledKeys.forEach((k) => set.add(k))
         next[groupKey] = set
         return next
       })
-
-      await republishMemberSnapshot39002({
-        groupId,
-        relay: resolved || relay || undefined,
-        isPublicGroup,
-        reason: 'approve-join-request'
+      setJoinRequests((prev) => {
+        const next = { ...prev }
+        next[groupKey] = (prev[groupKey] || []).filter((req) => {
+          if (req.pubkey !== targetPubkey) return true
+          if (typeof requestCreatedAt === 'number') return req.created_at !== requestCreatedAt
+          return false
+        })
+        return next
       })
     },
-    [
-      discoveryGroups,
-      discoveryRelays,
-      fetchGroupDetail,
-      fetchInviteMirrorMetadata,
-      getRelayEntryForGroup,
-      nip04Encrypt,
-      publish,
-      pubkey,
-      republishMemberSnapshot39002,
-      resolveRelayUrl,
-      sendToWorker
-    ]
+    [fetchGroupDetail, joinRequests, pubkey, resolveRelayUrl, sendInvites]
   )
 
   const rejectJoinRequest = useCallback(
-    async (groupId: string, targetPubkey: string, relay?: string) => {
+    async (groupId: string, targetPubkey: string, relay?: string, requestCreatedAt?: number) => {
       const groupKey = toGroupKey(groupId, relay)
-      setJoinRequests((prev) => {
-        const next = { ...prev }
-        next[groupKey] = (prev[groupKey] || []).filter((req) => req.pubkey !== targetPubkey)
-        return next
-      })
-      setRejectedJoinRequests((prev) => {
+      const requestsForGroup = joinRequests[groupKey] || []
+      const matchingRequests = requestsForGroup.filter((req) =>
+        req.pubkey === targetPubkey &&
+        (typeof requestCreatedAt !== 'number' || req.created_at === requestCreatedAt)
+      )
+      const handledKeys = matchingRequests.map((req) => toJoinRequestHandledKey(req.pubkey, req.created_at))
+      if (typeof requestCreatedAt === 'number' && handledKeys.length === 0) {
+        handledKeys.push(toJoinRequestHandledKey(targetPubkey, requestCreatedAt))
+      }
+
+      setHandledJoinRequests((prev) => {
         const next = { ...prev }
         const set = new Set(next[groupKey] || [])
-        set.add(targetPubkey)
+        handledKeys.forEach((k) => set.add(k))
         next[groupKey] = set
         return next
       })
+      setJoinRequests((prev) => {
+        const next = { ...prev }
+        next[groupKey] = (prev[groupKey] || []).filter((req) => {
+          if (req.pubkey !== targetPubkey) return true
+          if (typeof requestCreatedAt === 'number') return req.created_at !== requestCreatedAt
+          return false
+        })
+        return next
+      })
     },
-    []
+    [joinRequests]
   )
 
   const updateMetadata = useCallback(
