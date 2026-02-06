@@ -321,7 +321,117 @@ export default class NostrRelay extends Autobee {
   }
 
   _isEphemeralSubscriptionId(subscriptionId) {
-    return typeof subscriptionId === 'string' && subscriptionId.startsWith('f-fetch-events');
+    if (typeof subscriptionId !== 'string') return false;
+    return (
+      subscriptionId.startsWith('f-fetch-events') ||
+      subscriptionId.startsWith('f-more') ||
+      subscriptionId.startsWith('f-temporary')
+    );
+  }
+
+  _isTimelineSubscriptionId(subscriptionId) {
+    return typeof subscriptionId === 'string' && subscriptionId.startsWith('f-timeline');
+  }
+
+  _buildSubscriptionSignature(entry) {
+    if (!entry || typeof entry !== 'object') return null;
+    const filters = Array.isArray(entry.filters) ? entry.filters : null;
+    if (!filters || filters.length === 0) return null;
+    try {
+      const normalizedFilters = filters.map((filter) => {
+        if (!filter || typeof filter !== 'object' || Array.isArray(filter)) return filter;
+        const normalizedFilter = {};
+        const keys = Object.keys(filter).sort();
+        for (const key of keys) {
+          const value = filter[key];
+          if (Array.isArray(value)) {
+            normalizedFilter[key] = [...value].sort((a, b) =>
+              String(a).localeCompare(String(b))
+            );
+          } else {
+            normalizedFilter[key] = value;
+          }
+        }
+        return normalizedFilter;
+      });
+      return JSON.stringify(normalizedFilters);
+    } catch {
+      return null;
+    }
+  }
+
+  _subscriptionTimestamp(entry) {
+    const ts = entry?.last_returned_event_timestamp;
+    return Number.isFinite(ts) ? ts : -Infinity;
+  }
+
+  _pruneTimelineSubscriptions(
+    subscriptions,
+    { preferredSubscriptionId = null, maxTimelineSubscriptions = 32 } = {}
+  ) {
+    if (!subscriptions || typeof subscriptions !== 'object') {
+      return { subscriptions: {}, removedTimelineIds: [], keptTimelineIds: [] };
+    }
+
+    const nonTimelineSubscriptions = {};
+    const timelineEntries = [];
+    const bySignature = new Map();
+
+    for (const [subscriptionId, entry] of Object.entries(subscriptions)) {
+      if (!this._isTimelineSubscriptionId(subscriptionId)) {
+        nonTimelineSubscriptions[subscriptionId] = entry;
+        continue;
+      }
+      timelineEntries.push({ subscriptionId, entry });
+      const signature = this._buildSubscriptionSignature(entry) || `__id:${subscriptionId}`;
+      const existing = bySignature.get(signature);
+      if (!existing) {
+        bySignature.set(signature, { subscriptionId, entry });
+        continue;
+      }
+
+      const existingPreferred = existing.subscriptionId === preferredSubscriptionId;
+      const incomingPreferred = subscriptionId === preferredSubscriptionId;
+      if (incomingPreferred && !existingPreferred) {
+        bySignature.set(signature, { subscriptionId, entry });
+        continue;
+      }
+      if (!incomingPreferred && existingPreferred) {
+        continue;
+      }
+
+      const existingTs = this._subscriptionTimestamp(existing.entry);
+      const incomingTs = this._subscriptionTimestamp(entry);
+      if (incomingTs > existingTs) {
+        bySignature.set(signature, { subscriptionId, entry });
+      }
+    }
+
+    let selectedTimelineEntries = Array.from(bySignature.values());
+    if (selectedTimelineEntries.length > maxTimelineSubscriptions) {
+      selectedTimelineEntries = selectedTimelineEntries
+        .sort((a, b) => {
+          if (a.subscriptionId === preferredSubscriptionId) return -1;
+          if (b.subscriptionId === preferredSubscriptionId) return 1;
+          const bTs = this._subscriptionTimestamp(b.entry);
+          const aTs = this._subscriptionTimestamp(a.entry);
+          return bTs - aTs;
+        })
+        .slice(0, maxTimelineSubscriptions);
+    }
+
+    const keptTimelineIds = selectedTimelineEntries.map((entry) => entry.subscriptionId);
+    const keptTimelineIdSet = new Set(keptTimelineIds);
+    const removedTimelineIds = timelineEntries
+      .map((entry) => entry.subscriptionId)
+      .filter((subscriptionId) => !keptTimelineIdSet.has(subscriptionId));
+
+    const prunedSubscriptions = { ...nonTimelineSubscriptions };
+    for (const { subscriptionId, entry } of selectedTimelineEntries) {
+      prunedSubscriptions[subscriptionId] = entry;
+    }
+
+    return { subscriptions: prunedSubscriptions, removedTimelineIds, keptTimelineIds };
   }
 
   _filterEphemeralSubscriptions(subscriptions) {
@@ -1213,10 +1323,26 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
         filters: filters
       };
 
+      const {
+        subscriptions: prunedSubscriptions,
+        removedTimelineIds,
+        keptTimelineIds
+      } = this._pruneTimelineSubscriptions(subscriptions, {
+        preferredSubscriptionId: subscriptionId
+      });
+      if (removedTimelineIds.length > 0) {
+        logWithTimestamp('publishSubscription: pruned timeline subscriptions', {
+          connectionKey,
+          preferredSubscriptionId: subscriptionId,
+          removedCount: removedTimelineIds.length,
+          keptCount: keptTimelineIds.length
+        });
+      }
+
       const subscriptionObject = {
         ...mergedSnapshot,
         connection: connectionKey,
-        subscriptions
+        subscriptions: prunedSubscriptions
       };
 
       logWithTimestamp('publishSubscription: Subscription write requested', {
@@ -1256,7 +1382,7 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
 
       logWithTimestamp(`publishSubscription: Published subscription for connection: ${connectionKey}, subscriptionId: ${subscriptionId}`);
       if (clientId) {
-        const persistentSubscriptions = this._filterEphemeralSubscriptions(subscriptions);
+        const persistentSubscriptions = this._filterEphemeralSubscriptions(prunedSubscriptions);
         const clientSnapshot = {
           clientId,
           connection: connectionKey,
@@ -1293,7 +1419,18 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
 
       const storedSnapshot = await this.getSubscriptions(connectionKey);
       const mergedSnapshot = this._mergeSubscriptionSnapshots(storedSnapshot, activeSubscriptionsUpdated);
+      const {
+        subscriptions: prunedSubscriptions,
+        removedTimelineIds
+      } = this._pruneTimelineSubscriptions(mergedSnapshot?.subscriptions || {});
       mergedSnapshot.connection = connectionKey;
+      mergedSnapshot.subscriptions = prunedSubscriptions;
+      if (removedTimelineIds.length > 0) {
+        logWithTimestamp('updateSubscriptions: pruned timeline subscriptions', {
+          connectionKey,
+          removedCount: removedTimelineIds.length
+        });
+      }
 
       await this.append({
         type: 'subscriptions',
@@ -1355,11 +1492,21 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
       const existingSnapshot = await this.getClientSubscriptions(clientId);
       const mergedSnapshot = this._mergeSubscriptionSnapshots(existingSnapshot, subscriptionObject);
       const filteredSubscriptions = this._filterEphemeralSubscriptions(mergedSnapshot?.subscriptions || {});
+      const {
+        subscriptions: prunedSubscriptions,
+        removedTimelineIds
+      } = this._pruneTimelineSubscriptions(filteredSubscriptions);
+      if (removedTimelineIds.length > 0) {
+        logWithTimestamp('updateClientSubscriptions: pruned timeline subscriptions', {
+          clientId,
+          removedCount: removedTimelineIds.length
+        });
+      }
 
       const safeSnapshot = {
         clientId,
         connection: mergedSnapshot?.connection ?? null,
-        subscriptions: filteredSubscriptions
+        subscriptions: prunedSubscriptions
       };
 
       await this.append({

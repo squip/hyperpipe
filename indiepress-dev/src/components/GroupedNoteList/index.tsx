@@ -38,6 +38,18 @@ type TNoteGroup = {
   allNoteTimestamps: number[]
 }
 
+type GroupedNoteListSnapshot = {
+  subRequestsSignature: string
+  showKindsKey: string
+  settingsSignature: string
+  events: Event[]
+  updatedAt: number
+}
+
+const groupedNoteListSnapshotCache = new Map<string, GroupedNoteListSnapshot>()
+type RefreshTrigger = 'imperative-ref' | 'empty-state-button' | 'pull-to-refresh'
+const EMPTY_FINAL_FALLBACK_DELAY_MS = 1200
+
 const GroupedNoteList = forwardRef(
   (
     {
@@ -90,8 +102,27 @@ const GroupedNoteList = forwardRef(
     const settingsIdentityRef = useRef(settings)
     const resubscribeTimerRef = useRef<number | null>(null)
     const resubscribeAttemptRef = useRef(0)
+    const emptyFinalFallbackTimerRef = useRef<number | null>(null)
+    const emptyFinalFallbackAttemptedRef = useRef(false)
+    const emptyFinalFallbackContextRef = useRef<string>('')
     const softResubscribeRef = useRef(false)
+    const eventsRef = useRef<Event[]>([])
+    const snapshotCacheKey = useMemo(() => debugLabel || null, [debugLabel])
     const { getPinBuryState } = usePinBury()
+    const timelineLabel = useMemo(() => {
+      const relayReq = subRequests.find(
+        (
+          req
+        ): req is Extract<TFeedSubRequest, { source: 'relays' }> =>
+          req.source === 'relays' && Array.isArray((req.filter as { ['#h']?: string[] })?.['#h'])
+      )
+      const hTag = relayReq ? (relayReq.filter as { ['#h']?: string[] })?.['#h']?.[0] : null
+      if (!hTag) return undefined
+      const normalized = String(hTag)
+        .replace(/[^a-zA-Z0-9]/g, '')
+        .slice(0, 24)
+      return `f-timeline-group-${normalized || 'default'}`
+    }, [subRequests])
 
     const [{ noteGroups, hasNoResults }, setNoteGroups] = useState<{
       noteGroups: TNoteGroup[]
@@ -100,6 +131,41 @@ const GroupedNoteList = forwardRef(
       noteGroups: [],
       hasNoResults: false
     })
+
+    useEffect(() => {
+      eventsRef.current = events
+      if (!snapshotCacheKey || events.length === 0) return
+      const settingsSignature = JSON.stringify({
+        includeReplies: settings.includeReplies,
+        showOnlyFirstLevelReplies: settings.showOnlyFirstLevelReplies,
+        hideShortNotes: settings.hideShortNotes,
+        wordFilter: settings.wordFilter,
+        maxNotesFilter: settings.maxNotesFilter,
+        timeFrame: settings.timeFrame
+      })
+      const subRequestsSignature = JSON.stringify(
+        subRequests.map((req) => {
+          if (req.source === 'local') {
+            return { source: 'local', filterKeys: Object.keys(req.filter ?? {}) }
+          }
+          const hTag = Array.isArray(req.filter?.['#h']) ? req.filter['#h'][0] : undefined
+          return {
+            source: 'relays',
+            urls: req.urls,
+            filterKeys: Object.keys(req.filter ?? {}),
+            kindsCount: Array.isArray(req.filter?.kinds) ? req.filter.kinds.length : 0,
+            hTag: hTag ? String(hTag).slice(0, 32) : null
+          }
+        })
+      )
+      groupedNoteListSnapshotCache.set(snapshotCacheKey, {
+        subRequestsSignature,
+        showKindsKey: showKinds.join(','),
+        settingsSignature,
+        events,
+        updatedAt: Date.now()
+      })
+    }, [events, settings, showKinds, snapshotCacheKey, subRequests])
 
     useEffect(() => {
       let filteredEvents = events
@@ -301,14 +367,60 @@ const GroupedNoteList = forwardRef(
       }, 20)
     }
 
-    const refresh = () => {
-      scrollToTop()
+    const resetEmptyFinalFallbackState = (trigger: RefreshTrigger) => {
+      const attempted = emptyFinalFallbackAttemptedRef.current
+      emptyFinalFallbackAttemptedRef.current = false
+      if (emptyFinalFallbackTimerRef.current !== null) {
+        clearTimeout(emptyFinalFallbackTimerRef.current)
+        emptyFinalFallbackTimerRef.current = null
+      }
+      console.info('[GroupedNoteList] empty-final fallback state reset', {
+        label: debugLabel ?? null,
+        activeTab: debugActiveTab ?? null,
+        trigger,
+        attempted
+      })
+    }
+
+    const refresh = (trigger: RefreshTrigger = 'imperative-ref') => {
+      console.info('[GroupedNoteList] refresh requested', {
+        label: debugLabel ?? null,
+        activeTab: debugActiveTab ?? null,
+        trigger,
+        refreshCount,
+        eventsCount: eventsRef.current.length,
+        loading
+      })
+      resetEmptyFinalFallbackState(trigger)
+      // Avoid jumping the entire GroupPage header when user clicks reload in empty state.
+      if (trigger !== 'empty-state-button') {
+        scrollToTop()
+      }
       setTimeout(() => {
-        setRefreshCount((count) => count + 1)
+        // Keep existing notes while forcing a resubscribe to avoid UI flicker/empty-state flashes.
+        softResubscribeRef.current = true
+        setRefreshCount((count) => {
+          const next = count + 1
+          console.info('[GroupedNoteList] refreshCount increment', {
+            label: debugLabel ?? null,
+            activeTab: debugActiveTab ?? null,
+            trigger,
+            from: count,
+            to: next
+          })
+          return next
+        })
       }, 500)
     }
 
-    useImperativeHandle(ref, () => ({ scrollToTop, refresh }), [])
+    useImperativeHandle(
+      ref,
+      () => ({
+        scrollToTop,
+        refresh: () => refresh('imperative-ref')
+      }),
+      [refresh]
+    )
 
     useEffect(() => {
       if (hasLoggedMount.current) return
@@ -353,6 +465,15 @@ const GroupedNoteList = forwardRef(
         maxNotesFilter: settings.maxNotesFilter,
         timeFrame: settings.timeFrame
       })
+      const retryContextKey = `${subRequestsSignature}|${showKinds.join(',')}|${settingsSignature}`
+      if (emptyFinalFallbackContextRef.current !== retryContextKey) {
+        emptyFinalFallbackContextRef.current = retryContextKey
+        emptyFinalFallbackAttemptedRef.current = false
+        if (emptyFinalFallbackTimerRef.current !== null) {
+          clearTimeout(emptyFinalFallbackTimerRef.current)
+          emptyFinalFallbackTimerRef.current = null
+        }
+      }
       const snapshot = {
         effectId,
         label: debugLabel ?? null,
@@ -387,11 +508,50 @@ const GroupedNoteList = forwardRef(
 
       if (!subRequests.length) return
 
-      if (!softResubscribe) {
+      const sameSubscriptionInputs =
+        prev !== null &&
+        prev.subRequestsSignature === subRequestsSignature &&
+        prev.showKindsKey === snapshot.showKindsKey &&
+        prev.settingsSignature === settingsSignature
+      const cachedSnapshot = snapshotCacheKey
+        ? groupedNoteListSnapshotCache.get(snapshotCacheKey)
+        : null
+      const sameCachedSubscriptionInputs =
+        !!cachedSnapshot &&
+        cachedSnapshot.subRequestsSignature === subRequestsSignature &&
+        cachedSnapshot.showKindsKey === snapshot.showKindsKey &&
+        cachedSnapshot.settingsSignature === settingsSignature
+
+      if (sameCachedSubscriptionInputs && eventsRef.current.length === 0 && cachedSnapshot?.events?.length) {
+        console.info('[GroupedNoteList] restored events from snapshot cache', {
+          label: debugLabel ?? null,
+          activeTab: debugActiveTab ?? null,
+          eventCount: cachedSnapshot.events.length
+        })
+        setEvents(cachedSnapshot.events)
+      }
+
+      const preserveExistingEvents =
+        softResubscribe || sameSubscriptionInputs || sameCachedSubscriptionInputs
+
+      if (!preserveExistingEvents) {
         setLoading(true)
         setEvents([])
         setNewEvents([])
       } else {
+        if (!softResubscribe && sameSubscriptionInputs) {
+          console.info('[GroupedNoteList] preserving events on equivalent subscription refresh', {
+            label: debugLabel ?? null,
+            activeTab: debugActiveTab ?? null,
+            effectId
+          })
+        } else if (!softResubscribe && sameCachedSubscriptionInputs) {
+          console.info('[GroupedNoteList] preserving events on cached equivalent subscription', {
+            label: debugLabel ?? null,
+            activeTab: debugActiveTab ?? null,
+            effectId
+          })
+        }
         setLoading(true)
       }
 
@@ -470,6 +630,69 @@ const GroupedNoteList = forwardRef(
           setRefreshCount((curr) => curr + 1)
         }, delayMs)
       }
+      let effectActive = true
+      const scheduleEmptyFinalFallback = (reason: string) => {
+        if (!canResubscribe) return false
+        if (eventsRef.current.length > 0) return false
+        if (emptyFinalFallbackAttemptedRef.current) return false
+        if (emptyFinalFallbackTimerRef.current !== null) return true
+
+        emptyFinalFallbackAttemptedRef.current = true
+        const delayMs = EMPTY_FINAL_FALLBACK_DELAY_MS
+        console.info('[GroupedNoteList] empty-final fallback scheduled', {
+          label: debugLabel ?? null,
+          activeTab: debugActiveTab ?? null,
+          effectId,
+          delayMs,
+          reason
+        })
+        emptyFinalFallbackTimerRef.current = window.setTimeout(async () => {
+          emptyFinalFallbackTimerRef.current = null
+          console.info('[GroupedNoteList] empty-final fallback firing', {
+            label: debugLabel ?? null,
+            activeTab: debugActiveTab ?? null,
+            effectId
+          })
+          try {
+            const fallbackEvents = await client.loadMoreTimeline(
+              subRequests,
+              {
+                kinds: showKinds,
+                since: groupedNotesSince
+              },
+              {
+                startLogin
+              }
+            )
+            const filteredEvents = fallbackEvents.filter((evt) => !shouldHideEvent(evt))
+            console.info('[GroupedNoteList] empty-final fallback result', {
+              label: debugLabel ?? null,
+              activeTab: debugActiveTab ?? null,
+              effectId,
+              batchSize: filteredEvents.length
+            })
+            if (!effectActive) return
+            if (filteredEvents.length > 0) {
+              setEvents((currentEvents) => {
+                const merged = [...filteredEvents, ...currentEvents].sort(
+                  (a, b) => b.created_at - a.created_at
+                )
+                return merged.filter((evt, i) => i === 0 || evt.id !== merged[i - 1].id)
+              })
+            }
+          } catch (error) {
+            console.warn('[GroupedNoteList] empty-final fallback failed', {
+              label: debugLabel ?? null,
+              activeTab: debugActiveTab ?? null,
+              effectId,
+              error: error instanceof Error ? error.message : String(error)
+            })
+          } finally {
+            if (effectActive) setLoading(false)
+          }
+        }, delayMs)
+        return true
+      }
 
       const subc = client.subscribeTimeline(
         subRequests,
@@ -482,7 +705,28 @@ const GroupedNoteList = forwardRef(
             events = events.filter((evt) => !shouldHideEvent(evt))
 
             if (isFinal) {
-              setLoading(false)
+              const isEmptyFinal = events.length === 0
+              const hasCachedEvents = eventsRef.current.length > 0
+              let fallbackScheduled = false
+              if (isEmptyFinal && !hasCachedEvents) {
+                fallbackScheduled = scheduleEmptyFinalFallback('final-empty-batch')
+              } else if (!isEmptyFinal) {
+                emptyFinalFallbackAttemptedRef.current = false
+                if (emptyFinalFallbackTimerRef.current !== null) {
+                  clearTimeout(emptyFinalFallbackTimerRef.current)
+                  emptyFinalFallbackTimerRef.current = null
+                }
+              }
+              console.info('[GroupedNoteList] onEvents final batch', {
+                label: debugLabel ?? null,
+                activeTab: debugActiveTab ?? null,
+                effectId,
+                batchSize: events.length,
+                hasCachedEvents,
+                fallbackScheduled,
+                fallbackAttempted: emptyFinalFallbackAttemptedRef.current
+              })
+              setLoading(fallbackScheduled)
             }
 
             if (events.length > 0) {
@@ -560,14 +804,20 @@ const GroupedNoteList = forwardRef(
           }
         },
         {
-          startLogin
+          startLogin,
+          timelineLabel
         }
       )
 
       return () => {
+        effectActive = false
         if (resubscribeTimerRef.current !== null) {
           clearTimeout(resubscribeTimerRef.current)
           resubscribeTimerRef.current = null
+        }
+        if (emptyFinalFallbackTimerRef.current !== null) {
+          clearTimeout(emptyFinalFallbackTimerRef.current)
+          emptyFinalFallbackTimerRef.current = null
         }
         console.info('[GroupedNoteList] subscribe cleanup', {
           effectId,
@@ -577,7 +827,7 @@ const GroupedNoteList = forwardRef(
         })
         subc.close(`GroupedNoteList cleanup effectId=${effectId}`)
       }
-    }, [subRequests, refreshCount, showKinds, settings])
+    }, [subRequests, refreshCount, showKinds, settings, timelineLabel])
 
     function mergeNewEvents() {
       setEvents((oldEvents) =>
@@ -670,7 +920,7 @@ const GroupedNoteList = forwardRef(
           </div>
         ) : !loading && !events.length ? (
           <div className="flex justify-center w-full mt-2">
-            <Button size="lg" onClick={() => setRefreshCount((count) => count + 1)}>
+            <Button size="lg" onClick={() => refresh('empty-state-button')}>
               {t('reload notes')}
             </Button>
           </div>
@@ -684,7 +934,7 @@ const GroupedNoteList = forwardRef(
         {supportTouch ? (
           <PullToRefresh
             onRefresh={async () => {
-              refresh()
+              refresh('pull-to-refresh')
               await new Promise((resolve) => setTimeout(resolve, 1000))
             }}
             pullingContent=""

@@ -22,81 +22,86 @@ import { toast } from 'sonner'
 type TTab = 'discover' | 'my' | 'invites'
 
 const makeGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${groupId}` : groupId)
-
-const facepileCache = new Map<string, string[]>() // persists across page mounts within the session
-let runningFetches = 0
-const facepilePending = new Map<string, Promise<string[]>>()
+const GROUP_FACEPILE_REFRESH_INTERVAL_MS = 60 * 1000
+const GROUP_FACEPILE_REFRESH_JITTER_MS = 10 * 1000
 
 function GroupFacepile({ groupId, relay, show }: { groupId: string; relay?: string; show: boolean }) {
   const { t } = useTranslation()
   const { followList } = useNostr()
-  const { fetchGroupDetail, myGroupList } = useGroups()
+  const { getGroupMemberPreview, refreshGroupMemberPreview, groupMemberPreviewVersion } = useGroups()
   const { getRelayPeerCount } = useWorkerBridge()
   const [members, setMembers] = useState<string[] | null>(null)
 
-  if (!show) return null
-
-  // Lightweight, rate-limited member fetch to avoid hammering relays for every card
   useEffect(() => {
-    let cancelled = false
-    const cacheKey = makeGroupKey(groupId, relay)
-    if (facepileCache.has(cacheKey)) {
-      setMembers(facepileCache.get(cacheKey) || [])
+    if (!show) {
+      setMembers(null)
       return
     }
-
-    // simple semaphore limiter
-    const MAX_CONCURRENT = 2
-    const acquire = async () => {
-      while (runningFetches >= MAX_CONCURRENT) {
-        await new Promise((res) => setTimeout(res, 150))
-      }
-      runningFetches += 1
-      return () => {
-        runningFetches = Math.max(0, runningFetches - 1)
-      }
+    let cancelled = false
+    const cached = getGroupMemberPreview(groupId, relay)
+    if (cached) {
+      setMembers(cached.members)
+      console.info('[GroupFacepile] cache read', {
+        groupId,
+        relay: relay || null,
+        membersCount: cached.members.length,
+        source: cached.source,
+        authoritative: cached.authoritative,
+        previewVersion: groupMemberPreviewVersion
+      })
     }
 
-    const loadMembers = () => {
-      const pending = facepilePending.get(cacheKey)
-      if (pending) return pending
-
-      const promise = (async () => {
-        const release = await acquire()
-        try {
-          const isMember = myGroupList.some(
-            (entry) => entry.groupId === groupId && (!relay || entry.relay === relay)
-          )
-          const detail = await fetchGroupDetail(groupId, relay, {
-            discoveryOnly: !isMember,
-            preferRelay: isMember
+    const load = async (force = false) => {
+      try {
+        const memberList = await refreshGroupMemberPreview(groupId, relay, {
+          force,
+          reason: force ? 'groups-page-facepile-interval' : 'groups-page-facepile-init'
+        })
+        if (!cancelled) {
+          const latest = getGroupMemberPreview(groupId, relay)
+          const shouldPreferLatest =
+            !!latest &&
+            latest.authoritative &&
+            latest.members.length >= memberList.length
+          const appliedMembers = shouldPreferLatest ? latest.members : memberList
+          setMembers(appliedMembers)
+          console.info('[GroupFacepile] applied preview', {
+            groupId,
+            relay: relay || null,
+            membersCount: appliedMembers.length,
+            force,
+            preferredAuthoritativeCache: shouldPreferLatest,
+            previewVersion: groupMemberPreviewVersion
           })
-          return detail.members || []
-        } finally {
-          release()
         }
-      })()
-      facepilePending.set(cacheKey, promise)
-      promise.finally(() => facepilePending.delete(cacheKey))
-      return promise
+      } catch (_err) {
+        if (!cancelled) setMembers(cached?.members || [])
+      }
     }
 
-    loadMembers()
-      .then((memberList) => {
+    load(!cached)
+    let timer: number | null = null
+    const scheduleRefresh = () => {
+      const jitter = Math.floor(Math.random() * GROUP_FACEPILE_REFRESH_JITTER_MS)
+      timer = window.setTimeout(async () => {
         if (cancelled) return
-        facepileCache.set(cacheKey, memberList)
-        setMembers(memberList)
-      })
-      .catch(() => {
-        if (cancelled) return
-        facepileCache.set(cacheKey, [])
-        setMembers([])
-      })
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+          scheduleRefresh()
+          return
+        }
+        await load(false)
+        scheduleRefresh()
+      }, GROUP_FACEPILE_REFRESH_INTERVAL_MS + jitter)
+    }
+    scheduleRefresh()
 
     return () => {
       cancelled = true
+      if (timer !== null) {
+        window.clearTimeout(timer)
+      }
     }
-  }, [fetchGroupDetail, groupId, relay, myGroupList])
+  }, [getGroupMemberPreview, groupId, relay, refreshGroupMemberPreview, show, groupMemberPreviewVersion])
 
   const sortedMembers = useMemo(() => {
     if (!members || !members.length) return []
@@ -110,7 +115,7 @@ function GroupFacepile({ groupId, relay, show }: { groupId: string; relay?: stri
     return list.slice(0, 3)
   }, [members, followList])
 
-  if (!members || members.length === 0 || sortedMembers.length === 0) return null
+  if (!show || !members || members.length === 0 || sortedMembers.length === 0) return null
 
   const memberCountLabel = `${new Intl.NumberFormat(undefined, { notation: 'compact' }).format(
     members.length

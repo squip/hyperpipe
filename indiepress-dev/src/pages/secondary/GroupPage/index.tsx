@@ -346,6 +346,14 @@ type TGroupPageProps = {
 
 const makeGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${groupId}` : groupId)
 
+const normalizeComparablePubkeys = (values: string[]) =>
+  [...new Set((values || []).map((value) => String(value || '').trim()).filter(Boolean))].sort()
+
+const areComparablePubkeysEqual = (left: string[], right: string[]) => {
+  if (left.length !== right.length) return false
+  return left.every((value, index) => value === right[index])
+}
+
 const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, ref) => {
   const { t } = useTranslation()
   const {
@@ -403,6 +411,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     } as NostrEvent
   }, [reportTarget])
   const requestIdRef = useRef(0)
+  const lastRouteSubscriptionRefreshRef = useRef<string | null>(null)
 
   const myGroupRelay = useMemo(
     () => (groupId ? myGroupList.find((entry) => entry.groupId === groupId)?.relay : undefined),
@@ -444,6 +453,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           groupId,
           relay: effectiveGroupRelay,
           membershipStatus: d?.membershipStatus,
+          membershipAuthoritative: d?.membershipAuthoritative,
+          membershipEventsCount: d?.membershipEventsCount,
+          membersFromEventCount: d?.membersFromEventCount,
+          membersSnapshotCreatedAt: d?.membersSnapshotCreatedAt,
+          membershipFetchTimedOutLike: d?.membershipFetchTimedOutLike,
+          membershipFetchSource: d?.membershipFetchSource,
           membersCount: d?.members?.length,
           adminsCount: d?.admins?.length,
           metadataCreatedAt: d?.metadata?.event?.created_at,
@@ -473,6 +488,10 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           const normalizeMembers = (members?: any[]) =>
             (members || [])
               .map((m) => (typeof m === 'string' ? m : m?.pubkey))
+              .filter(Boolean) as string[]
+          const normalizeAdmins = (admins?: any[]) =>
+            (admins || [])
+              .map((admin) => String(admin?.pubkey || '').trim())
               .filter(Boolean) as string[]
 
           d.members = normalizeMembers(d.members)
@@ -533,6 +552,32 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           if ((!next.members || !next.members.length) && isSameGroup && normalizedPrevMembers?.length) {
             next.members = normalizedPrevMembers
           }
+          const nextMembers = normalizeMembers(next.members)
+          const shouldBlockMembershipDowngrade =
+            isSameGroup &&
+            normalizedPrevMembers.length > 0 &&
+            nextMembers.length < normalizedPrevMembers.length &&
+            !next.membershipAuthoritative &&
+            (next.membershipFetchTimedOutLike ||
+              (nextMembers.length === 1 && pubkey ? nextMembers[0] === pubkey : false))
+          if (shouldBlockMembershipDowngrade) {
+            console.info('[GroupPage] membership downgrade blocked (non-authoritative)', {
+              groupId,
+              prevMembersCount: normalizedPrevMembers.length,
+              nextMembersCount: nextMembers.length,
+              membershipStatus: next.membershipStatus,
+              membershipAuthoritative: next.membershipAuthoritative,
+              membershipEventsCount: next.membershipEventsCount,
+              membersFromEventCount: next.membersFromEventCount,
+              membersSnapshotCreatedAt: next.membersSnapshotCreatedAt,
+              membershipFetchTimedOutLike: next.membershipFetchTimedOutLike,
+              membershipFetchSource: next.membershipFetchSource
+            })
+            next.members = normalizedPrevMembers
+            if (prev?.membershipStatus) {
+              next.membershipStatus = prev.membershipStatus
+            }
+          }
           if (
             (!next.membershipStatus ||
               (next.membershipStatus === 'not-member' &&
@@ -555,6 +600,32 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
               }
             }
           }
+
+          const prevComparableMembers = normalizeComparablePubkeys(normalizeMembers(prev?.members))
+          const nextComparableMembers = normalizeComparablePubkeys(normalizeMembers(next.members))
+          const prevComparableAdmins = normalizeComparablePubkeys(normalizeAdmins(prev?.admins))
+          const nextComparableAdmins = normalizeComparablePubkeys(normalizeAdmins(next.admins))
+          const sameMembers = areComparablePubkeysEqual(prevComparableMembers, nextComparableMembers)
+          const sameAdmins = areComparablePubkeysEqual(prevComparableAdmins, nextComparableAdmins)
+          const sameMembership =
+            (prev?.membershipStatus || 'not-member') === (next.membershipStatus || 'not-member') &&
+            !!prev?.membershipAuthoritative === !!next.membershipAuthoritative &&
+            (prev?.membershipEventsCount || 0) === (next.membershipEventsCount || 0) &&
+            (prev?.membersFromEventCount || 0) === (next.membersFromEventCount || 0) &&
+            (prev?.membersSnapshotCreatedAt || null) === (next.membersSnapshotCreatedAt || null) &&
+            !!prev?.membershipFetchTimedOutLike === !!next.membershipFetchTimedOutLike &&
+            (prev?.membershipFetchSource || null) === (next.membershipFetchSource || null)
+          const prevMetaId = prev?.metadata?.event?.id || null
+          const nextMetaId = next.metadata?.event?.id || null
+          const sameMetadata =
+            prevMetaId === nextMetaId &&
+            (prev?.metadata?.picture || null) === (next.metadata?.picture || null) &&
+            (prev?.metadata?.name || null) === (next.metadata?.name || null) &&
+            (prev?.metadata?.about || null) === (next.metadata?.about || null)
+          if (isSameGroup && sameMembers && sameAdmins && sameMembership && sameMetadata) {
+            return prev || next
+          }
+
           return next
         })
       })
@@ -601,8 +672,18 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       relayUrl: joinFlow.relayUrl,
       mode: joinFlow.mode
     })
+    if (sendToWorker) {
+      sendToWorker({
+        type: 'refresh-relay-subscriptions',
+        data: {
+          relayKey: joinFlow.relayKey || null,
+          publicIdentifier: groupId,
+          reason: 'group-page-join-writable'
+        }
+      }).catch(() => {})
+    }
     setJoinRelayRefreshNonce((prev) => prev + 1)
-  }, [groupId, joinFlow?.mode, joinFlow?.relayKey, joinFlow?.relayUrl, joinFlow?.writable, joinFlow?.writableAt])
+  }, [groupId, joinFlow?.mode, joinFlow?.relayKey, joinFlow?.relayUrl, joinFlow?.writable, joinFlow?.writableAt, sendToWorker])
 
   const resolvedGroupRelay = useMemo(() => {
     return effectiveGroupRelay ? resolveRelayUrl(effectiveGroupRelay) : undefined
@@ -635,8 +716,13 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     )
   }, [tokenizedResolvedGroupRelay])
 
-  const activeGroupRelay = pinnedGroupRelay || tokenizedResolvedGroupRelay
-  const shouldGateGroupSubRequests = Boolean(groupId && effectiveGroupRelay && !activeGroupRelay)
+  const fallbackGroupRelay = useMemo(
+    () => resolvedGroupRelay || effectiveGroupRelay || undefined,
+    [effectiveGroupRelay, resolvedGroupRelay]
+  )
+
+  const activeGroupRelay = pinnedGroupRelay || tokenizedResolvedGroupRelay || fallbackGroupRelay
+  const shouldGateGroupSubRequests = Boolean(groupId && !activeGroupRelay && BIG_RELAY_URLS.length === 0)
 
   const groupSubRequests = useMemo(
     () =>
@@ -674,6 +760,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       groupRelay,
       effectiveGroupRelay,
       resolvedGroupRelay,
+      fallbackGroupRelay,
       tokenizedGroupRelay: tokenizedResolvedGroupRelay,
       pinnedGroupRelay: pinnedGroupRelay,
       activeGroupRelay,
@@ -683,7 +770,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       console.info('[GroupPage] subRequests gated (awaiting tokenized relay)', {
         groupId,
         effectiveGroupRelay,
-        resolvedGroupRelay
+        resolvedGroupRelay,
+        fallbackGroupRelay
       })
     }
     if (groupSubRequests.length) {
@@ -695,6 +783,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     effectiveGroupRelay,
     id,
     resolvedGroupRelay,
+    fallbackGroupRelay,
     tokenizedResolvedGroupRelay,
     pinnedGroupRelay,
     activeGroupRelay,
@@ -731,7 +820,34 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   useEffect(() => {
     if (!groupId) return
     if (joinFlow?.phase !== 'success') return
-    fetchGroupDetail(groupId, effectiveGroupRelay, { preferRelay: true }).then(setDetail).catch(() => {})
+    fetchGroupDetail(groupId, effectiveGroupRelay, { preferRelay: true })
+      .then((nextDetail) => {
+        if (!nextDetail) return
+        setDetail((prev) => {
+          if (!prev) return nextDetail
+          const prevMembers = normalizeComparablePubkeys((prev.members || []) as string[])
+          const incomingMembers = normalizeComparablePubkeys((nextDetail.members || []) as string[])
+          const shouldKeepPrevMembers =
+            prevMembers.length > 0 &&
+            incomingMembers.length < prevMembers.length &&
+            !nextDetail.membershipAuthoritative &&
+            (nextDetail.membershipFetchTimedOutLike || incomingMembers.length === 0)
+          if (!shouldKeepPrevMembers) return nextDetail
+          console.info('[GroupPage] join-success refresh kept previous members (non-authoritative)', {
+            groupId,
+            prevMembersCount: prevMembers.length,
+            incomingMembersCount: incomingMembers.length,
+            membershipFetchTimedOutLike: nextDetail.membershipFetchTimedOutLike,
+            membershipFetchSource: nextDetail.membershipFetchSource
+          })
+          return {
+            ...nextDetail,
+            members: prev.members || [],
+            membershipStatus: prev.membershipStatus || nextDetail.membershipStatus
+          }
+        })
+      })
+      .catch(() => {})
   }, [fetchGroupDetail, groupId, effectiveGroupRelay, joinFlow?.phase])
 
   const handleJoin = async () => {
@@ -868,7 +984,18 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const baseDetail =
     detail ||
     (fallbackMeta
-      ? { metadata: fallbackMeta, admins: [], members: [], membershipStatus: 'not-member' as const }
+      ? {
+          metadata: fallbackMeta,
+          admins: [],
+          members: [],
+          membershipStatus: 'not-member' as const,
+          membershipAuthoritative: false,
+          membershipEventsCount: 0,
+          membersFromEventCount: 0,
+          membersSnapshotCreatedAt: null,
+          membershipFetchTimedOutLike: false,
+          membershipFetchSource: 'group-relay' as const
+        }
       : null)
   let membershipStatus = baseDetail?.membershipStatus ?? 'not-member'
   if (isInMyGroups || isCreator) {
@@ -987,6 +1114,23 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     )
     return match?.relayKey
   }, [groupId, relays])
+
+  useEffect(() => {
+    if (!sendToWorker || !groupId) return
+    const inviteRelayKey = inviteData?.relayKey || null
+    const relayKey = relayKeyForGroup || inviteRelayKey || null
+    const refreshKey = `${groupId}|${relayKey || ''}`
+    if (lastRouteSubscriptionRefreshRef.current === refreshKey) return
+    lastRouteSubscriptionRefreshRef.current = refreshKey
+    sendToWorker({
+      type: 'refresh-relay-subscriptions',
+      data: {
+        relayKey,
+        publicIdentifier: groupId,
+        reason: 'group-page-route-enter'
+      }
+    }).catch(() => {})
+  }, [groupId, inviteData?.relayKey, relayKeyForGroup, sendToWorker])
 
   useEffect(() => {
     if (process.env.NODE_ENV !== 'development') return
@@ -1448,7 +1592,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                 )}
               </TabsList>
             </div>
-            <TabsContent value="notes" className="mt-0">
+            <TabsContent value="notes" forceMount className="mt-0">
               <NormalFeed
                 subRequests={groupSubRequests}
                 isMainFeed={false}

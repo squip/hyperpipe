@@ -4935,6 +4935,134 @@ async function handleMessageObject(message) {
       }
       break
 
+    case 'refresh-relay-subscriptions':
+      try {
+        const requestId = message?.requestId
+        const payload = (message && typeof message === 'object' ? message.data : null) || {}
+        const reason = typeof payload.reason === 'string' && payload.reason.trim()
+          ? payload.reason.trim()
+          : 'manual'
+        const publicIdentifier =
+          typeof payload.publicIdentifier === 'string' && payload.publicIdentifier.trim()
+            ? payload.publicIdentifier.trim()
+            : null
+        const requestedRelayKeyRaw =
+          typeof payload.relayKey === 'string' && payload.relayKey.trim()
+            ? payload.relayKey.trim()
+            : null
+        const requestedRelayKey = normalizeRelayKeyHex(requestedRelayKeyRaw) || requestedRelayKeyRaw || null
+        let resolvedRelayKey = normalizeRelayKeyHex(payload.relayKey) || null
+        let lookupSource = resolvedRelayKey ? 'payload' : null
+        console.log('[Worker] refresh-relay-subscriptions request', {
+          reason,
+          publicIdentifier,
+          requestedRelayKey: requestedRelayKey || null
+        })
+        if (!resolvedRelayKey && publicIdentifier) {
+          try {
+            resolvedRelayKey = await getRelayKeyFromPublicIdentifier(publicIdentifier)
+            if (resolvedRelayKey) lookupSource = 'profile-map'
+          } catch (_err) {
+            // fallback below
+          }
+        }
+        if (!resolvedRelayKey && publicIdentifier) {
+          for (const [relayKey, manager] of activeRelays.entries()) {
+            const managerIdentifier = manager?.publicIdentifier || keyToPublic.get(relayKey) || null
+            if (managerIdentifier === publicIdentifier) {
+              resolvedRelayKey = relayKey
+              lookupSource = 'active-relays'
+              break
+            }
+          }
+        }
+
+        if (!resolvedRelayKey) {
+          sendMessage({
+            type: 'refresh-relay-subscriptions:result',
+            requestId,
+            data: {
+              status: 'skipped',
+              reason: 'relay-not-found',
+              publicIdentifier,
+              relayKey: null,
+              requestedRelayKey: requestedRelayKey || null
+            }
+          })
+          break
+        }
+
+        let result = null
+        let finalRelayKey = resolvedRelayKey
+        let retryRelayKey = null
+        let retried = false
+        if (typeof global.requestRelaySubscriptionRefresh === 'function') {
+          result = await global.requestRelaySubscriptionRefresh(resolvedRelayKey, {
+            reason
+          })
+          if (result?.status === 'skipped' && result?.reason === 'no-clients' && publicIdentifier) {
+            for (const [candidateRelayKey, manager] of activeRelays.entries()) {
+              const managerIdentifier = manager?.publicIdentifier || keyToPublic.get(candidateRelayKey) || null
+              if (managerIdentifier !== publicIdentifier) continue
+              if (candidateRelayKey === resolvedRelayKey) continue
+              retryRelayKey = candidateRelayKey
+              break
+            }
+            if (retryRelayKey) {
+              retried = true
+              console.log('[Worker] refresh-relay-subscriptions retrying with fallback relay key', {
+                reason,
+                publicIdentifier,
+                initialRelayKey: resolvedRelayKey,
+                retryRelayKey
+              })
+              const retryResult = await global.requestRelaySubscriptionRefresh(retryRelayKey, {
+                reason: `${reason}:fallback`
+              })
+              if (retryResult && retryResult.status !== 'skipped') {
+                result = retryResult
+                finalRelayKey = retryRelayKey
+              } else {
+                result = retryResult || result
+              }
+            }
+          }
+        }
+        console.log('[Worker] refresh-relay-subscriptions result', {
+          reason,
+          publicIdentifier,
+          requestedRelayKey: requestedRelayKey || null,
+          resolvedRelayKey,
+          lookupSource,
+          retried,
+          retryRelayKey,
+          finalRelayKey,
+          result
+        })
+        sendMessage({
+          type: 'refresh-relay-subscriptions:result',
+          requestId,
+          data: {
+            status: 'ok',
+            relayKey: finalRelayKey,
+            reason,
+            result: result || null,
+            requestedRelayKey: requestedRelayKey || null,
+            resolvedRelayKey,
+            lookupSource,
+            retried,
+            retryRelayKey
+          }
+        })
+      } catch (err) {
+        sendMessage({
+          type: 'refresh-relay-subscriptions:error',
+          requestId: message?.requestId,
+          error: err?.message || String(err)
+        })
+      }
+      break
+
     case 'remove-auth-data':
       console.log('[Worker] Remove auth data requested:', message.data)
       if (relayServer) {

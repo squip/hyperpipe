@@ -230,7 +230,15 @@ export async function requestRelaySubscriptionRefresh(relayKey, { reason = 'writ
   }
   const map = relayClientConnections.get(relayKey);
   if (!map || map.size === 0) {
+    const knownRelayKeys = Array.from(relayClientConnections.keys());
     console.log('[RelayServer] Subscription refresh skipped (no clients)', { relayKey, reason });
+    console.log('[RelayServer] Subscription refresh skip diagnostics', {
+      relayKey,
+      reason,
+      knownRelayCount: knownRelayKeys.length,
+      knownRelayPreview: knownRelayKeys.slice(0, 10),
+      requestedRelayKnown: knownRelayKeys.includes(relayKey)
+    });
     return { status: 'skipped', reason: 'no-clients', total: 0, updated: 0, failed: 0 };
   }
 

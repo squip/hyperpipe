@@ -279,6 +279,44 @@ function readinessMessageForStatus(status: WorkerStatusV1 | null): string {
   }
 }
 
+const RELAY_COMPARE_FIELDS: Array<keyof RelayEntry> = [
+  'relayKey',
+  'publicIdentifier',
+  'connectionUrl',
+  'userAuthToken',
+  'requiresAuth',
+  'registrationStatus',
+  'registrationError',
+  'isActive',
+  'gatewayPath',
+  'name',
+  'description',
+  'createdAt'
+]
+
+function normalizeRelayForCompare(relay: RelayEntry) {
+  const normalized: Record<string, unknown> = {}
+  for (const field of RELAY_COMPARE_FIELDS) {
+    normalized[field] = relay[field] ?? null
+  }
+  const members = Array.isArray(relay.members) ? [...relay.members].sort() : null
+  normalized.members = members
+  return normalized
+}
+
+function areRelayListsEquivalent(a: RelayEntry[], b: RelayEntry[]) {
+  if (a === b) return true
+  if (!Array.isArray(a) || !Array.isArray(b)) return false
+  if (a.length !== b.length) return false
+  const sortByKey = (left: RelayEntry, right: RelayEntry) =>
+    `${left.relayKey || ''}|${left.publicIdentifier || ''}`.localeCompare(
+      `${right.relayKey || ''}|${right.publicIdentifier || ''}`
+    )
+  const normalizedA = [...a].sort(sortByKey).map(normalizeRelayForCompare)
+  const normalizedB = [...b].sort(sortByKey).map(normalizeRelayForCompare)
+  return JSON.stringify(normalizedA) === JSON.stringify(normalizedB)
+}
+
 export function WorkerBridgeProvider({ children }: PropsWithChildren) {
   const nostr = useNostr()
   const pubkeyHex = nostr.pubkey
@@ -533,6 +571,12 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         autobaseLocal?: string | null
         writerSecret?: string | null
         openJoin?: boolean
+        fastForward?: {
+          key?: string | null
+          length?: number | null
+          signedLength?: number | null
+          timeoutMs?: number | null
+        } | null
       }
     ) => {
       if (!isElectron()) throw new Error('Electron IPC unavailable')
@@ -821,7 +865,16 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                 userAuthToken: r.userAuthToken,
                 requiresAuth: r.requiresAuth
               })))
-              setRelays(msg.relays)
+              setRelays((prev) => {
+                const next = msg.relays as RelayEntry[]
+                if (areRelayListsEquivalent(prev, next)) {
+                  console.info('[WorkerBridge] relay-update deduped (unchanged)', {
+                    count: next.length
+                  })
+                  return prev
+                }
+                return next
+              })
             }
             break
           case 'relay-created':

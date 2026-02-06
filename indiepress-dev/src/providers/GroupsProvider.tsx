@@ -44,6 +44,14 @@ const DEFAULT_PUBLIC_GATEWAY_BASE = 'https://hypertuna.com'
 const INVITE_DISMISSED_STORAGE_PREFIX = 'hypertuna_group_invites_dismissed_v1'
 const INVITE_ACCEPTED_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_v1'
 const INVITE_ACCEPTED_GROUPS_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_groups_v1'
+const GROUP_MEMBER_PREVIEW_TTL_MS = 2 * 60 * 1000
+
+type GroupMemberPreviewEntry = {
+  members: string[]
+  updatedAt: number
+  authoritative: boolean
+  source: 'group-relay' | 'fallback-discovery' | 'group-relay-empty' | 'authoritative-promotion' | 'unknown'
+}
 
 type TGroupsContext = {
   discoveryGroups: TGroupMetadata[]
@@ -74,7 +82,24 @@ type TGroupsContext = {
     admins: TGroupAdmin[]
     members: string[]
     membershipStatus: TGroupMembershipStatus
+    membershipAuthoritative: boolean
+    membershipEventsCount: number
+    membersFromEventCount: number
+    membersSnapshotCreatedAt: number | null
+    membershipFetchTimedOutLike: boolean
+    membershipFetchSource: 'group-relay' | 'fallback-discovery' | 'group-relay-empty'
   }>
+  getGroupMemberPreview: (
+    groupId: string,
+    relay?: string
+  ) => { members: string[]; updatedAt: number; authoritative: boolean; source: GroupMemberPreviewEntry['source'] } | null
+  groupMemberPreviewVersion: number
+  refreshGroupMemberPreview: (
+    groupId: string,
+    relay?: string,
+    opts?: { force?: boolean; reason?: string }
+  ) => Promise<string[]>
+  invalidateGroupMemberPreview: (groupId: string, relay?: string, opts?: { reason?: string }) => void
   sendInvites: (groupId: string, invitees: string[], relay?: string, options?: SendInviteOptions) => Promise<void>
   updateMetadata: (groupId: string, data: Partial<{ name: string; about: string; picture: string; isPublic: boolean; isOpen: boolean }>, relay?: string) => Promise<void>
   grantAdmin: (groupId: string, targetPubkey: string, relay?: string) => Promise<void>
@@ -132,8 +157,18 @@ export const useGroups = () => {
         metadata: null,
         admins: [],
         members: [],
-        membershipStatus: 'not-member' as TGroupMembershipStatus
+        membershipStatus: 'not-member' as TGroupMembershipStatus,
+        membershipAuthoritative: false,
+        membershipEventsCount: 0,
+        membersFromEventCount: 0,
+        membersSnapshotCreatedAt: null,
+        membershipFetchTimedOutLike: false,
+        membershipFetchSource: 'group-relay' as const
       }),
+      getGroupMemberPreview: () => null,
+      groupMemberPreviewVersion: 0,
+      refreshGroupMemberPreview: async () => [],
+      invalidateGroupMemberPreview: () => {},
       sendInvites: async () => {},
       updateMetadata: async () => {},
       grantAdmin: async () => {},
@@ -157,6 +192,8 @@ export const useGroups = () => {
 const defaultDiscoveryRelays = BIG_RELAY_URLS
 
 const toGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${groupId}` : groupId)
+const toGroupMemberPreviewKey = (groupId: string, relay?: string) =>
+  `${relay ? getBaseRelayUrl(relay) : ''}|${groupId}`
 
 type InviteMirrorMetadata = {
   blindPeer?: {
@@ -184,6 +221,9 @@ const normalizePubkeyList = (values?: string[] | null) =>
         .filter(Boolean)
     )
   )
+
+const areSameMemberLists = (left: string[], right: string[]) =>
+  left.length === right.length && left.every((value, idx) => value === right[idx])
 
 const readInviteCache = (key: string): Set<string> => {
   if (typeof window === 'undefined') return new Set()
@@ -272,6 +312,15 @@ const extractRelayKeyFromUrl = (value?: string | null) => {
   return null
 }
 
+const buildMembershipPublishTargets = (resolvedRelay: string | null | undefined, isPublicGroup: boolean) => {
+  const targets = new Set<string>()
+  if (resolvedRelay) targets.add(resolvedRelay)
+  if (isPublicGroup) {
+    defaultDiscoveryRelays.forEach((url) => targets.add(url))
+  }
+  return Array.from(targets)
+}
+
 export function GroupsProvider({ children }: { children: ReactNode }) {
   const { pubkey, publish, relayList, nip04Decrypt, nip04Encrypt } = useNostr()
   const { relays: workerRelays, joinFlows, createRelay, sendToWorker } = useWorkerBridge()
@@ -306,9 +355,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const [dismissedInviteIds, setDismissedInviteIds] = useState<Set<string>>(new Set())
   const [acceptedInviteIds, setAcceptedInviteIds] = useState<Set<string>>(new Set())
   const [acceptedInviteGroupIds, setAcceptedInviteGroupIds] = useState<Set<string>>(new Set())
+  const [groupMemberPreviewByKey, setGroupMemberPreviewByKey] = useState<Record<string, GroupMemberPreviewEntry>>({})
+  const [groupMemberPreviewVersion, setGroupMemberPreviewVersion] = useState(0)
   const dismissedInviteIdsRef = useRef<Set<string>>(new Set())
   const acceptedInviteIdsRef = useRef<Set<string>>(new Set())
   const acceptedInviteGroupIdsRef = useRef<Set<string>>(new Set())
+  const groupMemberPreviewByKeyRef = useRef<Record<string, GroupMemberPreviewEntry>>({})
+  const groupMemberPreviewInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map())
 
   const workerRelayUrlMap = useMemo(() => {
     const map = new Map<string, string>()
@@ -529,6 +582,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       // best effort
     }
   }, [acceptedInviteGroupIds, pubkey])
+
+  useEffect(() => {
+    groupMemberPreviewByKeyRef.current = groupMemberPreviewByKey
+  }, [groupMemberPreviewByKey])
+
+  useEffect(() => {
+    setGroupMemberPreviewByKey({})
+    setGroupMemberPreviewVersion(0)
+    groupMemberPreviewByKeyRef.current = {}
+    groupMemberPreviewInFlightRef.current.clear()
+  }, [pubkey])
 
   useEffect(() => {
     // Clear per-account volatile state on account switch
@@ -908,6 +972,143 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [pubkey]
   )
 
+  const fetchMembershipPreview = useCallback(
+    async (
+      groupId: string,
+      relay?: string,
+      opts?: { preferRelay?: boolean; discoveryOnly?: boolean }
+    ) => {
+      const relayFromList = myGroupList.find((entry) => entry.groupId === groupId)?.relay
+      const targetRelay = relay || relayFromList || undefined
+      const resolved = targetRelay ? resolveRelayUrl(targetRelay) : null
+      const isInMyGroups = myGroupList.some((entry) => entry.groupId === groupId)
+      const preferRelay = (!opts?.discoveryOnly && (opts?.preferRelay || isInMyGroups) && !!resolved)
+      const groupRelays = preferRelay && resolved ? [resolved] : defaultDiscoveryRelays
+
+      const time = () => performance.now()
+      let primaryMembershipDuration = 0
+
+      const fetchLatestMembersSnapshot = async () => {
+        const results = await Promise.all(
+          ['d', 'h'].map(async (tagKey) => {
+            const filter: any = { kinds: [39002], limit: 10 }
+            filter[`#${tagKey}`] = [groupId]
+            const events = await client.fetchEvents(groupRelays, filter)
+            return events
+          })
+        )
+        const flat = results.flat().sort((a, b) => b.created_at - a.created_at)
+        return flat[0] || null
+      }
+
+      const membersPromise = fetchLatestMembersSnapshot().catch(() => null)
+      const membershipPromise = (async () => {
+        const start = time()
+        try {
+          return await client.fetchEvents(groupRelays, {
+            kinds: [9000, 9001],
+            '#h': [groupId],
+            limit: 50
+          })
+        } catch (_err) {
+          return []
+        } finally {
+          primaryMembershipDuration = performance.now() - start
+        }
+      })()
+
+      const [membersEvt, membershipEvents] = await Promise.all([membersPromise, membershipPromise])
+
+      let effectiveMembershipEvents = membershipEvents
+      let membershipFetchSource: 'group-relay' | 'fallback-discovery' | 'group-relay-empty' = 'group-relay'
+      const membershipFetchTimedOutLike = primaryMembershipDuration >= 9000
+      const hasRelayAuthToken = (() => {
+        if (!resolved) return false
+        try {
+          const parsed = new URL(resolved)
+          return parsed.searchParams.has('token')
+        } catch (_err) {
+          return /[?&]token=/.test(resolved)
+        }
+      })()
+      const shouldFallbackMembershipFetch =
+        preferRelay &&
+        resolved &&
+        membershipEvents.length === 0 &&
+        !membersEvt &&
+        (membershipFetchTimedOutLike || (!hasRelayAuthToken && isInMyGroups))
+
+      if (shouldFallbackMembershipFetch) {
+        let fallbackMembershipEvents: typeof membershipEvents = []
+        try {
+          fallbackMembershipEvents = await client.fetchEvents(defaultDiscoveryRelays, {
+            kinds: [9000, 9001],
+            '#h': [groupId],
+            limit: 50
+          })
+        } catch (_err) {
+          fallbackMembershipEvents = []
+        }
+        if (fallbackMembershipEvents.length > 0) {
+          effectiveMembershipEvents = fallbackMembershipEvents
+          membershipFetchSource = 'fallback-discovery'
+        } else {
+          membershipFetchSource = 'group-relay-empty'
+        }
+        console.info('[GroupsProvider] membership preview fallback retry', {
+          groupId,
+          relay: targetRelay,
+          resolved,
+          isInMyGroups,
+          membershipFetchTimedOutLike,
+          hasRelayAuthToken,
+          fallbackMembershipCount: fallbackMembershipEvents.length,
+          source: membershipFetchSource
+        })
+      }
+
+      const membersFromEvent = membersEvt ? parseGroupMembersEvent(membersEvt) : []
+      const resolvedMembers = resolveGroupMembersFromSnapshotAndOps({
+        snapshotMembers: membersFromEvent,
+        snapshotCreatedAt: membersEvt?.created_at,
+        membershipEvents: effectiveMembershipEvents
+      })
+
+      const members = normalizePubkeyList(resolvedMembers)
+      const membershipAuthoritativeRaw =
+        !!membersEvt || membersFromEvent.length > 0 || effectiveMembershipEvents.length > 0
+      const fallbackDiscoveryProvisional =
+        membershipFetchSource === 'fallback-discovery' && isInMyGroups && !hasRelayAuthToken
+      const membershipAuthoritative = fallbackDiscoveryProvisional
+        ? false
+        : membershipAuthoritativeRaw
+
+      console.info('[GroupsProvider] membership preview fetch', {
+        groupId,
+        relay: targetRelay,
+        resolved,
+        preferRelay,
+        membersCount: members.length,
+        membershipAuthoritative,
+        membershipAuthoritativeRaw,
+        fallbackDiscoveryProvisional,
+        hasRelayAuthToken,
+        membershipFetchTimedOutLike,
+        membershipFetchSource
+      })
+
+      return {
+        members,
+        membershipAuthoritative,
+        membershipFetchSource,
+        membershipFetchTimedOutLike,
+        resolved,
+        isInMyGroups
+      }
+    },
+    [myGroupList, resolveRelayUrl]
+  )
+
   const fetchGroupDetail = useCallback(
     async (
       groupId: string,
@@ -928,8 +1129,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         : Array.from(new Set([...resolvedRelayList, ...discoveryRelays]))
 
       const time = () => performance.now()
+      const fetchDurations: Record<string, number> = {}
       const logDuration = (label: string, start: number) => {
-        console.info(`[GroupsProvider] fetch ${label} took ${(performance.now() - start).toFixed(0)}ms`, {
+        const elapsed = performance.now() - start
+        fetchDurations[label] = elapsed
+        console.info(`[GroupsProvider] fetch ${label} took ${elapsed.toFixed(0)}ms`, {
           groupId,
           relays: preferRelay && resolved ? 'group-relay-only' : 'discovery',
           resolved
@@ -1059,16 +1263,62 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         joinRequestsPromise
       ])
 
+      let effectiveMembershipEvents = membershipEvents
+      let membershipFetchSource: 'group-relay' | 'fallback-discovery' | 'group-relay-empty' = 'group-relay'
+      const primaryMembershipDuration = fetchDurations['9000/9001'] ?? 0
+      const membershipFetchTimedOutLike = primaryMembershipDuration >= 9000
+      if (preferRelay && resolved && membershipEvents.length === 0 && membershipFetchTimedOutLike) {
+        const fallbackStart = time()
+        let fallbackMembershipEvents: typeof membershipEvents = []
+        try {
+          fallbackMembershipEvents = await client.fetchEvents(defaultDiscoveryRelays, {
+            kinds: [9000, 9001],
+            '#h': [groupId],
+            limit: 50
+          })
+        } catch (_error) {
+          fallbackMembershipEvents = []
+        }
+        logDuration('9000/9001-fallback-discovery', fallbackStart)
+        if (fallbackMembershipEvents.length > 0) {
+          effectiveMembershipEvents = fallbackMembershipEvents
+          membershipFetchSource = 'fallback-discovery'
+        } else {
+          membershipFetchSource = 'group-relay-empty'
+        }
+        console.info('[GroupsProvider] membership fallback retry', {
+          groupId,
+          relay: targetRelay,
+          resolved,
+          primaryMembershipDurationMs: Math.round(primaryMembershipDuration),
+          fallbackMembershipCount: fallbackMembershipEvents.length,
+          source: membershipFetchSource
+        })
+      }
+
       const membershipStatus = pubkey
-        ? deriveMembershipStatus(pubkey, membershipEvents, joinRequests)
+        ? deriveMembershipStatus(pubkey, effectiveMembershipEvents, joinRequests)
         : 'not-member'
+      const latestMembershipEvent = effectiveMembershipEvents.reduce((latest, evt) => {
+        if (!latest) return evt
+        if (evt.created_at > latest.created_at) return evt
+        if (evt.created_at < latest.created_at) return latest
+        if (evt.kind === 9001 && latest.kind !== 9001) return evt
+        return latest
+      }, null as (typeof membershipEvents)[number] | null)
+      const latestMembershipTargetsPreview = latestMembershipEvent
+        ? latestMembershipEvent.tags
+            .filter((tag) => tag[0] === 'p' && tag[1])
+            .map((tag) => tag[1])
+            .slice(0, 5)
+        : []
 
       // Resolve current member set from snapshot + membership ops.
       const membersFromEvent = membersEvt ? parseGroupMembersEvent(membersEvt) : []
       const resolvedMembers = resolveGroupMembersFromSnapshotAndOps({
         snapshotMembers: membersFromEvent,
         snapshotCreatedAt: membersEvt?.created_at,
-        membershipEvents
+        membershipEvents: effectiveMembershipEvents
       })
       const groupIdPubkey = (() => {
         try {
@@ -1109,6 +1359,14 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         if (!members.includes(pubkey)) members = [...members, pubkey]
       }
 
+      const membersSnapshotCreatedAt = membersEvt?.created_at ?? null
+      const membersFromEventCount = membersFromEvent.length
+      const membershipEventsCount = effectiveMembershipEvents.length
+      const membershipAuthoritative =
+        !!membersEvt ||
+        membersFromEventCount > 0 ||
+        membershipEventsCount > 0
+
       const metadata = metadataEvt ? parseGroupMetadataEvent(metadataEvt, relay) : null
       let admins = adminsEvt ? parseGroupAdminsEvent(adminsEvt) : []
 
@@ -1143,15 +1401,23 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       console.info('[GroupsProvider] membership derivation', {
         groupId,
         relay: targetRelay,
-        membershipEventsCount: membershipEvents.length,
+        membershipEventsCount,
         joinRequestsCount: joinRequests.length,
         initialStatus: membershipStatus,
-        membersFromEventCount: membersFromEvent.length,
+        membersFromEventCount,
+        membersSnapshotCreatedAt,
+        membersSnapshotId: membersEvt?.id ?? null,
         resolvedMembersCount: resolvedMembers.length,
+        latestMembershipEventKind: latestMembershipEvent?.kind ?? null,
+        latestMembershipEventCreatedAt: latestMembershipEvent?.created_at ?? null,
+        latestMembershipTargetsPreview,
         isInMyGroups,
         isCreator,
         creatorPubkey,
         groupIdPubkey,
+        membershipAuthoritative,
+        membershipFetchTimedOutLike,
+        membershipFetchSource,
         coercedStatus: coercedMembershipStatus
       })
 
@@ -1167,12 +1433,441 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         metadataPicture: metadata?.picture,
         adminsCount: admins.length,
         membersCount: members.length,
+        membershipAuthoritative,
+        membershipEventsCount,
+        membersFromEventCount,
+        membersSnapshotCreatedAt,
+        membershipFetchTimedOutLike,
+        membershipFetchSource,
         membershipStatus: coercedMembershipStatus
       })
 
-      return { metadata, admins, members, membershipStatus: coercedMembershipStatus }
+      // Keep GroupsPage facepile/count in sync with authoritative GroupPage detail.
+      if (membershipAuthoritative) {
+        const previewMembers = normalizePubkeyList(members)
+        const previewKeys = Array.from(
+          new Set(
+            [
+              toGroupMemberPreviewKey(groupId),
+              targetRelay ? toGroupMemberPreviewKey(groupId, targetRelay) : null,
+              resolved ? toGroupMemberPreviewKey(groupId, resolved) : null
+            ].filter((key): key is string => !!key)
+          )
+        )
+
+        if (previewKeys.length > 0) {
+          let changed = false
+          setGroupMemberPreviewByKey((prev) => {
+            const next = { ...prev }
+            const nextEntry: GroupMemberPreviewEntry = {
+              members: previewMembers,
+              updatedAt: Date.now(),
+              authoritative: true,
+              source: 'authoritative-promotion'
+            }
+            previewKeys.forEach((key) => {
+              const current = next[key]
+              const same =
+                !!current &&
+                current.authoritative === nextEntry.authoritative &&
+                current.source === nextEntry.source &&
+                areSameMemberLists(current.members, nextEntry.members)
+              if (!same) {
+                next[key] = nextEntry
+                changed = true
+              }
+            })
+            if (changed) {
+              console.info('[GroupsProvider] Promoted authoritative members to preview cache', {
+                groupId,
+                relay: targetRelay || null,
+                resolved,
+                membersCount: previewMembers.length,
+                keyCount: previewKeys.length
+              })
+            }
+            return changed ? next : prev
+          })
+          if (changed) {
+            setGroupMemberPreviewVersion((prev) => prev + 1)
+          }
+        }
+      }
+
+      return {
+        metadata,
+        admins,
+        members,
+        membershipStatus: coercedMembershipStatus,
+        membershipAuthoritative,
+        membershipEventsCount,
+        membersFromEventCount,
+        membersSnapshotCreatedAt,
+        membershipFetchTimedOutLike,
+        membershipFetchSource
+      }
     },
     [discoveryRelays, pubkey, resolveRelayUrl, myGroupList]
+  )
+
+  const getGroupMemberPreview = useCallback((groupId: string, relay?: string) => {
+    const normalizedGroupId = String(groupId || '').trim()
+    if (!normalizedGroupId) return null
+    const relayKey = relay ? toGroupMemberPreviewKey(normalizedGroupId, relay) : null
+    const fallbackKey = toGroupMemberPreviewKey(normalizedGroupId)
+    const fromRelay = relayKey ? groupMemberPreviewByKey[relayKey] : null
+    const fromFallback = groupMemberPreviewByKey[fallbackKey]
+    return fromRelay || fromFallback || null
+  }, [groupMemberPreviewByKey])
+
+  const invalidateGroupMemberPreview = useCallback(
+    (groupId: string, relay?: string, opts?: { reason?: string }) => {
+      const normalizedGroupId = String(groupId || '').trim()
+      if (!normalizedGroupId) return
+      const reason = opts?.reason || 'unknown'
+      const suffix = `|${normalizedGroupId}`
+      const explicitKey = relay ? toGroupMemberPreviewKey(normalizedGroupId, relay) : null
+      let invalidated = false
+      setGroupMemberPreviewByKey((prev) => {
+        const keys = Object.keys(prev)
+        if (!keys.length) return prev
+        let changed = false
+        const next: Record<string, GroupMemberPreviewEntry> = {}
+        keys.forEach((key) => {
+          const shouldDelete =
+            key.endsWith(suffix) ||
+            (explicitKey ? key === explicitKey : false)
+          if (shouldDelete) {
+            changed = true
+            return
+          }
+          next[key] = prev[key]
+        })
+        if (changed) {
+          console.info('[GroupsProvider] Invalidated member preview cache', {
+            groupId: normalizedGroupId,
+            relay: relay || null,
+            reason
+          })
+        }
+        invalidated = changed
+        return changed ? next : prev
+      })
+      if (invalidated) {
+        setGroupMemberPreviewVersion((prev) => prev + 1)
+      }
+      Array.from(groupMemberPreviewInFlightRef.current.keys()).forEach((key) => {
+        if (key.includes(suffix)) {
+          groupMemberPreviewInFlightRef.current.delete(key)
+        }
+      })
+    },
+    []
+  )
+
+  const refreshGroupMemberPreview = useCallback(
+    async (
+      groupId: string,
+      relay?: string,
+      opts?: { force?: boolean; reason?: string }
+    ) => {
+      const normalizedGroupId = String(groupId || '').trim()
+      if (!normalizedGroupId) return []
+      const reason = opts?.reason || 'unspecified'
+      const cacheKeys = relay
+        ? [toGroupMemberPreviewKey(normalizedGroupId, relay), toGroupMemberPreviewKey(normalizedGroupId)]
+        : [toGroupMemberPreviewKey(normalizedGroupId)]
+      const relayCacheKey = cacheKeys[0]
+      const cached =
+        groupMemberPreviewByKeyRef.current[relayCacheKey] ||
+        groupMemberPreviewByKeyRef.current[toGroupMemberPreviewKey(normalizedGroupId)]
+      const now = Date.now()
+      if (!opts?.force && cached && now - cached.updatedAt < GROUP_MEMBER_PREVIEW_TTL_MS) {
+        return cached.members
+      }
+
+      const inFlightKey = `${relayCacheKey}|${opts?.force ? 'force' : 'normal'}`
+      const existingPromise = groupMemberPreviewInFlightRef.current.get(inFlightKey)
+      if (existingPromise) return existingPromise
+
+      const fetchPromise = (async () => {
+        try {
+          const preview = await fetchMembershipPreview(normalizedGroupId, relay, {
+            discoveryOnly: !myGroupList.some((entry) => entry.groupId === normalizedGroupId),
+            preferRelay: true
+          })
+          let members = normalizePubkeyList(preview.members || [])
+          const isMember = preview.isInMyGroups
+
+          if (isMember && pubkey && !members.includes(pubkey)) {
+            members = [...members, pubkey]
+          }
+
+          const shouldBlockMembershipDowngrade =
+            !!cached &&
+            cached.members.length > 0 &&
+            members.length < cached.members.length &&
+            !preview.membershipAuthoritative &&
+            (preview.membershipFetchTimedOutLike ||
+              members.length === 0 ||
+              (members.length === 1 && pubkey ? members[0] === pubkey : false))
+
+          if (shouldBlockMembershipDowngrade) {
+            console.info('[GroupsProvider] member preview downgrade blocked', {
+              groupId: normalizedGroupId,
+              relay: relay || null,
+              reason,
+              prevMembersCount: cached?.members.length || 0,
+              nextMembersCount: members.length,
+              membershipAuthoritative: preview.membershipAuthoritative,
+              membershipFetchTimedOutLike: preview.membershipFetchTimedOutLike,
+              membershipFetchSource: preview.membershipFetchSource
+            })
+            members = cached?.members || members
+          }
+
+          const entry: GroupMemberPreviewEntry = {
+            members,
+            updatedAt: Date.now(),
+            authoritative: !!preview.membershipAuthoritative,
+            source: preview.membershipFetchSource || 'unknown'
+          }
+          let changed = false
+          let blockedByAuthoritative = 0
+          let resolvedMembers = entry.members
+          setGroupMemberPreviewByKey((prev) => {
+            const next = { ...prev }
+            cacheKeys.forEach((key) => {
+              const current = next[key]
+              const blockNonAuthoritativeDowngrade =
+                !!current &&
+                current.authoritative &&
+                !entry.authoritative &&
+                current.members.length >= entry.members.length
+              if (blockNonAuthoritativeDowngrade) {
+                blockedByAuthoritative += 1
+                if (current && current.members.length >= resolvedMembers.length) {
+                  resolvedMembers = current.members
+                }
+                return
+              }
+              const same =
+                !!current &&
+                current.authoritative === entry.authoritative &&
+                current.source === entry.source &&
+                areSameMemberLists(current.members, entry.members)
+              if (same) {
+                resolvedMembers = current.members
+                return
+              }
+              next[key] = entry
+              changed = true
+              resolvedMembers = entry.members
+            })
+            return changed ? next : prev
+          })
+          if (changed) {
+            setGroupMemberPreviewVersion((prev) => prev + 1)
+          }
+          if (blockedByAuthoritative > 0) {
+            console.info('[GroupsProvider] member preview overwrite blocked by authoritative cache', {
+              groupId: normalizedGroupId,
+              relay: relay || null,
+              reason,
+              blockedKeys: blockedByAuthoritative,
+              incomingMembersCount: members.length,
+              incomingAuthoritative: entry.authoritative,
+              incomingSource: entry.source
+            })
+          }
+          console.info('[GroupsProvider] Refreshed member preview cache', {
+            groupId: normalizedGroupId,
+            relay: relay || null,
+            reason,
+            membersCount: members.length,
+            isMember,
+            source: preview.membershipFetchSource,
+            membershipAuthoritative: preview.membershipAuthoritative
+          })
+          return resolvedMembers
+        } catch (err) {
+          console.warn('[GroupsProvider] Failed to refresh member preview cache', {
+            groupId: normalizedGroupId,
+            relay: relay || null,
+            reason,
+            err: err instanceof Error ? err.message : err
+          })
+          return cached?.members || []
+        } finally {
+          groupMemberPreviewInFlightRef.current.delete(inFlightKey)
+        }
+      })()
+
+      groupMemberPreviewInFlightRef.current.set(inFlightKey, fetchPromise)
+      return fetchPromise
+    },
+    [fetchMembershipPreview, myGroupList, pubkey]
+  )
+
+  const tokenizedPreviewRefreshByGroupRef = useRef<Map<string, string>>(new Map())
+
+  useEffect(() => {
+    if (!pubkey) return
+    if (!myGroupList.length) return
+    if (!workerRelays.length) return
+
+    const hasTokenInRelayUrl = (relayUrl?: string | null) => {
+      if (!relayUrl) return false
+      try {
+        return new URL(relayUrl).searchParams.has('token')
+      } catch (_err) {
+        return /[?&]token=/.test(relayUrl)
+      }
+    }
+
+    const nextByGroup = new Map<string, string>()
+
+    myGroupList.forEach((entry) => {
+      const relayEntry =
+        workerRelays.find((r) => r.publicIdentifier === entry.groupId) ||
+        workerRelays.find((r) => r.relayKey === entry.groupId) ||
+        null
+      if (!relayEntry?.connectionUrl) return
+
+      const resolvedRelay = resolveRelayUrl(relayEntry.connectionUrl) || relayEntry.connectionUrl
+      if (!hasTokenInRelayUrl(resolvedRelay)) return
+
+      nextByGroup.set(entry.groupId, resolvedRelay)
+      const prevRelay = tokenizedPreviewRefreshByGroupRef.current.get(entry.groupId)
+      if (prevRelay === resolvedRelay) return
+
+      console.info('[GroupsProvider] tokenized relay observed; forcing member preview refresh', {
+        groupId: entry.groupId,
+        relay: resolvedRelay
+      })
+
+      invalidateGroupMemberPreview(entry.groupId, resolvedRelay, {
+        reason: 'worker-relay-tokenized-update'
+      })
+      refreshGroupMemberPreview(entry.groupId, resolvedRelay, {
+        force: true,
+        reason: 'worker-relay-tokenized-update'
+      }).catch(() => {})
+    })
+
+    tokenizedPreviewRefreshByGroupRef.current = nextByGroup
+  }, [
+    invalidateGroupMemberPreview,
+    myGroupList,
+    pubkey,
+    refreshGroupMemberPreview,
+    resolveRelayUrl,
+    workerRelays
+  ])
+
+  const republishMemberSnapshot39002 = useCallback(
+    async (params: { groupId: string; relay?: string; isPublicGroup?: boolean; reason: string }) => {
+      const { groupId, relay, isPublicGroup, reason } = params
+      const resolved = relay ? resolveRelayUrl(relay) : undefined
+      let members: string[] = []
+      let resolvedIsPublic = typeof isPublicGroup === 'boolean' ? isPublicGroup : true
+      try {
+        const detail = await fetchGroupDetail(groupId, relay, { preferRelay: true })
+        members = normalizePubkeyList(detail?.members || [])
+        if (typeof isPublicGroup !== 'boolean') {
+          resolvedIsPublic = detail?.metadata?.isPublic !== false
+        }
+      } catch (err) {
+        console.warn('[GroupsProvider] Failed to resolve members for 39002 republish', {
+          groupId,
+          reason,
+          err: err instanceof Error ? err.message : err
+        })
+        return
+      }
+
+      const relayUrls = buildMembershipPublishTargets(resolved, resolvedIsPublic)
+      if (!relayUrls.length) {
+        console.warn('[GroupsProvider] Skipping 39002 republish: no targets', {
+          groupId,
+          reason,
+          resolved
+        })
+        return
+      }
+
+      const tags: string[][] = [
+        ['h', groupId],
+        ['d', groupId]
+      ]
+      if (groupId.includes(':')) {
+        tags.push(['hypertuna', groupId], ['i', HYPERTUNA_IDENTIFIER_TAG])
+      }
+      members.forEach((memberPubkey) => {
+        tags.push(['p', memberPubkey])
+      })
+
+      const membersEvent: TDraftEvent = {
+        kind: 39002,
+        created_at: Math.floor(Date.now() / 1000),
+        tags,
+        content: ''
+      }
+
+      await publish(membersEvent, { specifiedRelayUrls: relayUrls })
+      console.info('[GroupsProvider] Republished 39002 members snapshot', {
+        groupId,
+        reason,
+        membersCount: members.length,
+        targets: relayUrls.length,
+        isPublicGroup: resolvedIsPublic
+      })
+      invalidateGroupMemberPreview(groupId, resolved || relay || undefined, {
+        reason: `republish-39002:${reason}`
+      })
+      refreshGroupMemberPreview(groupId, resolved || relay || undefined, {
+        force: true,
+        reason: `republish-39002:${reason}`
+      }).catch(() => {})
+
+      let latestSnapshotCreatedAt: number | null = null
+      let latestSnapshotId: string | null = null
+      try {
+        const snapshots = await client.fetchEvents(relayUrls, {
+          kinds: [39002],
+          '#h': [groupId],
+          limit: 10
+        })
+        const latestSnapshot = snapshots.sort((a, b) => b.created_at - a.created_at)[0] || null
+        latestSnapshotCreatedAt = latestSnapshot?.created_at ?? null
+        latestSnapshotId = latestSnapshot?.id ?? null
+      } catch (err) {
+        console.warn('[GroupsProvider] Failed to verify latest 39002 snapshot after republish', {
+          groupId,
+          reason,
+          err: err instanceof Error ? err.message : err
+        })
+      }
+
+      let postPublishMembersCount: number | null = null
+      try {
+        const postDetail = await fetchGroupDetail(groupId, relay, { preferRelay: true })
+        postPublishMembersCount = Array.isArray(postDetail?.members) ? postDetail.members.length : 0
+      } catch (_err) {
+        postPublishMembersCount = null
+      }
+
+      console.info('[GroupsProvider] 39002 republish verification', {
+        groupId,
+        reason,
+        membersCountBeforePublish: members.length,
+        latestSnapshotCreatedAt,
+        latestSnapshotId,
+        postPublishMembersCount,
+        targets: relayUrls.length
+      })
+    },
+    [fetchGroupDetail, invalidateGroupMemberPreview, publish, refreshGroupMemberPreview, resolveRelayUrl]
   )
 
   const saveMyGroupList = useCallback(
@@ -1198,13 +1893,74 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   )
 
   const processedJoinFlowsRef = useMemo(() => new Set<string>(), [])
+  const announcedOpenJoinMembershipRef = useMemo(() => new Set<string>(), [])
 
   useEffect(() => {
     processedJoinFlowsRef.clear()
-  }, [processedJoinFlowsRef, pubkey])
+    announcedOpenJoinMembershipRef.clear()
+  }, [announcedOpenJoinMembershipRef, processedJoinFlowsRef, pubkey])
 
   useEffect(() => {
     if (!pubkey) return
+
+    const announceOpenJoinMembership = (flow: (typeof joinFlows)[string], baseUrl: string) => {
+      const identifier = flow?.publicIdentifier
+      if (!identifier) return
+      const dedupeKey = `${identifier}|${pubkey}`
+      if (announcedOpenJoinMembershipRef.has(dedupeKey)) return
+      const flowMode = typeof flow?.mode === 'string' ? flow.mode.toLowerCase() : ''
+      const isOpenJoinMode = flowMode.includes('open')
+      if (!isOpenJoinMode) return
+      announcedOpenJoinMembershipRef.add(dedupeKey)
+
+      ;(async () => {
+        let isPublicGroup = true
+        try {
+          const fromDiscovery = discoveryGroups.find((g) => g.id === identifier)
+          if (fromDiscovery) {
+            isPublicGroup = fromDiscovery.isPublic !== false
+          } else {
+            const detail = await fetchGroupDetail(identifier, baseUrl, { preferRelay: true })
+            isPublicGroup = detail?.metadata?.isPublic !== false
+          }
+        } catch (_err) {
+          isPublicGroup = true
+        }
+        if (!isPublicGroup) return
+
+        const targets = buildMembershipPublishTargets(baseUrl, true)
+        if (!targets.length) return
+        const memberEvent: TDraftEvent = {
+          kind: 9000,
+          created_at: Math.floor(Date.now() / 1000),
+          tags: [
+            ['h', identifier],
+            ['p', pubkey]
+          ],
+          content: ''
+        }
+        try {
+          await publish(memberEvent, { specifiedRelayUrls: targets })
+          console.info('[GroupsProvider] Published open-join member announce', {
+            groupId: identifier,
+            relay: baseUrl,
+            targets: targets.length
+          })
+          invalidateGroupMemberPreview(identifier, baseUrl, { reason: 'open-join-member-announce' })
+          refreshGroupMemberPreview(identifier, baseUrl, {
+            force: true,
+            reason: 'open-join-member-announce'
+          }).catch(() => {})
+        } catch (err) {
+          console.warn('[GroupsProvider] Failed open-join member announce', {
+            groupId: identifier,
+            relay: baseUrl,
+            err: err instanceof Error ? err.message : err
+          })
+          announcedOpenJoinMembershipRef.delete(dedupeKey)
+        }
+      })()
+    }
 
     Object.values(joinFlows || {}).forEach((flow) => {
       if (!flow || flow.phase !== 'success') return
@@ -1217,17 +1973,41 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const baseUrl = getBaseRelayUrl(relayUrl)
       if (!baseUrl) return
 
+      announceOpenJoinMembership(flow, baseUrl)
+
       const already = myGroupList.some((e) => e.groupId === identifier && e.relay === baseUrl)
       if (already) {
         processedJoinFlowsRef.add(identifier)
+        invalidateGroupMemberPreview(identifier, baseUrl, { reason: 'join-flow-success-existing' })
+        refreshGroupMemberPreview(identifier, baseUrl, {
+          force: true,
+          reason: 'join-flow-success-existing'
+        }).catch(() => {})
         return
       }
 
       processedJoinFlowsRef.add(identifier)
       const updated = [...myGroupList, { groupId: identifier, relay: baseUrl }]
       saveMyGroupList(updated, { specifiedRelayUrls: BIG_RELAY_URLS }).catch(() => {})
+      invalidateGroupMemberPreview(identifier, baseUrl, { reason: 'join-flow-success-added' })
+      refreshGroupMemberPreview(identifier, baseUrl, {
+        force: true,
+        reason: 'join-flow-success-added'
+      }).catch(() => {})
     })
-  }, [joinFlows, myGroupList, pubkey, saveMyGroupList, processedJoinFlowsRef])
+  }, [
+    announcedOpenJoinMembershipRef,
+    discoveryGroups,
+    fetchGroupDetail,
+    invalidateGroupMemberPreview,
+    joinFlows,
+    myGroupList,
+    processedJoinFlowsRef,
+    pubkey,
+    publish,
+    refreshGroupMemberPreview,
+    saveMyGroupList
+  ])
 
   useEffect(() => {
     if (!pubkey) return
@@ -1345,9 +2125,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         adminPubkeyHex: pubkey,
         name
       })
+      const membershipSnapshotTargets = isPublic
+        ? Array.from(new Set([authenticatedRelayUrl, ...BIG_RELAY_URLS]))
+        : [authenticatedRelayUrl]
       await Promise.all([
-        publish(adminListEvent, { specifiedRelayUrls: [authenticatedRelayUrl] }),
-        publish(memberListEvent, { specifiedRelayUrls: [authenticatedRelayUrl] })
+        publish(adminListEvent, { specifiedRelayUrls: membershipSnapshotTargets }),
+        publish(memberListEvent, { specifiedRelayUrls: membershipSnapshotTargets })
       ])
 
       return { groupId: publicIdentifier, relay: relayWsUrl }
@@ -1399,17 +2182,29 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const resolved = relay ? resolveRelayUrl(relay) : null
       // Send invites to both the group relay (if provided) and discovery relays so non-members can see them.
       const relayUrls = Array.from(new Set([...(resolved ? [resolved] : []), ...defaultDiscoveryRelays]))
-      const meta =
+      let meta =
         discoveryGroups.find(
           (g) => g.id === groupId && (!relay || !g.relay || g.relay === relay || g.relay === resolved)
         ) || null
+      if (!meta) {
+        try {
+          const detail = await fetchGroupDetail(groupId, resolved || relay || undefined, {
+            preferRelay: true
+          })
+          meta = detail?.metadata || null
+        } catch (_err) {
+          meta = null
+        }
+      }
       const relayEntry = getRelayEntryForGroup(groupId)
       const resolvedIsOpen = typeof options?.isOpen === 'boolean' ? options.isOpen : meta?.isOpen
       const isOpenGroup = resolvedIsOpen === true
+      const isPublicGroup = meta?.isPublic !== false
       const inviteName = options?.name ?? meta?.name
       const inviteAbout = options?.about ?? meta?.about
       const invitePicture = options?.picture ?? meta?.picture
       const baseAuthorizedMemberPubkeys = normalizePubkeyList(options?.authorizedMemberPubkeys)
+      const membershipRelayUrls = buildMembershipPublishTargets(resolved, isPublicGroup)
 
       const inviteRelayUrl = getBaseRelayUrl(resolved || relay || '') || resolved || relay || null
       const inviteRelayKey =
@@ -1559,7 +2354,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               ],
               content: ''
             }
-            await publish(putUser, { specifiedRelayUrls: relayUrls })
+            if (membershipRelayUrls.length) {
+              await publish(putUser, { specifiedRelayUrls: membershipRelayUrls })
+            }
           }
 
           const draftEvent: TDraftEvent = {
@@ -1598,8 +2395,28 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           }
         })
       )
+
+      if (!isOpenGroup) {
+        await republishMemberSnapshot39002({
+          groupId,
+          relay: resolved || relay || undefined,
+          isPublicGroup,
+          reason: 'send-invites'
+        })
+      }
     },
-    [discoveryGroups, fetchInviteMirrorMetadata, getRelayEntryForGroup, nip04Encrypt, pubkey, publish, resolveRelayUrl, sendToWorker]
+    [
+      discoveryGroups,
+      fetchGroupDetail,
+      fetchInviteMirrorMetadata,
+      getRelayEntryForGroup,
+      nip04Encrypt,
+      pubkey,
+      publish,
+      republishMemberSnapshot39002,
+      resolveRelayUrl,
+      sendToWorker
+    ]
   )
 
   const approveJoinRequest = useCallback(
@@ -1608,20 +2425,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const groupKey = toGroupKey(groupId, relay)
       const token = randomString(24)
       const resolved = relay ? resolveRelayUrl(relay) : undefined
-      const relayUrls = resolved ? [resolved] : discoveryRelays
+      const inviteRelayUrls = resolved ? [resolved] : discoveryRelays
       const timestamp = Math.floor(Date.now() / 1000)
-
-      // Build put-user (9000) with token
-      const putUser: TDraftEvent = {
-        kind: 9000,
-        created_at: timestamp,
-        tags: [
-          ['h', groupId],
-          ['p', targetPubkey, 'member', token]
-        ],
-        content: ''
-      }
-      await publish(putUser, { specifiedRelayUrls: relayUrls })
 
       // Resolve metadata for invite tags/payload
       let meta =
@@ -1642,6 +2447,22 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         detailMembers = normalizePubkeyList(detail?.members || [])
       } catch (_err) {
         detailMembers = []
+      }
+      const isPublicGroup = meta?.isPublic !== false
+      const membershipRelayUrls = buildMembershipPublishTargets(resolved, isPublicGroup)
+
+      // Build put-user (9000) with token.
+      const putUser: TDraftEvent = {
+        kind: 9000,
+        created_at: timestamp,
+        tags: [
+          ['h', groupId],
+          ['p', targetPubkey, 'member', token]
+        ],
+        content: ''
+      }
+      if (membershipRelayUrls.length) {
+        await publish(putUser, { specifiedRelayUrls: membershipRelayUrls })
       }
       const invitePicture = meta?.picture
       const authorizedMemberPubkeys = normalizePubkeyList([...detailMembers, targetPubkey])
@@ -1771,7 +2592,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         tags,
         content: encryptedPayload
       }
-      await publish(inviteEvent, { specifiedRelayUrls: relayUrls })
+      await publish(inviteEvent, { specifiedRelayUrls: inviteRelayUrls })
 
       // Notify worker about auth/membership so relay profile is synced
       try {
@@ -1811,8 +2632,27 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         next[groupKey] = set
         return next
       })
+
+      await republishMemberSnapshot39002({
+        groupId,
+        relay: resolved || relay || undefined,
+        isPublicGroup,
+        reason: 'approve-join-request'
+      })
     },
-    [discoveryGroups, discoveryRelays, fetchGroupDetail, fetchInviteMirrorMetadata, getRelayEntryForGroup, nip04Encrypt, publish, pubkey, resolveRelayUrl, sendToWorker]
+    [
+      discoveryGroups,
+      discoveryRelays,
+      fetchGroupDetail,
+      fetchInviteMirrorMetadata,
+      getRelayEntryForGroup,
+      nip04Encrypt,
+      publish,
+      pubkey,
+      republishMemberSnapshot39002,
+      resolveRelayUrl,
+      sendToWorker
+    ]
   )
 
   const rejectJoinRequest = useCallback(
@@ -1924,6 +2764,19 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const addUser = useCallback(
     async (groupId: string, targetPubkey: string, relay?: string) => {
       if (!pubkey) throw new Error('Not logged in')
+      const resolved = relay ? resolveRelayUrl(relay) : undefined
+      let isPublicGroup = true
+      try {
+        const detail = await fetchGroupDetail(groupId, relay, { preferRelay: true })
+        isPublicGroup = detail?.metadata?.isPublic !== false
+      } catch (_err) {
+        isPublicGroup = true
+      }
+      const relayUrls = buildMembershipPublishTargets(resolved, isPublicGroup)
+      if (!relayUrls.length) {
+        console.warn('[GroupsProvider] addUser skipped: no publish targets', { groupId, relay, resolved })
+        return
+      }
       const draftEvent: TDraftEvent = {
         kind: 9000,
         created_at: Math.floor(Date.now() / 1000),
@@ -1933,10 +2786,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         ],
         content: ''
       }
-      const resolved = relay ? resolveRelayUrl(relay) : undefined
-      await publish(draftEvent, { specifiedRelayUrls: resolved ? [resolved] : undefined })
+      await publish(draftEvent, { specifiedRelayUrls: relayUrls })
+      await republishMemberSnapshot39002({
+        groupId,
+        relay: resolved || relay || undefined,
+        isPublicGroup,
+        reason: 'add-user'
+      })
     },
-    [pubkey, publish, resolveRelayUrl]
+    [fetchGroupDetail, pubkey, publish, republishMemberSnapshot39002, resolveRelayUrl]
   )
 
   const grantAdmin = useCallback(
@@ -1960,6 +2818,19 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const removeUser = useCallback(
     async (groupId: string, targetPubkey: string, relay?: string) => {
       if (!pubkey) throw new Error('Not logged in')
+      const resolved = relay ? resolveRelayUrl(relay) : undefined
+      let isPublicGroup = true
+      try {
+        const detail = await fetchGroupDetail(groupId, relay, { preferRelay: true })
+        isPublicGroup = detail?.metadata?.isPublic !== false
+      } catch (_err) {
+        isPublicGroup = true
+      }
+      const relayUrls = buildMembershipPublishTargets(resolved, isPublicGroup)
+      if (!relayUrls.length) {
+        console.warn('[GroupsProvider] removeUser skipped: no publish targets', { groupId, relay, resolved })
+        return
+      }
       const draftEvent: TDraftEvent = {
         kind: 9001,
         created_at: Math.floor(Date.now() / 1000),
@@ -1969,10 +2840,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         ],
         content: ''
       }
-      const resolved = relay ? resolveRelayUrl(relay) : undefined
-      await publish(draftEvent, { specifiedRelayUrls: resolved ? [resolved] : undefined })
+      await publish(draftEvent, { specifiedRelayUrls: relayUrls })
+      await republishMemberSnapshot39002({
+        groupId,
+        relay: resolved || relay || undefined,
+        isPublicGroup,
+        reason: 'remove-user'
+      })
     },
-    [pubkey, publish, resolveRelayUrl]
+    [fetchGroupDetail, pubkey, publish, republishMemberSnapshot39002, resolveRelayUrl]
   )
 
   const deleteGroup = useCallback(
@@ -2030,6 +2906,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       sendJoinRequest,
       sendLeaveRequest,
       fetchGroupDetail,
+      getGroupMemberPreview,
+      groupMemberPreviewVersion,
+      refreshGroupMemberPreview,
+      invalidateGroupMemberPreview,
       sendInvites,
       updateMetadata,
       grantAdmin,
@@ -2145,6 +3025,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       sendJoinRequest,
       sendLeaveRequest,
       fetchGroupDetail,
+      getGroupMemberPreview,
+      groupMemberPreviewVersion,
+      refreshGroupMemberPreview,
+      invalidateGroupMemberPreview,
       sendInvites,
       updateMetadata,
       grantAdmin,

@@ -125,6 +125,16 @@ export default function NormalFeed({
     uniqueSubRequestsSignature
   ])
 
+  const handleToolbarRefresh = () => {
+    console.info('[NormalFeed] toolbar refresh click', {
+      label: debugLabel ?? null,
+      activeTab: debugActiveTab ?? null,
+      groupedMode: groupedNotesSettings.enabled,
+      listMode: effectiveListMode
+    })
+    noteListRef.current?.refresh()
+  }
+
   return (
     <>
       {groupedNotesSettings.enabled ? (
@@ -161,7 +171,7 @@ export default function NormalFeed({
             />
           </div>
           <div className="flex items-center gap-1">
-            {!supportTouch && <RefreshButton onClick={() => noteListRef.current?.refresh()} />}
+            {!supportTouch && <RefreshButton onClick={handleToolbarRefresh} />}
             <KindFilter showKinds={temporaryShowKinds} onShowKindsChange={handleShowKindsChange} />
             <GroupedNotesFilter />
           </div>
@@ -176,7 +186,7 @@ export default function NormalFeed({
           }}
           options={
             <>
-              {!supportTouch && <RefreshButton onClick={() => noteListRef.current?.refresh()} />}
+              {!supportTouch && <RefreshButton onClick={handleToolbarRefresh} />}
               <KindFilter
                 showKinds={temporaryShowKinds}
                 onShowKindsChange={handleShowKindsChange}

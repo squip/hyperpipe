@@ -268,9 +268,11 @@ class ClientService extends EventTarget {
       onClose?: (url: string, reason: string) => void
     },
     {
-      startLogin
+      startLogin,
+      timelineLabel
     }: {
       startLogin?: () => void
+      timelineLabel?: string
     } = {}
   ): SubCloser {
     let subc: SubCloser
@@ -298,9 +300,11 @@ class ClientService extends EventTarget {
     const relayUrls = Array.from(
       new Set(relayRequests.flatMap(({ urls }) => urls))
     )
+    const resolvedTimelineLabel = timelineLabel?.trim() || 'f-timeline'
 
     console.info('[subscribeTimeline] start', {
       subscriptionId,
+      timelineLabel: resolvedTimelineLabel,
       subRequests: subRequests.length,
       localRequests: localFilters.length,
       relayRequests: relayRequests.length,
@@ -402,7 +406,7 @@ class ClientService extends EventTarget {
                 })
               ),
               {
-                label: 'f-timeline',
+                label: resolvedTimelineLabel,
                 onevent: (evt) => {
                   if (!eosed) {
                     events.push(evt)
@@ -447,7 +451,7 @@ class ClientService extends EventTarget {
                     reason
                   }))
                   console.info('[subscribeTimeline] onclose', {
-                    label: 'f-timeline',
+                    label: resolvedTimelineLabel,
                     subscriptionId,
                     reasons: closeReport
                   })
