@@ -28,6 +28,7 @@ import Username from '@/components/Username'
 import NormalFeed from '@/components/NormalFeed'
 import { BIG_RELAY_URLS } from '@/constants'
 import { parseGroupIdentifier } from '@/lib/groups'
+import client from '@/services/client.service'
 import relayMembershipService from '@/services/relay-membership.service'
 import { Input } from '@/components/ui/input'
 import { toast } from 'sonner'
@@ -412,6 +413,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   }, [reportTarget])
   const requestIdRef = useRef(0)
   const lastRouteSubscriptionRefreshRef = useRef<string | null>(null)
+  const groupRelayWarmupKeyRef = useRef<string | null>(null)
 
   const myGroupRelay = useMemo(
     () => (groupId ? myGroupList.find((entry) => entry.groupId === groupId)?.relay : undefined),
@@ -753,6 +755,46 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   )
 
   useEffect(() => {
+    if (!groupId || !activeGroupRelay || groupSubRequests.length === 0) return
+    const warmupKey = `${groupId}|${activeGroupRelay}`
+    if (groupRelayWarmupKeyRef.current === warmupKey) return
+    groupRelayWarmupKeyRef.current = warmupKey
+    let active = true
+    const startedAt = Date.now()
+    console.info('[GroupPage] warm relay fetch start', {
+      groupId,
+      relay: activeGroupRelay,
+      kindsCount: 15
+    })
+    client
+      .loadMoreTimeline(groupSubRequests, {
+        '#h': [groupId],
+        kinds: [9000, 9001, 1, 6, 20, 21, 22, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089],
+        limit: 1
+      })
+      .then((events) => {
+        if (!active) return
+        console.info('[GroupPage] warm relay fetch complete', {
+          groupId,
+          relay: activeGroupRelay,
+          eventCount: events.length,
+          elapsedMs: Date.now() - startedAt
+        })
+      })
+      .catch((error) => {
+        if (!active) return
+        console.warn('[GroupPage] warm relay fetch failed', {
+          groupId,
+          relay: activeGroupRelay,
+          error: error instanceof Error ? error.message : String(error)
+        })
+      })
+    return () => {
+      active = false
+    }
+  }, [groupId, activeGroupRelay, groupSubRequests])
+
+  useEffect(() => {
     // Debug aid: confirm routing + relay resolution for hypertuna relays
     console.info('[GroupPage] route params', {
       rawId: id,
@@ -1064,6 +1106,35 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const isOpenGroup = effectiveDetail?.metadata?.isOpen !== false
   const inviteOpenJoin = !!inviteData && !inviteToken && inviteData.fileSharing !== false
   const openJoinAllowed = inviteOpenJoin || effectiveDetail?.metadata?.isOpen === true
+  const inviteMemberSet = useMemo(
+    () => new Set((effectiveDetail?.members || []).filter((member) => !!member)),
+    [effectiveDetail?.members]
+  )
+  const inviteCandidateProfiles = useMemo(
+    () => inviteProfiles.filter((profile) => !inviteMemberSet.has(profile.pubkey)),
+    [inviteProfiles, inviteMemberSet]
+  )
+
+  useEffect(() => {
+    const query = inviteSearch.trim()
+    if (!query) return
+    console.info('[GroupPage] invite suggestions summary', {
+      groupId,
+      query,
+      rawProfilesCount: inviteProfiles.length,
+      candidateProfilesCount: inviteCandidateProfiles.length,
+      suppressedAsExistingMemberCount: inviteProfiles.length - inviteCandidateProfiles.length,
+      selectedInviteesCount: selectedInvitees.length,
+      isSearchingInvites
+    })
+  }, [
+    groupId,
+    inviteSearch,
+    inviteProfiles.length,
+    inviteCandidateProfiles.length,
+    selectedInvitees.length,
+    isSearchingInvites
+  ])
 
   const isAdmin =
     !!pubkey &&
@@ -1695,12 +1766,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           }
         }}
       >
-        <DialogContent>
+        <DialogContent className="sm:max-w-xl max-h-[80vh]">
           <DialogHeader>
             <DialogTitle>{t('Invite members')}</DialogTitle>
           </DialogHeader>
-          <div className="space-y-3">
-            <div className="relative">
+          <div className="flex min-h-0 flex-col gap-3">
+            <div className="relative px-0.5">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
               <Input
                 value={inviteSearch}
@@ -1709,35 +1780,33 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                 className="pl-9"
               />
             </div>
-            <div className="max-h-64 overflow-y-auto space-y-2">
-              {inviteSearch && isSearchingInvites && (
-                <div className="text-sm text-muted-foreground px-2">{t('Searching...')}</div>
-              )}
-              {inviteSearch && !isSearchingInvites && inviteProfiles.length === 0 && (
-                <div className="text-sm text-muted-foreground px-2">{t('No users found')}</div>
-              )}
-              {inviteProfiles
-                .filter((profile) => !(effectiveDetail?.members || []).includes(profile.pubkey))
-                .map((profile) => {
+            <div className="h-64 overflow-y-auto overflow-x-hidden space-y-2 pr-1">
+              <div className="min-h-5 px-2 text-sm text-muted-foreground">
+                {inviteSearch && isSearchingInvites ? t('Searching...') : null}
+                {inviteSearch && !isSearchingInvites && inviteCandidateProfiles.length === 0
+                  ? t('No users found')
+                  : null}
+              </div>
+              {inviteCandidateProfiles.map((profile) => {
                   const isSelected = selectedInvitees.includes(profile.pubkey)
                   return (
                     <div
                       key={profile.pubkey}
-                      className="flex items-center gap-2 hover:bg-accent rounded px-2 py-1 transition-colors"
+                      className="flex w-full min-w-0 items-center gap-2 rounded px-2 py-1 transition-colors hover:bg-accent"
                     >
                       <UserAvatar userId={profile.pubkey} className="shrink-0" />
-                      <div className="flex-1 overflow-hidden">
+                      <div className="min-w-0 flex-1 overflow-hidden">
                         <Username
                           userId={profile.pubkey}
-                          className="font-semibold truncate max-w-full w-fit"
+                          className="block w-full min-w-0 truncate font-semibold"
                         />
-                        <Nip05 pubkey={profile.pubkey} />
+                        <Nip05 pubkey={profile.pubkey} className="w-full min-w-0" />
                       </div>
                       <Button
                         variant={isSelected ? 'secondary' : 'outline'}
                         size="sm"
                         onClick={() => handleInviteToggle(profile.pubkey)}
-                        className="flex-shrink-0 h-8 px-3"
+                        className="h-8 w-20 shrink-0 px-2"
                       >
                         {isSelected ? (
                           <>
@@ -1756,17 +1825,17 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                 })}
             </div>
             {selectedInvitees.length > 0 && (
-              <div className="flex flex-wrap gap-2">
+              <div className="flex max-h-28 flex-wrap gap-2 overflow-y-auto pr-1">
                 {selectedInvitees.map((pk) => (
                   <Button
                     key={pk}
                     variant="secondary"
                     size="sm"
-                    className="flex items-center gap-2"
+                    className="flex max-w-full items-center gap-2"
                     onClick={() => handleInviteToggle(pk)}
                   >
                     <UserAvatar userId={pk} size="xSmall" />
-                    <Username userId={pk} className="truncate max-w-[8rem]" />
+                    <Username userId={pk} className="truncate max-w-[8rem] min-w-0" />
                     <span className="text-xs text-muted-foreground">{t('Remove')}</span>
                   </Button>
                 ))}

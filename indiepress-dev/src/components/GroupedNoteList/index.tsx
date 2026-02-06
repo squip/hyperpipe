@@ -48,7 +48,7 @@ type GroupedNoteListSnapshot = {
 
 const groupedNoteListSnapshotCache = new Map<string, GroupedNoteListSnapshot>()
 type RefreshTrigger = 'imperative-ref' | 'empty-state-button' | 'pull-to-refresh'
-const EMPTY_FINAL_FALLBACK_DELAY_MS = 1200
+const EMPTY_FINAL_FALLBACK_DELAY_MS = 300
 
 const GroupedNoteList = forwardRef(
   (
@@ -105,6 +105,8 @@ const GroupedNoteList = forwardRef(
     const emptyFinalFallbackTimerRef = useRef<number | null>(null)
     const emptyFinalFallbackAttemptedRef = useRef(false)
     const emptyFinalFallbackContextRef = useRef<string>('')
+    const emptyFinalAutoRetryTimerRef = useRef<number | null>(null)
+    const emptyFinalAutoRetryCountRef = useRef(0)
     const softResubscribeRef = useRef(false)
     const eventsRef = useRef<Event[]>([])
     const snapshotCacheKey = useMemo(() => debugLabel || null, [debugLabel])
@@ -374,6 +376,11 @@ const GroupedNoteList = forwardRef(
         clearTimeout(emptyFinalFallbackTimerRef.current)
         emptyFinalFallbackTimerRef.current = null
       }
+      if (emptyFinalAutoRetryTimerRef.current !== null) {
+        clearTimeout(emptyFinalAutoRetryTimerRef.current)
+        emptyFinalAutoRetryTimerRef.current = null
+      }
+      emptyFinalAutoRetryCountRef.current = 0
       console.info('[GroupedNoteList] empty-final fallback state reset', {
         label: debugLabel ?? null,
         activeTab: debugActiveTab ?? null,
@@ -473,6 +480,11 @@ const GroupedNoteList = forwardRef(
           clearTimeout(emptyFinalFallbackTimerRef.current)
           emptyFinalFallbackTimerRef.current = null
         }
+        if (emptyFinalAutoRetryTimerRef.current !== null) {
+          clearTimeout(emptyFinalAutoRetryTimerRef.current)
+          emptyFinalAutoRetryTimerRef.current = null
+        }
+        emptyFinalAutoRetryCountRef.current = 0
       }
       const snapshot = {
         effectId,
@@ -597,6 +609,13 @@ const GroupedNoteList = forwardRef(
       const isGroupRelayUrl = (url: string) =>
         groupRelayUrls.has(url) || groupRelayBaseUrls.has(stripRelayToken(url))
 
+      const mergeEventBatch = (incomingEvents: Event[], currentEvents: Event[]) => {
+        const merged = [...incomingEvents, ...currentEvents].sort(
+          (a, b) => b.created_at - a.created_at
+        )
+        return merged.filter((evt, i) => i === 0 || evt.id !== merged[i - 1].id)
+      }
+
       const shouldResubscribeReason = (reason: string) => {
         if (reason.startsWith('GroupedNoteList cleanup')) return false
         if (['closed by caller', 'relay connection closed by us'].includes(reason)) {
@@ -631,9 +650,77 @@ const GroupedNoteList = forwardRef(
         }, delayMs)
       }
       let effectActive = true
+      let earlyFetchResolvedWithEvents = false
+      let pendingEarlyFetchCount = 0
+      let awaitingFallbackAfterHedges = false
+      const earlyFetchRetryTimers: number[] = []
+      const scheduleAutoRetryAfterEmpty = (reason: string) => {
+        if (!effectActive) return false
+        if (eventsRef.current.length > 0 || earlyFetchResolvedWithEvents) return false
+        if (emptyFinalAutoRetryTimerRef.current !== null) return true
+        if (emptyFinalAutoRetryCountRef.current >= 1) return false
+        emptyFinalAutoRetryCountRef.current += 1
+        const attempt = emptyFinalAutoRetryCountRef.current
+        const delayMs = 450
+        console.info('[GroupedNoteList] empty-final auto-retry scheduled', {
+          label: debugLabel ?? null,
+          activeTab: debugActiveTab ?? null,
+          effectId,
+          reason,
+          attempt,
+          delayMs
+        })
+        setLoading(true)
+        emptyFinalAutoRetryTimerRef.current = window.setTimeout(() => {
+          emptyFinalAutoRetryTimerRef.current = null
+          if (!effectActive) return
+          console.info('[GroupedNoteList] empty-final auto-retry firing', {
+            label: debugLabel ?? null,
+            activeTab: debugActiveTab ?? null,
+            effectId,
+            reason,
+            attempt
+          })
+          softResubscribeRef.current = true
+          setRefreshCount((curr) => curr + 1)
+        }, delayMs)
+        return true
+      }
+      const resolveDeferredFallbackAfterHedges = (reason: string) => {
+        if (!effectActive || !awaitingFallbackAfterHedges) return
+        if (pendingEarlyFetchCount > 0) return
+        awaitingFallbackAfterHedges = false
+        const fallbackScheduled = scheduleEmptyFinalFallback(reason)
+        console.info('[GroupedNoteList] empty-final fallback hedge resolution', {
+          label: debugLabel ?? null,
+          activeTab: debugActiveTab ?? null,
+          effectId,
+          reason,
+          fallbackScheduled,
+          pendingEarlyFetchCount,
+          hasEvents: eventsRef.current.length > 0,
+          earlyFetchResolvedWithEvents
+        })
+        if (effectActive) {
+          setLoading(Boolean(fallbackScheduled))
+        }
+      }
+      const cancelPendingEmptyFallback = (reason: string) => {
+        if (emptyFinalFallbackTimerRef.current === null) return false
+        clearTimeout(emptyFinalFallbackTimerRef.current)
+        emptyFinalFallbackTimerRef.current = null
+        console.info('[GroupedNoteList] empty-final fallback canceled', {
+          label: debugLabel ?? null,
+          activeTab: debugActiveTab ?? null,
+          effectId,
+          reason
+        })
+        return true
+      }
       const scheduleEmptyFinalFallback = (reason: string) => {
         if (!canResubscribe) return false
         if (eventsRef.current.length > 0) return false
+        if (earlyFetchResolvedWithEvents) return false
         if (emptyFinalFallbackAttemptedRef.current) return false
         if (emptyFinalFallbackTimerRef.current !== null) return true
 
@@ -648,6 +735,16 @@ const GroupedNoteList = forwardRef(
         })
         emptyFinalFallbackTimerRef.current = window.setTimeout(async () => {
           emptyFinalFallbackTimerRef.current = null
+          if (earlyFetchResolvedWithEvents || eventsRef.current.length > 0) {
+            console.info('[GroupedNoteList] empty-final fallback skipped', {
+              label: debugLabel ?? null,
+              activeTab: debugActiveTab ?? null,
+              effectId,
+              reason: 'events-already-available'
+            })
+            if (effectActive) setLoading(false)
+            return
+          }
           console.info('[GroupedNoteList] empty-final fallback firing', {
             label: debugLabel ?? null,
             activeTab: debugActiveTab ?? null,
@@ -673,12 +770,16 @@ const GroupedNoteList = forwardRef(
             })
             if (!effectActive) return
             if (filteredEvents.length > 0) {
+              if (emptyFinalAutoRetryTimerRef.current !== null) {
+                clearTimeout(emptyFinalAutoRetryTimerRef.current)
+                emptyFinalAutoRetryTimerRef.current = null
+              }
+              emptyFinalAutoRetryCountRef.current = 0
               setEvents((currentEvents) => {
-                const merged = [...filteredEvents, ...currentEvents].sort(
-                  (a, b) => b.created_at - a.created_at
-                )
-                return merged.filter((evt, i) => i === 0 || evt.id !== merged[i - 1].id)
+                return mergeEventBatch(filteredEvents, currentEvents)
               })
+            } else {
+              scheduleAutoRetryAfterEmpty('fallback-empty')
             }
           } catch (error) {
             console.warn('[GroupedNoteList] empty-final fallback failed', {
@@ -688,10 +789,99 @@ const GroupedNoteList = forwardRef(
               error: error instanceof Error ? error.message : String(error)
             })
           } finally {
-            if (effectActive) setLoading(false)
+            if (effectActive && emptyFinalAutoRetryTimerRef.current === null) setLoading(false)
           }
         }, delayMs)
         return true
+      }
+
+      const shouldRunEarlyFetch = canResubscribe && !preserveExistingEvents
+      if (shouldRunEarlyFetch) {
+        const runEarlyFetchAttempt = (attempt: number, trigger: 'initial' | 'hedge') => {
+          if (!effectActive || earlyFetchResolvedWithEvents) return
+          pendingEarlyFetchCount += 1
+          const earlyFetchStartedAt = Date.now()
+          console.info('[GroupedNoteList] early one-shot fetch start', {
+            label: debugLabel ?? null,
+            activeTab: debugActiveTab ?? null,
+            effectId,
+            groupedNotesSince,
+            showKindsCount: showKinds.length,
+            attempt,
+            trigger,
+            pendingEarlyFetchCount
+          })
+          client
+            .loadMoreTimeline(
+              subRequests,
+              {
+                kinds: showKinds,
+                since: groupedNotesSince
+              },
+              {
+                startLogin
+              }
+            )
+            .then((earlyFetchEvents) => {
+              const filteredEvents = earlyFetchEvents.filter((evt) => !shouldHideEvent(evt))
+              const elapsedMs = Date.now() - earlyFetchStartedAt
+              console.info('[GroupedNoteList] early one-shot fetch result', {
+                label: debugLabel ?? null,
+                activeTab: debugActiveTab ?? null,
+                effectId,
+                batchSize: filteredEvents.length,
+                elapsedMs,
+                attempt,
+                trigger
+              })
+              if (!effectActive) {
+                console.info('[GroupedNoteList] early one-shot fetch ignored (stale effect)', {
+                  label: debugLabel ?? null,
+                  activeTab: debugActiveTab ?? null,
+                  effectId,
+                  attempt,
+                  trigger
+                })
+                return
+              }
+              if (!filteredEvents.length || earlyFetchResolvedWithEvents) return
+              earlyFetchResolvedWithEvents = true
+              awaitingFallbackAfterHedges = false
+              if (emptyFinalAutoRetryTimerRef.current !== null) {
+                clearTimeout(emptyFinalAutoRetryTimerRef.current)
+                emptyFinalAutoRetryTimerRef.current = null
+              }
+              emptyFinalAutoRetryCountRef.current = 0
+              emptyFinalFallbackAttemptedRef.current = false
+              cancelPendingEmptyFallback('early-fetch-events')
+              setEvents((currentEvents) => mergeEventBatch(filteredEvents, currentEvents))
+              setLoading(false)
+            })
+            .catch((error) => {
+              console.warn('[GroupedNoteList] early one-shot fetch failed', {
+                label: debugLabel ?? null,
+                activeTab: debugActiveTab ?? null,
+                effectId,
+                error: error instanceof Error ? error.message : String(error),
+                attempt,
+                trigger
+              })
+            })
+            .finally(() => {
+              pendingEarlyFetchCount = Math.max(0, pendingEarlyFetchCount - 1)
+              resolveDeferredFallbackAfterHedges('after-early-fetch-settled')
+            })
+        }
+
+        runEarlyFetchAttempt(1, 'initial')
+        const hedgeDelaysMs = [900, 1800]
+        for (let i = 0; i < hedgeDelaysMs.length; i++) {
+          const delayMs = hedgeDelaysMs[i]
+          const timer = window.setTimeout(() => {
+            runEarlyFetchAttempt(i + 2, 'hedge')
+          }, delayMs)
+          earlyFetchRetryTimers.push(timer)
+        }
       }
 
       const subc = client.subscribeTimeline(
@@ -706,16 +896,24 @@ const GroupedNoteList = forwardRef(
 
             if (isFinal) {
               const isEmptyFinal = events.length === 0
-              const hasCachedEvents = eventsRef.current.length > 0
+              const hasCachedEvents = eventsRef.current.length > 0 || earlyFetchResolvedWithEvents
               let fallbackScheduled = false
               if (isEmptyFinal && !hasCachedEvents) {
-                fallbackScheduled = scheduleEmptyFinalFallback('final-empty-batch')
-              } else if (!isEmptyFinal) {
-                emptyFinalFallbackAttemptedRef.current = false
-                if (emptyFinalFallbackTimerRef.current !== null) {
-                  clearTimeout(emptyFinalFallbackTimerRef.current)
-                  emptyFinalFallbackTimerRef.current = null
+                if (pendingEarlyFetchCount > 0) {
+                  awaitingFallbackAfterHedges = true
+                  console.info('[GroupedNoteList] empty-final fallback deferred for hedges', {
+                    label: debugLabel ?? null,
+                    activeTab: debugActiveTab ?? null,
+                    effectId,
+                    pendingEarlyFetchCount
+                  })
+                } else {
+                  fallbackScheduled = scheduleEmptyFinalFallback('final-empty-batch')
                 }
+              } else if (!isEmptyFinal) {
+                awaitingFallbackAfterHedges = false
+                emptyFinalFallbackAttemptedRef.current = false
+                cancelPendingEmptyFallback('final-non-empty')
               }
               console.info('[GroupedNoteList] onEvents final batch', {
                 label: debugLabel ?? null,
@@ -726,11 +924,23 @@ const GroupedNoteList = forwardRef(
                 fallbackScheduled,
                 fallbackAttempted: emptyFinalFallbackAttemptedRef.current
               })
-              setLoading(fallbackScheduled)
+              setLoading(
+                fallbackScheduled ||
+                  (isEmptyFinal && !hasCachedEvents && pendingEarlyFetchCount > 0)
+              )
             }
 
             if (events.length > 0) {
-              setEvents(events)
+              if (emptyFinalAutoRetryTimerRef.current !== null) {
+                clearTimeout(emptyFinalAutoRetryTimerRef.current)
+                emptyFinalAutoRetryTimerRef.current = null
+              }
+              emptyFinalAutoRetryCountRef.current = 0
+              if (earlyFetchResolvedWithEvents) {
+                setEvents((currentEvents) => mergeEventBatch(events, currentEvents))
+              } else {
+                setEvents(events)
+              }
             }
           },
           onNew: batchDebounce((newEvents) => {
@@ -818,6 +1028,13 @@ const GroupedNoteList = forwardRef(
         if (emptyFinalFallbackTimerRef.current !== null) {
           clearTimeout(emptyFinalFallbackTimerRef.current)
           emptyFinalFallbackTimerRef.current = null
+        }
+        if (emptyFinalAutoRetryTimerRef.current !== null) {
+          clearTimeout(emptyFinalAutoRetryTimerRef.current)
+          emptyFinalAutoRetryTimerRef.current = null
+        }
+        for (const timer of earlyFetchRetryTimers) {
+          clearTimeout(timer)
         }
         console.info('[GroupedNoteList] subscribe cleanup', {
           effectId,

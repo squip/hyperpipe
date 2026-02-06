@@ -2,6 +2,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useFetchProfile } from '@/hooks'
 import { useFetchNip05 } from '@/hooks/useFetchNip05'
 import { toNoteList } from '@/lib/link'
+import { cn } from '@/lib/utils'
 import { SecondaryPageLink } from '@/PageManager'
 import { BadgeAlert, BadgeCheck } from 'lucide-react'
 import { Favicon } from '../Favicon'
@@ -10,11 +11,13 @@ import { NostrUser } from '@nostr/gadgets/metadata'
 export default function Nip05({
   profile: providedProfile,
   pubkey,
-  append
+  append,
+  className
 }: {
   pubkey?: string
   profile?: NostrUser
   append?: string
+  className?: string
 }) {
   const { profile: fetchedProfile } = useFetchProfile(providedProfile ? undefined : pubkey)
   const profile = providedProfile || fetchedProfile
@@ -36,11 +39,14 @@ export default function Nip05({
 
   return (
     <div
-      className="flex items-center gap-1 truncate [&_svg]:!size-3.5 [&_svg]:shrink-0"
+      className={cn(
+        'flex min-w-0 items-center gap-1 truncate [&_svg]:!size-3.5 [&_svg]:shrink-0',
+        className
+      )}
       onClick={(e) => e.stopPropagation()}
     >
       {nip05Name !== '_' ? (
-        <span className="text-sm text-muted-foreground truncate">@{nip05Name}</span>
+        <span className="min-w-0 truncate text-sm text-muted-foreground">@{nip05Name}</span>
       ) : null}
       {nip05IsVerified ? (
         <Favicon
@@ -53,11 +59,11 @@ export default function Nip05({
       )}
       <SecondaryPageLink
         to={toNoteList({ domain: nip05Domain })}
-        className={`hover:underline truncate text-sm ${nip05IsVerified ? 'text-primary' : 'text-muted-foreground'}`}
+        className={`min-w-0 truncate text-sm hover:underline ${nip05IsVerified ? 'text-primary' : 'text-muted-foreground'}`}
       >
         {nip05Domain}
       </SecondaryPageLink>
-      {append && <span className="text-sm text-muted-foreground truncate">{append}</span>}
+      {append && <span className="min-w-0 truncate text-sm text-muted-foreground">{append}</span>}
     </div>
   )
 }
