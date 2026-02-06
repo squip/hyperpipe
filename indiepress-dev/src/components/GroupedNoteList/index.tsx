@@ -13,6 +13,7 @@ import client from '@/services/client.service'
 import { TFeedSubRequest } from '@/types'
 import { Event, NostrEvent } from '@nostr/tools/wasm'
 import * as kinds from '@nostr/tools/kinds'
+import { Loader2 } from 'lucide-react'
 import {
   forwardRef,
   useCallback,
@@ -49,6 +50,10 @@ type GroupedNoteListSnapshot = {
 const groupedNoteListSnapshotCache = new Map<string, GroupedNoteListSnapshot>()
 type RefreshTrigger = 'imperative-ref' | 'empty-state-button' | 'pull-to-refresh'
 const EMPTY_FINAL_FALLBACK_DELAY_MS = 300
+const EMPTY_FINAL_MAX_AUTO_RETRIES = 3
+const EMPTY_FINAL_AUTO_RETRY_BASE_DELAY_MS = 450
+const EMPTY_FINAL_AUTO_RETRY_MAX_DELAY_MS = 2400
+const RELAY_SYNC_RETRY_DELAY_MS = 3000
 
 const GroupedNoteList = forwardRef(
   (
@@ -95,6 +100,15 @@ const GroupedNoteList = forwardRef(
     const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null)
     const [matchingPubkeys, setMatchingPubkeys] = useState<Set<string> | null>(null)
     const supportTouch = useMemo(() => isTouchDevice(), [])
+    const isGroupRelayFeed = useMemo(
+      () =>
+        subRequests.some((req) => {
+          if (req.source !== 'relays') return false
+          const hTags = (req.filter as { ['#h']?: string[] })?.['#h']
+          return Array.isArray(hTags) && hTags.length > 0
+        }),
+      [subRequests]
+    )
     const topRef = useRef<HTMLDivElement | null>(null)
     const hasLoggedMount = useRef(false)
     const effectIdRef = useRef(0)
@@ -107,6 +121,7 @@ const GroupedNoteList = forwardRef(
     const emptyFinalFallbackContextRef = useRef<string>('')
     const emptyFinalAutoRetryTimerRef = useRef<number | null>(null)
     const emptyFinalAutoRetryCountRef = useRef(0)
+    const relaySyncRetryTimerRef = useRef<number | null>(null)
     const softResubscribeRef = useRef(false)
     const eventsRef = useRef<Event[]>([])
     const snapshotCacheKey = useMemo(() => debugLabel || null, [debugLabel])
@@ -380,6 +395,10 @@ const GroupedNoteList = forwardRef(
         clearTimeout(emptyFinalAutoRetryTimerRef.current)
         emptyFinalAutoRetryTimerRef.current = null
       }
+      if (relaySyncRetryTimerRef.current !== null) {
+        clearTimeout(relaySyncRetryTimerRef.current)
+        relaySyncRetryTimerRef.current = null
+      }
       emptyFinalAutoRetryCountRef.current = 0
       console.info('[GroupedNoteList] empty-final fallback state reset', {
         label: debugLabel ?? null,
@@ -646,6 +665,12 @@ const GroupedNoteList = forwardRef(
         })
         resubscribeTimerRef.current = window.setTimeout(() => {
           resubscribeTimerRef.current = null
+          emptyFinalFallbackAttemptedRef.current = false
+          emptyFinalAutoRetryCountRef.current = 0
+          if (relaySyncRetryTimerRef.current !== null) {
+            clearTimeout(relaySyncRetryTimerRef.current)
+            relaySyncRetryTimerRef.current = null
+          }
           setRefreshCount((curr) => curr + 1)
         }, delayMs)
       }
@@ -654,21 +679,59 @@ const GroupedNoteList = forwardRef(
       let pendingEarlyFetchCount = 0
       let awaitingFallbackAfterHedges = false
       const earlyFetchRetryTimers: number[] = []
+      const scheduleRelaySyncRetry = (reason: string) => {
+        if (!effectActive || !canResubscribe) return false
+        if (eventsRef.current.length > 0 || earlyFetchResolvedWithEvents) return false
+        if (relaySyncRetryTimerRef.current !== null) return true
+        if (resubscribeTimerRef.current !== null) return true
+        if (emptyFinalFallbackTimerRef.current !== null) return true
+        if (emptyFinalAutoRetryTimerRef.current !== null) return true
+        const delayMs = RELAY_SYNC_RETRY_DELAY_MS
+        console.info('[GroupedNoteList] relay sync retry scheduled', {
+          label: debugLabel ?? null,
+          activeTab: debugActiveTab ?? null,
+          effectId,
+          reason,
+          delayMs
+        })
+        setLoading(true)
+        relaySyncRetryTimerRef.current = window.setTimeout(() => {
+          relaySyncRetryTimerRef.current = null
+          if (!effectActive) return
+          console.info('[GroupedNoteList] relay sync retry firing', {
+            label: debugLabel ?? null,
+            activeTab: debugActiveTab ?? null,
+            effectId,
+            reason
+          })
+          emptyFinalFallbackAttemptedRef.current = false
+          emptyFinalAutoRetryCountRef.current = 0
+          softResubscribeRef.current = true
+          setRefreshCount((curr) => curr + 1)
+        }, delayMs)
+        return true
+      }
       const scheduleAutoRetryAfterEmpty = (reason: string) => {
         if (!effectActive) return false
         if (eventsRef.current.length > 0 || earlyFetchResolvedWithEvents) return false
         if (emptyFinalAutoRetryTimerRef.current !== null) return true
-        if (emptyFinalAutoRetryCountRef.current >= 1) return false
+        if (emptyFinalAutoRetryCountRef.current >= EMPTY_FINAL_MAX_AUTO_RETRIES) {
+          return scheduleRelaySyncRetry('auto-retry-exhausted')
+        }
         emptyFinalAutoRetryCountRef.current += 1
         const attempt = emptyFinalAutoRetryCountRef.current
-        const delayMs = 450
+        const delayMs = Math.min(
+          EMPTY_FINAL_AUTO_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1),
+          EMPTY_FINAL_AUTO_RETRY_MAX_DELAY_MS
+        )
         console.info('[GroupedNoteList] empty-final auto-retry scheduled', {
           label: debugLabel ?? null,
           activeTab: debugActiveTab ?? null,
           effectId,
           reason,
           attempt,
-          delayMs
+          delayMs,
+          maxAttempts: EMPTY_FINAL_MAX_AUTO_RETRIES
         })
         setLoading(true)
         emptyFinalAutoRetryTimerRef.current = window.setTimeout(() => {
@@ -681,6 +744,8 @@ const GroupedNoteList = forwardRef(
             reason,
             attempt
           })
+          // Allow another empty-final fallback cycle on the next subscribe effect.
+          emptyFinalFallbackAttemptedRef.current = false
           softResubscribeRef.current = true
           setRefreshCount((curr) => curr + 1)
         }, delayMs)
@@ -774,6 +839,10 @@ const GroupedNoteList = forwardRef(
                 clearTimeout(emptyFinalAutoRetryTimerRef.current)
                 emptyFinalAutoRetryTimerRef.current = null
               }
+              if (relaySyncRetryTimerRef.current !== null) {
+                clearTimeout(relaySyncRetryTimerRef.current)
+                relaySyncRetryTimerRef.current = null
+              }
               emptyFinalAutoRetryCountRef.current = 0
               setEvents((currentEvents) => {
                 return mergeEventBatch(filteredEvents, currentEvents)
@@ -789,7 +858,13 @@ const GroupedNoteList = forwardRef(
               error: error instanceof Error ? error.message : String(error)
             })
           } finally {
-            if (effectActive && emptyFinalAutoRetryTimerRef.current === null) setLoading(false)
+            if (
+              effectActive &&
+              emptyFinalAutoRetryTimerRef.current === null &&
+              relaySyncRetryTimerRef.current === null
+            ) {
+              setLoading(false)
+            }
           }
         }, delayMs)
         return true
@@ -898,6 +973,7 @@ const GroupedNoteList = forwardRef(
               const isEmptyFinal = events.length === 0
               const hasCachedEvents = eventsRef.current.length > 0 || earlyFetchResolvedWithEvents
               let fallbackScheduled = false
+              let relaySyncScheduled = false
               if (isEmptyFinal && !hasCachedEvents) {
                 if (pendingEarlyFetchCount > 0) {
                   awaitingFallbackAfterHedges = true
@@ -909,10 +985,17 @@ const GroupedNoteList = forwardRef(
                   })
                 } else {
                   fallbackScheduled = scheduleEmptyFinalFallback('final-empty-batch')
+                  if (!fallbackScheduled && canResubscribe) {
+                    relaySyncScheduled = scheduleRelaySyncRetry('final-empty-batch')
+                  }
                 }
               } else if (!isEmptyFinal) {
                 awaitingFallbackAfterHedges = false
                 emptyFinalFallbackAttemptedRef.current = false
+                if (relaySyncRetryTimerRef.current !== null) {
+                  clearTimeout(relaySyncRetryTimerRef.current)
+                  relaySyncRetryTimerRef.current = null
+                }
                 cancelPendingEmptyFallback('final-non-empty')
               }
               console.info('[GroupedNoteList] onEvents final batch', {
@@ -922,10 +1005,12 @@ const GroupedNoteList = forwardRef(
                 batchSize: events.length,
                 hasCachedEvents,
                 fallbackScheduled,
+                relaySyncScheduled,
                 fallbackAttempted: emptyFinalFallbackAttemptedRef.current
               })
               setLoading(
                 fallbackScheduled ||
+                  relaySyncScheduled ||
                   (isEmptyFinal && !hasCachedEvents && pendingEarlyFetchCount > 0)
               )
             }
@@ -934,6 +1019,10 @@ const GroupedNoteList = forwardRef(
               if (emptyFinalAutoRetryTimerRef.current !== null) {
                 clearTimeout(emptyFinalAutoRetryTimerRef.current)
                 emptyFinalAutoRetryTimerRef.current = null
+              }
+              if (relaySyncRetryTimerRef.current !== null) {
+                clearTimeout(relaySyncRetryTimerRef.current)
+                relaySyncRetryTimerRef.current = null
               }
               emptyFinalAutoRetryCountRef.current = 0
               if (earlyFetchResolvedWithEvents) {
@@ -1032,6 +1121,10 @@ const GroupedNoteList = forwardRef(
         if (emptyFinalAutoRetryTimerRef.current !== null) {
           clearTimeout(emptyFinalAutoRetryTimerRef.current)
           emptyFinalAutoRetryTimerRef.current = null
+        }
+        if (relaySyncRetryTimerRef.current !== null) {
+          clearTimeout(relaySyncRetryTimerRef.current)
+          relaySyncRetryTimerRef.current = null
         }
         for (const timer of earlyFetchRetryTimers) {
           clearTimeout(timer)
@@ -1134,6 +1227,11 @@ const GroupedNoteList = forwardRef(
         {events.length ? (
           <div className="text-center text-sm text-muted-foreground mt-2">
             {t('end of grouped results')}
+          </div>
+        ) : isGroupRelayFeed && !events.length ? (
+          <div className="flex flex-col items-center justify-center w-full mt-4 gap-2 text-muted-foreground">
+            <Loader2 className="h-5 w-5 animate-spin" />
+            <div className="text-sm">{t('syncing relay data')}</div>
           </div>
         ) : !loading && !events.length ? (
           <div className="flex justify-center w-full mt-2">

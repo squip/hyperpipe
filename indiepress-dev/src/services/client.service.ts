@@ -394,14 +394,14 @@ class ClientService extends EventTarget {
         : new Promise<NostrEvent[]>((resolve) => {
             let eosed = false
 
-            // keep track of this just so we can refer to them for onClose
-            const urls: string[] = []
+            // keep track of relay URLs so onclose callbacks can map reasons to relays
+            const closeUrls: string[] = []
 
             let events: NostrEvent[] = []
             subc = pool.subscribeMap(
-              relayRequests.flatMap(({ urls, filter }) =>
-                urls.flatMap((url) => {
-                  if (!urls.includes(url)) urls.push(url)
+              relayRequests.flatMap(({ urls: requestUrls, filter }) =>
+                requestUrls.flatMap((url) => {
+                  if (!closeUrls.includes(url)) closeUrls.push(url)
                   return { url, filter }
                 })
               ),
@@ -447,7 +447,7 @@ class ClientService extends EventTarget {
                 }) as (event: EventTemplate) => Promise<VerifiedEvent>,
                 onclose(reasons) {
                   const closeReport = reasons.map((reason, index) => ({
-                    url: urls[index],
+                    url: closeUrls[index] || relayUrls[index],
                     reason
                   }))
                   console.info('[subscribeTimeline] onclose', {
@@ -458,7 +458,9 @@ class ClientService extends EventTarget {
                   if (onClose) {
                     for (let i = 0; i < reasons.length; i++) {
                       const reason = reasons[i]
-                      onClose(urls[i], reason)
+                      const url = closeUrls[i] || relayUrls[i]
+                      if (!url) continue
+                      onClose(url, reason)
                     }
                   }
                   resolve(events)
