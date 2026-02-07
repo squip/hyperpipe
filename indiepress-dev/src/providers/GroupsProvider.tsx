@@ -2017,14 +2017,23 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   ])
 
   const republishMemberSnapshot39002 = useCallback(
-    async (params: { groupId: string; relay?: string; isPublicGroup?: boolean; reason: string }) => {
-      const { groupId, relay, isPublicGroup, reason } = params
+    async (params: {
+      groupId: string
+      relay?: string
+      isPublicGroup?: boolean
+      reason: string
+      ensureMemberPubkey?: string
+    }) => {
+      const { groupId, relay, isPublicGroup, reason, ensureMemberPubkey } = params
       const resolved = relay ? resolveRelayUrl(relay) : undefined
       let members: string[] = []
       let resolvedIsPublic = typeof isPublicGroup === 'boolean' ? isPublicGroup : true
       try {
         const detail = await fetchGroupDetail(groupId, relay, { preferRelay: true })
         members = normalizePubkeyList(detail?.members || [])
+        if (ensureMemberPubkey) {
+          members = normalizePubkeyList([...members, ensureMemberPubkey])
+        }
         if (typeof isPublicGroup !== 'boolean') {
           resolvedIsPublic = detail?.metadata?.isPublic !== false
         }
@@ -2177,9 +2186,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         } catch (_err) {
           isPublicGroup = true
         }
-        if (!isPublicGroup) return
-
-        const targets = buildMembershipPublishTargets(baseUrl, true)
+        const targets = buildMembershipPublishTargets(baseUrl, isPublicGroup)
         if (!targets.length) return
         const memberEvent: TDraftEvent = {
           kind: 9000,
@@ -2195,8 +2202,24 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           console.info('[GroupsProvider] Published open-join member announce', {
             groupId: identifier,
             relay: baseUrl,
-            targets: targets.length
+            targets: targets.length,
+            isPublicGroup
           })
+          try {
+            await republishMemberSnapshot39002({
+              groupId: identifier,
+              relay: baseUrl,
+              isPublicGroup,
+              reason: 'open-join-member-announce',
+              ensureMemberPubkey: pubkey
+            })
+          } catch (republishErr) {
+            console.warn('[GroupsProvider] Failed 39002 republish after open-join member announce', {
+              groupId: identifier,
+              relay: baseUrl,
+              err: republishErr instanceof Error ? republishErr.message : republishErr
+            })
+          }
           invalidateGroupMemberPreview(identifier, baseUrl, { reason: 'open-join-member-announce' })
           refreshGroupMemberPreview(identifier, baseUrl, {
             force: true,
@@ -2278,6 +2301,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     processedJoinFlowsRef,
     pubkey,
     publish,
+    republishMemberSnapshot39002,
     refreshGroupMemberPreview,
     saveMyGroupList,
     upsertProvisionalGroupMetadata
