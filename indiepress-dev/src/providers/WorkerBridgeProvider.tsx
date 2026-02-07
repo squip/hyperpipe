@@ -136,6 +136,17 @@ type RelayCreateRequest = {
   isPublic?: boolean
   isOpen?: boolean
   fileSharing?: boolean
+  picture?: string
+}
+
+type RelayBootstrapPublishStatus = {
+  status?: 'success' | 'failed' | 'skipped' | string
+  attempt?: number
+  publishedKinds?: number[]
+  eventIds?: string[]
+  relayIdentifier?: string | null
+  relayWsUrl?: string | null
+  error?: string | null
 }
 
 type RelayCreatedPayload = {
@@ -153,6 +164,7 @@ type RelayCreatedPayload = {
   gatewayRegistration?: string
   registrationError?: string
   members?: string[]
+  bootstrapPublish?: RelayBootstrapPublishStatus
 }
 
 type WorkerBridgeContextValue = {
@@ -1008,9 +1020,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
               typeof data.publicIdentifier === 'string' && data.publicIdentifier.trim()
                 ? data.publicIdentifier.trim()
                 : null
-            const summaries = Array.isArray(data.summaries) ? data.summaries : []
+            const summaries: any[] = Array.isArray(data.summaries) ? data.summaries : []
             const timelineSummaries = summaries.filter(
-              (summary) =>
+              (summary: any) =>
                 summary &&
                 typeof summary === 'object' &&
                 summary.isTimelineGroup === true &&
@@ -1195,42 +1207,44 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           case 'relay-writable': {
             const data = (msg as any)?.data || {}
             const identifier = data.publicIdentifier
-            if (!identifier) break
-            const isWritable = data.writable === true
-            setJoinFlows((prev) => {
-              const current = prev[identifier]
-              if (!current) return prev
-              if (!isWritable) {
+            if (identifier) {
+              const isWritable = data.writable === true
+              setJoinFlows((prev) => {
+                const current = prev[identifier]
+                if (!current) return prev
+                if (!isWritable) {
+                  return {
+                    ...prev,
+                    [identifier]: {
+                      ...current,
+                      updatedAt: Date.now(),
+                      relayKey: data.relayKey ?? current.relayKey,
+                      relayUrl: data.relayUrl ?? current.relayUrl,
+                      authToken: data.authToken ?? current.authToken,
+                      mode: data.mode ?? current.mode,
+                      expectedWriterActive: data.expectedWriterActive ?? current.expectedWriterActive,
+                      writable: data.writable ?? current.writable
+                    }
+                  }
+                }
                 return {
                   ...prev,
                   [identifier]: {
                     ...current,
+                    phase: current.phase === 'error' ? current.phase : 'success',
                     updatedAt: Date.now(),
                     relayKey: data.relayKey ?? current.relayKey,
                     relayUrl: data.relayUrl ?? current.relayUrl,
                     authToken: data.authToken ?? current.authToken,
                     mode: data.mode ?? current.mode,
                     expectedWriterActive: data.expectedWriterActive ?? current.expectedWriterActive,
-                    writable: data.writable ?? current.writable
+                    writable: true,
+                    writableAt: current.writableAt ?? Date.now()
                   }
                 }
-              }
-              return {
-                ...prev,
-                [identifier]: {
-                  ...current,
-                  phase: current.phase === 'error' ? current.phase : 'success',
-                  updatedAt: Date.now(),
-                  relayKey: data.relayKey ?? current.relayKey,
-                  relayUrl: data.relayUrl ?? current.relayUrl,
-                  authToken: data.authToken ?? current.authToken,
-                  mode: data.mode ?? current.mode,
-                  expectedWriterActive: data.expectedWriterActive ?? current.expectedWriterActive,
-                  writable: true,
-                  writableAt: current.writableAt ?? Date.now()
-                }
-              }
-            })
+              })
+            }
+            electronIpc.sendToWorker({ type: 'get-relays' }).catch(() => {})
             break
           }
           case 'error':

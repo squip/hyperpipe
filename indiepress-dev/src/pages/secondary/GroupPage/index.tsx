@@ -352,6 +352,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const {
     discoveryGroups,
     fetchGroupDetail,
+    getProvisionalGroupMetadata,
     sendJoinRequest,
     sendLeaveRequest,
     favoriteGroups,
@@ -422,12 +423,18 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     [groupId, myGroupList]
   )
   const effectiveGroupRelay = useMemo(() => groupRelay || myGroupRelay, [groupRelay, myGroupRelay])
+  const provisionalMeta = useMemo(
+    () => (groupId ? getProvisionalGroupMetadata(groupId, effectiveGroupRelay) : null),
+    [effectiveGroupRelay, getProvisionalGroupMetadata, groupId]
+  )
   const fallbackMeta = useMemo(
-    () =>
-      discoveryGroups.find(
+    () => {
+      const discoveryMeta = discoveryGroups.find(
         (g) => g.id === groupId && (!effectiveGroupRelay || !g.relay || g.relay === effectiveGroupRelay)
-      ),
-    [discoveryGroups, effectiveGroupRelay, groupId]
+      )
+      return discoveryMeta || provisionalMeta || undefined
+    },
+    [discoveryGroups, effectiveGroupRelay, groupId, provisionalMeta]
   )
 
   useEffect(() => {

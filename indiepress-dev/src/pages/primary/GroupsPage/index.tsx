@@ -187,6 +187,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     discoveryGroups,
     invites,
     myGroupList,
+    getProvisionalGroupMetadata,
     refreshDiscovery,
     refreshInvites,
     dismissInvite,
@@ -215,9 +216,11 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
   })
 
   const renderGroupCard = (groupId: string, relay?: string) => {
-    const meta = discoveryGroups.find(
+    const discoveryMeta = discoveryGroups.find(
       (g) => g.id === groupId && (relay ? g.relay === relay : true)
     )
+    const provisionalMeta = getProvisionalGroupMetadata(groupId, relay)
+    const meta = discoveryMeta || provisionalMeta
     const name = meta?.name || groupId
     const about = meta?.about
     const membersText = meta?.tags?.length ? `${meta.tags.length} tags` : null

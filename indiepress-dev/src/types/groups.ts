@@ -44,6 +44,7 @@ export type TGroupInvite = {
   about?: string
   authorizedMemberPubkeys?: string[]
   fileSharing?: boolean
+  isPublic?: boolean
   relayUrl?: string | null
   relayKey?: string | null
   writerCore?: string | null

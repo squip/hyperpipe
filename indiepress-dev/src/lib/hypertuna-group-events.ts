@@ -82,6 +82,7 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
 
   const metadataTags: string[][] = [
     ['d', args.publicIdentifier],
+    ['h', args.publicIdentifier],
     ['name', String(args.name)],
     ['about', args.about ? String(args.about) : ''],
     ['hypertuna', args.publicIdentifier],
@@ -124,8 +125,10 @@ export function buildHypertunaAdminBootstrapDraftEvents(args: {
 }): { adminListEvent: TDraftEvent; memberListEvent: TDraftEvent } {
   const now = Math.floor(Date.now() / 1000)
   const tags: string[][] = [
+    ['h', args.publicIdentifier],
     ['d', args.publicIdentifier],
     ['hypertuna', args.publicIdentifier],
+    ['i', HYPERTUNA_IDENTIFIER_TAG],
     ['p', args.adminPubkeyHex, 'admin']
   ]
 
@@ -145,4 +148,3 @@ export function buildHypertunaAdminBootstrapDraftEvents(args: {
 
   return { adminListEvent, memberListEvent }
 }
-

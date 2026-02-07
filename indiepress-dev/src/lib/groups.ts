@@ -142,6 +142,7 @@ export function parseGroupInviteEvent(event: Event, relay?: string): TGroupInvit
   const name = event.tags.find((t) => t[0] === 'name')?.[1]
   const picture = event.tags.find((t) => t[0] === 'picture')?.[1]
   const about = event.tags.find((t) => t[0] === 'about')?.[1]
+  const isPublic = event.tags.some((t) => t[0] === 'public')
   const fileSharingOn = event.tags.some((t) => t[0] === 'file-sharing-on')
   return {
     groupId,
@@ -150,6 +151,7 @@ export function parseGroupInviteEvent(event: Event, relay?: string): TGroupInvit
     groupPicture: picture,
     name,
     about,
+    isPublic,
     fileSharing: fileSharingOn,
     // Token is encrypted in content per requirements; decrypted elsewhere
     token: undefined,

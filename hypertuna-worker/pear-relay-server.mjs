@@ -66,6 +66,13 @@ import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/
 
 const PUBLIC_GATEWAY_REPLICA_IDENTIFIER = 'public-gateway:hyperbee';
 const { DEFAULT_NAMESPACE } = hypercoreCaps;
+const HYPERTUNA_IDENTIFIER_TAG = 'hypertuna:relay';
+const KIND_GROUP_CREATE = 9007;
+const KIND_GROUP_METADATA = 39000;
+const KIND_GROUP_ADMIN_LIST = 39001;
+const KIND_GROUP_MEMBER_LIST = 39002;
+const KIND_HYPERTUNA_RELAY = 30166;
+const CREATE_RELAY_BOOTSTRAP_MAX_ATTEMPTS = 3;
 
 function isHex64(value) {
   return typeof value === 'string' && /^[0-9a-fA-F]{64}$/.test(value.trim());
@@ -2558,6 +2565,176 @@ async function publishMemberAddEvent(identifier, pubkey, token, subnetHashes = [
   }
 }
 
+function buildCreateRelayBootstrapDraftEvents({
+  publicIdentifier,
+  adminPubkey,
+  name,
+  description,
+  isPublic,
+  isOpen,
+  fileSharing,
+  relayWsUrl,
+  picture
+}) {
+  const canonicalIdentifier = normalizeRelayIdentifier(publicIdentifier);
+  const now = Math.floor(Date.now() / 1000);
+  const groupName = String(name || canonicalIdentifier || 'Untitled Group');
+  const about = description ? String(description) : '';
+  const fileSharingEnabled = fileSharing !== false;
+  const pictureTag = typeof picture === 'string' && picture.trim() ? picture.trim() : null;
+
+  const groupTags = [
+    ['h', canonicalIdentifier],
+    ['name', groupName],
+    ['about', about],
+    ['hypertuna', canonicalIdentifier],
+    ['i', HYPERTUNA_IDENTIFIER_TAG],
+    [isPublic ? 'public' : 'private'],
+    [isOpen ? 'open' : 'closed'],
+    [fileSharingEnabled ? 'file-sharing-on' : 'file-sharing-off']
+  ];
+  if (pictureTag) groupTags.push(['picture', pictureTag, 'hypertuna:drive:pfp']);
+
+  const metadataTags = [
+    ['d', canonicalIdentifier],
+    ['h', canonicalIdentifier],
+    ['name', groupName],
+    ['about', about],
+    ['hypertuna', canonicalIdentifier],
+    ['i', HYPERTUNA_IDENTIFIER_TAG],
+    [isPublic ? 'public' : 'private'],
+    [isOpen ? 'open' : 'closed'],
+    [fileSharingEnabled ? 'file-sharing-on' : 'file-sharing-off']
+  ];
+  if (pictureTag) metadataTags.push(['picture', pictureTag, 'hypertuna:drive:pfp']);
+
+  const adminTags = [
+    ['h', canonicalIdentifier],
+    ['d', canonicalIdentifier],
+    ['hypertuna', canonicalIdentifier],
+    ['i', HYPERTUNA_IDENTIFIER_TAG],
+    ['p', adminPubkey, 'admin']
+  ];
+
+  return [
+    {
+      kind: KIND_GROUP_CREATE,
+      created_at: now,
+      tags: groupTags,
+      content: `Created group: ${groupName}`
+    },
+    {
+      kind: KIND_GROUP_METADATA,
+      created_at: now,
+      tags: metadataTags,
+      content: `Group metadata for: ${groupName}`
+    },
+    {
+      kind: KIND_HYPERTUNA_RELAY,
+      created_at: now,
+      tags: [
+        ['d', relayWsUrl],
+        ['hypertuna', canonicalIdentifier],
+        ['h', canonicalIdentifier],
+        ['i', HYPERTUNA_IDENTIFIER_TAG]
+      ],
+      content: `Hypertuna relay for group: ${groupName}`
+    },
+    {
+      kind: KIND_GROUP_ADMIN_LIST,
+      created_at: now,
+      tags: adminTags,
+      content: `Admin list for group: ${groupName}`
+    },
+    {
+      kind: KIND_GROUP_MEMBER_LIST,
+      created_at: now,
+      tags: adminTags,
+      content: `Member list for group: ${groupName}`
+    }
+  ];
+}
+
+async function publishCreateRelayBootstrapEvents({
+  relayKey,
+  publicIdentifier,
+  adminPubkey,
+  name,
+  description,
+  isPublic,
+  isOpen,
+  fileSharing,
+  picture
+}) {
+  const canonicalIdentifier = normalizeRelayIdentifier(publicIdentifier || relayKey || '');
+  if (!canonicalIdentifier) {
+    return {
+      ok: false,
+      attempt: 0,
+      published: [],
+      error: 'missing relay identifier'
+    };
+  }
+  if (!adminPubkey || !config.nostr_nsec_hex) {
+    return {
+      ok: false,
+      attempt: 0,
+      published: [],
+      error: 'missing signer context for bootstrap publish'
+    };
+  }
+
+  const relayWsUrl = `${buildGatewayWebsocketBase(config)}/${canonicalIdentifier.replace(':', '/')}`;
+  const drafts = buildCreateRelayBootstrapDraftEvents({
+    publicIdentifier: canonicalIdentifier,
+    adminPubkey,
+    name,
+    description,
+    isPublic,
+    isOpen,
+    fileSharing,
+    relayWsUrl,
+    picture
+  });
+
+  let lastError = null;
+  for (let attempt = 0; attempt < CREATE_RELAY_BOOTSTRAP_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const published = [];
+      for (const draft of drafts) {
+        const signed = await NostrUtils.signEvent(
+          { ...draft, pubkey: adminPubkey },
+          config.nostr_nsec_hex
+        );
+        await publishEventToRelay(canonicalIdentifier, signed);
+        published.push({ kind: signed.kind, id: signed.id });
+      }
+      return {
+        ok: true,
+        attempt: attempt + 1,
+        relayIdentifier: canonicalIdentifier,
+        relayWsUrl,
+        published,
+        error: null
+      };
+    } catch (error) {
+      lastError = error;
+      if (attempt < CREATE_RELAY_BOOTSTRAP_MAX_ATTEMPTS - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    attempt: CREATE_RELAY_BOOTSTRAP_MAX_ATTEMPTS,
+    relayIdentifier: canonicalIdentifier,
+    relayWsUrl,
+    published: [],
+    error: lastError?.message || String(lastError || 'bootstrap publish failed')
+  };
+}
+
 async function isRelayAuthProtected(identifier) {
   try {
     const canonicalIdentifier = normalizeRelayIdentifier(identifier);
@@ -4052,8 +4229,22 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
 // Export relay management functions for worker access
 export async function createRelay(options) {
   // The subnetHash is no longer passed in, it's retrieved from the config
-  const { name, description, isPublic = false, isOpen = false, fileSharing = true } = options;
-  console.log('[RelayServer] Creating relay via adapter:', { name, description, isPublic, isOpen, fileSharing });
+  const {
+    name,
+    description,
+    isPublic = false,
+    isOpen = false,
+    fileSharing = true,
+    picture
+  } = options;
+  console.log('[RelayServer] Creating relay via adapter:', {
+    name,
+    description,
+    isPublic,
+    isOpen,
+    fileSharing,
+    hasPicture: typeof picture === 'string' && !!picture.trim()
+  });
 
   const result = await createRelayManager({
     name,
@@ -4120,6 +4311,122 @@ export async function createRelay(options) {
       }
     }
     result.gatewayRegistration = registrationStatus;
+
+    try {
+      const relayWaitResult = await waitForRelayWriterActivation({
+        relayKey: result.relayKey,
+        timeoutMs: DIRECT_JOIN_WRITABLE_TIMEOUT_MS,
+        reason: 'create-relay'
+      });
+      result.writable = relayWaitResult?.writable ?? null;
+      result.expectedWriterActive = relayWaitResult?.expectedWriterActive ?? null;
+      console.log('[RelayServer] Create relay writer wait result', {
+        relayKey: result.relayKey,
+        publicIdentifier: result.publicIdentifier || null,
+        ok: relayWaitResult?.ok ?? null,
+        writable: relayWaitResult?.writable ?? null,
+        expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
+        elapsedMs: relayWaitResult?.elapsedMs ?? null
+      });
+
+      if (relayWaitResult?.ok && global.sendMessage) {
+        const relayWritablePayload = {
+          relayKey: result.relayKey,
+          publicIdentifier: result.publicIdentifier || null,
+          relayUrl: result.relayUrl || null,
+          authToken: result.authToken || null,
+          mode: 'create-relay',
+          writable: relayWaitResult?.writable ?? null,
+          expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
+        };
+        global.sendMessage({
+          type: 'relay-writable',
+          data: relayWritablePayload
+        });
+        if (typeof global.onRelayWritable === 'function') {
+          try {
+            global.onRelayWritable(relayWritablePayload);
+          } catch (error) {
+            console.warn('[RelayServer] Failed to invoke relay-writable hook:', error?.message || error);
+          }
+        }
+      }
+
+      if (!relayWaitResult?.ok || !relayWaitResult?.writable) {
+        scheduleLateWriterRecovery({
+          relayKey: result.relayKey,
+          publicIdentifier: result.publicIdentifier || null,
+          authToken: result.authToken || null,
+          relayUrl: result.relayUrl || null,
+          mode: 'create-relay',
+          requireWritable: true,
+          reason: 'create-relay'
+        });
+      }
+    } catch (waitError) {
+      console.warn('[RelayServer] Create relay writer wait failed', {
+        relayKey: result.relayKey,
+        error: waitError?.message || waitError
+      });
+    }
+
+    const bootstrapPublish = {
+      status: 'skipped',
+      attempt: 0,
+      publishedKinds: [],
+      eventIds: [],
+      relayIdentifier: result.publicIdentifier || result.relayKey || null,
+      relayWsUrl: result.publicIdentifier
+        ? `${buildGatewayWebsocketBase(config)}/${String(result.publicIdentifier).replace(':', '/')}`
+        : null,
+      error: null
+    };
+
+    if (config.nostr_pubkey_hex && config.nostr_nsec_hex && result.publicIdentifier) {
+      console.log('[RelayServer] Create relay bootstrap publish start', {
+        relayKey: result.relayKey,
+        publicIdentifier: result.publicIdentifier,
+        isPublic,
+        isOpen
+      });
+      const bootstrapResult = await publishCreateRelayBootstrapEvents({
+        relayKey: result.relayKey,
+        publicIdentifier: result.publicIdentifier,
+        adminPubkey: config.nostr_pubkey_hex,
+        name,
+        description,
+        isPublic,
+        isOpen,
+        fileSharing,
+        picture
+      });
+      bootstrapPublish.status = bootstrapResult.ok ? 'success' : 'failed';
+      bootstrapPublish.attempt = bootstrapResult.attempt || 0;
+      bootstrapPublish.publishedKinds = (bootstrapResult.published || []).map((entry) => entry.kind);
+      bootstrapPublish.eventIds = (bootstrapResult.published || []).map((entry) => entry.id);
+      bootstrapPublish.relayIdentifier = bootstrapResult.relayIdentifier || bootstrapPublish.relayIdentifier;
+      bootstrapPublish.relayWsUrl = bootstrapResult.relayWsUrl || bootstrapPublish.relayWsUrl;
+      bootstrapPublish.error = bootstrapResult.error || null;
+
+      console.log('[RelayServer] Create relay bootstrap publish complete', {
+        relayKey: result.relayKey,
+        publicIdentifier: result.publicIdentifier,
+        status: bootstrapPublish.status,
+        attempt: bootstrapPublish.attempt,
+        publishedKinds: bootstrapPublish.publishedKinds,
+        error: bootstrapPublish.error
+      });
+    } else {
+      bootstrapPublish.error = 'missing signer or public identifier for bootstrap publish';
+      console.warn('[RelayServer] Create relay bootstrap publish skipped', {
+        relayKey: result.relayKey,
+        publicIdentifier: result.publicIdentifier || null,
+        hasPubkey: !!config.nostr_pubkey_hex,
+        hasNsec: !!config.nostr_nsec_hex
+      });
+    }
+
+    result.bootstrapPublish = bootstrapPublish;
   }
   
   return result;
