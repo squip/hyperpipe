@@ -189,14 +189,6 @@ function MemberRowComponent({
   onRemove,
   t
 }: MemberRowProps) {
-  React.useEffect(() => {
-    console.info('[GroupPage] member row render', {
-      memberPubkey,
-      isSelf,
-      ts: Date.now()
-    })
-  })
-
   const actionsDisabled = isSelf
   const selfProfile =
     isSelf && pubkey
@@ -414,6 +406,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const requestIdRef = useRef(0)
   const lastRouteSubscriptionRefreshRef = useRef<string | null>(null)
   const groupRelayWarmupKeyRef = useRef<string | null>(null)
+  const lastWritableRefreshKeyRef = useRef<string | null>(null)
+  const sendToWorkerRef = useRef(sendToWorker)
+
+  useEffect(() => {
+    sendToWorkerRef.current = sendToWorker
+  }, [sendToWorker])
 
   const myGroupRelay = useMemo(
     () => (groupId ? myGroupList.find((entry) => entry.groupId === groupId)?.relay : undefined),
@@ -451,42 +449,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       .then((d) => {
         // Ignore stale responses
         if (requestId !== requestIdRef.current) return
-        console.info('[GroupPage] detail fetched', {
-          groupId,
-          relay: effectiveGroupRelay,
-          membershipStatus: d?.membershipStatus,
-          membershipAuthoritative: d?.membershipAuthoritative,
-          membershipEventsCount: d?.membershipEventsCount,
-          membersFromEventCount: d?.membersFromEventCount,
-          membersSnapshotCreatedAt: d?.membersSnapshotCreatedAt,
-          membershipFetchTimedOutLike: d?.membershipFetchTimedOutLike,
-          membershipFetchSource: d?.membershipFetchSource,
-          membersCount: d?.members?.length,
-          adminsCount: d?.admins?.length,
-          metadataCreatedAt: d?.metadata?.event?.created_at,
-          metadataPicture: d?.metadata?.picture,
-          metadataTags: d?.metadata?.event?.tags,
-          prevMetadataCreatedAt: detail?.metadata?.event?.created_at,
-          prevMetadataPicture: detail?.metadata?.picture,
-          prevMetadataTags: detail?.metadata?.event?.tags
-        })
         setDetail((prev) => {
           if (!d) return prev
-          const incomingMetaTs = d?.metadata?.event?.created_at || 0
-          const incomingMetaPicture = d?.metadata?.picture
-          const prevMetaTs = prev?.metadata?.event?.created_at || 0
-          const prevMetaPicture = prev?.metadata?.picture
-          const fallbackMetaTs = fallbackMeta?.event?.created_at || 0
-          const fallbackMetaPicture = fallbackMeta?.picture
-          console.info('[GroupPage] detail merge', {
-            groupId,
-            incomingMetaTs,
-            incomingMetaPicture,
-            prevMetaTs,
-            prevMetaPicture,
-            fallbackMetaTs,
-            fallbackMetaPicture
-          })
           const normalizeMembers = (members?: any[]) =>
             (members || [])
               .map((m) => (typeof m === 'string' ? m : m?.pubkey))
@@ -506,7 +470,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             (!next.admins || next.admins.length === 0) &&
             (!next.members || next.members.length === 0)
           if (isSameGroup && prev?.metadata && isIncomingEmpty) {
-            console.info('[GroupPage] detail merge skip empty', { groupId })
             return prev
           }
           // Preserve previous data if new fetch is empty/undefined
@@ -515,11 +478,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           const prevMetaTsCached = prevMetadata?.event?.created_at || 0
           const nextMetaTs = next?.metadata?.event?.created_at || 0
           if (isSameGroup && prevMetadata && prevMetaTsCached > 0 && nextMetaTs > 0 && nextMetaTs < prevMetaTsCached) {
-            console.info('[GroupPage] keeping newer cached metadata', {
-              groupId,
-              prevMetaTs: prevMetaTsCached,
-              nextMetaTs
-            })
             next.metadata = prevMetadata
           }
           const metaCandidates = [
@@ -563,18 +521,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             (next.membershipFetchTimedOutLike ||
               (nextMembers.length === 1 && pubkey ? nextMembers[0] === pubkey : false))
           if (shouldBlockMembershipDowngrade) {
-            console.info('[GroupPage] membership downgrade blocked (non-authoritative)', {
-              groupId,
-              prevMembersCount: normalizedPrevMembers.length,
-              nextMembersCount: nextMembers.length,
-              membershipStatus: next.membershipStatus,
-              membershipAuthoritative: next.membershipAuthoritative,
-              membershipEventsCount: next.membershipEventsCount,
-              membersFromEventCount: next.membersFromEventCount,
-              membersSnapshotCreatedAt: next.membersSnapshotCreatedAt,
-              membershipFetchTimedOutLike: next.membershipFetchTimedOutLike,
-              membershipFetchSource: next.membershipFetchSource
-            })
             next.members = normalizedPrevMembers
             if (prev?.membershipStatus) {
               next.membershipStatus = prev.membershipStatus
@@ -591,9 +537,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             next.membershipStatus = prev.membershipStatus
           }
           if (isInMyGroups || isCreator) {
-            if (next.membershipStatus !== 'member') {
-              console.info('[GroupPage] forcing membership via myGroupList/creator', { groupId })
-            }
             next.membershipStatus = 'member'
             if (pubkey) {
               const hasSelf = next.members?.some((m) => m === pubkey)
@@ -668,14 +611,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   useEffect(() => {
     if (!groupId) return
     if (!joinFlow?.writableAt || !joinFlow?.writable) return
-    console.info('[GroupPage] relay writable: refreshing subscriptions', {
-      groupId,
-      relayKey: joinFlow.relayKey,
-      relayUrl: joinFlow.relayUrl,
-      mode: joinFlow.mode
-    })
-    if (sendToWorker) {
-      sendToWorker({
+    const writableRefreshKey = `${groupId}|${joinFlow.relayKey || ''}|${joinFlow.mode || ''}|${joinFlow.writableAt}`
+    if (lastWritableRefreshKeyRef.current === writableRefreshKey) return
+    lastWritableRefreshKeyRef.current = writableRefreshKey
+    const send = sendToWorkerRef.current
+    if (send) {
+      send({
         type: 'refresh-relay-subscriptions',
         data: {
           relayKey: joinFlow.relayKey || null,
@@ -685,7 +626,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       }).catch(() => {})
     }
     setJoinRelayRefreshNonce((prev) => prev + 1)
-  }, [groupId, joinFlow?.mode, joinFlow?.relayKey, joinFlow?.relayUrl, joinFlow?.writable, joinFlow?.writableAt, sendToWorker])
+  }, [groupId, joinFlow?.mode, joinFlow?.relayKey, joinFlow?.relayUrl, joinFlow?.writable, joinFlow?.writableAt])
 
   const resolvedGroupRelay = useMemo(() => {
     return effectiveGroupRelay ? resolveRelayUrl(effectiveGroupRelay) : undefined
@@ -695,6 +636,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
 
   useEffect(() => {
     setPinnedGroupRelay(null)
+    lastWritableRefreshKeyRef.current = null
   }, [groupKey])
 
   const isTokenizedRelayUrl = (relay?: string) => {
@@ -760,26 +702,14 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     if (groupRelayWarmupKeyRef.current === warmupKey) return
     groupRelayWarmupKeyRef.current = warmupKey
     let active = true
-    const startedAt = Date.now()
-    console.info('[GroupPage] warm relay fetch start', {
-      groupId,
-      relay: activeGroupRelay,
-      kindsCount: 15
-    })
     client
       .loadMoreTimeline(groupSubRequests, {
         '#h': [groupId],
         kinds: [9000, 9001, 1, 6, 20, 21, 22, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089],
         limit: 1
       })
-      .then((events) => {
+      .then((_events) => {
         if (!active) return
-        console.info('[GroupPage] warm relay fetch complete', {
-          groupId,
-          relay: activeGroupRelay,
-          eventCount: events.length,
-          elapsedMs: Date.now() - startedAt
-        })
       })
       .catch((error) => {
         if (!active) return
@@ -793,45 +723,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       active = false
     }
   }, [groupId, activeGroupRelay, groupSubRequests])
-
-  useEffect(() => {
-    // Debug aid: confirm routing + relay resolution for hypertuna relays
-    console.info('[GroupPage] route params', {
-      rawId: id,
-      groupId,
-      groupRelay,
-      effectiveGroupRelay,
-      resolvedGroupRelay,
-      fallbackGroupRelay,
-      tokenizedGroupRelay: tokenizedResolvedGroupRelay,
-      pinnedGroupRelay: pinnedGroupRelay,
-      activeGroupRelay,
-      gateSubRequests: shouldGateGroupSubRequests
-    })
-    if (shouldGateGroupSubRequests) {
-      console.info('[GroupPage] subRequests gated (awaiting tokenized relay)', {
-        groupId,
-        effectiveGroupRelay,
-        resolvedGroupRelay,
-        fallbackGroupRelay
-      })
-    }
-    if (groupSubRequests.length) {
-      console.info('[GroupPage] subRequests', groupSubRequests)
-    }
-  }, [
-    groupId,
-    groupRelay,
-    effectiveGroupRelay,
-    id,
-    resolvedGroupRelay,
-    fallbackGroupRelay,
-    tokenizedResolvedGroupRelay,
-    pinnedGroupRelay,
-    activeGroupRelay,
-    shouldGateGroupSubRequests,
-    groupSubRequests
-  ])
 
   const isHypertunaGroup = useMemo(() => {
     const tags = detail?.metadata?.event?.tags
@@ -875,13 +766,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             !nextDetail.membershipAuthoritative &&
             (nextDetail.membershipFetchTimedOutLike || incomingMembers.length === 0)
           if (!shouldKeepPrevMembers) return nextDetail
-          console.info('[GroupPage] join-success refresh kept previous members (non-authoritative)', {
-            groupId,
-            prevMembersCount: prevMembers.length,
-            incomingMembersCount: incomingMembers.length,
-            membershipFetchTimedOutLike: nextDetail.membershipFetchTimedOutLike,
-            membershipFetchSource: nextDetail.membershipFetchSource
-          })
           return {
             ...nextDetail,
             members: prev.members || [],
@@ -911,22 +795,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       }
       if (isOpenGroup === false && !inviteToken) {
         if (membershipStatus !== 'pending') {
-          console.info('[GroupPage] Closed join without invite; publishing join request', {
-            groupId,
-            relayUrl: relayUrlForJoin ? String(relayUrlForJoin).slice(0, 80) : null,
-            relayKey: relayKey ? String(relayKey).slice(0, 16) : null,
-            shouldUseWorkerJoin
-          })
           await sendJoinRequest(groupId, effectiveGroupRelay)
           setDetail((prev) =>
             prev
               ? { ...prev, membershipStatus: 'pending' }
               : prev
           )
-        } else {
-          console.info('[GroupPage] Closed join already pending; skipping duplicate request', {
-            groupId
-          })
         }
         return
       }
@@ -939,15 +813,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       }
 
       if (shouldUseWorkerJoin) {
-        console.info('[GroupPage] Starting worker join with invite data', {
-          groupId,
-          hasWriterCore: !!inviteData?.writerCore,
-          hasWriterCoreHex: !!inviteData?.writerCoreHex,
-          hasAutobaseLocal: !!inviteData?.autobaseLocal,
-          hasWriterSecret: !!inviteData?.writerSecret,
-          hasBlindPeer: !!inviteData?.blindPeer,
-          hasFastForward: !!inviteData?.fastForward
-        })
         await startJoinFlow(groupId, {
           fileSharing: isOpenGroup,
           isOpen: isOpenGroup,
@@ -1088,7 +953,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       new Set((parsed?.length ? parsed : defaultMembers).map(normalizeMockMember).filter((m) => !!m && m.length > 10))
     )
     const admins = members[1] ? [{ pubkey: members[1] }] : []
-    console.info('[GroupPage] mockMembers enabled', { members, admins })
     return { members, admins }
   }, [pubkey])
 
@@ -1114,27 +978,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     () => inviteProfiles.filter((profile) => !inviteMemberSet.has(profile.pubkey)),
     [inviteProfiles, inviteMemberSet]
   )
-
-  useEffect(() => {
-    const query = inviteSearch.trim()
-    if (!query) return
-    console.info('[GroupPage] invite suggestions summary', {
-      groupId,
-      query,
-      rawProfilesCount: inviteProfiles.length,
-      candidateProfilesCount: inviteCandidateProfiles.length,
-      suppressedAsExistingMemberCount: inviteProfiles.length - inviteCandidateProfiles.length,
-      selectedInviteesCount: selectedInvitees.length,
-      isSearchingInvites
-    })
-  }, [
-    groupId,
-    inviteSearch,
-    inviteProfiles.length,
-    inviteCandidateProfiles.length,
-    selectedInvitees.length,
-    isSearchingInvites
-  ])
 
   const isAdmin =
     !!pubkey &&

@@ -73,6 +73,9 @@ const storagePath = path.join(userDataPath, 'hypertuna-data');
 const logFilePath = path.join(storagePath, 'desktop-console.log');
 const gatewaySettingsPath = path.join(storagePath, 'gateway-settings.json');
 const publicGatewaySettingsPath = path.join(storagePath, 'public-gateway-settings.json');
+const LOG_APPEND_EMFILE_RETRIES = 4;
+const LOG_APPEND_EMFILE_BASE_DELAY_MS = 25;
+let logAppendChain = Promise.resolve();
 const DEFAULT_CERT_ALLOWLIST = new Set(['relay.nostr.band', 'relay.damus.io', 'nos.lol']);
 const envAllowlist = (process.env.NOSTR_CERT_ALLOWLIST || '')
   .split(',')
@@ -103,6 +106,30 @@ async function ensureStorageDir() {
     await fs.mkdir(storagePath, { recursive: true });
   } catch (error) {
     console.error('[Main] Failed to create storage directory', error);
+  }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function appendLogLineWithBackoff(line) {
+  const payload = typeof line === 'string' ? line : String(line ?? '');
+  if (!payload) return;
+
+  await ensureStorageDir();
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await fs.appendFile(logFilePath, payload, 'utf8');
+      return;
+    } catch (error) {
+      const code = error && typeof error === 'object' ? error.code : null;
+      const shouldRetry =
+        (code === 'EMFILE' || code === 'ENFILE') && attempt < LOG_APPEND_EMFILE_RETRIES;
+      if (!shouldRetry) throw error;
+      const backoffMs = LOG_APPEND_EMFILE_BASE_DELAY_MS * Math.pow(2, attempt);
+      await delay(backoffMs);
+    }
   }
 }
 
@@ -531,13 +558,14 @@ ipcMain.handle('get-log-file-path', async () => {
 });
 
 ipcMain.handle('append-log-line', async (_event, line) => {
+  const writeTask = logAppendChain.then(() => appendLogLineWithBackoff(line));
+  logAppendChain = writeTask.catch(() => {});
   try {
-    await ensureStorageDir();
-    await fs.appendFile(logFilePath, line, 'utf8');
+    await writeTask;
     return { success: true };
   } catch (error) {
     console.error('[Main] Failed to append log', error);
-    return { success: false, error: error.message };
+    return { success: false, error: error?.message || String(error) };
   }
 });
 

@@ -95,6 +95,16 @@ type JoinFlowPhase =
   | 'success'
   | 'error'
 
+type TimelineReplayState = {
+  subscriptionId: string
+  eventCount: number
+  eoseSeen: boolean
+  relaySyncReady: boolean
+  replayedAt: number
+  firstNonEmptyAt?: number | null
+  postReadyEmptyEoseAt?: number | null
+}
+
 type JoinFlowState = {
   publicIdentifier: string
   phase: JoinFlowPhase
@@ -111,6 +121,13 @@ type JoinFlowState = {
   writableAt?: number | null
   mode?: string | null
   provisional?: boolean | null
+  subscriptionRefreshStatus?: string | null
+  subscriptionRefreshReason?: string | null
+  subscriptionRefreshUpdatedAt?: number | null
+  subscriptionRefreshRelayKey?: string | null
+  subscriptionRefreshLookupSource?: string | null
+  subscriptionRefreshRetried?: boolean | null
+  timelineReplays?: Record<string, TimelineReplayState>
 }
 
 type RelayCreateRequest = {
@@ -457,7 +474,6 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           metadata: info?.metadata
         })
       })
-      console.info('[WorkerBridge] peerRelayMap keys', Array.from(next.keys()))
       setPeerRelayMap(next)
     }
     if (status.peerDetails) {
@@ -488,7 +504,6 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           address: info?.address ?? null
         })
       })
-      console.info('[WorkerBridge] peerDetails keys', Array.from(nextDetails.keys()))
       setPeerDetails(nextDetails)
     }
   }, [])
@@ -652,25 +667,6 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         fastForward: opts?.fastForward || undefined
       }
       if (hostPeers && hostPeers.length) data.hostPeers = hostPeers
-
-      console.info('[WorkerBridge] startJoinFlow sending to worker', {
-        publicIdentifier: identifier,
-        hasWriterSecret: !!opts?.writerSecret,
-        hasWriterCore: !!opts?.writerCore,
-        hasWriterCoreHex: !!opts?.writerCoreHex,
-        hasAutobaseLocal: !!opts?.autobaseLocal,
-        writerSecretLen: opts?.writerSecret ? String(opts.writerSecret).length : 0,
-        hostPeersCount: hostPeers?.length || 0,
-        coreRefsCount: Array.isArray(opts?.cores) ? opts.cores.length : 0,
-        hasBlindPeer: !!opts?.blindPeer?.publicKey,
-        relayKey: opts?.relayKey ? String(opts.relayKey).slice(0, 16) : null,
-        relayUrl: opts?.relayUrl ? String(opts.relayUrl).slice(0, 80) : null,
-        hasToken: !!opts?.token,
-        isOpen: typeof opts?.isOpen === 'boolean' ? opts.isOpen : null,
-        openJoin: opts?.openJoin === true,
-        fileSharing,
-        hasFastForward: !!opts?.fastForward
-      })
 
       await electronIpc.sendToWorker({ type: 'start-join-flow', data })
 
@@ -870,13 +866,6 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         switch (msg.type) {
           case 'relay-update':
             if (Array.isArray(msg.relays)) {
-              console.info('[WorkerBridge] relay-update received', msg.relays.map((r: any) => ({
-                relayKey: r.relayKey,
-                publicIdentifier: r.publicIdentifier,
-                connectionUrl: r.connectionUrl,
-                userAuthToken: r.userAuthToken,
-                requiresAuth: r.requiresAuth
-              })))
               setRelays((prev) => {
                 const next = msg.relays as RelayEntry[]
                 if (next.length === 0 && prev.length > 0) {
@@ -889,26 +878,15 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                       if (!pending) return
                       setRelays((current) => {
                         if (current.length === 0) return current
-                        console.info('[WorkerBridge] relay-update empty applied after grace window', {
-                          previousCount: current.length,
-                          graceMs: EMPTY_RELAY_UPDATE_GRACE_MS
-                        })
                         return pending
                       })
                     }, EMPTY_RELAY_UPDATE_GRACE_MS)
                   }
-                  console.info('[WorkerBridge] relay-update empty suppressed (transient)', {
-                    previousCount: prev.length,
-                    graceMs: EMPTY_RELAY_UPDATE_GRACE_MS
-                  })
                   electronIpc.sendToWorker({ type: 'get-relays' }).catch(() => {})
                   return prev
                 }
                 clearPendingEmptyRelayUpdate()
                 if (areRelayListsEquivalent(prev, next)) {
-                  console.info('[WorkerBridge] relay-update deduped (unchanged)', {
-                    count: next.length
-                  })
                   return prev
                 }
                 return next
@@ -948,10 +926,6 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
             break
           case 'gateway-log':
             if (msg.entry) {
-              const message = typeof msg.entry.message === 'string' ? msg.entry.message : ''
-              if (message.includes('Open join pool')) {
-                console.info('[GatewayLog]', msg.entry)
-              }
               setGatewayLogs((prev) => {
                 const next = [...prev, msg.entry]
                 return next.length > MAX_LOGS ? next.slice(-MAX_LOGS) : next
@@ -981,6 +955,126 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           case 'auth-data-updated':
             electronIpc.sendToWorker({ type: 'get-relays' }).catch(() => {})
             break
+          case 'refresh-relay-subscriptions:result': {
+            const data = (msg as any)?.data || {}
+            const relayKey = typeof data.relayKey === 'string' ? data.relayKey : null
+            const publicIdentifier =
+              typeof data.publicIdentifier === 'string' && data.publicIdentifier.trim()
+                ? data.publicIdentifier.trim()
+                : null
+            const status = typeof data.status === 'string' ? data.status : null
+            const reason = typeof data.reason === 'string' ? data.reason : null
+            const lookupSource = typeof data.lookupSource === 'string' ? data.lookupSource : null
+            const retried = typeof data.retried === 'boolean' ? data.retried : null
+            const updatedAt = Date.now()
+
+            setJoinFlows((prev) => {
+              let identifier = publicIdentifier
+              if (!identifier && relayKey) {
+                const match = Object.keys(prev).find((key) => prev[key]?.relayKey === relayKey)
+                identifier = match || null
+              }
+              if (!identifier) return prev
+              const current = prev[identifier]
+              const startedAt = current?.startedAt ?? updatedAt
+              return {
+                ...prev,
+                [identifier]: {
+                  ...(current || {
+                    publicIdentifier: identifier,
+                    phase: 'idle',
+                    startedAt
+                  }),
+                  publicIdentifier: identifier,
+                  startedAt,
+                  updatedAt,
+                  relayKey: relayKey ?? current?.relayKey ?? null,
+                  subscriptionRefreshStatus: status,
+                  subscriptionRefreshReason: reason,
+                  subscriptionRefreshUpdatedAt: updatedAt,
+                  subscriptionRefreshRelayKey: relayKey ?? current?.relayKey ?? null,
+                  subscriptionRefreshLookupSource: lookupSource,
+                  subscriptionRefreshRetried: retried
+                }
+              }
+            })
+            break
+          }
+          case 'relay-subscription-replay': {
+            const data = (msg as any)?.data || {}
+            const relayKey = typeof data.relayKey === 'string' ? data.relayKey : null
+            const replayedAt = typeof data.replayedAt === 'number' ? data.replayedAt : Date.now()
+            const publicIdentifier =
+              typeof data.publicIdentifier === 'string' && data.publicIdentifier.trim()
+                ? data.publicIdentifier.trim()
+                : null
+            const summaries = Array.isArray(data.summaries) ? data.summaries : []
+            const timelineSummaries = summaries.filter(
+              (summary) =>
+                summary &&
+                typeof summary === 'object' &&
+                summary.isTimelineGroup === true &&
+                typeof summary.subscriptionId === 'string'
+            )
+            if (!timelineSummaries.length) break
+
+            setJoinFlows((prev) => {
+              let identifier = publicIdentifier
+              if (!identifier && relayKey) {
+                const match = Object.keys(prev).find((key) => prev[key]?.relayKey === relayKey)
+                identifier = match || null
+              }
+              if (!identifier) return prev
+              const current = prev[identifier]
+              const startedAt = current?.startedAt ?? replayedAt
+              const timelineReplays = { ...(current?.timelineReplays || {}) }
+              for (const summary of timelineSummaries) {
+                const subscriptionId = String(summary.subscriptionId)
+                const eventCount =
+                  typeof summary.eventCount === 'number' && Number.isFinite(summary.eventCount)
+                    ? Math.max(0, Math.floor(summary.eventCount))
+                    : 0
+                const eoseSeen = summary.eoseSeen === true
+                const relaySyncReady = summary.relaySyncReady === true || data.relaySyncReady === true
+                const previousReplay = timelineReplays[subscriptionId]
+                const firstNonEmptyAt =
+                  eventCount > 0
+                    ? previousReplay?.firstNonEmptyAt ?? replayedAt
+                    : previousReplay?.firstNonEmptyAt ?? null
+                const postReadyEmptyEoseAt =
+                  relaySyncReady && eoseSeen && eventCount === 0
+                    ? previousReplay?.postReadyEmptyEoseAt ?? replayedAt
+                    : previousReplay?.postReadyEmptyEoseAt ?? null
+
+                timelineReplays[subscriptionId] = {
+                  subscriptionId,
+                  eventCount,
+                  eoseSeen,
+                  relaySyncReady,
+                  replayedAt,
+                  firstNonEmptyAt,
+                  postReadyEmptyEoseAt
+                }
+              }
+
+              return {
+                ...prev,
+                [identifier]: {
+                  ...(current || {
+                    publicIdentifier: identifier,
+                    phase: 'idle',
+                    startedAt
+                  }),
+                  publicIdentifier: identifier,
+                  startedAt,
+                  updatedAt: replayedAt,
+                  relayKey: relayKey ?? current?.relayKey ?? null,
+                  timelineReplays
+                }
+              }
+            })
+            break
+          }
           case 'provision-writer-for-invitee:result':
           case 'provision-writer-for-invitee:error': {
             const requestId = (msg as any)?.requestId
@@ -1022,6 +1116,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
               return {
                 ...prev,
                 [identifier]: {
+                  ...(current || {}),
                   publicIdentifier: identifier,
                   phase: progress,
                   startedAt,
@@ -1048,6 +1143,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
               return {
                 ...prev,
                 [identifier]: {
+                  ...(current || {}),
                   publicIdentifier: identifier,
                   phase: 'success',
                   startedAt,
@@ -1077,6 +1173,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
               return {
                 ...prev,
                 [identifier]: {
+                  ...(current || {}),
                   publicIdentifier: identifier,
                   phase: 'error',
                   startedAt,
@@ -1100,13 +1197,6 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
             const identifier = data.publicIdentifier
             if (!identifier) break
             const isWritable = data.writable === true
-            console.info('[WorkerBridge] relay-writable received', {
-              publicIdentifier: identifier,
-              relayKey: data.relayKey,
-              mode: data.mode,
-              writable: data.writable,
-              expectedWriterActive: data.expectedWriterActive
-            })
             setJoinFlows((prev) => {
               const current = prev[identifier]
               if (!current) return prev
@@ -1137,7 +1227,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   mode: data.mode ?? current.mode,
                   expectedWriterActive: data.expectedWriterActive ?? current.expectedWriterActive,
                   writable: true,
-                  writableAt: Date.now()
+                  writableAt: current.writableAt ?? Date.now()
                 }
               }
             })
@@ -1198,32 +1288,34 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
 
     unsubscribers.push(
       electronIpc.onWorkerStdout((data) => {
+        const lines = String(data).split(/\r?\n/).filter(Boolean)
         setWorkerStdout((prev) => {
-          const lines = String(data).split(/\r?\n/).filter(Boolean)
           const next = [...prev, ...lines]
           return next.length > MAX_OUTPUT_LINES ? next.slice(-MAX_OUTPUT_LINES) : next
         })
-        if (isElectron() && electronIpc.appendLogLine) {
-          const lines = String(data).split(/\r?\n/).filter(Boolean)
-          lines.forEach((line) => {
-            electronIpc.appendLogLine(`[${new Date().toISOString()}] [WORKER STDOUT] ${line}\n`).catch(() => {})
-          })
+        if (lines.length && isElectron() && electronIpc.appendLogLine) {
+          const stamp = new Date().toISOString()
+          const payload = lines
+            .map((line) => `[${stamp}] [WORKER STDOUT] ${line}\n`)
+            .join('')
+          electronIpc.appendLogLine(payload).catch(() => {})
         }
       })
     )
 
     unsubscribers.push(
       electronIpc.onWorkerStderr((data) => {
+        const lines = String(data).split(/\r?\n/).filter(Boolean)
         setWorkerStderr((prev) => {
-          const lines = String(data).split(/\r?\n/).filter(Boolean)
           const next = [...prev, ...lines]
           return next.length > MAX_OUTPUT_LINES ? next.slice(-MAX_OUTPUT_LINES) : next
         })
-        if (isElectron() && electronIpc.appendLogLine) {
-          const lines = String(data).split(/\r?\n/).filter(Boolean)
-          lines.forEach((line) => {
-            electronIpc.appendLogLine(`[${new Date().toISOString()}] [WORKER STDERR] ${line}\n`).catch(() => {})
-          })
+        if (lines.length && isElectron() && electronIpc.appendLogLine) {
+          const stamp = new Date().toISOString()
+          const payload = lines
+            .map((line) => `[${stamp}] [WORKER STDERR] ${line}\n`)
+            .join('')
+          electronIpc.appendLogLine(payload).catch(() => {})
         }
       })
     )

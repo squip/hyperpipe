@@ -2302,6 +2302,30 @@ function setupProtocolHandlers(protocol) {
             const eventFrames = events.filter((frame) => Array.isArray(frame) && frame[0] === 'EVENT');
             const eoseFrames = events.filter((frame) => Array.isArray(frame) && frame[0] === 'EOSE');
             console.log(`[RelayServer] Subscription replay for connectionKey: ${connectionKey}${virtualRelay ? ' [virtual relay]' : ''} events=${eventFrames.length} eose=${eoseFrames.length}`);
+            const relayManager = !virtualRelay && relayKey ? activeRelays.get(relayKey) : null;
+            const relayProgressSnapshot = relayManager?.relay
+              ? collectRelayProgressSnapshot(relayManager.relay)
+              : null;
+            const relaySyncReady = isRelayProgressSyncReady(relayProgressSnapshot);
+            const replaySummaries = summarizeSubscriptionReplayFrames(events, relaySyncReady);
+            const replayedAt = Date.now();
+            const publicIdentifier =
+              profile?.public_identifier
+              || (identifier && identifier.includes(':') ? identifier : null)
+              || null;
+            if (global.sendMessage) {
+              global.sendMessage({
+                type: 'relay-subscription-replay',
+                data: {
+                  relayKey: relayKey || null,
+                  publicIdentifier,
+                  connectionKey,
+                  relaySyncReady,
+                  replayedAt,
+                  summaries: replaySummaries
+                }
+              });
+            }
         } else {
             console.log(`[RelayServer] Subscription replay produced unexpected payload for connectionKey: ${connectionKey}${virtualRelay ? ' [virtual relay]' : ''}`);
         }
@@ -2905,6 +2929,79 @@ function collectRelayProgressSnapshot(relay) {
     autobase: autobaseSummary,
     writers: writersSummary
   };
+}
+
+function maxNumber(values = []) {
+  const numeric = values.filter((value) => typeof value === 'number' && Number.isFinite(value));
+  if (!numeric.length) return null;
+  return Math.max(...numeric);
+}
+
+function minNumber(values = []) {
+  const numeric = values.filter((value) => typeof value === 'number' && Number.isFinite(value));
+  if (!numeric.length) return null;
+  return Math.min(...numeric);
+}
+
+function isRelayProgressSyncReady(snapshot) {
+  if (!snapshot || snapshot.hasRelay !== true) return false;
+  if (snapshot.writable !== true) return false;
+
+  const view = snapshot.view || {};
+  const writers = snapshot.writers || {};
+
+  const writerScopeKnown =
+    (typeof writers.refsCount === 'number' && writers.refsCount > 0) ||
+    (typeof writers.count === 'number' && writers.count > 0) ||
+    (typeof snapshot.activeWriters === 'number' && snapshot.activeWriters > 0);
+  if (!writerScopeKnown) return false;
+
+  const targetLength = maxNumber([
+    view.remoteLength,
+    view.length,
+    writers.maxRemoteLength,
+    writers.maxLength,
+    writers.maxContiguousLength
+  ]);
+  if (targetLength == null) return false;
+
+  const currentProgress = minNumber([
+    minNumber([view.contiguousLength, view.length]),
+    minNumber([writers.minContiguousLength, writers.minLength])
+  ]);
+  if (currentProgress == null) return false;
+
+  return currentProgress >= targetLength;
+}
+
+function summarizeSubscriptionReplayFrames(frames, relaySyncReady) {
+  if (!Array.isArray(frames)) return [];
+  const bySubscription = new Map();
+  for (const frame of frames) {
+    if (!Array.isArray(frame) || frame.length < 2) continue;
+    const frameType = frame[0];
+    const subscriptionId = typeof frame[1] === 'string' ? frame[1] : null;
+    if (!subscriptionId) continue;
+    if (!bySubscription.has(subscriptionId)) {
+      bySubscription.set(subscriptionId, {
+        subscriptionId,
+        eventCount: 0,
+        eoseSeen: false
+      });
+    }
+    const summary = bySubscription.get(subscriptionId);
+    if (frameType === 'EVENT') {
+      summary.eventCount += 1;
+    } else if (frameType === 'EOSE') {
+      summary.eoseSeen = true;
+    }
+  }
+
+  return Array.from(bySubscription.values()).map((summary) => ({
+    ...summary,
+    isTimelineGroup: summary.subscriptionId.startsWith('f-timeline-group-'),
+    relaySyncReady
+  }));
 }
 
 function prehydrateRelayCoreRefs({ relay, coreRefs, writerRefsHint = [], relayKey, reason, context } = {}) {

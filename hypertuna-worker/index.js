@@ -5044,6 +5044,7 @@ async function handleMessageObject(message) {
           requestId,
           data: {
             status: 'ok',
+            publicIdentifier,
             relayKey: finalRelayKey,
             reason,
             result: result || null,

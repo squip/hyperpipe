@@ -36,6 +36,12 @@ import { seenOn } from '@nostr/gadgets/store'
 import { outboxFilterRelayBatch } from '@nostr/gadgets/outbox'
 
 let timelineSubscriptionCounter = 0
+const ENABLE_TIMELINE_DEBUG_LOGS = false
+
+function debugTimeline(...args: unknown[]) {
+  if (!ENABLE_TIMELINE_DEBUG_LOGS) return
+  console.info(...args)
+}
 
 class ClientService extends EventTarget {
   static instance: ClientService
@@ -302,7 +308,7 @@ class ClientService extends EventTarget {
     )
     const resolvedTimelineLabel = timelineLabel?.trim() || 'f-timeline'
 
-    console.info('[subscribeTimeline] start', {
+    debugTimeline('[subscribeTimeline] start', {
       subscriptionId,
       timelineLabel: resolvedTimelineLabel,
       subRequests: subRequests.length,
@@ -450,7 +456,7 @@ class ClientService extends EventTarget {
                     url: closeUrls[index] || relayUrls[index],
                     reason
                   }))
-                  console.info('[subscribeTimeline] onclose', {
+                  debugTimeline('[subscribeTimeline] onclose', {
                     label: resolvedTimelineLabel,
                     subscriptionId,
                     reasons: closeReport
@@ -613,7 +619,7 @@ class ClientService extends EventTarget {
                     url: relayUrls[index],
                     reason
                   }))
-                  console.info('[loadMoreTimeline] onclose', {
+                  debugTimeline('[loadMoreTimeline] onclose', {
                     label: 'f-more',
                     reasons: closeReport
                   })
