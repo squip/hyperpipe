@@ -26,7 +26,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import UserAvatar from '@/components/UserAvatar'
 import Username from '@/components/Username'
 import NormalFeed from '@/components/NormalFeed'
-import NoteList from '@/components/NoteList'
+import GroupFilesList from '@/components/GroupFilesList'
 import { BIG_RELAY_URLS } from '@/constants'
 import { parseGroupIdentifier } from '@/lib/groups'
 import client from '@/services/client.service'
@@ -375,6 +375,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const { joinFlows, startJoinFlow, relays, sendToWorker } = useWorkerBridge()
   const [isLoading, setIsLoading] = useState(true)
   const [activeTab, setActiveTab] = useState<'notes' | 'files' | 'members' | 'requests'>('notes')
+  const [groupFileCount, setGroupFileCount] = useState<number | undefined>(undefined)
   const [error, setError] = useState<string | null>(null)
   const [groupRelay, setGroupRelay] = useState<string | undefined>(relay)
   const [groupId, setGroupId] = useState<string | undefined>(id)
@@ -724,6 +725,10 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         : [],
     [groupId, activeGroupRelay, shouldGateGroupSubRequests, joinRelayRefreshNonce]
   )
+
+  useEffect(() => {
+    setGroupFileCount(undefined)
+  }, [groupId, activeGroupRelay])
 
   useEffect(() => {
     if (!groupId || !activeGroupRelay || groupSubRequests.length === 0) return
@@ -1531,6 +1536,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                   className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-4 py-3"
                 >
                   {t('Files')}
+                  {typeof groupFileCount === 'number' ? ` (${groupFileCount})` : ''}
                 </TabsTrigger>
                 {isAdmin && (
                   <TabsTrigger
@@ -1551,14 +1557,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                 debugLabel={groupId ? `GroupPage:${groupId}` : 'GroupPage:unknown'}
               />
             </TabsContent>
-            <TabsContent value="files" className="mt-0">
-              <NoteList
+            <TabsContent value="files" forceMount className="mt-0">
+              <GroupFilesList
+                groupId={groupId}
                 subRequests={groupFileSubRequests}
-                showKinds={[1063]}
-                hideReplies
-                showRelayCloseReason={false}
-                debugActiveTab={activeTab}
-                debugLabel={groupId ? `GroupPage:files:${groupId}` : 'GroupPage:files:unknown'}
+                timelineLabel={groupId ? `f-fetch-events-group-files-${groupId}` : 'f-fetch-events-group-files'}
+                onCountChange={setGroupFileCount}
               />
             </TabsContent>
             <TabsContent value="members" className="mt-0">

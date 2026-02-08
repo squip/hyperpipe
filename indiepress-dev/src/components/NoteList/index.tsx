@@ -42,6 +42,7 @@ const NoteList = forwardRef(
       showRelayCloseReason = false,
       debugActiveTab,
       debugLabel,
+      timelineLabel,
       sinceTimestamp,
       onNotesLoaded,
       pinnedEventIds,
@@ -56,6 +57,7 @@ const NoteList = forwardRef(
       showRelayCloseReason?: boolean
       debugActiveTab?: string
       debugLabel?: string
+      timelineLabel?: string
       sinceTimestamp?: number
       onNotesLoaded?: (count: number, hasPosts: boolean, hasReplies: boolean) => void
       pinnedEventIds?: string[]
@@ -85,6 +87,7 @@ const NoteList = forwardRef(
     const resubscribeTimerRef = useRef<number | null>(null)
     const resubscribeAttemptRef = useRef(0)
     const softResubscribeRef = useRef(false)
+    const showKindsKey = useMemo(() => showKinds.join(','), [showKinds])
 
     const shouldHideEvent = useCallback(
       (evt: Event) => {
@@ -228,7 +231,8 @@ const NoteList = forwardRef(
         activeTab,
         subRequestsCount: subRequests.length,
         subRequestsSignature,
-        showKindsKey: showKinds.join(','),
+        showKindsKey,
+        timelineLabel: timelineLabel ?? null,
         refreshCount,
         sinceTimestamp: sinceTimestamp ?? null,
         isFilteredView
@@ -397,7 +401,8 @@ const NoteList = forwardRef(
           }
         },
         {
-          startLogin
+          startLogin,
+          timelineLabel
         }
       )
 
@@ -414,7 +419,7 @@ const NoteList = forwardRef(
         })
         subc.close(`NoteList cleanup effectId=${effectId}`)
       }
-    }, [subRequests, refreshCount, showKinds])
+    }, [subRequests, refreshCount, showKindsKey, timelineLabel])
 
     const loadMore = useCallback(async () => {
       setEvents((events) => {

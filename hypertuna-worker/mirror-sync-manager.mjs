@@ -70,7 +70,9 @@ export async function ensureRemoteMirror (remoteKeyHex, folder) {
       const t0 = Date.now()
       // Use built-in mirror (MirrorDrive). We only filter keys under prefix.
       const mirror = remoteDrive.mirror(localDrive, {
-        prune: true,
+        // Multiple providers mirror into the same relay folder. Pruning per-provider
+        // can delete files that only exist on another provider.
+        prune: false,
         batch: true,
         includeEquals: false,
         filter: (key) => isRelayFolderMatch(key, prefix)

@@ -380,20 +380,20 @@ function PostEditorFrame({
 
   return (
     <div
-      className={cn('flex h-full w-full flex-col', maxHeightClass, className)}
+      className={cn('flex h-full w-full min-w-0 max-w-full flex-col overflow-x-hidden', maxHeightClass, className)}
       style={style}
     >
-      <div ref={headerRef} className="px-4 pt-4 pb-2 space-y-3 min-h-[64px]">
+      <div ref={headerRef} className="min-w-0 max-w-full px-4 pt-4 pb-2 space-y-3 min-h-[64px]">
         {header}
       </div>
       <ScrollArea
-        className="flex-1 min-h-0 px-4"
+        className="flex-1 min-h-0 overflow-hidden px-4"
         allowStickyChildren
         data-post-editor-scroll
       >
-        <div className="space-y-3 px-2 py-3">{body}</div>
+        <div className="min-w-0 max-w-full overflow-x-hidden space-y-3 px-2 py-3">{body}</div>
       </ScrollArea>
-      {footer ? <div className="px-4 py-3">{footer}</div> : null}
+      {footer ? <div className="min-w-0 max-w-full overflow-x-hidden px-4 py-3">{footer}</div> : null}
     </div>
   )
 }

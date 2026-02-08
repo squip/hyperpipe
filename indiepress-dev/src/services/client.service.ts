@@ -36,6 +36,13 @@ import { seenOn } from '@nostr/gadgets/store'
 import { outboxFilterRelayBatch } from '@nostr/gadgets/outbox'
 
 let timelineSubscriptionCounter = 0
+const activeTimelineSubscriptionsByLabel = new Map<
+  string,
+  {
+    subscriptionId: number
+    close: (reason?: string) => void
+  }
+>()
 const ENABLE_TIMELINE_DEBUG_LOGS = false
 
 function debugTimeline(...args: unknown[]) {
@@ -286,6 +293,45 @@ class ClientService extends EventTarget {
     let subc: SubCloser
     const abort = new AbortController()
     const subscriptionId = ++timelineSubscriptionCounter
+    const explicitTimelineLabel = timelineLabel?.trim()
+    const hasExplicitTimelineLabel = Boolean(explicitTimelineLabel)
+    const resolvedTimelineLabel = hasExplicitTimelineLabel
+      ? (explicitTimelineLabel as string)
+      : 'f-timeline'
+    let preliminarySub: SubCloser | undefined
+    let closed = false
+    const unregisterLabelSubscription = () => {
+      if (!hasExplicitTimelineLabel) return
+      const active = activeTimelineSubscriptionsByLabel.get(resolvedTimelineLabel)
+      if (active?.subscriptionId === subscriptionId) {
+        activeTimelineSubscriptionsByLabel.delete(resolvedTimelineLabel)
+      }
+    }
+    const closeSubscription = (reason?: string) => {
+      if (closed) return
+      closed = true
+      onClose = undefined
+      unregisterLabelSubscription()
+      abort.abort(reason ?? '<subc>')
+      subc?.close?.(reason)
+      preliminarySub?.close?.(reason)
+    }
+    const closeReasonForReplacement = `[subscribeTimeline] replaced by ${subscriptionId}`
+    if (hasExplicitTimelineLabel) {
+      const active = activeTimelineSubscriptionsByLabel.get(resolvedTimelineLabel)
+      if (active && active.subscriptionId !== subscriptionId) {
+        debugTimeline('[subscribeTimeline] replacing active subscription', {
+          timelineLabel: resolvedTimelineLabel,
+          previousSubscriptionId: active.subscriptionId,
+          replacementSubscriptionId: subscriptionId
+        })
+        active.close(closeReasonForReplacement)
+      }
+      activeTimelineSubscriptionsByLabel.set(resolvedTimelineLabel, {
+        subscriptionId,
+        close: closeSubscription
+      })
+    }
 
     const localFilters = subRequests
       .filter((req): req is Extract<TFeedSubRequest, { source: 'local' }> => req.source === 'local')
@@ -308,7 +354,6 @@ class ClientService extends EventTarget {
     const relayUrls = Array.from(
       new Set(relayRequests.flatMap(({ urls }) => urls))
     )
-    const resolvedTimelineLabel = timelineLabel?.trim() || 'f-timeline'
 
     debugTimeline('[subscribeTimeline] start', {
       subscriptionId,
@@ -485,7 +530,6 @@ class ClientService extends EventTarget {
       })
     }
 
-    let preliminarySub: SubCloser | undefined
     if (
       relayRequests.length === 0 &&
       localFilters.length === 1 &&
@@ -559,11 +603,8 @@ class ClientService extends EventTarget {
     })
 
     return {
-      close() {
-        onClose = undefined
-        abort.abort('<subc>')
-        subc?.close?.()
-        preliminarySub?.close?.()
+      close(reason?: string) {
+        closeSubscription(reason)
       }
     }
   }

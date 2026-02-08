@@ -1,8 +1,122 @@
 import { TDraftEvent } from '@/types'
 import { MediaUploadResult } from '@/services/media-upload.service'
+import { Event as NostrEvent } from '@nostr/tools/wasm'
+
+export type GroupFileSortKey = 'fileName' | 'uploadedAt' | 'uploadedBy' | 'size' | 'mime'
+
+export type GroupFileRecord = {
+  eventId: string
+  event: NostrEvent
+  url: string
+  fileName: string
+  mime: string | null
+  size: number | null
+  uploadedAt: number
+  uploadedBy: string
+  sha256: string | null
+  dim: string | null
+  alt: string | null
+  summary: string | null
+}
 
 function readTag(tags: string[][], name: string) {
   return tags.find((tag) => tag[0] === name)?.[1]
+}
+
+function toOptionalString(value: string | null | undefined) {
+  const normalized = typeof value === 'string' ? value.trim() : ''
+  return normalized ? normalized : null
+}
+
+function readFiniteNumber(value: string | null | undefined) {
+  if (!value) return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function getUrlFileName(url: string) {
+  try {
+    const parsed = new URL(url)
+    const name = decodeURIComponent(parsed.pathname.split('/').filter(Boolean).pop() || '').trim()
+    return name || null
+  } catch {
+    const name = url.split('?')[0].split('#')[0].split('/').filter(Boolean).pop()?.trim()
+    return name || null
+  }
+}
+
+function buildFallbackFileName(sha256: string | null) {
+  return sha256 ? `file-${sha256.slice(0, 12)}` : 'file'
+}
+
+function deriveGroupFileName({
+  url,
+  alt,
+  content,
+  sha256
+}: {
+  url: string
+  alt: string | null
+  content: string
+  sha256: string | null
+}) {
+  if (alt) return alt
+
+  const trimmedContent = content.trim()
+  if (trimmedContent) return trimmedContent
+
+  const urlName = getUrlFileName(url)
+  if (urlName) return urlName
+
+  return buildFallbackFileName(sha256)
+}
+
+export function parseGroupFileRecordFromEvent(event: NostrEvent): GroupFileRecord | null {
+  if (!event || event.kind !== 1063 || !Array.isArray(event.tags)) return null
+
+  const url = toOptionalString(readTag(event.tags, 'url'))
+  if (!url) return null
+
+  const mime = toOptionalString(readTag(event.tags, 'm'))?.toLowerCase() || null
+  const size = readFiniteNumber(readTag(event.tags, 'size'))
+  const sha256 =
+    toOptionalString(readTag(event.tags, 'x')) || toOptionalString(readTag(event.tags, 'ox')) || null
+  const dim = toOptionalString(readTag(event.tags, 'dim'))
+  const alt = toOptionalString(readTag(event.tags, 'alt'))
+  const summary = toOptionalString(readTag(event.tags, 'summary'))
+
+  return {
+    eventId: event.id,
+    event,
+    url,
+    fileName: deriveGroupFileName({
+      url,
+      alt,
+      content: event.content || '',
+      sha256
+    }),
+    mime,
+    size,
+    uploadedAt: event.created_at || 0,
+    uploadedBy: event.pubkey,
+    sha256,
+    dim,
+    alt,
+    summary
+  }
+}
+
+export function formatGroupFileSize(size: number | null | undefined) {
+  if (!Number.isFinite(size)) return '-'
+  const value = Number(size)
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(2)} MB`
+  return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+export function formatGroupFileMime(mime: string | null | undefined) {
+  return toOptionalString(mime)?.toLowerCase() || 'unknown'
 }
 
 function hasTag(tags: string[][], candidate: string[]) {

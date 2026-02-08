@@ -349,7 +349,7 @@ export default function PostContent({
   )
 
   const body = (
-    <div className="flex flex-col gap-2 flex-1 min-h-0 overflow-y-auto">
+    <div className="flex flex-col gap-2 flex-1 min-h-0 min-w-0 max-w-full overflow-y-auto overflow-x-hidden">
       {parentEvent && (
         <div className="flex max-h-48 flex-col overflow-y-auto rounded-lg border bg-muted/40">
           <div className="p-2 sm:p-3 pointer-events-none">
@@ -387,7 +387,7 @@ export default function PostContent({
         <Preview
           content={text}
           className={cn(
-            'border rounded-lg p-3 min-h-52 bg-background',
+            'border rounded-lg p-3 min-h-52 bg-background max-w-full overflow-x-hidden break-words [overflow-wrap:anywhere]',
             isPoll ? 'min-h-20' : 'min-h-52'
           )}
         />

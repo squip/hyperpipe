@@ -2397,8 +2397,30 @@ function setupProtocolHandlers(protocol) {
     };
   });
 
+  const buildDriveCorsHeaders = (contentType = null, extraHeaders = {}) => {
+    const headers = {
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'GET,HEAD,OPTIONS',
+      'access-control-allow-headers': 'Content-Type, Range',
+      'access-control-expose-headers': 'Content-Length, Content-Range, Accept-Ranges',
+      'cross-origin-resource-policy': 'cross-origin',
+      ...extraHeaders
+    };
+    if (contentType) headers['content-type'] = contentType;
+    return headers;
+  };
+
   // Serve files stored in Hyperdrive
   protocol.handle('/drive/:identifier/:file', async (request) => {
+    if (request?.method === 'OPTIONS') {
+      updateMetrics(true);
+      return {
+        statusCode: 204,
+        headers: buildDriveCorsHeaders(null, { 'content-length': '0' }),
+        body: b4a.from('')
+      };
+    }
+
     const rawIdentifier = request.params.identifier;
     const identifier = normalizeRelayIdentifier(rawIdentifier);
     const fileId = request.params.file;
@@ -2418,7 +2440,7 @@ function setupProtocolHandlers(protocol) {
           updateMetrics(false);
           return {
             statusCode: 404,
-            headers: { 'content-type': 'application/json' },
+            headers: buildDriveCorsHeaders('application/json'),
             body: b4a.from(JSON.stringify({ error: 'Relay not found' }))
           };
         }
@@ -2455,7 +2477,7 @@ function setupProtocolHandlers(protocol) {
         updateMetrics(false);
         return {
           statusCode: 404,
-          headers: { 'content-type': 'application/json' },
+          headers: buildDriveCorsHeaders('application/json'),
           body: b4a.from(JSON.stringify({ error: 'File not found' }))
         };
       }
@@ -2478,10 +2500,10 @@ function setupProtocolHandlers(protocol) {
       updateMetrics(true);
       return {
         statusCode: 200,
-        headers: {
-          'content-type': contentType,
-          'content-length': fileBuffer.length.toString()
-        },
+        headers: buildDriveCorsHeaders(contentType, {
+          'content-length': fileBuffer.length.toString(),
+          'accept-ranges': 'bytes'
+        }),
         body: b4a.from(fileBuffer)
       };
     } catch (error) {
@@ -2489,7 +2511,7 @@ function setupProtocolHandlers(protocol) {
       updateMetrics(false);
       return {
         statusCode: 500,
-        headers: { 'content-type': 'application/json' },
+        headers: buildDriveCorsHeaders('application/json'),
         body: b4a.from(JSON.stringify({ error: error.message }))
       };
     }

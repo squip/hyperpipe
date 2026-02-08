@@ -514,7 +514,7 @@ export default function ArticleContent({
   }, [])
 
   const body = (
-    <div className="flex flex-col gap-2 flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
+    <div className="flex flex-col gap-2 flex-1 min-h-0 min-w-0 max-w-full overflow-y-auto overflow-x-hidden">
       {!cacheHydrated ? (
         <div className="text-sm text-muted-foreground">{t('Loading...')}</div>
       ) : (
