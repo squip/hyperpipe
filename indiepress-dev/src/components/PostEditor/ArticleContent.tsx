@@ -1,10 +1,15 @@
 import { Button } from '@/components/ui/button'
 import PostRelaySelector from './PostRelaySelector'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
-import { cn } from '@/lib/utils'
 import { createLongFormDraftEvent } from '@/lib/draft-event'
+import {
+  appendGroupAttachmentTagsToDraft,
+  createGroupFileMetadataDraftEvent,
+  getGroupHyperdriveUploads
+} from '@/lib/group-files'
 import { useNostr } from '@/providers/NostrProvider'
 import postEditorCache from '@/services/post-editor-cache.service'
+import { MediaUploadContext, MediaUploadResult } from '@/services/media-upload.service'
 import { Event } from '@nostr/tools/wasm'
 import { useEffect, useMemo, useState, MouseEvent, ReactNode, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -15,13 +20,29 @@ import * as nip19 from '@nostr/tools/nip19'
 import { TDraftEvent } from '@/types'
 import ArticleMarkdownEditor, { MetadataSnapshot } from './ArticleMarkdownEditor'
 
+type FailedUpload = {
+  key: string
+  fileName: string
+  error: string
+}
+
+function getUploadFailureKey(file: File) {
+  return `${file.name}:${file.size}:${file.lastModified}`
+}
+
 export default function ArticleContent({
   close,
   openFrom,
   existingEvent,
   extraTags = [],
   onPublish,
-  renderSections,
+  renderSections = ({ header, body, footer }) => (
+    <>
+      {header}
+      {body}
+      {footer}
+    </>
+  ),
   groupContext
 }: {
   close: () => void
@@ -29,7 +50,7 @@ export default function ArticleContent({
   existingEvent?: Event
   extraTags?: string[][]
   onPublish?: (draftEvent: TDraftEvent, options: { isDraft: boolean; relayUrls: string[] }) => Promise<void>
-  renderSections: (sections: {
+  renderSections?: (sections: {
     header?: React.ReactNode
     body: React.ReactNode
     footer: React.ReactNode
@@ -55,16 +76,28 @@ export default function ArticleContent({
   const [posting, setPosting] = useState(false)
   const [savingDraft, setSavingDraft] = useState(false)
   const [mentions, setMentions] = useState<string[]>([])
-  const [isProtectedEvent, setIsProtectedEvent] = useState(false)
+  const [, setIsProtectedEvent] = useState(false)
   const [additionalRelayUrls, setAdditionalRelayUrls] = useState<string[]>([])
   const [uploadProgresses, setUploadProgresses] = useState<
     { file: File; progress: number; cancel: () => void }[]
   >([])
+  const [uploadedResults, setUploadedResults] = useState<MediaUploadResult[]>([])
+  const [failedUploads, setFailedUploads] = useState<FailedUpload[]>([])
   const [metadataSnapshot, setMetadataSnapshot] = useState<MetadataSnapshot | null>(null)
   const [cacheHydrated, setCacheHydrated] = useState(false)
   const [templateResetKey, setTemplateResetKey] = useState(0)
+  const groupUploadContext = useMemo<MediaUploadContext | undefined>(() => {
+    if (!groupContext?.groupId) return undefined
+    return {
+      target: 'group-hyperdrive',
+      groupId: groupContext.groupId,
+      relayUrl: groupContext.relay,
+      parentKind: 30023
+    }
+  }, [groupContext?.groupId, groupContext?.relay])
   const groupDisplayName = groupContext?.name || groupContext?.groupId
   const groupInitials = (groupDisplayName || 'GR').slice(0, 2).toUpperCase()
+  const hasBlockingUploadFailures = !!groupContext?.groupId && failedUploads.length > 0
 
   const cacheKey = useMemo(
     () => `article-editor:${existingEvent?.id ?? 'new'}`,
@@ -180,9 +213,19 @@ export default function ArticleContent({
       hasContent &&
       !posting &&
       !savingDraft &&
-      !uploadProgresses.length
+      !uploadProgresses.length &&
+      !hasBlockingUploadFailures
     )
-  }, [identifier, bodyContent, content, posting, savingDraft, uploadProgresses.length, metadataSnapshot])
+  }, [
+    identifier,
+    bodyContent,
+    content,
+    posting,
+    savingDraft,
+    uploadProgresses.length,
+    metadataSnapshot,
+    hasBlockingUploadFailures
+  ])
 
   const hashtags = useMemo(
     () =>
@@ -307,6 +350,10 @@ export default function ArticleContent({
 
   const publishDraft = async (isDraft: boolean) => {
     await checkLogin(async () => {
+      if (hasBlockingUploadFailures) {
+        toast.error(t('Resolve failed uploads before posting. Retry upload or remove failed files.'))
+        return
+      }
       if (!canPublish) return
       if (isDraft) {
         setSavingDraft(true)
@@ -319,6 +366,17 @@ export default function ArticleContent({
           draftEvent.tags = draftEvent.tags || []
           if (!draftEvent.tags.some((t) => t[0] === 'h' && t[1] === groupContext.groupId)) {
             draftEvent.tags.push(['h', groupContext.groupId])
+          }
+          appendGroupAttachmentTagsToDraft(draftEvent, uploadedResults)
+          if (!isDraft) {
+            const groupFileDrafts = getGroupHyperdriveUploads(uploadedResults)
+              .map((upload) => createGroupFileMetadataDraftEvent(upload, groupContext.groupId))
+              .filter((event): event is NonNullable<ReturnType<typeof createGroupFileMetadataDraftEvent>> => Boolean(event))
+            if (groupFileDrafts.length > 0) {
+              for (const fileDraft of groupFileDrafts) {
+                await publishGroupFileMetadataWithRetry(fileDraft)
+              }
+            }
           }
         }
         let newEvent
@@ -359,6 +417,8 @@ export default function ArticleContent({
         } catch (_e) {
           /* ignore */
         }
+        setUploadedResults([])
+        setFailedUploads([])
         close()
         return newEvent
       } catch (error) {
@@ -391,6 +451,63 @@ export default function ArticleContent({
     setUploadProgresses((prev) => prev.filter((item) => item.file !== file))
   }
 
+  const handleUploadSuccess = (result: MediaUploadResult, file?: File) => {
+    if (file) {
+      const key = getUploadFailureKey(file)
+      setFailedUploads((prev) => prev.filter((item) => item.key !== key))
+    }
+    setUploadedResults((prev) => {
+      if (!result?.url) return prev
+      if (prev.some((item) => item.url === result.url)) return prev
+      return [...prev, result]
+    })
+  }
+
+  const handleUploadError = (file: File, error: Error) => {
+    if (!groupContext?.groupId) return
+    const key = getUploadFailureKey(file)
+    const next: FailedUpload = {
+      key,
+      fileName: file.name || t('Unknown file'),
+      error: error?.message || t('Upload failed')
+    }
+    setFailedUploads((prev) => {
+      const index = prev.findIndex((item) => item.key === key)
+      if (index === -1) return [...prev, next]
+      const copy = [...prev]
+      copy[index] = next
+      return copy
+    })
+  }
+
+  const dismissFailedUpload = (key: string) => {
+    setFailedUploads((prev) => prev.filter((item) => item.key !== key))
+  }
+
+  const publishGroupFileMetadataWithRetry = async (
+    draftEvent: NonNullable<ReturnType<typeof createGroupFileMetadataDraftEvent>>
+  ) => {
+    if (!groupContext?.relay) {
+      throw new Error('Missing group relay URL for group file metadata publish')
+    }
+    let lastError: unknown = null
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await publish(draftEvent, {
+          specifiedRelayUrls: [groupContext.relay],
+          additionalRelayUrls: [groupContext.relay]
+        })
+        return
+      } catch (error) {
+        lastError = error
+        if (attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, attempt * 500))
+        }
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError))
+  }
+
   const [toolbar, setToolbar] = useState<ReactNode | null>(null)
   const handleRenderToolbar = useCallback((node: ReactNode) => {
     setToolbar(node)
@@ -415,9 +532,12 @@ export default function ArticleContent({
           onUploadStart={handleUploadStart}
           onUploadEnd={handleUploadEnd}
           onUploadProgress={handleUploadProgress}
+          onUploadError={handleUploadError}
+          uploadContext={groupUploadContext}
           onClearEditor={handleClearEditor}
-          onUploadSuccess={({ url }) => {
-            setContent((prev) => `${prev}${prev ? '\n' : ''}${url}`)
+          onUploadSuccess={(result, file) => {
+            setContent((prev) => `${prev}${prev ? '\n' : ''}${result.url}`)
+            handleUploadSuccess(result, file)
           }}
           onEmojiSelect={(emoji) => {
             if (!emoji) return
@@ -462,6 +582,32 @@ export default function ArticleContent({
             </button>
           </div>
         ))}
+      {hasBlockingUploadFailures && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/5 p-2">
+          <div className="text-xs text-destructive mb-2">
+            {t('Some uploads failed. Retry upload or remove failed files before posting.')}
+          </div>
+          <div className="space-y-2">
+            {failedUploads.map((item) => (
+              <div key={item.key} className="flex items-start gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-xs font-medium">{item.fileName}</div>
+                  <div className="truncate text-[11px] text-muted-foreground">{item.error}</div>
+                </div>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 px-2"
+                  onClick={() => dismissFailedUpload(item.key)}
+                >
+                  {t('Remove')}
+                </Button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="flex flex-wrap items-center gap-2 justify-between">
         {groupContext?.groupId && (
           <div className="inline-flex items-center gap-2 rounded-full bg-muted px-2 py-1">

@@ -761,6 +761,24 @@ function normalizeHttpOrigin(candidate) {
   }
 }
 
+function normalizeDriveIdentifier(identifier) {
+  if (typeof identifier !== 'string') return null
+  const trimmed = identifier.trim()
+  if (!trimmed) return null
+  return trimmed.replace(/^\/+/, '').replace(/\/+$/, '')
+}
+
+function buildLocalDriveFileUrl(localBaseUrl, identifier, fileId) {
+  const origin = normalizeHttpOrigin(localBaseUrl)
+  const normalizedIdentifier = normalizeDriveIdentifier(identifier)
+  const normalizedFileId =
+    typeof fileId === 'string' && fileId.trim()
+      ? fileId.trim().replace(/^\/+/, '')
+      : null
+  if (!origin || !normalizedIdentifier || !normalizedFileId) return null
+  return `${origin}/drive/${normalizedIdentifier}/${normalizedFileId}`
+}
+
 function collectPublicGatewayOrigins() {
   const origins = new Set()
   const addOrigin = (candidate) => {
@@ -3278,6 +3296,17 @@ const sendMessage = (message) => {
   }
 }
 
+function sendWorkerResponse(requestId, { success = true, data = null, error = null } = {}) {
+  if (!requestId || typeof requestId !== 'string') return
+  sendMessage({
+    type: 'worker-response',
+    requestId,
+    success: success !== false,
+    data,
+    error: error || null
+  })
+}
+
 let workerStatusState = {
   user: null,
   app: {
@@ -3588,6 +3617,158 @@ async function reconcileRelayFiles() {
   }
 }
 
+async function recoverRelayDriveFile({
+  relayKey = null,
+  identifier = null,
+  fileHash = null,
+  reason = 'on-demand-fetch'
+} = {}) {
+  if (!fileHash || typeof fileHash !== 'string') {
+    return { status: 'error', reason: 'missing-file-hash' }
+  }
+
+  let resolvedRelayKey = relayKey
+  if (!resolvedRelayKey && identifier) {
+    if (/^[a-fA-F0-9]{64}$/.test(identifier)) {
+      resolvedRelayKey = identifier.toLowerCase()
+    } else {
+      try {
+        resolvedRelayKey = await getRelayKeyFromPublicIdentifier(identifier)
+      } catch (_) {}
+    }
+  }
+  if (!resolvedRelayKey) {
+    return { status: 'error', reason: 'relay-unresolved' }
+  }
+
+  const relayManager = activeRelays.get(resolvedRelayKey)
+  if (!relayManager?.relay || typeof relayManager.relay.queryFilekeyIndex !== 'function') {
+    return { status: 'error', reason: 'relay-unavailable', relayKey: resolvedRelayKey }
+  }
+
+  let resolvedIdentifier = identifier || resolvedRelayKey
+  if (!resolvedIdentifier || /^[a-fA-F0-9]{64}$/.test(resolvedIdentifier)) {
+    try {
+      const profile = await getRelayProfileByKey(resolvedRelayKey)
+      if (profile?.public_identifier) {
+        resolvedIdentifier = profile.public_identifier
+      }
+    } catch (_) {}
+  }
+  if (!resolvedIdentifier) resolvedIdentifier = resolvedRelayKey
+
+  try {
+    const local = await getFile(resolvedIdentifier, fileHash)
+    if (local) {
+      return {
+        status: 'ok',
+        reason: 'already-local',
+        relayKey: resolvedRelayKey,
+        identifier: resolvedIdentifier,
+        fileHash
+      }
+    }
+  } catch (_) {}
+
+  let fileMap
+  try {
+    fileMap = await relayManager.relay.queryFilekeyIndex()
+  } catch (err) {
+    return {
+      status: 'error',
+      reason: 'filekey-query-failed',
+      relayKey: resolvedRelayKey,
+      error: err?.message || String(err)
+    }
+  }
+
+  const driveMap = fileMap?.get?.(fileHash) || null
+  if (!driveMap || !(driveMap instanceof Map) || driveMap.size === 0) {
+    return {
+      status: 'error',
+      reason: 'no-providers',
+      relayKey: resolvedRelayKey,
+      identifier: resolvedIdentifier,
+      fileHash
+    }
+  }
+
+  const providers = Array.from(driveMap.keys()).filter(Boolean)
+  if (!providers.length) {
+    return {
+      status: 'error',
+      reason: 'no-provider-keys',
+      relayKey: resolvedRelayKey,
+      identifier: resolvedIdentifier,
+      fileHash
+    }
+  }
+
+  console.info('[Recover] drive file fetch requested', {
+    relayKey: resolvedRelayKey,
+    identifier: resolvedIdentifier,
+    fileHash,
+    providers: providers.length,
+    reason
+  })
+
+  try {
+    await ensureMirrorsForProviders(new Set(providers), resolvedIdentifier)
+  } catch (err) {
+    console.warn('[Recover] ensureMirrorsForProviders failed', {
+      relayKey: resolvedRelayKey,
+      identifier: resolvedIdentifier,
+      fileHash,
+      error: err?.message || err
+    })
+  }
+
+  for (const driveKey of providers) {
+    try {
+      let data = await fetchFileFromDrive(driveKey, resolvedIdentifier, fileHash)
+      if (!data && resolvedIdentifier !== resolvedRelayKey) {
+        data = await fetchFileFromDrive(driveKey, resolvedRelayKey, fileHash)
+      }
+      if (!data) continue
+      await storeFile(resolvedIdentifier, fileHash, data, {
+        sourceDrive: driveKey,
+        recoveredAt: Date.now(),
+        reason
+      })
+      console.info('[Recover] drive file fetch complete', {
+        relayKey: resolvedRelayKey,
+        identifier: resolvedIdentifier,
+        fileHash,
+        provider: driveKey
+      })
+      return {
+        status: 'ok',
+        reason: 'fetched',
+        relayKey: resolvedRelayKey,
+        identifier: resolvedIdentifier,
+        fileHash,
+        provider: driveKey
+      }
+    } catch (err) {
+      console.warn('[Recover] provider fetch failed', {
+        relayKey: resolvedRelayKey,
+        identifier: resolvedIdentifier,
+        fileHash,
+        provider: driveKey,
+        error: err?.message || err
+      })
+    }
+  }
+
+  return {
+    status: 'error',
+    reason: 'fetch-failed',
+    relayKey: resolvedRelayKey,
+    identifier: resolvedIdentifier,
+    fileHash
+  }
+}
+
 async function syncRemotePfpMirrors() {
   if (!gatewayService?.getPeersWithPfpDrive) return
   const peers = gatewayService.getPeersWithPfpDrive()
@@ -3819,6 +4000,7 @@ global.resolveRelayMirrorCoreRefs = resolveRelayMirrorCoreRefs
 global.getRelayMirrorCoreRefsCache = getRelayMirrorCoreRefsCache
 global.syncActiveRelayCoreRefs = syncActiveRelayCoreRefs
 global.appendOpenJoinMirrorCores = appendOpenJoinMirrorCores
+global.recoverRelayDriveFile = recoverRelayDriveFile
 global.requestRelaySubscriptionRefresh = async ({ relayKey = null, reason = 'manual' } = {}) => {
   console.log('[Worker] Subscription refresh requested before relay server ready', {
     relayKey,
@@ -4100,12 +4282,34 @@ async function handleMessageObject(message) {
     }
 
     case 'upload-file': {
+      const requestId =
+        (typeof message.requestId === 'string' && message.requestId) ||
+        (typeof message?.data?.requestId === 'string' && message.data.requestId) ||
+        null
+      const startedAt = Date.now()
       try {
-        const { relayKey, identifier: idFromMsg, publicIdentifier, fileHash, metadata, buffer } = message.data || {}
+        const {
+          relayKey,
+          identifier: idFromMsg,
+          publicIdentifier,
+          fileHash,
+          fileId: fileIdFromMsg,
+          metadata,
+          buffer,
+          localRelayBaseUrl
+        } = message.data || {}
         const identifier = idFromMsg || publicIdentifier || relayKey
         if (!identifier || !fileHash || !buffer) throw new Error('Missing identifier/publicIdentifier, fileHash, or buffer')
         console.log(`[Upload] begin relayKey=${relayKey} identifier=${identifier} fileHash=${fileHash} metaKeys=${metadata ? Object.keys(metadata) : 'none'} bufLen=${buffer?.length}`)
         const data = b4a.from(buffer, 'base64')
+        const fileId =
+          typeof fileIdFromMsg === 'string' && fileIdFromMsg.trim()
+            ? fileIdFromMsg.trim()
+            : fileHash
+        let dedupHit = false
+        try {
+          dedupHit = await fileExists(identifier, fileHash)
+        } catch (_) {}
         await ensureRelayFolder(identifier)
         await storeFile(identifier, fileHash, data, metadata || null)
         let resolvedRelayKey = relayKey
@@ -4118,10 +4322,43 @@ async function handleMessageObject(message) {
         } else {
           console.warn('[Worker] upload-file: could not resolve relayKey for identifier', identifier)
         }
+        const localUrl = buildLocalDriveFileUrl(localRelayBaseUrl, identifier, fileId)
+        const summary = {
+          relayKey: resolvedRelayKey || null,
+          identifier,
+          fileHash,
+          fileId,
+          url: localUrl,
+          mime: metadata?.mimeType || metadata?.m || null,
+          size: Number.isFinite(metadata?.size) ? Number(metadata.size) : null,
+          dim:
+            typeof metadata?.dim === 'string' && metadata.dim
+              ? metadata.dim
+              : metadata?.dim && Number.isFinite(metadata.dim.width) && Number.isFinite(metadata.dim.height)
+                ? `${Math.trunc(metadata.dim.width)}x${Math.trunc(metadata.dim.height)}`
+                : null,
+          driveKey: config?.driveKey || null,
+          dedupHit,
+          elapsedMs: Date.now() - startedAt
+        }
+        console.info('[Upload] complete', summary)
         console.log(`[Upload] complete relayKey=${resolvedRelayKey || relayKey} identifier=${identifier} fileHash=${fileHash}`)
         sendMessage({ type: 'upload-file-complete', relayKey: resolvedRelayKey || null, identifier, fileHash })
+        sendWorkerResponse(requestId, {
+          success: true,
+          data: {
+            ...summary,
+            sha256: fileHash,
+            ox: fileHash,
+            metadata: metadata || null
+          }
+        })
       } catch (err) {
         console.error('[Worker] upload-file error:', err)
+        sendWorkerResponse(requestId, {
+          success: false,
+          error: err?.message || String(err)
+        })
         sendMessage({ type: 'error', message: `upload-file failed: ${err.message}` })
       }
       break

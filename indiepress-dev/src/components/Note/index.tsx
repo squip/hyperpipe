@@ -34,6 +34,7 @@ import Poll from './Poll'
 import RelayReview from './RelayReview'
 import UnknownNote from './UnknownNote'
 import VideoNote from './VideoNote'
+import FileMetadataNote from './FileMetadata'
 
 export default function Note({
   event,
@@ -100,6 +101,8 @@ export default function Note({
     )
   } else if (event.kind === ExtendedKind.VOICE || event.kind === ExtendedKind.VOICE_COMMENT) {
     content = <AudioPlayer className="mt-2" src={event.content} />
+  } else if (event.kind === ExtendedKind.FILE_METADATA) {
+    content = <FileMetadataNote className="mt-2" event={event} />
   } else if (event.kind === ExtendedKind.PICTURE) {
     content = <PictureNote className="mt-2" event={event} />
   } else if (event.kind === ExtendedKind.VIDEO || event.kind === ExtendedKind.SHORT_VIDEO) {

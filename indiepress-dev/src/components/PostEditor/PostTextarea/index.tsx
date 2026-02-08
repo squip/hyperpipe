@@ -16,6 +16,7 @@ import { Event } from '@nostr/tools/wasm'
 import { Dispatch, forwardRef, SetStateAction, useEffect, useImperativeHandle, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { ClipboardAndDropHandler } from './ClipboardAndDropHandler'
+import { MediaUploadContext, MediaUploadResult } from '@/services/media-upload.service'
 import Emoji from './Emoji'
 import emojiSuggestion from './Emoji/suggestion'
 import Mention from './Mention'
@@ -42,6 +43,9 @@ const PostTextarea = forwardRef<
     onUploadStart?: (file: File, cancel: () => void) => void
     onUploadProgress?: (file: File, progress: number) => void
     onUploadEnd?: (file: File) => void
+    onUploadSuccess?: (file: File, result: MediaUploadResult) => void
+    onUploadError?: (file: File, error: Error) => void
+    uploadContext?: MediaUploadContext
     hidePreviewToggle?: boolean
   }
 >(
@@ -57,6 +61,9 @@ const PostTextarea = forwardRef<
       onUploadStart,
       onUploadProgress,
       onUploadEnd,
+      onUploadSuccess,
+      onUploadError,
+      uploadContext,
       hidePreviewToggle
     },
     ref
@@ -86,7 +93,10 @@ const PostTextarea = forwardRef<
             onUploadStart?.(file, cancel)
           },
           onUploadEnd: (file) => onUploadEnd?.(file),
-          onUploadProgress: (file, p) => onUploadProgress?.(file, p)
+          onUploadProgress: (file, p) => onUploadProgress?.(file, p),
+          onUploadSuccess: (file, result) => onUploadSuccess?.(file, result),
+          onUploadError: (file, error) => onUploadError?.(file, error),
+          uploadContext
         })
       ],
       editorProps: {

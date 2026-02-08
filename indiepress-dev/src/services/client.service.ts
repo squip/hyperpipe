@@ -175,9 +175,11 @@ class ClientService extends EventTarget {
           const publishOnce = async () => {
             const result = await relay.publish(event)
             const ok =
-              typeof result === 'object' && result !== null && 'ok' in result
+              typeof result === 'boolean'
+                ? result
+                : typeof result === 'object' && result !== null && 'ok' in result
                 ? (result as { ok?: boolean }).ok !== false
-                : result !== false
+                : true
             if (!ok) {
               const reason =
                 typeof result === 'object' && result !== null && 'reason' in result

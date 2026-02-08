@@ -2425,6 +2425,31 @@ function setupProtocolHandlers(protocol) {
         if (relayKey) {
           fileBuffer = await getFile(relayKey, hash);
         }
+        if (!fileBuffer && typeof global.recoverRelayDriveFile === 'function') {
+          const recoverResult = await global.recoverRelayDriveFile({
+            relayKey: relayKey || null,
+            identifier,
+            fileHash: hash,
+            reason: 'drive-http-request'
+          }).catch((error) => ({
+            status: 'error',
+            reason: 'recover-threw',
+            error: error?.message || String(error)
+          }));
+          if (recoverResult?.status === 'ok') {
+            fileBuffer = await getFile(identifier, hash);
+            if (!fileBuffer && relayKey) {
+              fileBuffer = await getFile(relayKey, hash);
+            }
+          } else {
+            console.warn('[RelayServer] Drive recovery failed', {
+              identifier,
+              hash,
+              relayKey: relayKey || null,
+              recoverResult
+            });
+          }
+        }
       }
       if (!fileBuffer) {
         updateMetrics(false);

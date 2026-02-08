@@ -1,22 +1,28 @@
 import Note from '@/components/Note'
 import { Button } from '@/components/ui/button'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
-import { cn } from '@/lib/utils'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { cn, isTouchDevice } from '@/lib/utils'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   createCommentDraftEvent,
   createPollDraftEvent,
   createShortTextNoteDraftEvent,
   deleteDraftEventCache
 } from '@/lib/draft-event'
+import {
+  appendGroupAttachmentTagsToDraft,
+  createGroupFileMetadataDraftEvent,
+  getGroupHyperdriveUploads
+} from '@/lib/group-files'
 import { useNostr } from '@/providers/NostrProvider'
 import { useReply } from '@/providers/ReplyProvider'
 import postEditorCache from '@/services/post-editor-cache.service'
+import { MediaUploadContext, MediaUploadResult } from '@/services/media-upload.service'
 import { TPollCreateData } from '@/types'
 import { ImageUp, ListTodo, LoaderCircle, Settings, Smile, X } from 'lucide-react'
 import { Event } from '@nostr/tools/wasm'
 import * as kinds from '@nostr/tools/kinds'
-import { ReactNode, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import EmojiPickerDialog from '../EmojiPickerDialog'
@@ -27,7 +33,16 @@ import PostRelaySelector from './PostRelaySelector'
 import PostTextarea, { TPostTextareaHandle } from './PostTextarea'
 import Preview from './PostTextarea/Preview'
 import Uploader from './Uploader'
-import { isTouchDevice } from '@/lib/utils'
+
+type FailedUpload = {
+  key: string
+  fileName: string
+  error: string
+}
+
+function getUploadFailureKey(file: File) {
+  return `${file.name}:${file.size}:${file.lastModified}`
+}
 
 export default function PostContent({
   defaultContent = '',
@@ -75,16 +90,32 @@ export default function PostContent({
     endsAt: undefined,
     relays: []
   })
+  const [uploadedResults, setUploadedResults] = useState<MediaUploadResult[]>([])
+  const [failedUploads, setFailedUploads] = useState<FailedUpload[]>([])
   const [minPow, setMinPow] = useState(0)
   const allowEmoji = useMemo(() => !isTouchDevice(), [])
   const [view, setView] = useState<'edit' | 'preview'>('edit')
+  const groupUploadContext = useMemo<MediaUploadContext | undefined>(() => {
+    if (!groupContext?.groupId) return undefined
+    return {
+      target: 'group-hyperdrive',
+      groupId: groupContext.groupId,
+      relayUrl: groupContext.relay,
+      parentKind:
+        parentEvent && parentEvent.kind !== kinds.ShortTextNote
+          ? 1111
+          : kinds.ShortTextNote
+    }
+  }, [groupContext?.groupId, groupContext?.relay, parentEvent])
   const isFirstRender = useRef(true)
+  const hasBlockingUploadFailures = !!groupContext?.groupId && failedUploads.length > 0
   const canPost = useMemo(() => {
     return (
       !!pubkey &&
       !!text &&
       !posting &&
       !uploadProgresses.length &&
+      !hasBlockingUploadFailures &&
       (!isPoll || pollCreateData.options.filter((option) => !!option.trim()).length >= 2) &&
       (!isProtectedEvent || additionalRelayUrls.length > 0) &&
       (!groupContext || !!groupContext.groupId)
@@ -94,6 +125,7 @@ export default function PostContent({
     text,
     posting,
     uploadProgresses,
+    hasBlockingUploadFailures,
     isPoll,
     pollCreateData,
     isProtectedEvent,
@@ -137,6 +169,10 @@ export default function PostContent({
   const post = async (e?: React.MouseEvent) => {
     e?.stopPropagation()
     checkLogin(async () => {
+      if (hasBlockingUploadFailures) {
+        toast.error(t('Resolve failed uploads before posting. Retry upload or remove failed files.'))
+        return
+      }
       if (!canPost) return
 
       setPosting(true)
@@ -162,7 +198,19 @@ export default function PostContent({
 
         if (groupContext?.groupId) {
           draftEvent.tags = draftEvent.tags || []
-          draftEvent.tags.push(['h', groupContext.groupId])
+          if (!draftEvent.tags.some((tag) => tag[0] === 'h' && tag[1] === groupContext.groupId)) {
+            draftEvent.tags.push(['h', groupContext.groupId])
+          }
+          appendGroupAttachmentTagsToDraft(draftEvent, uploadedResults)
+          const groupFileDrafts = getGroupHyperdriveUploads(uploadedResults)
+            .map((upload) => createGroupFileMetadataDraftEvent(upload, groupContext.groupId))
+            .filter((event): event is NonNullable<ReturnType<typeof createGroupFileMetadataDraftEvent>> => Boolean(event))
+
+          if (groupFileDrafts.length > 0) {
+            for (const fileDraft of groupFileDrafts) {
+              await publishGroupFileMetadataWithRetry(fileDraft)
+            }
+          }
         }
 
         const newEvent = await publish(draftEvent, {
@@ -177,6 +225,8 @@ export default function PostContent({
         postEditorCache.clearPostCache({ defaultContent, parentEvent })
         deleteDraftEventCache(draftEvent)
         addReplies([newEvent])
+        setUploadedResults([])
+        setFailedUploads([])
         close()
       } catch (error) {
         const errors = error instanceof AggregateError ? error.errors : [error]
@@ -213,6 +263,61 @@ export default function PostContent({
 
   const handleUploadEnd = (file: File) => {
     setUploadProgresses((prev) => prev.filter((item) => item.file !== file))
+  }
+
+  const handleUploadSuccess = (result: MediaUploadResult, file?: File) => {
+    if (file) {
+      const key = getUploadFailureKey(file)
+      setFailedUploads((prev) => prev.filter((item) => item.key !== key))
+    }
+    setUploadedResults((prev) => {
+      if (!result?.url) return prev
+      if (prev.some((item) => item.url === result.url)) return prev
+      return [...prev, result]
+    })
+  }
+
+  const handleUploadError = (file: File, error: Error) => {
+    if (!groupContext?.groupId) return
+    const key = getUploadFailureKey(file)
+    const next: FailedUpload = {
+      key,
+      fileName: file.name || t('Unknown file'),
+      error: error?.message || t('Upload failed')
+    }
+    setFailedUploads((prev) => {
+      const index = prev.findIndex((item) => item.key === key)
+      if (index === -1) return [...prev, next]
+      const copy = [...prev]
+      copy[index] = next
+      return copy
+    })
+  }
+
+  const dismissFailedUpload = (key: string) => {
+    setFailedUploads((prev) => prev.filter((item) => item.key !== key))
+  }
+
+  const publishGroupFileMetadataWithRetry = async (draftEvent: NonNullable<ReturnType<typeof createGroupFileMetadataDraftEvent>>) => {
+    if (!groupContext?.relay) {
+      throw new Error('Missing group relay URL for group file metadata publish')
+    }
+    let lastError: unknown = null
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await publish(draftEvent, {
+          specifiedRelayUrls: [groupContext.relay],
+          additionalRelayUrls: [groupContext.relay]
+        })
+        return
+      } catch (error) {
+        lastError = error
+        if (attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, attempt * 500))
+        }
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError))
   }
 
   const groupDisplayName = groupContext?.name || groupContext?.groupId
@@ -265,6 +370,9 @@ export default function PostContent({
             onUploadStart={handleUploadStart}
             onUploadProgress={handleUploadProgress}
             onUploadEnd={handleUploadEnd}
+            onUploadSuccess={(file, result) => handleUploadSuccess(result, file)}
+            onUploadError={handleUploadError}
+            uploadContext={groupUploadContext}
             hidePreviewToggle
           />
           {isPoll && (
@@ -311,6 +419,32 @@ export default function PostContent({
             </button>
           </div>
         ))}
+      {hasBlockingUploadFailures && (
+        <div className="mt-2 rounded-md border border-destructive/40 bg-destructive/5 p-2">
+          <div className="text-xs text-destructive mb-2">
+            {t('Some uploads failed. Retry upload or remove failed files before posting.')}
+          </div>
+          <div className="space-y-2">
+            {failedUploads.map((item) => (
+              <div key={item.key} className="flex items-start gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-xs font-medium">{item.fileName}</div>
+                  <div className="truncate text-[11px] text-muted-foreground">{item.error}</div>
+                </div>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 px-2"
+                  onClick={() => dismissFailedUpload(item.key)}
+                >
+                  {t('Remove')}
+                </Button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       <PostOptions
         posting={posting}
         show={showMoreOptions}
@@ -337,13 +471,16 @@ export default function PostContent({
       <div className="flex items-center justify-between">
         <div className="flex gap-2 items-center">
           <Uploader
-            onUploadSuccess={({ url }) => {
-              textareaRef.current?.appendText(url, true)
+            onUploadSuccess={(result, file) => {
+              textareaRef.current?.appendText(result.url, true)
+              handleUploadSuccess(result, file)
             }}
+            onUploadError={handleUploadError}
             onUploadStart={handleUploadStart}
             onUploadEnd={handleUploadEnd}
             onProgress={handleUploadProgress}
             accept="image/*,video/*,audio/*"
+            uploadContext={groupUploadContext}
           >
             <Button variant="ghost" size="icon">
               <ImageUp />

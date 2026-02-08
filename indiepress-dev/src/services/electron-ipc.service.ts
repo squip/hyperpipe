@@ -86,6 +86,8 @@ type ElectronAPI = {
   startWorker: (config?: unknown) => Promise<WorkerStartResult>
   stopWorker: () => Promise<WorkerCommandResult>
   sendToWorker: (message: unknown) => Promise<any>
+  sendToWorkerAwait: (payload: unknown) => Promise<any>
+  getWorkerIdentity?: () => Promise<{ success: boolean; identity?: unknown }>
 
   getGatewayStatus: () => Promise<{ success: boolean; status: GatewayStatus | null }>
   getGatewayLogs: () => Promise<{ success: boolean; logs: GatewayLogEntry[] }>
@@ -139,6 +141,12 @@ export const electronIpc = {
   },
   sendToWorker(message: unknown) {
     return api()?.sendToWorker(message) ?? unavailable()
+  },
+  sendToWorkerAwait(payload: unknown) {
+    return api()?.sendToWorkerAwait(payload) ?? unavailable()
+  },
+  getWorkerIdentity() {
+    return api()?.getWorkerIdentity?.() ?? unavailable()
   },
 
   getGatewayStatus() {

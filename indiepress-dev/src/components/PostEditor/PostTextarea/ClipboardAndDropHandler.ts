@@ -1,4 +1,5 @@
-import mediaUpload from '@/services/media-upload.service'
+import mediaUpload, { UPLOAD_ABORTED_ERROR_MSG } from '@/services/media-upload.service'
+import { MediaUploadContext, MediaUploadResult } from '@/services/media-upload.service'
 import { Extension } from '@tiptap/core'
 import { EditorView } from '@tiptap/pm/view'
 import { Plugin, TextSelection } from 'prosemirror-state'
@@ -15,7 +16,9 @@ export interface ClipboardAndDropHandlerOptions {
   onUploadStart?: (file: File, cancel: () => void) => void
   onUploadEnd?: (file: File) => void
   onUploadProgress?: (file: File, progress: number) => void
-  onUploadSuccess?: (file: File, result: { url: string; tags: string[][] }) => boolean | void
+  onUploadSuccess?: (file: File, result: MediaUploadResult) => boolean | void
+  onUploadError?: (file: File, error: Error) => void
+  uploadContext?: MediaUploadContext
 }
 
 export const ClipboardAndDropHandler = Extension.create<ClipboardAndDropHandlerOptions>({
@@ -138,10 +141,14 @@ async function uploadFiles(
     const abortController = abortControllers.get(file)
 
     mediaUpload
-      .upload(file, {
-        onProgress: (p) => options.onUploadProgress?.(file, p),
-        signal: abortController?.signal
-      })
+      .upload(
+        file,
+        {
+          onProgress: (p) => options.onUploadProgress?.(file, p),
+          signal: abortController?.signal
+        },
+        options.uploadContext
+      )
       .then((result) => {
         options.onUploadEnd?.(file)
         const handled = options.onUploadSuccess?.(file, result)
@@ -200,6 +207,10 @@ async function uploadFiles(
       .catch((error) => {
         console.error('Upload failed:', error)
         options.onUploadEnd?.(file)
+        const uploadError = error instanceof Error ? error : new Error(String(error))
+        if (uploadError.message !== UPLOAD_ABORTED_ERROR_MSG) {
+          options.onUploadError?.(file, uploadError)
+        }
 
         const tr = view.state.tr
         let didReplace = false
@@ -220,7 +231,6 @@ async function uploadFiles(
         if (didReplace) {
           view.dispatch(tr)
         }
-        throw error
       })
   }
 }

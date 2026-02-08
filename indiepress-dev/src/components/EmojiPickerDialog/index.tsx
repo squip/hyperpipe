@@ -34,8 +34,7 @@ export default function EmojiPickerDialog({
         <DrawerTrigger asChild>{children}</DrawerTrigger>
         <DrawerContent>
           <EmojiPicker
-            onEmojiClick={(emoji, e) => {
-              e.stopPropagation()
+            onEmojiClick={(emoji, _e) => {
               handleOpenChange(false, 'drawer')
               onEmojiClick?.(emoji)
             }}
@@ -52,12 +51,12 @@ export default function EmojiPickerDialog({
     >
       <DropdownMenuTrigger
         asChild
-        onPointerDown={(e) => {
+        onPointerDown={(_e) => {
           // Force-open for reliability while still letting Radix manage focus.
           pointerToggledRef.current = true
           handleOpenChange(!open, 'dropdown')
         }}
-        onClick={(e) => {
+        onClick={(_e) => {
           // Avoid double toggling; Radix handles it but we keep state in sync.
           if (pointerToggledRef.current) {
             pointerToggledRef.current = false
@@ -70,8 +69,7 @@ export default function EmojiPickerDialog({
       </DropdownMenuTrigger>
       <DropdownMenuContent side="top" className="p-0 w-fit">
         <EmojiPicker
-          onEmojiClick={(emoji, e) => {
-            e.stopPropagation()
+          onEmojiClick={(emoji, _e) => {
             handleOpenChange(false, 'dropdown')
             onEmojiClick?.(emoji)
           }}

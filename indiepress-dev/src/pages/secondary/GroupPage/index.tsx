@@ -26,6 +26,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import UserAvatar from '@/components/UserAvatar'
 import Username from '@/components/Username'
 import NormalFeed from '@/components/NormalFeed'
+import NoteList from '@/components/NoteList'
 import { BIG_RELAY_URLS } from '@/constants'
 import { parseGroupIdentifier } from '@/lib/groups'
 import client from '@/services/client.service'
@@ -373,7 +374,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const { pubkey, profile: nostrProfile } = useNostr()
   const { joinFlows, startJoinFlow, relays, sendToWorker } = useWorkerBridge()
   const [isLoading, setIsLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState<'notes' | 'members' | 'requests'>('notes')
+  const [activeTab, setActiveTab] = useState<'notes' | 'files' | 'members' | 'requests'>('notes')
   const [error, setError] = useState<string | null>(null)
   const [groupRelay, setGroupRelay] = useState<string | undefined>(relay)
   const [groupId, setGroupId] = useState<string | undefined>(id)
@@ -694,8 +695,29 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                     // Hypertuna/NIP-29 flows
                     9000, 9001, 9002, 9005, 9007, 9008, 9009, 9021, 9022,
                     // Timeline kinds (retain existing set)
-                    1, 6, 20, 21, 22, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089
+                    1, 6, 20, 21, 22, 1063, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089
                   ]
+                }
+              }
+            ]
+        : [],
+    [groupId, activeGroupRelay, shouldGateGroupSubRequests, joinRelayRefreshNonce]
+  )
+
+  const groupFileSubRequests = useMemo(
+    () =>
+      groupId
+        ? shouldGateGroupSubRequests
+          ? []
+          : [
+              {
+                source: 'relays' as const,
+                urls: activeGroupRelay
+                  ? [activeGroupRelay]
+                  : BIG_RELAY_URLS,
+                filter: {
+                  '#h': [groupId],
+                  kinds: [1063]
                 }
               }
             ]
@@ -712,7 +734,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     client
       .loadMoreTimeline(groupSubRequests, {
         '#h': [groupId],
-        kinds: [9000, 9001, 1, 6, 20, 21, 22, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089],
+        kinds: [9000, 9001, 1, 6, 20, 21, 22, 1063, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089],
         limit: 1
       })
       .then((_events) => {
@@ -1486,7 +1508,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
 
           <Tabs
             value={activeTab}
-            onValueChange={(v) => setActiveTab(v as 'notes' | 'members')}
+            onValueChange={(v) => setActiveTab(v as 'notes' | 'files' | 'members' | 'requests')}
             className="w-full"
           >
             <div className="border-b border-t">
@@ -1503,6 +1525,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                 >
                   {t('Members')}
                   {effectiveDetail.members ? ` (${effectiveDetail.members.length})` : ''}
+                </TabsTrigger>
+                <TabsTrigger
+                  value="files"
+                  className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-4 py-3"
+                >
+                  {t('Files')}
                 </TabsTrigger>
                 {isAdmin && (
                   <TabsTrigger
@@ -1521,6 +1549,16 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                 isMainFeed={false}
                 debugActiveTab={activeTab}
                 debugLabel={groupId ? `GroupPage:${groupId}` : 'GroupPage:unknown'}
+              />
+            </TabsContent>
+            <TabsContent value="files" className="mt-0">
+              <NoteList
+                subRequests={groupFileSubRequests}
+                showKinds={[1063]}
+                hideReplies
+                showRelayCloseReason={false}
+                debugActiveTab={activeTab}
+                debugLabel={groupId ? `GroupPage:files:${groupId}` : 'GroupPage:files:unknown'}
               />
             </TabsContent>
             <TabsContent value="members" className="mt-0">

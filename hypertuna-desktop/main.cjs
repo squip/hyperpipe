@@ -6,6 +6,7 @@ const { spawn } = require('child_process');
 let mainWindow = null;
 let workerProcess = null;
 let pendingWorkerMessages = [];
+let pendingWorkerRequests = new Map();
 let gatewayStatusCache = null;
 let gatewayLogsCache = [];
 let publicGatewayConfigCache = null;
@@ -233,6 +234,7 @@ async function startWorkerProcess(workerConfig = null) {
     gatewayLogsCache = [];
 
     workerProcess.on('message', (message) => {
+      resolveWorkerRequest(message);
       if (message && typeof message === 'object') {
         if (message.type === 'gateway-status') {
           gatewayStatusCache = message.status || null;
@@ -263,6 +265,7 @@ async function startWorkerProcess(workerConfig = null) {
 
     workerProcess.on('error', (error) => {
       console.error('[Main] Worker error', error);
+      rejectPendingWorkerRequests(error?.message || 'Worker process error');
       if (mainWindow) {
         mainWindow.webContents.send('worker-error', error.message);
       }
@@ -270,6 +273,7 @@ async function startWorkerProcess(workerConfig = null) {
 
     workerProcess.on('exit', (code, signal) => {
       console.log(`[Main] Worker exited with code=${code} signal=${signal}`);
+      rejectPendingWorkerRequests(`Worker exited with code=${code ?? 'unknown'}`);
       workerProcess = null;
       pendingWorkerMessages = [];
       gatewayStatusCache = null;
@@ -333,6 +337,7 @@ async function stopWorkerProcess() {
   try {
     workerProcess.removeAllListeners();
     workerProcess.kill();
+    rejectPendingWorkerRequests('Worker stopped');
     workerProcess = null;
     pendingWorkerMessages = [];
     currentWorkerUserKey = null;
@@ -344,6 +349,33 @@ async function stopWorkerProcess() {
   } catch (error) {
     console.error('[Main] Failed to stop worker', error);
     return { success: false, error: error.message };
+  }
+}
+
+function resolveWorkerRequest(message) {
+  if (!message || typeof message !== 'object') return false;
+  if (message.type !== 'worker-response') return false;
+  const requestId = typeof message.requestId === 'string' ? message.requestId : null;
+  if (!requestId) return false;
+  const pending = pendingWorkerRequests.get(requestId);
+  if (!pending) return false;
+  pendingWorkerRequests.delete(requestId);
+  clearTimeout(pending.timeoutId);
+  pending.resolve({
+    success: message.success !== false,
+    data: message.data ?? null,
+    error: message.error || null,
+    requestId
+  });
+  return true;
+}
+
+function rejectPendingWorkerRequests(reason = 'Worker unavailable') {
+  const entries = Array.from(pendingWorkerRequests.values());
+  pendingWorkerRequests.clear();
+  for (const pending of entries) {
+    clearTimeout(pending.timeoutId);
+    pending.resolve({ success: false, error: reason });
   }
 }
 
@@ -381,6 +413,53 @@ ipcMain.handle('send-to-worker', async (_event, message) => {
     console.error('[Main] Failed to send message to worker', error);
     return { success: false, error: error.message };
   }
+});
+
+ipcMain.handle('send-to-worker-await', async (_event, payload) => {
+  if (!workerProcess) {
+    return { success: false, error: 'Worker not running' };
+  }
+
+  const baseMessage =
+    payload && typeof payload === 'object' && payload.message && typeof payload.message === 'object'
+      ? payload.message
+      : payload;
+  if (!baseMessage || typeof baseMessage !== 'object') {
+    return { success: false, error: 'Invalid worker message payload' };
+  }
+
+  const timeoutMsRaw =
+    payload && typeof payload === 'object' && Number.isFinite(payload.timeoutMs)
+      ? Number(payload.timeoutMs)
+      : 30000;
+  const timeoutMs = Math.max(1000, Math.min(timeoutMsRaw, 300000));
+  const requestId =
+    typeof baseMessage.requestId === 'string' && baseMessage.requestId
+      ? baseMessage.requestId
+      : `worker-req-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+  const messageToSend = { ...baseMessage, requestId };
+
+  if (pendingWorkerRequests.has(requestId)) {
+    return { success: false, error: `Duplicate worker requestId: ${requestId}` };
+  }
+
+  return await new Promise((resolve) => {
+    const timeoutId = setTimeout(() => {
+      if (!pendingWorkerRequests.has(requestId)) return;
+      pendingWorkerRequests.delete(requestId);
+      resolve({ success: false, error: `Worker reply timeout after ${timeoutMs}ms`, requestId });
+    }, timeoutMs);
+
+    pendingWorkerRequests.set(requestId, { resolve, timeoutId });
+
+    try {
+      workerProcess.send(messageToSend);
+    } catch (error) {
+      clearTimeout(timeoutId);
+      pendingWorkerRequests.delete(requestId);
+      resolve({ success: false, error: error.message, requestId });
+    }
+  });
 });
 
 ipcMain.handle('gateway-start', async (_event, options) => {

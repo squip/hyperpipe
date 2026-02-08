@@ -70,7 +70,7 @@ const formatAggregateError = (error: any) => {
   const errors = Array.isArray(error.errors) ? error.errors : []
   if (!errors.length) return null
   return errors
-    .map((err) => (err instanceof Error ? err.message : String(err)))
+    .map((err: unknown) => (err instanceof Error ? err.message : String(err)))
     .filter(Boolean)
     .join('; ')
 }
@@ -790,7 +790,7 @@ export default function ClosedJoinE2EBridge(): null {
 
           const joined = await waitForJoinSuccess(groupId, joinTimeoutMs)
           const writable = await waitForWritable(groupId, joinTimeoutMs)
-          const joinRelayUrl = writable.relayUrl || joined.relayUrl || inviteRelayUrl || relayUrl
+          const joinRelayUrl = writable?.relayUrl || joined?.relayUrl || inviteRelayUrl || relayUrl
           if (!joinRelayUrl) {
             throw new Error('Join flow did not provide relayUrl')
           }

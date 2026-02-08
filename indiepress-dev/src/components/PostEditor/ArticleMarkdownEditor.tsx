@@ -83,6 +83,7 @@ import { Decoration, DecorationSet } from '@tiptap/pm/view'
 import { Plugin } from '@tiptap/pm/state'
 import { DOMParser as PMDOMParser } from '@tiptap/pm/model'
 import { useNostr } from '@/providers/NostrProvider'
+import { MediaUploadContext, MediaUploadResult } from '@/services/media-upload.service'
 
 type ArticleMarkdownEditorProps = {
   value: string
@@ -98,7 +99,9 @@ type ArticleMarkdownEditorProps = {
   onUploadStart?: (file: File, cancel: () => void) => void
   onUploadEnd?: (file: File) => void
   onUploadProgress?: (file: File, progress: number) => void
-  onUploadSuccess?: ({ url, tags }: { url: string; tags: string[][] }) => void
+  onUploadSuccess?: (result: MediaUploadResult, file?: File) => void
+  onUploadError?: (file: File, error: Error) => void
+  uploadContext?: MediaUploadContext
   onSaveDraft?: () => void
   shouldInsertTemplate?: boolean
   renderToolbar?: (toolbar: React.ReactNode) => void
@@ -145,6 +148,8 @@ export default function ArticleMarkdownEditor({
   onUploadEnd,
   onUploadProgress,
   onUploadSuccess,
+  onUploadError,
+  uploadContext,
   onSaveDraft,
   shouldInsertTemplate,
   renderToolbar,
@@ -456,8 +461,19 @@ export default function ArticleMarkdownEditor({
     []
   )
   const coverPlaceholderExtension = useMemo(
-    () => createCoverPlaceholderNode(metadataControlsRef),
-    []
+    () =>
+      createCoverPlaceholderNode(
+        metadataControlsRef,
+        () => uploadContext,
+        () => ({
+          onUploadStart,
+          onUploadEnd,
+          onUploadProgress,
+          onUploadSuccess,
+          onUploadError
+        })
+      ),
+    [uploadContext, onUploadStart, onUploadEnd, onUploadProgress, onUploadSuccess, onUploadError]
   )
   const metadataProtectionExtension = useMemo(
     () =>
@@ -811,14 +827,16 @@ export default function ArticleMarkdownEditor({
         onUploadSuccess: (file, result) => {
           const handled = insertUploadedMedia(editor, file.type, result.url)
           if (handled) {
-            onUploadSuccess?.(result)
+            onUploadSuccess?.(result, file)
             debugLog('upload:inserted', {
               url: result.url,
               type: detectMediaType(result.url, file.type)
             })
           }
           return handled
-        }
+        },
+        onUploadError: (file, error) => onUploadError?.(file, error),
+        uploadContext
       }),
       Placeholder.configure({
         placeholder: ({ node, pos, editor }) => {
@@ -1377,24 +1395,26 @@ export default function ArticleMarkdownEditor({
           shouldIgnoreTap={() => skipToolbarTapRef.current}
         />
         <Uploader
+          uploadContext={uploadContext}
           onUploadStart={onUploadStart}
           onUploadEnd={onUploadEnd}
           onProgress={onUploadProgress}
-          onUploadSuccess={({ url, tags }) => {
-            onUploadSuccess?.({ url, tags })
-            const type = detectMediaType(url)
+          onUploadError={onUploadError}
+          onUploadSuccess={(result, file) => {
+            onUploadSuccess?.(result, file)
+            const type = detectMediaType(result.url)
             if (type === 'image') {
-              editor.chain().focus().setImage({ src: url, alt: '' }).run()
+              editor.chain().focus().setImage({ src: result.url, alt: '' }).run()
             } else if (type === 'video') {
               editor
                 .chain()
                 .focus()
-                .insertContent({ type: 'mediaEmbed', attrs: { src: url, mediaType: 'video' } })
+                .insertContent({ type: 'mediaEmbed', attrs: { src: result.url, mediaType: 'video' } })
                 .run()
             } else {
-              editor.chain().focus().insertContent(url).run()
+              editor.chain().focus().insertContent(result.url).run()
             }
-            debugLog('toolbar:upload-insert', { url, type })
+            debugLog('toolbar:upload-insert', { url: result.url, type })
           }}
           accept="image/*,video/*,audio/*"
           onPickerOpen={() => {
@@ -2127,7 +2147,17 @@ function createMetadataBlockquoteExtension(
   })
 }
 
-function createCoverPlaceholderNode(controlsRef: React.MutableRefObject<MetadataControls>) {
+function createCoverPlaceholderNode(
+  controlsRef: React.MutableRefObject<MetadataControls>,
+  getUploadContext?: () => MediaUploadContext | undefined,
+  getUploadHandlers?: () => {
+    onUploadStart?: (file: File, cancel: () => void) => void
+    onUploadEnd?: (file: File) => void
+    onUploadProgress?: (file: File, progress: number) => void
+    onUploadSuccess?: (result: MediaUploadResult, file?: File) => void
+    onUploadError?: (file: File, error: Error) => void
+  }
+) {
   return Node.create({
     name: 'coverPlaceholder',
     group: 'block',
@@ -2151,7 +2181,12 @@ function createCoverPlaceholderNode(controlsRef: React.MutableRefObject<Metadata
     },
     addNodeView() {
       return ReactNodeViewRenderer((props) => (
-        <CoverPlaceholderView {...props} controlsRef={controlsRef} />
+        <CoverPlaceholderView
+          {...props}
+          controlsRef={controlsRef}
+          uploadContext={getUploadContext?.()}
+          uploadHandlers={getUploadHandlers?.()}
+        />
       ))
     },
     addStorage() {
@@ -3036,7 +3071,16 @@ function MetadataSummaryView(props: any) {
 }
 
 function CoverPlaceholderView(props: any) {
-  const { node, updateAttributes, deleteNode, editor, getPos, controlsRef } = props
+  const {
+    node,
+    updateAttributes,
+    deleteNode,
+    editor,
+    getPos,
+    controlsRef,
+    uploadContext,
+    uploadHandlers
+  } = props
   useMetadataRerender(editor)
   const src = node?.attrs?.src as string | null
   const mode = controlsRef?.current?.getMode?.() ?? 'hidden'
@@ -3114,15 +3158,31 @@ function CoverPlaceholderView(props: any) {
         </button>
       )}
       <Uploader
-        onUploadSuccess={({ url }) => {
-          updateAttributes({ src: url, isTemplate: false, metadata: true })
+        uploadContext={uploadContext}
+        onUploadSuccess={(result, file) => {
+          updateAttributes({ src: result.url, isTemplate: false, metadata: true })
+          uploadHandlers?.onUploadSuccess?.(result, file)
+          props?.extensionStorage?.onUploadSuccess?.(result, file)
           if (typeof getPos === 'function') {
             editor?.commands.setNodeSelection(getPos())
           }
         }}
-        onUploadStart={(file, cancel) => props?.extensionStorage?.onUploadStart?.(file, cancel)}
-        onUploadEnd={(file) => props?.extensionStorage?.onUploadEnd?.(file)}
-        onProgress={(file, p) => props?.extensionStorage?.onUploadProgress?.(file, p)}
+        onUploadError={(file, error) => {
+          uploadHandlers?.onUploadError?.(file, error)
+          props?.extensionStorage?.onUploadError?.(file, error)
+        }}
+        onUploadStart={(file, cancel) => {
+          uploadHandlers?.onUploadStart?.(file, cancel)
+          props?.extensionStorage?.onUploadStart?.(file, cancel)
+        }}
+        onUploadEnd={(file) => {
+          uploadHandlers?.onUploadEnd?.(file)
+          props?.extensionStorage?.onUploadEnd?.(file)
+        }}
+        onProgress={(file, p) => {
+          uploadHandlers?.onUploadProgress?.(file, p)
+          props?.extensionStorage?.onUploadProgress?.(file, p)
+        }}
       >
         <button
           type="button"

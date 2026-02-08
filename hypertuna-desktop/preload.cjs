@@ -31,6 +31,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   startWorker: (config) => ipcRenderer.invoke('start-worker', config),
   stopWorker: () => ipcRenderer.invoke('stop-worker'),
   sendToWorker: (message) => ipcRenderer.invoke('send-to-worker', message),
+  sendToWorkerAwait: (payload) => ipcRenderer.invoke('send-to-worker-await', payload),
   onWorkerMessage: registerListener('worker-message'),
   onWorkerError: registerListener('worker-error'),
   onWorkerExit: registerListener('worker-exit'),
