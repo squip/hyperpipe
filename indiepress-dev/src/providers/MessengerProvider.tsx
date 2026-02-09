@@ -100,6 +100,28 @@ const inviteDismissedStorageKey = (pubkey: string | null | undefined) => `marmot
 const inviteAcceptedStorageKey = (pubkey: string | null | undefined) => `marmotInviteAccepted:${pubkey || 'anon'}`
 const inviteAcceptedConversationStorageKey = (pubkey: string | null | undefined) => `marmotInviteAcceptedConversation:${pubkey || 'anon'}`
 
+function normalizeRelayUrl(relay: string): string | null {
+  if (typeof relay !== 'string') return null
+  const trimmed = relay.trim()
+  if (!trimmed) return null
+
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') return null
+
+    const pathname = parsed.pathname.replace(/\/+/g, '/')
+    parsed.pathname = pathname.endsWith('/') && pathname !== '/' ? pathname.slice(0, -1) : pathname
+    if ((parsed.protocol === 'ws:' && parsed.port === '80') || (parsed.protocol === 'wss:' && parsed.port === '443')) {
+      parsed.port = ''
+    }
+    parsed.searchParams.sort()
+    parsed.hash = ''
+    return parsed.toString()
+  } catch {
+    return null
+  }
+}
+
 function normalizeRelayUrls(relayList: { read: string[]; write: string[] } | null, discoveryRelay?: string) {
   const relays = [
     ...(relayList?.read || []),
@@ -109,17 +131,10 @@ function normalizeRelayUrls(relayList: { read: string[]; write: string[] } | nul
   const seen = new Set<string>()
   const normalized: string[] = []
   for (const relay of relays) {
-    if (!relay || typeof relay !== 'string') continue
-    try {
-      const parsed = new URL(relay)
-      if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') continue
-      const candidate = `wss://${parsed.host}${parsed.pathname === '/' ? '' : parsed.pathname}`
-      if (seen.has(candidate)) continue
-      seen.add(candidate)
-      normalized.push(candidate)
-    } catch {
-      continue
-    }
+    const candidate = normalizeRelayUrl(relay)
+    if (!candidate || seen.has(candidate)) continue
+    seen.add(candidate)
+    normalized.push(candidate)
   }
   return normalized
 }
@@ -168,6 +183,7 @@ function parseInvites(payload: any): ConversationInvite[] {
       protocol: 'marmot' as const,
       senderPubkey: typeof row.senderPubkey === 'string' ? row.senderPubkey : '',
       createdAt: Number.isFinite(row.createdAt) ? Number(row.createdAt) : 0,
+      receivedAt: Number.isFinite(row.receivedAt) ? Number(row.receivedAt) : 0,
       status: ['pending', 'joining', 'joined', 'failed'].includes(row.status)
         ? row.status
         : 'pending',
@@ -586,7 +602,13 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
         title: input.title,
         description: input.description,
         members: input.members,
-        imageUrl: input.imageUrl || null
+        imageUrl: input.imageUrl || null,
+        relayUrls: Array.isArray(input.relayUrls)
+          ? input.relayUrls
+              .map((relay) => normalizeRelayUrl(relay))
+              .filter((relay): relay is string => Boolean(relay))
+          : undefined,
+        relayMode: input.relayMode === 'strict' ? 'strict' : 'withFallback'
       }
     })
 

@@ -34,7 +34,7 @@ import {
 } from 'lucide-react'
 import PostTextarea, { TPostTextareaHandle } from '@/components/PostEditor/PostTextarea'
 
-const debug = (...args: any[]) => console.debug('[DMThread]', ...args)
+const debug = (...args: any[]) => console.debug('[ChatThread]', ...args)
 
 const HYPERDRIVE_UPLOAD_RELAY_URL = 'http://127.0.0.1:8443'
 
@@ -83,7 +83,7 @@ function toAttachmentFromUpload(result: MediaUploadResult, ownerPubkey: string |
   } satisfies MessageAttachment
 }
 
-export function DMThread({
+export function ChatThread({
   conversationId,
   myPubkey,
   useDocumentScroll = false
@@ -261,19 +261,8 @@ export function DMThread({
   type ScrollContext = { el: HTMLElement | null; useDocument: boolean }
 
   const getScrollContext = (): ScrollContext => {
-    if (useDocumentScroll && typeof document !== 'undefined') {
-      return {
-        el: (document.scrollingElement as HTMLElement | null) || document.documentElement,
-        useDocument: true
-      }
-    }
-
-    const list = listRef.current
-    const viewport = list?.closest('[data-radix-scroll-area-viewport]') as HTMLElement | null
-    const candidate = (viewport || list || null) as HTMLElement | null
-
-    if (candidate && candidate.scrollHeight > candidate.clientHeight + 4) {
-      return { el: candidate, useDocument: false }
+    if (!useDocumentScroll) {
+      return { el: listRef.current, useDocument: false }
     }
 
     if (typeof document !== 'undefined') {
@@ -309,14 +298,20 @@ export function DMThread({
     const { el: list, useDocument } = getScrollContext()
     if (!list) return false
 
-    const top = list.scrollHeight
     if (useDocument) {
+      const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0
+      if (list.scrollHeight <= viewportHeight + 4) return false
+      const top = list.scrollHeight
       window.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
-    } else if ((list as any).scrollTo) {
-      ;(list as any).scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
-      list.scrollTop = list.scrollHeight
     } else {
-      window.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
+      if (list.scrollHeight <= list.clientHeight + 4) return false
+      const top = list.scrollHeight
+      if ((list as any).scrollTo) {
+        ;(list as any).scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
+        list.scrollTop = list.scrollHeight
+      } else {
+        window.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
+      }
     }
 
     const last = localMessages.at(-1)
@@ -370,6 +365,25 @@ export function DMThread({
         : localMessages.at(-1)
 
     if (!targetMessage) return
+
+    const { el: anchorContextEl, useDocument: useDocumentContext } = getScrollContext()
+    let canScroll = false
+    if (anchorContextEl) {
+      canScroll = useDocumentContext
+        ? anchorContextEl.scrollHeight > ((window.innerHeight || anchorContextEl.clientHeight || 0) + 4)
+        : anchorContextEl.scrollHeight > (anchorContextEl.clientHeight + 4)
+    }
+
+    if (!canScroll && unreadCount <= CONVERSATION_JUMP_FAB_THRESHOLD) {
+      if (unreadCount > 0) {
+        const last = localMessages.at(-1)
+        if (last) {
+          void markConversationReadIfNeeded(last)
+        }
+      }
+      setAnchored(true)
+      return
+    }
 
     const scrolled =
       unreadCount > CONVERSATION_JUMP_FAB_THRESHOLD
@@ -555,16 +569,24 @@ export function DMThread({
   }
 
   if (!ready || !messenger) {
-    return <div className="p-4 text-sm text-muted-foreground">Loading conversation…</div>
+    return <div className="p-4 text-sm text-muted-foreground">Loading chat…</div>
   }
 
   if (!conversation) {
-    return <div className="p-4 text-sm text-muted-foreground">Conversation not found.</div>
+    return <div className="p-4 text-sm text-muted-foreground">Chat not found.</div>
   }
 
   return (
-    <div className="flex flex-col h-full min-h-screen gap-3">
-      <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto space-y-3 px-3 py-2 relative">
+    <div
+      className={cn(
+        'flex min-h-0 flex-col gap-3 overflow-hidden',
+        useDocumentScroll ? '' : 'h-[calc(var(--vh)-3rem)] max-h-full'
+      )}
+    >
+      <div
+        ref={listRef}
+        className="relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden space-y-3 px-3 py-2"
+      >
         {localMessages.map((message, index) => (
           <React.Fragment key={message.id}>
             {firstUnreadIdx === index && unreadCount > 0 && (
@@ -1011,7 +1033,7 @@ function ChatComposer({
   }
 
   return (
-    <div className="sticky bottom-0 left-0 right-0 bg-background border-t px-3 py-3 space-y-2">
+    <div className="bg-background border-t px-3 py-3 space-y-2">
       {replyTarget && (
         <div className="flex items-center justify-between text-xs text-muted-foreground px-2">
           <span>

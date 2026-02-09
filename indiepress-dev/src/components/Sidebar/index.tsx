@@ -9,7 +9,7 @@ import AccountButton from './AccountButton'
 import BookmarkButton from './BookmarkButton'
 import RelaysButton from './ExploreButton'
 import HomeButton from './HomeButton'
-import ConversationsButton from './ConversationsButton'
+import ChatButton from './ChatButton'
 import NotificationsButton from './NotificationButton'
 import PostButton from './PostButton'
 import ListsButton from './ListsButton'
@@ -44,7 +44,7 @@ export default function PrimaryPageSidebar() {
           </div>
         )}
         <HomeButton collapse={sidebarCollapse} />
-        <ConversationsButton collapse={sidebarCollapse} />
+        <ChatButton collapse={sidebarCollapse} />
         <NotificationsButton collapse={sidebarCollapse} />
         <ReadsButton collapse={sidebarCollapse} />
         <GroupsButton collapse={sidebarCollapse} />

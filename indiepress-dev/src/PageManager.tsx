@@ -2,7 +2,7 @@ import Sidebar from '@/components/Sidebar'
 import { cn } from '@/lib/utils'
 import NoteListPage from '@/pages/primary/NoteListPage'
 import HomePage from '@/pages/secondary/HomePage'
-import ConversationListPage from '@/pages/primary/ConversationListPage'
+import ChatListPage from '@/pages/primary/ChatListPage'
 import { CurrentRelaysProvider } from '@/providers/CurrentRelaysProvider'
 import { TPageRef } from '@/types'
 import {
@@ -82,7 +82,7 @@ const PRIMARY_PAGE_REF_MAP = {
 
 const PRIMARY_PAGE_MAP = {
   home: <NoteListPage ref={PRIMARY_PAGE_REF_MAP.home} />,
-  conversations: <ConversationListPage ref={PRIMARY_PAGE_REF_MAP.conversations} />,
+  conversations: <ChatListPage ref={PRIMARY_PAGE_REF_MAP.conversations} />,
   explore: <ExplorePage ref={PRIMARY_PAGE_REF_MAP.explore} />,
   groups: <GroupsPage ref={PRIMARY_PAGE_REF_MAP.groups} />,
   files: <FilesPage ref={PRIMARY_PAGE_REF_MAP.files} />,

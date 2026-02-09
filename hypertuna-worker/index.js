@@ -3388,6 +3388,8 @@ function summarizeMarmotCommandPayload(type, payload = {}) {
   const summary = {}
 
   if (Array.isArray(data.relays)) summary.relayCount = data.relays.length
+  if (Array.isArray(data.relayUrls)) summary.relayUrlCount = data.relayUrls.length
+  if (typeof data.relayMode === 'string') summary.relayMode = data.relayMode
   if (typeof data.search === 'string') summary.searchLength = data.search.length
   if (typeof data.conversationId === 'string') summary.conversationId = previewValue(data.conversationId, 20)
   if (typeof data.inviteId === 'string' || typeof data.id === 'string') {

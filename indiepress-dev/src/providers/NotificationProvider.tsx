@@ -96,7 +96,10 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       const inviteId = invite.id
       if (!inviteId || seenConversationInviteIds.has(inviteId)) continue
       seenConversationInviteIds.add(inviteId)
-      if (invite.createdAt > notificationsSeenAt) {
+      const createdAt = Number.isFinite(invite.createdAt) ? Number(invite.createdAt) : 0
+      const receivedAt = Number.isFinite(invite.receivedAt) ? Number(invite.receivedAt) : 0
+      const effectiveTimestamp = Math.max(createdAt, receivedAt)
+      if (effectiveTimestamp > notificationsSeenAt) {
         count += 1
       }
     }

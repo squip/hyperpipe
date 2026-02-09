@@ -3,7 +3,7 @@ import BackgroundAudio from '../BackgroundAudio'
 import AccountButton from './AccountButton'
 import ExploreButton from './ExploreButton'
 import HomeButton from './HomeButton'
-import ConversationsButton from './ConversationsButton'
+import ChatButton from './ChatButton'
 import NotificationsButton from './NotificationsButton'
 
 export default function BottomNavigationBar() {
@@ -17,7 +17,7 @@ export default function BottomNavigationBar() {
       <BackgroundAudio className="rounded-none border-x-0 border-t-0 border-b bg-background" />
       <div className="w-full flex justify-around items-center [&_svg]:size-4 [&_svg]:shrink-0">
         <HomeButton />
-        <ConversationsButton />
+        <ChatButton />
         <NotificationsButton />
         <ExploreButton />
         <AccountButton />

@@ -1,7 +1,7 @@
 import { useMessenger } from '@/providers/MessengerProvider'
 import { useMemo } from 'react'
 
-export function useConversationBadge() {
+export function useChatBadge() {
   const { conversations } = useMessenger()
   const unreadCount = useMemo(
     () => conversations.reduce((sum, conversation) => sum + Math.max(0, conversation.unreadCount || 0), 0),

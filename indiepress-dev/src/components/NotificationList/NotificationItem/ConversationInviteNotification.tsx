@@ -34,11 +34,11 @@ export function ConversationInviteNotification({
   const title =
     invite?.title ||
     parsed.title ||
-    t('Conversation')
+    t('Chat')
   const description =
     invite?.description ||
     parsed.description ||
-    t('Encrypted conversation invite')
+    t('Encrypted chat invite')
   const imageUrl = invite?.imageUrl || parsed.imageUrl || null
   const inviteMemberCount = Array.isArray(invite?.memberPubkeys) ? invite.memberPubkeys.length : 0
   const parsedMemberCount = Array.isArray(parsed.memberPubkeys) ? parsed.memberPubkeys.length : 0
@@ -64,7 +64,7 @@ export function ConversationInviteNotification({
       icon={<MessageSquare size={24} className="shrink-0 text-emerald-500" />}
       sender={parsed.senderPubkey}
       sentAt={parsed.createdAt}
-      description={t('invited you to a conversation')}
+      description={t('invited you to a chat')}
       isNew={isNew}
       showBottomTimestamp={false}
       onClick={handleClick}

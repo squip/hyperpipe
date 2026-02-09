@@ -61,6 +61,7 @@ export type ConversationInvite = {
   protocol: 'marmot'
   senderPubkey: string
   createdAt: number
+  receivedAt?: number
   status: InviteStatus
   error?: string | null
   keyPackageEventId?: string | null
@@ -105,6 +106,8 @@ export type CreateConversationInput = {
   description?: string
   members: string[]
   imageUrl?: string | null
+  relayUrls?: string[]
+  relayMode?: 'withFallback' | 'strict'
 }
 
 export type UpdateConversationMetadataInput = {

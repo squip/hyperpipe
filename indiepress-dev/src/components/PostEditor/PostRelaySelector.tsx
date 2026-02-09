@@ -9,7 +9,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Separator } from '@/components/ui/separator'
 import { isProtectedEvent } from '@/lib/event'
-import { simplifyUrl } from '@/lib/url'
+import { isWebsocketUrl, normalizeUrl, simplifyUrl } from '@/lib/url'
 import { useCurrentRelays } from '@/providers/CurrentRelaysProvider'
 import { useFavoriteRelays } from '@/providers/FavoriteRelaysProvider'
 import { useScreenSize } from '@/providers/ScreenSizeProvider'
@@ -19,6 +19,7 @@ import { NostrEvent } from '@nostr/tools/wasm'
 import { Dispatch, SetStateAction, useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import RelayIcon from '../RelayIcon'
+import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 
 type TPostTargetItem =
   | {
@@ -34,32 +35,114 @@ type TPostTargetItem =
       urls: string[]
     }
 
+export type RelayDisplayMeta = {
+  label?: string | null
+  imageUrl?: string | null
+  subtitle?: string | null
+  hideUrl?: boolean
+}
+
+function serializePostTargetItem(item: TPostTargetItem): string {
+  if (item.type === 'writeRelays') return 'writeRelays'
+  if (item.type === 'relay') return `relay:${item.url}`
+  return `relaySet:${item.id}:${dedupeRelayUrls(item.urls).join(',')}`
+}
+
+function signaturesMatch(a: TPostTargetItem[], b: TPostTargetItem[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i += 1) {
+    if (serializePostTargetItem(a[i]) !== serializePostTargetItem(b[i])) {
+      return false
+    }
+  }
+  return true
+}
+
+function buildRelayTargetItems(relays: string[]): TPostTargetItem[] {
+  return dedupeRelayUrls(relays).map((url) => ({ type: 'relay' as const, url }))
+}
+
+function toCanonicalRelayUrl(url: string): string | null {
+  if (typeof url !== 'string') return null
+  const normalized = normalizeUrl(url)
+  if (!normalized || !isWebsocketUrl(normalized)) return null
+  return normalized
+}
+
+function dedupeRelayUrls(relays: string[]): string[] {
+  const seen = new Set<string>()
+  const deduped: string[] = []
+  for (const relay of relays) {
+    const canonical = toCanonicalRelayUrl(relay)
+    if (!canonical || seen.has(canonical)) continue
+    seen.add(canonical)
+    deduped.push(canonical)
+  }
+  return deduped
+}
+
 export default function PostRelaySelector({
   parentEvent,
   openFrom,
   setIsProtectedEvent,
-  setAdditionalRelayUrls
+  setAdditionalRelayUrls,
+  allowWriteRelays = true,
+  allowRelaySets = true,
+  extraRelayUrls = [],
+  relayDisplayMeta = {},
+  valueRelayUrls,
+  onValueRelayUrlsChange
 }: {
   parentEvent?: NostrEvent
   openFrom?: string[]
-  setIsProtectedEvent: Dispatch<SetStateAction<boolean>>
-  setAdditionalRelayUrls: Dispatch<SetStateAction<string[]>>
+  setIsProtectedEvent?: Dispatch<SetStateAction<boolean>>
+  setAdditionalRelayUrls?: Dispatch<SetStateAction<string[]>>
+  allowWriteRelays?: boolean
+  allowRelaySets?: boolean
+  extraRelayUrls?: string[]
+  relayDisplayMeta?: Record<string, RelayDisplayMeta>
+  valueRelayUrls?: string[]
+  onValueRelayUrlsChange?: (relayUrls: string[]) => void
 }) {
   const { t } = useTranslation()
   const { isSmallScreen } = useScreenSize()
   const [isDrawerOpen, setIsDrawerOpen] = useState(false)
   const { relayUrls } = useCurrentRelays()
   const { relaySets, urls } = useFavoriteRelays()
-  const [postTargetItems, setPostTargetItems] = useState<TPostTargetItem[]>([])
+  const [postTargetItems, setPostTargetItems] = useState<TPostTargetItem[]>(() => {
+    const initialFromValue = dedupeRelayUrls(valueRelayUrls || [])
+    if (initialFromValue.length) {
+      return buildRelayTargetItems(initialFromValue)
+    }
+    const initialFromOpenFrom = dedupeRelayUrls(openFrom || [])
+    if (initialFromOpenFrom.length) {
+      return buildRelayTargetItems(initialFromOpenFrom)
+    }
+    return allowWriteRelays ? [{ type: 'writeRelays' }] : []
+  })
   const parentEventSeenOnRelays = useMemo(() => {
     if (!parentEvent || !isProtectedEvent(parentEvent)) {
       return []
     }
-    return client.getSeenEventRelayUrls(parentEvent.id, parentEvent)
+    return dedupeRelayUrls(client.getSeenEventRelayUrls(parentEvent.id, parentEvent))
   }, [parentEvent])
   const selectableRelays = useMemo(() => {
-    return Array.from(new Set(parentEventSeenOnRelays.concat(relayUrls).concat(urls)))
-  }, [parentEventSeenOnRelays, relayUrls, urls])
+    return dedupeRelayUrls(
+      parentEventSeenOnRelays
+        .concat(relayUrls)
+        .concat(urls)
+        .concat(Array.isArray(extraRelayUrls) ? extraRelayUrls : [])
+    )
+  }, [parentEventSeenOnRelays, relayUrls, urls, extraRelayUrls])
+  const relayDisplayByUrl = useMemo(() => {
+    const map = new Map<string, RelayDisplayMeta>()
+    Object.entries(relayDisplayMeta || {}).forEach(([url, value]) => {
+      const canonical = toCanonicalRelayUrl(url)
+      if (!canonical) return
+      map.set(canonical, value || {})
+    })
+    return map
+  }, [relayDisplayMeta])
   const description = useMemo(() => {
     if (postTargetItems.length === 0) {
       return t('No relays selected')
@@ -95,16 +178,25 @@ export default function PostRelaySelector({
   }, [postTargetItems])
 
   useEffect(() => {
+    const fromValue = dedupeRelayUrls(valueRelayUrls || [])
+    if (fromValue.length) {
+      const nextItems = buildRelayTargetItems(fromValue)
+      setPostTargetItems((previous) => (signaturesMatch(previous, nextItems) ? previous : nextItems))
+      return
+    }
     if (openFrom && openFrom.length) {
-      setPostTargetItems(Array.from(new Set(openFrom)).map((url) => ({ type: 'relay', url })))
+      const nextItems = buildRelayTargetItems(openFrom)
+      setPostTargetItems((previous) => (signaturesMatch(previous, nextItems) ? previous : nextItems))
       return
     }
     if (parentEventSeenOnRelays && parentEventSeenOnRelays.length) {
-      setPostTargetItems(parentEventSeenOnRelays.map((url) => ({ type: 'relay', url })))
+      const nextItems = buildRelayTargetItems(parentEventSeenOnRelays)
+      setPostTargetItems((previous) => (signaturesMatch(previous, nextItems) ? previous : nextItems))
       return
     }
-    setPostTargetItems([{ type: 'writeRelays' }])
-  }, [openFrom, parentEventSeenOnRelays])
+    const fallbackItems = allowWriteRelays ? [{ type: 'writeRelays' as const }] : []
+    setPostTargetItems((previous) => (signaturesMatch(previous, fallbackItems) ? previous : fallbackItems))
+  }, [allowWriteRelays, openFrom, parentEventSeenOnRelays, valueRelayUrls])
 
   useEffect(() => {
     const isProtectedEvent = postTargetItems.every((item) => item.type !== 'writeRelays')
@@ -118,9 +210,16 @@ export default function PostRelaySelector({
       return []
     })
 
-    setIsProtectedEvent(isProtectedEvent)
-    setAdditionalRelayUrls(relayUrls)
-  }, [postTargetItems])
+    setIsProtectedEvent?.(isProtectedEvent)
+    setAdditionalRelayUrls?.(relayUrls)
+    if (onValueRelayUrlsChange) {
+      const currentValueSignature = dedupeRelayUrls(valueRelayUrls || []).join('|')
+      const nextValueSignature = relayUrls.join('|')
+      if (nextValueSignature !== currentValueSignature) {
+        onValueRelayUrlsChange(relayUrls)
+      }
+    }
+  }, [onValueRelayUrlsChange, postTargetItems, setAdditionalRelayUrls, setIsProtectedEvent, valueRelayUrls])
 
   const handleWriteRelaysCheckedChange = useCallback((checked: boolean) => {
     if (checked) {
@@ -131,19 +230,23 @@ export default function PostRelaySelector({
   }, [])
 
   const handleRelayCheckedChange = useCallback((checked: boolean, url: string) => {
+    const canonical = toCanonicalRelayUrl(url)
+    if (!canonical) return
     if (checked) {
-      setPostTargetItems((prev) => [...prev, { type: 'relay', url }])
+      setPostTargetItems((prev) => [...prev, { type: 'relay', url: canonical }])
     } else {
       setPostTargetItems((prev) =>
-        prev.filter((item) => !(item.type === 'relay' && item.url === url))
+        prev.filter((item) => !(item.type === 'relay' && item.url === canonical))
       )
     }
   }, [])
 
   const handleRelaySetCheckedChange = useCallback(
     (checked: boolean, id: string, urls: string[]) => {
+      const canonicalUrls = dedupeRelayUrls(urls)
+      if (!canonicalUrls.length) return
       if (checked) {
-        setPostTargetItems((prev) => [...prev, { type: 'relaySet', id, urls }])
+        setPostTargetItems((prev) => [...prev, { type: 'relaySet', id, urls: canonicalUrls }])
       } else {
         setPostTargetItems((prev) =>
           prev.filter((item) => !(item.type === 'relaySet' && item.id === id))
@@ -154,20 +257,24 @@ export default function PostRelaySelector({
   )
 
   const content = useMemo(() => {
+    const selectableRelaySets = relaySets.filter(({ relayUrls }) => relayUrls.length)
+    const hasRelaySetSection = allowRelaySets && selectableRelaySets.length > 0
+    const hasSectionBeforeRelayList = allowWriteRelays || hasRelaySetSection
+
     return (
       <>
-        <MenuItem
-          checked={postTargetItems.some((item) => item.type === 'writeRelays')}
-          onCheckedChange={handleWriteRelaysCheckedChange}
-        >
-          {t('Write relays')}
-        </MenuItem>
-        {relaySets.length > 0 && (
+        {allowWriteRelays && (
+          <MenuItem
+            checked={postTargetItems.some((item) => item.type === 'writeRelays')}
+            onCheckedChange={handleWriteRelaysCheckedChange}
+          >
+            {t('Write relays')}
+          </MenuItem>
+        )}
+        {hasRelaySetSection && (
           <>
             <MenuSeparator />
-            {relaySets
-              .filter(({ relayUrls }) => relayUrls.length)
-              .map(({ id, name, relayUrls }) => (
+            {selectableRelaySets.map(({ id, name, relayUrls }) => (
                 <MenuItem
                   key={id}
                   checked={postTargetItems.some(
@@ -184,24 +291,28 @@ export default function PostRelaySelector({
         )}
         {selectableRelays.length > 0 && (
           <>
-            <MenuSeparator />
+            {hasSectionBeforeRelayList ? <MenuSeparator /> : null}
             {selectableRelays.map((url) => (
               <MenuItem
                 key={url}
                 checked={postTargetItems.some((item) => item.type === 'relay' && item.url === url)}
                 onCheckedChange={(checked) => handleRelayCheckedChange(checked, url)}
               >
-                <div className="flex items-center gap-2">
-                  <RelayIcon url={url} />
-                  <div className="truncate">{simplifyUrl(url)}</div>
-                </div>
+                {relayDisplayByUrl.has(url) ? (
+                  <RelayDisplayRow relayUrl={url} meta={relayDisplayByUrl.get(url) || {}} />
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <RelayIcon url={url} />
+                    <div className="truncate">{simplifyUrl(url)}</div>
+                  </div>
+                )}
               </MenuItem>
             ))}
           </>
         )}
       </>
     )
-  }, [postTargetItems, relaySets, selectableRelays])
+  }, [allowRelaySets, allowWriteRelays, postTargetItems, relayDisplayByUrl, relaySets, selectableRelays])
 
   if (isSmallScreen) {
     return (
@@ -249,6 +360,34 @@ export default function PostRelaySelector({
         {content}
       </DropdownMenuContent>
     </DropdownMenu>
+  )
+}
+
+function RelayDisplayRow({ relayUrl, meta }: { relayUrl: string; meta: RelayDisplayMeta }) {
+  const label = meta.label?.trim() || simplifyUrl(relayUrl)
+  const displayRelayUrl = simplifyUrl(relayUrl)
+  const initials = label.slice(0, 2).toUpperCase()
+
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      {meta.imageUrl ? (
+        <Avatar className="h-5 w-5 shrink-0">
+          <AvatarImage src={meta.imageUrl} alt={label} />
+          <AvatarFallback className="text-[9px] font-semibold">{initials}</AvatarFallback>
+        </Avatar>
+      ) : (
+        <RelayIcon url={relayUrl} />
+      )}
+      <div className="min-w-0">
+        <div className="truncate">{label}</div>
+        {!meta.hideUrl ? (
+          <div className="truncate text-[11px] text-muted-foreground">{displayRelayUrl}</div>
+        ) : null}
+        {meta.subtitle ? (
+          <div className="truncate text-[11px] text-muted-foreground">{meta.subtitle}</div>
+        ) : null}
+      </div>
+    </div>
   )
 }
 

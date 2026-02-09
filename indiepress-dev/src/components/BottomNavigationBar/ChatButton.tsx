@@ -1,18 +1,16 @@
 import { usePrimaryPage } from '@/PageManager'
-import { useConversationBadge } from '@/hooks'
+import { useChatBadge } from '@/hooks'
 import { MessageSquare } from 'lucide-react'
-import SidebarItem from './SidebarItem'
+import BottomNavigationBarItem from './BottomNavigationBarItem'
 
-export default function ConversationsButton({ collapse }: { collapse: boolean }) {
+export default function ChatButton() {
   const { navigate, current, display } = usePrimaryPage()
-  const { hasNewMessages, unreadCount } = useConversationBadge()
+  const { hasNewMessages, unreadCount } = useChatBadge()
 
   return (
-    <SidebarItem
-      title="Conversations"
+    <BottomNavigationBarItem
+      active={current === 'conversations' && display}
       onClick={() => navigate('conversations')}
-      active={display && current === 'conversations'}
-      collapse={collapse}
     >
       <div className="relative">
         <MessageSquare />
@@ -25,6 +23,6 @@ export default function ConversationsButton({ collapse }: { collapse: boolean })
           </div>
         )}
       </div>
-    </SidebarItem>
+    </BottomNavigationBarItem>
   )
 }

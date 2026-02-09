@@ -83,8 +83,17 @@ function normalizeRelayUrl(candidate) {
   try {
     const parsed = new URL(trimmed)
     if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') return null
-    const path = parsed.pathname && parsed.pathname !== '/' ? parsed.pathname : ''
-    return `wss://${parsed.host}${path}`
+
+    parsed.pathname = parsed.pathname.replace(/\/+/g, '/')
+    if (parsed.pathname.endsWith('/') && parsed.pathname !== '/') {
+      parsed.pathname = parsed.pathname.slice(0, -1)
+    }
+    if ((parsed.protocol === 'ws:' && parsed.port === '80') || (parsed.protocol === 'wss:' && parsed.port === '443')) {
+      parsed.port = ''
+    }
+    parsed.searchParams.sort()
+    parsed.hash = ''
+    return parsed.toString()
   } catch {
     return null
   }
@@ -862,6 +871,7 @@ export class MarmotService {
     if (!input || typeof input !== 'object') return null
     const senderPubkey = normalizePubkey(input.senderPubkey)
     const createdAt = Number(input.createdAt)
+    const receivedAt = Number(input.receivedAt)
     if (!senderPubkey || !Number.isFinite(createdAt)) return null
 
     const status = ['pending', 'joining', 'joined', 'failed'].includes(input.status)
@@ -877,6 +887,7 @@ export class MarmotService {
       id: inviteId,
       senderPubkey,
       createdAt: Math.floor(createdAt),
+      receivedAt: Number.isFinite(receivedAt) ? Math.floor(receivedAt) : Math.floor(createdAt),
       status,
       error: typeof input.error === 'string' ? input.error : null,
       keyPackageEventId: typeof input.keyPackageEventId === 'string' ? input.keyPackageEventId : null,
@@ -896,6 +907,7 @@ export class MarmotService {
       id: invite.id,
       senderPubkey: invite.senderPubkey,
       createdAt: invite.createdAt,
+      receivedAt: invite.receivedAt,
       status: invite.status,
       error: invite.error,
       keyPackageEventId: invite.keyPackageEventId,
@@ -1543,6 +1555,7 @@ export class MarmotService {
         id: inviteId,
         senderPubkey: normalizePubkey(welcomeRumor.pubkey),
         createdAt: createdAt || Number(welcomeRumor.created_at) || nowSeconds(),
+        receivedAt: existing?.receivedAt || existing?.createdAt || nowSeconds(),
         status: existing?.status || 'pending',
         keyPackageEventId:
           readTag(welcomeRumor.tags, 'e')
@@ -1956,22 +1969,41 @@ export class MarmotService {
     title,
     description,
     members,
-    imageUrl
+    imageUrl,
+    relayUrls,
+    relayMode
   } = {}) {
-    const normalizedTitle = sanitizeString(title || 'Conversation', 256) || 'Conversation'
+    const normalizedTitle = sanitizeString(title || 'Chat', 256) || 'Chat'
     const normalizedDescription = sanitizeString(description, 1024) || ''
+    const normalizedRelayMode = relayMode === 'strict' ? 'strict' : 'withFallback'
+    const selectedRelays = uniqueRelays(relayUrls || [], { includeDefaults: false })
+    const defaultRelays = uniqueRelays(this.relays || [], { includeDefaults: true })
+    let effectiveRelays = defaultRelays
+
+    if (normalizedRelayMode === 'strict') {
+      effectiveRelays = selectedRelays.length ? selectedRelays : defaultRelays
+    } else if (selectedRelays.length) {
+      effectiveRelays = uniqueRelays([...selectedRelays, ...defaultRelays], { includeDefaults: false })
+      if (!effectiveRelays.length) {
+        effectiveRelays = defaultRelays
+      }
+    }
 
     this.logger.info?.('[MarmotService] createConversation start', {
       titleLength: normalizedTitle.length,
       descriptionLength: normalizedDescription.length,
       requestedMembers: ensureArray(members).length,
+      relayMode: normalizedRelayMode,
+      requestedRelayCount: selectedRelays.length,
+      effectiveRelayCount: effectiveRelays.length,
       relayCount: this.relays.length,
-      relays: this.relays
+      relays: this.relays,
+      effectiveRelays
     })
 
     const group = await this.client.createGroup(normalizedTitle, {
       description: normalizedDescription,
-      relays: this.relays,
+      relays: effectiveRelays,
       adminPubkeys: [this.pubkey]
     })
 
@@ -2364,7 +2396,9 @@ export class MarmotService {
           title: payload.title,
           description: payload.description,
           members: payload.members || payload.memberPubkeys || [],
-          imageUrl: payload.imageUrl || null
+          imageUrl: payload.imageUrl || null,
+          relayUrls: payload.relayUrls || payload.relays || [],
+          relayMode: payload.relayMode
         })
         return result
       }

@@ -13,7 +13,7 @@ function deriveDisplayName(meta: ConversationSummary, myPubkey: string | null): 
   return `${others[0]} +${others.length - 1}`
 }
 
-export function ConversationListPanel({
+export function ChatListPanel({
   myPubkey,
   onOpenConversation,
   conversations: providedConversations
@@ -36,11 +36,11 @@ export function ConversationListPanel({
   }
 
   if (!ready) {
-    return <div className="p-4 text-sm text-muted-foreground">Loading conversations…</div>
+    return <div className="p-4 text-sm text-muted-foreground">Loading chats…</div>
   }
 
   if (!sorted.length) {
-    return <div className="p-4 text-sm text-muted-foreground">No conversations yet.</div>
+    return <div className="p-4 text-sm text-muted-foreground">No chats yet.</div>
   }
 
   return (
@@ -82,7 +82,7 @@ function ConversationListItem({
         {meta.imageUrl ? (
           <img
             src={meta.imageUrl}
-            alt="Conversation"
+            alt="Chat"
             className="w-9 h-9 rounded-full object-cover border"
           />
         ) : others.length <= 1 ? (

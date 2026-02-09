@@ -2,13 +2,15 @@ import HideUntrustedContentButton from '@/components/HideUntrustedContentButton'
 import UserAvatar, { SimpleUserAvatar } from '@/components/UserAvatar'
 import { FormattedTimestamp } from '@/components/FormattedTimestamp'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
+import PostRelaySelector, { type RelayDisplayMeta } from '@/components/PostEditor/PostRelaySelector'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Check, Loader2, MessageSquare, Plus, Search, UserPlus, Users, X } from 'lucide-react'
-import { forwardRef, type ChangeEvent, useEffect, useMemo, useState } from 'react'
+import { forwardRef, type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useMessenger } from '@/providers/MessengerProvider'
-import { ConversationListPanel } from '@/components/DMConversations'
+import { ChatListPanel } from '@/components/ChatConversations'
 import { useNostr } from '@/providers/NostrProvider'
+import { useGroups } from '@/providers/GroupsProvider'
 import { useSecondaryPage } from '@/PageManager'
 import {
   Dialog,
@@ -20,23 +22,59 @@ import {
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
+import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useSearchProfiles } from '@/hooks/useSearchProfiles'
 import Username from '@/components/Username'
 import Nip05 from '@/components/Nip05'
 import type { ConversationInvite, ConversationSummary, ConversationTab } from '@/lib/conversations/types'
+import { isWebsocketUrl, normalizeUrl } from '@/lib/url'
 import mediaUploadService from '@/services/media-upload.service'
 import { toast } from 'sonner'
 import type { TPageRef } from '@/types'
 
-type CreateConversationModalPayload = {
+type RelayPublishMode = 'withFallback' | 'strict'
+
+type CreateChatModalPayload = {
   title: string
   description: string
   members: string[]
   imageFile: File | null
+  relayUrls: string[]
+  relayMode: RelayPublishMode
 }
 
 const HYPERDRIVE_UPLOAD_RELAY_URL = 'http://127.0.0.1:8443'
+
+function normalizeRelayCandidate(relay: string): string | null {
+  if (typeof relay !== 'string') return null
+  const normalized = normalizeUrl(relay)
+  if (!normalized || !isWebsocketUrl(normalized)) return null
+  return normalized
+}
+
+function normalizeRelaySet(relays: string[]): string[] {
+  const seen = new Set<string>()
+  const normalized: string[] = []
+  for (const relay of relays) {
+    const candidate = normalizeRelayCandidate(relay)
+    if (!candidate || seen.has(candidate)) continue
+    seen.add(candidate)
+    normalized.push(candidate)
+  }
+  return normalized
+}
+
+function normalizeRelayListForChat(
+  relayList: { read: string[]; write: string[] } | null,
+  discoveryRelay?: string
+) {
+  return normalizeRelaySet([
+    ...(relayList?.read || []),
+    ...(relayList?.write || []),
+    discoveryRelay || ''
+  ])
+}
 
 function MembersCell({ members }: { members: string[] }) {
   const compact = useMemo(
@@ -102,12 +140,13 @@ function matchesInviteSearch(invite: ConversationInvite, query: string) {
   return haystack.includes(query)
 }
 
-const ConversationListPage = forwardRef<
+const ChatListPage = forwardRef<
   TPageRef,
   { initialTab?: ConversationTab; tabRequestId?: string | number }
 >(({ initialTab, tabRequestId }, ref) => {
   const { t } = useTranslation()
-  const { pubkey } = useNostr()
+  const { pubkey, relayList } = useNostr()
+  const { myGroupList, discoveryGroups, getProvisionalGroupMetadata, resolveRelayUrl } = useGroups()
   const { push } = useSecondaryPage()
   const {
     conversations,
@@ -128,6 +167,36 @@ const ConversationListPage = forwardRef<
   const [creatingConversation, setCreatingConversation] = useState(false)
   const [joiningInviteId, setJoiningInviteId] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
+  const discoveryRelay = import.meta.env.VITE_DISCOVERY_RELAY as string | undefined
+
+  const defaultCreateRelayUrls = useMemo(
+    () => normalizeRelayListForChat(relayList, discoveryRelay),
+    [relayList, discoveryRelay]
+  )
+
+  const localGroupRelayDisplay = useMemo<Record<string, RelayDisplayMeta>>(() => {
+    const display: Record<string, RelayDisplayMeta> = {}
+    for (const entry of myGroupList) {
+      const relayCandidate = entry.relay ? resolveRelayUrl(entry.relay) || entry.relay : null
+      const normalizedRelay = normalizeRelayCandidate(relayCandidate || '')
+      if (!normalizedRelay) continue
+      if (display[normalizedRelay]) continue
+
+      const metadata =
+        getProvisionalGroupMetadata(entry.groupId, entry.relay || relayCandidate || undefined)
+        || discoveryGroups.find(
+          (group) => group.id === entry.groupId && (!entry.relay || group.relay === entry.relay)
+        )
+        || discoveryGroups.find((group) => group.id === entry.groupId)
+
+      display[normalizedRelay] = {
+        label: metadata?.name || entry.groupId,
+        imageUrl: metadata?.picture || null,
+        hideUrl: true
+      }
+    }
+    return display
+  }, [discoveryGroups, getProvisionalGroupMetadata, myGroupList, resolveRelayUrl])
 
   const query = useMemo(() => normalizeSearch(search), [search])
 
@@ -195,8 +264,8 @@ const ConversationListPage = forwardRef<
     try {
       await Promise.all([refreshConversations(), refreshInvites()])
     } catch (error) {
-      console.warn('Failed refreshing conversations', error)
-      toast.error(t('Failed to refresh conversations'))
+      console.warn('Failed refreshing chats', error)
+      toast.error(t('Failed to refresh chats'))
     } finally {
       setRefreshing(false)
     }
@@ -206,8 +275,10 @@ const ConversationListPage = forwardRef<
     title,
     description,
     members,
-    imageFile
-  }: CreateConversationModalPayload) => {
+    imageFile,
+    relayUrls,
+    relayMode
+  }: CreateChatModalPayload) => {
     const uniqueMembers = Array.from(
       new Set(members.map((member) => normalizePubkey(member)).filter((member): member is string => !!member))
     ).filter((member) => member !== pubkey)
@@ -220,20 +291,22 @@ const ConversationListPage = forwardRef<
     setCreatingConversation(true)
     try {
       const createResult = await createConversation({
-        title: title.trim() || t('Conversation'),
+        title: title.trim() || t('Chat'),
         description: description.trim() || undefined,
-        members: uniqueMembers
+        members: uniqueMembers,
+        relayUrls: normalizeRelaySet(relayUrls),
+        relayMode
       })
       const conversation = createResult.conversation
 
       if (createResult.failed.length > 0) {
         const failedLabel = createResult.failed[0]?.pubkey || t('one or more members')
-        console.warn('[Conversations] invite failures during create', {
+        console.warn('[Chat] invite failures during create', {
           conversationId: conversation.id,
           failed: createResult.failed
         })
         toast.warning(
-          t('Conversation created, but invite failed for {{member}}', {
+          t('Chat created, but invite failed for {{member}}', {
             member: failedLabel
           })
         )
@@ -273,8 +346,8 @@ const ConversationListPage = forwardRef<
 	            })
 	          }
         } catch (error) {
-          console.error('Conversation created but image upload failed', error)
-          toast.error(t('Conversation created, but image upload failed'))
+          console.error('Chat created but thumbnail upload failed', error)
+          toast.error(t('Chat created, but thumbnail upload failed'))
         }
       }
 
@@ -282,8 +355,8 @@ const ConversationListPage = forwardRef<
       setOpenNew(false)
       push(`/conversations/${conversation.id}`)
     } catch (error) {
-      console.error('Failed creating conversation', error)
-      toast.error(t('Failed to create conversation'))
+      console.error('Failed creating chat', error)
+      toast.error(t('Failed to create chat'))
     } finally {
       setCreatingConversation(false)
     }
@@ -307,7 +380,7 @@ const ConversationListPage = forwardRef<
         push(`/conversations/${conversationId}`)
       }
     } catch (error) {
-      console.error('Failed joining conversation invite', error)
+      console.error('Failed joining chat invite', error)
       toast.error(t('Failed to join invite'))
     } finally {
       setJoiningInviteId(null)
@@ -323,7 +396,7 @@ const ConversationListPage = forwardRef<
     <PrimaryPageLayout
       ref={ref}
       pageName="conversations"
-      titlebar={<ConversationListPageTitlebar onNew={() => setOpenNew(true)} />}
+      titlebar={<ChatListPageTitlebar onNew={() => setOpenNew(true)} />}
       displayScrollToTopButton
     >
       <div className="space-y-4 p-4">
@@ -333,7 +406,7 @@ const ConversationListPage = forwardRef<
             <Input
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder={tab === 'my' ? t('Search conversations...') as string : t('Search invites...') as string}
+              placeholder={tab === 'my' ? t('Search chats...') as string : t('Search invites...') as string}
               className="pl-8"
             />
           </div>
@@ -345,7 +418,7 @@ const ConversationListPage = forwardRef<
 
         <Tabs value={tab} onValueChange={(value) => setTab(value as ConversationTab)}>
           <TabsList className="grid w-full grid-cols-2">
-            <TabsTrigger value="my">{t('My Conversations')}</TabsTrigger>
+            <TabsTrigger value="my">{t('My Chats')}</TabsTrigger>
             <TabsTrigger value="invites">{invitesTabLabel}</TabsTrigger>
           </TabsList>
 
@@ -353,7 +426,7 @@ const ConversationListPage = forwardRef<
             {unsupportedReason ? (
               <div className="rounded-lg border p-4 text-sm text-muted-foreground">{unsupportedReason}</div>
             ) : (
-              <ConversationListPanel
+              <ChatListPanel
                 myPubkey={pubkey}
                 conversations={filteredConversations}
                 onOpenConversation={(id) => push(`/conversations/${id}`)}
@@ -375,7 +448,7 @@ const ConversationListPage = forwardRef<
                       <th className="w-14 px-3 py-2 text-left">
                         <span className="sr-only">{t('Thumbnail')}</span>
                       </th>
-                      <th className="w-[200px] px-3 py-2 text-left">{t('Conversation')}</th>
+                      <th className="w-[200px] px-3 py-2 text-left">{t('Chat')}</th>
                       <th className="w-[220px] px-3 py-2 text-left">{t('Description')}</th>
                       <th className="w-[160px] px-3 py-2 text-left">{t('Members')}</th>
                       <th className="w-[220px] px-3 py-2 text-left">{t('Invited by')}</th>
@@ -385,7 +458,7 @@ const ConversationListPage = forwardRef<
                   <tbody className="text-sm">
                     {inviteRows.map(({ invite, members }) => {
                       const isJoining = joiningInviteId === invite.id || invite.status === 'joining'
-                      const initials = (invite.title || t('Conversation')).slice(0, 2).toUpperCase()
+                      const initials = (invite.title || t('Chat')).slice(0, 2).toUpperCase()
 
                       return (
                         <tr key={invite.id} className="border-t transition-colors hover:bg-accent/30">
@@ -405,7 +478,7 @@ const ConversationListPage = forwardRef<
                           </td>
                           <td className="px-3 py-3 align-top">
                             <Avatar className="h-10 w-10 shrink-0">
-                              {invite.imageUrl ? <AvatarImage src={invite.imageUrl} alt={invite.title || t('Conversation invite')} /> : null}
+                              {invite.imageUrl ? <AvatarImage src={invite.imageUrl} alt={invite.title || t('Chat invite')} /> : null}
                               <AvatarFallback className="text-xs font-semibold">
                                 {invite.imageUrl ? initials : <Users className="h-4 w-4 text-muted-foreground" />}
                               </AvatarFallback>
@@ -413,12 +486,12 @@ const ConversationListPage = forwardRef<
                           </td>
                           <td className="px-3 py-3 align-top">
                             <div className="truncate font-semibold">
-                              {invite.title || t('Conversation invite')}
+                              {invite.title || t('Chat invite')}
                             </div>
                           </td>
                           <td className="px-3 py-3 align-top text-muted-foreground">
                             <div className="line-clamp-3 max-w-[220px] whitespace-pre-wrap break-words">
-                              {invite.description || t('Encrypted conversation invite')}
+                              {invite.description || t('Encrypted chat invite')}
                             </div>
                           </td>
                           <td className="px-3 py-3 align-top">
@@ -444,30 +517,32 @@ const ConversationListPage = forwardRef<
         </Tabs>
       </div>
 
-      <NewConversationDialog
+      <NewChatDialog
         open={openNew}
         onOpenChange={setOpenNew}
         creating={creatingConversation}
         myPubkey={pubkey}
+        defaultRelayUrls={defaultCreateRelayUrls}
+        localGroupRelayDisplay={localGroupRelayDisplay}
         onCreate={handleCreateConversation}
       />
     </PrimaryPageLayout>
   )
 })
-ConversationListPage.displayName = 'ConversationListPage'
-export default ConversationListPage
+ChatListPage.displayName = 'ChatListPage'
+export default ChatListPage
 
-function ConversationListPageTitlebar({ onNew }: { onNew: () => void }) {
+function ChatListPageTitlebar({ onNew }: { onNew: () => void }) {
   const { t } = useTranslation()
 
   return (
     <div className="flex gap-2 items-center justify-between h-full pl-3 pr-2">
       <div className="flex items-center gap-2">
         <MessageSquare />
-        <div className="text-lg font-semibold">{t('Conversations')}</div>
+        <div className="text-lg font-semibold">{t('Chat')}</div>
       </div>
       <div className="flex items-center gap-1">
-        <Button variant="ghost" size="titlebar-icon" onClick={onNew} aria-label={t('New conversation')}>
+        <Button variant="ghost" size="titlebar-icon" onClick={onNew} aria-label={t('New chat')}>
           <Plus />
         </Button>
         <HideUntrustedContentButton type="notifications" size="titlebar-icon" />
@@ -476,18 +551,22 @@ function ConversationListPageTitlebar({ onNew }: { onNew: () => void }) {
   )
 }
 
-function NewConversationDialog({
+function NewChatDialog({
   open,
   onOpenChange,
   creating,
   myPubkey,
+  defaultRelayUrls,
+  localGroupRelayDisplay,
   onCreate
 }: {
   open: boolean
   onOpenChange: (v: boolean) => void
   creating: boolean
   myPubkey: string | null
-  onCreate: (payload: CreateConversationModalPayload) => Promise<void>
+  defaultRelayUrls: string[]
+  localGroupRelayDisplay: Record<string, RelayDisplayMeta>
+  onCreate: (payload: CreateChatModalPayload) => Promise<void>
 }) {
   const { t } = useTranslation()
   const [title, setTitle] = useState('')
@@ -495,11 +574,30 @@ function NewConversationDialog({
   const [inviteSearch, setInviteSearch] = useState('')
   const [selectedInvitees, setSelectedInvitees] = useState<string[]>([])
   const [imageFile, setImageFile] = useState<File | null>(null)
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null)
+  const [selectedRelayUrls, setSelectedRelayUrls] = useState<string[]>(defaultRelayUrls)
+  const [relayMode, setRelayMode] = useState<RelayPublishMode>('withFallback')
+  const wasOpenRef = useRef(false)
   const { profiles: inviteProfiles, isFetching: isSearchingInvites } = useSearchProfiles(inviteSearch, 8)
   const inviteCandidateProfiles = useMemo(
     () => inviteProfiles.filter((profile) => profile.pubkey && profile.pubkey !== myPubkey),
     [inviteProfiles, myPubkey]
   )
+
+  useEffect(() => {
+    if (open && !wasOpenRef.current) {
+      setSelectedRelayUrls(defaultRelayUrls)
+    }
+    wasOpenRef.current = open
+  }, [defaultRelayUrls, open])
+
+  useEffect(() => {
+    return () => {
+      if (imagePreviewUrl) {
+        URL.revokeObjectURL(imagePreviewUrl)
+      }
+    }
+  }, [imagePreviewUrl])
 
   const resetState = () => {
     setTitle('')
@@ -507,6 +605,9 @@ function NewConversationDialog({
     setInviteSearch('')
     setSelectedInvitees([])
     setImageFile(null)
+    setImagePreviewUrl(null)
+    setSelectedRelayUrls(defaultRelayUrls)
+    setRelayMode('withFallback')
   }
 
   const handleOpenChange = (nextOpen: boolean) => {
@@ -519,6 +620,7 @@ function NewConversationDialog({
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0] || null
     setImageFile(file)
+    setImagePreviewUrl(file ? URL.createObjectURL(file) : null)
   }
 
   const handleInviteToggle = (pubkey: string) => {
@@ -529,32 +631,41 @@ function NewConversationDialog({
 
   const handleCreate = async () => {
     if (!selectedInvitees.length) return
+    if (!selectedRelayUrls.length) {
+      toast.error(t('Select at least one relay'))
+      return
+    }
     await onCreate({
       title,
       description,
       members: selectedInvitees,
-      imageFile
+      imageFile,
+      relayUrls: selectedRelayUrls,
+      relayMode
     })
   }
 
+  const hasThumbnailPreview = Boolean(imagePreviewUrl)
+
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="sm:max-w-xl max-h-[80vh]">
+      <DialogContent className="sm:max-w-xl max-h-[90vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>{t('Create conversation')}</DialogTitle>
+          <DialogTitle>{t('Create chat')}</DialogTitle>
         </DialogHeader>
 
-        <div className="flex min-h-0 flex-col gap-3">
+        <div className="flex min-h-0 flex-1 flex-col gap-3 px-1">
           <Input
             value={title}
             onChange={(event) => setTitle(event.target.value)}
             placeholder={t('Title') as string}
+            className="focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           />
           <Textarea
             value={description}
             onChange={(event) => setDescription(event.target.value)}
             placeholder={t('Description (optional)') as string}
-            className="min-h-[72px]"
+            className="min-h-[72px] focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
           />
 
           <div className="space-y-2">
@@ -568,7 +679,9 @@ function NewConversationDialog({
                 className="pl-9"
               />
             </div>
-            <div className="h-56 overflow-y-auto overflow-x-hidden space-y-2 pr-1 rounded border py-2">
+            <div
+              className={`${hasThumbnailPreview ? 'h-44' : 'h-56'} overflow-y-auto overflow-x-hidden space-y-2 pr-1 rounded border py-2`}
+            >
               <div className="min-h-5 px-2 text-sm text-muted-foreground">
                 {inviteSearch && isSearchingInvites ? t('Searching...') : null}
                 {inviteSearch && !isSearchingInvites && inviteCandidateProfiles.length === 0
@@ -632,22 +745,50 @@ function NewConversationDialog({
           </div>
 
           <div className="space-y-1">
-            <div className="text-sm font-medium">{t('Conversation image (optional)')}</div>
+            <div className="text-sm font-medium">{t('Chat thumbnail (optional)')}</div>
             <Input type="file" accept="image/*" onChange={handleFileChange} />
-            {imageFile ? (
-              <div className="text-xs text-muted-foreground truncate">
-                {t('Selected image')}: {imageFile.name}
+            {imagePreviewUrl ? (
+              <div className="flex items-center gap-2 rounded-md border p-2">
+                <img src={imagePreviewUrl} alt={imageFile?.name || 'Chat thumbnail'} className="h-10 w-10 rounded object-cover" />
+                <div className="text-xs text-muted-foreground truncate">
+                  {t('Selected image')}: {imageFile?.name}
+                </div>
               </div>
             ) : null}
           </div>
+
+          <div className="space-y-2 rounded-md border p-3">
+            <PostRelaySelector
+              allowWriteRelays={false}
+              extraRelayUrls={[...defaultRelayUrls, ...Object.keys(localGroupRelayDisplay)]}
+              relayDisplayMeta={localGroupRelayDisplay}
+              valueRelayUrls={selectedRelayUrls}
+              onValueRelayUrlsChange={setSelectedRelayUrls}
+            />
+            <div className="flex items-center justify-between rounded-md border px-3 py-2">
+              <div>
+                <div className="text-sm font-medium">{t('Discovery relay fallback')}</div>
+                <div className="text-xs text-muted-foreground">
+                  {t('Also publish chat events to discovery relays')}
+                </div>
+              </div>
+              <Switch
+                checked={relayMode === 'withFallback'}
+                onCheckedChange={(checked) => setRelayMode(checked ? 'withFallback' : 'strict')}
+              />
+            </div>
+          </div>
         </div>
 
-        <DialogFooter className="flex justify-end gap-2">
+        <DialogFooter className="flex shrink-0 justify-end gap-2 border-t pt-3">
           <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={creating}>
             {t('Cancel')}
           </Button>
-          <Button onClick={handleCreate} disabled={creating || selectedInvitees.length === 0}>
-            {creating ? t('Creating...') : t('Create')}
+          <Button
+            onClick={handleCreate}
+            disabled={creating || selectedInvitees.length === 0 || selectedRelayUrls.length === 0}
+          >
+            {creating ? t('Creating...') : t('Create chat')}
           </Button>
         </DialogFooter>
       </DialogContent>

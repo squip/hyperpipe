@@ -21,7 +21,7 @@ import SearchPage from './pages/secondary/SearchPage'
 import SettingsPage from './pages/secondary/SettingsPage'
 import TranslationPage from './pages/secondary/TranslationPage'
 import WalletPage from './pages/secondary/WalletPage'
-import ConversationPage from './pages/secondary/ConversationPage'
+import ChatPage from './pages/secondary/ChatPage'
 import ListsIndexPage from './pages/secondary/ListsIndexPage'
 import ListPage from './pages/secondary/ListPage'
 import ListEditorPage from './pages/secondary/ListEditorPage'
@@ -38,7 +38,7 @@ const ROUTES = [
   { path: '/users/:id/relays', element: <OthersRelaySettingsPage /> },
   { path: '/relays/:url', element: <RelayPage /> },
   { path: '/relays/:url/reviews', element: <RelayReviewsPage /> },
-  { path: '/conversations/:id', element: <ConversationPage /> },
+  { path: '/conversations/:id', element: <ChatPage /> },
   { path: '/search', element: <SearchPage /> },
   { path: '/settings', element: <SettingsPage /> },
   { path: '/settings/relays', element: <RelaySettingsPage /> },

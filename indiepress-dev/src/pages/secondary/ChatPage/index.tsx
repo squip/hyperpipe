@@ -5,7 +5,7 @@ import { forwardRef, useEffect, useMemo, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { useMessenger } from '@/providers/MessengerProvider'
 import { useNostr } from '@/providers/NostrProvider'
-import { DMThread } from '@/components/DMThread'
+import { ChatThread } from '@/components/ChatThread'
 import {
   Dialog,
   DialogClose,
@@ -18,7 +18,7 @@ import UserAvatar, { SimpleUserAvatar } from '@/components/UserAvatar'
 import client from '@/services/client.service'
 import { cn } from '@/lib/utils'
 
-const ConversationPage = forwardRef(({ index }: { index?: number }, ref) => {
+const ChatPage = forwardRef(({ index }: { index?: number }, ref) => {
   const { pop } = useSecondaryPage()
   const conversationId = useMemo(() => window.location.pathname.split('/').pop() || '', [])
   const { conversations } = useMessenger()
@@ -72,7 +72,7 @@ const ConversationPage = forwardRef(({ index }: { index?: number }, ref) => {
             {meta?.imageUrl ? (
               <img
                 src={meta.imageUrl}
-                alt="Conversation"
+                alt="Chat"
                 className="w-8 h-8 rounded-full object-cover border"
               />
             ) : meta?.participants && meta.participants.length <= 2 ? (
@@ -94,7 +94,7 @@ const ConversationPage = forwardRef(({ index }: { index?: number }, ref) => {
             )}
             onClick={() => setShowMembers(true)}
           >
-            <div className="text-sm font-semibold truncate">{meta?.title || 'Conversation'}</div>
+            <div className="text-sm font-semibold truncate">{meta?.title || 'Chat'}</div>
             <div className="text-xs text-muted-foreground truncate">{participantLine}</div>
           </button>
         </div>
@@ -103,19 +103,19 @@ const ConversationPage = forwardRef(({ index }: { index?: number }, ref) => {
       skipInitialScrollToTop
       onScrollContextChange={setUseDocumentScroll}
     >
-      <DMThread conversationId={conversationId} myPubkey={pubkey} useDocumentScroll={useDocumentScroll} />
+      <ChatThread conversationId={conversationId} myPubkey={pubkey} useDocumentScroll={useDocumentScroll} />
       <MembersDialog
         open={showMembers}
         onOpenChange={setShowMembers}
-        subject={meta?.title || 'Conversation'}
+        subject={meta?.title || 'Chat'}
         participants={meta?.participants || []}
       />
     </SecondaryPageLayout>
   )
 })
 
-ConversationPage.displayName = 'ConversationPage'
-export default ConversationPage
+ChatPage.displayName = 'ChatPage'
+export default ChatPage
 
 function MembersDialog({
   open,
@@ -166,7 +166,7 @@ function MembersDialog({
             </div>
           ))}
           {!participants.length && (
-            <div className="text-sm text-muted-foreground">No conversation members found.</div>
+            <div className="text-sm text-muted-foreground">No chat members found.</div>
           )}
         </div>
       </DialogContent>
