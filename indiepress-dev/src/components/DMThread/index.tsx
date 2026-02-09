@@ -1,4 +1,5 @@
 import React, {
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -109,18 +110,55 @@ export function DMThread({
   const [anchored, setAnchored] = useState(false)
   const prevLength = useRef(0)
   const anchorRetry = useRef<number | null>(null)
-  const localCountRef = useRef(0)
-  const lastLiveAt = useRef<number | null>(null)
-  const pollTimeout = useRef<number | null>(null)
+  const lastReadSentRef = useRef<{ messageId: string; timestamp: number } | null>(null)
 
   const conversation = useMemo(
     () => conversations.find((item) => item.id === conversationId) || null,
     [conversations, conversationId]
   )
 
+  const markConversationReadIfNeeded = useCallback(
+    async (message: ThreadMessage | null | undefined) => {
+      if (!messenger || !conversationId || !message) return
+
+      const messageId = String(message.id || '').trim()
+      const timestamp = Number(message.timestamp)
+      if (!messageId || !Number.isFinite(timestamp) || timestamp <= 0) return
+
+      const lastSent = lastReadSentRef.current
+      if (lastSent && lastSent.messageId === messageId && lastSent.timestamp === timestamp) {
+        return
+      }
+
+      const knownReadMessageId = String(conversation?.lastReadMessageId || '')
+      const knownReadAt = Number(conversation?.lastReadAt || 0)
+      if (knownReadMessageId === messageId && knownReadAt >= timestamp) {
+        lastReadSentRef.current = { messageId, timestamp }
+        return
+      }
+      if (knownReadAt > timestamp) {
+        return
+      }
+
+      lastReadSentRef.current = { messageId, timestamp }
+      try {
+        await messenger.markConversationRead(conversationId, messageId, timestamp)
+      } catch (error) {
+        if (
+          lastReadSentRef.current?.messageId === messageId
+          && lastReadSentRef.current?.timestamp === timestamp
+        ) {
+          lastReadSentRef.current = null
+        }
+        debug('markConversationRead failed', error)
+      }
+    },
+    [messenger, conversationId, conversation?.lastReadMessageId, conversation?.lastReadAt]
+  )
+
   useEffect(() => {
     if (!messenger || !conversationId) return
-    lastLiveAt.current = null
+    lastReadSentRef.current = null
     let cancelled = false
     const load = async () => {
       debug('load thread (init)', { conversationId })
@@ -145,57 +183,56 @@ export function DMThread({
     if (!messenger || !conversationId) return
     let cancelled = false
 
-    const sync = async () => {
-      const thread = await messenger.loadThread(conversationId, { limit: 500, sync: true })
-      if (cancelled) return
-      setLocalMessages((previous) => {
-        const prevLast = previous.at(-1)?.id
-        const nextLast = thread.messages.at(-1)?.id
-        if (previous.length === thread.messages.length && prevLast === nextLast) return previous
-        return thread.messages
-      })
-    }
-
-    const FAST_POLL_MS = 1200
-    const SLOW_POLL_MS = 5000
-    const LIVE_RECENT_WINDOW_MS = 15_000
-
-    const schedule = (delayMs: number) => {
-      if (pollTimeout.current) window.clearTimeout(pollTimeout.current)
-      pollTimeout.current = window.setTimeout(syncWithBackoff, delayMs)
-    }
-
-    const syncWithBackoff = async () => {
-      const startedAt = Date.now()
+    const sync = async (reason: string) => {
       try {
-        await sync()
+        const thread = await messenger.loadThread(conversationId, { limit: 500, sync: true })
+        if (cancelled) return
+        setLocalMessages((previous) => {
+          const prevLast = previous.at(-1)?.id
+          const nextLast = thread.messages.at(-1)?.id
+          if (previous.length === thread.messages.length && prevLast === nextLast) return previous
+          return thread.messages
+        })
       } catch (error) {
-        debug('periodic sync failed', error)
+        debug(`recovery sync failed (${reason})`, error)
       }
-
-      if (cancelled) return
-      const sinceLive = lastLiveAt.current ? startedAt - lastLiveAt.current : Number.POSITIVE_INFINITY
-      const nextDelay = sinceLive > LIVE_RECENT_WINDOW_MS ? FAST_POLL_MS : SLOW_POLL_MS
-      schedule(nextDelay)
     }
 
-    schedule(FAST_POLL_MS)
+    const handleFocus = () => {
+      void sync('focus')
+    }
+    const handleOnline = () => {
+      void sync('online')
+    }
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void sync('visible')
+      }
+    }
+
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void sync('interval')
+      }
+    }, 30_000)
+
+    window.addEventListener('focus', handleFocus)
+    window.addEventListener('online', handleOnline)
+    document.addEventListener('visibilitychange', handleVisibility)
 
     return () => {
       cancelled = true
-      if (pollTimeout.current) window.clearTimeout(pollTimeout.current)
+      window.clearInterval(intervalId)
+      window.removeEventListener('focus', handleFocus)
+      window.removeEventListener('online', handleOnline)
+      document.removeEventListener('visibilitychange', handleVisibility)
     }
   }, [messenger, conversationId])
-
-  useEffect(() => {
-    localCountRef.current = localMessages.length
-  }, [localMessages.length])
 
   useEffect(() => {
     if (!messenger) return
     const off = messenger.on((event) => {
       if (event.type === 'message' && event.message.conversationId === conversationId) {
-        lastLiveAt.current = Date.now()
         setLocalMessages((previous) => mergeMessagesById(previous, event.message))
       }
     })
@@ -284,7 +321,7 @@ export function DMThread({
 
     const last = localMessages.at(-1)
     if (last) {
-      messenger?.markConversationRead(conversationId, last.id, last.timestamp)
+      void markConversationReadIfNeeded(last)
     }
     return true
   }
@@ -351,7 +388,7 @@ export function DMThread({
         if (scrolled && unreadCount <= CONVERSATION_JUMP_FAB_THRESHOLD && unreadCount > 0) {
           const last = localMessages.at(-1)
           if (last) {
-            messenger?.markConversationRead(conversationId, last.id, last.timestamp)
+            void markConversationReadIfNeeded(last)
           }
         }
         setAnchored(true)
@@ -398,10 +435,10 @@ export function DMThread({
       setNearBottom(near)
       setShowScrollBottom(unreadCount > CONVERSATION_JUMP_FAB_THRESHOLD && !near)
 
-      if (near && messenger && unreadCount > 0) {
+      if (near && unreadCount > 0) {
         const last = localMessages.at(-1)
         if (last) {
-          messenger.markConversationRead(conversationId, last.id, last.timestamp)
+          void markConversationReadIfNeeded(last)
         }
       }
     }
@@ -417,7 +454,7 @@ export function DMThread({
       primaryTarget?.removeEventListener('scroll', handler)
       secondaryTarget?.removeEventListener('scroll', handler)
     }
-  }, [messenger, conversationId, unreadCount, localMessages])
+  }, [unreadCount, localMessages, isSmallScreen, markConversationReadIfNeeded])
 
   useEffect(() => {
     if (!localMessages.length) return
@@ -454,7 +491,7 @@ export function DMThread({
 
       const last = sentMessages.at(-1)
       if (last) {
-        await messenger.markConversationRead(conversationId, last.id, last.timestamp)
+        await markConversationReadIfNeeded(last)
       }
 
       scrollToBottom()
@@ -472,21 +509,21 @@ export function DMThread({
     setUploadProgress(0)
 
     try {
-	      const result = await mediaUploadService.upload(
-	        file,
+      const result = await mediaUploadService.upload(
+        file,
         {
           onProgress: (progress) => setUploadProgress(progress)
         },
-	        {
-	          target: 'group-hyperdrive',
-	          groupId: conversationId,
-	          relayUrl: HYPERDRIVE_UPLOAD_RELAY_URL,
-	          resourceScope: 'conversation',
-	          parentKind: 14
-	        }
-	      )
+        {
+          target: 'group-hyperdrive',
+          groupId: conversationId,
+          relayUrl: HYPERDRIVE_UPLOAD_RELAY_URL,
+          resourceScope: 'conversation',
+          parentKind: 14
+        }
+      )
 
-	      setPendingAttachments((previous) => [...previous, toAttachmentFromUpload(result, myPubkey)])
+      setPendingAttachments((previous) => [...previous, toAttachmentFromUpload(result, myPubkey)])
     } catch (error) {
       console.error('Media upload failed', error)
     } finally {

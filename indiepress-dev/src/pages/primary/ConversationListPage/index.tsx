@@ -1,9 +1,10 @@
 import HideUntrustedContentButton from '@/components/HideUntrustedContentButton'
-import { FormattedTimestamp } from '@/components/FormattedTimestamp'
 import UserAvatar, { SimpleUserAvatar } from '@/components/UserAvatar'
+import { FormattedTimestamp } from '@/components/FormattedTimestamp'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
-import { Check, Loader2, MessageSquare, Plus, Search, UserPlus, Users } from 'lucide-react'
-import { forwardRef, type ChangeEvent, useMemo, useState } from 'react'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { Check, Loader2, MessageSquare, Plus, Search, UserPlus, Users, X } from 'lucide-react'
+import { forwardRef, type ChangeEvent, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useMessenger } from '@/providers/MessengerProvider'
 import { ConversationListPanel } from '@/components/DMConversations'
@@ -23,11 +24,10 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useSearchProfiles } from '@/hooks/useSearchProfiles'
 import Username from '@/components/Username'
 import Nip05 from '@/components/Nip05'
-import type { ConversationInvite, ConversationSummary } from '@/lib/conversations/types'
+import type { ConversationInvite, ConversationSummary, ConversationTab } from '@/lib/conversations/types'
 import mediaUploadService from '@/services/media-upload.service'
 import { toast } from 'sonner'
-
-type ConversationTab = 'my' | 'invites'
+import type { TPageRef } from '@/types'
 
 type CreateConversationModalPayload = {
   title: string
@@ -37,6 +37,31 @@ type CreateConversationModalPayload = {
 }
 
 const HYPERDRIVE_UPLOAD_RELAY_URL = 'http://127.0.0.1:8443'
+
+function MembersCell({ members }: { members: string[] }) {
+  const compact = useMemo(
+    () => new Intl.NumberFormat(undefined, { notation: 'compact' }),
+    []
+  )
+
+  if (!members.length) {
+    return <span className="text-xs text-muted-foreground">0</span>
+  }
+
+  const preview = members.slice(0, 3)
+  return (
+    <div className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-1">
+      <div className="flex -space-x-2">
+        {preview.map((pubkey) => (
+          <div key={pubkey} className="h-5 w-5 overflow-hidden rounded-full bg-muted ring-2 ring-background">
+            <SimpleUserAvatar userId={pubkey} size="small" className="h-full w-full rounded-full" />
+          </div>
+        ))}
+      </div>
+      <span className="text-xs font-medium">{compact.format(members.length)}</span>
+    </div>
+  )
+}
 
 function normalizeSearch(value: string) {
   return value.trim().toLowerCase()
@@ -77,22 +102,27 @@ function matchesInviteSearch(invite: ConversationInvite, query: string) {
   return haystack.includes(query)
 }
 
-const ConversationListPage = forwardRef((_, ref) => {
+const ConversationListPage = forwardRef<
+  TPageRef,
+  { initialTab?: ConversationTab; tabRequestId?: string | number }
+>(({ initialTab, tabRequestId }, ref) => {
   const { t } = useTranslation()
   const { pubkey } = useNostr()
   const { push } = useSecondaryPage()
   const {
     conversations,
     invites,
+    pendingInviteCount,
     ready,
     unsupportedReason,
     createConversation,
     acceptInvite,
     refreshConversations,
     refreshInvites,
-    updateConversationMetadata
+    updateConversationMetadata,
+    dismissInvite
   } = useMessenger()
-  const [tab, setTab] = useState<ConversationTab>('my')
+  const [tab, setTab] = useState<ConversationTab>(initialTab || 'my')
   const [search, setSearch] = useState('')
   const [openNew, setOpenNew] = useState(false)
   const [creatingConversation, setCreatingConversation] = useState(false)
@@ -111,10 +141,51 @@ const ConversationListPage = forwardRef((_, ref) => {
     [invites, query]
   )
 
-  const pendingInviteCount = useMemo(
-    () => invites.filter((invite) => invite.status !== 'joined').length,
-    [invites]
-  )
+  useEffect(() => {
+    if (!initialTab) return
+    setTab(initialTab)
+  }, [initialTab, tabRequestId])
+
+  const conversationParticipantsById = useMemo(() => {
+    const next = new Map<string, string[]>()
+    for (const conversation of conversations) {
+      next.set(
+        conversation.id,
+        Array.isArray(conversation.participants)
+          ? conversation.participants.filter((participant) => Boolean(participant))
+          : []
+      )
+    }
+    return next
+  }, [conversations])
+
+  const inviteRows = useMemo(() => {
+    return [...filteredInvites]
+      .sort((left, right) => {
+        if (left.createdAt !== right.createdAt) return right.createdAt - left.createdAt
+        return left.id.localeCompare(right.id)
+      })
+      .map((invite) => {
+        const conversationMembers =
+          invite.conversationId
+            ? conversationParticipantsById.get(invite.conversationId) || []
+            : []
+        const explicitMembers =
+          Array.isArray(invite.memberPubkeys)
+            ? invite.memberPubkeys.filter((member) => Boolean(member))
+            : []
+        const members = Array.from(
+          new Set(
+            explicitMembers.length
+              ? explicitMembers
+              : conversationMembers.length
+                ? conversationMembers
+                : [invite.senderPubkey].filter(Boolean)
+          )
+        )
+        return { invite, members }
+      })
+  }, [filteredInvites, conversationParticipantsById])
 
   const invitesTabLabel =
     pendingInviteCount > 0 ? `${t('Invites')} (${pendingInviteCount})` : t('Invites')
@@ -243,6 +314,11 @@ const ConversationListPage = forwardRef((_, ref) => {
     }
   }
 
+  const handleDismissInvite = (invite: ConversationInvite) => {
+    if (!invite?.id) return
+    dismissInvite(invite.id)
+  }
+
   return (
     <PrimaryPageLayout
       ref={ref}
@@ -288,64 +364,80 @@ const ConversationListPage = forwardRef((_, ref) => {
           <TabsContent value="invites" className="mt-4">
             {!ready ? (
               <div className="rounded-lg border p-4 text-sm text-muted-foreground">{t('Loading invites...')}</div>
-            ) : !filteredInvites.length ? (
+            ) : !inviteRows.length ? (
               <div className="rounded-lg border p-4 text-sm text-muted-foreground">{t('No invites')}</div>
             ) : (
-              <div className="space-y-2">
-                {filteredInvites.map((invite) => {
-                  const isJoining = joiningInviteId === invite.id || invite.status === 'joining'
-                  const isJoined = invite.status === 'joined'
-                  return (
-                    <div key={invite.id} className="rounded-lg border px-3 py-3">
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="flex items-center gap-2 min-w-0">
-                          {invite.imageUrl ? (
-                            <img
-                              src={invite.imageUrl}
-                              alt={invite.title || 'Conversation invite'}
-                              className="h-9 w-9 rounded-full border object-cover"
-                            />
-                          ) : (
-                            <div className="flex h-9 w-9 items-center justify-center rounded-full border bg-muted">
-                              <Users className="h-4 w-4 text-muted-foreground" />
-                            </div>
-                          )}
+              <div className="overflow-x-auto scrollbar-hide rounded-lg border">
+                <table className="w-full min-w-[1060px] table-fixed">
+                  <thead className="bg-muted/40 text-xs font-medium text-muted-foreground">
+                    <tr>
+                      <th className="w-[220px] px-3 py-2 text-left">{t('Actions')}</th>
+                      <th className="w-14 px-3 py-2 text-left">
+                        <span className="sr-only">{t('Thumbnail')}</span>
+                      </th>
+                      <th className="w-[200px] px-3 py-2 text-left">{t('Conversation')}</th>
+                      <th className="w-[220px] px-3 py-2 text-left">{t('Description')}</th>
+                      <th className="w-[160px] px-3 py-2 text-left">{t('Members')}</th>
+                      <th className="w-[220px] px-3 py-2 text-left">{t('Invited by')}</th>
+                      <th className="w-[140px] px-3 py-2 text-left">{t('Invite age')}</th>
+                    </tr>
+                  </thead>
+                  <tbody className="text-sm">
+                    {inviteRows.map(({ invite, members }) => {
+                      const isJoining = joiningInviteId === invite.id || invite.status === 'joining'
+                      const initials = (invite.title || t('Conversation')).slice(0, 2).toUpperCase()
 
-                          <div className="min-w-0">
-                            <div className="font-medium truncate">{invite.title || t('Conversation invite')}</div>
-                            <div className="text-xs text-muted-foreground truncate">
+                      return (
+                        <tr key={invite.id} className="border-t transition-colors hover:bg-accent/30">
+                          <td className="px-3 py-3 align-top">
+                            <div className="flex items-center gap-2">
+                              <Button variant="outline" size="sm" onClick={() => handleDismissInvite(invite)}>
+                                <X className="mr-1 h-4 w-4" />
+                                {t('Dismiss')}
+                              </Button>
+                              <Button size="sm" disabled={isJoining} onClick={() => handleJoinInvite(invite)}>
+                                {isJoining ? t('Joining...') : t('Join')}
+                              </Button>
+                            </div>
+                            {invite.error ? (
+                              <div className="mt-2 text-xs text-red-500">{invite.error}</div>
+                            ) : null}
+                          </td>
+                          <td className="px-3 py-3 align-top">
+                            <Avatar className="h-10 w-10 shrink-0">
+                              {invite.imageUrl ? <AvatarImage src={invite.imageUrl} alt={invite.title || t('Conversation invite')} /> : null}
+                              <AvatarFallback className="text-xs font-semibold">
+                                {invite.imageUrl ? initials : <Users className="h-4 w-4 text-muted-foreground" />}
+                              </AvatarFallback>
+                            </Avatar>
+                          </td>
+                          <td className="px-3 py-3 align-top">
+                            <div className="truncate font-semibold">
+                              {invite.title || t('Conversation invite')}
+                            </div>
+                          </td>
+                          <td className="px-3 py-3 align-top text-muted-foreground">
+                            <div className="line-clamp-3 max-w-[220px] whitespace-pre-wrap break-words">
                               {invite.description || t('Encrypted conversation invite')}
                             </div>
-                          </div>
-                        </div>
-
-                        <Button
-                          size="sm"
-                          disabled={isJoining}
-                          onClick={() => handleJoinInvite(invite)}
-                        >
-                          {isJoining
-                            ? t('Joining...')
-                            : isJoined && invite.conversationId
-                              ? t('Open')
-                              : t('Join')}
-                        </Button>
-                      </div>
-
-                      <div className="mt-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                        <div className="flex min-w-0 items-center gap-2">
-                          <SimpleUserAvatar userId={invite.senderPubkey} size="small" className="h-5 w-5 rounded-full" />
-                          <span className="truncate">{invite.senderPubkey}</span>
-                        </div>
-                        {invite.createdAt > 0 ? <FormattedTimestamp timestamp={invite.createdAt} short /> : null}
-                      </div>
-
-                      {invite.error ? (
-                        <div className="mt-2 text-xs text-red-500">{invite.error}</div>
-                      ) : null}
-                    </div>
-                  )
-                })}
+                          </td>
+                          <td className="px-3 py-3 align-top">
+                            <MembersCell members={members} />
+                          </td>
+                          <td className="px-3 py-3 align-top">
+                            <div className="flex min-w-0 items-center gap-2">
+                              <SimpleUserAvatar userId={invite.senderPubkey} size="small" className="h-6 w-6 rounded-full" />
+                              <Username userId={invite.senderPubkey} className="truncate text-sm" />
+                            </div>
+                          </td>
+                          <td className="px-3 py-3 align-top text-xs text-muted-foreground">
+                            {invite.createdAt > 0 ? <FormattedTimestamp timestamp={invite.createdAt} /> : '-'}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
               </div>
             )}
           </TabsContent>

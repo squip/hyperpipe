@@ -10,6 +10,7 @@ import { SubCloser } from '@nostr/tools/abstract-pool'
 import { createContext, useContext, useEffect, useMemo, useState } from 'react'
 import { useContentPolicy } from './ContentPolicyProvider'
 import { useGroups } from './GroupsProvider'
+import { useMessenger } from './MessengerProvider'
 import { useMuteList } from './MuteListProvider'
 import { useNostr } from './NostrProvider'
 import { useUserTrust } from './UserTrustProvider'
@@ -39,6 +40,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
   const active = useMemo(() => current === 'notifications', [current])
   const { pubkey, notificationsSeenAt, updateNotificationsSeenAt } = useNostr()
   const { invites } = useGroups()
+  const { invites: conversationInvites } = useMessenger()
   const { hideUntrustedNotifications, isUserTrusted } = useUserTrust()
   const { mutePubkeySet } = useMuteList()
   const { hideContentMentioningMutedUsers } = useContentPolicy()
@@ -89,8 +91,17 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         count += 1
       }
     }
+    const seenConversationInviteIds = new Set<string>()
+    for (const invite of conversationInvites) {
+      const inviteId = invite.id
+      if (!inviteId || seenConversationInviteIds.has(inviteId)) continue
+      seenConversationInviteIds.add(inviteId)
+      if (invite.createdAt > notificationsSeenAt) {
+        count += 1
+      }
+    }
     return count
-  }, [active, invites, notificationsSeenAt])
+  }, [active, invites, conversationInvites, notificationsSeenAt])
 
   const newNotificationCount = filteredNewNotifications.length + newInviteNotificationCount
 

@@ -69,6 +69,7 @@ export type ConversationInvite = {
   title?: string | null
   description?: string | null
   imageUrl?: string | null
+  memberPubkeys?: string[]
 }
 
 export type ConversationQuery = {

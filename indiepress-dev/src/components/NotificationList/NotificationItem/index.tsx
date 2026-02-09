@@ -4,6 +4,7 @@ import { useContentPolicy } from '@/providers/ContentPolicyProvider'
 import { useMuteList } from '@/providers/MuteListProvider'
 import { useNostr } from '@/providers/NostrProvider'
 import { useUserTrust } from '@/providers/UserTrustProvider'
+import { CONVERSATION_INVITE_NOTIFICATION_KIND } from '@/lib/conversations/invite-notifications'
 import { Event } from '@nostr/tools/wasm'
 import * as kinds from '@nostr/tools/kinds'
 import { useMemo } from 'react'
@@ -13,6 +14,7 @@ import { ReactionNotification } from './ReactionNotification'
 import { RepostNotification } from './RepostNotification'
 import { ZapNotification } from './ZapNotification'
 import { GroupInviteNotification } from './GroupInviteNotification'
+import { ConversationInviteNotification } from './ConversationInviteNotification'
 
 const GROUP_INVITE_KIND = 9009
 
@@ -46,6 +48,9 @@ export function NotificationItem({
 
   if (notification.kind === GROUP_INVITE_KIND) {
     return <GroupInviteNotification notification={notification} isNew={isNew} />
+  }
+  if (notification.kind === CONVERSATION_INVITE_NOTIFICATION_KIND) {
+    return <ConversationInviteNotification notification={notification} isNew={isNew} />
   }
   if (notification.kind === kinds.Reaction) {
     return <ReactionNotification notification={notification} isNew={isNew} />

@@ -121,6 +121,26 @@ function ensureArray(value) {
   return Array.isArray(value) ? value : []
 }
 
+function normalizePubkeyList(values = []) {
+  return Array.from(
+    new Set(
+      ensureArray(values)
+        .map((value) => normalizePubkey(value))
+        .filter(Boolean)
+    )
+  )
+}
+
+function sameNormalizedPubkeyList(leftValues = [], rightValues = []) {
+  const left = normalizePubkeyList(leftValues).slice().sort()
+  const right = normalizePubkeyList(rightValues).slice().sort()
+  if (left.length !== right.length) return false
+  for (let idx = 0; idx < left.length; idx += 1) {
+    if (left[idx] !== right[idx]) return false
+  }
+  return true
+}
+
 function nowSeconds() {
   return Math.floor(Date.now() / 1000)
 }
@@ -291,6 +311,34 @@ class FileKeyValueBackend {
     return files
       .map((fileName) => this.decodeKeyFromFile(fileName))
       .filter((key) => typeof key === 'string')
+  }
+}
+
+class InMemoryKeyValueBackend {
+  constructor() {
+    this.store = new Map()
+  }
+
+  async getItem(key) {
+    const normalizedKey = String(key)
+    return this.store.has(normalizedKey) ? this.store.get(normalizedKey) : null
+  }
+
+  async setItem(key, value) {
+    this.store.set(String(key), value)
+    return value
+  }
+
+  async removeItem(key) {
+    this.store.delete(String(key))
+  }
+
+  async clear() {
+    this.store.clear()
+  }
+
+  async keys() {
+    return Array.from(this.store.keys())
   }
 }
 
@@ -823,6 +871,7 @@ export class MarmotService {
     const welcomeRumor = input.welcomeRumor && typeof input.welcomeRumor === 'object'
       ? input.welcomeRumor
       : null
+    const memberPubkeys = normalizePubkeyList(input.memberPubkeys || [])
 
     return {
       id: inviteId,
@@ -837,7 +886,8 @@ export class MarmotService {
       welcomeRumor,
       title: sanitizeString(input.title, 256) || null,
       description: sanitizeString(input.description, 1024) || null,
-      imageUrl: sanitizeString(input.imageUrl, 2048) || null
+      imageUrl: sanitizeString(input.imageUrl, 2048) || null,
+      memberPubkeys
     }
   }
 
@@ -854,6 +904,7 @@ export class MarmotService {
       title: invite.title,
       description: invite.description,
       imageUrl: invite.imageUrl,
+      memberPubkeys: normalizePubkeyList(invite.memberPubkeys || []),
       protocol: 'marmot'
     }
   }
@@ -1180,8 +1231,8 @@ export class MarmotService {
     return tags.some((tag) => Array.isArray(tag) && tag[0] === 'marmot-meta')
   }
 
-  applyMetadataRumor(conversationId, rumor) {
-    if (!this.isMetadataRumor(rumor)) return false
+  extractMetadataFromRumor(rumor) {
+    if (!this.isMetadataRumor(rumor)) return null
 
     let parsed = {}
     if (typeof rumor.content === 'string' && rumor.content.trim()) {
@@ -1194,10 +1245,19 @@ export class MarmotService {
     }
 
     const tags = ensureArray(rumor.tags)
-    const title = parsed.title || readTag(tags, 'title') || null
-    const description = parsed.description || readTag(tags, 'description') || null
-    const imageFileTag = tags.find((tag) => Array.isArray(tag) && tag[0] === 'image-file' && typeof tag[1] === 'string')
-    const parsedImageFile = normalizeAttachmentEnvelope(parsed.imageFile)
+    const parsedRecord = parsed && typeof parsed === 'object' ? parsed : {}
+    const hasOwn = (key) => Object.prototype.hasOwnProperty.call(parsedRecord, key)
+
+    const titleTag = readTag(tags, 'title')
+    const descriptionTag = readTag(tags, 'description')
+    const imageTag = readTag(tags, 'image')
+    const imageFileTag = tags.find((tag) => (
+      Array.isArray(tag)
+      && tag[0] === 'image-file'
+      && typeof tag[1] === 'string'
+    ))
+
+    const parsedImageFile = normalizeAttachmentEnvelope(parsedRecord.imageFile)
       || (() => {
         if (!imageFileTag) return null
         try {
@@ -1206,11 +1266,49 @@ export class MarmotService {
           return null
         }
       })()
-    const imageUrl = parsed.imageUrl || readTag(tags, 'image') || parsedImageFile?.url || null
 
-    const next = this.setMetadata(conversationId, { title, description, imageUrl })
-    if (parsedImageFile) {
-      this.observeConversationFile(conversationId, parsedImageFile, 'metadata-rumor')
+    const hasTitle = hasOwn('title') || typeof titleTag === 'string'
+    const hasDescription = hasOwn('description') || typeof descriptionTag === 'string'
+    const hasImage =
+      hasOwn('imageUrl')
+      || hasOwn('imageFile')
+      || typeof imageTag === 'string'
+      || Boolean(imageFileTag)
+
+    const title = hasTitle
+      ? sanitizeString(hasOwn('title') ? parsedRecord.title : titleTag, 256) || null
+      : undefined
+
+    const description = hasDescription
+      ? sanitizeString(hasOwn('description') ? parsedRecord.description : descriptionTag, 1024) || null
+      : undefined
+
+    const rawImageUrl = hasOwn('imageUrl')
+      ? parsedRecord.imageUrl
+      : imageTag || parsedImageFile?.url || parsedImageFile?.gatewayUrl || null
+    const imageUrl = hasImage ? sanitizeString(rawImageUrl, 2048) || null : undefined
+
+    return {
+      title,
+      description,
+      imageUrl,
+      imageAttachment: parsedImageFile
+    }
+  }
+
+  applyMetadataRumor(conversationId, rumor) {
+    const parsed = this.extractMetadataFromRumor(rumor)
+    if (!parsed) return false
+
+    const patch = {}
+    if (parsed.title !== undefined) patch.title = parsed.title
+    if (parsed.description !== undefined) patch.description = parsed.description
+    if (parsed.imageUrl !== undefined) patch.imageUrl = parsed.imageUrl
+    if (!Object.keys(patch).length) return false
+
+    const next = this.setMetadata(conversationId, patch)
+    if (parsed.imageAttachment) {
+      this.observeConversationFile(conversationId, parsed.imageAttachment, 'metadata-rumor')
     }
     return !!next
   }
@@ -1285,6 +1383,114 @@ export class MarmotService {
     }
   }
 
+  inviteNeedsPreview(invite) {
+    if (!invite || typeof invite !== 'object') return false
+    if (!invite.welcomeRumor) return false
+
+    if (!invite.conversationId) return true
+    if (!Array.isArray(invite.memberPubkeys) || invite.memberPubkeys.length === 0) return true
+    if (!invite.title && !invite.description && !invite.imageUrl) return true
+
+    return false
+  }
+
+  invitePreviewChanged(invite, preview) {
+    if (!invite || !preview) return false
+    if ((preview.conversationId || null) !== (invite.conversationId || null)) return true
+    if ((preview.title || null) !== (invite.title || null)) return true
+    if ((preview.description || null) !== (invite.description || null)) return true
+    if ((preview.imageUrl || null) !== (invite.imageUrl || null)) return true
+    if (!sameNormalizedPubkeyList(preview.memberPubkeys || [], invite.memberPubkeys || [])) return true
+    return false
+  }
+
+  async createInvitePreviewClient() {
+    if (!this.client || !this.signer || !this.network) {
+      throw new Error('Invite preview client unavailable before Marmot init')
+    }
+
+    const previewKeyValueStore = new InMemoryKeyValueBackend()
+    const previewGroupStateBackend = new KeyValueGroupStateBackend(new InMemoryKeyValueBackend())
+    const previewKeyPackageStore = new KeyPackageStore(previewKeyValueStore)
+    const previewClient = new MarmotClient({
+      signer: this.signer,
+      network: this.network,
+      groupStateBackend: previewGroupStateBackend,
+      keyPackageStore: previewKeyPackageStore
+    })
+
+    const localKeyPackages = await this.client.keyPackageStore.list()
+    for (const listedPackage of localKeyPackages) {
+      const privatePackage = await this.client.keyPackageStore.getPrivateKey(listedPackage.keyPackageRef)
+      if (!privatePackage) continue
+      await previewClient.keyPackageStore.add({
+        publicPackage: listedPackage.publicPackage,
+        privatePackage
+      })
+    }
+
+    return previewClient
+  }
+
+  async deriveInvitePreview(invite, previewClient) {
+    if (!invite?.welcomeRumor || !previewClient || !this.network) return null
+
+    const group = await previewClient.joinGroupFromWelcome({
+      welcomeRumor: invite.welcomeRumor,
+      keyPackageEventId: invite.keyPackageEventId || undefined
+    })
+
+    let title = sanitizeString(group?.groupData?.name || '', 256) || null
+    let description = sanitizeString(group?.groupData?.description || '', 1024) || null
+    let imageUrl = null
+
+    const cachedMetadata = this.getMetadata(group.idStr)
+    if (cachedMetadata) {
+      if (!title && cachedMetadata.title) title = cachedMetadata.title
+      if (!description && cachedMetadata.description) description = cachedMetadata.description
+      if (cachedMetadata.imageUrl) imageUrl = cachedMetadata.imageUrl
+    }
+
+    const relays = uniqueRelays(group.relays || this.relays)
+    try {
+      const events = await this.network.request(relays, {
+        kinds: [GROUP_EVENT_KIND],
+        '#h': [group.idStr],
+        limit: 400
+      })
+
+      if (events.length) {
+        for await (const result of group.ingest(sortEventsChronological(events))) {
+          if (result?.kind !== 'applicationMessage') continue
+          const rumor = deserializeApplicationRumor(result.message)
+          if (!rumor || !this.isMetadataRumor(rumor)) continue
+
+          const parsedMetadata = this.extractMetadataFromRumor(rumor)
+          if (!parsedMetadata) continue
+
+          if (parsedMetadata.title !== undefined) title = parsedMetadata.title
+          if (parsedMetadata.description !== undefined) description = parsedMetadata.description
+          if (parsedMetadata.imageUrl !== undefined) imageUrl = parsedMetadata.imageUrl
+        }
+      }
+    } catch (error) {
+      this.logger.debug?.('[MarmotService] Failed to derive invite metadata from group events', {
+        inviteId: invite.id,
+        conversationId: group.idStr,
+        error: error?.message || error
+      })
+    }
+
+    const memberPubkeys = normalizePubkeyList(getGroupMembers(group.state))
+    return {
+      conversationId: group.idStr,
+      title: title || null,
+      description: description || null,
+      imageUrl: imageUrl || sanitizeString(invite.imageUrl, 2048) || null,
+      memberPubkeys: memberPubkeys.length ? memberPubkeys : normalizePubkeyList([invite.senderPubkey])
+    }
+  }
+
   async syncInvites({ emit = false } = {}) {
     if (!this.network || !this.signer) return []
 
@@ -1296,10 +1502,14 @@ export class MarmotService {
     }
 
     const events = await this.network.request(this.relays, filters)
-    if (!events.length) return []
-
     let maxSeen = this.lastInviteSyncAt
-    const changedInvites = []
+    const changedInvitesById = new Map()
+    const markInviteChanged = (invite) => {
+      if (!invite?.id) return
+      changedInvitesById.set(invite.id, invite)
+    }
+    let previewClient = null
+    let previewClientUnavailable = false
 
     for (const event of sortEventsChronological(events)) {
       const createdAt = Number(event.created_at) || 0
@@ -1328,7 +1538,7 @@ export class MarmotService {
       const relaysTag = ensureArray(welcomeRumor.tags).find(
         (tag) => Array.isArray(tag) && tag[0] === 'relays'
       )
-      const invite = this.normalizeInvite(inviteId, {
+      let invite = this.normalizeInvite(inviteId, {
         ...existing,
         id: inviteId,
         senderPubkey: normalizePubkey(welcomeRumor.pubkey),
@@ -1345,14 +1555,87 @@ export class MarmotService {
 
       if (!invite) continue
 
+      if (this.inviteNeedsPreview(invite)) {
+        if (!previewClient && !previewClientUnavailable) {
+          try {
+            previewClient = await this.createInvitePreviewClient()
+          } catch (error) {
+            previewClientUnavailable = true
+            this.logger.debug?.('[MarmotService] Invite preview client unavailable', {
+              inviteId,
+              error: error?.message || error
+            })
+          }
+        }
+
+        if (previewClient) {
+          try {
+            const preview = await this.deriveInvitePreview(invite, previewClient)
+            if (preview) {
+              const enrichedInvite = this.normalizeInvite(inviteId, {
+                ...invite,
+                ...preview
+              })
+              if (enrichedInvite) invite = enrichedInvite
+            }
+          } catch (error) {
+            this.logger.debug?.('[MarmotService] Failed to derive invite preview', {
+              inviteId,
+              error: error?.message || error
+            })
+          }
+        }
+      }
+
       this.invitesById.set(inviteId, invite)
-      changedInvites.push(invite)
+      markInviteChanged(invite)
+    }
+
+    const pendingInviteIds = Array.from(this.invitesById.keys())
+    for (const inviteId of pendingInviteIds) {
+      const invite = this.invitesById.get(inviteId)
+      if (!invite || invite.status === 'joined') continue
+      if (!this.inviteNeedsPreview(invite)) continue
+
+      if (!previewClient && !previewClientUnavailable) {
+        try {
+          previewClient = await this.createInvitePreviewClient()
+        } catch (error) {
+          previewClientUnavailable = true
+          this.logger.debug?.('[MarmotService] Invite preview client unavailable', {
+            inviteId,
+            error: error?.message || error
+          })
+        }
+      }
+
+      if (!previewClient) continue
+
+      try {
+        const preview = await this.deriveInvitePreview(invite, previewClient)
+        if (!preview || !this.invitePreviewChanged(invite, preview)) continue
+
+        const enrichedInvite = this.normalizeInvite(inviteId, {
+          ...invite,
+          ...preview
+        })
+        if (!enrichedInvite) continue
+
+        this.invitesById.set(inviteId, enrichedInvite)
+        markInviteChanged(enrichedInvite)
+      } catch (error) {
+        this.logger.debug?.('[MarmotService] Failed to derive invite preview', {
+          inviteId,
+          error: error?.message || error
+        })
+      }
     }
 
     if (maxSeen > this.lastInviteSyncAt) {
       this.lastInviteSyncAt = maxSeen
     }
 
+    const changedInvites = Array.from(changedInvitesById.values())
     if (changedInvites.length) {
       this.schedulePersist()
       if (emit) {
@@ -1557,7 +1840,8 @@ export class MarmotService {
           invite.senderPubkey,
           invite.title,
           invite.description,
-          invite.conversationId
+          invite.conversationId,
+          ...(Array.isArray(invite.memberPubkeys) ? invite.memberPubkeys : [])
         ]
           .map((value) => String(value || '').toLowerCase())
           .join(' ')

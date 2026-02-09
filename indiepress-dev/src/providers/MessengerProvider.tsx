@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { useNostr } from './NostrProvider'
 import { electronIpc } from '@/services/electron-ipc.service'
 import type {
@@ -76,6 +76,7 @@ type MessengerContextType = {
   messenger: MarmotMessenger | null
   conversations: ConversationSummary[]
   invites: ConversationInvite[]
+  pendingInviteCount: number
   ready: boolean
   unsupportedReason?: string
   createConversation: (input: CreateConversationInput) => Promise<CreateConversationResult>
@@ -84,6 +85,9 @@ type MessengerContextType = {
   refreshConversations: (query?: ConversationQuery) => Promise<ConversationSummary[]>
   refreshInvites: (query?: ConversationQuery) => Promise<ConversationInvite[]>
   updateConversationMetadata: (input: UpdateConversationMetadataInput) => Promise<void>
+  dismissInvite: (inviteId: string) => void
+  markInviteAccepted: (inviteId: string, conversationId?: string | null) => void
+  getInviteById: (inviteId: string) => ConversationInvite | null
   drainBufferedMessages: (conversationId: string) => ThreadMessage[]
 }
 
@@ -92,6 +96,9 @@ const MessengerContext = createContext<MessengerContextType | undefined>(undefin
 const debug = (...args: any[]) => console.debug('[MarmotProvider]', ...args)
 
 const readStateStorageKey = (pubkey: string | null | undefined) => `marmotReadState:${pubkey || 'anon'}`
+const inviteDismissedStorageKey = (pubkey: string | null | undefined) => `marmotInviteDismissed:${pubkey || 'anon'}`
+const inviteAcceptedStorageKey = (pubkey: string | null | undefined) => `marmotInviteAccepted:${pubkey || 'anon'}`
+const inviteAcceptedConversationStorageKey = (pubkey: string | null | undefined) => `marmotInviteAcceptedConversation:${pubkey || 'anon'}`
 
 function normalizeRelayUrls(relayList: { read: string[]; write: string[] } | null, discoveryRelay?: string) {
   const relays = [
@@ -170,7 +177,12 @@ function parseInvites(payload: any): ConversationInvite[] {
       conversationId: typeof row.conversationId === 'string' ? row.conversationId : null,
       title: typeof row.title === 'string' ? row.title : null,
       description: typeof row.description === 'string' ? row.description : null,
-      imageUrl: typeof row.imageUrl === 'string' ? row.imageUrl : null
+      imageUrl: typeof row.imageUrl === 'string' ? row.imageUrl : null,
+      memberPubkeys: Array.isArray(row.memberPubkeys)
+        ? row.memberPubkeys
+            .map((value: unknown) => (typeof value === 'string' ? value.trim().toLowerCase() : ''))
+            .filter((value: string) => Boolean(value))
+        : []
     }))
 }
 
@@ -233,6 +245,19 @@ function parseReadState(payload: any, conversationId: string): ReadState {
   }
 }
 
+function readInviteCache(key: string): Set<string> {
+  if (typeof window === 'undefined') return new Set()
+  try {
+    const raw = window.localStorage.getItem(key)
+    if (!raw) return new Set()
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return new Set()
+    return new Set(parsed.map((entry) => String(entry || '').trim()).filter(Boolean))
+  } catch {
+    return new Set()
+  }
+}
+
 export function useMessenger() {
   const ctx = useContext(MessengerContext)
   if (!ctx) throw new Error('useMessenger must be used within MessengerProvider')
@@ -243,6 +268,9 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
   const { pubkey, relayList, isReady } = useNostr()
   const [conversations, setConversations] = useState<ConversationSummary[]>([])
   const [invites, setInvites] = useState<ConversationInvite[]>([])
+  const [dismissedInviteIds, setDismissedInviteIds] = useState<Set<string>>(new Set())
+  const [acceptedInviteIds, setAcceptedInviteIds] = useState<Set<string>>(new Set())
+  const [acceptedInviteConversationIds, setAcceptedInviteConversationIds] = useState<Set<string>>(new Set())
   const [unsupportedReason, setUnsupportedReason] = useState<string | undefined>(undefined)
   const [ready, setReady] = useState(false)
 
@@ -250,6 +278,9 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
   const bufferedMessagesRef = useRef<Map<string, ThreadMessage[]>>(new Map())
   const messageCacheRef = useRef<Map<string, ThreadMessage[]>>(new Map())
   const readStateRef = useRef<Map<string, ReadState>>(new Map())
+  const dismissedInviteIdsRef = useRef<Set<string>>(new Set())
+  const acceptedInviteIdsRef = useRef<Set<string>>(new Set())
+  const acceptedInviteConversationIdsRef = useRef<Set<string>>(new Set())
 
   const discoveryRelay = import.meta.env.VITE_DISCOVERY_RELAY as string | undefined
   const relayUrls = useMemo(
@@ -303,6 +334,69 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
+  useEffect(() => {
+    if (!pubkey || typeof window === 'undefined') {
+      const empty = new Set<string>()
+      setDismissedInviteIds(empty)
+      dismissedInviteIdsRef.current = empty
+      setAcceptedInviteIds(empty)
+      acceptedInviteIdsRef.current = empty
+      setAcceptedInviteConversationIds(empty)
+      acceptedInviteConversationIdsRef.current = empty
+      return
+    }
+
+    const dismissed = readInviteCache(inviteDismissedStorageKey(pubkey))
+    const accepted = readInviteCache(inviteAcceptedStorageKey(pubkey))
+    const acceptedConversations = readInviteCache(inviteAcceptedConversationStorageKey(pubkey))
+
+    setDismissedInviteIds(dismissed)
+    dismissedInviteIdsRef.current = dismissed
+    setAcceptedInviteIds(accepted)
+    acceptedInviteIdsRef.current = accepted
+    setAcceptedInviteConversationIds(acceptedConversations)
+    acceptedInviteConversationIdsRef.current = acceptedConversations
+  }, [pubkey])
+
+  useEffect(() => {
+    dismissedInviteIdsRef.current = dismissedInviteIds
+    if (!pubkey || typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(
+        inviteDismissedStorageKey(pubkey),
+        JSON.stringify(Array.from(dismissedInviteIds))
+      )
+    } catch {
+      // best effort
+    }
+  }, [dismissedInviteIds, pubkey])
+
+  useEffect(() => {
+    acceptedInviteIdsRef.current = acceptedInviteIds
+    if (!pubkey || typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(
+        inviteAcceptedStorageKey(pubkey),
+        JSON.stringify(Array.from(acceptedInviteIds))
+      )
+    } catch {
+      // best effort
+    }
+  }, [acceptedInviteIds, pubkey])
+
+  useEffect(() => {
+    acceptedInviteConversationIdsRef.current = acceptedInviteConversationIds
+    if (!pubkey || typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(
+        inviteAcceptedConversationStorageKey(pubkey),
+        JSON.stringify(Array.from(acceptedInviteConversationIds))
+      )
+    } catch {
+      // best effort
+    }
+  }, [acceptedInviteConversationIds, pubkey])
+
   const sendToWorkerAwait = async (message: Record<string, unknown>, timeoutMs = 30_000) => {
     const response = await electronIpc.sendToWorkerAwait({ message, timeoutMs })
     if (!response?.success) {
@@ -338,6 +432,87 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     })
   }
 
+  const isInviteActionable = useCallback((invite: ConversationInvite | null | undefined) => {
+    if (!invite || !invite.id) return false
+    if (dismissedInviteIdsRef.current.has(invite.id)) return false
+    if (acceptedInviteIdsRef.current.has(invite.id)) return false
+    if (
+      invite.conversationId
+      && acceptedInviteConversationIdsRef.current.has(invite.conversationId)
+    ) {
+      return false
+    }
+    if (invite.status === 'joined') return false
+    return true
+  }, [])
+
+  const sortInvites = useCallback((rows: ConversationInvite[]) => {
+    return [...rows].sort((left, right) => {
+      if (left.createdAt !== right.createdAt) return right.createdAt - left.createdAt
+      return left.id.localeCompare(right.id)
+    })
+  }, [])
+
+  const filterActionableInvites = useCallback((rows: ConversationInvite[]) => {
+    return sortInvites(rows.filter((invite) => isInviteActionable(invite)))
+  }, [isInviteActionable, sortInvites])
+
+  const dismissInvite = useCallback((inviteId: string) => {
+    const normalizedInviteId = String(inviteId || '').trim()
+    if (!normalizedInviteId) return
+    setDismissedInviteIds((previous) => {
+      if (previous.has(normalizedInviteId)) return previous
+      const next = new Set(previous)
+      next.add(normalizedInviteId)
+      return next
+    })
+    setInvites((previous) => previous.filter((invite) => invite.id !== normalizedInviteId))
+  }, [])
+
+  const markInviteAccepted = useCallback((inviteId: string, conversationId?: string | null) => {
+    const normalizedInviteId = String(inviteId || '').trim()
+    const normalizedConversationId = String(conversationId || '').trim()
+
+    if (normalizedInviteId) {
+      setAcceptedInviteIds((previous) => {
+        if (previous.has(normalizedInviteId)) return previous
+        const next = new Set(previous)
+        next.add(normalizedInviteId)
+        return next
+      })
+    }
+
+    if (normalizedConversationId) {
+      setAcceptedInviteConversationIds((previous) => {
+        if (previous.has(normalizedConversationId)) return previous
+        const next = new Set(previous)
+        next.add(normalizedConversationId)
+        return next
+      })
+    }
+
+    setInvites((previous) =>
+      previous.filter((invite) => {
+        if (normalizedInviteId && invite.id === normalizedInviteId) return false
+        if (normalizedConversationId && invite.conversationId === normalizedConversationId) return false
+        if (invite.status === 'joined') return false
+        return true
+      })
+    )
+  }, [])
+
+  const getInviteById = useCallback((inviteId: string) => {
+    const normalizedInviteId = String(inviteId || '').trim()
+    if (!normalizedInviteId) return null
+    return invites.find((invite) => invite.id === normalizedInviteId) || null
+  }, [invites])
+
+  const pendingInviteCount = invites.length
+
+  useEffect(() => {
+    setInvites((previous) => filterActionableInvites(previous))
+  }, [dismissedInviteIds, acceptedInviteIds, acceptedInviteConversationIds, filterActionableInvites])
+
   const refreshConversations = async (query: ConversationQuery = {}) => {
     if (!electronIpc.isElectron()) return []
     const data = await sendToWorkerAwait({
@@ -360,8 +535,9 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       }
     })
     const parsed = parseInvites(data?.invites || [])
-    setInvites(parsed)
-    return parsed
+    const actionable = filterActionableInvites(parsed)
+    setInvites(actionable)
+    return actionable
   }
 
   const loadThread = async (
@@ -468,14 +644,16 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
         inviteId
       }
     })
-    await refreshConversations()
-    await refreshInvites()
     const conversationId =
       typeof data?.conversation?.id === 'string'
         ? data.conversation.id
         : typeof data?.conversationId === 'string'
           ? data.conversationId
           : null
+
+    markInviteAccepted(inviteId, conversationId)
+    await refreshConversations()
+    await refreshInvites()
     return { conversationId }
   }
 
@@ -718,7 +896,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
         if (cancelled) return
 
         const nextConversations = parseConversations(initData?.conversations || [])
-        const nextInvites = parseInvites(initData?.invites || [])
+        const nextInvites = filterActionableInvites(parseInvites(initData?.invites || []))
 
         setConversations(nextConversations)
         setInvites(nextInvites)
@@ -768,13 +946,14 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       if (msg.type === 'marmot-invite-updated' && msg.data?.invite) {
         const invite = parseInvites([msg.data.invite])[0]
         if (!invite) return
+        if (!isInviteActionable(invite)) {
+          setInvites((previous) => previous.filter((item) => item.id !== invite.id))
+          emitEvent({ type: 'invite-updated', invite })
+          return
+        }
         setInvites((previous) => {
           const next = [...previous.filter((item) => item.id !== invite.id), invite]
-          next.sort((left, right) => {
-            if (left.createdAt !== right.createdAt) return right.createdAt - left.createdAt
-            return left.id.localeCompare(right.id)
-          })
-          return next
+          return sortInvites(next)
         })
         emitEvent({ type: 'invite-updated', invite })
         return
@@ -837,6 +1016,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       messenger,
       conversations,
       invites,
+      pendingInviteCount,
       ready,
       unsupportedReason,
       createConversation,
@@ -845,6 +1025,9 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       refreshConversations,
       refreshInvites,
       updateConversationMetadata,
+      dismissInvite,
+      markInviteAccepted,
+      getInviteById,
       drainBufferedMessages: (conversationId: string) => {
         const list = bufferedMessagesRef.current.get(conversationId) || []
         bufferedMessagesRef.current.delete(conversationId)
@@ -855,6 +1038,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       messenger,
       conversations,
       invites,
+      pendingInviteCount,
       ready,
       unsupportedReason,
       createConversation,
@@ -862,7 +1046,10 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       acceptInvite,
       refreshConversations,
       refreshInvites,
-      updateConversationMetadata
+      updateConversationMetadata,
+      dismissInvite,
+      markInviteAccepted,
+      getInviteById
     ]
   )
 

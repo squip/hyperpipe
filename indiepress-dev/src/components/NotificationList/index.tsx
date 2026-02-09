@@ -3,9 +3,11 @@ import { getEmbeddedPubkeys, getParentETag } from '@/lib/event'
 import { usePrimaryPage } from '@/PageManager'
 import { binarySearch } from '@nostr/tools/utils'
 import { useGroups } from '@/providers/GroupsProvider'
+import { useMessenger } from '@/providers/MessengerProvider'
 import { useNostr } from '@/providers/NostrProvider'
 import { useNotification } from '@/providers/NotificationProvider'
 import { useUserPreferences } from '@/providers/UserPreferencesProvider'
+import { toConversationInviteNotificationEvent } from '@/lib/conversations/invite-notifications'
 import client from '@/services/client.service'
 import noteStatsService from '@/services/note-stats.service'
 import { TFeedSubRequest, TNotificationType } from '@/types'
@@ -32,6 +34,7 @@ const NotificationList = forwardRef((_, ref) => {
   const { pubkey } = useNostr()
   const { getNotificationsSeenAt } = useNotification()
   const { invites } = useGroups()
+  const { invites: conversationInvites } = useMessenger()
   const { notificationListStyle } = useUserPreferences()
   const [notificationType, setNotificationType] = useState<TNotificationType>('all')
   const [lastReadTime, setLastReadTime] = useState(0)
@@ -55,8 +58,13 @@ const NotificationList = forwardRef((_, ref) => {
       if (!inviteEvent?.id) continue
       inviteByEventId.set(inviteEvent.id, inviteEvent)
     }
+    for (const invite of conversationInvites) {
+      const inviteEvent = toConversationInviteNotificationEvent(invite)
+      if (!inviteEvent?.id) continue
+      inviteByEventId.set(inviteEvent.id, inviteEvent)
+    }
     return Array.from(inviteByEventId.values())
-  }, [invites, notificationType])
+  }, [invites, conversationInvites, notificationType])
 
   const displayNotifications = useMemo(() => {
     if (notificationType !== 'all') return filteredNotifications
