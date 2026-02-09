@@ -24,7 +24,9 @@ export default function Notification({
   middle = null,
   targetEvent,
   isNew = false,
-  showStats = false
+  showStats = false,
+  showBottomTimestamp = true,
+  onClick
 }: {
   icon: React.ReactNode
   notificationId: string
@@ -35,6 +37,8 @@ export default function Notification({
   targetEvent?: NostrEvent
   isNew?: boolean
   showStats?: boolean
+  showBottomTimestamp?: boolean
+  onClick?: () => void
 }) {
   const { t } = useTranslation()
   const { push } = useSecondaryPage()
@@ -48,6 +52,10 @@ export default function Notification({
 
   const handleClick = () => {
     markNotificationAsRead(notificationId)
+    if (onClick) {
+      onClick()
+      return
+    }
     if (targetEvent) {
       push(toNote(targetEvent.id))
     } else if (pubkey) {
@@ -119,7 +127,9 @@ export default function Notification({
             event={targetEvent}
           />
         )}
-        <FormattedTimestamp timestamp={sentAt} className="shrink-0 text-muted-foreground text-sm" />
+        {showBottomTimestamp && (
+          <FormattedTimestamp timestamp={sentAt} className="shrink-0 text-muted-foreground text-sm" />
+        )}
         {showStats && targetEvent && <NoteStats event={targetEvent} className="mt-1" />}
       </div>
     </div>

@@ -7,7 +7,8 @@ import BottomNavigationBarItem from './BottomNavigationBarItem'
 export default function NotificationsButton() {
   const { checkLogin } = useNostr()
   const { navigate, current, display } = usePrimaryPage()
-  const { hasNewNotification } = useNotification()
+  const { newNotificationCount } = useNotification()
+  const badgeLabel = newNotificationCount > 99 ? '99+' : String(newNotificationCount)
 
   return (
     <BottomNavigationBarItem
@@ -16,8 +17,10 @@ export default function NotificationsButton() {
     >
       <div className="relative">
         <Bell />
-        {hasNewNotification && (
-          <div className="absolute -top-0.5 right-0.5 w-2 h-2 ring-2 ring-background bg-primary rounded-full" />
+        {newNotificationCount > 0 && (
+          <span className="absolute -top-2 -right-2 min-w-4 h-4 px-1 rounded-full bg-primary text-primary-foreground text-[10px] font-semibold leading-4 text-center">
+            {badgeLabel}
+          </span>
         )}
       </div>
     </BottomNavigationBarItem>

@@ -63,6 +63,7 @@ type ProvisionalGroupMetadataEntry = {
 type TGroupsContext = {
   discoveryGroups: TGroupMetadata[]
   invites: TGroupInvite[]
+  pendingInviteCount: number
   joinRequests: Record<string, TJoinRequest[]>
   favoriteGroups: string[]
   myGroupList: TGroupListEntry[]
@@ -74,6 +75,7 @@ type TGroupsContext = {
   refreshInvites: () => Promise<void>
   dismissInvite: (inviteId: string) => void
   markInviteAccepted: (inviteId: string, groupId?: string) => void
+  getInviteByEventId: (eventId: string) => TGroupInvite | null
   loadJoinRequests: (groupId: string, relay?: string) => Promise<void>
   resolveRelayUrl: (relay?: string) => string | undefined
   toggleFavorite: (groupKey: string) => void
@@ -154,6 +156,7 @@ export const useGroups = () => {
     return {
       discoveryGroups: [],
       invites: [],
+      pendingInviteCount: 0,
        joinRequests: {},
       favoriteGroups: [],
       myGroupList: [],
@@ -165,6 +168,7 @@ export const useGroups = () => {
       refreshInvites: async () => {},
       dismissInvite: () => {},
       markInviteAccepted: () => {},
+      getInviteByEventId: () => null,
       loadJoinRequests: async () => {},
       resolveRelayUrl: (r?: string) => r,
       toggleFavorite: () => {},
@@ -442,6 +446,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const acceptedInviteGroupIdsRef = useRef<Set<string>>(new Set())
   const groupMemberPreviewByKeyRef = useRef<Record<string, GroupMemberPreviewEntry>>({})
   const groupMemberPreviewInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map())
+  const inviteRefreshInFlightRef = useRef(false)
 
   const workerRelayUrlMap = useMemo(() => {
     const map = new Map<string, string>()
@@ -898,6 +903,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       })
     })
   }, [upsertProvisionalGroupMetadata])
+
+  const getInviteByEventId = useCallback(
+    (eventId: string) => {
+      const normalizedEventId = String(eventId || '').trim()
+      if (!normalizedEventId) return null
+      return invites.find((invite) => invite.event?.id === normalizedEventId) || null
+    },
+    [invites]
+  )
+
+  const pendingInviteCount = invites.length
 
   const refreshInvites = useCallback(async () => {
     if (!pubkey) {
@@ -3341,6 +3357,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     () => ({
       discoveryGroups,
       invites,
+      pendingInviteCount,
       joinRequests,
       favoriteGroups,
       myGroupList,
@@ -3352,6 +3369,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       refreshInvites,
       dismissInvite,
       markInviteAccepted,
+      getInviteByEventId,
       loadJoinRequests,
       resolveRelayUrl,
       toggleFavorite,
@@ -3477,6 +3495,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       discoveryGroups,
       favoriteGroups,
       invites,
+      pendingInviteCount,
       joinRequests,
       myGroupList,
       isLoadingDiscovery,
@@ -3487,6 +3506,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       refreshInvites,
       dismissInvite,
       markInviteAccepted,
+      getInviteByEventId,
       loadJoinRequests,
       saveMyGroupList,
       sendJoinRequest,
@@ -3521,8 +3541,50 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   }, [refreshDiscovery])
 
   useEffect(() => {
-    refreshInvites()
-  }, [refreshInvites])
+    if (!pubkey) {
+      setInvites([])
+      inviteRefreshInFlightRef.current = false
+      return
+    }
+    if (typeof window === 'undefined') return
+
+    let cancelled = false
+    const refreshWithGuard = async () => {
+      if (cancelled || inviteRefreshInFlightRef.current) return
+      inviteRefreshInFlightRef.current = true
+      try {
+        await refreshInvites()
+      } finally {
+        inviteRefreshInFlightRef.current = false
+      }
+    }
+
+    void refreshWithGuard()
+
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === 'hidden') return
+      void refreshWithGuard()
+    }, 45_000)
+
+    const onFocus = () => {
+      void refreshWithGuard()
+    }
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshWithGuard()
+      }
+    }
+
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(intervalId)
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
+  }, [pubkey, refreshInvites])
 
   return <GroupsContext.Provider value={value}>{children}</GroupsContext.Provider>
 }

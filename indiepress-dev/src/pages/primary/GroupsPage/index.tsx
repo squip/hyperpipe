@@ -117,11 +117,6 @@ function isDragScrollBlockedTarget(target: EventTarget | null) {
     && !!target.closest('button, a, input, textarea, select, label, [role="button"], [data-no-drag-scroll="true"]')
 }
 
-function formatAbsoluteDate(timestamp: number | null) {
-  if (!timestamp || !Number.isFinite(timestamp)) return '-'
-  return dayjs.unix(timestamp).format('YYYY-MM-DD HH:mm')
-}
-
 function SortHeaderButton({
   label,
   active,
@@ -189,13 +184,17 @@ function InviteSenderLabel({ userId }: { userId: string }) {
   return <span className="truncate text-xs font-medium max-w-[220px]">{label}</span>
 }
 
-const GroupsPage = forwardRef<TPageRef>((_, ref) => {
+const GroupsPage = forwardRef<
+  TPageRef,
+  { initialTab?: TTab; tabRequestId?: string | number }
+>(({ initialTab, tabRequestId }, ref) => {
   const layoutRef = useRef<TPageRef>(null)
   useImperativeHandle(ref, () => layoutRef.current!)
   const { t } = useTranslation()
   const {
     discoveryGroups,
     invites,
+    pendingInviteCount,
     myGroupList,
     getProvisionalGroupMetadata,
     refreshDiscovery,
@@ -213,7 +212,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
   } = useGroups()
   const { startJoinFlow, sendToWorker, getRelayPeerCount } = useWorkerBridge()
   const { pubkey } = useNostr()
-  const [tab, setTab] = useState<TTab>('discover')
+  const [tab, setTab] = useState<TTab>(initialTab || 'discover')
   const [search, setSearch] = useState('')
   const [showCreate, setShowCreate] = useState(false)
   const [joiningInviteId, setJoiningInviteId] = useState<string | null>(null)
@@ -227,6 +226,11 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
   const { push } = useSecondaryPage()
 
   const inviteGroupIds = useMemo(() => new Set(invites.map((inv) => inv.groupId)), [invites])
+
+  useEffect(() => {
+    if (!initialTab) return
+    setTab(initialTab)
+  }, [initialTab, tabRequestId])
 
   const resolveGroupMeta = useCallback(
     (groupId: string, relay?: string) => {
@@ -1041,9 +1045,10 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
           style={{ touchAction: 'pan-y' }}
           {...tableScrollHandlers}
         >
-          <table className="w-full min-w-[1280px] table-fixed">
+          <table className="w-full min-w-[1220px] table-fixed">
             <thead className="bg-muted/40 text-xs font-medium text-muted-foreground">
               <tr>
+                <th className="w-[220px] px-3 py-2 text-left">{t('Actions')}</th>
                 <th className="w-14 px-3 py-2 text-left"><span className="sr-only">{t('Thumbnail')}</span></th>
                 <th className="w-[200px] px-3 py-2 text-left">
                   <SortHeaderButton
@@ -1087,14 +1092,6 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
                 </th>
                 <th className="w-[150px] px-3 py-2 text-left">
                   <SortHeaderButton
-                    label={t('Invite date')}
-                    active={inviteSort.key === 'inviteDate'}
-                    direction={inviteSort.direction}
-                    onClick={() => toggleInviteSort('inviteDate')}
-                  />
-                </th>
-                <th className="w-[150px] px-3 py-2 text-left">
-                  <SortHeaderButton
                     label={t('Members')}
                     active={inviteSort.key === 'members'}
                     direction={inviteSort.direction}
@@ -1125,7 +1122,6 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
                     onClick={() => toggleInviteSort('invitedBy')}
                   />
                 </th>
-                <th className="w-[220px] px-3 py-2 text-left">{t('Actions')}</th>
               </tr>
             </thead>
             <tbody className="text-sm">
@@ -1144,6 +1140,21 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
                 const initials = (row.name || 'GR').slice(0, 2).toUpperCase()
                 return (
                   <tr key={row.key} className="border-t transition-colors hover:bg-accent/30">
+                    <td className="px-3 py-3 align-top">
+                      <div className="flex items-center gap-2">
+                        <Button variant="outline" size="sm" onClick={() => handleDismissInvite(row.invite)}>
+                          <X className="w-4 h-4 mr-1" />
+                          {t('Dismiss')}
+                        </Button>
+                        <Button
+                          size="sm"
+                          disabled={joiningInviteId === row.invite.event.id}
+                          onClick={() => handleUseInvite(row.invite)}
+                        >
+                          {joiningInviteId === row.invite.event.id ? t('Joining…') : t('Use invite')}
+                        </Button>
+                      </div>
+                    </td>
                     <td className="px-3 py-3 align-top">
                       <Avatar className="h-10 w-10 shrink-0">
                         {row.picture ? <AvatarImage src={row.picture} alt={row.name} /> : null}
@@ -1174,7 +1185,6 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
                         <span className="text-xs text-muted-foreground">-</span>
                       )}
                     </td>
-                    <td className="px-3 py-3 align-top text-xs text-muted-foreground">{formatAbsoluteDate(row.inviteDate)}</td>
                     <td className="px-3 py-3 align-top">
                       <MembersCell members={members} />
                     </td>
@@ -1190,21 +1200,6 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
                         <InviteSenderLabel userId={row.invitedBy} />
                       </div>
                     </td>
-                    <td className="px-3 py-3 align-top">
-                      <div className="flex items-center gap-2">
-                        <Button variant="outline" size="sm" onClick={() => handleDismissInvite(row.invite)}>
-                          <X className="w-4 h-4 mr-1" />
-                          {t('Dismiss')}
-                        </Button>
-                        <Button
-                          size="sm"
-                          disabled={joiningInviteId === row.invite.event.id}
-                          onClick={() => handleUseInvite(row.invite)}
-                        >
-                          {joiningInviteId === row.invite.event.id ? t('Joining…') : t('Use invite')}
-                        </Button>
-                      </div>
-                    </td>
                   </tr>
                 )
               })}
@@ -1214,6 +1209,9 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
       </div>
     )
   }
+
+  const invitesTabLabel =
+    pendingInviteCount > 0 ? `${t('Invites')} (${pendingInviteCount})` : t('Invites')
 
   return (
     <PrimaryPageLayout
@@ -1240,7 +1238,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
           <TabsList className="grid w-full grid-cols-3">
             <TabsTrigger value="discover">{t('Discover')}</TabsTrigger>
             <TabsTrigger value="my">{t('My Groups')}</TabsTrigger>
-            <TabsTrigger value="invites">{t('Invites')}</TabsTrigger>
+            <TabsTrigger value="invites">{invitesTabLabel}</TabsTrigger>
           </TabsList>
 
           <TabsContent value="discover" className="mt-4">

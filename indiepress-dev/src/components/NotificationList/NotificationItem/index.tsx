@@ -12,6 +12,9 @@ import { PollResponseNotification } from './PollResponseNotification'
 import { ReactionNotification } from './ReactionNotification'
 import { RepostNotification } from './RepostNotification'
 import { ZapNotification } from './ZapNotification'
+import { GroupInviteNotification } from './GroupInviteNotification'
+
+const GROUP_INVITE_KIND = 9009
 
 export function NotificationItem({
   notification,
@@ -41,6 +44,9 @@ export function NotificationItem({
   ])
   if (!canShow) return null
 
+  if (notification.kind === GROUP_INVITE_KIND) {
+    return <GroupInviteNotification notification={notification} isNew={isNew} />
+  }
   if (notification.kind === kinds.Reaction) {
     return <ReactionNotification notification={notification} isNew={isNew} />
   }

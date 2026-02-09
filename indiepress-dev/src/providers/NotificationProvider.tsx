@@ -9,6 +9,7 @@ import * as kinds from '@nostr/tools/kinds'
 import { SubCloser } from '@nostr/tools/abstract-pool'
 import { createContext, useContext, useEffect, useMemo, useState } from 'react'
 import { useContentPolicy } from './ContentPolicyProvider'
+import { useGroups } from './GroupsProvider'
 import { useMuteList } from './MuteListProvider'
 import { useNostr } from './NostrProvider'
 import { useUserTrust } from './UserTrustProvider'
@@ -16,6 +17,8 @@ import { pool } from '@nostr/gadgets/global'
 
 type TNotificationContext = {
   hasNewNotification: boolean
+  newNotificationCount: number
+  newInviteNotificationCount: number
   getNotificationsSeenAt: () => number
   isNotificationRead: (id: string) => boolean
   markNotificationAsRead: (id: string) => void
@@ -35,6 +38,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
   const { current } = usePrimaryPage()
   const active = useMemo(() => current === 'notifications', [current])
   const { pubkey, notificationsSeenAt, updateNotificationsSeenAt } = useNostr()
+  const { invites } = useGroups()
   const { hideUntrustedNotifications, isUserTrusted } = useUserTrust()
   const { mutePubkeySet } = useMuteList()
   const { hideContentMentioningMutedUsers } = useContentPolicy()
@@ -72,6 +76,23 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
     isUserTrusted,
     active
   ])
+
+  const newInviteNotificationCount = useMemo(() => {
+    if (active || notificationsSeenAt < 0) return 0
+    const seenInviteEventIds = new Set<string>()
+    let count = 0
+    for (const invite of invites) {
+      const inviteEventId = invite.event?.id
+      if (!inviteEventId || seenInviteEventIds.has(inviteEventId)) continue
+      seenInviteEventIds.add(inviteEventId)
+      if (invite.event.created_at > notificationsSeenAt) {
+        count += 1
+      }
+    }
+    return count
+  }, [active, invites, notificationsSeenAt])
+
+  const newNotificationCount = filteredNewNotifications.length + newInviteNotificationCount
 
   useEffect(() => {
     setNewNotifications([])
@@ -187,8 +208,6 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
   }, [pubkey])
 
   useEffect(() => {
-    const newNotificationCount = filteredNewNotifications.length
-
     // Update title
     if (newNotificationCount > 0) {
       document.title = `(${newNotificationCount >= 10 ? '9+' : newNotificationCount}) Fevela`
@@ -225,7 +244,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         })
       }
     }
-  }, [filteredNewNotifications])
+  }, [newNotificationCount])
 
   const getNotificationsSeenAt = () => {
     if (notificationsSeenAt >= 0) {
@@ -248,7 +267,9 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
   return (
     <NotificationContext.Provider
       value={{
-        hasNewNotification: filteredNewNotifications.length > 0,
+        hasNewNotification: newNotificationCount > 0,
+        newNotificationCount,
+        newInviteNotificationCount,
         getNotificationsSeenAt,
         isNotificationRead,
         markNotificationAsRead

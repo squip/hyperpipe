@@ -2,6 +2,7 @@ import { ExtendedKind, NOTIFICATION_LIST_STYLE } from '@/constants'
 import { getEmbeddedPubkeys, getParentETag } from '@/lib/event'
 import { usePrimaryPage } from '@/PageManager'
 import { binarySearch } from '@nostr/tools/utils'
+import { useGroups } from '@/providers/GroupsProvider'
 import { useNostr } from '@/providers/NostrProvider'
 import { useNotification } from '@/providers/NotificationProvider'
 import { useUserPreferences } from '@/providers/UserPreferencesProvider'
@@ -30,6 +31,7 @@ const NotificationList = forwardRef((_, ref) => {
   const active = useMemo(() => current === 'notifications' && display, [current, display])
   const { pubkey } = useNostr()
   const { getNotificationsSeenAt } = useNotification()
+  const { invites } = useGroups()
   const { notificationListStyle } = useUserPreferences()
   const [notificationType, setNotificationType] = useState<TNotificationType>('all')
   const [lastReadTime, setLastReadTime] = useState(0)
@@ -44,6 +46,36 @@ const NotificationList = forwardRef((_, ref) => {
   const topRef = useRef<HTMLDivElement | null>(null)
   const bottomRef = useRef<HTMLDivElement | null>(null)
   const filterGeneration = useRef(0)
+
+  const inviteNotificationEvents = useMemo(() => {
+    if (notificationType !== 'all') return []
+    const inviteByEventId = new Map<string, NostrEvent>()
+    for (const invite of invites) {
+      const inviteEvent = invite?.event
+      if (!inviteEvent?.id) continue
+      inviteByEventId.set(inviteEvent.id, inviteEvent)
+    }
+    return Array.from(inviteByEventId.values())
+  }, [invites, notificationType])
+
+  const displayNotifications = useMemo(() => {
+    if (notificationType !== 'all') return filteredNotifications
+
+    const dedupedById = new Map<string, NostrEvent>()
+    for (const event of filteredNotifications) {
+      dedupedById.set(event.id, event)
+    }
+    for (const event of inviteNotificationEvents) {
+      dedupedById.set(event.id, event)
+    }
+
+    return Array.from(dedupedById.values()).sort((left, right) => {
+      if (left.created_at !== right.created_at) {
+        return right.created_at - left.created_at
+      }
+      return right.id.localeCompare(left.id)
+    })
+  }, [filteredNotifications, inviteNotificationEvents, notificationType])
 
   const filter = useMemo<Omit<Filter, 'since' | 'until'> | undefined>(() => {
     if (!pubkey) return
@@ -330,7 +362,7 @@ const NotificationList = forwardRef((_, ref) => {
       if (showCount < events.length) {
         setShowCount((count) => count + SHOW_COUNT)
         // preload more?
-        if (filteredNotifications.length - showCount > LIMIT / 2) {
+        if (displayNotifications.length - showCount > LIMIT / 2) {
           return
         }
       }
@@ -362,7 +394,7 @@ const NotificationList = forwardRef((_, ref) => {
         setHasMore(false)
       }
     }
-  }, [pubkey, subRequests, loading, showCount, filteredNotifications])
+  }, [pubkey, subRequests, loading, showCount, displayNotifications])
 
   const refresh = () => {
     topRef.current?.scrollIntoView({ behavior: 'instant', block: 'start' })
@@ -373,7 +405,7 @@ const NotificationList = forwardRef((_, ref) => {
 
   const list = (
     <div className={notificationListStyle === NOTIFICATION_LIST_STYLE.COMPACT ? 'pt-2' : ''}>
-      {filteredNotifications.slice(0, showCount).map((notification) => (
+      {displayNotifications.slice(0, showCount).map((notification) => (
         <NotificationItem
           key={notification.id}
           notification={notification}
