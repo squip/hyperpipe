@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import nodeCrypto from 'node:crypto'
 import swarmCrypto from 'hypercore-crypto'
 import b4a from 'b4a'
+import WebSocket from 'ws'
 import GatewayService from './gateway/GatewayService.mjs'
 import {
   getAllRelayProfiles,
@@ -83,6 +84,34 @@ import {
   setRelayWriterPool,
   pruneWriterPoolEntries
 } from './relay-writer-pool-store.mjs'
+import MarmotService from './marmot-service.mjs'
+import ConversationFileIndex from './conversation-file-index.mjs'
+
+if (typeof globalThis.crypto === 'undefined' && nodeCrypto?.webcrypto) {
+  try {
+    Object.defineProperty(globalThis, 'crypto', {
+      value: nodeCrypto.webcrypto,
+      configurable: true,
+      writable: true
+    })
+    console.info('[Worker] Installed WebCrypto shim on globalThis.crypto')
+  } catch (error) {
+    console.warn('[Worker] Failed to install WebCrypto shim:', error?.message || error)
+  }
+}
+
+if (typeof globalThis.WebSocket === 'undefined' && WebSocket) {
+  try {
+    Object.defineProperty(globalThis, 'WebSocket', {
+      value: WebSocket,
+      configurable: true,
+      writable: true
+    })
+    console.info('[Worker] Installed WebSocket shim on globalThis.WebSocket')
+  } catch (error) {
+    console.warn('[Worker] Failed to install WebSocket shim:', error?.message || error)
+  }
+}
 
 const pearRuntime = globalThis?.Pear
 const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd()
@@ -797,6 +826,46 @@ function collectPublicGatewayOrigins() {
   }
 
   return Array.from(origins)
+}
+
+async function ensureConversationFileIndex(storageRoot = null) {
+  if (conversationFileIndex) return conversationFileIndex
+  const basePath =
+    storageRoot
+    || global.userConfig?.storage
+    || config?.storage
+    || defaultStorageDir
+  try {
+    const next = new ConversationFileIndex({
+      storageRoot: basePath,
+      logger: console
+    })
+    await next.load()
+    conversationFileIndex = next
+    return conversationFileIndex
+  } catch (error) {
+    console.warn('[Worker] Failed to initialize conversation file index:', error?.message || error)
+    return null
+  }
+}
+
+function registerConversationFileObservation(payload = {}) {
+  if (!payload || typeof payload !== 'object') return
+  ensureConversationFileIndex()
+    .then((index) => {
+      if (!index) return
+      const record = index.upsert(payload)
+      if (!record) return
+      console.debug('[Worker] conversation-file-index upsert', {
+        conversationId: record.conversationId,
+        fileHash: record.fileHash,
+        providers: record.providers?.size || 0,
+        source: payload.source || null
+      })
+    })
+    .catch((error) => {
+      console.warn('[Worker] Failed writing conversation file index entry:', error?.message || error)
+    })
 }
 
 function delay(ms) {
@@ -2750,6 +2819,8 @@ let gatewayOptions = { port: 8443, hostname: '127.0.0.1', listenHost: '127.0.0.1
 let publicGatewaySettings = null
 let publicGatewayStatusCache = null
 let pendingGatewayMetadataSync = false
+let marmotService = null
+let conversationFileIndex = null
 
 const WORKER_MESSAGE_VERSION = 1
 const WORKER_SESSION_ID =
@@ -2764,12 +2835,12 @@ const PROXY_DERIVATION_DKLEN_BYTES = 32
 async function appendFilekeyDbEntry (relayKey, fileHash) {
   if (!config?.driveKey || !config?.nostr_pubkey_hex) {
     console.warn(`[Worker] appendFilekeyDbEntry skipped: missing driveKey or nostr_pubkey_hex (driveKey=${!!config?.driveKey}, pub=${!!config?.nostr_pubkey_hex})`)
-    return
+    return false
   }
   const relayManager = activeRelays.get(relayKey)
   if (!relayManager?.relay) {
     console.warn(`[Worker] appendFilekeyDbEntry skipped: no active relay manager for key=${relayKey}`)
-    return
+    return false
   }
 
   const fileKey = `filekey:${fileHash}:drivekey:${config.driveKey}:pubkey:${config.nostr_pubkey_hex}`
@@ -2793,17 +2864,22 @@ async function appendFilekeyDbEntry (relayKey, fileHash) {
       console.warn('[Index] relay.update after put failed:', e?.message || e)
     }
     console.log(`[Worker] Stored filekey index for ${fileHash} on relay ${relayKey}`)
+    return true
   } catch (err) {
     console.error('[Worker] Failed to store filekey index:', err)
+    return false
   }
 }
 
 async function publishFilekeyEvent (relayKey, fileHash) {
   if (!config?.nostr_pubkey_hex || !config?.nostr_nsec_hex || !config?.driveKey) return
-  const relayManager = activeRelays.get(relayKey)
   try {
-    await appendFilekeyDbEntry(relayKey, fileHash)
-    console.log(`[Worker] Published filekey event for ${fileHash} on relay ${relayKey}`)
+    const stored = await appendFilekeyDbEntry(relayKey, fileHash)
+    if (stored) {
+      console.log(`[Worker] Published filekey event for ${fileHash} on relay ${relayKey}`)
+    } else {
+      console.debug(`[Worker] publishFilekeyEvent skipped (no relay manager) file=${fileHash} relay=${relayKey}`)
+    }
   } catch (err) {
     console.error('[Worker] Failed to publish filekey event:', err)
   }
@@ -3307,6 +3383,88 @@ function sendWorkerResponse(requestId, { success = true, data = null, error = nu
   })
 }
 
+function summarizeMarmotCommandPayload(type, payload = {}) {
+  const data = payload && typeof payload === 'object' ? payload : {}
+  const summary = {}
+
+  if (Array.isArray(data.relays)) summary.relayCount = data.relays.length
+  if (typeof data.search === 'string') summary.searchLength = data.search.length
+  if (typeof data.conversationId === 'string') summary.conversationId = previewValue(data.conversationId, 20)
+  if (typeof data.inviteId === 'string' || typeof data.id === 'string') {
+    summary.inviteId = previewValue(data.inviteId || data.id, 20)
+  }
+  if (Array.isArray(data.members) || Array.isArray(data.memberPubkeys)) {
+    const members = Array.isArray(data.members) ? data.members : data.memberPubkeys
+    summary.memberCount = members.length
+  }
+  if (Array.isArray(data.attachments)) summary.attachmentCount = data.attachments.length
+  if (typeof data.content === 'string') summary.contentLength = data.content.length
+  if (typeof data.title === 'string') summary.titleLength = data.title.length
+  if (typeof data.limit === 'number') summary.limit = data.limit
+  if (type === 'marmot-init') summary.relayOverride = Array.isArray(data.relays)
+  return summary
+}
+
+function summarizeMarmotCommandResult(type, result = {}) {
+  const data = result && typeof result === 'object' ? result : {}
+  const summary = {}
+
+  if (Array.isArray(data.conversations)) summary.conversationCount = data.conversations.length
+  if (Array.isArray(data.invites)) summary.inviteCount = data.invites.length
+  if (Array.isArray(data.messages)) summary.messageCount = data.messages.length
+  if (Array.isArray(data.invited)) summary.invitedCount = data.invited.length
+  if (Array.isArray(data.failed)) summary.failedCount = data.failed.length
+  if (Number.isFinite(data.unreadCount)) summary.unreadCount = Number(data.unreadCount)
+  if (type === 'marmot-send-message' || type === 'marmot-send-media-message') {
+    summary.hasMessage = !!data?.message
+  }
+  if (Array.isArray(data.failed) && data.failed.length > 0) {
+    const firstFailure = data.failed[0] && typeof data.failed[0] === 'object' ? data.failed[0] : null
+    if (firstFailure) {
+      if (typeof firstFailure.pubkey === 'string') summary.firstFailedPubkey = previewValue(firstFailure.pubkey, 20)
+      if (typeof firstFailure.error === 'string') summary.firstFailedError = firstFailure.error
+    }
+  }
+
+  const conversationId =
+    (typeof data?.conversation?.id === 'string' && data.conversation.id)
+    || (typeof data.conversationId === 'string' && data.conversationId)
+    || null
+  if (conversationId) summary.conversationId = previewValue(conversationId, 20)
+
+  const messageId =
+    (typeof data?.message?.id === 'string' && data.message.id)
+    || (typeof data.messageId === 'string' && data.messageId)
+    || null
+  if (messageId) summary.messageId = previewValue(messageId, 20)
+
+  if (type === 'marmot-init' && Array.isArray(data.relays)) {
+    summary.relayCount = data.relays.length
+  }
+
+  return summary
+}
+
+function getMarmotService() {
+  if (marmotService) return marmotService
+
+  const storageRoot = global.userConfig?.storage || config?.storage || defaultStorageDir
+  marmotService = new MarmotService({
+    storageRoot,
+    getConfig: () => config || storedParentConfig || {},
+    sendMessage,
+    logger: console,
+    getPublicGatewayOrigins: collectPublicGatewayOrigins,
+    onConversationFileObserved: (payload = {}) => {
+      registerConversationFileObservation({
+        ...payload,
+        source: payload?.source || 'marmot-observed'
+      })
+    }
+  })
+  return marmotService
+}
+
 let workerStatusState = {
   user: null,
   app: {
@@ -3617,6 +3775,123 @@ async function reconcileRelayFiles() {
   }
 }
 
+async function recoverConversationDriveFile({
+  conversationId = null,
+  fileHash = null,
+  reason = 'conversation-on-demand'
+} = {}) {
+  const normalizedConversationId = normalizeDriveIdentifier(conversationId)
+  const normalizedFileHash =
+    typeof fileHash === 'string' && /^[a-fA-F0-9]{64}$/.test(fileHash.trim())
+      ? fileHash.trim().toLowerCase()
+      : null
+
+  if (!normalizedConversationId || !normalizedFileHash) {
+    return { status: 'error', reason: 'invalid-conversation-recovery-input' }
+  }
+
+  try {
+    const local = await getFile(normalizedConversationId, normalizedFileHash)
+    if (local) {
+      return {
+        status: 'ok',
+        reason: 'already-local',
+        conversationId: normalizedConversationId,
+        fileHash: normalizedFileHash
+      }
+    }
+  } catch (_) {}
+
+  const index = await ensureConversationFileIndex()
+  if (!index) {
+    return {
+      status: 'error',
+      reason: 'conversation-file-index-unavailable',
+      conversationId: normalizedConversationId,
+      fileHash: normalizedFileHash
+    }
+  }
+
+  const providers = index.getProviders(normalizedConversationId, normalizedFileHash)
+  if (!providers.length) {
+    return {
+      status: 'error',
+      reason: 'conversation-file-no-providers',
+      conversationId: normalizedConversationId,
+      fileHash: normalizedFileHash
+    }
+  }
+
+  const providerKeys = providers
+    .map((provider) => provider?.driveKey)
+    .filter((driveKey) => typeof driveKey === 'string' && /^[a-f0-9]{64}$/i.test(driveKey))
+    .map((driveKey) => driveKey.toLowerCase())
+
+  if (!providerKeys.length) {
+    return {
+      status: 'error',
+      reason: 'conversation-file-no-provider-keys',
+      conversationId: normalizedConversationId,
+      fileHash: normalizedFileHash
+    }
+  }
+
+  try {
+    await ensureMirrorsForProviders(new Set(providerKeys), normalizedConversationId)
+  } catch (error) {
+    console.warn('[Recover] conversation ensureMirrorsForProviders failed', {
+      conversationId: normalizedConversationId,
+      fileHash: normalizedFileHash,
+      error: error?.message || error
+    })
+  }
+
+  for (const driveKey of providerKeys) {
+    try {
+      const data = await fetchFileFromDrive(driveKey, normalizedConversationId, normalizedFileHash)
+      if (!data) continue
+      await storeFile(normalizedConversationId, normalizedFileHash, data, {
+        sourceDrive: driveKey,
+        recoveredAt: Date.now(),
+        reason
+      })
+      registerConversationFileObservation({
+        conversationId: normalizedConversationId,
+        fileHash: normalizedFileHash,
+        driveKey,
+        source: 'recover-conversation-drive-file'
+      })
+      console.info('[Recover] conversation drive file fetch complete', {
+        conversationId: normalizedConversationId,
+        fileHash: normalizedFileHash,
+        provider: driveKey,
+        reason
+      })
+      return {
+        status: 'ok',
+        reason: 'fetched',
+        conversationId: normalizedConversationId,
+        fileHash: normalizedFileHash,
+        provider: driveKey
+      }
+    } catch (error) {
+      console.warn('[Recover] conversation provider fetch failed', {
+        conversationId: normalizedConversationId,
+        fileHash: normalizedFileHash,
+        provider: driveKey,
+        error: error?.message || error
+      })
+    }
+  }
+
+  return {
+    status: 'error',
+    reason: 'conversation-file-fetch-failed',
+    conversationId: normalizedConversationId,
+    fileHash: normalizedFileHash
+  }
+}
+
 async function recoverRelayDriveFile({
   relayKey = null,
   identifier = null,
@@ -3638,11 +3913,21 @@ async function recoverRelayDriveFile({
     }
   }
   if (!resolvedRelayKey) {
-    return { status: 'error', reason: 'relay-unresolved' }
+    return await recoverConversationDriveFile({
+      conversationId: identifier,
+      fileHash,
+      reason
+    })
   }
 
   const relayManager = activeRelays.get(resolvedRelayKey)
   if (!relayManager?.relay || typeof relayManager.relay.queryFilekeyIndex !== 'function') {
+    const conversationRecovery = await recoverConversationDriveFile({
+      conversationId: identifier || resolvedRelayKey,
+      fileHash,
+      reason
+    })
+    if (conversationRecovery?.status === 'ok') return conversationRecovery
     return { status: 'error', reason: 'relay-unavailable', relayKey: resolvedRelayKey }
   }
 
@@ -4001,6 +4286,7 @@ global.getRelayMirrorCoreRefsCache = getRelayMirrorCoreRefsCache
 global.syncActiveRelayCoreRefs = syncActiveRelayCoreRefs
 global.appendOpenJoinMirrorCores = appendOpenJoinMirrorCores
 global.recoverRelayDriveFile = recoverRelayDriveFile
+global.recoverConversationDriveFile = recoverConversationDriveFile
 global.requestRelaySubscriptionRefresh = async ({ relayKey = null, reason = 'manual' } = {}) => {
   console.log('[Worker] Subscription refresh requested before relay server ready', {
     relayKey,
@@ -4281,27 +4567,32 @@ async function handleMessageObject(message) {
       break
     }
 
-    case 'upload-file': {
+	    case 'upload-file': {
       const requestId =
         (typeof message.requestId === 'string' && message.requestId) ||
         (typeof message?.data?.requestId === 'string' && message.data.requestId) ||
         null
       const startedAt = Date.now()
       try {
-        const {
-          relayKey,
-          identifier: idFromMsg,
+	        const {
+	          relayKey,
+	          identifier: idFromMsg,
           publicIdentifier,
           fileHash,
           fileId: fileIdFromMsg,
           metadata,
           buffer,
-          localRelayBaseUrl
-        } = message.data || {}
-        const identifier = idFromMsg || publicIdentifier || relayKey
-        if (!identifier || !fileHash || !buffer) throw new Error('Missing identifier/publicIdentifier, fileHash, or buffer')
-        console.log(`[Upload] begin relayKey=${relayKey} identifier=${identifier} fileHash=${fileHash} metaKeys=${metadata ? Object.keys(metadata) : 'none'} bufLen=${buffer?.length}`)
-        const data = b4a.from(buffer, 'base64')
+	          localRelayBaseUrl
+	        } = message.data || {}
+	        const identifier = idFromMsg || publicIdentifier || relayKey
+	        if (!identifier || !fileHash || !buffer) throw new Error('Missing identifier/publicIdentifier, fileHash, or buffer')
+	        const resourceScope =
+	          typeof metadata?.resourceScope === 'string'
+	            ? metadata.resourceScope.trim().toLowerCase()
+	            : null
+	        const isConversationScope = resourceScope === 'conversation'
+	        console.log(`[Upload] begin relayKey=${relayKey} identifier=${identifier} fileHash=${fileHash} metaKeys=${metadata ? Object.keys(metadata) : 'none'} bufLen=${buffer?.length}`)
+	        const data = b4a.from(buffer, 'base64')
         const fileId =
           typeof fileIdFromMsg === 'string' && fileIdFromMsg.trim()
             ? fileIdFromMsg.trim()
@@ -4312,36 +4603,57 @@ async function handleMessageObject(message) {
         } catch (_) {}
         await ensureRelayFolder(identifier)
         await storeFile(identifier, fileHash, data, metadata || null)
-        let resolvedRelayKey = relayKey
-        if (!resolvedRelayKey && identifier && !/^[a-fA-F0-9]{64}$/.test(identifier)) {
-          try { resolvedRelayKey = await getRelayKeyFromPublicIdentifier(identifier) } catch (_) {}
-        }
-        if (resolvedRelayKey) {
-          await appendFilekeyDbEntry(resolvedRelayKey, fileHash)
-          ensureMirrorsForAllRelays().catch(err => console.warn('[Mirror] ensure after upload failed:', err))
-        } else {
-          console.warn('[Worker] upload-file: could not resolve relayKey for identifier', identifier)
-        }
-        const localUrl = buildLocalDriveFileUrl(localRelayBaseUrl, identifier, fileId)
-        const summary = {
-          relayKey: resolvedRelayKey || null,
-          identifier,
-          fileHash,
-          fileId,
-          url: localUrl,
-          mime: metadata?.mimeType || metadata?.m || null,
-          size: Number.isFinite(metadata?.size) ? Number(metadata.size) : null,
+	        let resolvedRelayKey = relayKey
+	        if (!isConversationScope && !resolvedRelayKey && identifier && !/^[a-fA-F0-9]{64}$/.test(identifier)) {
+	          try { resolvedRelayKey = await getRelayKeyFromPublicIdentifier(identifier) } catch (_) {}
+	        }
+	        if (!isConversationScope && resolvedRelayKey) {
+	          await appendFilekeyDbEntry(resolvedRelayKey, fileHash)
+	          ensureMirrorsForAllRelays().catch(err => console.warn('[Mirror] ensure after upload failed:', err))
+	        } else if (!isConversationScope) {
+	          console.warn('[Worker] upload-file: could not resolve relayKey for identifier', identifier)
+	        }
+	        const localUrl = buildLocalDriveFileUrl(localRelayBaseUrl, identifier, fileId)
+	        const gatewayOrigins = isConversationScope ? [] : collectPublicGatewayOrigins()
+	        const gatewayUrls = gatewayOrigins
+	          .map((origin) => buildLocalDriveFileUrl(origin, identifier, fileId))
+	          .filter(Boolean)
+	        const gatewayUrl = gatewayUrls[0] || localUrl || null
+	        const summary = {
+	          relayKey: resolvedRelayKey || null,
+	          identifier,
+	          fileHash,
+	          fileId,
+	          url: localUrl,
+	          gatewayUrl: isConversationScope ? null : gatewayUrl,
+	          gatewayUrls: isConversationScope ? [] : gatewayUrls,
+	          mime: metadata?.mimeType || metadata?.m || null,
+	          size: Number.isFinite(metadata?.size) ? Number(metadata.size) : null,
           dim:
             typeof metadata?.dim === 'string' && metadata.dim
               ? metadata.dim
               : metadata?.dim && Number.isFinite(metadata.dim.width) && Number.isFinite(metadata.dim.height)
                 ? `${Math.trunc(metadata.dim.width)}x${Math.trunc(metadata.dim.height)}`
                 : null,
-          driveKey: config?.driveKey || null,
-          dedupHit,
-          elapsedMs: Date.now() - startedAt
-        }
-        console.info('[Upload] complete', summary)
+	          driveKey: config?.driveKey || null,
+	          ownerPubkey: config?.nostr_pubkey_hex || null,
+	          dedupHit,
+	          elapsedMs: Date.now() - startedAt
+	        }
+	        if (isConversationScope) {
+	          registerConversationFileObservation({
+	            conversationId: identifier,
+	            fileHash,
+	            fileId,
+	            driveKey: config?.driveKey || null,
+	            ownerPubkey: config?.nostr_pubkey_hex || null,
+	            url: localUrl,
+	            mime: metadata?.mimeType || metadata?.m || null,
+	            size: Number.isFinite(metadata?.size) ? Number(metadata.size) : null,
+	            source: 'upload-file'
+	          })
+	        }
+	        console.info('[Upload] complete', summary)
         console.log(`[Upload] complete relayKey=${resolvedRelayKey || relayKey} identifier=${identifier} fileHash=${fileHash}`)
         sendMessage({ type: 'upload-file-complete', relayKey: resolvedRelayKey || null, identifier, fileHash })
         sendWorkerResponse(requestId, {
@@ -4416,6 +4728,64 @@ async function handleMessageObject(message) {
           success: false,
           error: err?.message || String(err)
         })
+      }
+      break
+    }
+
+    case 'marmot-init':
+    case 'marmot-list-conversations':
+    case 'marmot-list-invites':
+    case 'marmot-create-conversation':
+    case 'marmot-invite-members':
+    case 'marmot-accept-invite':
+    case 'marmot-load-thread':
+    case 'marmot-send-message':
+    case 'marmot-send-media-message':
+    case 'marmot-mark-read':
+    case 'marmot-update-conversation-metadata':
+    case 'marmot-subscribe-conversation':
+    case 'marmot-unsubscribe-conversation': {
+      const requestId =
+        (typeof message?.requestId === 'string' && message.requestId)
+        || (typeof message?.data?.requestId === 'string' && message.data.requestId)
+        || null
+      const commandType = message.type
+      const payload = message?.data || {}
+      const commandSummary = summarizeMarmotCommandPayload(commandType, payload)
+      const commandStartedAt = Date.now()
+
+      console.info('[Worker][MarmotCommand] start', {
+        type: commandType,
+        requestId: requestId || null,
+        ...commandSummary
+      })
+
+      try {
+        const service = getMarmotService()
+        const data = await service.handleCommand(commandType, payload)
+        const elapsedMs = Date.now() - commandStartedAt
+        console.info('[Worker][MarmotCommand] success', {
+          type: commandType,
+          requestId: requestId || null,
+          elapsedMs,
+          ...summarizeMarmotCommandResult(commandType, data)
+        })
+        sendWorkerResponse(requestId, { success: true, data })
+      } catch (err) {
+        const errorMessage = err?.message || String(err)
+        const elapsedMs = Date.now() - commandStartedAt
+        console.error('[Worker][MarmotCommand] failed', {
+          type: commandType,
+          requestId: requestId || null,
+          elapsedMs,
+          ...commandSummary,
+          error: errorMessage
+        }, err)
+        sendWorkerResponse(requestId, {
+          success: false,
+          error: errorMessage
+        })
+        sendMessage({ type: 'error', message: `${commandType} failed: ${errorMessage}` })
       }
       break
     }
@@ -5421,6 +5791,24 @@ async function cleanup() {
     })
   }
 
+  if (marmotService?.stop) {
+    try {
+      await marmotService.stop()
+    } catch (err) {
+      console.warn('[Worker] Failed to stop marmot service:', err?.message || err)
+    }
+  }
+  marmotService = null
+
+  if (conversationFileIndex?.close) {
+    try {
+      await conversationFileIndex.close()
+    } catch (err) {
+      console.warn('[Worker] Failed to close conversation file index:', err?.message || err)
+    }
+  }
+  conversationFileIndex = null
+
   if (relayServer && relayServer.shutdownRelayServer) {
     console.log('[Worker] Stopping relay server...')
     await relayServer.shutdownRelayServer()
@@ -5518,12 +5906,13 @@ async function main() {
         config = await loadOrCreateConfig(userSpecificStorage)
 
         // Merge parent config with loaded config (parent values win for identity fields)
-        config = {
-          ...config,
-          ...parentConfig,
-          storage: userSpecificStorage,
-          userKey
-        }
+	        config = {
+	          ...config,
+	          ...parentConfig,
+	          storage: userSpecificStorage,
+	          userKey
+	        }
+	        await ensureConversationFileIndex(userSpecificStorage)
 
         // Derive deterministic proxy identity in worker (matches legacy design intent)
         try {
@@ -5580,11 +5969,12 @@ async function main() {
 
         await loadRelayMembers()
         await loadRelayKeyMappings()
-      } else {
-        // Load or create configuration (no parent config provided)
-        config = await loadOrCreateConfig()
-        expectedRelayCount = Array.isArray(config.relays) ? config.relays.length : 0
-      }
+	      } else {
+	        // Load or create configuration (no parent config provided)
+	        config = await loadOrCreateConfig()
+	        expectedRelayCount = Array.isArray(config.relays) ? config.relays.length : 0
+	        await ensureConversationFileIndex(config?.storage || global.userConfig?.storage || defaultStorageDir)
+	      }
 
     applyClosedJoinPoolConfig(config)
 

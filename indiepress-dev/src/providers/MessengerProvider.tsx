@@ -1,26 +1,237 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { useNostr } from './NostrProvider'
-import { MultiPartyMessenger, createNDKWithSigner } from '@/lib/messaging/multi-party-messenger'
-import type { ConversationMeta, DMMessage, MessengerEvent } from '@/lib/messaging/types'
-import NDKCacheAdapterDexie from '@nostr-dev-kit/cache-dexie'
-import { MemoryStorage } from '@/lib/messaging/storage'
-import { CacheStorage } from '@/lib/messaging/cache-storage'
-import NDK, { NDKNip07Signer } from '@nostr-dev-kit/ndk'
-import * as nip49 from '@nostr/tools/nip49'
-import Dexie from 'dexie'
+import { electronIpc } from '@/services/electron-ipc.service'
+import type {
+  ConversationInvite,
+  ConversationQuery,
+  ConversationSummary,
+  CreateConversationInput,
+  MessageAttachment,
+  MessengerEvent,
+  ReadState,
+  SendMessageOptions,
+  ThreadMessage,
+  UpdateConversationMetadataInput
+} from '@/lib/conversations/types'
 
-const PASSWORD_PROMPT = 'Enter the password to decrypt your ncryptsec for messaging'
-const debug = (...args: any[]) => console.debug('[MessengerProvider]', ...args)
+type MarmotSendStatus = {
+  conversationId: string
+  clientMessageId: string
+  messageId?: string
+  status: 'sending' | 'sent' | 'failed'
+  error?: string
+}
+
+type LoadThreadResult = {
+  conversationId: string
+  messages: ThreadMessage[]
+  readState: ReadState
+  unreadCount: number
+}
+
+type InviteFailure = {
+  pubkey: string
+  error: string
+}
+
+type CreateConversationResult = {
+  conversation: ConversationSummary
+  invited: string[]
+  failed: InviteFailure[]
+}
+
+type MarmotMessenger = {
+  on: (cb: (event: MessengerEvent) => void) => () => void
+  off: (cb: (event: MessengerEvent) => void) => void
+  syncRecent: (conversationId?: string) => Promise<number>
+  getConversationMessages: (conversationId: string, limit?: number) => Promise<ThreadMessage[]>
+  loadThread: (
+    conversationId: string,
+    options?: {
+      limit?: number
+      beforeTimestamp?: number
+      afterTimestamp?: number
+      sync?: boolean
+    }
+  ) => Promise<LoadThreadResult>
+  sendMessage: (
+    conversationId: string,
+    content: string,
+    opts?: SendMessageOptions
+  ) => Promise<ThreadMessage[]>
+  sendMediaMessage: (
+    conversationId: string,
+    content: string,
+    attachments: MessageAttachment[],
+    opts?: SendMessageOptions
+  ) => Promise<ThreadMessage[]>
+  markConversationRead: (
+    conversationId: string,
+    lastReadMessageId?: string,
+    lastReadAt?: number
+  ) => Promise<void>
+}
 
 type MessengerContextType = {
-  messenger: MultiPartyMessenger | null
-  conversations: ConversationMeta[]
+  messenger: MarmotMessenger | null
+  conversations: ConversationSummary[]
+  invites: ConversationInvite[]
   ready: boolean
   unsupportedReason?: string
-  drainBufferedMessages: (conversationId: string) => DMMessage[]
+  createConversation: (input: CreateConversationInput) => Promise<CreateConversationResult>
+  inviteMembers: (conversationId: string, members: string[]) => Promise<void>
+  acceptInvite: (inviteId: string) => Promise<{ conversationId: string | null }>
+  refreshConversations: (query?: ConversationQuery) => Promise<ConversationSummary[]>
+  refreshInvites: (query?: ConversationQuery) => Promise<ConversationInvite[]>
+  updateConversationMetadata: (input: UpdateConversationMetadataInput) => Promise<void>
+  drainBufferedMessages: (conversationId: string) => ThreadMessage[]
 }
 
 const MessengerContext = createContext<MessengerContextType | undefined>(undefined)
+
+const debug = (...args: any[]) => console.debug('[MarmotProvider]', ...args)
+
+const readStateStorageKey = (pubkey: string | null | undefined) => `marmotReadState:${pubkey || 'anon'}`
+
+function normalizeRelayUrls(relayList: { read: string[]; write: string[] } | null, discoveryRelay?: string) {
+  const relays = [
+    ...(relayList?.read || []),
+    ...(relayList?.write || []),
+    discoveryRelay || ''
+  ]
+  const seen = new Set<string>()
+  const normalized: string[] = []
+  for (const relay of relays) {
+    if (!relay || typeof relay !== 'string') continue
+    try {
+      const parsed = new URL(relay)
+      if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') continue
+      const candidate = `wss://${parsed.host}${parsed.pathname === '/' ? '' : parsed.pathname}`
+      if (seen.has(candidate)) continue
+      seen.add(candidate)
+      normalized.push(candidate)
+    } catch {
+      continue
+    }
+  }
+  return normalized
+}
+
+function mergeMessages(existing: ThreadMessage[], incoming: ThreadMessage[]) {
+  const map = new Map(existing.map((message) => [message.id, message]))
+  for (const message of incoming) {
+    map.set(message.id, message)
+  }
+  return Array.from(map.values()).sort((a, b) => {
+    if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp
+    return a.id.localeCompare(b.id)
+  })
+}
+
+function parseConversations(payload: any): ConversationSummary[] {
+  if (!Array.isArray(payload)) return []
+  return payload
+    .filter((row) => row && typeof row === 'object' && typeof row.id === 'string')
+    .map((row) => ({
+      id: row.id,
+      protocol: 'marmot' as const,
+      participants: Array.isArray(row.participants) ? row.participants : [],
+      title: typeof row.title === 'string' && row.title ? row.title : 'Conversation',
+      description: typeof row.description === 'string' ? row.description : null,
+      imageUrl: typeof row.imageUrl === 'string' ? row.imageUrl : null,
+      unreadCount: Number.isFinite(row.unreadCount) ? Number(row.unreadCount) : 0,
+      lastMessageAt: Number.isFinite(row.lastMessageAt) ? Number(row.lastMessageAt) : 0,
+      lastMessageId: typeof row.lastMessageId === 'string' ? row.lastMessageId : null,
+      lastMessagePreview:
+        typeof row.lastMessagePreview === 'string' ? row.lastMessagePreview : null,
+      lastReadAt: Number.isFinite(row.lastReadAt) ? Number(row.lastReadAt) : 0,
+      lastReadMessageId:
+        typeof row.lastReadMessageId === 'string' ? row.lastReadMessageId : null,
+      relayCount: Number.isFinite(row.relayCount) ? Number(row.relayCount) : 0,
+      updatedAt: Number.isFinite(row.updatedAt) ? Number(row.updatedAt) : undefined
+    }))
+}
+
+function parseInvites(payload: any): ConversationInvite[] {
+  if (!Array.isArray(payload)) return []
+  return payload
+    .filter((row) => row && typeof row === 'object' && typeof row.id === 'string')
+    .map((row) => ({
+      id: row.id,
+      protocol: 'marmot' as const,
+      senderPubkey: typeof row.senderPubkey === 'string' ? row.senderPubkey : '',
+      createdAt: Number.isFinite(row.createdAt) ? Number(row.createdAt) : 0,
+      status: ['pending', 'joining', 'joined', 'failed'].includes(row.status)
+        ? row.status
+        : 'pending',
+      error: typeof row.error === 'string' ? row.error : null,
+      keyPackageEventId: typeof row.keyPackageEventId === 'string' ? row.keyPackageEventId : null,
+      relays: Array.isArray(row.relays) ? row.relays : [],
+      conversationId: typeof row.conversationId === 'string' ? row.conversationId : null,
+      title: typeof row.title === 'string' ? row.title : null,
+      description: typeof row.description === 'string' ? row.description : null,
+      imageUrl: typeof row.imageUrl === 'string' ? row.imageUrl : null
+    }))
+}
+
+function parseMessages(payload: any): ThreadMessage[] {
+  if (!Array.isArray(payload)) return []
+  return payload
+    .filter((row) => row && typeof row === 'object' && typeof row.id === 'string')
+    .map((row) => ({
+      id: row.id,
+      conversationId: typeof row.conversationId === 'string' ? row.conversationId : '',
+      senderPubkey: typeof row.senderPubkey === 'string' ? row.senderPubkey : '',
+      content: typeof row.content === 'string' ? row.content : '',
+      timestamp: Number.isFinite(row.timestamp) ? Number(row.timestamp) : 0,
+      type: ['text', 'media', 'reaction', 'system'].includes(row.type) ? row.type : 'text',
+      replyTo: typeof row.replyTo === 'string' ? row.replyTo : null,
+	      attachments: Array.isArray(row.attachments)
+	        ? row.attachments
+	            .filter((attachment: unknown): attachment is Record<string, unknown> => (
+	              !!attachment && typeof attachment === 'object'
+	            ))
+	            .map((attachment: Record<string, unknown>) => {
+	              const rawUrl = typeof attachment.url === 'string' ? attachment.url : ''
+	              const rawGatewayUrl = typeof attachment.gatewayUrl === 'string' ? attachment.gatewayUrl : ''
+	              return {
+	                url: rawUrl || rawGatewayUrl,
+	                gatewayUrl: rawGatewayUrl || null,
+	              mime: typeof attachment.mime === 'string' ? attachment.mime : null,
+	              size: Number.isFinite(attachment.size) ? Number(attachment.size) : null,
+	              width: Number.isFinite(attachment.width) ? Number(attachment.width) : null,
+	              height: Number.isFinite(attachment.height) ? Number(attachment.height) : null,
+	              blurhash: typeof attachment.blurhash === 'string' ? attachment.blurhash : null,
+	              fileName: typeof attachment.fileName === 'string' ? attachment.fileName : null,
+	              sha256: typeof attachment.sha256 === 'string' ? attachment.sha256 : null,
+	              driveKey: typeof attachment.driveKey === 'string' ? attachment.driveKey : null,
+	              ownerPubkey: typeof attachment.ownerPubkey === 'string' ? attachment.ownerPubkey : null,
+	              fileId: typeof attachment.fileId === 'string' ? attachment.fileId : null
+	              }
+	            })
+	            .filter((attachment: { url: string; gatewayUrl: string | null }) => (
+              Boolean(attachment.url || attachment.gatewayUrl)
+            ))
+        : [],
+      tags: Array.isArray(row.tags)
+        ? row.tags
+            .filter((tag: unknown): tag is unknown[] => Array.isArray(tag))
+            .map((tag: unknown[]) => tag.map((item: unknown) => String(item ?? '')))
+        : [],
+      protocol: 'marmot'
+    }))
+}
+
+function parseReadState(payload: any, conversationId: string): ReadState {
+  const source = payload && typeof payload === 'object' ? payload : {}
+  return {
+    conversationId,
+    lastReadMessageId:
+      typeof source.lastReadMessageId === 'string' ? source.lastReadMessageId : null,
+    lastReadAt: Number.isFinite(source.lastReadAt) ? Number(source.lastReadAt) : 0,
+    updatedAt: Number.isFinite(source.updatedAt) ? Number(source.updatedAt) : Date.now() / 1000
+  }
+}
 
 export function useMessenger() {
   const ctx = useContext(MessengerContext)
@@ -29,209 +240,630 @@ export function useMessenger() {
 }
 
 export function MessengerProvider({ children }: { children: React.ReactNode }) {
-  const { pubkey, relayList, nsec, ncryptsec, isReady } = useNostr()
-  const [messenger, setMessenger] = useState<MultiPartyMessenger | null>(null)
-  const [conversations, setConversations] = useState<ConversationMeta[]>([])
+  const { pubkey, relayList, isReady } = useNostr()
+  const [conversations, setConversations] = useState<ConversationSummary[]>([])
+  const [invites, setInvites] = useState<ConversationInvite[]>([])
   const [unsupportedReason, setUnsupportedReason] = useState<string | undefined>(undefined)
-  const ready = useRef(false)
-  const [readyFlag, setReadyFlag] = useState(false)
-  const messageBufferRef = useRef<Map<string, DMMessage[]>>(new Map())
+  const [ready, setReady] = useState(false)
+
+  const listenersRef = useRef<Set<(event: MessengerEvent) => void>>(new Set())
+  const bufferedMessagesRef = useRef<Map<string, ThreadMessage[]>>(new Map())
+  const messageCacheRef = useRef<Map<string, ThreadMessage[]>>(new Map())
+  const readStateRef = useRef<Map<string, ReadState>>(new Map())
+
   const discoveryRelay = import.meta.env.VITE_DISCOVERY_RELAY as string | undefined
   const relayUrls = useMemo(
-    () =>
-      Array.from(
-        new Set(
-          [...(relayList?.read || []), ...(relayList?.write || []), discoveryRelay].filter(Boolean)
-        )
-      ) as string[],
-    [discoveryRelay, relayList?.read, relayList?.write]
+    () => normalizeRelayUrls(relayList, discoveryRelay),
+    [relayList, discoveryRelay]
   )
+
   const relaySignature = useMemo(() => relayUrls.slice().sort().join('|'), [relayUrls])
-  const stableRelayUrls = useMemo(() => relayUrls, [relaySignature])
 
-  useEffect(() => {
-    debug('ready state', { readyFlag, hasMessenger: !!messenger })
-  }, [readyFlag, messenger])
+  const emitEvent = (event: MessengerEvent) => {
+    if (event.type === 'message') {
+      const list = bufferedMessagesRef.current.get(event.message.conversationId) || []
+      list.push(event.message)
+      bufferedMessagesRef.current.set(event.message.conversationId, list.slice(-50))
+    }
 
-  useEffect(() => {
-    const init = async () => {
-      if (!isReady || !pubkey || stableRelayUrls.length === 0) return
-      debug('init start', { isReady, pubkey, relays: stableRelayUrls })
-      setUnsupportedReason(undefined)
-      setReadyFlag(false)
-
-      const primaryDbName = 'fevela-nip17'
-      const fallbackDbName = `fevela-nip17-v2-${Date.now()}`
-
-      let mp: MultiPartyMessenger | null = null
-      let off: (() => void) | null = null
-
+    for (const listener of listenersRef.current) {
       try {
-        const cacheAdapter = new NDKCacheAdapterDexie({ dbName: primaryDbName })
-        let ndk: NDK | null = null
+        listener(event)
+      } catch (error) {
+        console.warn('[MarmotProvider] listener failed', error)
+      }
+    }
+  }
 
-        if (nsec) {
-          ndk = createNDKWithSigner(nsec, stableRelayUrls, discoveryRelay, cacheAdapter)
-        } else if (ncryptsec) {
-          const password = typeof window !== 'undefined' ? window.prompt(PASSWORD_PROMPT) : null
-          if (!password) {
-            setUnsupportedReason('Password required to decrypt ncryptsec for messaging.')
-            setReadyFlag(true)
-            return
-          }
-          const privkey = nip49.decrypt(ncryptsec, password)
-          ndk = createNDKWithSigner(privkey, stableRelayUrls, discoveryRelay, cacheAdapter)
-        } else if (typeof window !== 'undefined' && (window as any).nostr) {
-          const signer = new NDKNip07Signer(10_000)
-          ndk = new NDK({
-            explicitRelayUrls: stableRelayUrls,
-            signer
-          })
-          if (signer.blockUntilReady) {
-            await signer.blockUntilReady()
-          }
-        } else {
-          setUnsupportedReason('No compatible signer available for NIP-17.')
-          setReadyFlag(true)
-          return
+  const saveReadStateToStorage = (stateMap: Map<string, ReadState>) => {
+    if (typeof window === 'undefined') return
+    try {
+      const key = readStateStorageKey(pubkey)
+      const payload = Object.fromEntries(stateMap)
+      window.localStorage.setItem(key, JSON.stringify(payload))
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  const loadReadStateFromStorage = () => {
+    if (typeof window === 'undefined') return new Map<string, ReadState>()
+    try {
+      const key = readStateStorageKey(pubkey)
+      const raw = window.localStorage.getItem(key)
+      if (!raw) return new Map<string, ReadState>()
+      const parsed = JSON.parse(raw)
+      const map = new Map<string, ReadState>()
+      Object.entries(parsed || {}).forEach(([conversationId, value]) => {
+        map.set(conversationId, parseReadState(value, conversationId))
+      })
+      return map
+    } catch {
+      return new Map<string, ReadState>()
+    }
+  }
+
+  const sendToWorkerAwait = async (message: Record<string, unknown>, timeoutMs = 30_000) => {
+    const response = await electronIpc.sendToWorkerAwait({ message, timeoutMs })
+    if (!response?.success) {
+      throw new Error(response?.error || 'Worker request failed')
+    }
+    return response.data || {}
+  }
+
+  const applyConversationUpdate = (conversation: ConversationSummary) => {
+    setConversations((previous) => {
+      const existing = previous.find((item) => item.id === conversation.id)
+      if (
+        existing
+        && existing.lastMessageAt === conversation.lastMessageAt
+        && existing.unreadCount === conversation.unreadCount
+        && existing.lastReadAt === conversation.lastReadAt
+        && existing.lastReadMessageId === conversation.lastReadMessageId
+        && existing.title === conversation.title
+        && existing.description === conversation.description
+        && existing.imageUrl === conversation.imageUrl
+      ) {
+        return previous
+      }
+
+      const next = [...previous.filter((item) => item.id !== conversation.id), conversation]
+      next.sort((left, right) => {
+        if (left.lastMessageAt !== right.lastMessageAt) {
+          return right.lastMessageAt - left.lastMessageAt
         }
+        return left.id.localeCompare(right.id)
+      })
+      return next
+    })
+  }
 
-        ndk.cacheAdapter = cacheAdapter as any
+  const refreshConversations = async (query: ConversationQuery = {}) => {
+    if (!electronIpc.isElectron()) return []
+    const data = await sendToWorkerAwait({
+      type: 'marmot-list-conversations',
+      data: {
+        search: query.search || ''
+      }
+    })
+    const parsed = parseConversations(data?.conversations || [])
+    setConversations(parsed)
+    return parsed
+  }
 
-        await ndk.connect()
-        debug('NDK connected', { relays: stableRelayUrls.length })
+  const refreshInvites = async (query: ConversationQuery = {}) => {
+    if (!electronIpc.isElectron()) return []
+    const data = await sendToWorkerAwait({
+      type: 'marmot-list-invites',
+      data: {
+        search: query.search || ''
+      }
+    })
+    const parsed = parseInvites(data?.invites || [])
+    setInvites(parsed)
+    return parsed
+  }
 
-        const buildStorage = async (dbName: string) => {
-          const adapter = dbName === primaryDbName ? cacheAdapter : new NDKCacheAdapterDexie({ dbName })
-          const storage = new CacheStorage(adapter as any)
-          // ensure tables exist now so we fail early if the module is missing
-          await storage.getConversations()
-          debug('storage ready', dbName)
-          return storage
+  const loadThread = async (
+    conversationId: string,
+    options: {
+      limit?: number
+      beforeTimestamp?: number
+      afterTimestamp?: number
+      sync?: boolean
+    } = {}
+  ) => {
+    const data = await sendToWorkerAwait({
+      type: 'marmot-load-thread',
+      data: {
+        conversationId,
+        limit: options.limit,
+        beforeTimestamp: options.beforeTimestamp,
+        afterTimestamp: options.afterTimestamp,
+        sync: options.sync !== false
+      }
+    })
+
+    const messages = parseMessages(data?.messages || []).map((message) => ({
+      ...message,
+      conversationId
+    }))
+
+    messageCacheRef.current.set(conversationId, messages)
+
+    const readState = parseReadState(data?.readState || {}, conversationId)
+    readStateRef.current.set(conversationId, readState)
+    saveReadStateToStorage(readStateRef.current)
+
+    return {
+      conversationId,
+      messages,
+      readState,
+      unreadCount: Number.isFinite(data?.unreadCount) ? Number(data.unreadCount) : 0
+    }
+  }
+
+  const createConversation = async (input: CreateConversationInput) => {
+    const data = await sendToWorkerAwait({
+      type: 'marmot-create-conversation',
+      data: {
+        title: input.title,
+        description: input.description,
+        members: input.members,
+        imageUrl: input.imageUrl || null
+      }
+    })
+
+    const conversation = parseConversations(data?.conversation ? [data.conversation] : [])[0]
+    if (conversation) {
+      applyConversationUpdate(conversation)
+      emitEvent({ type: 'conversation-created', conversation })
+    }
+
+    await refreshConversations()
+    await refreshInvites()
+
+    if (!conversation) {
+      throw new Error('Worker did not return created conversation')
+    }
+
+    const invited = Array.isArray(data?.invited)
+      ? data.invited
+          .map((member: unknown) => (typeof member === 'string' ? member.trim().toLowerCase() : ''))
+          .filter((member: string) => Boolean(member))
+      : []
+
+    const failed = Array.isArray(data?.failed)
+      ? data.failed
+          .filter((row: unknown): row is Record<string, unknown> => !!row && typeof row === 'object')
+          .map((row: Record<string, unknown>) => ({
+            pubkey: typeof row.pubkey === 'string' ? row.pubkey : '',
+            error: typeof row.error === 'string' ? row.error : 'Unknown invite failure'
+          }))
+          .filter((row: InviteFailure) => Boolean(row.pubkey))
+      : []
+
+    return {
+      conversation,
+      invited,
+      failed
+    }
+  }
+
+  const inviteMembers = async (conversationId: string, members: string[]) => {
+    await sendToWorkerAwait({
+      type: 'marmot-invite-members',
+      data: {
+        conversationId,
+        members
+      }
+    })
+    await refreshConversations()
+  }
+
+  const acceptInvite = async (inviteId: string) => {
+    const data = await sendToWorkerAwait({
+      type: 'marmot-accept-invite',
+      data: {
+        inviteId
+      }
+    })
+    await refreshConversations()
+    await refreshInvites()
+    const conversationId =
+      typeof data?.conversation?.id === 'string'
+        ? data.conversation.id
+        : typeof data?.conversationId === 'string'
+          ? data.conversationId
+          : null
+    return { conversationId }
+  }
+
+  const updateConversationMetadata = async (input: UpdateConversationMetadataInput) => {
+    await sendToWorkerAwait({
+      type: 'marmot-update-conversation-metadata',
+      data: {
+        conversationId: input.conversationId,
+        title: input.title,
+        description: input.description,
+        imageUrl: input.imageUrl,
+        imageAttachment: input.imageAttachment || null,
+        publish: true
+      }
+    })
+    await refreshConversations()
+  }
+
+  const messenger = useMemo<MarmotMessenger | null>(() => {
+    if (!ready || !electronIpc.isElectron()) return null
+
+    return {
+      on: (cb: (event: MessengerEvent) => void) => {
+        listenersRef.current.add(cb)
+        return () => listenersRef.current.delete(cb)
+      },
+      off: (cb: (event: MessengerEvent) => void) => {
+        listenersRef.current.delete(cb)
+      },
+      syncRecent: async (conversationId?: string) => {
+        if (conversationId) {
+          const thread = await loadThread(conversationId, { sync: true, limit: 500 })
+          return thread.messages.length
         }
-
-        const ensureModuleSchema = async () => {
-          const db = new Dexie(`${primaryDbName}_modules`)
-          db.version(3).stores({
-            moduleMetadata: '&namespace',
-            nip17_messages: '&id, conversationId, timestamp, sender',
-            nip17_conversations: '&id, lastMessageAt'
-          })
-          await db.open()
-          db.close()
+        await refreshConversations()
+        await refreshInvites()
+        return conversations.length
+      },
+      getConversationMessages: async (conversationId: string, limit?: number) => {
+        const cached = messageCacheRef.current.get(conversationId)
+        if (cached && (!limit || cached.length <= limit)) {
+          return limit ? cached.slice(-limit) : cached
         }
+        const thread = await loadThread(conversationId, { limit: limit || 500, sync: false })
+        return limit ? thread.messages.slice(-limit) : thread.messages
+      },
+      loadThread,
+      sendMessage: async (conversationId: string, content: string, opts: SendMessageOptions = {}) => {
+        const clientMessageId =
+          opts.clientMessageId || `client-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`
 
-        let storage: CacheStorage | MemoryStorage
+        emitEvent({
+          type: 'message-send-status',
+          conversationId,
+          clientMessageId,
+          status: 'sending'
+        })
+
+        let data: any
         try {
-          storage = await buildStorage(primaryDbName)
-          debug('storage selected', 'CacheStorage', primaryDbName)
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          if (msg.includes('Collection messages not found')) {
-            console.warn('Cache module missing; repairing module schema and retrying primary', msg)
-            try {
-              await ensureModuleSchema()
-              storage = await buildStorage(primaryDbName)
-              debug('storage selected', 'CacheStorage', primaryDbName, '(after repair)')
-            } catch (errReset) {
-              console.warn('Cache module repair failed; trying fresh DB name', fallbackDbName, errReset)
-              try {
-                storage = await buildStorage(fallbackDbName)
-                debug('storage selected', 'CacheStorage', fallbackDbName)
-              } catch (err2) {
-                console.warn('Cache fallback failed; using MemoryStorage', err2)
-                storage = new MemoryStorage()
-                debug('storage selected', 'MemoryStorage')
-              }
+          data = await sendToWorkerAwait({
+            type: 'marmot-send-message',
+            data: {
+              conversationId,
+              content,
+              replyTo: opts.replyTo,
+              type: opts.type || 'text',
+              attachments: opts.attachments || [],
+              clientMessageId
             }
-          } else {
-            console.warn('Cache adapter unavailable; using MemoryStorage', err)
-            storage = new MemoryStorage()
-            debug('storage selected', 'MemoryStorage')
-          }
+          })
+        } catch (error) {
+          emitEvent({
+            type: 'message-send-status',
+            conversationId,
+            clientMessageId,
+            status: 'failed',
+            error: error instanceof Error ? error.message : String(error)
+          })
+          throw error
         }
 
-        mp = new MultiPartyMessenger(ndk, { storage, explicitRelayUrls: stableRelayUrls })
-        await mp.start()
-        debug('messenger started')
-        ready.current = true
-        setMessenger(mp)
-        const convos = await mp.getConversations()
-        debug('initial conversations', convos.length)
-        setConversations(convos)
+        const message = parseMessages(data?.message ? [data.message] : [])[0]
+        if (!message) {
+          const error = new Error('Worker did not return sent message')
+          emitEvent({
+            type: 'message-send-status',
+            conversationId,
+            clientMessageId,
+            status: 'failed',
+            error: error.message
+          })
+          throw error
+        }
 
-        off = mp.on(async (event: MessengerEvent) => {
-          if (event.type === 'message') {
-            debug('event message', {
-              id: event.message.id,
-              conversationId: event.message.conversationId,
-              read: event.message.read
-            })
-            // buffer in case UI listeners are not attached yet
-            const buf = messageBufferRef.current.get(event.message.conversationId) || []
-            buf.push(event.message)
-            // keep the latest 30 per conversation to avoid unbounded growth
-            messageBufferRef.current.set(event.message.conversationId, buf.slice(-30))
-          } else if (
-            event.type === 'conversation-created' ||
-            event.type === 'conversation-updated'
-          ) {
-            debug('event conversation', { type: event.type, id: event.conversation.id, unread: event.conversation.unreadCount })
-            setConversations((prev) => {
-              const existing = prev.find((c) => c.id === event.conversation.id)
-              const same =
-                existing &&
-                existing.lastMessageAt === event.conversation.lastMessageAt &&
-                existing.unreadCount === event.conversation.unreadCount &&
-                existing.lastReadAt === event.conversation.lastReadAt &&
-                existing.lastReadId === event.conversation.lastReadId &&
-                existing.subject === event.conversation.subject
-              if (same) {
-                return prev
-              }
-              const without = prev.filter((c) => c.id !== event.conversation.id)
-              return [...without, event.conversation].sort(
-                (a, b) => (b.lastMessageAt || 0) - (a.lastMessageAt || 0)
-              )
-            })
+        message.conversationId = conversationId
+
+        const existing = messageCacheRef.current.get(conversationId) || []
+        const merged = mergeMessages(existing, [message])
+        messageCacheRef.current.set(conversationId, merged)
+
+        emitEvent({ type: 'message', message })
+        emitEvent({
+          type: 'message-send-status',
+          conversationId,
+          clientMessageId,
+          messageId: message.id,
+          status: 'sent'
+        })
+
+        return [message]
+      },
+      sendMediaMessage: async (
+        conversationId: string,
+        content: string,
+        attachments: MessageAttachment[],
+        opts: SendMessageOptions = {}
+      ) => {
+        const clientMessageId =
+          opts.clientMessageId || `client-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`
+
+        emitEvent({
+          type: 'message-send-status',
+          conversationId,
+          clientMessageId,
+          status: 'sending'
+        })
+
+        let data: any
+        try {
+          data = await sendToWorkerAwait({
+            type: 'marmot-send-media-message',
+            data: {
+              conversationId,
+              content,
+              replyTo: opts.replyTo,
+              attachments,
+              type: 'media',
+              clientMessageId
+            }
+          })
+        } catch (error) {
+          emitEvent({
+            type: 'message-send-status',
+            conversationId,
+            clientMessageId,
+            status: 'failed',
+            error: error instanceof Error ? error.message : String(error)
+          })
+          throw error
+        }
+
+        const message = parseMessages(data?.message ? [data.message] : [])[0]
+        if (!message) {
+          const error = new Error('Worker did not return sent media message')
+          emitEvent({
+            type: 'message-send-status',
+            conversationId,
+            clientMessageId,
+            status: 'failed',
+            error: error.message
+          })
+          throw error
+        }
+
+        message.conversationId = conversationId
+
+        const existing = messageCacheRef.current.get(conversationId) || []
+        const merged = mergeMessages(existing, [message])
+        messageCacheRef.current.set(conversationId, merged)
+
+        emitEvent({ type: 'message', message })
+        emitEvent({
+          type: 'message-send-status',
+          conversationId,
+          clientMessageId,
+          messageId: message.id,
+          status: 'sent'
+        })
+
+        return [message]
+      },
+      markConversationRead: async (
+        conversationId: string,
+        lastReadMessageId?: string,
+        lastReadAt?: number
+      ) => {
+        const data = await sendToWorkerAwait({
+          type: 'marmot-mark-read',
+          data: {
+            conversationId,
+            lastReadMessageId,
+            lastReadAt
           }
         })
-      } catch (err) {
-        console.error('Failed to initialize NIP-17 messenger', err)
-        setUnsupportedReason(
-          err instanceof Error ? err.message : 'Unable to initialize NIP-17 messaging with this signer.'
+
+        const readState = parseReadState(data?.readState || {}, conversationId)
+        readStateRef.current.set(conversationId, readState)
+        saveReadStateToStorage(readStateRef.current)
+
+        setConversations((previous) =>
+          previous.map((conversation) =>
+            conversation.id === conversationId
+              ? {
+                  ...conversation,
+                  unreadCount: Number.isFinite(data?.unreadCount) ? Number(data.unreadCount) : 0,
+                  lastReadAt: readState.lastReadAt,
+                  lastReadMessageId: readState.lastReadMessageId || null
+                }
+              : conversation
+          )
         )
-        setMessenger(null)
-      } finally {
-        setReadyFlag(true)
       }
+    }
+  }, [ready, conversations.length])
 
-      return () => {
-        if (off) off()
-        debug('cleanup messenger')
-        mp?.stop()
+  useEffect(() => {
+    if (!isReady || !pubkey) return
+    if (!electronIpc.isElectron()) {
+      setUnsupportedReason('Conversations require Electron runtime.')
+      setReady(true)
+      return
+    }
+
+    let cancelled = false
+    setReady(false)
+    setUnsupportedReason(undefined)
+
+    readStateRef.current = loadReadStateFromStorage()
+
+    const init = async () => {
+      try {
+        const initData = await sendToWorkerAwait({
+          type: 'marmot-init',
+          data: {
+            relays: relayUrls
+          }
+        }, 60_000)
+
+        if (cancelled) return
+
+        const nextConversations = parseConversations(initData?.conversations || [])
+        const nextInvites = parseInvites(initData?.invites || [])
+
+        setConversations(nextConversations)
+        setInvites(nextInvites)
+        setReady(true)
+
+        debug('marmot init complete', {
+          conversations: nextConversations.length,
+          invites: nextInvites.length,
+          relayCount: relayUrls.length
+        })
+      } catch (error) {
+        console.error('Failed to initialize marmot conversations', error)
+        if (!cancelled) {
+          setUnsupportedReason(error instanceof Error ? error.message : 'Failed to initialize conversations')
+          setReady(true)
+        }
       }
     }
 
-    const cleanupPromise = init()
+    const offWorkerMessage = electronIpc.onWorkerMessage((msg) => {
+      if (!msg || typeof msg !== 'object') return
+
+      if (msg.type === 'marmot-conversation-updated' && msg.data?.conversation) {
+        const conversation = parseConversations([msg.data.conversation])[0]
+        if (!conversation) return
+        applyConversationUpdate(conversation)
+        emitEvent({ type: 'conversation-updated', conversation })
+        return
+      }
+
+      if (msg.type === 'marmot-thread-updated' && msg.data?.conversationId) {
+        const conversationId = String(msg.data.conversationId)
+        const incoming = parseMessages(msg.data.messages || []).map((message) => ({
+          ...message,
+          conversationId
+        }))
+        if (!incoming.length) return
+
+        const existing = messageCacheRef.current.get(conversationId) || []
+        const merged = mergeMessages(existing, incoming)
+        messageCacheRef.current.set(conversationId, merged)
+
+        incoming.forEach((message) => emitEvent({ type: 'message', message }))
+        return
+      }
+
+      if (msg.type === 'marmot-invite-updated' && msg.data?.invite) {
+        const invite = parseInvites([msg.data.invite])[0]
+        if (!invite) return
+        setInvites((previous) => {
+          const next = [...previous.filter((item) => item.id !== invite.id), invite]
+          next.sort((left, right) => {
+            if (left.createdAt !== right.createdAt) return right.createdAt - left.createdAt
+            return left.id.localeCompare(right.id)
+          })
+          return next
+        })
+        emitEvent({ type: 'invite-updated', invite })
+        return
+      }
+
+      if (msg.type === 'marmot-readstate-updated' && msg.data?.conversationId) {
+        const conversationId = String(msg.data.conversationId)
+        const readState = parseReadState(msg.data.readState || {}, conversationId)
+        const unreadCount = Number.isFinite(msg.data.unreadCount) ? Number(msg.data.unreadCount) : 0
+
+        readStateRef.current.set(conversationId, readState)
+        saveReadStateToStorage(readStateRef.current)
+
+        setConversations((previous) =>
+          previous.map((conversation) =>
+            conversation.id === conversationId
+              ? {
+                  ...conversation,
+                  unreadCount,
+                  lastReadAt: readState.lastReadAt,
+                  lastReadMessageId: readState.lastReadMessageId || null
+                }
+              : conversation
+          )
+        )
+
+        emitEvent({
+          type: 'readstate-updated',
+          conversationId,
+          readState,
+          unreadCount
+        })
+        return
+      }
+
+      if (msg.type === 'marmot-message-send-status' && msg.data) {
+        const statusData = msg.data as MarmotSendStatus
+        if (!statusData.conversationId || !statusData.clientMessageId) return
+        emitEvent({
+          type: 'message-send-status',
+          conversationId: statusData.conversationId,
+          clientMessageId: statusData.clientMessageId,
+          messageId: statusData.messageId,
+          status: statusData.status,
+          error: statusData.error
+        })
+      }
+    })
+
+    init()
+
     return () => {
-      cleanupPromise?.then((cleanup) => cleanup?.())
+      cancelled = true
+      offWorkerMessage?.()
     }
-  }, [isReady, pubkey, relaySignature, stableRelayUrls, nsec, ncryptsec])
+  }, [isReady, pubkey, relaySignature])
 
-  const value = useMemo(
+  const value = useMemo<MessengerContextType>(
     () => ({
       messenger,
       conversations,
-      ready: readyFlag,
+      invites,
+      ready,
       unsupportedReason,
+      createConversation,
+      inviteMembers,
+      acceptInvite,
+      refreshConversations,
+      refreshInvites,
+      updateConversationMetadata,
       drainBufferedMessages: (conversationId: string) => {
-        const buf = messageBufferRef.current.get(conversationId) || []
-        messageBufferRef.current.delete(conversationId)
-        return buf
+        const list = bufferedMessagesRef.current.get(conversationId) || []
+        bufferedMessagesRef.current.delete(conversationId)
+        return list
       }
     }),
-    [messenger, conversations, unsupportedReason, readyFlag]
+    [
+      messenger,
+      conversations,
+      invites,
+      ready,
+      unsupportedReason,
+      createConversation,
+      inviteMembers,
+      acceptInvite,
+      refreshConversations,
+      refreshInvites,
+      updateConversationMetadata
+    ]
   )
 
   return <MessengerContext.Provider value={value}>{children}</MessengerContext.Provider>

@@ -1,25 +1,247 @@
 import HideUntrustedContentButton from '@/components/HideUntrustedContentButton'
+import { FormattedTimestamp } from '@/components/FormattedTimestamp'
+import UserAvatar, { SimpleUserAvatar } from '@/components/UserAvatar'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
-import { MessageSquare, Pencil } from 'lucide-react'
-import { forwardRef, useMemo, useState } from 'react'
+import { Check, Loader2, MessageSquare, Plus, Search, UserPlus, Users } from 'lucide-react'
+import { forwardRef, type ChangeEvent, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useMessenger } from '@/providers/MessengerProvider'
 import { ConversationListPanel } from '@/components/DMConversations'
 import { useNostr } from '@/providers/NostrProvider'
 import { useSecondaryPage } from '@/PageManager'
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle
+} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
-import * as nip19 from '@nostr/tools/nip19'
-import { NDKUser } from '@nostr-dev-kit/ndk'
+import { Textarea } from '@/components/ui/textarea'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { useSearchProfiles } from '@/hooks/useSearchProfiles'
+import Username from '@/components/Username'
+import Nip05 from '@/components/Nip05'
+import type { ConversationInvite, ConversationSummary } from '@/lib/conversations/types'
+import mediaUploadService from '@/services/media-upload.service'
+import { toast } from 'sonner'
+
+type ConversationTab = 'my' | 'invites'
+
+type CreateConversationModalPayload = {
+  title: string
+  description: string
+  members: string[]
+  imageFile: File | null
+}
+
+const HYPERDRIVE_UPLOAD_RELAY_URL = 'http://127.0.0.1:8443'
+
+function normalizeSearch(value: string) {
+  return value.trim().toLowerCase()
+}
+
+function normalizePubkey(value: string): string | null {
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  if (/^[a-fA-F0-9]{64}$/.test(trimmed)) return trimmed.toLowerCase()
+  return null
+}
+
+function matchesConversationSearch(conversation: ConversationSummary, query: string) {
+  if (!query) return true
+  const haystack = [
+    conversation.id,
+    conversation.title,
+    conversation.description,
+    conversation.lastMessagePreview,
+    ...conversation.participants
+  ]
+    .map((value) => String(value || '').toLowerCase())
+    .join(' ')
+  return haystack.includes(query)
+}
+
+function matchesInviteSearch(invite: ConversationInvite, query: string) {
+  if (!query) return true
+  const haystack = [
+    invite.id,
+    invite.senderPubkey,
+    invite.title,
+    invite.description,
+    invite.conversationId
+  ]
+    .map((value) => String(value || '').toLowerCase())
+    .join(' ')
+  return haystack.includes(query)
+}
 
 const ConversationListPage = forwardRef((_, ref) => {
+  const { t } = useTranslation()
   const { pubkey } = useNostr()
   const { push } = useSecondaryPage()
+  const {
+    conversations,
+    invites,
+    ready,
+    unsupportedReason,
+    createConversation,
+    acceptInvite,
+    refreshConversations,
+    refreshInvites,
+    updateConversationMetadata
+  } = useMessenger()
+  const [tab, setTab] = useState<ConversationTab>('my')
+  const [search, setSearch] = useState('')
   const [openNew, setOpenNew] = useState(false)
-  const [recipients, setRecipients] = useState('')
-  const [subject, setSubject] = useState('')
-  const [creating, setCreating] = useState(false)
+  const [creatingConversation, setCreatingConversation] = useState(false)
+  const [joiningInviteId, setJoiningInviteId] = useState<string | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
+
+  const query = useMemo(() => normalizeSearch(search), [search])
+
+  const filteredConversations = useMemo(
+    () => conversations.filter((conversation) => matchesConversationSearch(conversation, query)),
+    [conversations, query]
+  )
+
+  const filteredInvites = useMemo(
+    () => invites.filter((invite) => matchesInviteSearch(invite, query)),
+    [invites, query]
+  )
+
+  const pendingInviteCount = useMemo(
+    () => invites.filter((invite) => invite.status !== 'joined').length,
+    [invites]
+  )
+
+  const invitesTabLabel =
+    pendingInviteCount > 0 ? `${t('Invites')} (${pendingInviteCount})` : t('Invites')
+
+  const handleRefresh = async () => {
+    setRefreshing(true)
+    try {
+      await Promise.all([refreshConversations(), refreshInvites()])
+    } catch (error) {
+      console.warn('Failed refreshing conversations', error)
+      toast.error(t('Failed to refresh conversations'))
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
+  const handleCreateConversation = async ({
+    title,
+    description,
+    members,
+    imageFile
+  }: CreateConversationModalPayload) => {
+    const uniqueMembers = Array.from(
+      new Set(members.map((member) => normalizePubkey(member)).filter((member): member is string => !!member))
+    ).filter((member) => member !== pubkey)
+
+    if (!uniqueMembers.length) {
+      toast.error(t('Add at least one valid member'))
+      return
+    }
+
+    setCreatingConversation(true)
+    try {
+      const createResult = await createConversation({
+        title: title.trim() || t('Conversation'),
+        description: description.trim() || undefined,
+        members: uniqueMembers
+      })
+      const conversation = createResult.conversation
+
+      if (createResult.failed.length > 0) {
+        const failedLabel = createResult.failed[0]?.pubkey || t('one or more members')
+        console.warn('[Conversations] invite failures during create', {
+          conversationId: conversation.id,
+          failed: createResult.failed
+        })
+        toast.warning(
+          t('Conversation created, but invite failed for {{member}}', {
+            member: failedLabel
+          })
+        )
+      }
+
+      if (imageFile) {
+        try {
+	          const upload = await mediaUploadService.upload(
+	            imageFile,
+	            undefined,
+	            {
+	              target: 'group-hyperdrive',
+	              groupId: conversation.id,
+	              relayUrl: HYPERDRIVE_UPLOAD_RELAY_URL,
+	              resourceScope: 'conversation',
+	              parentKind: 39000
+	            }
+	          )
+	          const imageUrl = upload.url
+	          if (imageUrl) {
+	            await updateConversationMetadata({
+	              conversationId: conversation.id,
+	              imageUrl,
+	              imageAttachment: {
+	                url: upload.url,
+	                gatewayUrl: null,
+	                mime: upload.metadata?.mimeType || null,
+	                size: Number.isFinite(upload.metadata?.size) ? Number(upload.metadata?.size) : null,
+	                width: Number.isFinite(upload.metadata?.dim?.width) ? Number(upload.metadata?.dim?.width) : null,
+	                height: Number.isFinite(upload.metadata?.dim?.height) ? Number(upload.metadata?.dim?.height) : null,
+	                fileName: upload.metadata?.fileName || null,
+	                sha256: upload.metadata?.sha256 || null,
+	                driveKey: upload.metadata?.driveKey || null,
+	                ownerPubkey: normalizePubkey(pubkey || '') || null,
+	                fileId: upload.metadata?.fileId || null
+	              }
+	            })
+	          }
+        } catch (error) {
+          console.error('Conversation created but image upload failed', error)
+          toast.error(t('Conversation created, but image upload failed'))
+        }
+      }
+
+      await Promise.all([refreshConversations(), refreshInvites()])
+      setOpenNew(false)
+      push(`/conversations/${conversation.id}`)
+    } catch (error) {
+      console.error('Failed creating conversation', error)
+      toast.error(t('Failed to create conversation'))
+    } finally {
+      setCreatingConversation(false)
+    }
+  }
+
+  const handleJoinInvite = async (invite: ConversationInvite) => {
+    if (!invite?.id) return
+    if (joiningInviteId === invite.id) return
+
+    if (invite.status === 'joined' && invite.conversationId) {
+      push(`/conversations/${invite.conversationId}`)
+      return
+    }
+
+    setJoiningInviteId(invite.id)
+    try {
+      const result = await acceptInvite(invite.id)
+      await Promise.all([refreshConversations(), refreshInvites()])
+      const conversationId = result.conversationId || invite.conversationId
+      if (conversationId) {
+        push(`/conversations/${conversationId}`)
+      }
+    } catch (error) {
+      console.error('Failed joining conversation invite', error)
+      toast.error(t('Failed to join invite'))
+    } finally {
+      setJoiningInviteId(null)
+    }
+  }
 
   return (
     <PrimaryPageLayout
@@ -28,20 +250,114 @@ const ConversationListPage = forwardRef((_, ref) => {
       titlebar={<ConversationListPageTitlebar onNew={() => setOpenNew(true)} />}
       displayScrollToTopButton
     >
-      <ConversationListPanel
-        myPubkey={pubkey}
-        onOpenConversation={(id) => push(`/conversations/${id}`)}
-      />
+      <div className="space-y-4 p-4">
+        <div className="flex items-center gap-2">
+          <div className="relative flex-1">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder={tab === 'my' ? t('Search conversations...') as string : t('Search invites...') as string}
+              className="pl-8"
+            />
+          </div>
+          <Button variant="ghost" size="icon" onClick={handleRefresh} disabled={refreshing}>
+            <Loader2 className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+          </Button>
+          <Button onClick={() => setOpenNew(true)}>{t('Create')}</Button>
+        </div>
+
+        <Tabs value={tab} onValueChange={(value) => setTab(value as ConversationTab)}>
+          <TabsList className="grid w-full grid-cols-2">
+            <TabsTrigger value="my">{t('My Conversations')}</TabsTrigger>
+            <TabsTrigger value="invites">{invitesTabLabel}</TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="my" className="mt-4">
+            {unsupportedReason ? (
+              <div className="rounded-lg border p-4 text-sm text-muted-foreground">{unsupportedReason}</div>
+            ) : (
+              <ConversationListPanel
+                myPubkey={pubkey}
+                conversations={filteredConversations}
+                onOpenConversation={(id) => push(`/conversations/${id}`)}
+              />
+            )}
+          </TabsContent>
+
+          <TabsContent value="invites" className="mt-4">
+            {!ready ? (
+              <div className="rounded-lg border p-4 text-sm text-muted-foreground">{t('Loading invites...')}</div>
+            ) : !filteredInvites.length ? (
+              <div className="rounded-lg border p-4 text-sm text-muted-foreground">{t('No invites')}</div>
+            ) : (
+              <div className="space-y-2">
+                {filteredInvites.map((invite) => {
+                  const isJoining = joiningInviteId === invite.id || invite.status === 'joining'
+                  const isJoined = invite.status === 'joined'
+                  return (
+                    <div key={invite.id} className="rounded-lg border px-3 py-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-center gap-2 min-w-0">
+                          {invite.imageUrl ? (
+                            <img
+                              src={invite.imageUrl}
+                              alt={invite.title || 'Conversation invite'}
+                              className="h-9 w-9 rounded-full border object-cover"
+                            />
+                          ) : (
+                            <div className="flex h-9 w-9 items-center justify-center rounded-full border bg-muted">
+                              <Users className="h-4 w-4 text-muted-foreground" />
+                            </div>
+                          )}
+
+                          <div className="min-w-0">
+                            <div className="font-medium truncate">{invite.title || t('Conversation invite')}</div>
+                            <div className="text-xs text-muted-foreground truncate">
+                              {invite.description || t('Encrypted conversation invite')}
+                            </div>
+                          </div>
+                        </div>
+
+                        <Button
+                          size="sm"
+                          disabled={isJoining}
+                          onClick={() => handleJoinInvite(invite)}
+                        >
+                          {isJoining
+                            ? t('Joining...')
+                            : isJoined && invite.conversationId
+                              ? t('Open')
+                              : t('Join')}
+                        </Button>
+                      </div>
+
+                      <div className="mt-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <SimpleUserAvatar userId={invite.senderPubkey} size="small" className="h-5 w-5 rounded-full" />
+                          <span className="truncate">{invite.senderPubkey}</span>
+                        </div>
+                        {invite.createdAt > 0 ? <FormattedTimestamp timestamp={invite.createdAt} short /> : null}
+                      </div>
+
+                      {invite.error ? (
+                        <div className="mt-2 text-xs text-red-500">{invite.error}</div>
+                      ) : null}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </TabsContent>
+        </Tabs>
+      </div>
+
       <NewConversationDialog
         open={openNew}
         onOpenChange={setOpenNew}
-        recipients={recipients}
-        subject={subject}
-        setRecipients={setRecipients}
-        setSubject={setSubject}
-        creating={creating}
-        setCreating={setCreating}
+        creating={creatingConversation}
         myPubkey={pubkey}
+        onCreate={handleCreateConversation}
       />
     </PrimaryPageLayout>
   )
@@ -59,8 +375,8 @@ function ConversationListPageTitlebar({ onNew }: { onNew: () => void }) {
         <div className="text-lg font-semibold">{t('Conversations')}</div>
       </div>
       <div className="flex items-center gap-1">
-        <Button variant="ghost" size="titlebar-icon" onClick={onNew} aria-label="New conversation">
-          <Pencil />
+        <Button variant="ghost" size="titlebar-icon" onClick={onNew} aria-label={t('New conversation')}>
+          <Plus />
         </Button>
         <HideUntrustedContentButton type="notifications" size="titlebar-icon" />
       </div>
@@ -71,94 +387,177 @@ function ConversationListPageTitlebar({ onNew }: { onNew: () => void }) {
 function NewConversationDialog({
   open,
   onOpenChange,
-  recipients,
-  subject,
-  setRecipients,
-  setSubject,
   creating,
-  setCreating,
-  myPubkey
+  myPubkey,
+  onCreate
 }: {
   open: boolean
   onOpenChange: (v: boolean) => void
-  recipients: string
-  subject: string
-  setRecipients: (v: string) => void
-  setSubject: (v: string) => void
   creating: boolean
-  setCreating: (v: boolean) => void
   myPubkey: string | null
+  onCreate: (payload: CreateConversationModalPayload) => Promise<void>
 }) {
-  const { messenger } = useMessenger()
-  const { push } = useSecondaryPage()
+  const { t } = useTranslation()
+  const [title, setTitle] = useState('')
+  const [description, setDescription] = useState('')
+  const [inviteSearch, setInviteSearch] = useState('')
+  const [selectedInvitees, setSelectedInvitees] = useState<string[]>([])
+  const [imageFile, setImageFile] = useState<File | null>(null)
+  const { profiles: inviteProfiles, isFetching: isSearchingInvites } = useSearchProfiles(inviteSearch, 8)
+  const inviteCandidateProfiles = useMemo(
+    () => inviteProfiles.filter((profile) => profile.pubkey && profile.pubkey !== myPubkey),
+    [inviteProfiles, myPubkey]
+  )
 
-  const decodedRecipients = useMemo(() => {
-    return recipients
-      .split(',')
-      .map((p: string) => p.trim())
-      .map((p: string) => {
-        if (!p) return ''
-        try {
-          const { type, data } = nip19.decode(p)
-          if (type === 'npub') return data as string
-          if (type === 'nprofile' && typeof data === 'object' && 'pubkey' in data) {
-            return (data as any).pubkey as string
-          }
-          return p
-        } catch {
-          return p
-        }
-      })
-      .filter(Boolean)
-  }, [recipients])
+  const resetState = () => {
+    setTitle('')
+    setDescription('')
+    setInviteSearch('')
+    setSelectedInvitees([])
+    setImageFile(null)
+  }
 
-  const startConversation = async () => {
-    if (!messenger) return
-    if (decodedRecipients.length === 0) return
-    setCreating(true)
-    try {
-      const participants = decodedRecipients.map((p: string) => new NDKUser({ pubkey: p }))
-      const msgs = await messenger.sendMessage(
-        participants,
-        subject ? `Started conversation: ${subject}` : '(conversation created)',
-        { subject }
-      )
-      const convId =
-        msgs[0]?.conversationId || decodedRecipients.concat(myPubkey || '').sort().join(':')
-      onOpenChange(false)
-      setRecipients('')
-      setSubject('')
-      push(`/conversations/${convId}`)
-    } catch (err) {
-      console.error('Failed to start conversation', err)
-    } finally {
-      setCreating(false)
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen) {
+      resetState()
     }
+    onOpenChange(nextOpen)
+  }
+
+  const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0] || null
+    setImageFile(file)
+  }
+
+  const handleInviteToggle = (pubkey: string) => {
+    setSelectedInvitees((prev) =>
+      prev.includes(pubkey) ? prev.filter((existing) => existing !== pubkey) : [...prev, pubkey]
+    )
+  }
+
+  const handleCreate = async () => {
+    if (!selectedInvitees.length) return
+    await onCreate({
+      title,
+      description,
+      members: selectedInvitees,
+      imageFile
+    })
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent className="sm:max-w-xl max-h-[80vh]">
         <DialogHeader>
-          <DialogTitle>New Conversation</DialogTitle>
+          <DialogTitle>{t('Create conversation')}</DialogTitle>
         </DialogHeader>
-        <div className="space-y-3">
+
+        <div className="flex min-h-0 flex-col gap-3">
           <Input
-            value={subject}
-            onChange={(e) => setSubject(e.target.value)}
-            placeholder="Subject (optional)"
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
+            placeholder={t('Title') as string}
           />
-          <Input
-            value={recipients}
-            onChange={(e) => setRecipients(e.target.value)}
-            placeholder="Recipients (comma-separated npub/nprofile or hex)"
+          <Textarea
+            value={description}
+            onChange={(event) => setDescription(event.target.value)}
+            placeholder={t('Description (optional)') as string}
+            className="min-h-[72px]"
           />
-          <div className="flex justify-end">
-            <Button onClick={startConversation} disabled={creating || decodedRecipients.length === 0}>
-              {creating ? 'Starting…' : 'Start chat'}
-            </Button>
+
+          <div className="space-y-2">
+            <div className="text-sm font-medium">{t('Invite members')}</div>
+            <div className="relative px-0.5">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+              <Input
+                value={inviteSearch}
+                onChange={(event) => setInviteSearch(event.target.value)}
+                placeholder={t('Search users...') as string}
+                className="pl-9"
+              />
+            </div>
+            <div className="h-56 overflow-y-auto overflow-x-hidden space-y-2 pr-1 rounded border py-2">
+              <div className="min-h-5 px-2 text-sm text-muted-foreground">
+                {inviteSearch && isSearchingInvites ? t('Searching...') : null}
+                {inviteSearch && !isSearchingInvites && inviteCandidateProfiles.length === 0
+                  ? t('No users found')
+                  : null}
+              </div>
+              {inviteCandidateProfiles.map((profile) => {
+                const isSelected = selectedInvitees.includes(profile.pubkey)
+                return (
+                  <div
+                    key={profile.pubkey}
+                    className="flex w-full min-w-0 items-center gap-2 rounded px-2 py-1 transition-colors hover:bg-accent"
+                  >
+                    <UserAvatar userId={profile.pubkey} className="shrink-0" />
+                    <div className="min-w-0 flex-1 overflow-hidden">
+                      <Username
+                        userId={profile.pubkey}
+                        className="block w-full min-w-0 truncate font-semibold"
+                      />
+                      <Nip05 pubkey={profile.pubkey} className="w-full min-w-0" />
+                    </div>
+                    <Button
+                      variant={isSelected ? 'secondary' : 'outline'}
+                      size="sm"
+                      onClick={() => handleInviteToggle(profile.pubkey)}
+                      className="h-8 w-20 shrink-0 px-2"
+                    >
+                      {isSelected ? (
+                        <>
+                          <Check className="w-3 h-3 mr-1" />
+                          {t('Added')}
+                        </>
+                      ) : (
+                        <>
+                          <UserPlus className="w-3 h-3 mr-1" />
+                          {t('Add')}
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                )
+              })}
+            </div>
+            {selectedInvitees.length > 0 ? (
+              <div className="flex max-h-24 flex-wrap gap-2 overflow-y-auto pr-1">
+                {selectedInvitees.map((pubkey) => (
+                  <Button
+                    key={pubkey}
+                    variant="secondary"
+                    size="sm"
+                    className="flex max-w-full items-center gap-2"
+                    onClick={() => handleInviteToggle(pubkey)}
+                  >
+                    <UserAvatar userId={pubkey} size="xSmall" />
+                    <Username userId={pubkey} className="truncate max-w-[8rem] min-w-0" />
+                    <span className="text-xs text-muted-foreground">{t('Remove')}</span>
+                  </Button>
+                ))}
+              </div>
+            ) : null}
+          </div>
+
+          <div className="space-y-1">
+            <div className="text-sm font-medium">{t('Conversation image (optional)')}</div>
+            <Input type="file" accept="image/*" onChange={handleFileChange} />
+            {imageFile ? (
+              <div className="text-xs text-muted-foreground truncate">
+                {t('Selected image')}: {imageFile.name}
+              </div>
+            ) : null}
           </div>
         </div>
+
+        <DialogFooter className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={creating}>
+            {t('Cancel')}
+          </Button>
+          <Button onClick={handleCreate} disabled={creating || selectedInvitees.length === 0}>
+            {creating ? t('Creating...') : t('Create')}
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   )

@@ -20,11 +20,14 @@ export type MediaUploadContext = {
   relayUrl?: string
   relayKey?: string | null
   parentKind?: number
+  resourceScope?: 'group' | 'conversation'
 }
 
 export type UploadedFileMetadata = {
   source: MediaUploadTarget
   url: string
+  gatewayUrl?: string
+  gatewayUrls?: string[]
   mimeType?: string
   sha256?: string
   originalSha256?: string
@@ -35,6 +38,8 @@ export type UploadedFileMetadata = {
   groupId?: string
   relayKey?: string | null
   driveKey?: string | null
+  ownerPubkey?: string | null
+  resourceScope?: 'group' | 'conversation'
 }
 
 export type MediaUploadResult = {
@@ -311,17 +316,18 @@ class MediaUploadService {
         fileHash,
         fileId,
         localRelayBaseUrl: localBaseUrl,
-        metadata: {
-          mimeType: file.type || 'application/octet-stream',
-          filename: file.name || fileId,
-          size: file.size,
-          dim: dim ? `${dim.width}x${dim.height}` : null,
-          parentKind: context.parentKind ?? null,
-          groupId: context.groupId
-        },
-        buffer: uint8ToBase64(bytes)
-      }
-    }
+	        metadata: {
+	          mimeType: file.type || 'application/octet-stream',
+	          filename: file.name || fileId,
+	          size: file.size,
+	          dim: dim ? `${dim.width}x${dim.height}` : null,
+	          parentKind: context.parentKind ?? null,
+	          groupId: context.groupId,
+	          resourceScope: context.resourceScope || 'group'
+	        },
+	        buffer: uint8ToBase64(bytes)
+	      }
+	    }
 
     const response = await electronIpc.sendToWorkerAwait({
       message,
@@ -334,10 +340,23 @@ class MediaUploadService {
 
     options?.onProgress?.(100)
 
-    const responseData = (response?.data || {}) as Record<string, unknown>
-    const url =
-      (typeof responseData.url === 'string' && responseData.url) ||
-      this.buildLocalDriveUrl(localBaseUrl, context.groupId, fileId)
+	    const responseData = (response?.data || {}) as Record<string, unknown>
+	    const isConversationScope = context.resourceScope === 'conversation'
+	    const url =
+	      (typeof responseData.url === 'string' && responseData.url) ||
+	      this.buildLocalDriveUrl(localBaseUrl, context.groupId, fileId)
+	    const gatewayUrl =
+	      isConversationScope
+	        ? url
+	        : ((typeof responseData.gatewayUrl === 'string' && responseData.gatewayUrl) || url)
+	    const gatewayUrls =
+	      isConversationScope
+	        ? [url]
+	        : (Array.isArray(responseData.gatewayUrls)
+	          ? responseData.gatewayUrls.filter((value): value is string => typeof value === 'string' && Boolean(value))
+	          : [])
+	          .concat(gatewayUrl ? [gatewayUrl] : [])
+	          .filter((value, index, list) => list.indexOf(value) === index)
 
     const mimeType =
       (typeof responseData.mime === 'string' && responseData.mime) ||
@@ -364,6 +383,8 @@ class MediaUploadService {
     const metadata: UploadedFileMetadata = {
       source: 'group-hyperdrive',
       url,
+      gatewayUrl,
+      gatewayUrls,
       mimeType,
       sha256: fileHash,
       originalSha256: fileHash,
@@ -372,15 +393,20 @@ class MediaUploadService {
       fileId,
       fileName: file.name,
       groupId: context.groupId,
-      relayKey:
-        typeof responseData.relayKey === 'string'
-          ? responseData.relayKey
-          : context.relayKey || null,
-      driveKey:
-        typeof responseData.driveKey === 'string'
-          ? responseData.driveKey
-          : null
-    }
+	      relayKey:
+	        typeof responseData.relayKey === 'string'
+	          ? responseData.relayKey
+	          : context.relayKey || null,
+	      driveKey:
+	        typeof responseData.driveKey === 'string'
+	          ? responseData.driveKey
+	          : null,
+	      ownerPubkey:
+	        typeof responseData.ownerPubkey === 'string'
+	          ? responseData.ownerPubkey
+	          : null,
+	      resourceScope: context.resourceScope || 'group'
+	    }
 
     return { url, tags, metadata }
   }

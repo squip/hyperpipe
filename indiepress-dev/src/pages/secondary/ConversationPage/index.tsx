@@ -18,21 +18,15 @@ import UserAvatar, { SimpleUserAvatar } from '@/components/UserAvatar'
 import client from '@/services/client.service'
 import { cn } from '@/lib/utils'
 
-const debug = (...args: any[]) => console.debug('[ConversationPage]', ...args)
-
 const ConversationPage = forwardRef(({ index }: { index?: number }, ref) => {
   const { pop } = useSecondaryPage()
   const conversationId = useMemo(() => window.location.pathname.split('/').pop() || '', [])
-  const { conversations, messenger } = useMessenger()
+  const { conversations } = useMessenger()
   const { pubkey } = useNostr()
-  const meta = conversations.find((c) => c.id === conversationId)
+  const meta = conversations.find((conversation) => conversation.id === conversationId)
   const [showMembers, setShowMembers] = useState(false)
   const [nameMap, setNameMap] = useState<Record<string, string>>({})
-  const [groupImage, setGroupImage] = useState<string | null>(null)
-
-  useEffect(() => {
-    debug('render', { conversationId, hasMeta: !!meta, participants: meta?.participants?.length })
-  }, [conversationId, meta?.id, meta?.participants?.length])
+  const [useDocumentScroll, setUseDocumentScroll] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -62,27 +56,8 @@ const ConversationPage = forwardRef(({ index }: { index?: number }, ref) => {
 
   const participantLine = useMemo(() => {
     if (!meta?.participants?.length) return ''
-    return meta.participants.map((p) => nameMap[p] || p).join(', ')
+    return meta.participants.map((participant) => nameMap[participant] || participant).join(', ')
   }, [meta?.participants, nameMap])
-
-  const [useDocumentScroll, setUseDocumentScroll] = useState(false)
-
-  useEffect(() => {
-    if (!meta || !messenger) return
-    let cancelled = false
-    ;(async () => {
-      debug('group image fetch', { conversationId: meta.id })
-      const msgs = await messenger.getConversationMessages(meta.id, 1)
-      if (cancelled) return
-      const first = msgs?.[0]
-      const imageTag = first?.tags?.find((t) => ['image', 'img', 'picture', 'avatar'].includes(t[0]))
-      setGroupImage(imageTag?.[1] ?? null)
-      debug('group image resolved', { conversationId: meta.id, hasImage: !!imageTag?.[1] })
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [meta?.id, messenger])
 
   return (
     <SecondaryPageLayout
@@ -94,16 +69,16 @@ const ConversationPage = forwardRef(({ index }: { index?: number }, ref) => {
             <ChevronLeft />
           </Button>
           <div className="flex items-center gap-2">
-            {meta?.participants && meta.participants.length <= 2 ? (
-              <UserAvatar
-                userId={meta.participants.find((p) => p !== pubkey) || meta.participants[0]}
-                size="small"
-              />
-            ) : groupImage ? (
+            {meta?.imageUrl ? (
               <img
-                src={groupImage}
+                src={meta.imageUrl}
                 alt="Conversation"
                 className="w-8 h-8 rounded-full object-cover border"
+              />
+            ) : meta?.participants && meta.participants.length <= 2 ? (
+              <UserAvatar
+                userId={meta.participants.find((participant) => participant !== pubkey) || meta.participants[0]}
+                size="small"
               />
             ) : (
               <div className="w-8 h-8 rounded-full bg-muted flex items-center justify-center border">
@@ -119,9 +94,7 @@ const ConversationPage = forwardRef(({ index }: { index?: number }, ref) => {
             )}
             onClick={() => setShowMembers(true)}
           >
-            <div className="text-sm font-semibold truncate">
-              {meta?.subject || 'Conversation'}
-            </div>
+            <div className="text-sm font-semibold truncate">{meta?.title || 'Conversation'}</div>
             <div className="text-xs text-muted-foreground truncate">{participantLine}</div>
           </button>
         </div>
@@ -134,12 +107,13 @@ const ConversationPage = forwardRef(({ index }: { index?: number }, ref) => {
       <MembersDialog
         open={showMembers}
         onOpenChange={setShowMembers}
-        subject={meta?.subject || 'Conversation'}
+        subject={meta?.title || 'Conversation'}
         participants={meta?.participants || []}
       />
     </SecondaryPageLayout>
   )
 })
+
 ConversationPage.displayName = 'ConversationPage'
 export default ConversationPage
 
@@ -170,10 +144,10 @@ function MembersDialog({
                 <Username userId={participants[0]} className="truncate" withoutSkeleton />
               ) : (
                 <div className="truncate">
-                  {participants.map((p, idx) => (
-                    <span key={p} className="text-sm text-muted-foreground">
-                      <SimpleUsername userId={p} className="inline" withoutSkeleton />
-                      {idx < participants.length - 1 ? ', ' : ''}
+                  {participants.map((participant, index) => (
+                    <span key={participant} className="text-sm text-muted-foreground">
+                      <SimpleUsername userId={participant} className="inline" withoutSkeleton />
+                      {index < participants.length - 1 ? ', ' : ''}
                     </span>
                   ))}
                 </div>
@@ -182,12 +156,12 @@ function MembersDialog({
           </div>
         </DialogHeader>
         <div className="mt-2 max-h-[70vh] overflow-y-auto space-y-3 pr-1">
-          {participants.map((p) => (
-            <div key={p} className="flex items-center gap-3">
-              <SimpleUserAvatar userId={p} size="medium" />
+          {participants.map((participant) => (
+            <div key={participant} className="flex items-center gap-3">
+              <SimpleUserAvatar userId={participant} size="medium" />
               <div className="flex-1 min-w-0">
-                <SimpleUsername userId={p} className="font-medium truncate" withoutSkeleton />
-                <div className="text-xs text-muted-foreground truncate">{p}</div>
+                <SimpleUsername userId={participant} className="font-medium truncate" withoutSkeleton />
+                <div className="text-xs text-muted-foreground truncate">{participant}</div>
               </div>
             </div>
           ))}

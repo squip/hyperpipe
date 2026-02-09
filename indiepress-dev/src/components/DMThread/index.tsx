@@ -1,4 +1,3 @@
-
 import React, {
   useEffect,
   useLayoutEffect,
@@ -8,12 +7,12 @@ import React, {
   type Dispatch,
   type SetStateAction
 } from 'react'
-import mediaUploadService from '@/services/media-upload.service'
+import mediaUploadService, { type MediaUploadResult } from '@/services/media-upload.service'
 import * as nip19 from '@nostr/tools/nip19'
 import { Button } from '@/components/ui/button'
 import { useMessenger } from '@/providers/MessengerProvider'
-import { NDKUser } from '@nostr-dev-kit/ndk'
-import type { DMMessage } from '@/lib/messaging/types'
+import type { MessageAttachment, ThreadMessage } from '@/lib/conversations/types'
+import { CONVERSATION_JUMP_FAB_THRESHOLD } from '@/lib/conversations/types'
 import { cn } from '@/lib/utils'
 import { SimpleUserAvatar } from '@/components/UserAvatar'
 import { useScreenSize } from '@/providers/ScreenSizeProvider'
@@ -29,11 +28,14 @@ import {
   Heart,
   MessageCircle,
   X,
-  Plus
+  Plus,
+  Paperclip
 } from 'lucide-react'
 import PostTextarea, { TPostTextareaHandle } from '@/components/PostEditor/PostTextarea'
 
 const debug = (...args: any[]) => console.debug('[DMThread]', ...args)
+
+const HYPERDRIVE_UPLOAD_RELAY_URL = 'http://127.0.0.1:8443'
 
 function shortNpub(pubkey: string) {
   try {
@@ -51,12 +53,33 @@ function formatName(pubkey: string, myPubkey: string | null) {
 
 type ReactionStat = { emoji: string; count: number; self: boolean }
 
-function mergeMessagesById(existing: DMMessage[], incoming: DMMessage | DMMessage[]) {
+function mergeMessagesById(existing: ThreadMessage[], incoming: ThreadMessage | ThreadMessage[]) {
   const list = Array.isArray(incoming) ? incoming : [incoming]
-  const map = new Map<string, DMMessage>()
-  existing.forEach((m) => map.set(m.id, m))
-  list.forEach((m) => map.set(m.id, m))
-  return Array.from(map.values()).sort((a, b) => a.timestamp - b.timestamp)
+  const map = new Map<string, ThreadMessage>()
+  existing.forEach((message) => map.set(message.id, message))
+  list.forEach((message) => map.set(message.id, message))
+  return Array.from(map.values()).sort((left, right) => {
+    if (left.timestamp !== right.timestamp) return left.timestamp - right.timestamp
+    return left.id.localeCompare(right.id)
+  })
+}
+
+function toAttachmentFromUpload(result: MediaUploadResult, ownerPubkey: string | null) {
+  return {
+    url: result.url,
+    gatewayUrl: null,
+    mime: result.metadata?.mimeType || null,
+    size: Number.isFinite(result.metadata?.size) ? Number(result.metadata?.size) : null,
+    width: Number.isFinite(result.metadata?.dim?.width) ? Number(result.metadata?.dim?.width) : null,
+    height: Number.isFinite(result.metadata?.dim?.height)
+      ? Number(result.metadata?.dim?.height)
+      : null,
+    fileName: result.metadata?.fileName || null,
+    sha256: result.metadata?.sha256 || null,
+    driveKey: result.metadata?.driveKey || null,
+    ownerPubkey: ownerPubkey || null,
+    fileId: result.metadata?.fileId || null
+  } satisfies MessageAttachment
 }
 
 export function DMThread({
@@ -72,14 +95,15 @@ export function DMThread({
   const { isSmallScreen } = useScreenSize()
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
-  const [replyTarget, setReplyTarget] = useState<DMMessage | null>(null)
+  const [replyTarget, setReplyTarget] = useState<ThreadMessage | null>(null)
   const [reactionSendingId, setReactionSendingId] = useState<string | null>(null)
-  const [localMessages, setLocalMessages] = useState<DMMessage[]>([])
+  const [localMessages, setLocalMessages] = useState<ThreadMessage[]>([])
   const [pickerOpen, setPickerOpen] = useState<string | null>(null)
   const [showScrollBottom, setShowScrollBottom] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [uploadProgress, setUploadProgress] = useState<number | null>(null)
   const [nearBottom, setNearBottom] = useState(false)
+  const [pendingAttachments, setPendingAttachments] = useState<MessageAttachment[]>([])
   const listRef = useRef<HTMLDivElement>(null)
   const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map())
   const [anchored, setAnchored] = useState(false)
@@ -90,7 +114,7 @@ export function DMThread({
   const pollTimeout = useRef<number | null>(null)
 
   const conversation = useMemo(
-    () => conversations.find((c) => c.id === conversationId) || null,
+    () => conversations.find((item) => item.id === conversationId) || null,
     [conversations, conversationId]
   )
 
@@ -99,15 +123,16 @@ export function DMThread({
     lastLiveAt.current = null
     let cancelled = false
     const load = async () => {
-      debug('fetch messages (init)', { conversationId })
-      await messenger.syncRecent(conversationId)
-      const msgs = await messenger.getConversationMessages(conversationId)
+      debug('load thread (init)', { conversationId })
+      const thread = await messenger.loadThread(conversationId, { limit: 500, sync: true })
       const buffered = drainBufferedMessages(conversationId)
-      const merged = [...msgs, ...buffered]
-        .reduce<Map<string, DMMessage>>((map, msg) => map.set(msg.id, msg), new Map())
-      const mergedList = Array.from(merged.values()).sort((a, b) => a.timestamp - b.timestamp)
+      const merged = [...thread.messages, ...buffered]
+        .reduce<Map<string, ThreadMessage>>((map, message) => map.set(message.id, message), new Map())
+      const mergedList = Array.from(merged.values()).sort((left, right) => {
+        if (left.timestamp !== right.timestamp) return left.timestamp - right.timestamp
+        return left.id.localeCompare(right.id)
+      })
       if (cancelled) return
-      debug('initial messages', { conversationId, count: mergedList.length, buffered: buffered.length })
       setLocalMessages(mergedList)
     }
     load()
@@ -119,51 +144,43 @@ export function DMThread({
   useEffect(() => {
     if (!messenger || !conversationId) return
     let cancelled = false
+
     const sync = async () => {
-      await messenger.syncRecent(conversationId)
-      const msgs = await messenger.getConversationMessages(conversationId)
+      const thread = await messenger.loadThread(conversationId, { limit: 500, sync: true })
       if (cancelled) return
-      setLocalMessages((prev) => {
-        const prevLast = prev.at(-1)?.id
-        const nextLast = msgs.at(-1)?.id
-        if (prev.length === msgs.length && prevLast === nextLast) return prev
-        const latest = msgs.at(-1)
-        const latestLagMs = latest ? Date.now() - latest.timestamp * 1000 : null
-        debug('periodic sync update', {
-          conversationId,
-          prev: prev.length,
-          next: msgs.length,
-          prevLast,
-          nextLast,
-          latestLagMs
-        })
-        return msgs
+      setLocalMessages((previous) => {
+        const prevLast = previous.at(-1)?.id
+        const nextLast = thread.messages.at(-1)?.id
+        if (previous.length === thread.messages.length && prevLast === nextLast) return previous
+        return thread.messages
       })
     }
-    const FAST_POLL_MS = 1000
-    const SLOW_POLL_MS = 5000
-    const LIVE_RECENT_WINDOW = 15000
 
-    const schedule = (delay: number) => {
+    const FAST_POLL_MS = 1200
+    const SLOW_POLL_MS = 5000
+    const LIVE_RECENT_WINDOW_MS = 15_000
+
+    const schedule = (delayMs: number) => {
       if (pollTimeout.current) window.clearTimeout(pollTimeout.current)
-      pollTimeout.current = window.setTimeout(syncWithBackoff, delay)
+      pollTimeout.current = window.setTimeout(syncWithBackoff, delayMs)
     }
 
     const syncWithBackoff = async () => {
       const startedAt = Date.now()
       try {
         await sync()
-      } catch (err) {
-        debug('periodic sync error', err)
+      } catch (error) {
+        debug('periodic sync failed', error)
       }
+
       if (cancelled) return
       const sinceLive = lastLiveAt.current ? startedAt - lastLiveAt.current : Number.POSITIVE_INFINITY
-      const nextDelay = sinceLive > LIVE_RECENT_WINDOW ? FAST_POLL_MS : SLOW_POLL_MS
-      debug('periodic sync schedule', { conversationId, nextDelay, sinceLive })
+      const nextDelay = sinceLive > LIVE_RECENT_WINDOW_MS ? FAST_POLL_MS : SLOW_POLL_MS
       schedule(nextDelay)
     }
 
     schedule(FAST_POLL_MS)
+
     return () => {
       cancelled = true
       if (pollTimeout.current) window.clearTimeout(pollTimeout.current)
@@ -176,121 +193,174 @@ export function DMThread({
 
   useEffect(() => {
     if (!messenger) return
-    debug('live listener attach', { conversationId })
     const off = messenger.on((event) => {
       if (event.type === 'message' && event.message.conversationId === conversationId) {
         lastLiveAt.current = Date.now()
-        const latencyMs = Date.now() - event.message.timestamp * 1000
-        debug('live event message', {
-          id: event.message.id,
-          ts: event.message.timestamp,
-          read: event.message.read,
-          localCount: localCountRef.current,
-          latencyMs
-        })
-        setLocalMessages((prev) => mergeMessagesById(prev, event.message))
+        setLocalMessages((previous) => mergeMessagesById(previous, event.message))
       }
     })
     return () => {
-      debug('live listener detach', { conversationId })
       off?.()
     }
   }, [messenger, conversationId])
 
   useEffect(() => {
     if (localMessages.length !== prevLength.current) {
-      debug('localMessages length change', {
-        from: prevLength.current,
-        to: localMessages.length,
-        conversationId
-      })
       setAnchored(false)
       prevLength.current = localMessages.length
     }
   }, [localMessages.length])
 
   const firstUnreadIdx = useMemo(
-    () => localMessages.findIndex((m) => !m.read && m.sender.pubkey !== myPubkey),
-    [localMessages, myPubkey]
+    () => localMessages.findIndex((message) => message.senderPubkey !== myPubkey && message.timestamp > (conversation?.lastReadAt || 0)),
+    [localMessages, myPubkey, conversation?.lastReadAt]
   )
 
   const unreadCount = useMemo(
-    () => localMessages.filter((m) => !m.read && m.sender.pubkey !== myPubkey).length,
-    [localMessages, myPubkey]
+    () => localMessages.filter((message) => message.senderPubkey !== myPubkey && message.timestamp > (conversation?.lastReadAt || 0)).length,
+    [localMessages, myPubkey, conversation?.lastReadAt]
   )
+
+  type ScrollContext = { el: HTMLElement | null; useDocument: boolean }
+
+  const getScrollContext = (): ScrollContext => {
+    if (useDocumentScroll && typeof document !== 'undefined') {
+      return {
+        el: (document.scrollingElement as HTMLElement | null) || document.documentElement,
+        useDocument: true
+      }
+    }
+
+    const list = listRef.current
+    const viewport = list?.closest('[data-radix-scroll-area-viewport]') as HTMLElement | null
+    const candidate = (viewport || list || null) as HTMLElement | null
+
+    if (candidate && candidate.scrollHeight > candidate.clientHeight + 4) {
+      return { el: candidate, useDocument: false }
+    }
+
+    if (typeof document !== 'undefined') {
+      return {
+        el: (document.scrollingElement as HTMLElement | null) || document.documentElement,
+        useDocument: true
+      }
+    }
+
+    return { el: null, useDocument: false }
+  }
+
+  const scrollToMessage = (id: string, smooth = true) => {
+    const element = messageRefs.current.get(id)
+    const { el: list, useDocument } = getScrollContext()
+    if (!element || !list) return false
+
+    const top = useDocument
+      ? element.getBoundingClientRect().top + (window.scrollY || document.documentElement.scrollTop) - 24
+      : element.offsetTop - 24
+
+    if (useDocument) {
+      window.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
+    } else if ((list as any).scrollTo) {
+      ;(list as any).scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
+    } else {
+      window.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
+    }
+    return true
+  }
+
+  const scrollToBottom = (smooth = true) => {
+    const { el: list, useDocument } = getScrollContext()
+    if (!list) return false
+
+    const top = list.scrollHeight
+    if (useDocument) {
+      window.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
+    } else if ((list as any).scrollTo) {
+      ;(list as any).scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
+      list.scrollTop = list.scrollHeight
+    } else {
+      window.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
+    }
+
+    const last = localMessages.at(-1)
+    if (last) {
+      messenger?.markConversationRead(conversationId, last.id, last.timestamp)
+    }
+    return true
+  }
+
+  const isNearBottom = (
+    list?: HTMLElement | null,
+    viewportHeight?: number,
+    useDocumentFlag = false,
+    threshold = 80
+  ) => {
+    if (!list) return false
+    if (useDocumentFlag) {
+      const scrollTop = window.scrollY || document.documentElement.scrollTop || 0
+      const clientHeight = viewportHeight ?? window.innerHeight
+      const distance = list.scrollHeight - scrollTop - clientHeight
+      return distance < threshold
+    }
+    const distance = list.scrollHeight - list.scrollTop - list.clientHeight
+    return distance < threshold
+  }
+
+  const isMessageVisible = (id: string) => {
+    const element = messageRefs.current.get(id)
+    const { el: list, useDocument } = getScrollContext()
+    if (!element || !list) return false
+
+    if (useDocument) {
+      const rect = element.getBoundingClientRect()
+      return rect.bottom <= window.innerHeight && rect.top >= -24
+    }
+
+    const top = element.offsetTop
+    const bottom = top + element.offsetHeight
+    const viewTop = list.scrollTop
+    const viewBottom = list.scrollTop + list.clientHeight
+    return bottom <= viewBottom && top >= viewTop - 24
+  }
 
   const attemptAnchor = (attempt = 1) => {
     if (anchored) return
     if (!localMessages.length) return
-    const hasReadMarker = !!conversation?.lastReadAt
+
     const targetMessage =
-      unreadCount > 0 && firstUnreadIdx >= 0 && hasReadMarker
+      unreadCount > 0 && firstUnreadIdx >= 0
         ? localMessages[firstUnreadIdx]
         : localMessages.at(-1)
+
     if (!targetMessage) return
-    const { el: scrollEl, useDocument } = getScrollContext()
-    if (!scrollEl) {
-      debug('anchor attempt skipped - no scroll element', { conversationId })
-      return
-    }
-    const scrollTop = useDocument
-      ? window.scrollY || document.documentElement.scrollTop
-      : scrollEl.scrollTop
-    const clientHeight = useDocument ? window.innerHeight : scrollEl.clientHeight
-    debug('anchor attempt', {
-      conversationId,
-      unreadCount,
-      firstUnreadIdx,
-      targetId: targetMessage.id,
-      messages: localMessages.length,
-      attempt,
-      scrollTop,
-      scrollHeight: scrollEl.scrollHeight,
-      clientHeight,
-      useDocument,
-      scrollTag: (scrollEl as HTMLElement | null)?.tagName,
-      scrollId: (scrollEl as HTMLElement | null)?.id,
-      useDocumentScrollProp: useDocumentScroll
-    })
+
     const scrolled =
-      unreadCount > 0 && unreadCount > 10
+      unreadCount > CONVERSATION_JUMP_FAB_THRESHOLD
         ? scrollToMessage(targetMessage.id, false)
         : scrollToBottom(false)
+
     const verify = () => {
       anchorRetry.current = null
-      const { el: listEl, useDocument: verifyUseDocument } = getScrollContext()
+      const { el: list, useDocument } = getScrollContext()
       const targetVisible =
-        unreadCount > 0 && unreadCount > 10
+        unreadCount > CONVERSATION_JUMP_FAB_THRESHOLD
           ? isMessageVisible(targetMessage.id)
-          : isNearBottom(listEl, verifyUseDocument ? window.innerHeight : undefined, verifyUseDocument)
-      debug('anchor verification', {
-        conversationId,
-        targetId: targetMessage.id,
-        scrolled,
-        targetVisible,
-        scrollTop: verifyUseDocument
-          ? window.scrollY || document.documentElement.scrollTop
-          : listEl?.scrollTop,
-        scrollHeight: listEl?.scrollHeight,
-        clientHeight: verifyUseDocument ? window.innerHeight : listEl?.clientHeight,
-        attempt,
-        useDocument: verifyUseDocument,
-        scrollTag: (listEl as HTMLElement | null)?.tagName,
-        scrollId: (listEl as HTMLElement | null)?.id,
-        useDocumentScrollProp: useDocumentScroll
-      })
+          : isNearBottom(list, useDocument ? window.innerHeight : undefined, useDocument)
+
       if (targetVisible) {
-        if (scrolled && unreadCount > 0 && unreadCount <= 10) {
-          messenger?.markConversationRead(conversationId)
+        if (scrolled && unreadCount <= CONVERSATION_JUMP_FAB_THRESHOLD && unreadCount > 0) {
+          const last = localMessages.at(-1)
+          if (last) {
+            messenger?.markConversationRead(conversationId, last.id, last.timestamp)
+          }
         }
         setAnchored(true)
       } else if (attempt < 5) {
         anchorRetry.current = window.setTimeout(() => attemptAnchor(attempt + 1), 120)
       }
     }
-    debug('anchor verify scheduled', { attempt })
+
     anchorRetry.current = window.setTimeout(verify, 16)
-    // also try immediately in case refs are already ready
     verify()
   }
 
@@ -316,38 +386,40 @@ export function DMThread({
   useEffect(() => {
     const { el, useDocument } = getScrollContext()
     if (!el) return
+
     const handler = () => {
-      const ctx = getScrollContext()
-      const isNear = isNearBottom(
-        ctx.el,
-        ctx.useDocument ? window.innerHeight : undefined,
-        ctx.useDocument,
+      const context = getScrollContext()
+      const near = isNearBottom(
+        context.el,
+        context.useDocument ? window.innerHeight : undefined,
+        context.useDocument,
         120
       )
-      setNearBottom(isNear)
-      setShowScrollBottom(unreadCount > 0 && !isNear)
-      if (isNear && messenger && unreadCount > 0) {
-        debug('scroll near bottom', { conversationId, unreadCount })
-        messenger.markConversationRead(conversationId)
+      setNearBottom(near)
+      setShowScrollBottom(unreadCount > CONVERSATION_JUMP_FAB_THRESHOLD && !near)
+
+      if (near && messenger && unreadCount > 0) {
+        const last = localMessages.at(-1)
+        if (last) {
+          messenger.markConversationRead(conversationId, last.id, last.timestamp)
+        }
       }
     }
+
     handler()
+
     const primaryTarget = useDocument ? window : el
     primaryTarget?.addEventListener('scroll', handler, { passive: true } as any)
     const secondaryTarget = !useDocument && isSmallScreen ? window : null
     secondaryTarget?.addEventListener('scroll', handler, { passive: true } as any)
+
     return () => {
       primaryTarget?.removeEventListener('scroll', handler)
       secondaryTarget?.removeEventListener('scroll', handler)
     }
-  }, [messenger, conversationId, unreadCount])
+  }, [messenger, conversationId, unreadCount, localMessages])
 
   useEffect(() => {
-    debug('showScrollBottom changed', { conversationId, showScrollBottom })
-  }, [conversationId, showScrollBottom])
-
-  useEffect(() => {
-    // If we were anchored or already near bottom, keep snapping when new messages arrive
     if (!localMessages.length) return
     const { el: scrollEl, useDocument } = getScrollContext()
     const wasNearBottom = isNearBottom(scrollEl, useDocument ? window.innerHeight : undefined, useDocument)
@@ -357,167 +429,88 @@ export function DMThread({
   }, [localMessages.length])
 
   const handleSend = async () => {
-    if (!messenger || !conversation || !draft.trim()) return
+    if (!messenger || !conversation) return
+    const hasText = Boolean(draft.trim())
+    const hasAttachments = pendingAttachments.length > 0
+    if (!hasText && !hasAttachments) return
+
     setSending(true)
     try {
-      debug('handleSend', { conversationId, draftLength: draft.length, replyTo: replyTarget?.id })
-      const participants = conversation.participants.map((p) => new NDKUser({ pubkey: p }))
-      const msgs = await messenger.sendMessage(participants, draft, {
-        replyTo: replyTarget?.id
-      })
-      debug('handleSend result', { added: msgs.length })
-      setLocalMessages((prev) => mergeMessagesById(prev, msgs))
+      let sentMessages: ThreadMessage[] = []
+      if (hasAttachments) {
+        sentMessages = await messenger.sendMediaMessage(conversation.id, draft.trim(), pendingAttachments, {
+          replyTo: replyTarget?.id
+        })
+      } else {
+        sentMessages = await messenger.sendMessage(conversation.id, draft.trim(), {
+          replyTo: replyTarget?.id
+        })
+      }
+
+      setLocalMessages((previous) => mergeMessagesById(previous, sentMessages))
       setDraft('')
       setReplyTarget(null)
-      await messenger.markConversationRead(conversationId)
+      setPendingAttachments([])
+
+      const last = sentMessages.at(-1)
+      if (last) {
+        await messenger.markConversationRead(conversationId, last.id, last.timestamp)
+      }
+
       scrollToBottom()
-    } catch (err) {
-      console.error('Failed to send DM', err)
-      debug('handleSend error', err)
+    } catch (error) {
+      console.error('Failed to send conversation message', error)
     } finally {
       setSending(false)
     }
   }
 
   const handleMediaUpload = async (file: File) => {
+    if (!conversationId) return
+
     setUploading(true)
     setUploadProgress(0)
+
     try {
-      debug('media upload start', { name: file.name, size: file.size })
-      const result = await mediaUploadService.upload(file, { onProgress: (p) => setUploadProgress(p) })
-      const url = result.url
-      setDraft((d) => `${d}${d ? ' ' : ''}${url}`)
-    } catch (err) {
-      console.error('Media upload failed', err)
-      debug('media upload error', err)
+	      const result = await mediaUploadService.upload(
+	        file,
+        {
+          onProgress: (progress) => setUploadProgress(progress)
+        },
+	        {
+	          target: 'group-hyperdrive',
+	          groupId: conversationId,
+	          relayUrl: HYPERDRIVE_UPLOAD_RELAY_URL,
+	          resourceScope: 'conversation',
+	          parentKind: 14
+	        }
+	      )
+
+	      setPendingAttachments((previous) => [...previous, toAttachmentFromUpload(result, myPubkey)])
+    } catch (error) {
+      console.error('Media upload failed', error)
     } finally {
       setUploading(false)
       setUploadProgress(null)
     }
   }
 
-  const handleReact = async (message: DMMessage, emoji = '👍') => {
+  const handleReact = async (message: ThreadMessage, emoji = '👍') => {
     if (!messenger || !conversation) return
+
     setReactionSendingId(message.id)
     try {
-      debug('react start', { conversationId, messageId: message.id, emoji })
-      const reaction = await messenger.sendReaction(conversation.id, message.id, emoji)
-      if (reaction) {
-        setLocalMessages((prev) => [...prev, reaction])
-        debug('react persisted', { reactionId: reaction.id })
-      }
-    } catch (err) {
-      console.error('Failed to send reaction', err)
-      debug('react error', err)
+      const reactions = await messenger.sendMessage(conversation.id, emoji, {
+        type: 'reaction',
+        replyTo: message.id
+      })
+      setLocalMessages((previous) => mergeMessagesById(previous, reactions))
+    } catch (error) {
+      console.error('Failed to send reaction', error)
     } finally {
       setReactionSendingId(null)
       setPickerOpen(null)
     }
-  }
-
-  type ScrollContext = { el: HTMLElement | null; useDocument: boolean }
-
-  const getScrollContext = (): ScrollContext => {
-    if (useDocumentScroll && typeof document !== 'undefined') {
-      return {
-        el: (document.scrollingElement as HTMLElement | null) || document.documentElement,
-        useDocument: true
-      }
-    }
-    const list = listRef.current
-    const viewport = list?.closest('[data-radix-scroll-area-viewport]') as HTMLElement | null
-    const candidate = (viewport || list || null) as HTMLElement | null
-    if (candidate) {
-      const scrollable = candidate.scrollHeight > candidate.clientHeight + 4
-      if (scrollable) return { el: candidate, useDocument: false }
-    }
-    if (typeof document !== 'undefined') {
-      return {
-        el: (document.scrollingElement as HTMLElement | null) || document.documentElement,
-        useDocument: true
-      }
-    }
-    return { el: null, useDocument: false }
-  }
-
-  const scrollToMessage = (id: string, smooth = true) => {
-    const el = messageRefs.current.get(id)
-    const { el: list, useDocument } = getScrollContext()
-    if (el && list) {
-      const top = useDocument
-        ? el.getBoundingClientRect().top + (window.scrollY || document.documentElement.scrollTop) - 24
-        : el.offsetTop - 24
-      debug('scrollToMessage', { id, top, smooth, useDocument })
-      if (useDocument) {
-        window.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
-      } else if ((list as any).scrollTo) {
-        ;(list as any).scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
-      } else {
-        window.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
-      }
-      return true
-    } else {
-      debug('scrollToMessage missing ref', { id, hasEl: !!el, hasList: !!list })
-      return false
-    }
-  }
-
-  const scrollToBottom = (smooth = true) => {
-    const { el: list, useDocument } = getScrollContext()
-    if (!list) {
-      debug('scrollToBottom missing list')
-      return false
-    }
-    const top = list.scrollHeight
-    debug('scrollToBottom', { scrollHeight: list.scrollHeight, smooth, useDocument })
-    if (useDocument) {
-      window.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
-    } else if ((list as any).scrollTo) {
-      ;(list as any).scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
-    } else {
-      window.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
-    }
-    if (!useDocument) {
-      list.scrollTop = list.scrollHeight
-    }
-    messenger?.markConversationRead(conversationId)
-    return true
-  }
-
-  const isNearBottom = (
-    list?: HTMLElement | null,
-    viewportHeight?: number,
-    useDocumentFlag = false,
-    threshold = 80
-  ) => {
-    if (!list) return false
-    if (useDocumentFlag) {
-      const scrollTop = window.scrollY || document.documentElement.scrollTop || 0
-      const clientHeight = viewportHeight ?? window.innerHeight
-      const distance = list.scrollHeight - scrollTop - clientHeight
-      return distance < threshold
-    }
-    const distance = list.scrollHeight - list.scrollTop - list.clientHeight
-    return distance < threshold
-  }
-
-  const isMessageVisible = (id: string) => {
-    const el = messageRefs.current.get(id)
-    const { el: list, useDocument } = getScrollContext()
-    if (!el || !list) return false
-    if (useDocument) {
-      const rect = el.getBoundingClientRect()
-      const visible = rect.bottom <= window.innerHeight && rect.top >= -24
-      debug('isMessageVisible', { id, visible, rectTop: rect.top, rectBottom: rect.bottom, useDocument })
-      return visible
-    }
-    const top = el.offsetTop
-    const bottom = top + el.offsetHeight
-    const viewTop = list.scrollTop
-    const viewBottom = list.scrollTop + list.clientHeight
-    const visible = bottom <= viewBottom && top >= viewTop - 24
-    debug('isMessageVisible', { id, visible, top, bottom, viewTop, viewBottom })
-    return visible
   }
 
   if (unsupportedReason) {
@@ -535,40 +528,40 @@ export function DMThread({
   return (
     <div className="flex flex-col h-full min-h-screen gap-3">
       <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto space-y-3 px-3 py-2 relative">
-        {localMessages.map((m, idx) => (
-          <React.Fragment key={m.id}>
-            {firstUnreadIdx === idx && unreadCount > 0 && (
+        {localMessages.map((message, index) => (
+          <React.Fragment key={message.id}>
+            {firstUnreadIdx === index && unreadCount > 0 && (
               <UnreadDivider onClick={() => scrollToBottom()} disabled={nearBottom} />
             )}
             <MessageBubble
-              messageRef={(el) => {
-                if (!el) return
-                const existing = messageRefs.current.get(m.id)
-                if (existing === el) return
-                messageRefs.current.set(m.id, el)
-                debug('messageRef set', { id: m.id })
+              messageRef={(element) => {
+                if (!element) return
+                const existing = messageRefs.current.get(message.id)
+                if (existing === element) return
+                messageRefs.current.set(message.id, element)
               }}
-              message={m}
+              message={message}
               myPubkey={myPubkey}
-              onReply={() => setReplyTarget(m)}
+              onReply={() => setReplyTarget(message)}
               replyTarget={replyTarget}
-              onReact={(emoji) => handleReact(m, emoji)}
+              onReact={(emoji) => handleReact(message, emoji)}
               reactionSendingId={reactionSendingId}
-              reactions={collectReactions(localMessages, m.id, myPubkey)}
-              pickerOpen={pickerOpen === m.id}
-              setPickerOpen={(open) => setPickerOpen(open ? m.id : null)}
-              resolveReply={async (_id) => {
-                debug('fetch messages (resolveReply)', { conversationId, replyId: _id })
-                const msgs = await messenger.getConversationMessages(conversationId)
-                setLocalMessages(msgs)
+              reactions={collectReactions(localMessages, message.id, myPubkey)}
+              pickerOpen={pickerOpen === message.id}
+              setPickerOpen={(open) => setPickerOpen(open ? message.id : null)}
+              resolveReply={async () => {
+                const thread = await messenger.loadThread(conversationId, { limit: 500, sync: true })
+                setLocalMessages(thread.messages)
               }}
               allMessages={localMessages}
             />
           </React.Fragment>
         ))}
+
         {localMessages.length === 0 && (
           <div className="text-sm text-muted-foreground text-center py-6">No messages yet.</div>
         )}
+
         {showScrollBottom && (
           <div className="flex justify-center">
             <Button
@@ -595,21 +588,30 @@ export function DMThread({
         onAddMedia={handleMediaUpload}
         uploading={uploading}
         uploadProgress={uploadProgress}
+        pendingAttachments={pendingAttachments}
+        clearAttachment={(index) => {
+          setPendingAttachments((previous) => previous.filter((_, attachmentIndex) => attachmentIndex !== index))
+        }}
       />
     </div>
   )
 }
 
-function collectReactions(messages: DMMessage[], targetId: string, myPubkey: string | null) {
+function collectReactions(messages: ThreadMessage[], targetId: string, myPubkey: string | null) {
   const stats = new Map<string, { count: number; self: boolean }>()
+
   messages
-    .filter((m) => m.type === 'reaction' && m.replyTo === targetId)
-    .forEach((m) => {
-      const key = m.content || '+'
-      const prev = stats.get(key) || { count: 0, self: false }
-      stats.set(key, { count: prev.count + 1, self: prev.self || m.sender.pubkey === myPubkey })
+    .filter((message) => message.type === 'reaction' && message.replyTo === targetId)
+    .forEach((message) => {
+      const key = message.content || '+'
+      const previous = stats.get(key) || { count: 0, self: false }
+      stats.set(key, {
+        count: previous.count + 1,
+        self: previous.self || message.senderPubkey === myPubkey
+      })
     })
-  return Array.from(stats.entries()).map(([emoji, val]) => ({ emoji, ...val }))
+
+  return Array.from(stats.entries()).map(([emoji, value]) => ({ emoji, ...value }))
 }
 
 function MessageBubble({
@@ -626,10 +628,10 @@ function MessageBubble({
   resolveReply,
   allMessages
 }: {
-  message: DMMessage
+  message: ThreadMessage
   myPubkey: string | null
   onReply: () => void
-  replyTarget: DMMessage | null
+  replyTarget: ThreadMessage | null
   onReact: (emoji: string) => void
   reactions: ReactionStat[]
   reactionSendingId: string | null
@@ -637,21 +639,21 @@ function MessageBubble({
   setPickerOpen: (open: boolean) => void
   messageRef: (el: HTMLDivElement | null) => void
   resolveReply: (id: string) => void
-  allMessages: DMMessage[]
+  allMessages: ThreadMessage[]
 }) {
-  const mine = message.sender.pubkey === myPubkey
+  const mine = message.senderPubkey === myPubkey
   const bubbleClasses = mine
     ? 'bg-primary/10 border-primary/30 ml-auto'
     : 'bg-muted/60 border-muted-foreground/20 mr-auto'
 
-  const { profile } = useFetchProfile(message.sender.pubkey)
+  const { profile } = useFetchProfile(message.senderPubkey)
 
   const replyMessage = useMemo(() => {
     if (!message.replyTo) return null
-    return allMessages.find((m) => m.id === message.replyTo) || null
+    return allMessages.find((item) => item.id === message.replyTo) || null
   }, [allMessages, message.replyTo])
 
-  const { profile: replyProfile } = useFetchProfile(replyMessage?.sender.pubkey || '')
+  const { profile: replyProfile } = useFetchProfile(replyMessage?.senderPubkey || '')
 
   const attemptedResolve = useRef<Set<string>>(new Set())
 
@@ -662,33 +664,69 @@ function MessageBubble({
     }
   }, [message.replyTo, replyMessage, resolveReply])
 
-  const displayName = (pubkey: string, prof?: any) => {
+  const displayName = (pubkey: string, profileData?: any) => {
     if (pubkey === myPubkey) return 'You'
-    if (prof?.shortName) return prof.shortName
+    if (profileData?.shortName) return profileData.shortName
     return shortNpub(pubkey)
+  }
+
+  const renderAttachment = (attachment: MessageAttachment, index: number) => {
+    const url = attachment.url || attachment.gatewayUrl
+    if (!url) return null
+
+    const mime = attachment.mime || ''
+    if (mime.startsWith('image/')) {
+      return (
+        <img
+          key={`${message.id}:attachment:${index}`}
+          src={url}
+          alt={attachment.fileName || 'attachment'}
+          className="max-h-72 rounded-lg border object-cover"
+        />
+      )
+    }
+
+    if (mime.startsWith('video/')) {
+      return (
+        <video
+          key={`${message.id}:attachment:${index}`}
+          src={url}
+          controls
+          className="max-h-72 rounded-lg border"
+        />
+      )
+    }
+
+    return (
+      <a
+        key={`${message.id}:attachment:${index}`}
+        href={url}
+        target="_blank"
+        rel="noreferrer"
+        className="inline-flex items-center gap-2 rounded-md border px-3 py-2 text-xs hover:bg-muted/60"
+      >
+        <Paperclip className="h-3.5 w-3.5" />
+        <span>{attachment.fileName || attachment.url}</span>
+      </a>
+    )
   }
 
   return (
     <div className={cn('flex w-full gap-2', mine ? 'justify-end' : 'justify-start')} ref={messageRef}>
-      {!mine && <SimpleUserAvatar userId={message.sender.pubkey} size="small" />}
+      {!mine && <SimpleUserAvatar userId={message.senderPubkey} size="small" />}
       <div className={cn('max-w-[80%] space-y-2')}>
-        <div
-          className={cn(
-            'rounded-2xl border px-3 py-2 shadow-sm',
-            bubbleClasses,
-            'flex flex-col gap-2'
-          )}
-        >
+        <div className={cn('rounded-2xl border px-3 py-2 shadow-sm', bubbleClasses, 'flex flex-col gap-2')}>
           <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-            <span className="font-medium text-foreground">{displayName(message.sender.pubkey, profile)}</span>
+            <span className="font-medium text-foreground">{displayName(message.senderPubkey, profile)}</span>
             <span>{new Date(message.timestamp * 1000).toLocaleString()}</span>
           </div>
+
           {message.replyTo && (
             <div className="text-[11px] text-muted-foreground border-l pl-2">
               {replyMessage ? (
                 <>
                   <div className="font-semibold text-foreground/80 text-xs">
-                    {displayName(replyMessage.sender.pubkey, replyProfile)}
+                    {displayName(replyMessage.senderPubkey, replyProfile)}
                   </div>
                   <div className="text-sm line-clamp-2">
                     <Content content={replyMessage.content || 'Encrypted message'} />
@@ -699,10 +737,20 @@ function MessageBubble({
               )}
             </div>
           )}
-          <div className="text-sm whitespace-pre-wrap space-y-2">
-            <Content content={message.content || ''} />
-          </div>
+
+          {message.attachments && message.attachments.length > 0 && (
+            <div className="flex flex-col gap-2">
+              {message.attachments.map((attachment, index) => renderAttachment(attachment, index))}
+            </div>
+          )}
+
+          {message.content && (
+            <div className="text-sm whitespace-pre-wrap space-y-2">
+              <Content content={message.content || ''} />
+            </div>
+          )}
         </div>
+
         <div className="flex items-center gap-2">
           <button
             className={cn(
@@ -714,6 +762,7 @@ function MessageBubble({
             <MessageCircle className="h-4 w-4" />
             Reply
           </button>
+
           <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
             <PopoverTrigger asChild>
               <button
@@ -732,24 +781,27 @@ function MessageBubble({
               />
             </PopoverContent>
           </Popover>
+
           <div className="flex gap-1 flex-wrap">
-            {reactions.map((r) => (
+            {reactions.map((reaction) => (
               <button
-                key={r.emoji}
+                key={reaction.emoji}
                 className={cn(
                   'flex items-center gap-1 px-2 py-1 rounded-full border text-xs',
-                  r.self ? 'border-primary text-primary bg-primary/10' : 'text-muted-foreground'
+                  reaction.self
+                    ? 'border-primary text-primary bg-primary/10'
+                    : 'text-muted-foreground'
                 )}
-                onClick={() => onReact(r.emoji)}
+                onClick={() => onReact(reaction.emoji)}
               >
-                <span>{r.emoji}</span>
-                <span>{r.count}</span>
+                <span>{reaction.emoji}</span>
+                <span>{reaction.count}</span>
               </button>
             ))}
           </div>
         </div>
       </div>
-      {mine && <SimpleUserAvatar userId={message.sender.pubkey} size="small" />}
+      {mine && <SimpleUserAvatar userId={message.senderPubkey} size="small" />}
     </div>
   )
 }
@@ -765,34 +817,34 @@ function ChatComposer({
   clearReply,
   onAddMedia,
   uploading,
-  uploadProgress
+  uploadProgress,
+  pendingAttachments,
+  clearAttachment
 }: {
   isSmallScreen: boolean
   draft: string
   setDraft: Dispatch<SetStateAction<string>>
   onSend: () => void
   sending: boolean
-  replyTarget: DMMessage | null
+  replyTarget: ThreadMessage | null
   myPubkey: string | null
   clearReply: () => void
   onAddMedia: (file: File) => void
   uploading: boolean
   uploadProgress: number | null
+  pendingAttachments: MessageAttachment[]
+  clearAttachment: (index: number) => void
 }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const editorRef = useRef<TPostTextareaHandle | null>(null)
   const mobileComposerOffset = 'calc(env(safe-area-inset-bottom) + 3rem)'
 
-  useEffect(() => {
-    debug('composer render', { isSmallScreen, draftLength: draft.length, replyTarget: replyTarget?.id })
-  }, [isSmallScreen, draft.length, replyTarget?.id])
-
   const handleMediaClick = () => {
     if (!fileInputRef.current) {
       fileInputRef.current = document.createElement('input')
       fileInputRef.current.type = 'file'
-      fileInputRef.current.onchange = (e: any) => {
-        const file = e.target.files?.[0]
+      fileInputRef.current.onchange = (event: any) => {
+        const file = event.target.files?.[0]
         if (file) {
           onAddMedia(file)
         }
@@ -805,7 +857,7 @@ function ChatComposer({
     if (editorRef.current) {
       editorRef.current.insertEmoji(emoji)
     } else {
-      setDraft((d) => `${d}${emoji}`)
+      setDraft((current) => `${current}${emoji}`)
     }
   }
 
@@ -826,6 +878,25 @@ function ChatComposer({
     </Popover>
   )
 
+  const renderPendingAttachments = (
+    <div className="flex flex-wrap gap-2 px-1">
+      {pendingAttachments.map((attachment, index) => (
+        <div
+          key={`${attachment.url}:${index}`}
+          className="inline-flex items-center gap-2 rounded-full border px-2 py-1 text-xs"
+        >
+          <Paperclip className="h-3.5 w-3.5" />
+          <span className="max-w-[10rem] truncate">
+            {attachment.fileName || attachment.url.split('/').pop() || 'attachment'}
+          </span>
+          <button onClick={() => clearAttachment(index)}>
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      ))}
+    </div>
+  )
+
   if (isSmallScreen) {
     return (
       <div
@@ -834,12 +905,18 @@ function ChatComposer({
       >
         {replyTarget && (
           <div className="flex items-center justify-between text-xs text-muted-foreground px-2">
-            <span>Replying to {formatName(replyTarget.sender.pubkey, myPubkey)}: {replyTarget.content || 'Encrypted message'}</span>
+            <span>
+              Replying to {formatName(replyTarget.senderPubkey, myPubkey)}:{' '}
+              {replyTarget.content || 'Encrypted message'}
+            </span>
             <Button variant="ghost" size="sm" onClick={clearReply}>
               <X className="h-4 w-4" />
             </Button>
           </div>
         )}
+
+        {pendingAttachments.length > 0 && renderPendingAttachments}
+
         <div className="flex items-end gap-2">
           <Popover>
             <PopoverTrigger asChild>
@@ -857,32 +934,36 @@ function ChatComposer({
                     Emoji
                   </Button>
                 </PopoverTrigger>
-                  <PopoverContent className="p-0" align="start">
-                    <EmojiPicker
-                      onEmojiClick={(emoji) => {
-                      if (emoji) handleAddEmoji(typeof emoji === 'string' ? emoji : (emoji as any).native || '+')
+                <PopoverContent className="p-0" align="start">
+                  <EmojiPicker
+                    onEmojiClick={(emoji) => {
+                      if (emoji) {
+                        handleAddEmoji(typeof emoji === 'string' ? emoji : (emoji as any).native || '+')
+                      }
                     }}
                   />
                 </PopoverContent>
               </Popover>
             </PopoverContent>
           </Popover>
-        <div className="flex-1">
-          <PostTextarea
-            ref={editorRef}
-            text={draft}
-            setText={setDraft}
-            onSubmit={onSend}
-            className="min-h-[40px] rounded-2xl"
-            submitOnEnter={!isSmallScreen}
-            hidePreviewToggle
-          />
-        </div>
+
+          <div className="flex-1">
+            <PostTextarea
+              ref={editorRef}
+              text={draft}
+              setText={setDraft}
+              onSubmit={onSend}
+              className="min-h-[40px] rounded-2xl"
+              submitOnEnter={!isSmallScreen}
+              hidePreviewToggle
+            />
+          </div>
+
           <Button
             variant="ghost"
             size="icon"
             className="rounded-full"
-            disabled={sending || !draft.trim()}
+            disabled={sending || (!draft.trim() && pendingAttachments.length === 0)}
             onClick={onSend}
           >
             <Send className="h-5 w-5" />
@@ -896,12 +977,16 @@ function ChatComposer({
     <div className="sticky bottom-0 left-0 right-0 bg-background border-t px-3 py-3 space-y-2">
       {replyTarget && (
         <div className="flex items-center justify-between text-xs text-muted-foreground px-2">
-          <span>Replying to {formatName(replyTarget.sender.pubkey, myPubkey)}: {replyTarget.content || 'Encrypted message'}</span>
+          <span>
+            Replying to {formatName(replyTarget.senderPubkey, myPubkey)}:{' '}
+            {replyTarget.content || 'Encrypted message'}
+          </span>
           <Button variant="ghost" size="sm" onClick={clearReply}>
             <X className="h-4 w-4" />
           </Button>
         </div>
       )}
+
       <div className="rounded-lg border bg-muted/30 p-3 space-y-2 shadow-sm">
         <div className="flex items-center gap-2 text-muted-foreground text-sm">
           <Button variant="ghost" size="icon" className="rounded-full" title="Media" onClick={handleMediaClick}>
@@ -909,12 +994,16 @@ function ChatComposer({
           </Button>
           {emojiButton}
         </div>
+
+        {pendingAttachments.length > 0 && renderPendingAttachments}
+
         {uploading && (
           <div className="text-xs text-muted-foreground flex items-center gap-2 px-1">
             <span>Uploading…</span>
             {uploadProgress !== null && <span>{Math.round(uploadProgress)}%</span>}
           </div>
         )}
+
         <PostTextarea
           ref={editorRef}
           text={draft}
@@ -924,11 +1013,17 @@ function ChatComposer({
           submitOnEnter={!isSmallScreen}
           hidePreviewToggle
         />
+
         <div className="flex justify-end gap-2">
-          <Button variant="ghost" onClick={() => setDraft('')}>
+          <Button
+            variant="ghost"
+            onClick={() => {
+              setDraft('')
+            }}
+          >
             Cancel
           </Button>
-          <Button onClick={onSend} disabled={sending || !draft.trim()}>
+          <Button onClick={onSend} disabled={sending || (!draft.trim() && pendingAttachments.length === 0)}>
             {sending ? 'Sending…' : 'Send'}
           </Button>
         </div>
@@ -947,7 +1042,7 @@ function UnreadDivider({ onClick, disabled }: { onClick: () => void; disabled?: 
       ) : (
         <Button variant="secondary" size="sm" className="rounded-full" onClick={onClick}>
           <ChevronDown className="h-4 w-4" />
-          <span className="ml-1">Jump to bottom</span>
+          <span className="ml-1">Jump to latest</span>
         </Button>
       )}
     </div>

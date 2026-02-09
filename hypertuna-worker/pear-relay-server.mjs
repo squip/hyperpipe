@@ -123,9 +123,14 @@ let config = null;
 let swarm = null;
 let gatewayRegistrationInterval = null;
 let gatewayConnection = null;
+let relayServerShuttingDown = false;
 let pendingRegistrations = []; // Queue registrations until gateway connects
 let connectedPeers = new Map(); // Track all connected peers
 const relayClientConnections = new Map(); // relayKey -> Map(clientId -> { connectionKey, updatedAt })
+
+function shouldSuppressMissingRelayLog(identifier) {
+  return relayServerShuttingDown && identifier === PUBLIC_GATEWAY_REPLICA_IDENTIFIER;
+}
 
 function getRelayClientMap(relayKey) {
   let map = relayClientConnections.get(relayKey);
@@ -487,6 +492,7 @@ async function fetchMirrorMetadataFromGateway(identifier, { reason = 'join-fallb
 
 // Initialize with enhanced config
 export async function initializeRelayServer(customConfig = {}) {
+  relayServerShuttingDown = false;
   console.log('[RelayServer] ========================================');
   console.log('[RelayServer] Initializing with Hyperswarm support...');
   console.log('[RelayServer] Timestamp:', new Date().toISOString());
@@ -1660,7 +1666,9 @@ function setupProtocolHandlers(protocol) {
         if (relayKey !== identifier) {
             console.log(`[RelayServer] Resolved public identifier ${identifier} to relay key ${relayKey.substring(0, 8)}...`);
         } else if (!/^[a-f0-9]{64}$/i.test(relayKey)) {
-            console.warn(`[RelayServer] No relay found for public identifier: ${identifier}`);
+            if (!shouldSuppressMissingRelayLog(identifier)) {
+              console.warn(`[RelayServer] No relay found for public identifier: ${identifier}`);
+            }
             updateMetrics(false);
             return {
                 statusCode: 404,
@@ -1755,7 +1763,9 @@ function setupProtocolHandlers(protocol) {
       if (!/^[a-f0-9]{64}$/i.test(relayKey)) {
         const isActive = await isRelayActiveByPublicIdentifier(identifier);
         if (!isActive) {
-          console.error(`[RelayServer] No relay found for public identifier: ${identifier}`);
+          if (!shouldSuppressMissingRelayLog(identifier)) {
+            console.error(`[RelayServer] No relay found for public identifier: ${identifier}`);
+          }
           updateMetrics(false);
           return {
             statusCode: 404,
@@ -2029,7 +2039,9 @@ function setupProtocolHandlers(protocol) {
         if (!/^[a-f0-9]{64}$/i.test(relayKey)) {
             const isActive = await isRelayActiveByPublicIdentifier(identifier);
             if (!isActive) {
-                console.error(`[RelayServer] No relay found for public identifier: ${identifier}`);
+                if (!shouldSuppressMissingRelayLog(identifier)) {
+                  console.error(`[RelayServer] No relay found for public identifier: ${identifier}`);
+                }
                 updateMetrics(false);
                 return {
                     statusCode: 404,
@@ -2464,19 +2476,11 @@ function setupProtocolHandlers(protocol) {
       const hash = fileId.split('.')[0];
       // Prefer new layout using publicIdentifier path; fall back to legacy relayKey path
       let fileBuffer = await getFile(identifier, hash);
-      if (!fileBuffer) {
-        const relayKey = await getRelayKeyFromPublicIdentifier(identifier);
-        if (!fileBuffer && !relayKey && !/^[a-f0-9]{64}$/i.test(identifier)) {
-          updateMetrics(false);
-          return {
-            statusCode: 404,
-            headers: buildDriveErrorHeaders(),
-            body: b4a.from(JSON.stringify({ error: 'Relay not found' }))
-          };
-        }
-        if (relayKey) {
-          fileBuffer = await getFile(relayKey, hash);
-        }
+	      if (!fileBuffer) {
+	        const relayKey = await getRelayKeyFromPublicIdentifier(identifier);
+	        if (relayKey) {
+	          fileBuffer = await getFile(relayKey, hash);
+	        }
         if (!fileBuffer && typeof global.recoverRelayDriveFile === 'function') {
           const recoverResult = await global.recoverRelayDriveFile({
             relayKey: relayKey || null,
@@ -5874,6 +5878,7 @@ export async function disconnectRelay(relayKey) {
 }
 
 export async function shutdownRelayServer() {
+  relayServerShuttingDown = true;
   console.log('[RelayServer] ========================================');
   console.log('[RelayServer] SHUTTING DOWN');
   console.log('[RelayServer] Timestamp:', new Date().toISOString());

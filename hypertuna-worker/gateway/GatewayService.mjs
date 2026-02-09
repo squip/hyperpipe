@@ -30,12 +30,29 @@ import { getRelayAuthStore } from '../relay-auth-store.mjs';
 import { updatePublicGatewaySettings } from '../../shared/config/PublicGatewaySettings.mjs';
 import HypercoreId from 'hypercore-id-encoding';
 import { resolveRelayMirrorCoreRefs } from '../relay-core-refs-store.mjs';
+import { getFile } from '../hyperdrive-manager.mjs';
 
 const MAX_LOG_ENTRIES = 500;
 const DEFAULT_PORT = 8443;
 const PUBLIC_GATEWAY_RELAY_KEY = 'public-gateway:hyperbee';
 const PUBLIC_GATEWAY_RELAY_PATH = 'relay';
 const PUBLIC_GATEWAY_RELAY_PATH_ALIASES = ['public-gateway/hyperbee'];
+
+function guessContentType(fileName = '') {
+  const lower = typeof fileName === 'string' ? fileName.toLowerCase() : '';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.svg')) return 'image/svg+xml';
+  if (lower.endsWith('.mp4')) return 'video/mp4';
+  if (lower.endsWith('.webm')) return 'video/webm';
+  if (lower.endsWith('.mp3')) return 'audio/mpeg';
+  if (lower.endsWith('.m4a')) return 'audio/mp4';
+  if (lower.endsWith('.pdf')) return 'application/pdf';
+  if (lower.endsWith('.txt')) return 'text/plain; charset=utf-8';
+  return 'application/octet-stream';
+}
 
 class MessageQueue {
   constructor() {
@@ -2613,6 +2630,36 @@ export class GatewayService extends EventEmitter {
     this.app.get('/drive/:identifier/:file', async (req, res) => {
       const { identifier, file } = req.params;
       try {
+        const fileHash = typeof file === 'string' ? file.split('.')[0] : null;
+        const validHash = typeof fileHash === 'string' && /^[a-f0-9]{64}$/i.test(fileHash);
+        if (validHash) {
+          let localBuffer = null;
+          try {
+            localBuffer = await getFile(identifier, fileHash.toLowerCase());
+          } catch (_) {}
+
+          if (!localBuffer && typeof global.recoverRelayDriveFile === 'function') {
+            try {
+              const recovery = await global.recoverRelayDriveFile({
+                relayKey: null,
+                identifier,
+                fileHash: fileHash.toLowerCase(),
+                reason: 'gateway-http-request'
+              });
+              if (recovery?.status === 'ok') {
+                localBuffer = await getFile(identifier, fileHash.toLowerCase());
+              }
+            } catch (_) {}
+          }
+
+          if (localBuffer) {
+            res.setHeader('content-type', guessContentType(file));
+            res.setHeader('cache-control', 'public, max-age=31536000, immutable');
+            res.status(200).send(Buffer.isBuffer(localBuffer) ? localBuffer : Buffer.from(localBuffer));
+            return;
+          }
+        }
+
         const peer = await this.findHealthyPeerForRelay(identifier);
         if (!peer) {
           return res.status(503).json({ error: 'No healthy peers available for this relay' });
