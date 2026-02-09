@@ -28,6 +28,7 @@ import { ZapProvider } from '@/providers/ZapProvider'
 import { MessengerProvider } from '@/providers/MessengerProvider'
 import { NotepadProvider } from '@/providers/NotepadProvider'
 import { PageManager } from './PageManager'
+import { GroupFilesProvider } from './providers/GroupFilesProvider'
 import { GroupsProvider } from './providers/GroupsProvider'
 import { WorkerBridgeProvider } from './providers/WorkerBridgeProvider'
 
@@ -59,7 +60,9 @@ export default function App(): JSX.Element {
                                                   <MessengerProvider>
                                                     <NotepadProvider>
                                                       <GroupsProvider>
-                                                        <PageManager />
+                                                        <GroupFilesProvider>
+                                                          <PageManager />
+                                                        </GroupFilesProvider>
                                                       </GroupsProvider>
                                                     </NotepadProvider>
                                                   </MessengerProvider>

@@ -1,173 +1,183 @@
-import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
-import { useGroups } from '@/providers/GroupsProvider'
-import { TPageRef } from '@/types'
-import { Card, CardContent } from '@/components/ui/card'
-import { Button } from '@/components/ui/button'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { useTranslation } from 'react-i18next'
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
-import { Loader2, Users, X } from 'lucide-react'
-import { Input } from '@/components/ui/input'
-import { useSecondaryPage } from '@/PageManager'
-import { toGroup } from '@/lib/link'
-import GroupCreateDialog from '@/components/GroupCreateDialog'
-import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
-import { SimpleUserAvatar } from '@/components/UserAvatar'
 import { FormattedTimestamp } from '@/components/FormattedTimestamp'
-import { useNostr } from '@/providers/NostrProvider'
+import GroupCreateDialog from '@/components/GroupCreateDialog'
+import Username from '@/components/Username'
+import { SimpleUserAvatar } from '@/components/UserAvatar'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
+import { toGroup } from '@/lib/link'
+import { useSecondaryPage } from '@/PageManager'
 import { useFetchProfile } from '@/hooks'
+import { useGroups } from '@/providers/GroupsProvider'
+import { useNostr } from '@/providers/NostrProvider'
+import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
+import { TGroupInvite } from '@/types/groups'
+import { TPageRef } from '@/types'
+import dayjs from 'dayjs'
+import { ArrowDown, ArrowUp, ArrowUpDown, Link2, Loader2, Users, X } from 'lucide-react'
+import { type PointerEvent as ReactPointerEvent, forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 type TTab = 'discover' | 'my' | 'invites'
+type SortDirection = 'asc' | 'desc'
+type GroupSortKey = 'name' | 'description' | 'open' | 'public' | 'admin' | 'createdAt' | 'members' | 'peers'
+type InviteSortKey = GroupSortKey | 'inviteDate' | 'inviteAge' | 'invitedBy'
+
+type GroupSortState = { key: GroupSortKey; direction: SortDirection }
+type InviteSortState = { key: InviteSortKey; direction: SortDirection }
+
+type GroupRow = {
+  key: string
+  groupId: string
+  relay?: string
+  name: string
+  about: string
+  picture?: string
+  isOpen: boolean
+  isPublic: boolean
+  createdAt: number | null
+  fallbackAdminPubkey: string | null
+}
+
+type InviteRow = {
+  key: string
+  invite: TGroupInvite
+  groupId: string
+  relay?: string
+  name: string
+  about: string
+  picture?: string
+  isOpen: boolean
+  isPublic: boolean
+  inviteDate: number
+  invitedBy: string
+}
+
+type GroupDetailCacheEntry = {
+  adminPubkey: string | null
+  members: string[]
+  createdAt: number | null
+  updatedAt: number
+}
+
+type HorizontalDragState = {
+  pointerId: number
+  startX: number
+  startScrollLeft: number
+  moved: boolean
+}
+
+type ActiveGroupTarget = {
+  key: string
+  groupId: string
+  relay?: string
+  fallbackAdminPubkey: string | null
+  fallbackCreatedAt: number | null
+}
+
+const GROUP_DETAIL_CACHE_TTL_MS = 2 * 60 * 1000
+const MEMBER_PREVIEW_REFRESH_TTL_MS = 90 * 1000
+const GROUP_DETAIL_FETCH_CONCURRENCY = 3
+const MEMBER_PREVIEW_FETCH_CONCURRENCY = 4
 
 const makeGroupKey = (groupId: string, relay?: string) => (relay ? `${relay}|${groupId}` : groupId)
-const GROUP_FACEPILE_REFRESH_INTERVAL_MS = 60 * 1000
-const GROUP_FACEPILE_REFRESH_JITTER_MS = 10 * 1000
 
-function GroupFacepile({ groupId, relay, show }: { groupId: string; relay?: string; show: boolean }) {
-  const { t } = useTranslation()
-  const { followList } = useNostr()
-  const { getGroupMemberPreview, refreshGroupMemberPreview, groupMemberPreviewVersion } = useGroups()
-  const { getRelayPeerCount } = useWorkerBridge()
-  const [members, setMembers] = useState<string[] | null>(null)
+function compareNumbers(left: number, right: number, direction: SortDirection) {
+  return direction === 'asc' ? left - right : right - left
+}
 
-  useEffect(() => {
-    if (!show) {
-      setMembers(null)
-      return
-    }
-    let cancelled = false
-    const cached = getGroupMemberPreview(groupId, relay)
-    if (cached) {
-      setMembers(cached.members)
-      console.info('[GroupFacepile] cache read', {
-        groupId,
-        relay: relay || null,
-        membersCount: cached.members.length,
-        source: cached.source,
-        authoritative: cached.authoritative,
-        previewVersion: groupMemberPreviewVersion
-      })
-    }
+function compareStrings(left: string, right: string, direction: SortDirection) {
+  return direction === 'asc'
+    ? left.localeCompare(right)
+    : right.localeCompare(left)
+}
 
-    const load = async (force = false) => {
-      try {
-        const memberList = await refreshGroupMemberPreview(groupId, relay, {
-          force,
-          reason: force ? 'groups-page-facepile-interval' : 'groups-page-facepile-init'
-        })
-        if (!cancelled) {
-          const latest = getGroupMemberPreview(groupId, relay)
-          const shouldPreferLatest =
-            !!latest &&
-            latest.authoritative &&
-            latest.members.length >= memberList.length
-          const appliedMembers = shouldPreferLatest ? latest.members : memberList
-          setMembers(appliedMembers)
-          console.info('[GroupFacepile] applied preview', {
-            groupId,
-            relay: relay || null,
-            membersCount: appliedMembers.length,
-            force,
-            preferredAuthoritativeCache: shouldPreferLatest,
-            previewVersion: groupMemberPreviewVersion
-          })
-        }
-      } catch (_err) {
-        if (!cancelled) setMembers(cached?.members || [])
-      }
-    }
+function normalizeSearch(value: string | null | undefined) {
+  return String(value || '').trim().toLowerCase()
+}
 
-    load(!cached)
-    let timer: number | null = null
-    const scheduleRefresh = () => {
-      const jitter = Math.floor(Math.random() * GROUP_FACEPILE_REFRESH_JITTER_MS)
-      timer = window.setTimeout(async () => {
-        if (cancelled) return
-        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
-          scheduleRefresh()
-          return
-        }
-        await load(false)
-        scheduleRefresh()
-      }, GROUP_FACEPILE_REFRESH_INTERVAL_MS + jitter)
-    }
-    scheduleRefresh()
+function isLikelyRelayUrl(value?: string | null) {
+  if (!value) return false
+  return /^wss?:\/\//i.test(value) || /^https?:\/\//i.test(value)
+}
 
-    return () => {
-      cancelled = true
-      if (timer !== null) {
-        window.clearTimeout(timer)
-      }
-    }
-  }, [getGroupMemberPreview, groupId, relay, refreshGroupMemberPreview, show, groupMemberPreviewVersion])
+function hasRelayToken(value: string) {
+  try {
+    return new URL(value).searchParams.has('token')
+  } catch (_err) {
+    return /[?&]token=/.test(value)
+  }
+}
 
-  const sortedMembers = useMemo(() => {
-    if (!members || !members.length) return []
-    const list = [...members]
-    list.sort((a, b) => {
-      const aFollow = followList.includes(a)
-      const bFollow = followList.includes(b)
-      if (aFollow !== bFollow) return aFollow ? -1 : 1
-      return 0
-    })
-    return list.slice(0, 3)
-  }, [members, followList])
+function isDragScrollBlockedTarget(target: EventTarget | null) {
+  return target instanceof Element
+    && !!target.closest('button, a, input, textarea, select, label, [role="button"], [data-no-drag-scroll="true"]')
+}
 
-  if (!show || !members || members.length === 0 || sortedMembers.length === 0) return null
+function formatAbsoluteDate(timestamp: number | null) {
+  if (!timestamp || !Number.isFinite(timestamp)) return '-'
+  return dayjs.unix(timestamp).format('YYYY-MM-DD HH:mm')
+}
 
-  const memberCountLabel = `${new Intl.NumberFormat(undefined, { notation: 'compact' }).format(
-    members.length
-  )} ${t('Members')}`
-  const peerCount = getRelayPeerCount(groupId) || getRelayPeerCount(relay)
-  const peerLabel =
-    peerCount > 0 ? `${new Intl.NumberFormat(undefined, { notation: 'compact' }).format(peerCount)} ${t('online')}` : null
-
+function SortHeaderButton({
+  label,
+  active,
+  direction,
+  onClick,
+  className
+}: {
+  label: string
+  active: boolean
+  direction: SortDirection
+  onClick: () => void
+  className?: string
+}) {
   return (
-    <div className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-1">
-      <div className="flex -space-x-2">
-        {sortedMembers.map((pubkey) => (
-          <div
-            key={pubkey}
-            className="h-5 w-5 rounded-full ring-2 ring-background overflow-hidden bg-muted"
-          >
-            <SimpleUserAvatar userId={pubkey} size="small" className="h-full w-full rounded-full" />
-          </div>
-        ))}
-      </div>
-      <div className="text-xs font-medium whitespace-nowrap truncate">
-        {memberCountLabel}
-        {peerLabel ? ` • ${peerLabel}` : ''}
-      </div>
-    </div>
+    <button type="button" onClick={onClick} className={`flex items-center gap-1 text-left ${className || ''}`}>
+      <span>{label}</span>
+      {!active ? (
+        <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground" />
+      ) : direction === 'asc' ? (
+        <ArrowUp className="h-3.5 w-3.5 text-foreground" />
+      ) : (
+        <ArrowDown className="h-3.5 w-3.5 text-foreground" />
+      )}
+    </button>
   )
 }
 
-function InviteMembersBadge({ memberPubkeys }: { memberPubkeys?: string[] }) {
-  const { t } = useTranslation()
-  const normalized = useMemo(
-    () =>
-      Array.from(
-        new Set((Array.isArray(memberPubkeys) ? memberPubkeys : []).map((pk) => String(pk || '').trim()).filter(Boolean))
-      ),
-    [memberPubkeys]
+function StatusBadge({ label }: { label: string }) {
+  return (
+    <span className="inline-flex items-center rounded-full border bg-muted/40 px-2 py-0.5 text-xs font-medium text-muted-foreground">
+      {label}
+    </span>
+  )
+}
+
+function MembersCell({ members }: { members: string[] }) {
+  const compact = useMemo(
+    () => new Intl.NumberFormat(undefined, { notation: 'compact' }),
+    []
   )
 
-  if (!normalized.length) return null
-  const preview = normalized.slice(0, 3)
-  const label = `${new Intl.NumberFormat(undefined, { notation: 'compact' }).format(normalized.length)} ${t('Members')}`
+  if (!members.length) {
+    return <span className="text-xs text-muted-foreground">0</span>
+  }
 
+  const preview = members.slice(0, 3)
   return (
     <div className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-1">
       <div className="flex -space-x-2">
         {preview.map((pubkey) => (
-          <div key={pubkey} className="h-5 w-5 rounded-full ring-2 ring-background overflow-hidden bg-muted">
+          <div key={pubkey} className="h-5 w-5 overflow-hidden rounded-full bg-muted ring-2 ring-background">
             <SimpleUserAvatar userId={pubkey} size="small" className="h-full w-full rounded-full" />
           </div>
         ))}
       </div>
-      <div className="text-xs font-medium whitespace-nowrap truncate">{label}</div>
+      <span className="text-xs font-medium">{compact.format(members.length)}</span>
     </div>
   )
 }
@@ -176,7 +186,7 @@ function InviteSenderLabel({ userId }: { userId: string }) {
   const { profile } = useFetchProfile(userId)
   const fallback = `${userId.slice(0, 8)}...${userId.slice(-4)}`
   const label = profile?.shortName || profile?.metadata?.name || fallback
-  return <span className="text-xs font-medium truncate max-w-[220px]">{label}</span>
+  return <span className="truncate text-xs font-medium max-w-[220px]">{label}</span>
 }
 
 const GroupsPage = forwardRef<TPageRef>((_, ref) => {
@@ -195,106 +205,499 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     isLoadingDiscovery,
     discoveryError,
     invitesError,
-    resolveRelayUrl
+    resolveRelayUrl,
+    fetchGroupDetail,
+    getGroupMemberPreview,
+    refreshGroupMemberPreview,
+    groupMemberPreviewVersion
   } = useGroups()
-  const { startJoinFlow, sendToWorker } = useWorkerBridge()
+  const { startJoinFlow, sendToWorker, getRelayPeerCount } = useWorkerBridge()
   const { pubkey } = useNostr()
   const [tab, setTab] = useState<TTab>('discover')
   const [search, setSearch] = useState('')
-  const { push } = useSecondaryPage()
   const [showCreate, setShowCreate] = useState(false)
   const [joiningInviteId, setJoiningInviteId] = useState<string | null>(null)
+  const [discoverSort, setDiscoverSort] = useState<GroupSortState>({ key: 'members', direction: 'desc' })
+  const [mySort, setMySort] = useState<GroupSortState>({ key: 'createdAt', direction: 'desc' })
+  const [inviteSort, setInviteSort] = useState<InviteSortState>({ key: 'inviteDate', direction: 'desc' })
+  const [groupDetailCache, setGroupDetailCache] = useState<Record<string, GroupDetailCacheEntry>>({})
+  const detailInFlightRef = useRef<Set<string>>(new Set())
+  const detailGenerationRef = useRef(0)
+  const horizontalDragStateRef = useRef<HorizontalDragState | null>(null)
+  const { push } = useSecondaryPage()
 
   const inviteGroupIds = useMemo(() => new Set(invites.map((inv) => inv.groupId)), [invites])
-  const filteredDiscovery = discoveryGroups.filter((g) => {
-    const isMember = myGroupList.some((entry) => entry.groupId === g.id)
-    const invited = inviteGroupIds.has(g.id)
-    if (g.isPublic === false && !isMember && !invited) return false
-    if (!search.trim()) return true
-    const q = search.toLowerCase()
-    return g.name.toLowerCase().includes(q) || (g.about ?? '').toLowerCase().includes(q)
-  })
 
-  const renderGroupCard = (groupId: string, relay?: string) => {
-    const discoveryMeta = discoveryGroups.find(
-      (g) => g.id === groupId && (relay ? g.relay === relay : true)
-    )
-    const provisionalMeta = getProvisionalGroupMetadata(groupId, relay)
-    const meta = discoveryMeta || provisionalMeta
-    const name = meta?.name || groupId
-    const about = meta?.about
-    const membersText = meta?.tags?.length ? `${meta.tags.length} tags` : null
-    const picture = meta?.picture
-    const initials = (name || 'GR').slice(0, 2).toUpperCase()
-
-    return (
-      <Card
-        key={makeGroupKey(groupId, relay)}
-        className="cursor-pointer transition-colors hover:bg-accent/50 overflow-hidden"
-        onClick={() => {
-          push(toGroup(groupId, relay))
-        }}
-      >
-        <CardContent className="p-4 flex gap-3 items-start">
-          <Avatar className="h-11 w-11 shrink-0">
-            {picture && <AvatarImage src={picture} alt={name} />}
-            <AvatarFallback className="text-sm font-semibold">{initials}</AvatarFallback>
-          </Avatar>
-          <div className="flex-1 min-w-0 space-y-1">
-            <div className="flex items-center justify-between gap-2">
-              <div className="font-semibold text-lg truncate">{name}</div>
-              <GroupFacepile
-                groupId={groupId}
-                relay={relay}
-                show={meta?.isPublic !== false || myGroupList.some((entry) => entry.groupId === groupId)}
-              />
-            </div>
-            {about && <div className="text-sm text-muted-foreground line-clamp-2">{about}</div>}
-            {membersText && <div className="text-xs text-muted-foreground">{membersText}</div>}
-          </div>
-        </CardContent>
-      </Card>
-    )
-  }
-
-  const renderDiscover = () => {
-    if (isLoadingDiscovery) {
-      return (
-        <div className="flex flex-col items-center gap-3 text-muted-foreground py-12">
-          <Loader2 className="w-6 h-6 animate-spin" />
-          <div>{t('Loading...')}</div>
-        </div>
+  const resolveGroupMeta = useCallback(
+    (groupId: string, relay?: string) => {
+      const exact = discoveryGroups.find(
+        (group) => group.id === groupId && (relay ? group.relay === relay : true)
       )
-    }
-    if (discoveryError) {
-      return (
-        <div className="text-sm text-red-500">
-          {t('Failed to load groups')}: {discoveryError}
-        </div>
-      )
-    }
-    if (!discoveryGroups.length) {
-      return <div className="text-muted-foreground">{t('No groups found')}</div>
-    }
-    return (
-      <div className="space-y-3">
-        {filteredDiscovery.map((g) => renderGroupCard(g.id, g.relay))}
-      </div>
-    )
-  }
+      if (exact) return exact
+      const provisional = getProvisionalGroupMetadata(groupId, relay)
+      if (provisional) return provisional
+      return discoveryGroups.find((group) => group.id === groupId) || null
+    },
+    [discoveryGroups, getProvisionalGroupMetadata]
+  )
 
-  const renderMyGroups = () => {
-    if (!myGroupList.length) {
-      return <div className="text-muted-foreground">{t('No groups yet')}</div>
-    }
-    return (
-      <div className="space-y-3">
-        {myGroupList.map((entry) => renderGroupCard(entry.groupId, entry.relay))}
-      </div>
-    )
-  }
+  const discoverRows = useMemo<GroupRow[]>(() => {
+    return discoveryGroups
+      .filter((group) => {
+        const isMember = myGroupList.some((entry) => entry.groupId === group.id)
+        const invited = inviteGroupIds.has(group.id)
+        if (group.isPublic === false && !isMember && !invited) return false
+        return true
+      })
+      .map((group) => ({
+        key: makeGroupKey(group.id, group.relay),
+        groupId: group.id,
+        relay: group.relay,
+        name: group.name || group.id,
+        about: group.about || '',
+        picture: group.picture,
+        isOpen: group.isOpen !== false,
+        isPublic: group.isPublic !== false,
+        createdAt: group.event?.created_at || null,
+        fallbackAdminPubkey: group.event?.pubkey || null
+      }))
+  }, [discoveryGroups, inviteGroupIds, myGroupList])
 
-  const handleUseInvite = async (inv: (typeof invites)[number]) => {
+  const myRows = useMemo<GroupRow[]>(() => {
+    return myGroupList.map((entry) => {
+      const meta = resolveGroupMeta(entry.groupId, entry.relay)
+      return {
+        key: makeGroupKey(entry.groupId, entry.relay),
+        groupId: entry.groupId,
+        relay: entry.relay,
+        name: meta?.name || entry.groupId,
+        about: meta?.about || '',
+        picture: meta?.picture,
+        isOpen: meta?.isOpen !== false,
+        isPublic: meta?.isPublic !== false,
+        createdAt: meta?.event?.created_at || null,
+        fallbackAdminPubkey: meta?.event?.pubkey || null
+      }
+    })
+  }, [myGroupList, resolveGroupMeta])
+
+  const inviteRows = useMemo<InviteRow[]>(() => {
+    return invites.map((invite) => {
+      const relay = invite.relayUrl ?? (invite.relay ? resolveRelayUrl(invite.relay) : undefined) ?? invite.relay
+      return {
+        key: invite.event.id,
+        invite,
+        groupId: invite.groupId,
+        relay,
+        name: invite.groupName || invite.name || invite.groupId,
+        about: invite.about || '',
+        picture: invite.groupPicture,
+        isOpen: invite.fileSharing !== false,
+        isPublic: invite.isPublic !== false,
+        inviteDate: invite.event.created_at,
+        invitedBy: invite.event.pubkey
+      }
+    })
+  }, [invites, resolveRelayUrl])
+
+  const activeTargets = useMemo(() => {
+    const targetMap = new Map<string, ActiveGroupTarget>()
+    const sourceRows: ActiveGroupTarget[] = tab === 'discover'
+      ? discoverRows.map((row) => ({
+          key: row.key,
+          groupId: row.groupId,
+          relay: row.relay,
+          fallbackAdminPubkey: row.fallbackAdminPubkey,
+          fallbackCreatedAt: row.createdAt
+        }))
+      : tab === 'my'
+        ? myRows.map((row) => ({
+            key: row.key,
+            groupId: row.groupId,
+            relay: row.relay,
+            fallbackAdminPubkey: row.fallbackAdminPubkey,
+            fallbackCreatedAt: row.createdAt
+          }))
+        : inviteRows.map((row) => ({
+            key: makeGroupKey(row.groupId, row.relay),
+            groupId: row.groupId,
+            relay: row.relay,
+            fallbackAdminPubkey: row.invitedBy || null,
+            fallbackCreatedAt: row.inviteDate || null
+          }))
+
+    for (const row of sourceRows) {
+      const key = row.key
+      if (targetMap.has(key)) continue
+      targetMap.set(key, {
+        key,
+        groupId: row.groupId,
+        relay: row.relay,
+        fallbackAdminPubkey: row.fallbackAdminPubkey,
+        fallbackCreatedAt: row.fallbackCreatedAt
+      })
+    }
+    return Array.from(targetMap.values())
+  }, [discoverRows, inviteRows, myRows, tab])
+
+  useEffect(() => {
+    if (activeTargets.length === 0) return
+    const generation = Date.now()
+    detailGenerationRef.current = generation
+    let cancelled = false
+    const now = Date.now()
+    const queue = activeTargets.filter((target) => {
+      if (detailInFlightRef.current.has(target.key)) return false
+      const cached = groupDetailCache[target.key]
+      if (!cached) return true
+      return now - cached.updatedAt > GROUP_DETAIL_CACHE_TTL_MS
+    })
+    if (!queue.length) return
+
+    let cursor = 0
+    const workers = Array.from({ length: Math.min(GROUP_DETAIL_FETCH_CONCURRENCY, queue.length) }, async () => {
+      while (true) {
+        const current = queue[cursor]
+        cursor += 1
+        if (!current) return
+        if (cancelled) return
+        if (detailInFlightRef.current.has(current.key)) continue
+        detailInFlightRef.current.add(current.key)
+        try {
+          const detail = await fetchGroupDetail(current.groupId, current.relay, { preferRelay: true })
+          if (cancelled || detailGenerationRef.current !== generation) continue
+          const nextEntry: GroupDetailCacheEntry = {
+            adminPubkey:
+              detail?.admins?.[0]?.pubkey ||
+              detail?.metadata?.event?.pubkey ||
+              current.fallbackAdminPubkey,
+            members: Array.isArray(detail?.members) ? detail.members : [],
+            createdAt: detail?.metadata?.event?.created_at || current.fallbackCreatedAt || null,
+            updatedAt: Date.now()
+          }
+          setGroupDetailCache((prev) => {
+            const existing = prev[current.key]
+            const same =
+              !!existing &&
+              existing.adminPubkey === nextEntry.adminPubkey &&
+              existing.createdAt === nextEntry.createdAt &&
+              existing.members.length === nextEntry.members.length &&
+              existing.members.every((value, index) => value === nextEntry.members[index])
+            if (same) return prev
+            return {
+              ...prev,
+              [current.key]: nextEntry
+            }
+          })
+        } catch (error) {
+          if (cancelled || detailGenerationRef.current !== generation) continue
+          setGroupDetailCache((prev) => {
+            if (prev[current.key]) return prev
+            return {
+              ...prev,
+              [current.key]: {
+                adminPubkey: current.fallbackAdminPubkey,
+                members: [],
+                createdAt: current.fallbackCreatedAt,
+                updatedAt: Date.now()
+              }
+            }
+          })
+          console.warn('[GroupsPage] group detail enrichment failed', {
+            groupId: current.groupId,
+            relay: current.relay || null,
+            error: error instanceof Error ? error.message : String(error)
+          })
+        } finally {
+          detailInFlightRef.current.delete(current.key)
+        }
+      }
+    })
+
+    Promise.all(workers).catch(() => {})
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeTargets, fetchGroupDetail, groupDetailCache])
+
+  useEffect(() => {
+    if (activeTargets.length === 0) return
+    let cancelled = false
+    const now = Date.now()
+    const queue = activeTargets.filter((target) => {
+      const cached = getGroupMemberPreview(target.groupId, target.relay)
+      if (!cached) return true
+      return now - cached.updatedAt > MEMBER_PREVIEW_REFRESH_TTL_MS
+    })
+    if (!queue.length) return
+
+    let cursor = 0
+    const workers = Array.from({ length: Math.min(MEMBER_PREVIEW_FETCH_CONCURRENCY, queue.length) }, async () => {
+      while (true) {
+        const current = queue[cursor]
+        cursor += 1
+        if (!current) return
+        if (cancelled) return
+        try {
+          await refreshGroupMemberPreview(current.groupId, current.relay, {
+            force: false,
+            reason: 'groups-page-row-list'
+          })
+        } catch (_err) {
+          // best effort
+        }
+      }
+    })
+
+    Promise.all(workers).catch(() => {})
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeTargets, getGroupMemberPreview, refreshGroupMemberPreview, groupMemberPreviewVersion])
+
+  const resolveRowMembers = useCallback(
+    ({ groupId, relay, fallbackMembers = [] }: { groupId: string; relay?: string; fallbackMembers?: string[] }) => {
+      const preview = getGroupMemberPreview(groupId, relay)
+      if (preview?.members?.length) return preview.members
+      const detailEntry = groupDetailCache[makeGroupKey(groupId, relay)]
+      if (detailEntry?.members?.length) return detailEntry.members
+      return fallbackMembers
+    },
+    [getGroupMemberPreview, groupDetailCache]
+  )
+
+  const resolveRowAdmin = useCallback(
+    ({ groupId, relay, fallbackAdminPubkey }: { groupId: string; relay?: string; fallbackAdminPubkey: string | null }) => {
+      const detailEntry = groupDetailCache[makeGroupKey(groupId, relay)]
+      return detailEntry?.adminPubkey || fallbackAdminPubkey
+    },
+    [groupDetailCache]
+  )
+
+  const resolveRowCreatedAt = useCallback(
+    ({ groupId, relay, fallbackCreatedAt }: { groupId: string; relay?: string; fallbackCreatedAt: number | null }) => {
+      const detailEntry = groupDetailCache[makeGroupKey(groupId, relay)]
+      return detailEntry?.createdAt || fallbackCreatedAt
+    },
+    [groupDetailCache]
+  )
+
+  const resolvePeerCount = useCallback(
+    ({ groupId, relay }: { groupId: string; relay?: string }) => {
+      const resolvedRelay = relay ? resolveRelayUrl(relay) : undefined
+      const candidates = [
+        getRelayPeerCount(groupId),
+        getRelayPeerCount(relay),
+        getRelayPeerCount(resolvedRelay)
+      ]
+      let best = 0
+      for (const candidate of candidates) {
+        if (typeof candidate !== 'number' || !Number.isFinite(candidate)) continue
+        if (candidate > best) best = candidate
+      }
+      return best
+    },
+    [getRelayPeerCount, resolveRelayUrl]
+  )
+
+  const filteredDiscoverRows = useMemo(() => {
+    const query = normalizeSearch(search)
+    if (!query) return discoverRows
+    return discoverRows.filter((row) => {
+      const admin = resolveRowAdmin({
+        groupId: row.groupId,
+        relay: row.relay,
+        fallbackAdminPubkey: row.fallbackAdminPubkey
+      })
+      const values = [row.name, row.about, row.groupId, admin]
+      return values.some((value) => normalizeSearch(value).includes(query))
+    })
+  }, [discoverRows, resolveRowAdmin, search])
+
+  const filteredMyRows = useMemo(() => {
+    const query = normalizeSearch(search)
+    if (!query) return myRows
+    return myRows.filter((row) => {
+      const admin = resolveRowAdmin({
+        groupId: row.groupId,
+        relay: row.relay,
+        fallbackAdminPubkey: row.fallbackAdminPubkey
+      })
+      const values = [row.name, row.about, row.groupId, admin]
+      return values.some((value) => normalizeSearch(value).includes(query))
+    })
+  }, [myRows, resolveRowAdmin, search])
+
+  const filteredInviteRows = useMemo(() => {
+    const query = normalizeSearch(search)
+    if (!query) return inviteRows
+    return inviteRows.filter((row) => {
+      const admin = resolveRowAdmin({
+        groupId: row.groupId,
+        relay: row.relay,
+        fallbackAdminPubkey: row.invitedBy
+      })
+      const values = [row.name, row.about, row.groupId, row.invitedBy, admin]
+      return values.some((value) => normalizeSearch(value).includes(query))
+    })
+  }, [inviteRows, resolveRowAdmin, search])
+
+  const sortedDiscoverRows = useMemo(() => {
+    return [...filteredDiscoverRows].sort((left, right) => {
+      const leftMembers = resolveRowMembers({ groupId: left.groupId, relay: left.relay }).length
+      const rightMembers = resolveRowMembers({ groupId: right.groupId, relay: right.relay }).length
+      const leftPeers = resolvePeerCount({ groupId: left.groupId, relay: left.relay })
+      const rightPeers = resolvePeerCount({ groupId: right.groupId, relay: right.relay })
+      const leftAdmin = resolveRowAdmin({
+        groupId: left.groupId,
+        relay: left.relay,
+        fallbackAdminPubkey: left.fallbackAdminPubkey
+      }) || ''
+      const rightAdmin = resolveRowAdmin({
+        groupId: right.groupId,
+        relay: right.relay,
+        fallbackAdminPubkey: right.fallbackAdminPubkey
+      }) || ''
+      const leftCreatedAt = resolveRowCreatedAt({
+        groupId: left.groupId,
+        relay: left.relay,
+        fallbackCreatedAt: left.createdAt
+      }) || 0
+      const rightCreatedAt = resolveRowCreatedAt({
+        groupId: right.groupId,
+        relay: right.relay,
+        fallbackCreatedAt: right.createdAt
+      }) || 0
+
+      switch (discoverSort.key) {
+        case 'name':
+          return compareStrings(left.name.toLowerCase(), right.name.toLowerCase(), discoverSort.direction)
+        case 'description':
+          return compareStrings(left.about.toLowerCase(), right.about.toLowerCase(), discoverSort.direction)
+        case 'open':
+          return compareNumbers(left.isOpen ? 1 : 0, right.isOpen ? 1 : 0, discoverSort.direction)
+        case 'public':
+          return compareNumbers(left.isPublic ? 1 : 0, right.isPublic ? 1 : 0, discoverSort.direction)
+        case 'admin':
+          return compareStrings(leftAdmin.toLowerCase(), rightAdmin.toLowerCase(), discoverSort.direction)
+        case 'createdAt':
+          return compareNumbers(leftCreatedAt, rightCreatedAt, discoverSort.direction)
+        case 'peers':
+          return compareNumbers(leftPeers, rightPeers, discoverSort.direction)
+        case 'members':
+        default:
+          return compareNumbers(leftMembers, rightMembers, discoverSort.direction)
+      }
+    })
+  }, [discoverSort, filteredDiscoverRows, resolvePeerCount, resolveRowAdmin, resolveRowCreatedAt, resolveRowMembers])
+
+  const sortedMyRows = useMemo(() => {
+    return [...filteredMyRows].sort((left, right) => {
+      const leftMembers = resolveRowMembers({ groupId: left.groupId, relay: left.relay }).length
+      const rightMembers = resolveRowMembers({ groupId: right.groupId, relay: right.relay }).length
+      const leftPeers = resolvePeerCount({ groupId: left.groupId, relay: left.relay })
+      const rightPeers = resolvePeerCount({ groupId: right.groupId, relay: right.relay })
+      const leftAdmin = resolveRowAdmin({
+        groupId: left.groupId,
+        relay: left.relay,
+        fallbackAdminPubkey: left.fallbackAdminPubkey
+      }) || ''
+      const rightAdmin = resolveRowAdmin({
+        groupId: right.groupId,
+        relay: right.relay,
+        fallbackAdminPubkey: right.fallbackAdminPubkey
+      }) || ''
+      const leftCreatedAt = resolveRowCreatedAt({
+        groupId: left.groupId,
+        relay: left.relay,
+        fallbackCreatedAt: left.createdAt
+      }) || 0
+      const rightCreatedAt = resolveRowCreatedAt({
+        groupId: right.groupId,
+        relay: right.relay,
+        fallbackCreatedAt: right.createdAt
+      }) || 0
+
+      switch (mySort.key) {
+        case 'name':
+          return compareStrings(left.name.toLowerCase(), right.name.toLowerCase(), mySort.direction)
+        case 'description':
+          return compareStrings(left.about.toLowerCase(), right.about.toLowerCase(), mySort.direction)
+        case 'open':
+          return compareNumbers(left.isOpen ? 1 : 0, right.isOpen ? 1 : 0, mySort.direction)
+        case 'public':
+          return compareNumbers(left.isPublic ? 1 : 0, right.isPublic ? 1 : 0, mySort.direction)
+        case 'admin':
+          return compareStrings(leftAdmin.toLowerCase(), rightAdmin.toLowerCase(), mySort.direction)
+        case 'members':
+          return compareNumbers(leftMembers, rightMembers, mySort.direction)
+        case 'peers':
+          return compareNumbers(leftPeers, rightPeers, mySort.direction)
+        case 'createdAt':
+        default:
+          return compareNumbers(leftCreatedAt, rightCreatedAt, mySort.direction)
+      }
+    })
+  }, [filteredMyRows, mySort, resolvePeerCount, resolveRowAdmin, resolveRowCreatedAt, resolveRowMembers])
+
+  const sortedInviteRows = useMemo(() => {
+    return [...filteredInviteRows].sort((left, right) => {
+      const leftMembers = resolveRowMembers({
+        groupId: left.groupId,
+        relay: left.relay,
+        fallbackMembers: left.invite.authorizedMemberPubkeys || []
+      }).length
+      const rightMembers = resolveRowMembers({
+        groupId: right.groupId,
+        relay: right.relay,
+        fallbackMembers: right.invite.authorizedMemberPubkeys || []
+      }).length
+      const leftPeers = resolvePeerCount({ groupId: left.groupId, relay: left.relay })
+      const rightPeers = resolvePeerCount({ groupId: right.groupId, relay: right.relay })
+      const leftAdmin = resolveRowAdmin({
+        groupId: left.groupId,
+        relay: left.relay,
+        fallbackAdminPubkey: left.invitedBy
+      }) || ''
+      const rightAdmin = resolveRowAdmin({
+        groupId: right.groupId,
+        relay: right.relay,
+        fallbackAdminPubkey: right.invitedBy
+      }) || ''
+      const now = dayjs().unix()
+
+      switch (inviteSort.key) {
+        case 'name':
+          return compareStrings(left.name.toLowerCase(), right.name.toLowerCase(), inviteSort.direction)
+        case 'description':
+          return compareStrings(left.about.toLowerCase(), right.about.toLowerCase(), inviteSort.direction)
+        case 'open':
+          return compareNumbers(left.isOpen ? 1 : 0, right.isOpen ? 1 : 0, inviteSort.direction)
+        case 'public':
+          return compareNumbers(left.isPublic ? 1 : 0, right.isPublic ? 1 : 0, inviteSort.direction)
+        case 'admin':
+          return compareStrings(leftAdmin.toLowerCase(), rightAdmin.toLowerCase(), inviteSort.direction)
+        case 'members':
+          return compareNumbers(leftMembers, rightMembers, inviteSort.direction)
+        case 'peers':
+          return compareNumbers(leftPeers, rightPeers, inviteSort.direction)
+        case 'invitedBy':
+          return compareStrings(left.invitedBy.toLowerCase(), right.invitedBy.toLowerCase(), inviteSort.direction)
+        case 'inviteAge': {
+          const leftAge = now - left.inviteDate
+          const rightAge = now - right.inviteDate
+          return compareNumbers(leftAge, rightAge, inviteSort.direction)
+        }
+        case 'inviteDate':
+        default:
+          return compareNumbers(left.inviteDate, right.inviteDate, inviteSort.direction)
+      }
+    })
+  }, [filteredInviteRows, inviteSort, resolvePeerCount, resolveRowAdmin, resolveRowMembers])
+
+  const handleUseInvite = async (inv: TGroupInvite) => {
     if (!inv) return
     if (joiningInviteId) return
     const relayUrl = inv.relayUrl ?? (inv.relay ? resolveRelayUrl(inv.relay) : null) ?? inv.relay ?? null
@@ -302,22 +705,6 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     const openJoin = !inv.token && inv.fileSharing !== false
     setJoiningInviteId(inv.event.id)
     try {
-      console.info('[GroupsPage] Use invite', {
-        groupId: inv.groupId,
-        inviteId: inv.event?.id || null,
-        openJoin,
-        hasToken: !!inv.token,
-        fileSharing: inv.fileSharing !== false,
-        relayKey: relayKey ? String(relayKey).slice(0, 16) : null,
-        relayUrl: relayUrl ? String(relayUrl).slice(0, 80) : null,
-        hasBlindPeer: !!inv.blindPeer?.publicKey,
-        coreRefsCount: Array.isArray(inv.cores) ? inv.cores.length : 0,
-        hasWriterCore: !!inv.writerCore,
-        hasWriterCoreHex: !!inv.writerCoreHex,
-        hasAutobaseLocal: !!inv.autobaseLocal,
-        writerSecretLen: inv.writerSecret ? String(inv.writerSecret).length : 0,
-        hasFastForward: !!inv.fastForward
-      })
       if (sendToWorker && pubkey && inv.token) {
         sendToWorker({
           type: 'update-auth-data',
@@ -355,78 +742,475 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
     }
   }
 
-  const handleDismissInvite = (inv: (typeof invites)[number]) => {
+  const handleDismissInvite = (inv: TGroupInvite) => {
     if (!inv?.event?.id) return
     dismissInvite(inv.event.id)
   }
 
+  const toggleGroupSort = (key: GroupSortKey, current: GroupSortState, setter: (next: GroupSortState) => void) => {
+    if (current.key === key) {
+      setter({ key, direction: current.direction === 'asc' ? 'desc' : 'asc' })
+      return
+    }
+    const defaultDirection: SortDirection = key === 'createdAt' || key === 'members' || key === 'peers' ? 'desc' : 'asc'
+    setter({ key, direction: defaultDirection })
+  }
+
+  const toggleInviteSort = (key: InviteSortKey) => {
+    if (inviteSort.key === key) {
+      setInviteSort({ key, direction: inviteSort.direction === 'asc' ? 'desc' : 'asc' })
+      return
+    }
+    const defaultDirection: SortDirection = key === 'inviteDate' || key === 'inviteAge' || key === 'members' || key === 'peers'
+      ? 'desc'
+      : 'asc'
+    setInviteSort({ key, direction: defaultDirection })
+  }
+
+  const getCopyableGroupRelayUrl = useCallback(
+    ({ groupId, relay }: { groupId: string; relay?: string }) => {
+      const candidates = [
+        relay ? resolveRelayUrl(relay) : null,
+        resolveRelayUrl(groupId),
+        relay
+      ]
+      const normalized = candidates.filter((value): value is string => typeof value === 'string' && isLikelyRelayUrl(value))
+      if (!normalized.length) return null
+      return normalized.find((value) => hasRelayToken(value)) || normalized[0]
+    },
+    [resolveRelayUrl]
+  )
+
+  const handleCopyGroupRelayUrl = useCallback(
+    async (args: { groupId: string; relay?: string }) => {
+      const relayUrl = getCopyableGroupRelayUrl(args)
+      if (!relayUrl) {
+        toast.error(t('Relay URL unavailable'))
+        return
+      }
+      try {
+        await navigator.clipboard.writeText(relayUrl)
+        toast.success(t('Relay URL copied'))
+      } catch (_error) {
+        toast.error(t('Failed to copy relay URL'))
+      }
+    },
+    [getCopyableGroupRelayUrl, t]
+  )
+
+  const handleTablePointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return
+    if (isDragScrollBlockedTarget(event.target)) return
+    if (!(event.target instanceof Element)) return
+    // Restrict drag-scroll initiation to header cells so body row clicks remain reliable.
+    if (!event.target.closest('thead')) return
+    const element = event.currentTarget
+    if (element.scrollWidth <= element.clientWidth) return
+    horizontalDragStateRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startScrollLeft: element.scrollLeft,
+      moved: false
+    }
+    element.setPointerCapture(event.pointerId)
+  }, [])
+
+  const handleTablePointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = horizontalDragStateRef.current
+    if (!drag || drag.pointerId !== event.pointerId) return
+    const deltaX = event.clientX - drag.startX
+    if (Math.abs(deltaX) > 3) {
+      drag.moved = true
+    }
+    event.currentTarget.scrollLeft = drag.startScrollLeft - deltaX
+    if (drag.moved) {
+      event.preventDefault()
+    }
+  }, [])
+
+  const handleTablePointerEnd = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = horizontalDragStateRef.current
+    if (!drag || drag.pointerId !== event.pointerId) return
+    horizontalDragStateRef.current = null
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }, [])
+
+  const tableScrollHandlers = {
+    onPointerDown: handleTablePointerDown,
+    onPointerMove: handleTablePointerMove,
+    onPointerUp: handleTablePointerEnd,
+    onPointerCancel: handleTablePointerEnd
+  }
+
+  const renderGroupRows = (rows: GroupRow[], mode: 'discover' | 'my') => {
+    if (!rows.length) {
+      return (
+        <div className="rounded-lg border p-4 text-sm text-muted-foreground">
+          {t('No groups found')}
+        </div>
+      )
+    }
+
+    const sortState = mode === 'discover' ? discoverSort : mySort
+    const setSortState = mode === 'discover' ? setDiscoverSort : setMySort
+    const showVisibilityColumn = mode !== 'discover'
+    const tableMinWidth = showVisibilityColumn ? 'min-w-[960px]' : 'min-w-[860px]'
+
+    return (
+      <div
+        className="overflow-x-auto scrollbar-hide rounded-lg border cursor-grab active:cursor-grabbing"
+        style={{ touchAction: 'pan-y' }}
+        {...tableScrollHandlers}
+      >
+        <table className={`w-full ${tableMinWidth} table-fixed`}>
+          <thead className="bg-muted/40 text-xs font-medium text-muted-foreground">
+            <tr>
+              <th className="w-14 px-3 py-2 text-left"><span className="sr-only">{t('Thumbnail')}</span></th>
+              <th className="w-[220px] px-3 py-2 text-left">
+                <SortHeaderButton
+                  label={t('Group')}
+                  active={sortState.key === 'name'}
+                  direction={sortState.direction}
+                  onClick={() => toggleGroupSort('name', sortState, setSortState)}
+                />
+              </th>
+              <th className="w-[220px] px-3 py-2 text-left">
+                <SortHeaderButton
+                  label={t('Description')}
+                  active={sortState.key === 'description'}
+                  direction={sortState.direction}
+                  onClick={() => toggleGroupSort('description', sortState, setSortState)}
+                />
+              </th>
+              <th className="w-[100px] px-3 py-2 text-left">
+                <SortHeaderButton
+                  label={t('Open/Closed')}
+                  active={sortState.key === 'open'}
+                  direction={sortState.direction}
+                  onClick={() => toggleGroupSort('open', sortState, setSortState)}
+                />
+              </th>
+              {showVisibilityColumn ? (
+                <th className="w-[110px] px-3 py-2 text-left">
+                  <SortHeaderButton
+                    label={t('Public/Private')}
+                    active={sortState.key === 'public'}
+                    direction={sortState.direction}
+                    onClick={() => toggleGroupSort('public', sortState, setSortState)}
+                  />
+                </th>
+              ) : null}
+              <th className="w-[220px] px-3 py-2 text-left">
+                <SortHeaderButton
+                  label={t('Admin')}
+                  active={sortState.key === 'admin'}
+                  direction={sortState.direction}
+                  onClick={() => toggleGroupSort('admin', sortState, setSortState)}
+                />
+              </th>
+              <th className="w-[150px] px-3 py-2 text-left">
+                <SortHeaderButton
+                  label={t('Members')}
+                  active={sortState.key === 'members'}
+                  direction={sortState.direction}
+                  onClick={() => toggleGroupSort('members', sortState, setSortState)}
+                />
+              </th>
+              <th className="w-[120px] px-3 py-2 text-left">
+                <SortHeaderButton
+                  label={t('Peers')}
+                  active={sortState.key === 'peers'}
+                  direction={sortState.direction}
+                  onClick={() => toggleGroupSort('peers', sortState, setSortState)}
+                />
+              </th>
+            </tr>
+          </thead>
+          <tbody className="text-sm">
+            {rows.map((row) => {
+              const adminPubkey = resolveRowAdmin({
+                groupId: row.groupId,
+                relay: row.relay,
+                fallbackAdminPubkey: row.fallbackAdminPubkey
+              })
+              const members = resolveRowMembers({
+                groupId: row.groupId,
+                relay: row.relay
+              })
+              const peers = resolvePeerCount({ groupId: row.groupId, relay: row.relay })
+              const initials = (row.name || 'GR').slice(0, 2).toUpperCase()
+              return (
+                <tr
+                  key={row.key}
+                  className="cursor-pointer border-t transition-colors hover:bg-accent/30"
+                  onClick={() => push(toGroup(row.groupId, row.relay))}
+                >
+                  <td className="px-3 py-3 align-top">
+                    <Avatar className="h-10 w-10 shrink-0">
+                      {row.picture ? <AvatarImage src={row.picture} alt={row.name} /> : null}
+                      <AvatarFallback className="text-xs font-semibold">{initials}</AvatarFallback>
+                    </Avatar>
+                  </td>
+                  <td className="px-3 py-3 align-top">
+                    <div className="flex items-start gap-2 min-w-0">
+                      <div className="truncate font-semibold">{row.name}</div>
+                      {mode === 'my' ? (
+                        <button
+                          type="button"
+                          className="ml-auto inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                          data-no-drag-scroll="true"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            void handleCopyGroupRelayUrl({ groupId: row.groupId, relay: row.relay })
+                          }}
+                          title={t('Copy relay URL') as string}
+                          aria-label={t('Copy relay URL') as string}
+                        >
+                          <Link2 className="h-3.5 w-3.5" />
+                        </button>
+                      ) : null}
+                    </div>
+                  </td>
+                  <td className="px-3 py-3 align-top text-muted-foreground">
+                    <div className="line-clamp-3 max-w-[220px] whitespace-pre-wrap break-words">{row.about || '-'}</div>
+                  </td>
+                  <td className="px-3 py-3 align-top">
+                    <StatusBadge label={row.isOpen ? t('Open') : t('Closed')} />
+                  </td>
+                  {showVisibilityColumn ? (
+                    <td className="px-3 py-3 align-top">
+                      <StatusBadge label={row.isPublic ? t('Public') : t('Private')} />
+                    </td>
+                  ) : null}
+                  <td className="px-3 py-3 align-top">
+                    {adminPubkey ? (
+                      <div className="flex items-center gap-2 min-w-0">
+                        <SimpleUserAvatar userId={adminPubkey} size="small" className="h-6 w-6 rounded-full" />
+                        <Username userId={adminPubkey} className="truncate text-sm" />
+                      </div>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">-</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-3 align-top">
+                    <MembersCell members={members} />
+                  </td>
+                  <td className="px-3 py-3 align-top text-xs text-muted-foreground">
+                    {new Intl.NumberFormat(undefined, { notation: 'compact' }).format(peers)}
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+
   const renderInvites = () => {
+    if (!sortedInviteRows.length) {
+      return (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="text-sm text-muted-foreground">{t('No invites')}</div>
+            <Button variant="ghost" size="sm" onClick={() => refreshInvites()}>
+              <Loader2 className="w-4 h-4 mr-2" />
+              {t('Refresh')}
+            </Button>
+          </div>
+          {invitesError ? <div className="text-sm text-red-500">{invitesError}</div> : null}
+        </div>
+      )
+    }
+
     return (
       <div className="space-y-3">
         <div className="flex items-center justify-between">
-          <div className="text-sm text-muted-foreground">
-            {invites.length ? t('Invites') : t('No invites')}
-          </div>
+          <div className="text-sm text-muted-foreground">{t('Invites')}</div>
           <Button variant="ghost" size="sm" onClick={() => refreshInvites()}>
             <Loader2 className="w-4 h-4 mr-2" />
             {t('Refresh')}
           </Button>
         </div>
-        {invitesError && <div className="text-sm text-red-500">{invitesError}</div>}
-        {invites.map((inv) => (
-          <div key={inv.event.id} className="space-y-1">
-            <div className="flex items-center justify-between gap-3 rounded-md bg-muted/70 px-2 py-1">
-              <div className="flex items-center gap-2 min-w-0">
-                <span className="text-xs text-muted-foreground shrink-0">{t('from')}</span>
-                <div className="h-7 w-7 rounded-full overflow-hidden shrink-0">
-                  <SimpleUserAvatar userId={inv.event.pubkey} size="small" className="h-7 w-7 rounded-full" />
-                </div>
-                <InviteSenderLabel userId={inv.event.pubkey} />
-              </div>
-              <FormattedTimestamp timestamp={inv.event.created_at} className="text-xs text-muted-foreground shrink-0" />
-            </div>
-            <Card className="overflow-hidden">
-              <CardContent className="p-4">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-start gap-3 min-w-0">
-                    <Avatar className="h-10 w-10 shrink-0">
-                      {inv.groupPicture && <AvatarImage src={inv.groupPicture} alt={inv.groupName || inv.name || inv.groupId} />}
-                      <AvatarFallback className="text-xs font-semibold">
-                        {(inv.groupName || inv.name || inv.groupId || 'GR').slice(0, 2).toUpperCase()}
-                      </AvatarFallback>
-                    </Avatar>
-                    <div className="min-w-0">
-                      <div className="font-semibold truncate max-w-[260px]">
-                        {inv.groupName || inv.name || inv.groupId}
+        {invitesError ? <div className="text-sm text-red-500">{invitesError}</div> : null}
+
+        <div
+          className="overflow-x-auto scrollbar-hide rounded-lg border cursor-grab active:cursor-grabbing"
+          style={{ touchAction: 'pan-y' }}
+          {...tableScrollHandlers}
+        >
+          <table className="w-full min-w-[1280px] table-fixed">
+            <thead className="bg-muted/40 text-xs font-medium text-muted-foreground">
+              <tr>
+                <th className="w-14 px-3 py-2 text-left"><span className="sr-only">{t('Thumbnail')}</span></th>
+                <th className="w-[200px] px-3 py-2 text-left">
+                  <SortHeaderButton
+                    label={t('Group')}
+                    active={inviteSort.key === 'name'}
+                    direction={inviteSort.direction}
+                    onClick={() => toggleInviteSort('name')}
+                  />
+                </th>
+                <th className="w-[210px] px-3 py-2 text-left">
+                  <SortHeaderButton
+                    label={t('Description')}
+                    active={inviteSort.key === 'description'}
+                    direction={inviteSort.direction}
+                    onClick={() => toggleInviteSort('description')}
+                  />
+                </th>
+                <th className="w-[100px] px-3 py-2 text-left">
+                  <SortHeaderButton
+                    label={t('Open/Closed')}
+                    active={inviteSort.key === 'open'}
+                    direction={inviteSort.direction}
+                    onClick={() => toggleInviteSort('open')}
+                  />
+                </th>
+                <th className="w-[110px] px-3 py-2 text-left">
+                  <SortHeaderButton
+                    label={t('Public/Private')}
+                    active={inviteSort.key === 'public'}
+                    direction={inviteSort.direction}
+                    onClick={() => toggleInviteSort('public')}
+                  />
+                </th>
+                <th className="w-[200px] px-3 py-2 text-left">
+                  <SortHeaderButton
+                    label={t('Admin')}
+                    active={inviteSort.key === 'admin'}
+                    direction={inviteSort.direction}
+                    onClick={() => toggleInviteSort('admin')}
+                  />
+                </th>
+                <th className="w-[150px] px-3 py-2 text-left">
+                  <SortHeaderButton
+                    label={t('Invite date')}
+                    active={inviteSort.key === 'inviteDate'}
+                    direction={inviteSort.direction}
+                    onClick={() => toggleInviteSort('inviteDate')}
+                  />
+                </th>
+                <th className="w-[150px] px-3 py-2 text-left">
+                  <SortHeaderButton
+                    label={t('Members')}
+                    active={inviteSort.key === 'members'}
+                    direction={inviteSort.direction}
+                    onClick={() => toggleInviteSort('members')}
+                  />
+                </th>
+                <th className="w-[110px] px-3 py-2 text-left">
+                  <SortHeaderButton
+                    label={t('Peers')}
+                    active={inviteSort.key === 'peers'}
+                    direction={inviteSort.direction}
+                    onClick={() => toggleInviteSort('peers')}
+                  />
+                </th>
+                <th className="w-[140px] px-3 py-2 text-left">
+                  <SortHeaderButton
+                    label={t('Invite age')}
+                    active={inviteSort.key === 'inviteAge'}
+                    direction={inviteSort.direction}
+                    onClick={() => toggleInviteSort('inviteAge')}
+                  />
+                </th>
+                <th className="w-[220px] px-3 py-2 text-left">
+                  <SortHeaderButton
+                    label={t('Invited by')}
+                    active={inviteSort.key === 'invitedBy'}
+                    direction={inviteSort.direction}
+                    onClick={() => toggleInviteSort('invitedBy')}
+                  />
+                </th>
+                <th className="w-[220px] px-3 py-2 text-left">{t('Actions')}</th>
+              </tr>
+            </thead>
+            <tbody className="text-sm">
+              {sortedInviteRows.map((row) => {
+                const adminPubkey = resolveRowAdmin({
+                  groupId: row.groupId,
+                  relay: row.relay,
+                  fallbackAdminPubkey: row.invitedBy
+                })
+                const members = resolveRowMembers({
+                  groupId: row.groupId,
+                  relay: row.relay,
+                  fallbackMembers: row.invite.authorizedMemberPubkeys || []
+                })
+                const peers = resolvePeerCount({ groupId: row.groupId, relay: row.relay })
+                const initials = (row.name || 'GR').slice(0, 2).toUpperCase()
+                return (
+                  <tr key={row.key} className="border-t transition-colors hover:bg-accent/30">
+                    <td className="px-3 py-3 align-top">
+                      <Avatar className="h-10 w-10 shrink-0">
+                        {row.picture ? <AvatarImage src={row.picture} alt={row.name} /> : null}
+                        <AvatarFallback className="text-xs font-semibold">{initials}</AvatarFallback>
+                      </Avatar>
+                    </td>
+                    <td className="px-3 py-3 align-top">
+                      <div className="flex items-start gap-2 min-w-0">
+                        <div className="truncate font-semibold">{row.name}</div>
                       </div>
-                      <div className="mt-1">
-                        <InviteMembersBadge memberPubkeys={inv.authorizedMemberPubkeys} />
-                      </div>
-                      {inv.relay && (
-                        <div className="text-xs text-muted-foreground truncate max-w-[260px] mt-1">
-                          {inv.relay}
+                    </td>
+                    <td className="px-3 py-3 align-top text-muted-foreground">
+                      <div className="line-clamp-3 max-w-[210px] whitespace-pre-wrap break-words">{row.about || '-'}</div>
+                    </td>
+                    <td className="px-3 py-3 align-top">
+                      <StatusBadge label={row.isOpen ? t('Open') : t('Closed')} />
+                    </td>
+                    <td className="px-3 py-3 align-top">
+                      <StatusBadge label={row.isPublic ? t('Public') : t('Private')} />
+                    </td>
+                    <td className="px-3 py-3 align-top">
+                      {adminPubkey ? (
+                        <div className="flex items-center gap-2 min-w-0">
+                          <SimpleUserAvatar userId={adminPubkey} size="small" className="h-6 w-6 rounded-full" />
+                          <Username userId={adminPubkey} className="truncate text-sm" />
                         </div>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">-</span>
                       )}
-                    </div>
-                  </div>
-                  <div className="flex items-center justify-end gap-2 ml-auto shrink-0 flex-wrap">
-                    <Button variant="outline" size="sm" onClick={() => handleDismissInvite(inv)}>
-                      <X className="w-4 h-4 mr-1" />
-                      {t('Dismiss')}
-                    </Button>
-                    <Button
-                      size="sm"
-                      disabled={joiningInviteId === inv.event.id}
-                      onClick={() => handleUseInvite(inv)}
-                    >
-                      {joiningInviteId === inv.event.id ? t('Joining…') : t('Use invite')}
-                    </Button>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          </div>
-        ))}
+                    </td>
+                    <td className="px-3 py-3 align-top text-xs text-muted-foreground">{formatAbsoluteDate(row.inviteDate)}</td>
+                    <td className="px-3 py-3 align-top">
+                      <MembersCell members={members} />
+                    </td>
+                    <td className="px-3 py-3 align-top text-xs text-muted-foreground">
+                      {new Intl.NumberFormat(undefined, { notation: 'compact' }).format(peers)}
+                    </td>
+                    <td className="px-3 py-3 align-top text-xs text-muted-foreground">
+                      <FormattedTimestamp timestamp={row.inviteDate} />
+                    </td>
+                    <td className="px-3 py-3 align-top">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <SimpleUserAvatar userId={row.invitedBy} size="small" className="h-6 w-6 rounded-full" />
+                        <InviteSenderLabel userId={row.invitedBy} />
+                      </div>
+                    </td>
+                    <td className="px-3 py-3 align-top">
+                      <div className="flex items-center gap-2">
+                        <Button variant="outline" size="sm" onClick={() => handleDismissInvite(row.invite)}>
+                          <X className="w-4 h-4 mr-1" />
+                          {t('Dismiss')}
+                        </Button>
+                        <Button
+                          size="sm"
+                          disabled={joiningInviteId === row.invite.event.id}
+                          onClick={() => handleUseInvite(row.invite)}
+                        >
+                          {joiningInviteId === row.invite.event.id ? t('Joining…') : t('Use invite')}
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
     )
   }
@@ -443,7 +1227,7 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
           <Input
             placeholder={t('Search groups...') as string}
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(event) => setSearch(event.target.value)}
             className="flex-1"
           />
           <Button variant="ghost" size="icon" onClick={() => refreshDiscovery()}>
@@ -451,18 +1235,33 @@ const GroupsPage = forwardRef<TPageRef>((_, ref) => {
           </Button>
           <Button onClick={() => setShowCreate(true)}>{t('Create')}</Button>
         </div>
-        <Tabs value={tab} onValueChange={(val) => setTab(val as TTab)}>
-          <TabsList className="grid grid-cols-3 w-full">
+
+        <Tabs value={tab} onValueChange={(value) => setTab(value as TTab)}>
+          <TabsList className="grid w-full grid-cols-3">
             <TabsTrigger value="discover">{t('Discover')}</TabsTrigger>
             <TabsTrigger value="my">{t('My Groups')}</TabsTrigger>
             <TabsTrigger value="invites">{t('Invites')}</TabsTrigger>
           </TabsList>
+
           <TabsContent value="discover" className="mt-4">
-            {renderDiscover()}
+            {isLoadingDiscovery ? (
+              <div className="flex flex-col items-center gap-3 py-12 text-muted-foreground">
+                <Loader2 className="h-6 w-6 animate-spin" />
+                <div>{t('Loading...')}</div>
+              </div>
+            ) : discoveryError ? (
+              <div className="text-sm text-red-500">
+                {t('Failed to load groups')}: {discoveryError}
+              </div>
+            ) : renderGroupRows(sortedDiscoverRows, 'discover')}
           </TabsContent>
+
           <TabsContent value="my" className="mt-4">
-            {renderMyGroups()}
+            {myGroupList.length === 0 ? (
+              <div className="rounded-lg border p-4 text-sm text-muted-foreground">{t('No groups yet')}</div>
+            ) : renderGroupRows(sortedMyRows, 'my')}
           </TabsContent>
+
           <TabsContent value="invites" className="mt-4">
             {renderInvites()}
           </TabsContent>

@@ -14,6 +14,7 @@ import NotificationsButton from './NotificationButton'
 import PostButton from './PostButton'
 import ListsButton from './ListsButton'
 import GroupsButton from './GroupsButton'
+import FilesButton from './FilesButton'
 import ReadsButton from './ReadsButton'
 import SearchButton from './SearchButton'
 import NotepadButton from './NotepadButton'
@@ -47,6 +48,7 @@ export default function PrimaryPageSidebar() {
         <NotificationsButton collapse={sidebarCollapse} />
         <ReadsButton collapse={sidebarCollapse} />
         <GroupsButton collapse={sidebarCollapse} />
+        <FilesButton collapse={sidebarCollapse} />
         <ListsButton collapse={sidebarCollapse} />
         <NotepadButton collapse={sidebarCollapse} />
         {pubkey && <BookmarkButton collapse={sidebarCollapse} />}

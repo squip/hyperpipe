@@ -3,11 +3,15 @@ import { MediaUploadResult } from '@/services/media-upload.service'
 import { Event as NostrEvent } from '@nostr/tools/wasm'
 
 export type GroupFileSortKey = 'fileName' | 'uploadedAt' | 'uploadedBy' | 'size' | 'mime'
+  | 'group'
 
 export type GroupFileRecord = {
   eventId: string
   event: NostrEvent
   url: string
+  groupId: string
+  groupRelay: string | null
+  groupName: string | null
   fileName: string
   mime: string | null
   size: number | null
@@ -76,6 +80,7 @@ export function parseGroupFileRecordFromEvent(event: NostrEvent): GroupFileRecor
 
   const url = toOptionalString(readTag(event.tags, 'url'))
   if (!url) return null
+  const groupId = toOptionalString(readTag(event.tags, 'h')) || 'unknown'
 
   const mime = toOptionalString(readTag(event.tags, 'm'))?.toLowerCase() || null
   const size = readFiniteNumber(readTag(event.tags, 'size'))
@@ -89,6 +94,9 @@ export function parseGroupFileRecordFromEvent(event: NostrEvent): GroupFileRecor
     eventId: event.id,
     event,
     url,
+    groupId,
+    groupRelay: null,
+    groupName: null,
     fileName: deriveGroupFileName({
       url,
       alt,
@@ -104,6 +112,47 @@ export function parseGroupFileRecordFromEvent(event: NostrEvent): GroupFileRecor
     alt,
     summary
   }
+}
+
+export function withGroupFileRecordContext(
+  record: GroupFileRecord,
+  context?: {
+    groupNameById?: Map<string, string>
+    groupRelayById?: Map<string, string>
+  }
+): GroupFileRecord {
+  if (!context) return record
+  const nextGroupName = context.groupNameById?.get(record.groupId) || null
+  const nextGroupRelay = context.groupRelayById?.get(record.groupId) || null
+  if (nextGroupName === record.groupName && nextGroupRelay === record.groupRelay) {
+    return record
+  }
+  return {
+    ...record,
+    groupName: nextGroupName,
+    groupRelay: nextGroupRelay
+  }
+}
+
+function normalizeForSearch(value: string | null | undefined) {
+  return (value || '').trim().toLowerCase()
+}
+
+export function matchesGroupFileSearch(record: GroupFileRecord, query?: string) {
+  const normalizedQuery = normalizeForSearch(query)
+  if (!normalizedQuery) return true
+  const searchValues = [
+    record.fileName,
+    record.url,
+    record.mime || '',
+    record.sha256 || '',
+    record.alt || '',
+    record.summary || '',
+    record.uploadedBy,
+    record.groupId,
+    record.groupName || ''
+  ]
+  return searchValues.some((value) => normalizeForSearch(value).includes(normalizedQuery))
 }
 
 export function formatGroupFileSize(size: number | null | undefined) {

@@ -2410,13 +2410,43 @@ function setupProtocolHandlers(protocol) {
     return headers;
   };
 
+  const buildDriveSuccessHeaders = ({ contentType, contentLength, fileHash }) => {
+    const etag = `"${fileHash}"`
+    return buildDriveCorsHeaders(contentType, {
+      'content-length': String(contentLength),
+      'accept-ranges': 'bytes',
+      etag,
+      'cache-control': 'private, max-age=31536000, immutable'
+    })
+  }
+
+  const buildDriveErrorHeaders = () =>
+    buildDriveCorsHeaders('application/json', {
+      'cache-control': 'no-store'
+    })
+
+  const etagMatches = (ifNoneMatchHeader, etag) => {
+    if (!ifNoneMatchHeader || !etag) return false
+    const normalized = String(ifNoneMatchHeader).trim()
+    if (!normalized) return false
+    if (normalized === '*') return true
+    const candidates = normalized.split(',').map((part) => part.trim()).filter(Boolean)
+    return candidates.some((candidate) => {
+      const weakNormalized = candidate.startsWith('W/') ? candidate.slice(2) : candidate
+      return weakNormalized === etag
+    })
+  }
+
   // Serve files stored in Hyperdrive
   protocol.handle('/drive/:identifier/:file', async (request) => {
     if (request?.method === 'OPTIONS') {
       updateMetrics(true);
       return {
         statusCode: 204,
-        headers: buildDriveCorsHeaders(null, { 'content-length': '0' }),
+        headers: buildDriveCorsHeaders(null, {
+          'content-length': '0',
+          'cache-control': 'no-store'
+        }),
         body: b4a.from('')
       };
     }
@@ -2440,7 +2470,7 @@ function setupProtocolHandlers(protocol) {
           updateMetrics(false);
           return {
             statusCode: 404,
-            headers: buildDriveCorsHeaders('application/json'),
+            headers: buildDriveErrorHeaders(),
             body: b4a.from(JSON.stringify({ error: 'Relay not found' }))
           };
         }
@@ -2477,7 +2507,7 @@ function setupProtocolHandlers(protocol) {
         updateMetrics(false);
         return {
           statusCode: 404,
-          headers: buildDriveCorsHeaders('application/json'),
+          headers: buildDriveErrorHeaders(),
           body: b4a.from(JSON.stringify({ error: 'File not found' }))
         };
       }
@@ -2497,13 +2527,30 @@ function setupProtocolHandlers(protocol) {
         contentType = mimeTypes[ext] || contentType;
       }
 
+      const successHeaders = buildDriveSuccessHeaders({
+        contentType,
+        contentLength: fileBuffer.length,
+        fileHash: hash
+      })
+      const ifNoneMatch = request?.headers?.['if-none-match'] || request?.headers?.['If-None-Match']
+      if (etagMatches(ifNoneMatch, successHeaders.etag)) {
+        updateMetrics(true);
+        return {
+          statusCode: 304,
+          headers: buildDriveCorsHeaders(null, {
+            etag: successHeaders.etag,
+            'cache-control': successHeaders['cache-control'],
+            'accept-ranges': successHeaders['accept-ranges'],
+            'content-length': '0'
+          }),
+          body: b4a.from('')
+        };
+      }
+
       updateMetrics(true);
       return {
         statusCode: 200,
-        headers: buildDriveCorsHeaders(contentType, {
-          'content-length': fileBuffer.length.toString(),
-          'accept-ranges': 'bytes'
-        }),
+        headers: successHeaders,
         body: b4a.from(fileBuffer)
       };
     } catch (error) {
@@ -2511,7 +2558,7 @@ function setupProtocolHandlers(protocol) {
       updateMetrics(false);
       return {
         statusCode: 500,
-        headers: buildDriveCorsHeaders('application/json'),
+        headers: buildDriveErrorHeaders(),
         body: b4a.from(JSON.stringify({ error: error.message }))
       };
     }
