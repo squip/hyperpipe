@@ -1,3 +1,4 @@
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import SecondaryPageLayout from '@/layouts/SecondaryPageLayout'
@@ -10,7 +11,6 @@ import {
   Users,
   Loader2,
   LogOut,
-  Star,
   Settings,
   Copy,
   Check,
@@ -29,6 +29,7 @@ import NormalFeed from '@/components/NormalFeed'
 import GroupFilesList from '@/components/GroupFilesList'
 import { BIG_RELAY_URLS } from '@/constants'
 import { parseGroupIdentifier } from '@/lib/groups'
+import { getBaseRelayUrl } from '@/lib/hypertuna-group-events'
 import client from '@/services/client.service'
 import relayMembershipService from '@/services/relay-membership.service'
 import { Input } from '@/components/ui/input'
@@ -348,16 +349,41 @@ const areComparablePubkeysEqual = (left: string[], right: string[]) => {
   return left.every((value, index) => value === right[index])
 }
 
+const CLOSED_GROUP_JOIN_PENDING_STORAGE_PREFIX = 'hypertuna_group_closed_join_pending_v1'
+
+const normalizePubkeyList = (values: Array<string | null | undefined>) => {
+  const seen = new Set<string>()
+  const normalized: string[] = []
+  values.forEach((value) => {
+    const next = String(value || '').trim()
+    if (!next || seen.has(next)) return
+    seen.add(next)
+    normalized.push(next)
+  })
+  return normalized
+}
+
+const toClosedGroupJoinPendingStorageKey = (args: {
+  pubkey?: string | null
+  groupId?: string
+  relay?: string | null
+}) => {
+  const accountKey = args.pubkey ? String(args.pubkey).trim() : 'anonymous'
+  const groupKey = String(args.groupId || '').trim() || 'unknown-group'
+  const relayValue = String(args.relay || '').trim()
+  const relayKey = relayValue ? getBaseRelayUrl(relayValue) : 'unknown-relay'
+  return `${CLOSED_GROUP_JOIN_PENDING_STORAGE_PREFIX}:${accountKey}:${groupKey}:${relayKey}`
+}
+
 const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, ref) => {
   const { t } = useTranslation()
   const {
     discoveryGroups,
     fetchGroupDetail,
     getProvisionalGroupMetadata,
+    getGroupMemberPreview,
     sendJoinRequest,
     sendLeaveRequest,
-    favoriteGroups,
-    toggleFavorite,
     invites,
     sendInvites,
     joinRequests,
@@ -392,6 +418,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const [reportTarget, setReportTarget] = useState<string | null>(null)
   const [joinRequestAction, setJoinRequestAction] = useState<{ pubkey: string; action: 'approve' | 'reject' } | null>(null)
   const [joinRelayRefreshNonce, setJoinRelayRefreshNonce] = useState(0)
+  const [closedJoinRequestPending, setClosedJoinRequestPending] = useState(false)
   const { profiles: inviteProfiles, isFetching: isSearchingInvites } = useSearchProfiles(inviteSearch, 8)
   const { mutePrivately, mutePublicly } = useMuteList()
   const reportEvent = useMemo(() => {
@@ -596,7 +623,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     [groupKey, joinRequests]
   )
   const joinRequestCount = pendingJoinRequests.length
-  const isFavorite = favoriteGroups.includes(groupKey)
 
   const inviteData = useMemo(() => {
     return invites.find(
@@ -675,6 +701,49 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   )
 
   const activeGroupRelay = pinnedGroupRelay || tokenizedResolvedGroupRelay || fallbackGroupRelay
+  const closedJoinPendingStorageKey = useMemo(
+    () =>
+      toClosedGroupJoinPendingStorageKey({
+        pubkey,
+        groupId,
+        relay: activeGroupRelay || resolvedGroupRelay || effectiveGroupRelay || null
+      }),
+    [activeGroupRelay, effectiveGroupRelay, groupId, pubkey, resolvedGroupRelay]
+  )
+
+  useEffect(() => {
+    if (!groupId || typeof window === 'undefined') {
+      setClosedJoinRequestPending(false)
+      return
+    }
+    try {
+      setClosedJoinRequestPending(window.localStorage.getItem(closedJoinPendingStorageKey) === '1')
+    } catch (_err) {
+      setClosedJoinRequestPending(false)
+    }
+  }, [closedJoinPendingStorageKey, groupId])
+
+  const markClosedJoinRequestPending = React.useCallback(() => {
+    if (!groupId) return
+    setClosedJoinRequestPending(true)
+    if (typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(closedJoinPendingStorageKey, '1')
+    } catch (_err) {
+      // best effort
+    }
+  }, [closedJoinPendingStorageKey, groupId])
+
+  const clearClosedJoinRequestPending = React.useCallback(() => {
+    setClosedJoinRequestPending(false)
+    if (typeof window === 'undefined') return
+    try {
+      window.localStorage.removeItem(closedJoinPendingStorageKey)
+    } catch (_err) {
+      // best effort
+    }
+  }, [closedJoinPendingStorageKey])
+
   const shouldGateGroupSubRequests = Boolean(groupId && !activeGroupRelay && BIG_RELAY_URLS.length === 0)
 
   const groupSubRequests = useMemo(
@@ -828,13 +897,14 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         })
       }
       if (isOpenGroup === false && !inviteToken) {
-        if (membershipStatus !== 'pending') {
+        if (membershipStatus !== 'pending' && !closedJoinRequestPending) {
           await sendJoinRequest(groupId, effectiveGroupRelay)
           setDetail((prev) =>
             prev
               ? { ...prev, membershipStatus: 'pending' }
               : prev
           )
+          markClosedJoinRequestPending()
         }
         return
       }
@@ -912,6 +982,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     if (!groupId) return
     try {
       await sendLeaveRequest(groupId, effectiveGroupRelay)
+      clearClosedJoinRequestPending()
       setDetail((prev) =>
         prev
           ? { ...prev, membershipStatus: 'not-member' }
@@ -1002,6 +1073,38 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     }
   }, [baseDetail, membershipStatus, membersWithSelf, mockMembersConfig])
   const isOpenGroup = effectiveDetail?.metadata?.isOpen !== false
+  const effectiveMembershipStatus =
+    membershipStatus === 'not-member' && !isOpenGroup && !inviteToken && closedJoinRequestPending
+      ? ('pending' as const)
+      : membershipStatus
+
+  useEffect(() => {
+    if (!closedJoinRequestPending) return
+    if (
+      inviteToken ||
+      isOpenGroup ||
+      effectiveMembershipStatus === 'member' ||
+      effectiveMembershipStatus === 'removed'
+    ) {
+      clearClosedJoinRequestPending()
+    }
+  }, [
+    clearClosedJoinRequestPending,
+    closedJoinRequestPending,
+    effectiveMembershipStatus,
+    inviteToken,
+    isOpenGroup
+  ])
+
+  const isMember = effectiveMembershipStatus === 'member'
+  const isJoinFlowBusy =
+    joinFlow?.phase === 'starting' ||
+    joinFlow?.phase === 'request' ||
+    joinFlow?.phase === 'verify' ||
+    joinFlow?.phase === 'complete'
+  const canRequestToJoinClosedGroup = !isMember && !isOpenGroup && !inviteToken
+  const hasSubmittedClosedGroupJoinRequest =
+    canRequestToJoinClosedGroup && effectiveMembershipStatus === 'pending'
   const inviteOpenJoin = !!inviteData && !inviteToken && inviteData.fileSharing !== false
   const openJoinAllowed = inviteOpenJoin || effectiveDetail?.metadata?.isOpen === true
   const inviteMemberSet = useMemo(
@@ -1016,6 +1119,26 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const isAdmin =
     !!pubkey &&
     (isCreator || !!effectiveDetail?.admins?.some((admin) => admin.pubkey === pubkey))
+
+  const groupMemberPreview = useMemo(
+    () => (groupId ? getGroupMemberPreview(groupId, effectiveGroupRelay) : null),
+    [effectiveGroupRelay, getGroupMemberPreview, groupId]
+  )
+  const summaryMembers = useMemo(() => {
+    const detailMembers = normalizePubkeyList(effectiveDetail?.members || [])
+    if (detailMembers.length > 0) return detailMembers
+    const inviteMembers = normalizePubkeyList(inviteData?.authorizedMemberPubkeys || [])
+    if (inviteMembers.length > 0) return inviteMembers
+    return normalizePubkeyList(groupMemberPreview?.members || [])
+  }, [effectiveDetail?.members, groupMemberPreview?.members, inviteData?.authorizedMemberPubkeys])
+  const summaryFacepileMembers = summaryMembers.slice(0, 5)
+
+  const adminPubkeys = useMemo(
+    () => normalizePubkeyList((effectiveDetail?.admins || []).map((admin) => admin.pubkey)),
+    [effectiveDetail?.admins]
+  )
+  const primaryAdminPubkey = adminPubkeys[0]
+  const additionalAdminCount = Math.max(0, adminPubkeys.length - 1)
 
   useEffect(() => {
     if (!groupId || !isAdmin) return
@@ -1123,7 +1246,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     </span>
   )
 
-  const relayUrlToCopy = resolvedGroupRelay || effectiveGroupRelay
+  const relayUrlToCopy = activeGroupRelay || resolvedGroupRelay || effectiveGroupRelay
 
   const filteredMembers = useMemo(() => {
     const term = memberSearch.trim().toLowerCase()
@@ -1382,21 +1505,21 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       ) : (
         <div className="space-y-4 pb-6">
           <Card className="overflow-hidden border-0 shadow-none">
-            <CardContent className="p-4 space-y-3">
-              <div className="flex gap-3 items-start">
+            <CardContent className="p-4 space-y-4">
+              <div className="flex gap-3 items-center">
                 {effectiveDetail.metadata?.picture && (
                   <img
                     src={effectiveDetail.metadata.picture}
                     alt={effectiveDetail.metadata.name}
-                    className="w-16 h-16 rounded-lg object-cover"
+                    className="w-12 h-12 rounded-lg object-cover shrink-0"
                   />
                 )}
-                <div className="flex-1 min-w-0 space-y-1">
-                  <div className="flex items-center justify-between gap-2">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-start justify-between gap-3">
                     <div className="text-2xl font-semibold truncate">
                       {effectiveDetail.metadata?.name || groupId}
                     </div>
-                    <div className="flex items-center gap-1">
+                    <div className="flex items-center gap-2 justify-start flex-wrap shrink-0">
                       {isAdmin && (
                         <Button
                           variant="ghost"
@@ -1420,64 +1543,91 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                           <Copy className="w-5 h-5" />
                         )}
                       </Button>
-                      <Button
-                        variant="ghost"
-                        size="titlebar-icon"
-                        onClick={() => toggleFavorite(groupKey)}
-                        title={isFavorite ? t('Remove from favorites') : t('Add to favorites')}
-                      >
-                        <Star className={`w-5 h-5 ${isFavorite ? 'fill-current text-yellow-500' : ''}`} />
-                      </Button>
+                      {isMember && (
+                        <Button variant="outline" size="sm" onClick={handleLeave}>
+                          <LogOut className="w-4 h-4 mr-2" />
+                          {t('Leave')}
+                        </Button>
+                      )}
                     </div>
-                  </div>
-                  {effectiveDetail.metadata?.about && (
-                    <div className="text-sm text-muted-foreground whitespace-pre-line">
-                      {effectiveDetail.metadata.about}
-                    </div>
-                  )}
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    {effectiveDetail.metadata?.isPublic === false && <span>{t('Private')}</span>}
-                    {effectiveDetail.metadata?.isOpen === false && <span>{t('Closed')}</span>}
-                    {effectiveDetail.members && effectiveDetail.members.length > 0 && (
-                      <span>
-                        {effectiveDetail.members.length}{' '}
-                        {effectiveDetail.members.length === 1 ? t('member') : t('members')}
-                      </span>
-                    )}
-                    
                   </div>
                 </div>
               </div>
-              <div className="flex items-center gap-2">
-                {membershipStatus === 'member' ? (
-                  <>
-                    <Button size="sm" onClick={() => setIsComposerOpen(true)}>
-                      {t('New post')}
-                    </Button>
-                    <Button variant="outline" size="sm" onClick={handleLeave}>
-                      <LogOut className="w-4 h-4 mr-2" />
-                      {t('Leave')}
-                    </Button>
-                  </>
-                ) : membershipStatus === 'pending' ? (
-                  <Button variant="secondary" size="sm" disabled>
-                    {t('Request sent')}
+              {effectiveDetail.metadata?.about && (
+                <div className="text-sm text-muted-foreground whitespace-pre-line break-words w-full">
+                  {effectiveDetail.metadata.about}
+                </div>
+              )}
+              {summaryMembers.length > 0 && (
+                <div className="w-full">
+                  <div className="inline-flex items-center gap-2 rounded-full bg-muted px-2.5 py-1">
+                    <div className="flex -space-x-1.5">
+                      {summaryFacepileMembers.map((memberPubkey) => (
+                        <div
+                          key={memberPubkey}
+                          className="inline-flex h-6 w-6 overflow-hidden rounded-full ring-1 ring-background"
+                        >
+                          <UserAvatar userId={memberPubkey} size="small" className="h-6 w-6 rounded-full" />
+                        </div>
+                      ))}
+                    </div>
+                    <span className="text-xs font-semibold text-muted-foreground">
+                    {summaryMembers.length}{' '}
+                    {summaryMembers.length === 1 ? t('member') : t('members')}
+                    </span>
+                  </div>
+                </div>
+              )}
+              <div className="overflow-x-auto sm:overflow-visible w-full">
+                <div className="flex w-max gap-8 pb-2 sm:w-full sm:flex-wrap sm:pb-0">
+                  {primaryAdminPubkey && (
+                    <div className="space-y-2 w-fit">
+                      <div className="text-sm font-semibold text-muted-foreground">{t('Admin')}</div>
+                      <div className="flex gap-2 items-center">
+                        <UserAvatar userId={primaryAdminPubkey} size="small" />
+                        <Username userId={primaryAdminPubkey} className="font-semibold text-nowrap" />
+                        {additionalAdminCount > 0 && (
+                          <span className="text-xs font-semibold text-muted-foreground">
+                            +{additionalAdminCount}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  <div className="space-y-2 w-fit">
+                    <div className="text-sm font-semibold text-muted-foreground">{t('Membership')}</div>
+                    <div className="flex items-center">
+                      <Badge variant="secondary">{isOpenGroup ? t('Open') : t('Closed')}</Badge>
+                    </div>
+                  </div>
+                  <div className="space-y-2 w-fit">
+                    <div className="text-sm font-semibold text-muted-foreground">{t('Visibility')}</div>
+                    <div className="flex items-center">
+                      <Badge variant="secondary">
+                        {effectiveDetail.metadata?.isPublic === false ? t('Private') : t('Public')}
+                      </Badge>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="w-full">
+                {isMember ? (
+                  <Button variant="secondary" className="w-full" onClick={() => setIsComposerOpen(true)}>
+                    {t('New Post')}
                   </Button>
-                ) : membershipStatus === 'removed' ? (
-                  <Button variant="destructive" size="sm" disabled>
-                    {t('Removed')}
+                ) : canRequestToJoinClosedGroup ? (
+                  <Button
+                    className="w-full"
+                    onClick={handleJoin}
+                    disabled={hasSubmittedClosedGroupJoinRequest || isJoinFlowBusy}
+                  >
+                    {hasSubmittedClosedGroupJoinRequest
+                      ? t('Join request submitted')
+                      : t('Request to Join Group')}
                   </Button>
                 ) : (
-                  <Button size="sm" onClick={handleJoin} disabled={joinFlow?.phase === 'starting' || joinFlow?.phase === 'request' || joinFlow?.phase === 'verify' || joinFlow?.phase === 'complete'}>
-                    {joinFlow?.phase && joinFlow.phase !== 'idle' && joinFlow.phase !== 'error'
-                      ? t('Joining…')
-                      : (!inviteToken && !isOpenGroup ? t('Request invite') : t('Join'))}
-                  </Button>
-                )}
-                
-                {inviteToken && membershipStatus !== 'member' && (
-                  <Button size="sm" variant="secondary" onClick={handleJoin}>
-                    {t('Use invite')}
+                  <Button className="w-full" onClick={handleJoin} disabled={isJoinFlowBusy}>
+                    {isJoinFlowBusy ? t('Joining…') : t('Join Group')}
                   </Button>
                 )}
               </div>
@@ -1487,141 +1637,122 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                   {joinFlow.error ? ` — ${joinFlow.error}` : ''}
                 </div>
               )}
-              {effectiveDetail.admins && effectiveDetail.admins.length > 0 && (
-                <div className="flex gap-2 flex-wrap text-sm text-muted-foreground">
-                  {effectiveDetail.admins.map((admin) => (
-                    <div
-                      key={admin.pubkey}
-                      className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-1"
-                    >
-                      <UserAvatar userId={admin.pubkey} size="xSmall" />
-                      <Username userId={admin.pubkey} className="text-xs" />
-                      {(() => {
-                        const roles = Array.isArray((admin as any).roles) ? (admin as any).roles : []
-                        return roles.length > 0 ? (
-                        <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                          {roles.join(', ')}
-                        </span>
-                        ) : null
-                      })()}
-                    </div>
-                  ))}
-                </div>
-              )}
             </CardContent>
           </Card>
 
-          <Tabs
-            value={activeTab}
-            onValueChange={(v) => setActiveTab(v as 'notes' | 'files' | 'members' | 'requests')}
-            className="w-full"
-          >
-            <div className="border-b border-t">
-              <TabsList className="w-full justify-start h-auto p-0 bg-transparent px-4">
-                <TabsTrigger
-                  value="notes"
-                  className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-4 py-3"
-                >
-                  {t('Notes')}
-                </TabsTrigger>
-                <TabsTrigger
-                  value="members"
-                  className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-4 py-3"
-                >
-                  {t('Members')}
-                  {effectiveDetail.members ? ` (${effectiveDetail.members.length})` : ''}
-                </TabsTrigger>
-                <TabsTrigger
-                  value="files"
-                  className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-4 py-3"
-                >
-                  {t('Files')}
-                  {typeof groupFileCount === 'number' ? ` (${groupFileCount})` : ''}
-                </TabsTrigger>
-                {isAdmin && (
+          {isMember && (
+            <Tabs
+              value={activeTab}
+              onValueChange={(v) => setActiveTab(v as 'notes' | 'files' | 'members' | 'requests')}
+              className="w-full"
+            >
+              <div className="border-b border-t">
+                <TabsList className="w-full justify-start h-auto p-0 bg-transparent px-4">
                   <TabsTrigger
-                    value="requests"
+                    value="notes"
                     className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-4 py-3"
                   >
-                    {t('Join Requests')}
-                    {joinRequestCount ? ` (${joinRequestCount})` : ''}
+                    {t('Notes')}
                   </TabsTrigger>
-                )}
-              </TabsList>
-            </div>
-            <TabsContent value="notes" forceMount className="mt-0">
-              <NormalFeed
-                subRequests={groupSubRequests}
-                isMainFeed={false}
-                debugActiveTab={activeTab}
-                debugLabel={groupId ? `GroupPage:${groupId}` : 'GroupPage:unknown'}
-              />
-            </TabsContent>
-            <TabsContent value="files" forceMount className="mt-0">
-              <GroupFilesList
-                groupId={groupId}
-                subRequests={groupFileSubRequests}
-                timelineLabel={groupId ? `f-fetch-events-group-files-${groupId}` : 'f-fetch-events-group-files'}
-                onCountChange={setGroupFileCount}
-              />
-            </TabsContent>
-            <TabsContent value="members" className="mt-0">
-              <div className="space-y-4">
-                <div className="px-4 py-3 border-b flex items-center gap-2">
-                  <div className="relative flex-1">
-                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                    <Input
-                      value={memberSearch}
-                      onChange={(e) => setMemberSearch(e.target.value)}
-                      placeholder={t('Search users...') as string}
-                      className="pl-9"
-                    />
-                  </div>
-                  {canInviteMembers && (
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-10 w-10 shrink-0 rounded-lg"
-                      onClick={() => setIsInviteDialogOpen(true)}
-                      title={t('Invite members')}
+                  <TabsTrigger
+                    value="members"
+                    className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-4 py-3"
+                  >
+                    {t('Members')}
+                    {effectiveDetail.members ? ` (${effectiveDetail.members.length})` : ''}
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value="files"
+                    className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-4 py-3"
+                  >
+                    {t('Files')}
+                    {typeof groupFileCount === 'number' ? ` (${groupFileCount})` : ''}
+                  </TabsTrigger>
+                  {isAdmin && (
+                    <TabsTrigger
+                      value="requests"
+                      className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-4 py-3"
                     >
-                      <UserPlus className="w-5 h-5" />
-                    </Button>
-                  )}
-                </div>
-                <div className="space-y-2">{memberRows}</div>
-              </div>
-            </TabsContent>
-            {isAdmin && (
-              <TabsContent value="requests" className="mt-0">
-                <div className="space-y-4">
-                  <div className="px-4 py-3 border-b flex items-center justify-between gap-2">
-                    <div className="text-sm font-medium">
-                      {t('Pending join requests')}
+                      {t('Join Requests')}
                       {joinRequestCount ? ` (${joinRequestCount})` : ''}
+                    </TabsTrigger>
+                  )}
+                </TabsList>
+              </div>
+              <TabsContent value="notes" forceMount className="mt-0">
+                <NormalFeed
+                  subRequests={groupSubRequests}
+                  isMainFeed={false}
+                  debugActiveTab={activeTab}
+                  debugLabel={groupId ? `GroupPage:${groupId}` : 'GroupPage:unknown'}
+                />
+              </TabsContent>
+              <TabsContent value="files" forceMount className="mt-0">
+                <GroupFilesList
+                  groupId={groupId}
+                  subRequests={groupFileSubRequests}
+                  timelineLabel={groupId ? `f-fetch-events-group-files-${groupId}` : 'f-fetch-events-group-files'}
+                  onCountChange={setGroupFileCount}
+                />
+              </TabsContent>
+              <TabsContent value="members" className="mt-0">
+                <div className="space-y-4">
+                  <div className="px-4 py-3 border-b flex items-center gap-2">
+                    <div className="relative flex-1">
+                      <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                      <Input
+                        value={memberSearch}
+                        onChange={(e) => setMemberSearch(e.target.value)}
+                        placeholder={t('Search users...') as string}
+                        className="pl-9"
+                      />
                     </div>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => groupId && loadJoinRequests(groupId, effectiveGroupRelay)}
-                    >
-                      {t('Refresh')}
-                    </Button>
+                    {canInviteMembers && (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-10 w-10 shrink-0 rounded-lg"
+                        onClick={() => setIsInviteDialogOpen(true)}
+                        title={t('Invite members')}
+                      >
+                        <UserPlus className="w-5 h-5" />
+                      </Button>
+                    )}
                   </div>
-                  {joinRequestsError && (
-                    <div className="text-red-500 px-4 text-sm">{joinRequestsError}</div>
-                  )}
-                  {joinRequestRows.length === 0 && !joinRequestsError ? (
-                    <div className="text-sm text-muted-foreground px-4 py-3">
-                      {t('No pending requests')}
-                    </div>
-                  ) : (
-                    <div className="space-y-2">{joinRequestRows}</div>
-                  )}
+                  <div className="space-y-2">{memberRows}</div>
                 </div>
               </TabsContent>
-            )}
-          </Tabs>
+              {isAdmin && (
+                <TabsContent value="requests" className="mt-0">
+                  <div className="space-y-4">
+                    <div className="px-4 py-3 border-b flex items-center justify-between gap-2">
+                      <div className="text-sm font-medium">
+                        {t('Pending join requests')}
+                        {joinRequestCount ? ` (${joinRequestCount})` : ''}
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => groupId && loadJoinRequests(groupId, effectiveGroupRelay)}
+                      >
+                        {t('Refresh')}
+                      </Button>
+                    </div>
+                    {joinRequestsError && (
+                      <div className="text-red-500 px-4 text-sm">{joinRequestsError}</div>
+                    )}
+                    {joinRequestRows.length === 0 && !joinRequestsError ? (
+                      <div className="text-sm text-muted-foreground px-4 py-3">
+                        {t('No pending requests')}
+                      </div>
+                    ) : (
+                      <div className="space-y-2">{joinRequestRows}</div>
+                    )}
+                  </div>
+                </TabsContent>
+              )}
+            </Tabs>
+          )}
         </div>
       )}
     </SecondaryPageLayout>
