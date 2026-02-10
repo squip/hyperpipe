@@ -38,7 +38,7 @@ import { NotificationProvider } from './providers/NotificationProvider'
 import { useScreenSize } from './providers/ScreenSizeProvider'
 import { useTheme } from './providers/ThemeProvider'
 import { useUserPreferences } from './providers/UserPreferencesProvider'
-import { routes } from './routes'
+import { getRoutes } from './routes'
 import modalManager from './services/modal-manager.service'
 
 export type TPrimaryPageName = keyof typeof PRIMARY_PAGE_MAP
@@ -627,7 +627,7 @@ function isCurrentPage(stack: TStackItem[], url: string) {
 
 function findAndCreateComponent(url: string, index: number) {
   const path = url.split('?')[0].split('#')[0]
-  for (const { matcher, element } of routes) {
+  for (const { matcher, element } of getRoutes()) {
     const match = matcher(path)
     if (!match) continue
 

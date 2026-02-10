@@ -1,0 +1,9 @@
+{
+  "name": "reference-threejs-multiplayer-demo",
+  "private": true,
+  "version": "1.0.1",
+  "type": "module",
+  "scripts": {
+    "build": "node ./scripts/build.mjs"
+  }
+}

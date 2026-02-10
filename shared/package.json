@@ -2,6 +2,12 @@
   "name": "shared-modules",
   "private": true,
   "type": "module",
+  "bin": {
+    "htplugin": "./plugins/sdk/htplugin-cli.mjs"
+  },
+  "scripts": {
+    "htplugin": "node ./plugins/sdk/htplugin-cli.mjs"
+  },
   "dependencies": {
     "protomux": "^3.10.1",
     "compact-encoding": "^2.16.1",

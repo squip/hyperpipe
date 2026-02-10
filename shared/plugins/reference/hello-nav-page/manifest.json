@@ -1,0 +1,55 @@
+{
+  "id": "com.hypertuna.reference.hello-nav-page",
+  "name": "Hello Nav Page",
+  "version": "1.0.0",
+  "engines": {
+    "hypertuna": "^1.0.0",
+    "worker": "^1.0.0",
+    "renderer": "^1.0.0",
+    "mediaApi": "^1.0.0"
+  },
+  "entrypoints": {
+    "runner": "dist/runner.mjs"
+  },
+  "permissions": [
+    "renderer.nav",
+    "renderer.route"
+  ],
+  "contributions": {
+    "navItems": [
+      {
+        "id": "home",
+        "title": "Hello Plugin",
+        "description": "First-party hello plugin page",
+        "icon": "puzzle",
+        "routePath": "/plugins/com.hypertuna.reference.hello-nav-page/home",
+        "order": 20
+      }
+    ],
+    "routes": [
+      {
+        "id": "home",
+        "title": "Hello Plugin Home",
+        "description": "Basic route/nav contribution demo",
+        "path": "/plugins/com.hypertuna.reference.hello-nav-page/home",
+        "timeoutMs": 12000
+      }
+    ],
+    "mediaFeatures": []
+  },
+  "integrity": {
+    "bundleSha256": "e74bf5ac401c5fdc79f5aac32405269962d621b6b6e37909dac239c556f865c9",
+    "sourceSha256": "a872516543b213279e951816677ff5e7d0c2370780e3ace14ecd71d4932667eb"
+  },
+  "source": {
+    "hyperdriveUrl": "",
+    "path": ""
+  },
+  "marketplace": {
+    "publisherPubkey": "",
+    "tags": [
+      "reference",
+      "hello"
+    ]
+  }
+}

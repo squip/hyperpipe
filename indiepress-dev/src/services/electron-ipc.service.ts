@@ -2,6 +2,14 @@
 // Extend types as you learn more about worker payload shapes.
 
 import { isElectron } from '@/lib/platform'
+import type {
+  InstalledPluginDescriptor,
+  PluginArchivePreviewResponse,
+  PluginAuditResponse,
+  PluginLifecycleResponse,
+  PluginPermission,
+  PluginUIContributionsResponse
+} from '@/plugins/types'
 
 export type WorkerCommandResult = { success: boolean; error?: string }
 export type WorkerStartResult = WorkerCommandResult & { alreadyRunning?: boolean; configSent?: boolean }
@@ -82,11 +90,98 @@ export type PublicGatewayStatus = {
   >
 }
 
+export type MediaCommandPayload = {
+  type: string
+  data?: Record<string, unknown>
+  sourceType?: 'host' | 'plugin'
+  pluginId?: string
+  permissions?: string[]
+  timeoutMs?: number
+}
+
+export type MarketplaceListing = {
+  manifest?: Record<string, unknown>
+  metadata?: Record<string, unknown>
+  social?: Record<string, unknown>
+  verification?: MarketplacePublisherVerification
+}
+
+export type MarketplacePublisherVerificationStatus = 'verified' | 'unverified' | 'mismatch'
+
+export type MarketplacePublisherVerification = {
+  status: MarketplacePublisherVerificationStatus
+  manifestPublisherPubkey?: string | null
+  listingPublisherPubkey?: string | null
+  canInstallByDefault?: boolean
+  reason?: string
+}
+
+export type MarketplaceDiscoveryResponse = {
+  success: boolean
+  listings?: MarketplaceListing[]
+  discovered?: InstalledPluginDescriptor[]
+  skipped?: Array<{ reason?: string; [key: string]: unknown }>
+  relays?: string[]
+  warnings?: string[]
+  totalListings?: number
+  error?: string
+}
+
+export type MarketplaceInstallResponse = {
+  success: boolean
+  plugin?: InstalledPluginDescriptor
+  download?: {
+    archivePath?: string
+    sizeBytes?: number
+    sha256?: string
+    source?: string
+    sourceType?: string
+    warnings?: string[]
+  }
+  verification?: MarketplacePublisherVerification
+  requiresOverride?: boolean
+  overrideAccepted?: boolean
+  error?: string
+}
+
+export type ReferencePluginDescriptor = {
+  id: string
+  slug: string
+  name: string
+  version: string
+  summary: string
+  majorCapability: string
+  permissions: PluginPermission[]
+  navItemCount: number
+  routeCount: number
+  mediaFeatureCount: number
+}
+
+export type ReferencePluginListResponse = {
+  success: boolean
+  plugins?: ReferencePluginDescriptor[]
+  warnings?: string[]
+  error?: string
+}
+
+export type ReferencePluginInstallResponse = {
+  success: boolean
+  plugin?: InstalledPluginDescriptor | null
+  referencePlugin?: ReferencePluginDescriptor | null
+  archive?: {
+    sizeBytes?: number
+    sha256?: string | null
+  } | null
+  warnings?: string[]
+  error?: string
+}
+
 type ElectronAPI = {
   startWorker: (config?: unknown) => Promise<WorkerStartResult>
   stopWorker: () => Promise<WorkerCommandResult>
   sendToWorker: (message: unknown) => Promise<any>
   sendToWorkerAwait: (payload: unknown) => Promise<any>
+  mediaCommand: (payload: MediaCommandPayload) => Promise<any>
   getWorkerIdentity?: () => Promise<{ success: boolean; identity?: unknown }>
 
   getGatewayStatus: () => Promise<{ success: boolean; status: GatewayStatus | null }>
@@ -111,6 +206,34 @@ type ElectronAPI = {
   appendLogLine: (line: string) => Promise<WorkerCommandResult>
   readFileBuffer: (filePath: string) => Promise<{ success: boolean; data: ArrayBuffer }>
 
+  listPlugins?: () => Promise<{ success: boolean; plugins: unknown[] }>
+  discoverPlugin?: (payload: unknown) => Promise<PluginLifecycleResponse>
+  installPlugin?: (payload: unknown) => Promise<PluginLifecycleResponse>
+  installPluginArchive?: (payload: { archivePath: string; source?: string }) => Promise<PluginLifecycleResponse>
+  previewPluginArchive?: (payload: { archivePath: string }) => Promise<PluginArchivePreviewResponse>
+  uninstallPlugin?: (payload: { pluginId: string }) => Promise<{ success: boolean; error?: string }>
+  enablePlugin?: (payload: { pluginId: string }) => Promise<PluginLifecycleResponse>
+  disablePlugin?: (payload: { pluginId: string }) => Promise<PluginLifecycleResponse>
+  approvePluginVersion?: (payload: { pluginId: string; version?: string }) => Promise<PluginLifecycleResponse>
+  rejectPluginVersion?: (payload: { pluginId: string; version?: string; reason?: string }) => Promise<PluginLifecycleResponse>
+  elevatePluginTier?: (payload: { pluginId: string; tier: 'restricted' | 'elevated' }) => Promise<PluginLifecycleResponse>
+  getPluginAudit?: (payload: { pluginId: string; limit?: number }) => Promise<PluginAuditResponse>
+  invokePlugin?: (payload: unknown) => Promise<{ success: boolean; data?: unknown; error?: string }>
+  discoverMarketplacePlugins?: (payload?: unknown) => Promise<MarketplaceDiscoveryResponse>
+  installMarketplacePlugin?: (payload: {
+    listing: MarketplaceListing
+    bundleUrl?: string
+    archiveUrl?: string
+    timeoutMs?: number
+    allowPublisherMismatch?: boolean
+  }) => Promise<MarketplaceInstallResponse>
+  getPluginUIContributions?: () => Promise<PluginUIContributionsResponse>
+  listReferencePlugins?: () => Promise<ReferencePluginListResponse>
+  installReferencePlugin?: (payload: {
+    pluginId: string
+    version?: string
+  }) => Promise<ReferencePluginInstallResponse>
+
   importModule?: (specifier: string) => Promise<unknown>
   requireModule?: (specifier: string) => unknown
 
@@ -119,6 +242,8 @@ type ElectronAPI = {
   onWorkerExit: (cb: (code: number) => void) => () => void
   onWorkerStdout: (cb: (data: string) => void) => () => void
   onWorkerStderr: (cb: (data: string) => void) => () => void
+  onMediaEvent?: (cb: (event: any) => void) => () => void
+  onPluginEvent?: (cb: (event: any) => void) => () => void
 }
 
 function api(): ElectronAPI | null {
@@ -144,6 +269,9 @@ export const electronIpc = {
   },
   sendToWorkerAwait(payload: unknown) {
     return api()?.sendToWorkerAwait(payload) ?? unavailable()
+  },
+  mediaCommand(payload: MediaCommandPayload) {
+    return api()?.mediaCommand(payload) ?? unavailable()
   },
   getWorkerIdentity() {
     return api()?.getWorkerIdentity?.() ?? unavailable()
@@ -206,6 +334,66 @@ export const electronIpc = {
   readFileBuffer(filePath: string) {
     return api()?.readFileBuffer(filePath) ?? unavailable()
   },
+  listPlugins() {
+    return api()?.listPlugins?.() ?? unavailable()
+  },
+  discoverPlugin(payload: unknown) {
+    return api()?.discoverPlugin?.(payload) ?? unavailable()
+  },
+  installPlugin(payload: unknown) {
+    return api()?.installPlugin?.(payload) ?? unavailable()
+  },
+  installPluginArchive(payload: { archivePath: string; source?: string }) {
+    return api()?.installPluginArchive?.(payload) ?? unavailable()
+  },
+  previewPluginArchive(payload: { archivePath: string }) {
+    return api()?.previewPluginArchive?.(payload) ?? unavailable()
+  },
+  uninstallPlugin(payload: { pluginId: string }) {
+    return api()?.uninstallPlugin?.(payload) ?? unavailable()
+  },
+  enablePlugin(payload: { pluginId: string }) {
+    return api()?.enablePlugin?.(payload) ?? unavailable()
+  },
+  disablePlugin(payload: { pluginId: string }) {
+    return api()?.disablePlugin?.(payload) ?? unavailable()
+  },
+  approvePluginVersion(payload: { pluginId: string; version?: string }) {
+    return api()?.approvePluginVersion?.(payload) ?? unavailable()
+  },
+  rejectPluginVersion(payload: { pluginId: string; version?: string; reason?: string }) {
+    return api()?.rejectPluginVersion?.(payload) ?? unavailable()
+  },
+  elevatePluginTier(payload: { pluginId: string; tier: 'restricted' | 'elevated' }) {
+    return api()?.elevatePluginTier?.(payload) ?? unavailable()
+  },
+  getPluginAudit(payload: { pluginId: string; limit?: number }) {
+    return api()?.getPluginAudit?.(payload) ?? unavailable()
+  },
+  invokePlugin(payload: unknown) {
+    return api()?.invokePlugin?.(payload) ?? unavailable()
+  },
+  discoverMarketplacePlugins(payload?: unknown) {
+    return api()?.discoverMarketplacePlugins?.(payload) ?? unavailable()
+  },
+  installMarketplacePlugin(payload: {
+    listing: MarketplaceListing
+    bundleUrl?: string
+    archiveUrl?: string
+    timeoutMs?: number
+    allowPublisherMismatch?: boolean
+  }) {
+    return api()?.installMarketplacePlugin?.(payload) ?? unavailable()
+  },
+  getPluginUIContributions() {
+    return api()?.getPluginUIContributions?.() ?? unavailable()
+  },
+  listReferencePlugins() {
+    return api()?.listReferencePlugins?.() ?? unavailable()
+  },
+  installReferencePlugin(payload: { pluginId: string; version?: string }) {
+    return api()?.installReferencePlugin?.(payload) ?? unavailable()
+  },
 
   onWorkerMessage(cb: (msg: any) => void) {
     return api()?.onWorkerMessage(cb) ?? (() => {})
@@ -221,5 +409,11 @@ export const electronIpc = {
   },
   onWorkerStderr(cb: (data: string) => void) {
     return api()?.onWorkerStderr(cb) ?? (() => {})
+  },
+  onMediaEvent(cb: (event: any) => void) {
+    return api()?.onMediaEvent?.(cb) ?? (() => {})
+  },
+  onPluginEvent(cb: (event: any) => void) {
+    return api()?.onPluginEvent?.(cb) ?? (() => {})
   }
 }

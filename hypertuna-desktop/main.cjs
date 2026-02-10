@@ -1,7 +1,11 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const { promises: fs, existsSync } = require('fs');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
+const { promisify } = require('util');
+const { PluginSupervisor } = require('./plugin-supervisor.cjs');
+
+const execFileAsync = promisify(execFile);
 
 let mainWindow = null;
 let workerProcess = null;
@@ -12,6 +16,7 @@ let gatewayLogsCache = [];
 let publicGatewayConfigCache = null;
 let publicGatewayStatusCache = null;
 let currentWorkerUserKey = null;
+let pluginSupervisor = null;
 
 function isHex64(value) {
   return typeof value === 'string' && /^[a-fA-F0-9]{64}$/.test(value);
@@ -69,6 +74,19 @@ function sendWorkerConfigToProcess(proc, payload) {
   }
 }
 
+function generateWorkerRequestId() {
+  return `worker-req-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+}
+
+function emitRendererEvent(channel, payload) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    mainWindow.webContents.send(channel, payload);
+  } catch (error) {
+    console.warn(`[Main] Failed to emit renderer event on ${channel}:`, error?.message || error);
+  }
+}
+
 const userDataPath = app.getPath('userData');
 const storagePath = path.join(userDataPath, 'hypertuna-data');
 const logFilePath = path.join(storagePath, 'desktop-console.log');
@@ -108,6 +126,320 @@ async function ensureStorageDir() {
   } catch (error) {
     console.error('[Main] Failed to create storage directory', error);
   }
+}
+
+async function ensurePluginSupervisor() {
+  if (pluginSupervisor) return pluginSupervisor;
+  pluginSupervisor = new PluginSupervisor({
+    storagePath,
+    logger: console
+  });
+  pluginSupervisor.setRendererEmitter((channel, payload) => {
+    emitRendererEvent(channel, payload);
+  });
+  await pluginSupervisor.init();
+  return pluginSupervisor;
+}
+
+function asString(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function asObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value;
+}
+
+function toArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function getReferencePluginPaths() {
+  const referenceRoot = path.join(__dirname, '..', 'shared', 'plugins', 'reference');
+  return {
+    referenceRoot,
+    catalogPath: path.join(referenceRoot, 'catalog.json'),
+    cliPath: path.join(__dirname, '..', 'shared', 'plugins', 'sdk', 'htplugin-cli.mjs')
+  };
+}
+
+async function loadReferencePluginDefinitions() {
+  const paths = getReferencePluginPaths();
+  let catalog = [];
+  try {
+    const raw = await fs.readFile(paths.catalogPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    catalog = Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    throw new Error(`Failed to read reference plugin catalog: ${error?.message || error}`);
+  }
+
+  const warnings = [];
+  const plugins = [];
+  for (const entry of catalog) {
+    const item = asObject(entry);
+    if (!item) continue;
+    const pluginId = asString(item.id).toLowerCase();
+    const slug = asString(item.slug);
+    if (!pluginId || !slug) {
+      warnings.push('Catalog entry missing id/slug');
+      continue;
+    }
+
+    const pluginDir = path.join(paths.referenceRoot, slug);
+    const manifestPath = path.join(pluginDir, 'manifest.json');
+    let manifest = null;
+    try {
+      const rawManifest = await fs.readFile(manifestPath, 'utf8');
+      manifest = JSON.parse(rawManifest);
+    } catch (error) {
+      warnings.push(`Failed to load manifest for ${pluginId}: ${error?.message || error}`);
+      continue;
+    }
+    const manifestObj = asObject(manifest) || {};
+    const contributions = asObject(manifestObj.contributions) || {};
+    plugins.push({
+      id: pluginId,
+      slug,
+      name: asString(item.name) || asString(manifestObj.name) || pluginId,
+      version: asString(manifestObj.version) || '0.0.0',
+      summary: asString(item.summary) || 'First-party reference plugin.',
+      majorCapability: asString(item.majorCapability) || 'Reference capability',
+      permissions: toArray(manifestObj.permissions).map((value) => asString(value)).filter(Boolean),
+      navItemCount: toArray(contributions.navItems).length,
+      routeCount: toArray(contributions.routes).length,
+      mediaFeatureCount: toArray(contributions.mediaFeatures).length,
+      pluginDir
+    });
+  }
+
+  return {
+    plugins,
+    warnings,
+    referenceRoot: paths.referenceRoot,
+    cliPath: paths.cliPath
+  };
+}
+
+function toPublicReferencePlugin(plugin) {
+  if (!plugin || typeof plugin !== 'object') return null;
+  return {
+    id: asString(plugin.id).toLowerCase(),
+    slug: asString(plugin.slug),
+    name: asString(plugin.name),
+    version: asString(plugin.version),
+    summary: asString(plugin.summary),
+    majorCapability: asString(plugin.majorCapability),
+    permissions: Array.isArray(plugin.permissions)
+      ? plugin.permissions.map((value) => asString(value)).filter(Boolean)
+      : [],
+    navItemCount: Number(plugin.navItemCount) || 0,
+    routeCount: Number(plugin.routeCount) || 0,
+    mediaFeatureCount: Number(plugin.mediaFeatureCount) || 0
+  };
+}
+
+async function packageReferencePlugin(plugin) {
+  const pluginId = asString(plugin?.id).toLowerCase();
+  const pluginVersion = asString(plugin?.version) || '0.0.0';
+  const pluginDir = asString(plugin?.pluginDir);
+  const { cliPath } = getReferencePluginPaths();
+  if (!pluginId || !pluginDir) {
+    throw new Error('Reference plugin metadata is incomplete');
+  }
+  if (!existsSync(cliPath)) {
+    throw new Error(`Reference plugin CLI not found: ${cliPath}`);
+  }
+
+  const outputRoot = path.join(storagePath, 'plugin-reference-cache');
+  await fs.mkdir(outputRoot, { recursive: true });
+  const archivePath = path.join(outputRoot, `${pluginId}-${pluginVersion}.htplugin.tgz`);
+
+  let stdout = '';
+  let stderr = '';
+  try {
+    const result = await execFileAsync(
+      process.execPath,
+      [cliPath, 'pack', pluginDir, '--output', archivePath, '--json'],
+      {
+        cwd: pluginDir,
+        env: {
+          ...process.env,
+          ELECTRON_RUN_AS_NODE: '1'
+        },
+        timeout: 180_000,
+        maxBuffer: 8 * 1024 * 1024
+      }
+    );
+    stdout = String(result?.stdout || '');
+    stderr = String(result?.stderr || '');
+  } catch (error) {
+    const out = String(error?.stdout || '');
+    const err = String(error?.stderr || '');
+    const details = [out, err].filter(Boolean).join('\n');
+    throw new Error(
+      `Failed to package reference plugin ${pluginId}: ${error?.message || error}${details ? `\n${details}` : ''}`
+    );
+  }
+
+  let archiveMeta = null;
+  try {
+    const parsed = JSON.parse(stdout);
+    archiveMeta = asObject(parsed?.archive);
+  } catch (_) {
+    archiveMeta = null;
+  }
+  if (!existsSync(archivePath)) {
+    throw new Error(`Reference plugin archive was not created: ${archivePath}`);
+  }
+  const archiveStats = await fs.stat(archivePath);
+  return {
+    archivePath,
+    archive: archiveMeta
+      ? {
+          sizeBytes: Number(archiveMeta.sizeBytes) || archiveStats.size,
+          sha256: asString(archiveMeta.sha256) || null
+        }
+      : {
+          sizeBytes: archiveStats.size,
+          sha256: null
+        },
+    stderr
+  };
+}
+
+function findReferencePluginById(plugins, pluginId) {
+  const normalizedPluginId = asString(pluginId).toLowerCase();
+  if (!normalizedPluginId) return null;
+  if (!Array.isArray(plugins)) return null;
+  return plugins.find((plugin) => asString(plugin?.id).toLowerCase() === normalizedPluginId) || null;
+}
+
+function normalizeHex64(value) {
+  const normalized = asString(value).toLowerCase();
+  return isHex64(normalized) ? normalized : '';
+}
+
+function evaluateMarketplacePublisherVerification(listing) {
+  const listingObj = listing && typeof listing === 'object' ? listing : {};
+  const manifest = listingObj?.manifest && typeof listingObj.manifest === 'object'
+    ? listingObj.manifest
+    : {};
+  const metadata = listingObj?.metadata && typeof listingObj.metadata === 'object'
+    ? listingObj.metadata
+    : {};
+  const manifestPublisherPubkey = normalizeHex64(
+    manifest?.marketplace?.publisherPubkey || manifest?.publisherPubkey
+  );
+  const listingPublisherPubkey = normalizeHex64(
+    metadata?.pubkey || metadata?.publisherPubkey || listingObj?.publisherPubkey
+  );
+
+  if (manifestPublisherPubkey && listingPublisherPubkey) {
+    if (manifestPublisherPubkey === listingPublisherPubkey) {
+      return {
+        status: 'verified',
+        manifestPublisherPubkey,
+        listingPublisherPubkey,
+        canInstallByDefault: true,
+        reason: 'manifest-and-listing-publisher-match'
+      };
+    }
+    return {
+      status: 'mismatch',
+      manifestPublisherPubkey,
+      listingPublisherPubkey,
+      canInstallByDefault: false,
+      reason: 'manifest-and-listing-publisher-mismatch'
+    };
+  }
+
+  return {
+    status: 'unverified',
+    manifestPublisherPubkey: manifestPublisherPubkey || null,
+    listingPublisherPubkey: listingPublisherPubkey || null,
+    canInstallByDefault: true,
+    reason: manifestPublisherPubkey || listingPublisherPubkey
+      ? 'publisher-pubkey-invalid'
+      : 'publisher-pubkey-missing'
+  };
+}
+
+function withMarketplacePublisherVerification(listing) {
+  if (!listing || typeof listing !== 'object') return listing;
+  const verification = evaluateMarketplacePublisherVerification(listing);
+  const metadata = listing?.metadata && typeof listing.metadata === 'object'
+    ? listing.metadata
+    : {};
+  return {
+    ...listing,
+    metadata: {
+      ...metadata,
+      publisherVerification: verification
+    },
+    verification
+  };
+}
+
+function normalizeCommandType(value) {
+  return asString(value);
+}
+
+function normalizeCommandSourceType(value, fallback = 'host') {
+  const sourceType = asString(value).toLowerCase();
+  return sourceType || fallback;
+}
+
+async function authorizePluginWorkerMessage(rawMessage, { defaultSourceType = 'host' } = {}) {
+  if (!rawMessage || typeof rawMessage !== 'object') {
+    return { success: false, error: 'Invalid worker message payload' };
+  }
+
+  const message = { ...rawMessage };
+  const commandType = normalizeCommandType(message.type);
+  if (!commandType) {
+    return { success: false, error: 'Worker message type is required' };
+  }
+
+  const sourceType = normalizeCommandSourceType(
+    message.sourceType || message.source || '',
+    defaultSourceType
+  );
+  const pluginId = asString(message.pluginId).toLowerCase();
+  const isPluginRequest = sourceType === 'plugin' || Boolean(pluginId);
+
+  if (!isPluginRequest) {
+    message.sourceType = 'host';
+    delete message.pluginId;
+    delete message.requiredPermission;
+    if (Array.isArray(message.permissions) && message.permissions.length) {
+      delete message.permissions;
+    }
+    return { success: true, message };
+  }
+
+  const supervisor = await ensurePluginSupervisor();
+  const authorization = supervisor.authorizePluginWorkerCommand({
+    pluginId,
+    commandType,
+    sourceType: 'plugin'
+  });
+  if (!authorization.success) {
+    return {
+      success: false,
+      error: authorization.error || 'Plugin worker authorization failed'
+    };
+  }
+
+  message.sourceType = 'plugin';
+  message.pluginId = authorization.pluginId;
+  message.permissions = authorization.permissions;
+  message.requiredPermission = authorization.requiredPermission;
+  return {
+    success: true,
+    message,
+    authorization
+  };
 }
 
 function delay(ms) {
@@ -151,6 +483,10 @@ function createWindow() {
     if (!pendingWorkerMessages.length) return;
     pendingWorkerMessages.forEach((message) => {
       mainWindow.webContents.send('worker-message', message);
+      const messageType = typeof message?.type === 'string' ? message.type : '';
+      if (messageType.startsWith('media-') || messageType.startsWith('p2p-')) {
+        mainWindow.webContents.send('media-event', message);
+      }
     });
     pendingWorkerMessages = [];
   });
@@ -258,6 +594,10 @@ async function startWorkerProcess(workerConfig = null) {
 
       if (mainWindow) {
         mainWindow.webContents.send('worker-message', message);
+        const messageType = typeof message?.type === 'string' ? message.type : '';
+        if (messageType.startsWith('media-') || messageType.startsWith('p2p-')) {
+          mainWindow.webContents.send('media-event', message);
+        }
       } else {
         pendingWorkerMessages.push(message);
       }
@@ -304,6 +644,10 @@ async function startWorkerProcess(workerConfig = null) {
     if (mainWindow && pendingWorkerMessages.length) {
       for (const message of pendingWorkerMessages) {
         mainWindow.webContents.send('worker-message', message);
+        const messageType = typeof message?.type === 'string' ? message.type : '';
+        if (messageType.startsWith('media-') || messageType.startsWith('p2p-')) {
+          mainWindow.webContents.send('media-event', message);
+        }
       }
       pendingWorkerMessages = [];
     }
@@ -393,29 +737,7 @@ function sendGatewayCommand(type, payload = {}) {
   }
 }
 
-ipcMain.handle('start-worker', async (_event, config) => {
-  return startWorkerProcess(config);
-});
-
-ipcMain.handle('stop-worker', async () => {
-  return stopWorkerProcess();
-});
-
-ipcMain.handle('send-to-worker', async (_event, message) => {
-  if (!workerProcess) {
-    return { success: false, error: 'Worker not running' };
-  }
-
-  try {
-    workerProcess.send(message);
-    return { success: true };
-  } catch (error) {
-    console.error('[Main] Failed to send message to worker', error);
-    return { success: false, error: error.message };
-  }
-});
-
-ipcMain.handle('send-to-worker-await', async (_event, payload) => {
+async function sendWorkerRequestAwait(payload, defaultTimeoutMs = 30000) {
   if (!workerProcess) {
     return { success: false, error: 'Worker not running' };
   }
@@ -431,12 +753,12 @@ ipcMain.handle('send-to-worker-await', async (_event, payload) => {
   const timeoutMsRaw =
     payload && typeof payload === 'object' && Number.isFinite(payload.timeoutMs)
       ? Number(payload.timeoutMs)
-      : 30000;
+      : defaultTimeoutMs;
   const timeoutMs = Math.max(1000, Math.min(timeoutMsRaw, 300000));
   const requestId =
     typeof baseMessage.requestId === 'string' && baseMessage.requestId
       ? baseMessage.requestId
-      : `worker-req-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+      : generateWorkerRequestId();
   const messageToSend = { ...baseMessage, requestId };
 
   if (pendingWorkerRequests.has(requestId)) {
@@ -460,6 +782,387 @@ ipcMain.handle('send-to-worker-await', async (_event, payload) => {
       resolve({ success: false, error: error.message, requestId });
     }
   });
+}
+
+ipcMain.handle('start-worker', async (_event, config) => {
+  return startWorkerProcess(config);
+});
+
+ipcMain.handle('stop-worker', async () => {
+  return stopWorkerProcess();
+});
+
+ipcMain.handle('send-to-worker', async (_event, message) => {
+  if (!workerProcess) {
+    return { success: false, error: 'Worker not running' };
+  }
+
+  const authorization = await authorizePluginWorkerMessage(message, {
+    defaultSourceType: 'host'
+  });
+  if (!authorization.success) {
+    return {
+      success: false,
+      error: authorization.error || 'Worker command authorization failed'
+    };
+  }
+
+  try {
+    workerProcess.send(authorization.message);
+    return { success: true };
+  } catch (error) {
+    console.error('[Main] Failed to send message to worker', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('send-to-worker-await', async (_event, payload) => {
+  const normalizedPayload = payload && typeof payload === 'object' ? payload : {};
+  const hasMessageWrapper = normalizedPayload.message && typeof normalizedPayload.message === 'object';
+  const rawMessage = hasMessageWrapper ? normalizedPayload.message : normalizedPayload;
+  const authorization = await authorizePluginWorkerMessage(rawMessage, {
+    defaultSourceType: 'host'
+  });
+  if (!authorization.success) {
+    return {
+      success: false,
+      error: authorization.error || 'Worker command authorization failed'
+    };
+  }
+
+  if (hasMessageWrapper) {
+    return sendWorkerRequestAwait(
+      {
+        ...normalizedPayload,
+        message: authorization.message
+      },
+      30000
+    );
+  }
+  return sendWorkerRequestAwait(authorization.message, 30000);
+});
+
+ipcMain.handle('media-command', async (_event, payload) => {
+  const command = payload && typeof payload === 'object' ? payload : {};
+  const type = typeof command.type === 'string' ? command.type : '';
+  if (!type || (!type.startsWith('media-') && !type.startsWith('p2p-'))) {
+    return { success: false, error: 'Invalid media command type' };
+  }
+
+  const authorization = await authorizePluginWorkerMessage(
+    {
+      type,
+      data: command.data || {},
+      sourceType: command.sourceType || 'host',
+      pluginId: command.pluginId
+    },
+    {
+      defaultSourceType: 'host'
+    }
+  );
+  if (!authorization.success) {
+    return {
+      success: false,
+      error: authorization.error || 'Media command authorization failed'
+    };
+  }
+
+  const response = await sendWorkerRequestAwait(
+    {
+      message: authorization.message,
+      timeoutMs: Number.isFinite(command.timeoutMs) ? Number(command.timeoutMs) : 45000
+    },
+    45000
+  );
+  return response;
+});
+
+ipcMain.handle('plugin-list', async () => {
+  const supervisor = await ensurePluginSupervisor();
+  return { success: true, plugins: supervisor.listPlugins() };
+});
+
+ipcMain.handle('plugin-get-ui-contributions', async () => {
+  const supervisor = await ensurePluginSupervisor();
+  const data = supervisor.getUiContributions();
+  return { success: true, ...data };
+});
+
+ipcMain.handle('plugin-reference-list', async () => {
+  try {
+    const definitions = await loadReferencePluginDefinitions();
+    return {
+      success: true,
+      plugins: definitions.plugins
+        .map((plugin) => toPublicReferencePlugin(plugin))
+        .filter((plugin) => plugin && plugin.id),
+      warnings: definitions.warnings
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error?.message || String(error)
+    };
+  }
+});
+
+ipcMain.handle('plugin-reference-install', async (_event, payload) => {
+  const request = payload && typeof payload === 'object' ? payload : {};
+  const pluginId = asString(request.pluginId).toLowerCase();
+  if (!pluginId) {
+    return {
+      success: false,
+      error: 'pluginId is required'
+    };
+  }
+
+  try {
+    const definitions = await loadReferencePluginDefinitions();
+    const referencePlugin = findReferencePluginById(definitions.plugins, pluginId);
+    if (!referencePlugin) {
+      return {
+        success: false,
+        error: `Reference plugin not found: ${pluginId}`
+      };
+    }
+
+    const requestedVersion = asString(request.version);
+    if (requestedVersion && requestedVersion !== referencePlugin.version) {
+      return {
+        success: false,
+        error: `Reference plugin ${pluginId} is available as ${referencePlugin.version}; requested ${requestedVersion}`
+      };
+    }
+
+    const packaged = await packageReferencePlugin(referencePlugin);
+    const supervisor = await ensurePluginSupervisor();
+    const installResult = await supervisor.installPluginArchive({
+      archivePath: packaged.archivePath,
+      source: 'first-party-reference'
+    });
+
+    if (!installResult?.success) {
+      return installResult;
+    }
+
+    return {
+      success: true,
+      plugin: installResult.plugin || null,
+      referencePlugin: toPublicReferencePlugin(referencePlugin),
+      archive: packaged.archive,
+      warnings: definitions.warnings
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error?.message || String(error)
+    };
+  }
+});
+
+ipcMain.handle('plugin-discover', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  return supervisor.discoverPlugin(payload || {});
+});
+
+ipcMain.handle('plugin-install', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  return supervisor.installPlugin(payload || {});
+});
+
+ipcMain.handle('plugin-install-archive', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  return supervisor.installPluginArchive(payload || {});
+});
+
+ipcMain.handle('plugin-preview-archive', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  return supervisor.previewPluginArchive(payload || {});
+});
+
+ipcMain.handle('plugin-uninstall', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  return supervisor.uninstallPlugin(payload || {});
+});
+
+ipcMain.handle('plugin-enable', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  return supervisor.enablePlugin(payload || {});
+});
+
+ipcMain.handle('plugin-disable', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  return supervisor.disablePlugin(payload || {});
+});
+
+ipcMain.handle('plugin-approve-version', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  return supervisor.approveVersion(payload || {});
+});
+
+ipcMain.handle('plugin-reject-version', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  return supervisor.rejectVersion(payload || {});
+});
+
+ipcMain.handle('plugin-elevate-tier', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  return supervisor.elevateTier(payload || {});
+});
+
+ipcMain.handle('plugin-get-audit', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  const pluginId = typeof payload === 'string' ? payload : payload?.pluginId;
+  const limit = typeof payload?.limit === 'number' ? payload.limit : 200;
+  return supervisor.getAudit(pluginId, limit);
+});
+
+ipcMain.handle('plugin-invoke', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  return supervisor.invokePlugin(payload || {});
+});
+
+ipcMain.handle('plugin-marketplace-discover', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  const discoveryPayload = payload && typeof payload === 'object' ? payload : {};
+  const workerDiscovery = await sendWorkerRequestAwait(
+    {
+      message: {
+        type: 'plugin-marketplace-discover',
+        data: discoveryPayload
+      },
+      timeoutMs: Number.isFinite(discoveryPayload.timeoutMs) ? Number(discoveryPayload.timeoutMs) : 60_000
+    },
+    60_000
+  );
+
+  if (!workerDiscovery?.success) {
+    return {
+      success: false,
+      error: workerDiscovery?.error || 'Marketplace discovery failed'
+    };
+  }
+
+  const listings = (Array.isArray(workerDiscovery?.data?.listings) ? workerDiscovery.data.listings : [])
+    .map((listing) => withMarketplacePublisherVerification(listing));
+  const ingest = await supervisor.discoverFromMarketplaceListings({
+    listings,
+    source: 'nostr-marketplace'
+  });
+
+  if (!ingest.success) {
+    return ingest;
+  }
+
+  return {
+    success: true,
+    listings,
+    warnings: Array.isArray(workerDiscovery?.data?.warnings) ? workerDiscovery.data.warnings : [],
+    relays: Array.isArray(workerDiscovery?.data?.relays) ? workerDiscovery.data.relays : [],
+    ...ingest
+  };
+});
+
+ipcMain.handle('plugin-marketplace-install', async (_event, payload) => {
+  const supervisor = await ensurePluginSupervisor();
+  const installPayload = payload && typeof payload === 'object' ? payload : {};
+  const listing = installPayload.listing && typeof installPayload.listing === 'object'
+    ? installPayload.listing
+    : null;
+  const manifest = listing?.manifest && typeof listing.manifest === 'object'
+    ? listing.manifest
+    : null;
+  if (!listing || !manifest) {
+    return {
+      success: false,
+      error: 'Marketplace install requires listing.manifest'
+    };
+  }
+
+  const verification = evaluateMarketplacePublisherVerification(listing);
+  const allowPublisherMismatch = installPayload.allowPublisherMismatch === true;
+  if (verification.status === 'mismatch' && !allowPublisherMismatch) {
+    return {
+      success: false,
+      error: [
+        'Publisher mismatch detected between listing and manifest.',
+        `listing=${verification.listingPublisherPubkey || 'unknown'}`,
+        `manifest=${verification.manifestPublisherPubkey || 'unknown'}`
+      ].join(' '),
+      requiresOverride: true,
+      verification
+    };
+  }
+
+  const listingWithVerification = withMarketplacePublisherVerification(listing);
+  const discoverResult = await supervisor.discoverPlugin({
+    manifest,
+    source: 'nostr-marketplace',
+    marketplace:
+      listingWithVerification?.metadata && typeof listingWithVerification.metadata === 'object'
+        ? listingWithVerification.metadata
+        : null,
+    social: listingWithVerification?.metadata?.social || listingWithVerification?.social || null
+  });
+  if (!discoverResult.success) {
+    return {
+      ...discoverResult,
+      verification
+    };
+  }
+
+  const timeoutMs = Number.isFinite(installPayload.timeoutMs) ? Number(installPayload.timeoutMs) : 120_000;
+  const workerDownload = await sendWorkerRequestAwait(
+    {
+      message: {
+        type: 'plugin-marketplace-download',
+        data: {
+          listing: listingWithVerification,
+          bundleUrl: asString(installPayload.bundleUrl),
+          archiveUrl: asString(installPayload.archiveUrl),
+          maxBytes: Number.isFinite(installPayload.maxBytes) ? Number(installPayload.maxBytes) : undefined
+        }
+      },
+      timeoutMs
+    },
+    timeoutMs
+  );
+
+  if (!workerDownload?.success) {
+    return {
+      success: false,
+      error: workerDownload?.error || 'Failed to download marketplace plugin archive',
+      verification
+    };
+  }
+
+  const archivePath = asString(workerDownload?.data?.archivePath);
+  if (!archivePath) {
+    return {
+      success: false,
+      error: 'Marketplace download did not return an archive path',
+      verification
+    };
+  }
+
+  const installResult = await supervisor.installPluginArchive({
+    archivePath,
+    source: 'nostr-marketplace'
+  });
+  if (!installResult.success) {
+    return {
+      ...installResult,
+      verification
+    };
+  }
+
+  return {
+    success: true,
+    plugin: installResult.plugin,
+    download: workerDownload.data || null,
+    verification,
+    overrideAccepted: verification.status === 'mismatch' ? allowPublisherMismatch : false
+  };
 });
 
 ipcMain.handle('gateway-start', async (_event, options) => {
@@ -661,6 +1364,7 @@ ipcMain.handle('read-file-buffer', async (_event, filePath) => {
 
 app.whenReady().then(async () => {
   await ensureStorageDir();
+  await ensurePluginSupervisor();
   createWindow();
 
   app.on('activate', () => {
@@ -672,6 +1376,11 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
+    if (pluginSupervisor) {
+      pluginSupervisor.stopAll().catch((error) => {
+        console.warn('[Main] Failed to stop plugin supervisor on shutdown', error?.message || error);
+      });
+    }
     if (workerProcess) {
       try {
         workerProcess.kill();
@@ -685,6 +1394,11 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  if (pluginSupervisor) {
+    pluginSupervisor.stopAll().catch((error) => {
+      console.warn('[Main] Failed to stop plugin supervisor before quit', error?.message || error);
+    });
+  }
   if (workerProcess) {
     try {
       workerProcess.kill();

@@ -1,5 +1,6 @@
 import { match } from 'path-to-regexp'
 import { isValidElement } from 'react'
+import type { ReactElement } from 'react'
 import AppearanceSettingsPage from './pages/secondary/AppearanceSettingsPage'
 import ArticlePage from './pages/secondary/ArticlePage'
 import BookmarkPage from './pages/secondary/BookmarkPage'
@@ -19,6 +20,7 @@ import RelaySettingsPage from './pages/secondary/RelaySettingsPage'
 import RizfulPage from './pages/secondary/RizfulPage'
 import SearchPage from './pages/secondary/SearchPage'
 import SettingsPage from './pages/secondary/SettingsPage'
+import PluginManagerPage from './pages/secondary/PluginManagerPage'
 import TranslationPage from './pages/secondary/TranslationPage'
 import WalletPage from './pages/secondary/WalletPage'
 import ChatPage from './pages/secondary/ChatPage'
@@ -28,7 +30,16 @@ import ListEditorPage from './pages/secondary/ListEditorPage'
 import NotepadNotePage from './pages/secondary/NotepadNotePage'
 import GroupPage from './pages/secondary/GroupPage'
 
-const ROUTES = [
+export type RouteDefinition = {
+  path: string
+  element: ReactElement | null
+}
+
+type ResolvedRoute = RouteDefinition & {
+  matcher: ReturnType<typeof match>
+}
+
+const CORE_ROUTES: RouteDefinition[] = [
   { path: '/notes', element: <NoteListPage /> },
   { path: '/notes/:id', element: <NotePage /> },
   { path: '/articles/:id', element: <ArticlePage /> },
@@ -47,6 +58,7 @@ const ROUTES = [
   { path: '/settings/general', element: <GeneralSettingsPage /> },
   { path: '/settings/appearance', element: <AppearanceSettingsPage /> },
   { path: '/settings/translation', element: <TranslationPage /> },
+  { path: '/settings/plugins', element: <PluginManagerPage /> },
   { path: '/profile-editor', element: <ProfileEditorPage /> },
   { path: '/mutes', element: <MuteListPage /> },
   { path: '/rizful', element: <RizfulPage /> },
@@ -59,8 +71,33 @@ const ROUTES = [
   { path: '/groups/:id', element: <GroupPage id="" /> }
 ]
 
-export const routes = ROUTES.map(({ path, element }) => ({
-  path,
-  element: isValidElement(element) ? element : null,
-  matcher: match(path)
-}))
+let pluginRoutes: RouteDefinition[] = []
+let cachedRoutes: ResolvedRoute[] | null = null
+
+function buildRouteList(definitions: RouteDefinition[]): ResolvedRoute[] {
+  return definitions.map(({ path, element }) => ({
+    path,
+    element: isValidElement(element) ? element : null,
+    matcher: match(path)
+  }))
+}
+
+export function setPluginRoutes(routes: RouteDefinition[]) {
+  pluginRoutes = Array.isArray(routes)
+    ? routes
+      .filter((route) => route && typeof route.path === 'string')
+      .map((route) => ({
+        path: route.path.trim(),
+        element: isValidElement(route.element) ? route.element : null
+      }))
+      .filter((route) => route.path.startsWith('/plugins/'))
+    : []
+  cachedRoutes = null
+}
+
+export function getRoutes(): ResolvedRoute[] {
+  if (!cachedRoutes) {
+    cachedRoutes = buildRouteList([...CORE_ROUTES, ...pluginRoutes])
+  }
+  return cachedRoutes
+}

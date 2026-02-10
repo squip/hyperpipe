@@ -27,6 +27,7 @@ import { UserTrustProvider } from '@/providers/UserTrustProvider'
 import { ZapProvider } from '@/providers/ZapProvider'
 import { MessengerProvider } from '@/providers/MessengerProvider'
 import { NotepadProvider } from '@/providers/NotepadProvider'
+import { PluginRegistryProvider } from '@/providers/PluginRegistryProvider'
 import { PageManager } from './PageManager'
 import { GroupFilesProvider } from './providers/GroupFilesProvider'
 import { GroupsProvider } from './providers/GroupsProvider'
@@ -61,7 +62,9 @@ export default function App(): JSX.Element {
                                                     <NotepadProvider>
                                                       <GroupsProvider>
                                                         <GroupFilesProvider>
-                                                          <PageManager />
+                                                          <PluginRegistryProvider>
+                                                            <PageManager />
+                                                          </PluginRegistryProvider>
                                                         </GroupFilesProvider>
                                                       </GroupsProvider>
                                                     </NotepadProvider>

@@ -1,0 +1,67 @@
+{
+  "id": "com.hypertuna.reference.threejs-multiplayer-demo",
+  "name": "Three.js Multiplayer Demo",
+  "version": "1.0.1",
+  "engines": {
+    "hypertuna": "^1.0.0",
+    "worker": "^1.0.0",
+    "renderer": "^1.0.0",
+    "mediaApi": "^1.0.0"
+  },
+  "entrypoints": {
+    "runner": "dist/runner.mjs"
+  },
+  "permissions": [
+    "renderer.nav",
+    "renderer.route",
+    "media.session",
+    "p2p.session"
+  ],
+  "contributions": {
+    "navItems": [
+      {
+        "id": "threejs-demo",
+        "title": "Three.js Demo",
+        "description": "First-party Three.js multiplayer demo plugin",
+        "icon": "gamepad-2",
+        "routePath": "/plugins/com.hypertuna.reference.threejs-multiplayer-demo/game",
+        "order": 40
+      }
+    ],
+    "routes": [
+      {
+        "id": "threejs-demo",
+        "title": "Three.js Multiplayer Demo",
+        "description": "Interactive 3D scene + WebRTC datachannel multiplayer",
+        "path": "/plugins/com.hypertuna.reference.threejs-multiplayer-demo/game",
+        "timeoutMs": 15000
+      }
+    ],
+    "mediaFeatures": [
+      {
+        "id": "multiplayer-signal-demo",
+        "name": "Multiplayer WebRTC Sync",
+        "description": "Uses host signaling and WebRTC data channels for multiplayer state sync.",
+        "maxSessions": 2,
+        "supportsRecording": false,
+        "supportsTranscode": false
+      }
+    ]
+  },
+  "integrity": {
+    "bundleSha256": "74bc585312e4275dcdae6a3ec4a0ba40f5c53b0a297531ca0dbf250966435454",
+    "sourceSha256": "ddc71474a8c34cfd48caea7c3fe5e5417d5b52a2fbdc0cb1163a12356eb3aed8"
+  },
+  "source": {
+    "hyperdriveUrl": "",
+    "path": ""
+  },
+  "marketplace": {
+    "publisherPubkey": "",
+    "tags": [
+      "reference",
+      "threejs",
+      "multiplayer"
+    ]
+  }
+}

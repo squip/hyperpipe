@@ -3,6 +3,7 @@ import Donation from '@/components/Donation'
 import {
   toAppearanceSettings,
   toGeneralSettings,
+  toPluginSettings,
   toPostSettings,
   toRelaySettings,
   toTranslation,
@@ -20,6 +21,7 @@ import {
   Languages,
   Palette,
   PencilLine,
+  Puzzle,
   Server,
   Settings2,
   Wallet
@@ -84,6 +86,13 @@ export default function Settings() {
           <ChevronRight />
         </SettingItem>
       )}
+      <SettingItem className="clickable" onClick={() => push(toPluginSettings())}>
+        <div className="flex items-center gap-4">
+          <Puzzle />
+          <div>{t('Plugins')}</div>
+        </div>
+        <ChevronRight />
+      </SettingItem>
       {!!nsec && (
         <SettingItem
           className="clickable"

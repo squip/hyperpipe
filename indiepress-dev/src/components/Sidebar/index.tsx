@@ -1,10 +1,12 @@
 import Icon from '@/assets/Icon'
 import Logo from '@/assets/Logo'
 import { cn } from '@/lib/utils'
+import { useSecondaryPage } from '@/PageManager'
 import { useNostr } from '@/providers/NostrProvider'
+import { usePluginRegistry } from '@/providers/PluginRegistryProvider'
 import { useScreenSize } from '@/providers/ScreenSizeProvider'
 import { useUserPreferences } from '@/providers/UserPreferencesProvider'
-import { ChevronsLeft, ChevronsRight } from 'lucide-react'
+import { ChevronsLeft, ChevronsRight, Puzzle } from 'lucide-react'
 import AccountButton from './AccountButton'
 import BookmarkButton from './BookmarkButton'
 import RelaysButton from './ExploreButton'
@@ -18,11 +20,15 @@ import FilesButton from './FilesButton'
 import ReadsButton from './ReadsButton'
 import SearchButton from './SearchButton'
 import NotepadButton from './NotepadButton'
+import SidebarItem from './SidebarItem'
 
 export default function PrimaryPageSidebar() {
   const { isSmallScreen } = useScreenSize()
   const { sidebarCollapse, updateSidebarCollapse, enableSingleColumnLayout } = useUserPreferences()
   const { pubkey } = useNostr()
+  const { push } = useSecondaryPage()
+  const { navItems: pluginNavItems } = usePluginRegistry()
+  const currentPath = typeof window !== 'undefined' ? window.location.pathname : ''
 
   if (isSmallScreen) return null
 
@@ -53,6 +59,23 @@ export default function PrimaryPageSidebar() {
         <NotepadButton collapse={sidebarCollapse} />
         {pubkey && <BookmarkButton collapse={sidebarCollapse} />}
         <SearchButton collapse={sidebarCollapse} />
+        {pluginNavItems.map((item) => {
+          const active = currentPath === item.routePath || currentPath.startsWith(`${item.routePath}/`)
+          const title = item.title || item.pluginName || item.id
+          const description = item.description || item.pluginName || item.title
+          return (
+            <SidebarItem
+              key={`${item.pluginId}:${item.id}`}
+              title={title}
+              description={description}
+              onClick={() => push(item.routePath)}
+              active={active}
+              collapse={sidebarCollapse}
+            >
+              <Puzzle />
+            </SidebarItem>
+          )
+        })}
         <RelaysButton collapse={sidebarCollapse} />
         <PostButton collapse={sidebarCollapse} />
       </div>

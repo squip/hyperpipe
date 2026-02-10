@@ -13,6 +13,9 @@ dist-ssr
 dev-dist
 *.local
 .env
+playwright-report
+test-results
+.playwright
 
 # Editor directories and files
 .vscode/*
@@ -28,4 +31,3 @@ dev-dist
 .vercel
 
 /indiepress-dev-2/*
-

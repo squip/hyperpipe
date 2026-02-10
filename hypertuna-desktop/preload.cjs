@@ -1,8 +1,16 @@
 const { contextBridge, ipcRenderer } = require('electron');
 const { createRequire } = require('module');
 const nodeRequire = createRequire(__filename);
+const SAFE_MODULE_ALLOWLIST = new Set(['hypercore-crypto']);
+
+function assertAllowedModule(specifier) {
+  if (!SAFE_MODULE_ALLOWLIST.has(specifier)) {
+    throw new Error(`Module not allowlisted: ${specifier}`);
+  }
+}
 
 async function importModule(specifier) {
+  assertAllowedModule(specifier);
   try {
     return await import(specifier);
   } catch (importError) {
@@ -15,6 +23,7 @@ async function importModule(specifier) {
 }
 
 function requireModule(specifier) {
+  assertAllowedModule(specifier);
   return nodeRequire(specifier);
 }
 
@@ -32,11 +41,32 @@ contextBridge.exposeInMainWorld('electronAPI', {
   stopWorker: () => ipcRenderer.invoke('stop-worker'),
   sendToWorker: (message) => ipcRenderer.invoke('send-to-worker', message),
   sendToWorkerAwait: (payload) => ipcRenderer.invoke('send-to-worker-await', payload),
+  mediaCommand: (payload) => ipcRenderer.invoke('media-command', payload),
+  listPlugins: () => ipcRenderer.invoke('plugin-list'),
+  discoverPlugin: (payload) => ipcRenderer.invoke('plugin-discover', payload),
+  installPlugin: (payload) => ipcRenderer.invoke('plugin-install', payload),
+  installPluginArchive: (payload) => ipcRenderer.invoke('plugin-install-archive', payload),
+  previewPluginArchive: (payload) => ipcRenderer.invoke('plugin-preview-archive', payload),
+  uninstallPlugin: (payload) => ipcRenderer.invoke('plugin-uninstall', payload),
+  enablePlugin: (payload) => ipcRenderer.invoke('plugin-enable', payload),
+  disablePlugin: (payload) => ipcRenderer.invoke('plugin-disable', payload),
+  approvePluginVersion: (payload) => ipcRenderer.invoke('plugin-approve-version', payload),
+  rejectPluginVersion: (payload) => ipcRenderer.invoke('plugin-reject-version', payload),
+  elevatePluginTier: (payload) => ipcRenderer.invoke('plugin-elevate-tier', payload),
+  getPluginAudit: (payload) => ipcRenderer.invoke('plugin-get-audit', payload),
+  invokePlugin: (payload) => ipcRenderer.invoke('plugin-invoke', payload),
+  discoverMarketplacePlugins: (payload) => ipcRenderer.invoke('plugin-marketplace-discover', payload),
+  installMarketplacePlugin: (payload) => ipcRenderer.invoke('plugin-marketplace-install', payload),
+  getPluginUIContributions: () => ipcRenderer.invoke('plugin-get-ui-contributions'),
+  listReferencePlugins: () => ipcRenderer.invoke('plugin-reference-list'),
+  installReferencePlugin: (payload) => ipcRenderer.invoke('plugin-reference-install', payload),
   onWorkerMessage: registerListener('worker-message'),
   onWorkerError: registerListener('worker-error'),
   onWorkerExit: registerListener('worker-exit'),
   onWorkerStdout: registerListener('worker-stdout'),
   onWorkerStderr: registerListener('worker-stderr'),
+  onMediaEvent: registerListener('media-event'),
+  onPluginEvent: registerListener('plugin-event'),
   readConfig: () => ipcRenderer.invoke('read-config'),
   writeConfig: (config) => ipcRenderer.invoke('write-config', config),
   readGatewaySettings: () => ipcRenderer.invoke('read-gateway-settings'),

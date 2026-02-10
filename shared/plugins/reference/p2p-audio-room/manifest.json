@@ -1,0 +1,68 @@
+{
+  "id": "com.hypertuna.reference.p2p-audio-room",
+  "name": "P2P Audio Room",
+  "version": "1.0.0",
+  "engines": {
+    "hypertuna": "^1.0.0",
+    "worker": "^1.0.0",
+    "renderer": "^1.0.0",
+    "mediaApi": "^1.0.0"
+  },
+  "entrypoints": {
+    "runner": "dist/runner.mjs"
+  },
+  "permissions": [
+    "renderer.nav",
+    "renderer.route",
+    "media.session",
+    "p2p.session",
+    "media.record"
+  ],
+  "contributions": {
+    "navItems": [
+      {
+        "id": "audio-room",
+        "title": "P2P Audio Room",
+        "description": "Reference plugin for media session APIs",
+        "icon": "mic",
+        "routePath": "/plugins/com.hypertuna.reference.p2p-audio-room/room",
+        "order": 30
+      }
+    ],
+    "routes": [
+      {
+        "id": "audio-room",
+        "title": "P2P Audio Room",
+        "description": "Cross-instance WebRTC audio/video room via host signaling",
+        "path": "/plugins/com.hypertuna.reference.p2p-audio-room/room",
+        "timeoutMs": 15000
+      }
+    ],
+    "mediaFeatures": [
+      {
+        "id": "audio-room-core",
+        "name": "WebRTC AV Session Orchestration",
+        "description": "Create/join sessions and exchange SDP/ICE for real-time A/V.",
+        "maxSessions": 4,
+        "supportsRecording": true,
+        "supportsTranscode": false
+      }
+    ]
+  },
+  "integrity": {
+    "bundleSha256": "af429b3f9221e798018f093679503afa77a87f11de67f6f81a7db6b06494ca5d",
+    "sourceSha256": "32bea35dff73679edd8db4e729628154c4640d8e4054cdd0f43c104a1eafd75c"
+  },
+  "source": {
+    "hyperdriveUrl": "",
+    "path": ""
+  },
+  "marketplace": {
+    "publisherPubkey": "",
+    "tags": [
+      "reference",
+      "p2p",
+      "audio"
+    ]
+  }
+}

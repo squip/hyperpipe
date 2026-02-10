@@ -86,6 +86,8 @@ import {
 } from './relay-writer-pool-store.mjs'
 import MarmotService from './marmot-service.mjs'
 import ConversationFileIndex from './conversation-file-index.mjs'
+import MediaServiceManager from './media/MediaServiceManager.mjs'
+import PluginMarketplaceService from './plugins/PluginMarketplaceService.mjs'
 
 if (typeof globalThis.crypto === 'undefined' && nodeCrypto?.webcrypto) {
   try {
@@ -2821,6 +2823,8 @@ let publicGatewayStatusCache = null
 let pendingGatewayMetadataSync = false
 let marmotService = null
 let conversationFileIndex = null
+let mediaServiceManager = null
+let pluginMarketplaceService = null
 
 const WORKER_MESSAGE_VERSION = 1
 const WORKER_SESSION_ID =
@@ -3474,6 +3478,137 @@ function getMarmotService() {
     }
   })
   return marmotService
+}
+
+const MEDIA_COMMAND_ALIASES = {
+  'p2p-create-session': 'media-create-session',
+  'p2p-join-session': 'media-join-session',
+  'p2p-leave-session': 'media-leave-session',
+  'p2p-send-signal': 'media-send-signal'
+}
+
+const PLUGIN_WORKER_COMMAND_PERMISSION_MAP = {
+  'media-create-session': 'media.session',
+  'media-join-session': 'media.session',
+  'media-leave-session': 'media.session',
+  'media-list-sessions': 'media.session',
+  'media-get-session': 'media.session',
+  'media-update-stream-metadata': 'media.session',
+  'media-get-service-status': 'media.session',
+  'media-get-stats': 'media.session',
+  'media-send-signal': 'p2p.session',
+  'media-start-recording': 'media.record',
+  'media-stop-recording': 'media.record',
+  'media-list-recordings': 'media.record',
+  'media-export-recording': 'media.record',
+  'media-transcode-recording': 'media.transcode',
+  'p2p-create-session': 'p2p.session',
+  'p2p-join-session': 'p2p.session',
+  'p2p-leave-session': 'p2p.session',
+  'p2p-send-signal': 'p2p.session',
+  'nostr-read': 'nostr.read',
+  'nostr-query': 'nostr.read',
+  'nostr-subscribe': 'nostr.read',
+  'nostr-list-relays': 'nostr.read',
+  'nostr-publish': 'nostr.publish',
+  'nostr-publish-event': 'nostr.publish'
+}
+
+function normalizePluginSourceType(value) {
+  const sourceType = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return sourceType || 'host'
+}
+
+function normalizePluginRequestId(value) {
+  if (typeof value !== 'string') return ''
+  return value.trim().toLowerCase()
+}
+
+function normalizePluginPermissionSet(permissions) {
+  if (!Array.isArray(permissions)) return new Set()
+  return new Set(
+    permissions
+      .map((permission) => (typeof permission === 'string' ? permission.trim() : ''))
+      .filter(Boolean)
+  )
+}
+
+function getRequiredPluginPermissionForCommand(commandType) {
+  return PLUGIN_WORKER_COMMAND_PERMISSION_MAP[commandType] || null
+}
+
+function assertPluginMessageAuthorization(message) {
+  const commandType = typeof message?.type === 'string' ? message.type.trim() : ''
+  const sourceType = normalizePluginSourceType(message?.sourceType || message?.source || 'host')
+  const pluginId = normalizePluginRequestId(message?.pluginId)
+  const isPluginRequest = sourceType === 'plugin' || Boolean(pluginId)
+
+  if (!isPluginRequest) {
+    return { isPluginRequest: false, commandType, sourceType: 'host', pluginId: null, requiredPermission: null }
+  }
+
+  if (!pluginId) {
+    throw new Error(`Plugin-origin command requires pluginId (${commandType || '<unknown>'})`)
+  }
+
+  const requiredPermission = getRequiredPluginPermissionForCommand(commandType)
+  if (!requiredPermission) {
+    throw new Error(`Plugin command is not allowlisted: ${commandType || '<unknown>'}`)
+  }
+
+  const permissionSet = normalizePluginPermissionSet(message?.permissions)
+  if (!permissionSet.has(requiredPermission)) {
+    throw new Error(`Plugin permission denied for ${commandType}: missing ${requiredPermission}`)
+  }
+
+  return {
+    isPluginRequest: true,
+    commandType,
+    sourceType: 'plugin',
+    pluginId,
+    requiredPermission
+  }
+}
+
+function normalizeMediaCommandType(type) {
+  if (!type || typeof type !== 'string') return null
+  if (type.startsWith('media-')) return type
+  if (type.startsWith('p2p-')) return MEDIA_COMMAND_ALIASES[type] || null
+  return null
+}
+
+function extractMessageRequestId(message) {
+  return (
+    (typeof message?.requestId === 'string' && message.requestId) ||
+    (typeof message?.data?.requestId === 'string' && message.data.requestId) ||
+    null
+  )
+}
+
+function getMediaServiceManager() {
+  if (mediaServiceManager) return mediaServiceManager
+  const storageRoot = global.userConfig?.storage || config?.storage || defaultStorageDir
+  mediaServiceManager = new MediaServiceManager({
+    storageRoot,
+    sendMessage,
+    logger: console,
+    getConfig: () => config || storedParentConfig || {},
+    maxConcurrentSessions: Number(config?.media?.maxConcurrentSessions) || 8,
+    maxParticipantsPerSession: Number(config?.media?.maxParticipantsPerSession) || 32,
+    transcodeEnabled: Boolean(config?.media?.enableTranscode),
+    enableRemoteSignaling: config?.media?.enableRemoteSignaling !== false
+  })
+  return mediaServiceManager
+}
+
+function getPluginMarketplaceService() {
+  if (pluginMarketplaceService) return pluginMarketplaceService
+  const storageRoot = global.userConfig?.storage || config?.storage || defaultStorageDir
+  pluginMarketplaceService = new PluginMarketplaceService({
+    logger: console,
+    storageRoot
+  })
+  return pluginMarketplaceService
 }
 
 let workerStatusState = {
@@ -4379,6 +4514,32 @@ async function handleMessageObject(message) {
     }
   }
 
+  try {
+    const pluginAuthorization = assertPluginMessageAuthorization(message)
+    if (pluginAuthorization.isPluginRequest) {
+      console.info('[Worker] Authorized plugin-origin command', {
+        pluginId: pluginAuthorization.pluginId,
+        type: pluginAuthorization.commandType || message.type || null,
+        permission: pluginAuthorization.requiredPermission
+      })
+    }
+  } catch (error) {
+    const requestId = extractMessageRequestId(message)
+    const errorMessage = error?.message || String(error)
+    sendWorkerResponse(requestId, {
+      success: false,
+      error: errorMessage
+    })
+    sendMessage({
+      type: 'plugin-permission-denied',
+      command: message?.type || null,
+      requestId: requestId || null,
+      pluginId: normalizePluginRequestId(message?.pluginId) || null,
+      error: errorMessage
+    })
+    return
+  }
+
   switch (message.type) {
     case 'get-replication-health': {
       try {
@@ -4736,6 +4897,84 @@ async function handleMessageObject(message) {
         sendMessage({
           type: 'crypto-response',
           requestId: message?.requestId || null,
+          success: false,
+          error: err?.message || String(err)
+        })
+      }
+      break
+    }
+
+    case 'media-create-session':
+    case 'media-join-session':
+    case 'media-leave-session':
+    case 'media-list-sessions':
+    case 'media-get-session':
+    case 'media-update-stream-metadata':
+    case 'media-send-signal':
+    case 'media-start-recording':
+    case 'media-stop-recording':
+    case 'media-list-recordings':
+    case 'media-export-recording':
+    case 'media-transcode-recording':
+    case 'media-get-service-status':
+    case 'media-get-stats':
+    case 'p2p-create-session':
+    case 'p2p-join-session':
+    case 'p2p-leave-session':
+    case 'p2p-send-signal': {
+      const requestId = extractMessageRequestId(message)
+      const commandType = normalizeMediaCommandType(message.type)
+      const payload = message?.data || {}
+      try {
+        if (!commandType) throw new Error(`Unsupported media command alias: ${message.type}`)
+        const manager = getMediaServiceManager()
+        const data = await manager.handleCommand(commandType, payload, {
+          sourceType: message?.sourceType || message?.source || 'host',
+          permissions: Array.isArray(message?.permissions) ? message.permissions : []
+        })
+
+        sendWorkerResponse(requestId, { success: true, data })
+      } catch (err) {
+        const errorMessage = err?.message || String(err)
+        sendWorkerResponse(requestId, {
+          success: false,
+          error: errorMessage
+        })
+        sendMessage({
+          type: 'media-error',
+          command: commandType || message.type || null,
+          requestId: requestId || null,
+          error: errorMessage
+        })
+      }
+      break
+    }
+
+    case 'plugin-marketplace-discover': {
+      const requestId = extractMessageRequestId(message)
+      const payload = message?.data || {}
+      try {
+        const service = getPluginMarketplaceService()
+        const data = await service.discover(payload)
+        sendWorkerResponse(requestId, { success: true, data })
+      } catch (err) {
+        sendWorkerResponse(requestId, {
+          success: false,
+          error: err?.message || String(err)
+        })
+      }
+      break
+    }
+
+    case 'plugin-marketplace-download': {
+      const requestId = extractMessageRequestId(message)
+      const payload = message?.data || {}
+      try {
+        const service = getPluginMarketplaceService()
+        const data = await service.downloadArchive(payload)
+        sendWorkerResponse(requestId, { success: true, data })
+      } catch (err) {
+        sendWorkerResponse(requestId, {
           success: false,
           error: err?.message || String(err)
         })
@@ -5811,6 +6050,16 @@ async function cleanup() {
     }
   }
   marmotService = null
+
+  if (mediaServiceManager?.stop) {
+    try {
+      await mediaServiceManager.stop()
+    } catch (err) {
+      console.warn('[Worker] Failed to stop media service manager:', err?.message || err)
+    }
+  }
+  mediaServiceManager = null
+  pluginMarketplaceService = null
 
   if (conversationFileIndex?.close) {
     try {
