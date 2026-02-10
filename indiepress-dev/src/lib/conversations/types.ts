@@ -41,12 +41,15 @@ export type ConversationSummary = {
   id: string
   protocol: 'marmot'
   participants: string[]
+  adminPubkeys: string[]
+  canInviteMembers: boolean
   title: string
   description?: string | null
   imageUrl?: string | null
   unreadCount: number
   lastMessageAt: number
   lastMessageId?: string | null
+  lastMessageSenderPubkey?: string | null
   lastMessagePreview?: string | null
   lastReadAt: number
   lastReadMessageId?: string | null

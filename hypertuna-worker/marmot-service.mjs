@@ -12,6 +12,7 @@ import {
   KeyPackageStore,
   KeyValueGroupStateBackend,
   MarmotClient,
+  Proposals,
   WELCOME_EVENT_KIND,
   createCredential,
   createKeyPackageEvent,
@@ -1786,9 +1787,15 @@ export class MarmotService {
     return `${others[0]} +${others.length - 1}`
   }
 
+  getGroupAdminPubkeys(group) {
+    return normalizePubkeyList(group?.groupData?.adminPubkeys || [])
+  }
+
   buildConversationSummary(group) {
     const conversationId = group.idStr
     const participants = getGroupMembers(group.state)
+    const adminPubkeys = this.getGroupAdminPubkeys(group)
+    const actorPubkey = normalizePubkey(this.pubkey)
     const metadata = this.getMetadata(conversationId)
     const messages = this.getMessages(conversationId)
     const lastMessage = messages.at(-1) || null
@@ -1804,9 +1811,12 @@ export class MarmotService {
       unreadCount: this.computeUnreadCount(conversationId),
       lastMessageAt: lastMessage?.timestamp || 0,
       lastMessageId: lastMessage?.id || null,
+      lastMessageSenderPubkey: lastMessage?.senderPubkey || null,
       lastMessagePreview: this.getLastMessagePreview(lastMessage),
       lastReadAt: readState?.lastReadAt || 0,
       lastReadMessageId: readState?.lastReadMessageId || null,
+      adminPubkeys,
+      canInviteMembers: !!actorPubkey && adminPubkeys.includes(actorPubkey),
       relayCount: Array.isArray(group.relays) ? group.relays.length : this.relays.length,
       updatedAt: nowSeconds()
     }
@@ -1961,6 +1971,88 @@ export class MarmotService {
       conversationId: group.idStr,
       invited,
       failed,
+      conversation: this.buildConversationSummary(group)
+    }
+  }
+
+  async grantAdmin(conversationId, targetPubkey) {
+    const normalizedConversationId = sanitizeString(conversationId, 256)
+    if (!normalizedConversationId) {
+      throw new Error('Conversation id is required')
+    }
+
+    const normalizedTargetPubkey = normalizePubkey(targetPubkey)
+    if (!normalizedTargetPubkey) {
+      throw new Error(`Invalid target pubkey: ${targetPubkey}`)
+    }
+
+    try {
+      await this.syncConversation(normalizedConversationId, {
+        emit: false,
+        reason: 'grant-admin-presync'
+      })
+    } catch (error) {
+      this.logger.warn?.('[MarmotService] grantAdmin pre-sync failed', {
+        conversationId: normalizedConversationId,
+        targetPubkey: normalizedTargetPubkey,
+        error: error?.message || error
+      })
+    }
+
+    const group =
+      this.groupsById.get(normalizedConversationId)
+      || (await this.client.getGroup(normalizedConversationId))
+    if (!group) throw new Error(`Conversation ${normalizedConversationId} not found`)
+
+    const members = normalizePubkeyList(getGroupMembers(group.state))
+    if (!members.includes(normalizedTargetPubkey)) {
+      throw new Error(`Target pubkey ${normalizedTargetPubkey} is not a member of this chat`)
+    }
+
+    const actorPubkey = normalizePubkey(this.pubkey)
+    const currentAdminPubkeys = this.getGroupAdminPubkeys(group)
+    if (!actorPubkey || !currentAdminPubkeys.includes(actorPubkey)) {
+      throw new Error('Not a chat admin. Cannot grant admin permissions.')
+    }
+
+    if (currentAdminPubkeys.includes(normalizedTargetPubkey)) {
+      return {
+        conversationId: group.idStr,
+        promotedPubkey: normalizedTargetPubkey,
+        alreadyAdmin: true,
+        conversation: this.buildConversationSummary(group)
+      }
+    }
+
+    const nextAdminPubkeys = normalizePubkeyList([
+      ...currentAdminPubkeys,
+      normalizedTargetPubkey
+    ])
+
+    this.logger.info?.('[MarmotService] grantAdmin start', {
+      conversationId: group.idStr,
+      actorPubkey,
+      targetPubkey: normalizedTargetPubkey,
+      currentAdminCount: currentAdminPubkeys.length,
+      nextAdminCount: nextAdminPubkeys.length
+    })
+
+    await group.commit({
+      extraProposals: [
+        Proposals.proposeUpdateMetadata({
+          adminPubkeys: nextAdminPubkeys
+        })
+      ]
+    })
+
+    this.groupsById.set(group.idStr, group)
+    this.schedulePersist()
+    await this.emitConversationUpdated(group.idStr, 'grant-admin')
+
+    return {
+      conversationId: group.idStr,
+      promotedPubkey: normalizedTargetPubkey,
+      alreadyAdmin: false,
       conversation: this.buildConversationSummary(group)
     }
   }
@@ -2405,6 +2497,10 @@ export class MarmotService {
 
       case 'marmot-invite-members': {
         return await this.inviteMembers(payload.conversationId, payload.members || payload.memberPubkeys || [])
+      }
+
+      case 'marmot-grant-admin': {
+        return await this.grantAdmin(payload.conversationId, payload.targetPubkey || payload.pubkey)
       }
 
       case 'marmot-accept-invite': {

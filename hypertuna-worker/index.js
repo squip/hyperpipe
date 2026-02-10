@@ -3392,6 +3392,9 @@ function summarizeMarmotCommandPayload(type, payload = {}) {
   if (typeof data.relayMode === 'string') summary.relayMode = data.relayMode
   if (typeof data.search === 'string') summary.searchLength = data.search.length
   if (typeof data.conversationId === 'string') summary.conversationId = previewValue(data.conversationId, 20)
+  if (typeof data.targetPubkey === 'string' || typeof data.pubkey === 'string') {
+    summary.targetPubkey = previewValue(data.targetPubkey || data.pubkey, 20)
+  }
   if (typeof data.inviteId === 'string' || typeof data.id === 'string') {
     summary.inviteId = previewValue(data.inviteId || data.id, 20)
   }
@@ -3419,6 +3422,12 @@ function summarizeMarmotCommandResult(type, result = {}) {
   if (Number.isFinite(data.unreadCount)) summary.unreadCount = Number(data.unreadCount)
   if (type === 'marmot-send-message' || type === 'marmot-send-media-message') {
     summary.hasMessage = !!data?.message
+  }
+  if (typeof data.promotedPubkey === 'string') {
+    summary.promotedPubkey = previewValue(data.promotedPubkey, 20)
+  }
+  if (typeof data.alreadyAdmin === 'boolean') {
+    summary.alreadyAdmin = data.alreadyAdmin
   }
   if (Array.isArray(data.failed) && data.failed.length > 0) {
     const firstFailure = data.failed[0] && typeof data.failed[0] === 'object' ? data.failed[0] : null
@@ -4739,6 +4748,7 @@ async function handleMessageObject(message) {
     case 'marmot-list-invites':
     case 'marmot-create-conversation':
     case 'marmot-invite-members':
+    case 'marmot-grant-admin':
     case 'marmot-accept-invite':
     case 'marmot-load-thread':
     case 'marmot-send-message':

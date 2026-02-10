@@ -81,6 +81,7 @@ type MessengerContextType = {
   unsupportedReason?: string
   createConversation: (input: CreateConversationInput) => Promise<CreateConversationResult>
   inviteMembers: (conversationId: string, members: string[]) => Promise<void>
+  grantConversationAdmin: (conversationId: string, targetPubkey: string) => Promise<void>
   acceptInvite: (inviteId: string) => Promise<{ conversationId: string | null }>
   refreshConversations: (query?: ConversationQuery) => Promise<ConversationSummary[]>
   refreshInvites: (query?: ConversationQuery) => Promise<ConversationInvite[]>
@@ -150,6 +151,23 @@ function mergeMessages(existing: ThreadMessage[], incoming: ThreadMessage[]) {
   })
 }
 
+function normalizePubkeyList(values: unknown): string[] {
+  if (!Array.isArray(values)) return []
+  return Array.from(
+    new Set(
+      values
+        .map((value) => (typeof value === 'string' ? value.trim().toLowerCase() : ''))
+        .filter((value) => Boolean(value))
+    )
+  )
+}
+
+function sameStringSet(left: string[], right: string[]) {
+  if (left.length !== right.length) return false
+  const rightSet = new Set(right)
+  return left.every((value) => rightSet.has(value))
+}
+
 function parseConversations(payload: any): ConversationSummary[] {
   if (!Array.isArray(payload)) return []
   return payload
@@ -158,12 +176,16 @@ function parseConversations(payload: any): ConversationSummary[] {
       id: row.id,
       protocol: 'marmot' as const,
       participants: Array.isArray(row.participants) ? row.participants : [],
+      adminPubkeys: normalizePubkeyList(row.adminPubkeys),
+      canInviteMembers: Boolean(row.canInviteMembers),
       title: typeof row.title === 'string' && row.title ? row.title : 'Conversation',
       description: typeof row.description === 'string' ? row.description : null,
       imageUrl: typeof row.imageUrl === 'string' ? row.imageUrl : null,
       unreadCount: Number.isFinite(row.unreadCount) ? Number(row.unreadCount) : 0,
       lastMessageAt: Number.isFinite(row.lastMessageAt) ? Number(row.lastMessageAt) : 0,
       lastMessageId: typeof row.lastMessageId === 'string' ? row.lastMessageId : null,
+      lastMessageSenderPubkey:
+        typeof row.lastMessageSenderPubkey === 'string' ? row.lastMessageSenderPubkey : null,
       lastMessagePreview:
         typeof row.lastMessagePreview === 'string' ? row.lastMessagePreview : null,
       lastReadAt: Number.isFinite(row.lastReadAt) ? Number(row.lastReadAt) : 0,
@@ -427,9 +449,12 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       if (
         existing
         && existing.lastMessageAt === conversation.lastMessageAt
+        && existing.lastMessageSenderPubkey === conversation.lastMessageSenderPubkey
         && existing.unreadCount === conversation.unreadCount
         && existing.lastReadAt === conversation.lastReadAt
         && existing.lastReadMessageId === conversation.lastReadMessageId
+        && existing.canInviteMembers === conversation.canInviteMembers
+        && sameStringSet(existing.adminPubkeys || [], conversation.adminPubkeys || [])
         && existing.title === conversation.title
         && existing.description === conversation.description
         && existing.imageUrl === conversation.imageUrl
@@ -656,6 +681,24 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
         members
       }
     })
+    await refreshConversations()
+  }
+
+  const grantConversationAdmin = async (conversationId: string, targetPubkey: string) => {
+    const data = await sendToWorkerAwait({
+      type: 'marmot-grant-admin',
+      data: {
+        conversationId,
+        targetPubkey
+      }
+    })
+
+    const conversation = parseConversations(data?.conversation ? [data.conversation] : [])[0]
+    if (conversation) {
+      applyConversationUpdate(conversation)
+      emitEvent({ type: 'conversation-updated', conversation })
+    }
+
     await refreshConversations()
   }
 
@@ -1043,6 +1086,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       unsupportedReason,
       createConversation,
       inviteMembers,
+      grantConversationAdmin,
       acceptInvite,
       refreshConversations,
       refreshInvites,
@@ -1065,6 +1109,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       unsupportedReason,
       createConversation,
       inviteMembers,
+      grantConversationAdmin,
       acceptInvite,
       refreshConversations,
       refreshInvites,

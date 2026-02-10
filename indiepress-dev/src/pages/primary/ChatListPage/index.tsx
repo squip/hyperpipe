@@ -1,10 +1,9 @@
-import HideUntrustedContentButton from '@/components/HideUntrustedContentButton'
 import UserAvatar, { SimpleUserAvatar } from '@/components/UserAvatar'
 import { FormattedTimestamp } from '@/components/FormattedTimestamp'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
 import PostRelaySelector, { type RelayDisplayMeta } from '@/components/PostEditor/PostRelaySelector'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
-import { Check, Loader2, MessageSquare, Plus, Search, UserPlus, Users, X } from 'lucide-react'
+import { Check, Loader2, MessageSquare, Search, UserPlus, Users, X } from 'lucide-react'
 import { forwardRef, type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useMessenger } from '@/providers/MessengerProvider'
@@ -396,7 +395,7 @@ const ChatListPage = forwardRef<
     <PrimaryPageLayout
       ref={ref}
       pageName="conversations"
-      titlebar={<ChatListPageTitlebar onNew={() => setOpenNew(true)} />}
+      titlebar={<ChatListPageTitlebar />}
       displayScrollToTopButton
     >
       <div className="space-y-4 p-4">
@@ -532,7 +531,7 @@ const ChatListPage = forwardRef<
 ChatListPage.displayName = 'ChatListPage'
 export default ChatListPage
 
-function ChatListPageTitlebar({ onNew }: { onNew: () => void }) {
+function ChatListPageTitlebar() {
   const { t } = useTranslation()
 
   return (
@@ -540,12 +539,6 @@ function ChatListPageTitlebar({ onNew }: { onNew: () => void }) {
       <div className="flex items-center gap-2">
         <MessageSquare />
         <div className="text-lg font-semibold">{t('Chat')}</div>
-      </div>
-      <div className="flex items-center gap-1">
-        <Button variant="ghost" size="titlebar-icon" onClick={onNew} aria-label={t('New chat')}>
-          <Plus />
-        </Button>
-        <HideUntrustedContentButton type="notifications" size="titlebar-icon" />
       </div>
     </div>
   )

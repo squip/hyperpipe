@@ -1,9 +1,10 @@
 import { useMemo } from 'react'
 import { useMessenger } from '@/providers/MessengerProvider'
 import type { ConversationSummary } from '@/lib/conversations/types'
-import UserAvatar from '@/components/UserAvatar'
+import UserAvatar, { SimpleUserAvatar } from '@/components/UserAvatar'
 import { Users } from 'lucide-react'
 import { FormattedTimestamp } from '@/components/FormattedTimestamp'
+import { useFetchProfile } from '@/hooks'
 
 function deriveDisplayName(meta: ConversationSummary, myPubkey: string | null): string {
   if (meta.title) return meta.title
@@ -11,6 +12,12 @@ function deriveDisplayName(meta: ConversationSummary, myPubkey: string | null): 
   if (others.length === 0) return 'Me'
   if (others.length === 1) return others[0]
   return `${others[0]} +${others.length - 1}`
+}
+
+function shortPubkey(pubkey: string): string {
+  const normalized = String(pubkey || '').trim()
+  if (!normalized) return ''
+  return `${normalized.slice(0, 8)}…${normalized.slice(-6)}`
 }
 
 export function ChatListPanel({
@@ -72,10 +79,39 @@ function ConversationListItem({
   )
 
   const title = deriveDisplayName(meta, myPubkey)
+  const compactMemberCount = useMemo(
+    () => new Intl.NumberFormat(undefined, { notation: 'compact' }),
+    []
+  )
+  const facepileMembers = useMemo(
+    () => meta.participants.slice(0, 3),
+    [meta.participants]
+  )
+  const normalizedSenderPubkey = useMemo(
+    () => String(meta.lastMessageSenderPubkey || '').trim().toLowerCase(),
+    [meta.lastMessageSenderPubkey]
+  )
+  const normalizedMyPubkey = useMemo(
+    () => String(myPubkey || '').trim().toLowerCase(),
+    [myPubkey]
+  )
+  const { profile: senderProfile } = useFetchProfile(normalizedSenderPubkey || undefined)
+  const messagePreview = meta.lastMessagePreview || 'No messages yet.'
+  const senderLabel = useMemo(() => {
+    if (!normalizedSenderPubkey || !meta.lastMessagePreview) return null
+    if (normalizedSenderPubkey === normalizedMyPubkey) return 'You'
+    return (
+      senderProfile?.shortName
+      || senderProfile?.metadata?.display_name
+      || senderProfile?.metadata?.name
+      || shortPubkey(normalizedSenderPubkey)
+    )
+  }, [meta.lastMessagePreview, normalizedMyPubkey, normalizedSenderPubkey, senderProfile])
+  const messagePreviewLabel = senderLabel ? `${senderLabel}: ${messagePreview}` : messagePreview
 
   return (
     <div
-      className="clickable flex items-start gap-3 cursor-pointer px-4 py-3 border-b"
+      className="clickable flex items-center gap-3 cursor-pointer px-4 py-3 border-b"
       onClick={() => onOpenConversation(meta.id)}
     >
       <div className="flex items-center justify-center mt-1.5">
@@ -95,31 +131,48 @@ function ConversationListItem({
       </div>
 
       <div className="flex-1 w-0 min-w-0">
-        <div className="flex items-center justify-between gap-2">
-          <div className="font-semibold truncate">{title}</div>
-          {meta.lastMessageAt > 0 && (
-            <FormattedTimestamp
-              timestamp={meta.lastMessageAt}
-              className="text-muted-foreground text-xs shrink-0"
-              short
-            />
-          )}
-        </div>
-        <div className="text-xs text-muted-foreground truncate">
-          {others.length > 1 ? `${others.length} participants` : null}
-        </div>
-        <div className="line-clamp-1 text-sm text-muted-foreground">
-          {meta.lastMessagePreview || 'No messages yet.'}
+        <div className="font-semibold truncate">{title}</div>
+        <div className="mt-1 line-clamp-1 text-sm text-muted-foreground">
+          {messagePreviewLabel}
+          {meta.lastMessageAt > 0 ? (
+            <>
+              <span className="mx-1">•</span>
+              <FormattedTimestamp
+                timestamp={meta.lastMessageAt}
+                className="text-muted-foreground text-sm"
+                short
+              />
+            </>
+          ) : null}
         </div>
       </div>
 
-      {meta.unreadCount > 0 && (
-        <div className="self-center shrink-0">
+      <div className="shrink-0 flex items-center gap-2">
+        <div className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-1">
+          <div className="flex -space-x-2">
+            {facepileMembers.map((participant) => (
+              <div
+                key={`${meta.id}:${participant}`}
+                className="h-5 w-5 overflow-hidden rounded-full bg-muted ring-2 ring-background"
+              >
+                <SimpleUserAvatar
+                  userId={participant}
+                  size="small"
+                  className="h-full w-full rounded-full"
+                />
+              </div>
+            ))}
+          </div>
+          <span className="text-xs font-medium">
+            {compactMemberCount.format(meta.participants.length)}
+          </span>
+        </div>
+        {meta.unreadCount > 0 && (
           <span className="text-xs bg-primary text-primary-foreground px-2 py-0.5 rounded-full">
             {meta.unreadCount}
           </span>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   )
 }
