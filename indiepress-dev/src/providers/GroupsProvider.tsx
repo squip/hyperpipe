@@ -1915,6 +1915,22 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         : provisionalMetadata
       let admins = adminsEvt ? parseGroupAdminsEvent(adminsEvt) : []
 
+      // Persist authoritative metadata so My Groups rows can render name/about/avatar
+      // even when initial row fetch happened before relay tokenization completed.
+      if (metadataEvt && metadata) {
+        upsertProvisionalGroupMetadata({
+          groupId,
+          relay: resolved || targetRelay || undefined,
+          name: metadata.name,
+          about: metadata.about,
+          picture: metadata.picture,
+          isPublic: metadata.isPublic,
+          isOpen: metadata.isOpen,
+          createdAt: metadata.event?.created_at,
+          source: 'update'
+        })
+      }
+
       const shouldInjectCreatorAdmin = isCreator && pubkey && admins.length === 0
       if (shouldInjectCreatorAdmin) {
         const relayForBootstrap = resolved || targetRelay || null
@@ -2066,7 +2082,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       getRelayEntryForGroup,
       myGroupList,
       pubkey,
-      resolveRelayUrl
+      resolveRelayUrl,
+      upsertProvisionalGroupMetadata
     ]
   )
 
@@ -2320,10 +2337,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         force: true,
         reason: 'worker-relay-tokenized-update'
       }).catch(() => {})
+      fetchGroupDetail(entry.groupId, resolvedRelay, { preferRelay: true }).catch(() => {})
     })
 
     tokenizedPreviewRefreshByGroupRef.current = nextByGroup
   }, [
+    fetchGroupDetail,
     invalidateGroupMemberPreview,
     myGroupList,
     pubkey,
