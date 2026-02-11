@@ -10,6 +10,8 @@ import {
   TJoinRequest
 } from '@/types/groups'
 
+export const PRIVATE_GROUP_LEAVE_SHADOW_NAMESPACE = 'ht-private-leave:v1'
+
 export function parseGroupIdentifier(rawId: string): TGroupIdentifier {
   if (rawId.includes("'")) {
     const [relay, groupId] = rawId.split("'")
@@ -99,11 +101,7 @@ export function resolveGroupMembersFromSnapshotAndOps(args: {
   snapshotCreatedAt?: number | null
   membershipEvents?: Event[]
 }): string[] {
-  const {
-    snapshotMembers = [],
-    snapshotCreatedAt = null,
-    membershipEvents = []
-  } = args
+  const { snapshotMembers = [], snapshotCreatedAt = null, membershipEvents = [] } = args
 
   const stateByPubkey = new Map<string, MembershipState>()
   const snapshotTs = Number.isFinite(snapshotCreatedAt as number)
@@ -251,4 +249,32 @@ export function deriveMembershipStatus(
   }
 
   return 'not-member'
+}
+
+export async function buildPrivateGroupLeaveShadowRef(args: {
+  groupId: string
+  relayKey?: string | null
+  publicIdentifier?: string | null
+}): Promise<string | null> {
+  const groupId = String(args.groupId || '').trim()
+  if (!groupId) return null
+
+  const relayKey = typeof args.relayKey === 'string' ? args.relayKey.trim().toLowerCase() : ''
+  const publicIdentifier =
+    typeof args.publicIdentifier === 'string' ? args.publicIdentifier.trim() : ''
+  const privacySalt = relayKey || publicIdentifier || groupId
+  const payload = `${PRIVATE_GROUP_LEAVE_SHADOW_NAMESPACE}:${privacySalt}:${groupId}`
+
+  const subtle = globalThis?.crypto?.subtle
+  if (!subtle) return null
+
+  try {
+    const bytes = new TextEncoder().encode(payload)
+    const digest = await subtle.digest('SHA-256', bytes)
+    return Array.from(new Uint8Array(digest))
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('')
+  } catch (_err) {
+    return null
+  }
 }

@@ -34,6 +34,9 @@ export type ArchivedGroupFilesEntry = {
 export type GroupLeavePublishRetryEntry = {
   groupId: string
   relay?: string
+  relayKey?: string | null
+  publicIdentifier?: string | null
+  isPublicGroup?: boolean
   needs9022: boolean
   needs10009: boolean
   attempts: number
@@ -243,7 +246,9 @@ class LocalStorageService {
       }
     }
 
-    const archivedGroupFilesStr = window.localStorage.getItem(StorageKey.GROUP_FILES_ARCHIVED_GROUPS)
+    const archivedGroupFilesStr = window.localStorage.getItem(
+      StorageKey.GROUP_FILES_ARCHIVED_GROUPS
+    )
     if (archivedGroupFilesStr) {
       try {
         const parsed = JSON.parse(archivedGroupFilesStr)
@@ -271,7 +276,9 @@ class LocalStorageService {
     if (dismissedGroupAdminLeaveEventsStr) {
       try {
         const parsed = JSON.parse(dismissedGroupAdminLeaveEventsStr)
-        this.dismissedGroupAdminLeaveEventsMap = Array.isArray(parsed) ? { _global: parsed } : parsed
+        this.dismissedGroupAdminLeaveEventsMap = Array.isArray(parsed)
+          ? { _global: parsed }
+          : parsed
       } catch {
         this.dismissedGroupAdminLeaveEventsMap = {}
       }
@@ -786,7 +793,11 @@ class LocalStorageService {
     )
   }
 
-  removeGroupLeavePublishRetryEntry(groupId: string, relay?: string | null, pubkey?: string | null) {
+  removeGroupLeavePublishRetryEntry(
+    groupId: string,
+    relay?: string | null,
+    pubkey?: string | null
+  ) {
     const key = pubkey || '_global'
     const current = this.groupLeavePublishRetryQueueMap[key] || []
     this.groupLeavePublishRetryQueueMap[key] = current.filter((entry) => {

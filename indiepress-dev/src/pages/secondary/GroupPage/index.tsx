@@ -28,7 +28,7 @@ import Username from '@/components/Username'
 import NormalFeed from '@/components/NormalFeed'
 import GroupFilesList from '@/components/GroupFilesList'
 import { BIG_RELAY_URLS } from '@/constants'
-import { parseGroupIdentifier } from '@/lib/groups'
+import { buildPrivateGroupLeaveShadowRef, parseGroupIdentifier } from '@/lib/groups'
 import { getBaseRelayUrl } from '@/lib/hypertuna-group-events'
 import client from '@/services/client.service'
 import relayMembershipService from '@/services/relay-membership.service'
@@ -38,12 +38,7 @@ import { useNostr } from '@/providers/NostrProvider'
 import { isElectron } from '@/lib/platform'
 import PostEditor from '@/components/PostEditor'
 import GroupMetadataEditor, { TGroupMetadataForm } from '@/components/GroupMetadataEditor'
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle
-} from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
   DropdownMenu,
@@ -196,10 +191,10 @@ function MemberRowComponent({
   const actionsDisabled = isSelf
   const selfProfile =
     isSelf && pubkey
-      ? (nostrProfile || {
+      ? nostrProfile || {
           pubkey,
           metadata: { picture: generateImageByPubkey(pubkey) }
-        })
+        }
       : null
 
   return (
@@ -299,7 +294,14 @@ type JoinRequestRowProps = {
   t: (key: string, opts?: any) => string
 }
 
-function JoinRequestRow({ request, onApprove, onReject, approving, rejecting, t }: JoinRequestRowProps) {
+function JoinRequestRow({
+  request,
+  onApprove,
+  onReject,
+  approving,
+  rejecting,
+  t
+}: JoinRequestRowProps) {
   return (
     <div className="flex items-center gap-3 px-4 py-3 rounded-lg border border-transparent hover:border-border hover:bg-accent/30">
       <UserAvatar userId={request.pubkey} className="shrink-0" />
@@ -416,17 +418,26 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const [isLeavingGroup, setIsLeavingGroup] = useState(false)
   const [leaveSaveRelaySnapshot, setLeaveSaveRelaySnapshot] = useState(true)
   const [leaveSaveSharedFiles, setLeaveSaveSharedFiles] = useState(true)
-  const [adminLeaveNotice, setAdminLeaveNotice] = useState<{ eventId: string; pubkey: string } | null>(null)
+  const [adminLeaveNotice, setAdminLeaveNotice] = useState<{
+    eventId: string
+    pubkey: string
+  } | null>(null)
   const [copiedRelayUrl, setCopiedRelayUrl] = useState(false)
   const [memberSearch, setMemberSearch] = useState('')
   const [isInviteDialogOpen, setIsInviteDialogOpen] = useState(false)
   const [inviteSearch, setInviteSearch] = useState('')
   const [selectedInvitees, setSelectedInvitees] = useState<string[]>([])
   const [reportTarget, setReportTarget] = useState<string | null>(null)
-  const [joinRequestAction, setJoinRequestAction] = useState<{ pubkey: string; action: 'approve' | 'reject' } | null>(null)
+  const [joinRequestAction, setJoinRequestAction] = useState<{
+    pubkey: string
+    action: 'approve' | 'reject'
+  } | null>(null)
   const [joinRelayRefreshNonce, setJoinRelayRefreshNonce] = useState(0)
   const [closedJoinRequestPending, setClosedJoinRequestPending] = useState(false)
-  const { profiles: inviteProfiles, isFetching: isSearchingInvites } = useSearchProfiles(inviteSearch, 8)
+  const { profiles: inviteProfiles, isFetching: isSearchingInvites } = useSearchProfiles(
+    inviteSearch,
+    8
+  )
   const { mutePrivately, mutePublicly } = useMuteList()
   const reportEvent = useMemo(() => {
     if (!reportTarget) return null
@@ -469,9 +480,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           ? publicIdentifier.trim()
           : null
       const normalizedRelayKey =
-        typeof relayKey === 'string' && relayKey.trim()
-          ? relayKey.trim()
-          : null
+        typeof relayKey === 'string' && relayKey.trim() ? relayKey.trim() : null
       if (!normalizedPublicIdentifier && !normalizedRelayKey) return false
       if (!relayServerReady) return false
 
@@ -530,15 +539,13 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     () => (groupId ? getProvisionalGroupMetadata(groupId, effectiveGroupRelay) : null),
     [effectiveGroupRelay, getProvisionalGroupMetadata, groupId]
   )
-  const fallbackMeta = useMemo(
-    () => {
-      const discoveryMeta = discoveryGroups.find(
-        (g) => g.id === groupId && (!effectiveGroupRelay || !g.relay || g.relay === effectiveGroupRelay)
-      )
-      return discoveryMeta || provisionalMeta || undefined
-    },
-    [discoveryGroups, effectiveGroupRelay, groupId, provisionalMeta]
-  )
+  const fallbackMeta = useMemo(() => {
+    const discoveryMeta = discoveryGroups.find(
+      (g) =>
+        g.id === groupId && (!effectiveGroupRelay || !g.relay || g.relay === effectiveGroupRelay)
+    )
+    return discoveryMeta || provisionalMeta || undefined
+  }, [discoveryGroups, effectiveGroupRelay, groupId, provisionalMeta])
 
   useEffect(() => {
     const searchRelay =
@@ -587,15 +594,21 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           const prevMetadata = prev?.metadata
           const prevMetaTsCached = prevMetadata?.event?.created_at || 0
           const nextMetaTs = next?.metadata?.event?.created_at || 0
-          if (isSameGroup && prevMetadata && prevMetaTsCached > 0 && nextMetaTs > 0 && nextMetaTs < prevMetaTsCached) {
+          if (
+            isSameGroup &&
+            prevMetadata &&
+            prevMetaTsCached > 0 &&
+            nextMetaTs > 0 &&
+            nextMetaTs < prevMetaTsCached
+          ) {
             next.metadata = prevMetadata
           }
-          const metaCandidates = [
-            next.metadata,
-            prevMetadata,
-            fallbackMeta
-          ].filter(Boolean) as typeof next.metadata[]
-          const bestMeta = metaCandidates.sort((a, b) => (b?.event?.created_at || 0) - (a?.event?.created_at || 0))[0]
+          const metaCandidates = [next.metadata, prevMetadata, fallbackMeta].filter(
+            Boolean
+          ) as (typeof next.metadata)[]
+          const bestMeta = metaCandidates.sort(
+            (a, b) => (b?.event?.created_at || 0) - (a?.event?.created_at || 0)
+          )[0]
           if (bestMeta) {
             const pictureFromBestOrFallback =
               bestMeta.picture || metaCandidates.find((m) => m?.picture)?.picture
@@ -619,7 +632,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           if ((!next.admins || !next.admins.length) && isSameGroup && prev?.admins?.length) {
             next.admins = prev.admins
           }
-          if ((!next.members || !next.members.length) && isSameGroup && normalizedPrevMembers?.length) {
+          if (
+            (!next.members || !next.members.length) &&
+            isSameGroup &&
+            normalizedPrevMembers?.length
+          ) {
             next.members = normalizedPrevMembers
           }
           const nextMembers = normalizeMembers(next.members)
@@ -660,7 +677,10 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           const nextComparableMembers = normalizeComparablePubkeys(normalizeMembers(next.members))
           const prevComparableAdmins = normalizeComparablePubkeys(normalizeAdmins(prev?.admins))
           const nextComparableAdmins = normalizeComparablePubkeys(normalizeAdmins(next.admins))
-          const sameMembers = areComparablePubkeysEqual(prevComparableMembers, nextComparableMembers)
+          const sameMembers = areComparablePubkeysEqual(
+            prevComparableMembers,
+            nextComparableMembers
+          )
           const sameAdmins = areComparablePubkeysEqual(prevComparableAdmins, nextComparableAdmins)
           const sameMembership =
             (prev?.membershipStatus || 'not-member') === (next.membershipStatus || 'not-member') &&
@@ -701,7 +721,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const inviteData = useMemo(() => {
     return invites.find(
       (inv) =>
-        inv.groupId === groupId && (!effectiveGroupRelay || !inv.relay || inv.relay === effectiveGroupRelay)
+        inv.groupId === groupId &&
+        (!effectiveGroupRelay || !inv.relay || inv.relay === effectiveGroupRelay)
     )
   }, [invites, groupId, effectiveGroupRelay])
   const inviteToken = inviteData?.token
@@ -801,10 +822,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     workerRelayEntryForGroup?.connectionUrl
   const shouldWaitForAuthRelay = Boolean(groupId && relayRequiresAuth && !relayHasAuthToken)
   const shouldWaitForLocalRelayReady = Boolean(
-    groupId &&
-    isElectron() &&
-    isLocalRelayProxyUrl(relayCandidateForGating) &&
-    !relayServerReady
+    groupId && isElectron() && isLocalRelayProxyUrl(relayCandidateForGating) && !relayServerReady
   )
   const publishReadyRelay =
     shouldWaitForAuthRelay || shouldWaitForLocalRelayReady
@@ -862,11 +880,9 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
 
   const shouldGateGroupSubRequests = Boolean(
     groupId &&
-    (
-      shouldWaitForAuthRelay ||
-      shouldWaitForLocalRelayReady ||
-      (!activeGroupRelay && BIG_RELAY_URLS.length === 0)
-    )
+      (shouldWaitForAuthRelay ||
+        shouldWaitForLocalRelayReady ||
+        (!activeGroupRelay && BIG_RELAY_URLS.length === 0))
   )
 
   const groupSubRequests = useMemo(
@@ -877,9 +893,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           : [
               {
                 source: 'relays' as const,
-                urls: activeGroupRelay
-                  ? [activeGroupRelay]
-                  : BIG_RELAY_URLS,
+                urls: activeGroupRelay ? [activeGroupRelay] : BIG_RELAY_URLS,
                 filter: {
                   '#h': [groupId],
                   kinds: [
@@ -905,9 +919,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           : [
               {
                 source: 'relays' as const,
-                urls: activeGroupRelay
-                  ? [activeGroupRelay]
-                  : BIG_RELAY_URLS,
+                urls: activeGroupRelay ? [activeGroupRelay] : BIG_RELAY_URLS,
                 filter: {
                   '#h': [groupId],
                   kinds: [1063]
@@ -931,7 +943,9 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     client
       .loadMoreTimeline(groupSubRequests, {
         '#h': [groupId],
-        kinds: [9000, 9001, 1, 6, 20, 21, 22, 1063, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089],
+        kinds: [
+          9000, 9001, 1, 6, 20, 21, 22, 1063, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089
+        ],
         limit: 1
       })
       .then((_events) => {
@@ -1022,11 +1036,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       if (isOpenGroup === false && !inviteToken) {
         if (membershipStatus !== 'pending' && !closedJoinRequestPending) {
           await sendJoinRequest(groupId, effectiveGroupRelay)
-          setDetail((prev) =>
-            prev
-              ? { ...prev, membershipStatus: 'pending' }
-              : prev
-          )
+          setDetail((prev) => (prev ? { ...prev, membershipStatus: 'pending' } : prev))
           markClosedJoinRequestPending()
         }
         return
@@ -1059,11 +1069,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       }
 
       await sendJoinRequest(groupId, effectiveGroupRelay, inviteToken)
-      setDetail((prev) =>
-        prev
-          ? { ...prev, membershipStatus: 'pending' }
-          : prev
-      )
+      setDetail((prev) => (prev ? { ...prev, membershipStatus: 'pending' } : prev))
     } catch (err) {
       setError((err as Error).message)
     }
@@ -1240,7 +1246,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       try {
         const decoded = nip19.decode(m)
         if (decoded.type === 'npub') return decoded.data as string
-        if (decoded.type === 'nprofile' && typeof decoded.data === 'object' && 'pubkey' in decoded.data) {
+        if (
+          decoded.type === 'nprofile' &&
+          typeof decoded.data === 'object' &&
+          'pubkey' in decoded.data
+        ) {
           return (decoded.data as any).pubkey as string
         }
       } catch {
@@ -1255,7 +1265,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
     ]
     const members = Array.from(
-      new Set((parsed?.length ? parsed : defaultMembers).map(normalizeMockMember).filter((m) => !!m && m.length > 10))
+      new Set(
+        (parsed?.length ? parsed : defaultMembers)
+          .map(normalizeMockMember)
+          .filter((m) => !!m && m.length > 10)
+      )
     )
     const admins = members[1] ? [{ pubkey: members[1] }] : []
     return { members, admins }
@@ -1317,11 +1331,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   )
 
   const isAdmin =
-    !!pubkey &&
-    (isCreator || !!effectiveDetail?.admins?.some((admin) => admin.pubkey === pubkey))
+    !!pubkey && (isCreator || !!effectiveDetail?.admins?.some((admin) => admin.pubkey === pubkey))
 
   const adminLeaveCandidatePubkeys = useMemo(() => {
-    const pubkeys = normalizePubkeyList((effectiveDetail?.admins || []).map((admin) => admin.pubkey))
+    const pubkeys = normalizePubkeyList(
+      (effectiveDetail?.admins || []).map((admin) => admin.pubkey)
+    )
     if (effectiveDetail?.metadata?.event?.pubkey) {
       pubkeys.push(effectiveDetail.metadata.event.pubkey)
     }
@@ -1330,9 +1345,19 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
 
   const adminLeaveFetchKey = useMemo(() => {
     if (!groupId || !isMember || adminLeaveCandidatePubkeys.length === 0) return null
-    const relayUrls = activeGroupRelay ? [activeGroupRelay] : BIG_RELAY_URLS
-    return `${groupId}|${relayUrls.join(',')}|${adminLeaveCandidatePubkeys.join(',')}|${pubkey || ''}`
-  }, [activeGroupRelay, adminLeaveCandidatePubkeys, groupId, isMember, pubkey])
+    const relayUrls = Array.from(
+      new Set([...(activeGroupRelay ? [activeGroupRelay] : []), ...BIG_RELAY_URLS])
+    )
+    return `${groupId}|${relayUrls.join(',')}|${adminLeaveCandidatePubkeys.join(',')}|${workerRelayEntryForGroup?.relayKey || ''}|${workerRelayEntryForGroup?.publicIdentifier || ''}|${pubkey || ''}`
+  }, [
+    activeGroupRelay,
+    adminLeaveCandidatePubkeys,
+    groupId,
+    isMember,
+    pubkey,
+    workerRelayEntryForGroup?.publicIdentifier,
+    workerRelayEntryForGroup?.relayKey
+  ])
 
   useEffect(() => {
     if (!groupId || !isMember) return
@@ -1346,33 +1371,66 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
 
     let cancelled = false
     const adminPubkeys = new Set(adminLeaveCandidatePubkeys)
-    const relayUrls = activeGroupRelay ? [activeGroupRelay] : BIG_RELAY_URLS
-    client
-      .fetchEvents(relayUrls, {
-        kinds: [9022],
-        '#h': [groupId],
-        limit: 200
+    const relayUrls = Array.from(
+      new Set([...(activeGroupRelay ? [activeGroupRelay] : []), ...BIG_RELAY_URLS])
+    )
+    ;(async () => {
+      const shadowRef = await buildPrivateGroupLeaveShadowRef({
+        groupId,
+        relayKey: workerRelayEntryForGroup?.relayKey || null,
+        publicIdentifier: workerRelayEntryForGroup?.publicIdentifier || groupId
       })
-      .then((events) => {
-        if (cancelled) return
-        const latestAdminLeave = events
-          .filter((event) => adminPubkeys.has(event.pubkey))
-          .sort((a, b) => b.created_at - a.created_at)[0]
-        if (!latestAdminLeave) return
-        if (latestAdminLeave.pubkey === pubkey) return
-        const eventKey = `${groupId}:${latestAdminLeave.id}`
-        if (localStorageService.isGroupAdminLeaveEventDismissed(eventKey, pubkey)) return
-        setAdminLeaveNotice({
-          eventId: latestAdminLeave.id,
-          pubkey: latestAdminLeave.pubkey
+      const leaveFilters: Array<{ '#h': string[]; kinds: number[]; limit: number }> = [
+        {
+          kinds: [9022],
+          '#h': [groupId],
+          limit: 200
+        }
+      ]
+      if (shadowRef) {
+        leaveFilters.push({
+          kinds: [9022],
+          '#h': [shadowRef],
+          limit: 200
         })
+      }
+      const batches = await Promise.all(
+        leaveFilters.map((filter) => client.fetchEvents(relayUrls, filter).catch(() => []))
+      )
+      const seenIds = new Set<string>()
+      const events = batches.flat().filter((event) => {
+        if (!event?.id) return true
+        if (seenIds.has(event.id)) return false
+        seenIds.add(event.id)
+        return true
       })
-      .catch(() => {})
+      if (cancelled) return
+      const latestAdminLeave = events
+        .filter((event) => adminPubkeys.has(event.pubkey))
+        .sort((a, b) => b.created_at - a.created_at)[0]
+      if (!latestAdminLeave) return
+      if (latestAdminLeave.pubkey === pubkey) return
+      const eventKey = `${groupId}:${latestAdminLeave.id}`
+      if (localStorageService.isGroupAdminLeaveEventDismissed(eventKey, pubkey)) return
+      setAdminLeaveNotice({
+        eventId: latestAdminLeave.id,
+        pubkey: latestAdminLeave.pubkey
+      })
+    })().catch(() => {})
 
     return () => {
       cancelled = true
     }
-  }, [activeGroupRelay, adminLeaveCandidatePubkeys, adminLeaveFetchKey, groupId, isMember, pubkey])
+  }, [
+    activeGroupRelay,
+    adminLeaveCandidatePubkeys,
+    adminLeaveFetchKey,
+    groupId,
+    isMember,
+    pubkey,
+    workerRelayEntryForGroup?.publicIdentifier,
+    workerRelayEntryForGroup?.relayKey
+  ])
 
   const groupMemberPreview = useMemo(
     () => (groupId ? getGroupMemberPreview(groupId, effectiveGroupRelay) : null),
@@ -1454,7 +1512,13 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     })
     if (!requested) return
     lastRouteSubscriptionRefreshRef.current = refreshKey
-  }, [groupId, inviteData?.relayKey, relayKeyForGroup, requestRelaySubscriptionRefresh, sendToWorker])
+  }, [
+    groupId,
+    inviteData?.relayKey,
+    relayKeyForGroup,
+    requestRelaySubscriptionRefresh,
+    sendToWorker
+  ])
 
   useEffect(() => {
     if (process.env.NODE_ENV !== 'development') return
@@ -1494,7 +1558,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const groupPicture = effectiveDetail?.metadata?.picture || fallbackMeta?.picture
   const groupTitle = (
     <span className="inline-flex items-center gap-2 min-w-0">
-     
       <span className="truncate">{groupDisplayName}</span>
     </span>
   )
@@ -1665,8 +1728,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         setDetail((prev) => {
           if (!prev) return prev
           const nextMembers = (prev.members || []).filter((m) => m !== targetPubkey)
-          const nextStatus =
-            targetPubkey === pubkey ? ('removed' as const) : prev.membershipStatus
+          const nextStatus = targetPubkey === pubkey ? ('removed' as const) : prev.membershipStatus
           return { ...prev, members: nextMembers, membershipStatus: nextStatus }
         })
         toast.success(t('Member removed'))
@@ -1727,8 +1789,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         <JoinRequestRow
           key={req.event.id}
           request={req}
-          approving={joinRequestAction?.pubkey === req.pubkey && joinRequestAction.action === 'approve'}
-          rejecting={joinRequestAction?.pubkey === req.pubkey && joinRequestAction.action === 'reject'}
+          approving={
+            joinRequestAction?.pubkey === req.pubkey && joinRequestAction.action === 'approve'
+          }
+          rejecting={
+            joinRequestAction?.pubkey === req.pubkey && joinRequestAction.action === 'reject'
+          }
           onApprove={handleApproveJoinRequest}
           onReject={handleRejectJoinRequest}
           t={t}
@@ -1738,11 +1804,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   )
 
   const content = (
-    <SecondaryPageLayout
-      ref={ref}
-      index={index}
-      title={groupTitle}
-    >
+    <SecondaryPageLayout ref={ref} index={index} title={groupTitle}>
       {isLoading ? (
         <div className="flex items-center justify-center h-64 text-muted-foreground gap-2">
           <Loader2 className="w-4 h-4 animate-spin" />
@@ -1750,7 +1812,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         </div>
       ) : error ? (
         <div className="text-red-500 px-4 py-3">{error}</div>
-      ) : (!effectiveDetail || !groupId) ? (
+      ) : !effectiveDetail || !groupId ? (
         <div className="flex flex-col items-center justify-center h-64 gap-2 text-muted-foreground">
           <Users className="w-6 h-6" />
           {t('Group not found')}
@@ -1825,13 +1887,17 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                           key={memberPubkey}
                           className="inline-flex h-6 w-6 overflow-hidden rounded-full ring-1 ring-background"
                         >
-                          <UserAvatar userId={memberPubkey} size="small" className="h-6 w-6 rounded-full" />
+                          <UserAvatar
+                            userId={memberPubkey}
+                            size="small"
+                            className="h-6 w-6 rounded-full"
+                          />
                         </div>
                       ))}
                     </div>
                     <span className="text-xs font-semibold text-muted-foreground">
-                    {summaryMembers.length}{' '}
-                    {summaryMembers.length === 1 ? t('member') : t('members')}
+                      {summaryMembers.length}{' '}
+                      {summaryMembers.length === 1 ? t('member') : t('members')}
                     </span>
                   </div>
                 </div>
@@ -1840,10 +1906,15 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                 <div className="flex w-max gap-8 pb-2 sm:w-full sm:flex-wrap sm:pb-0">
                   {primaryAdminPubkey && (
                     <div className="space-y-2 w-fit">
-                      <div className="text-sm font-semibold text-muted-foreground">{t('Admin')}</div>
+                      <div className="text-sm font-semibold text-muted-foreground">
+                        {t('Admin')}
+                      </div>
                       <div className="flex gap-2 items-center">
                         <UserAvatar userId={primaryAdminPubkey} size="small" />
-                        <Username userId={primaryAdminPubkey} className="font-semibold text-nowrap" />
+                        <Username
+                          userId={primaryAdminPubkey}
+                          className="font-semibold text-nowrap"
+                        />
                         {additionalAdminCount > 0 && (
                           <span className="text-xs font-semibold text-muted-foreground">
                             +{additionalAdminCount}
@@ -1853,13 +1924,17 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                     </div>
                   )}
                   <div className="space-y-2 w-fit">
-                    <div className="text-sm font-semibold text-muted-foreground">{t('Membership')}</div>
+                    <div className="text-sm font-semibold text-muted-foreground">
+                      {t('Membership')}
+                    </div>
                     <div className="flex items-center">
                       <Badge variant="secondary">{isOpenGroup ? t('Open') : t('Closed')}</Badge>
                     </div>
                   </div>
                   <div className="space-y-2 w-fit">
-                    <div className="text-sm font-semibold text-muted-foreground">{t('Visibility')}</div>
+                    <div className="text-sm font-semibold text-muted-foreground">
+                      {t('Visibility')}
+                    </div>
                     <div className="flex items-center">
                       <Badge variant="secondary">
                         {effectiveDetail.metadata?.isPublic === false ? t('Private') : t('Public')}
@@ -1954,7 +2029,9 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                 <GroupFilesList
                   groupId={groupId}
                   subRequests={groupFileSubRequests}
-                  timelineLabel={groupId ? `f-fetch-events-group-files-${groupId}` : 'f-fetch-events-group-files'}
+                  timelineLabel={
+                    groupId ? `f-fetch-events-group-files-${groupId}` : 'f-fetch-events-group-files'
+                  }
                   onCountChange={setGroupFileCount}
                 />
               </TabsContent>
@@ -2076,41 +2153,41 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                   : null}
               </div>
               {inviteCandidateProfiles.map((profile) => {
-                  const isSelected = selectedInvitees.includes(profile.pubkey)
-                  return (
-                    <div
-                      key={profile.pubkey}
-                      className="flex w-full min-w-0 items-center gap-2 rounded px-2 py-1 transition-colors hover:bg-accent"
-                    >
-                      <UserAvatar userId={profile.pubkey} className="shrink-0" />
-                      <div className="min-w-0 flex-1 overflow-hidden">
-                        <Username
-                          userId={profile.pubkey}
-                          className="block w-full min-w-0 truncate font-semibold"
-                        />
-                        <Nip05 pubkey={profile.pubkey} className="w-full min-w-0" />
-                      </div>
-                      <Button
-                        variant={isSelected ? 'secondary' : 'outline'}
-                        size="sm"
-                        onClick={() => handleInviteToggle(profile.pubkey)}
-                        className="h-8 w-20 shrink-0 px-2"
-                      >
-                        {isSelected ? (
-                          <>
-                            <Check className="w-3 h-3 mr-1" />
-                            {t('Added')}
-                          </>
-                        ) : (
-                          <>
-                            <UserPlus className="w-3 h-3 mr-1" />
-                            {t('Add')}
-                          </>
-                        )}
-                      </Button>
+                const isSelected = selectedInvitees.includes(profile.pubkey)
+                return (
+                  <div
+                    key={profile.pubkey}
+                    className="flex w-full min-w-0 items-center gap-2 rounded px-2 py-1 transition-colors hover:bg-accent"
+                  >
+                    <UserAvatar userId={profile.pubkey} className="shrink-0" />
+                    <div className="min-w-0 flex-1 overflow-hidden">
+                      <Username
+                        userId={profile.pubkey}
+                        className="block w-full min-w-0 truncate font-semibold"
+                      />
+                      <Nip05 pubkey={profile.pubkey} className="w-full min-w-0" />
                     </div>
-                  )
-                })}
+                    <Button
+                      variant={isSelected ? 'secondary' : 'outline'}
+                      size="sm"
+                      onClick={() => handleInviteToggle(profile.pubkey)}
+                      className="h-8 w-20 shrink-0 px-2"
+                    >
+                      {isSelected ? (
+                        <>
+                          <Check className="w-3 h-3 mr-1" />
+                          {t('Added')}
+                        </>
+                      ) : (
+                        <>
+                          <UserPlus className="w-3 h-3 mr-1" />
+                          {t('Add')}
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                )
+              })}
             </div>
             {selectedInvitees.length > 0 && (
               <div className="flex max-h-28 flex-wrap gap-2 overflow-y-auto pr-1">
@@ -2160,7 +2237,10 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           />
         </DialogContent>
       </Dialog>
-      <Dialog open={isLeaveDialogOpen} onOpenChange={(open) => !isLeavingGroup && setIsLeaveDialogOpen(open)}>
+      <Dialog
+        open={isLeaveDialogOpen}
+        onOpenChange={(open) => !isLeavingGroup && setIsLeaveDialogOpen(open)}
+      >
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>Leave group?</DialogTitle>
@@ -2178,7 +2258,10 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                   disabled={isLeavingGroup}
                 />
                 <div className="space-y-1">
-                  <label htmlFor="leave-save-relay-snapshot" className="text-sm font-medium cursor-pointer">
+                  <label
+                    htmlFor="leave-save-relay-snapshot"
+                    className="text-sm font-medium cursor-pointer"
+                  >
                     Save relay database snapshot
                   </label>
                   <p className="text-xs text-muted-foreground">
@@ -2194,7 +2277,10 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                   disabled={isLeavingGroup}
                 />
                 <div className="space-y-1">
-                  <label htmlFor="leave-save-shared-files" className="text-sm font-medium cursor-pointer">
+                  <label
+                    htmlFor="leave-save-shared-files"
+                    className="text-sm font-medium cursor-pointer"
+                  >
                     Save shared files in Files page
                   </label>
                   <p className="text-xs text-muted-foreground">
@@ -2235,7 +2321,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           </DialogHeader>
           <div className="space-y-3">
             <p className="text-sm text-muted-foreground">
-              An admin has left this group. New members may have limited read/write access on this relay.
+              An admin has left this group. New members may have limited read/write access on this
+              relay.
             </p>
             <p className="text-sm text-muted-foreground">
               For full control and stability, start a new group.
