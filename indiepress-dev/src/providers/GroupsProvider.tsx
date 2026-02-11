@@ -2131,6 +2131,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const normalizedGroupId = String(groupId || '').trim()
       if (!normalizedGroupId) return []
       const reason = opts?.reason || 'unspecified'
+      const isMyGroup = myGroupList.some((entry) => entry.groupId === normalizedGroupId)
       const cacheKeys = relay
         ? [
             toGroupMemberPreviewKey(normalizedGroupId, relay),
@@ -2145,6 +2146,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       if (!opts?.force && cached && now - cached.updatedAt < GROUP_MEMBER_PREVIEW_TTL_MS) {
         return cached.members
       }
+      if (reason === 'groups-page-row-list' && !isMyGroup) {
+        return cached?.members || []
+      }
 
       const inFlightKey = `${relayCacheKey}|${opts?.force ? 'force' : 'normal'}`
       const existingPromise = groupMemberPreviewInFlightRef.current.get(inFlightKey)
@@ -2153,7 +2157,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const fetchPromise = (async () => {
         try {
           const preview = await fetchMembershipPreview(normalizedGroupId, relay, {
-            discoveryOnly: !myGroupList.some((entry) => entry.groupId === normalizedGroupId),
+            discoveryOnly: !isMyGroup,
             preferRelay: true
           })
           let members = normalizePubkeyList(preview.members || [])
@@ -2470,6 +2474,14 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [pubkey, publish]
   )
 
+  const leaveGroupListPublishOptions = useMemo<TPublishOptions | undefined>(() => {
+    const targets = Array.from(
+      new Set([...(relayList?.write || []), ...(relayList?.read || []), ...BIG_RELAY_URLS])
+    ).filter((relayUrl) => typeof relayUrl === 'string' && relayUrl.length > 0)
+    if (!targets.length) return undefined
+    return { specifiedRelayUrls: targets }
+  }, [relayList?.read, relayList?.write])
+
   const sendLeaveRequest = useCallback(
     async (
       groupId: string,
@@ -2588,7 +2600,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         if (needs10009) {
           try {
             workingMyGroups = workingMyGroups.filter((entry) => entry.groupId !== item.groupId)
-            await saveMyGroupList(workingMyGroups)
+            await saveMyGroupList(workingMyGroups, leaveGroupListPublishOptions)
             needs10009 = false
           } catch (error) {
             lastError = error instanceof Error ? error.message : String(error)
@@ -2611,7 +2623,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       localStorageService.setGroupLeavePublishRetryQueue(nextQueue, pubkey)
     },
-    [myGroupList, pubkey, saveMyGroupList, sendLeaveRequest]
+    [leaveGroupListPublishOptions, myGroupList, pubkey, saveMyGroupList, sendLeaveRequest]
   )
 
   useEffect(() => {
@@ -2804,7 +2816,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       setMyGroupList(nextMyGroups)
 
       try {
-        await saveMyGroupList(nextMyGroups)
+        await saveMyGroupList(nextMyGroups, leaveGroupListPublishOptions)
         needs10009 = false
       } catch (error) {
         publishErrors.push(error instanceof Error ? error.message : String(error))
@@ -2858,6 +2870,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       pubkey,
       refreshGroupMemberPreview,
       resolveRelayUrl,
+      leaveGroupListPublishOptions,
       saveMyGroupList,
       sendLeaveRequest
     ]
@@ -3026,6 +3039,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
     const desired = new Map<string, string>()
     workerRelays.forEach((relay) => {
+      if (relay.isActive === false) return
       const publicIdentifier = relay.publicIdentifier
       const connectionUrl = relay.connectionUrl
       if (!publicIdentifier || !connectionUrl) return
@@ -3047,21 +3061,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       return { ...entry, relay: targetRelay }
     })
 
-    desired.forEach((relay, groupId) => {
-      const exists = next.some(
-        (e) => e.groupId === groupId && getBaseRelayUrl(e.relay || '') === relay
-      )
-      if (!exists) {
-        changed = true
-        next.push({ groupId, relay })
-      }
-    })
-
     if (!changed) return
 
-    // Don’t force BIG_RELAY_URLS here; use normal publish routing (privacy-preserving for token-joins).
-    saveMyGroupList(next).catch(() => {})
-  }, [myGroupList, pubkey, saveMyGroupList, workerRelays])
+    // Keep local relay URLs aligned with worker connection state without publishing a new 10009.
+    setMyGroupList(next)
+  }, [myGroupList, pubkey, workerRelays])
 
   useEffect(() => {
     if (!pubkey) return

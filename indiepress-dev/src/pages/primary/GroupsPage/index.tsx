@@ -8,7 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
 import { toGroup } from '@/lib/link'
-import { useSecondaryPage } from '@/PageManager'
+import { usePrimaryPage, useSecondaryPage } from '@/PageManager'
 import { useFetchProfile } from '@/hooks'
 import { useGroups } from '@/providers/GroupsProvider'
 import { useNostr } from '@/providers/NostrProvider'
@@ -212,6 +212,8 @@ const GroupsPage = forwardRef<
   } = useGroups()
   const { startJoinFlow, sendToWorker, getRelayPeerCount } = useWorkerBridge()
   const { pubkey } = useNostr()
+  const { current: currentPrimaryPage, display: primaryDisplay } = usePrimaryPage()
+  const isGroupsPageActive = currentPrimaryPage === 'groups' && primaryDisplay
   const [tab, setTab] = useState<TTab>(initialTab || 'discover')
   const [search, setSearch] = useState('')
   const [showCreate, setShowCreate] = useState(false)
@@ -306,31 +308,15 @@ const GroupsPage = forwardRef<
     })
   }, [invites, resolveRelayUrl])
 
-  const activeTargets = useMemo(() => {
+  const enrichmentTargets = useMemo(() => {
     const targetMap = new Map<string, ActiveGroupTarget>()
-    const sourceRows: ActiveGroupTarget[] = tab === 'discover'
-      ? discoverRows.map((row) => ({
-          key: row.key,
-          groupId: row.groupId,
-          relay: row.relay,
-          fallbackAdminPubkey: row.fallbackAdminPubkey,
-          fallbackCreatedAt: row.createdAt
-        }))
-      : tab === 'my'
-        ? myRows.map((row) => ({
-            key: row.key,
-            groupId: row.groupId,
-            relay: row.relay,
-            fallbackAdminPubkey: row.fallbackAdminPubkey,
-            fallbackCreatedAt: row.createdAt
-          }))
-        : inviteRows.map((row) => ({
-            key: makeGroupKey(row.groupId, row.relay),
-            groupId: row.groupId,
-            relay: row.relay,
-            fallbackAdminPubkey: row.invitedBy || null,
-            fallbackCreatedAt: row.inviteDate || null
-          }))
+    const sourceRows: ActiveGroupTarget[] = myRows.map((row) => ({
+      key: row.key,
+      groupId: row.groupId,
+      relay: row.relay,
+      fallbackAdminPubkey: row.fallbackAdminPubkey,
+      fallbackCreatedAt: row.createdAt
+    }))
 
     for (const row of sourceRows) {
       const key = row.key
@@ -344,15 +330,15 @@ const GroupsPage = forwardRef<
       })
     }
     return Array.from(targetMap.values())
-  }, [discoverRows, inviteRows, myRows, tab])
+  }, [myRows])
 
   useEffect(() => {
-    if (activeTargets.length === 0) return
+    if (!isGroupsPageActive || enrichmentTargets.length === 0) return
     const generation = Date.now()
     detailGenerationRef.current = generation
     let cancelled = false
     const now = Date.now()
-    const queue = activeTargets.filter((target) => {
+    const queue = enrichmentTargets.filter((target) => {
       if (detailInFlightRef.current.has(target.key)) return false
       const cached = groupDetailCache[target.key]
       if (!cached) return true
@@ -429,13 +415,13 @@ const GroupsPage = forwardRef<
     return () => {
       cancelled = true
     }
-  }, [activeTargets, fetchGroupDetail, groupDetailCache, myGroupKeys])
+  }, [enrichmentTargets, fetchGroupDetail, groupDetailCache, isGroupsPageActive, myGroupKeys])
 
   useEffect(() => {
-    if (activeTargets.length === 0) return
+    if (!isGroupsPageActive || enrichmentTargets.length === 0) return
     let cancelled = false
     const now = Date.now()
-    const queue = activeTargets.filter((target) => {
+    const queue = enrichmentTargets.filter((target) => {
       const cached = getGroupMemberPreview(target.groupId, target.relay)
       if (!cached) return true
       return now - cached.updatedAt > MEMBER_PREVIEW_REFRESH_TTL_MS
@@ -465,7 +451,13 @@ const GroupsPage = forwardRef<
     return () => {
       cancelled = true
     }
-  }, [activeTargets, getGroupMemberPreview, refreshGroupMemberPreview, groupMemberPreviewVersion])
+  }, [
+    enrichmentTargets,
+    getGroupMemberPreview,
+    groupMemberPreviewVersion,
+    isGroupsPageActive,
+    refreshGroupMemberPreview
+  ])
 
   const resolveRowMembers = useCallback(
     ({ groupId, relay, fallbackMembers = [] }: { groupId: string; relay?: string; fallbackMembers?: string[] }) => {

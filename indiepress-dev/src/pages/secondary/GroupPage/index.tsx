@@ -32,6 +32,7 @@ import { buildPrivateGroupLeaveShadowRef, parseGroupIdentifier } from '@/lib/gro
 import { getBaseRelayUrl } from '@/lib/hypertuna-group-events'
 import client from '@/services/client.service'
 import relayMembershipService from '@/services/relay-membership.service'
+import { useSecondaryPage } from '@/PageManager'
 import { Input } from '@/components/ui/input'
 import { toast } from 'sonner'
 import { useNostr } from '@/providers/NostrProvider'
@@ -403,6 +404,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   } = useGroups()
   const { pubkey, profile: nostrProfile } = useNostr()
   const { joinFlows, startJoinFlow, relays, sendToWorker, relayServerReady } = useWorkerBridge()
+  const { pop } = useSecondaryPage()
   const [isLoading, setIsLoading] = useState(true)
   const [activeTab, setActiveTab] = useState<'notes' | 'files' | 'members' | 'requests'>('notes')
   const [groupFileCount, setGroupFileCount] = useState<number | undefined>(undefined)
@@ -453,6 +455,9 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     } as NostrEvent
   }, [reportTarget])
   const requestIdRef = useRef(0)
+  const autoPopKeyRef = useRef<string | null>(null)
+  const trackedGroupIdRef = useRef<string | undefined>(undefined)
+  const previousIsInMyGroupsRef = useRef(false)
   const lastRouteSubscriptionRefreshRef = useRef<string | null>(null)
   const groupRelayWarmupKeyRef = useRef<string | null>(null)
   const lastWritableRefreshKeyRef = useRef<string | null>(null)
@@ -520,6 +525,33 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     () => !!(groupId && myGroupList.some((entry) => entry.groupId === groupId)),
     [groupId, myGroupList]
   )
+
+  useEffect(() => {
+    if (!groupId) {
+      trackedGroupIdRef.current = undefined
+      previousIsInMyGroupsRef.current = false
+      autoPopKeyRef.current = null
+      return
+    }
+
+    const nextPopKey = `${groupId}|${pubkey || ''}`
+    const groupChanged = trackedGroupIdRef.current !== groupId
+    if (groupChanged) {
+      trackedGroupIdRef.current = groupId
+      previousIsInMyGroupsRef.current = isInMyGroups
+      autoPopKeyRef.current = null
+      return
+    }
+
+    const lostMembership = previousIsInMyGroupsRef.current && !isInMyGroups
+    if (lostMembership && autoPopKeyRef.current !== nextPopKey) {
+      autoPopKeyRef.current = nextPopKey
+      window.setTimeout(() => pop(), 0)
+    }
+
+    previousIsInMyGroupsRef.current = isInMyGroups
+  }, [groupId, isInMyGroups, pop, pubkey])
+
   const workerRelayEntryForGroup = useMemo(() => {
     if (!groupId || !relays?.length) return null
     const candidates = new Set<string>()
@@ -663,7 +695,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           ) {
             next.membershipStatus = prev.membershipStatus
           }
-          if (isInMyGroups || isCreator) {
+          if (isInMyGroups) {
             next.membershipStatus = 'member'
             if (pubkey) {
               const hasSelf = next.members?.some((m) => m === pubkey)
@@ -1142,6 +1174,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           description:
             "Local leave is complete. We'll retry publishing your leave updates (9022/10009) in the background."
         })
+        const popKey = `${groupId}|${pubkey || ''}`
+        if (autoPopKeyRef.current !== popKey) {
+          autoPopKeyRef.current = popKey
+          window.setTimeout(() => pop(), 0)
+        }
         return
       }
 
@@ -1150,6 +1187,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           id: toastId,
           description: 'You left the group and removed all local relay and shared file data.'
         })
+        const popKey = `${groupId}|${pubkey || ''}`
+        if (autoPopKeyRef.current !== popKey) {
+          autoPopKeyRef.current = popKey
+          window.setTimeout(() => pop(), 0)
+        }
         return
       }
 
@@ -1172,6 +1214,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           ? `${statusDescription} ${recoveryDescription}`
           : statusDescription
       })
+      const popKey = `${groupId}|${pubkey || ''}`
+      if (autoPopKeyRef.current !== popKey) {
+        autoPopKeyRef.current = popKey
+        window.setTimeout(() => pop(), 0)
+      }
     } catch (err) {
       setError((err as Error).message)
       toast.error('Failed to leave group', {
@@ -1213,7 +1260,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     [detail, fallbackMeta]
   )
   let membershipStatus = baseDetail?.membershipStatus ?? 'not-member'
-  if (isInMyGroups || isCreator) {
+  if (isInMyGroups) {
     membershipStatus = 'member'
   }
   const membersWithSelf = useMemo(() => {
@@ -2348,16 +2395,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             <p className="text-sm text-muted-foreground">
               For full control and stability, start a new group.
             </p>
-            <div className="flex justify-end gap-2">
-              <Button
-                variant="outline"
-                onClick={() => {
-                  dismissAdminLeaveNotice()
-                  toast.message('Open Groups to start a new group.')
-                }}
-              >
-                Start new group
-              </Button>
+            <div className="flex justify-end">
               <Button onClick={dismissAdminLeaveNotice}>Understood</Button>
             </div>
           </div>
