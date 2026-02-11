@@ -46,6 +46,22 @@ npm install
 npm run dev
 ```
 
+## Feature Flags
+
+Renderer feature visibility can be toggled with Vite env flags (values: `true/false`, `1/0`, `enabled/disabled`):
+
+- `VITE_FEATURE_EXPLORE_ENABLED`
+- `VITE_FEATURE_NOTEPAD_ENABLED`
+- `VITE_FEATURE_LISTS_ENABLED`
+- `VITE_FEATURE_BOOKMARKS_ENABLED`
+
+Default behavior in this codebase:
+
+- Explore: disabled
+- Notepad: disabled
+- Lists: enabled
+- Bookmarks: enabled
+
 ## Run Docker
 
 ```bash

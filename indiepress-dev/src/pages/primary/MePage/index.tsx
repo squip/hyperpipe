@@ -8,6 +8,7 @@ import { Separator } from '@/components/ui/separator'
 import { SimpleUserAvatar } from '@/components/UserAvatar'
 import { SimpleUsername } from '@/components/Username'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
+import { getRendererFeatureFlags } from '@/lib/features'
 import { toBookmarks, toProfile, toRelaySettings, toSettings, toWallet } from '@/lib/link'
 import { cn } from '@/lib/utils'
 import { usePrimaryPage, useSecondaryPage } from '@/PageManager'
@@ -33,6 +34,7 @@ const MePage = forwardRef((_, ref) => {
   const { push } = useSecondaryPage()
   const { navigate } = usePrimaryPage()
   const { pubkey } = useNostr()
+  const featureFlags = getRendererFeatureFlags()
   const [loginDialogOpen, setLoginDialogOpen] = useState(false)
   const [logoutDialogOpen, setLogoutDialogOpen] = useState(false)
 
@@ -83,15 +85,21 @@ const MePage = forwardRef((_, ref) => {
         <Item onClick={() => navigate('reads')}>
           <BookOpen /> {t('Reads')}
         </Item>
-        <Item onClick={() => navigate('lists')}>
-          <List /> {t('Lists')}
-        </Item>
-        <Item onClick={() => navigate('notepad')}>
-          <NotebookPen /> {t('Notepad')}
-        </Item>
-        <Item onClick={() => push(toBookmarks())}>
-          <Bookmark /> {t('Bookmarks')}
-        </Item>
+        {featureFlags.lists && (
+          <Item onClick={() => navigate('lists')}>
+            <List /> {t('Lists')}
+          </Item>
+        )}
+        {featureFlags.notepad && (
+          <Item onClick={() => navigate('notepad')}>
+            <NotebookPen /> {t('Notepad')}
+          </Item>
+        )}
+        {featureFlags.bookmarks && (
+          <Item onClick={() => push(toBookmarks())}>
+            <Bookmark /> {t('Bookmarks')}
+          </Item>
+        )}
         <Item onClick={() => push(toWallet())}>
           <Wallet />
           {t('Wallet')}

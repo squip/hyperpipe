@@ -1,4 +1,5 @@
 import { cn } from '@/lib/utils'
+import { getRendererFeatureFlags } from '@/lib/features'
 import { useNostr } from '@/providers/NostrProvider'
 import { useScreenSize } from '@/providers/ScreenSizeProvider'
 import noteStatsService from '@/services/note-stats.service'
@@ -30,6 +31,7 @@ export default function NoteStats({
 }) {
   const { isSmallScreen } = useScreenSize()
   const { pubkey } = useNostr()
+  const featureFlags = getRendererFeatureFlags()
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
@@ -59,7 +61,7 @@ export default function NoteStats({
           <RepostButton event={event} />
           <LikeButton event={event} />
           <ZapButton event={event} />
-          <BookmarkButton event={event} />
+          {featureFlags.bookmarks && <BookmarkButton event={event} />}
           <SeenOnButton event={event} />
         </div>
       </div>
@@ -85,7 +87,7 @@ export default function NoteStats({
           <ZapButton event={event} />
         </div>
         <div className="flex items-center" onClick={(e) => e.stopPropagation()}>
-          <BookmarkButton event={event} />
+          {featureFlags.bookmarks && <BookmarkButton event={event} />}
           <SeenOnButton event={event} />
         </div>
       </div>

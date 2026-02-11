@@ -1,4 +1,6 @@
 import Sidebar from '@/components/Sidebar'
+import { isRendererFeatureEnabled } from '@/lib/features'
+import type { RendererFeature } from '@/lib/features'
 import { cn } from '@/lib/utils'
 import NoteListPage from '@/pages/primary/NoteListPage'
 import HomePage from '@/pages/secondary/HomePage'
@@ -96,6 +98,18 @@ const PRIMARY_PAGE_MAP = {
   bookmark: <BookmarkPage ref={PRIMARY_PAGE_REF_MAP.bookmark} />,
   notepad: <NotepadPage ref={PRIMARY_PAGE_REF_MAP.notepad} />,
   settings: <SettingsPage ref={PRIMARY_PAGE_REF_MAP.settings} />
+}
+
+const PRIMARY_PAGE_FEATURES: Partial<Record<TPrimaryPageName, RendererFeature>> = {
+  explore: 'explore',
+  notepad: 'notepad',
+  lists: 'lists',
+  bookmark: 'bookmarks'
+}
+
+function isPrimaryPageEnabled(page: TPrimaryPageName) {
+  const feature = PRIMARY_PAGE_FEATURES[page]
+  return !feature || isRendererFeatureEnabled(feature)
 }
 
 const PrimaryPageContext = createContext<TPrimaryPageContext | undefined>(undefined)
@@ -319,6 +333,14 @@ export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
   }, [])
 
   const navigatePrimaryPage = (page: TPrimaryPageName, props?: any) => {
+    if (!isPrimaryPageEnabled(page)) {
+      if (currentPrimaryPage !== 'home') {
+        setCurrentPrimaryPage('home')
+      }
+      clearSecondaryPages()
+      return
+    }
+
     const needScrollToTop = page === currentPrimaryPage
     setPrimaryPages((prev) => {
       const exists = prev.find((p) => p.name === page)

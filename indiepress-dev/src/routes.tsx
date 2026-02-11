@@ -1,6 +1,7 @@
 import { match } from 'path-to-regexp'
 import { isValidElement } from 'react'
 import type { ReactElement } from 'react'
+import { getRendererFeatureFlags } from './lib/features'
 import AppearanceSettingsPage from './pages/secondary/AppearanceSettingsPage'
 import ArticlePage from './pages/secondary/ArticlePage'
 import BookmarkPage from './pages/secondary/BookmarkPage'
@@ -29,6 +30,7 @@ import ListPage from './pages/secondary/ListPage'
 import ListEditorPage from './pages/secondary/ListEditorPage'
 import NotepadNotePage from './pages/secondary/NotepadNotePage'
 import GroupPage from './pages/secondary/GroupPage'
+import NotFoundPage from './pages/secondary/NotFoundPage'
 
 export type RouteDefinition = {
   path: string
@@ -39,37 +41,46 @@ type ResolvedRoute = RouteDefinition & {
   matcher: ReturnType<typeof match>
 }
 
-const CORE_ROUTES: RouteDefinition[] = [
-  { path: '/notes', element: <NoteListPage /> },
-  { path: '/notes/:id', element: <NotePage /> },
-  { path: '/articles/:id', element: <ArticlePage /> },
-  { path: '/users', element: <ProfileListPage /> },
-  { path: '/users/:id', element: <ProfilePage /> },
-  { path: '/users/:id/following', element: <FollowingListPage /> },
-  { path: '/users/:id/relays', element: <OthersRelaySettingsPage /> },
-  { path: '/relays/:url', element: <RelayPage /> },
-  { path: '/relays/:url/reviews', element: <RelayReviewsPage /> },
-  { path: '/conversations/:id', element: <ChatPage /> },
-  { path: '/search', element: <SearchPage /> },
-  { path: '/settings', element: <SettingsPage /> },
-  { path: '/settings/relays', element: <RelaySettingsPage /> },
-  { path: '/settings/wallet', element: <WalletPage /> },
-  { path: '/settings/posts', element: <PostSettingsPage /> },
-  { path: '/settings/general', element: <GeneralSettingsPage /> },
-  { path: '/settings/appearance', element: <AppearanceSettingsPage /> },
-  { path: '/settings/translation', element: <TranslationPage /> },
-  { path: '/settings/plugins', element: <PluginManagerPage /> },
-  { path: '/profile-editor', element: <ProfileEditorPage /> },
-  { path: '/mutes', element: <MuteListPage /> },
-  { path: '/rizful', element: <RizfulPage /> },
-  { path: '/bookmarks', element: <BookmarkPage /> },
-  { path: '/lists', element: <ListsIndexPage /> },
-  { path: '/lists/create', element: <ListEditorPage /> },
-  { path: '/lists/:id', element: <ListPage listId="" /> },
-  { path: '/lists/:id/edit', element: <ListEditorPage listId="" /> },
-  { path: '/notepad/:id', element: <NotepadNotePage /> },
-  { path: '/groups/:id', element: <GroupPage id="" /> }
-]
+const CORE_ROUTES: RouteDefinition[] = buildCoreRoutes()
+
+function buildCoreRoutes(): RouteDefinition[] {
+  const featureFlags = getRendererFeatureFlags()
+
+  return [
+    { path: '/notes', element: <NoteListPage /> },
+    { path: '/notes/:id', element: <NotePage /> },
+    { path: '/articles/:id', element: <ArticlePage /> },
+    { path: '/users', element: <ProfileListPage /> },
+    { path: '/users/:id', element: <ProfilePage /> },
+    { path: '/users/:id/following', element: <FollowingListPage /> },
+    { path: '/users/:id/relays', element: <OthersRelaySettingsPage /> },
+    { path: '/relays/:url', element: <RelayPage /> },
+    { path: '/relays/:url/reviews', element: <RelayReviewsPage /> },
+    { path: '/conversations/:id', element: <ChatPage /> },
+    { path: '/search', element: <SearchPage /> },
+    { path: '/settings', element: <SettingsPage /> },
+    { path: '/settings/relays', element: <RelaySettingsPage /> },
+    { path: '/settings/wallet', element: <WalletPage /> },
+    { path: '/settings/posts', element: <PostSettingsPage /> },
+    { path: '/settings/general', element: <GeneralSettingsPage /> },
+    { path: '/settings/appearance', element: <AppearanceSettingsPage /> },
+    { path: '/settings/translation', element: <TranslationPage /> },
+    { path: '/settings/plugins', element: <PluginManagerPage /> },
+    { path: '/profile-editor', element: <ProfileEditorPage /> },
+    { path: '/mutes', element: <MuteListPage /> },
+    { path: '/rizful', element: <RizfulPage /> },
+    { path: '/bookmarks', element: featureFlags.bookmarks ? <BookmarkPage /> : <NotFoundPage /> },
+    { path: '/lists', element: featureFlags.lists ? <ListsIndexPage /> : <NotFoundPage /> },
+    { path: '/lists/create', element: featureFlags.lists ? <ListEditorPage /> : <NotFoundPage /> },
+    { path: '/lists/:id', element: featureFlags.lists ? <ListPage listId="" /> : <NotFoundPage /> },
+    {
+      path: '/lists/:id/edit',
+      element: featureFlags.lists ? <ListEditorPage listId="" /> : <NotFoundPage />
+    },
+    { path: '/notepad/:id', element: featureFlags.notepad ? <NotepadNotePage /> : <NotFoundPage /> },
+    { path: '/groups/:id', element: <GroupPage id="" /> }
+  ]
+}
 
 let pluginRoutes: RouteDefinition[] = []
 let cachedRoutes: ResolvedRoute[] | null = null

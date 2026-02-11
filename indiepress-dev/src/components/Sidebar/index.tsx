@@ -1,5 +1,6 @@
 import Icon from '@/assets/Icon'
 import Logo from '@/assets/Logo'
+import { getRendererFeatureFlags } from '@/lib/features'
 import { cn } from '@/lib/utils'
 import { useSecondaryPage } from '@/PageManager'
 import { useNostr } from '@/providers/NostrProvider'
@@ -26,6 +27,7 @@ export default function PrimaryPageSidebar() {
   const { isSmallScreen } = useScreenSize()
   const { sidebarCollapse, updateSidebarCollapse, enableSingleColumnLayout } = useUserPreferences()
   const { pubkey } = useNostr()
+  const featureFlags = getRendererFeatureFlags()
   const { push } = useSecondaryPage()
   const { navItems: pluginNavItems } = usePluginRegistry()
   const currentPath = typeof window !== 'undefined' ? window.location.pathname : ''
@@ -55,9 +57,9 @@ export default function PrimaryPageSidebar() {
         <ReadsButton collapse={sidebarCollapse} />
         <GroupsButton collapse={sidebarCollapse} />
         <FilesButton collapse={sidebarCollapse} />
-        <ListsButton collapse={sidebarCollapse} />
-        <NotepadButton collapse={sidebarCollapse} />
-        {pubkey && <BookmarkButton collapse={sidebarCollapse} />}
+        {featureFlags.lists && <ListsButton collapse={sidebarCollapse} />}
+        {featureFlags.notepad && <NotepadButton collapse={sidebarCollapse} />}
+        {featureFlags.bookmarks && pubkey && <BookmarkButton collapse={sidebarCollapse} />}
         <SearchButton collapse={sidebarCollapse} />
         {pluginNavItems.map((item) => {
           const active = currentPath === item.routePath || currentPath.startsWith(`${item.routePath}/`)
@@ -76,7 +78,7 @@ export default function PrimaryPageSidebar() {
             </SidebarItem>
           )
         })}
-        <RelaysButton collapse={sidebarCollapse} />
+        {featureFlags.explore && <RelaysButton collapse={sidebarCollapse} />}
         <PostButton collapse={sidebarCollapse} />
       </div>
       <div className="space-y-4">
