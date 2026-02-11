@@ -285,6 +285,8 @@ const GroupsPage = forwardRef<
     })
   }, [myGroupList, resolveGroupMeta])
 
+  const myGroupKeys = useMemo(() => new Set(myRows.map((row) => row.key)), [myRows])
+
   const inviteRows = useMemo<InviteRow[]>(() => {
     return invites.map((invite) => {
       const relay = invite.relayUrl ?? (invite.relay ? resolveRelayUrl(invite.relay) : undefined) ?? invite.relay
@@ -368,7 +370,11 @@ const GroupsPage = forwardRef<
         if (detailInFlightRef.current.has(current.key)) continue
         detailInFlightRef.current.add(current.key)
         try {
-          const detail = await fetchGroupDetail(current.groupId, current.relay, { preferRelay: true })
+          const preferRelay = myGroupKeys.has(current.key)
+          const detail = await fetchGroupDetail(current.groupId, current.relay, preferRelay
+            ? { preferRelay: true }
+            : { discoveryOnly: true }
+          )
           if (cancelled || detailGenerationRef.current !== generation) continue
           const nextEntry: GroupDetailCacheEntry = {
             adminPubkey:
@@ -423,7 +429,7 @@ const GroupsPage = forwardRef<
     return () => {
       cancelled = true
     }
-  }, [activeTargets, fetchGroupDetail, groupDetailCache])
+  }, [activeTargets, fetchGroupDetail, groupDetailCache, myGroupKeys])
 
   useEffect(() => {
     if (activeTargets.length === 0) return

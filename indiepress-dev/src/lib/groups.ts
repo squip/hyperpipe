@@ -68,7 +68,17 @@ type MembershipState = {
 const membershipActionForKind = (kind: number): MembershipAction | null => {
   if (kind === 9000) return 'member'
   if (kind === 9001) return 'removed'
+  if (kind === 9022) return 'removed'
   return null
+}
+
+const getMembershipTargetsForEvent = (event: Event): string[] => {
+  const targets = event.tags.filter((t) => t[0] === 'p' && t[1]).map((t) => t[1])
+  if (targets.length > 0) return targets
+  if (event.kind === 9022 && event.pubkey) {
+    return [event.pubkey]
+  }
+  return []
 }
 
 const shouldReplaceMembershipState = (
@@ -114,7 +124,7 @@ export function resolveGroupMembersFromSnapshotAndOps(args: {
     const action = membershipActionForKind(evt.kind)
     if (!action) continue
     const createdAt = Number.isFinite(evt.created_at) ? evt.created_at : 0
-    const targets = evt.tags.filter((t) => t[0] === 'p' && t[1]).map((t) => t[1])
+    const targets = getMembershipTargetsForEvent(evt)
     for (const target of targets) {
       const existing = stateByPubkey.get(target)
       if (!shouldReplaceMembershipState(existing, action, createdAt)) continue
@@ -210,8 +220,8 @@ export function deriveMembershipStatus(
 ): TGroupMembershipStatus {
   let latestMembershipEvent: Event | null = null
   for (const evt of events) {
-    if (evt.kind !== 9000 && evt.kind !== 9001) continue
-    const targetsPubkey = evt.tags.some((tag) => tag[0] === 'p' && tag[1] === pubkey)
+    if (evt.kind !== 9000 && evt.kind !== 9001 && evt.kind !== 9022) continue
+    const targetsPubkey = getMembershipTargetsForEvent(evt).includes(pubkey)
     if (!targetsPubkey) continue
     if (!latestMembershipEvent || evt.created_at > latestMembershipEvent.created_at) {
       latestMembershipEvent = evt
@@ -220,8 +230,8 @@ export function deriveMembershipStatus(
     if (
       latestMembershipEvent &&
       evt.created_at === latestMembershipEvent.created_at &&
-      evt.kind === 9001 &&
-      latestMembershipEvent.kind !== 9001
+      (evt.kind === 9001 || evt.kind === 9022) &&
+      latestMembershipEvent.kind === 9000
     ) {
       latestMembershipEvent = evt
     }
@@ -229,7 +239,7 @@ export function deriveMembershipStatus(
 
   if (latestMembershipEvent) {
     if (latestMembershipEvent.kind === 9000) return 'member'
-    if (latestMembershipEvent.kind === 9001) return 'removed'
+    if (latestMembershipEvent.kind === 9001 || latestMembershipEvent.kind === 9022) return 'removed'
   }
 
   const latestRequest = joinRequests

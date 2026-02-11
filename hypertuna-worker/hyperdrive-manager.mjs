@@ -133,6 +133,26 @@ export function getRelayCorestore (relayKey, { storageBase = null } = {}) {
   return entry.store
 }
 
+export async function removeRelayCorestore (relayKey) {
+  const normalized = normalizeIdentifier(relayKey)
+  if (!normalized) return false
+  const entry = relayStores.get(normalized)
+  if (!entry?.store) {
+    relayStores.delete(normalized)
+    return false
+  }
+  relayStores.delete(normalized)
+  try {
+    await entry.store.close?.()
+  } catch (error) {
+    console.warn('[Hyperdrive] Failed to close relay corestore during removal', {
+      relayKey: normalized,
+      error: error?.message || error
+    })
+  }
+  return true
+}
+
 export function getLocalDrive() {
   return drive
 }
@@ -634,6 +654,58 @@ export async function fileExists(identifier, fileHash) {
   }
 }
 
+export async function deleteRelayFilesByIdentifierPrefix (identifier) {
+  const normalizedIdentifier = normalizeIdentifier(identifier)
+  if (!normalizedIdentifier) return { deletedCount: 0 }
+  if (!drive) throw new Error('Hyperdrive not initialized')
+
+  const prefix = relayPath(normalizedIdentifier)
+  let deletedCount = 0
+  let keys = []
+  try {
+    for await (const entry of drive.list(prefix, { recursive: true })) {
+      if (!entry?.key) continue
+      keys.push(entry.key)
+    }
+  } catch (err) {
+    const isClosing = isClosingCoreError(err) || isStoreClosedError(err)
+    if (isClosing && (store || storageDir) && localDriveKeyHex) {
+      console.warn('[Hyperdrive] deleteRelayFilesByIdentifierPrefix detected closing core; reopening local drive...')
+      const ok = await reopenLocalDriveIfClosing()
+      if (ok) {
+        keys = []
+        for await (const entry of drive.list(prefix, { recursive: true })) {
+          if (!entry?.key) continue
+          keys.push(entry.key)
+        }
+      } else {
+        throw err
+      }
+    } else {
+      throw err
+    }
+  }
+
+  for (const key of keys) {
+    try {
+      await drive.del(key)
+      deletedCount += 1
+    } catch (err) {
+      const isClosing = isClosingCoreError(err) || isStoreClosedError(err)
+      if (isClosing && (store || storageDir) && localDriveKeyHex) {
+        const ok = await reopenLocalDriveIfClosing()
+        if (!ok) throw err
+        await drive.del(key)
+        deletedCount += 1
+      } else {
+        throw err
+      }
+    }
+  }
+
+  return { deletedCount }
+}
+
 export async function fetchFileFromDrive(driveKey, identifier, fileHash) {
   const remote = new Hyperdrive(store, driveKey)
   await remote.ready()
@@ -803,4 +875,42 @@ export function getReplicationHealth () {
     topicsJoined: topicCache.size,
     topics
   }
+}
+
+// Test-only cleanup helper to avoid dangling Hyperdrive/Hyperswarm handles.
+export async function shutdownHyperdriveForTests () {
+  for (const cache of [topicCache, pfpTopicCache]) {
+    for (const entry of cache.values()) {
+      try { entry?.discovery?.destroy?.() } catch (_) {}
+      if (entry?.timer) {
+        try { clearTimeout(entry.timer) } catch (_) {}
+      }
+    }
+    cache.clear()
+  }
+
+  for (const entry of relayStores.values()) {
+    try { await entry?.store?.close?.() } catch (_) {}
+  }
+  relayStores.clear()
+
+  try { await pfpDrive?.close?.() } catch (_) {}
+  try { await drive?.close?.() } catch (_) {}
+
+  if (pfpStore && pfpStore !== store) {
+    try { await pfpStore.close?.() } catch (_) {}
+  }
+  try { await store?.close?.() } catch (_) {}
+  try { await replicationSwarm?.destroy?.() } catch (_) {}
+
+  store = null
+  drive = null
+  localDriveKeyHex = null
+  pfpDrive = null
+  pfpDriveKeyHex = null
+  pfpStore = null
+  storageDir = null
+  replicationSwarm = null
+  replicationConnectionsOpen = 0
+  replicationConnectionsTotal = 0
 }

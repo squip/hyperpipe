@@ -55,6 +55,7 @@ const EMPTY_FINAL_MAX_AUTO_RETRIES = 3
 const EMPTY_FINAL_AUTO_RETRY_BASE_DELAY_MS = 450
 const EMPTY_FINAL_AUTO_RETRY_MAX_DELAY_MS = 2400
 const RELAY_SYNC_RETRY_DELAY_MS = 3000
+const GROUPED_NOTE_LIST_REFRESH_THROTTLE_MS = 900
 const GROUP_EMPTY_POST_READY_TIMEOUT_MS = 10000
 const ENABLE_GROUPED_NOTE_LIST_DEBUG = false
 
@@ -133,6 +134,7 @@ const GroupedNoteList = forwardRef(
     const relaySyncRetryTimerRef = useRef<number | null>(null)
     const authoritativeEmptyTimerRef = useRef<number | null>(null)
     const softResubscribeRef = useRef(false)
+    const lastRefreshAtRef = useRef(0)
     const eventsRef = useRef<Event[]>([])
     const snapshotCacheKey = useMemo(() => debugLabel || null, [debugLabel])
     const [authoritativeEmptyTimedOut, setAuthoritativeEmptyTimedOut] = useState(false)
@@ -523,6 +525,37 @@ const GroupedNoteList = forwardRef(
       })
     }
 
+    const incrementRefreshCount = useCallback(
+      (trigger: string, minIntervalMs = GROUPED_NOTE_LIST_REFRESH_THROTTLE_MS) => {
+        const now = Date.now()
+        const elapsed = now - lastRefreshAtRef.current
+        if (elapsed < minIntervalMs) {
+          debugGroupedNoteList('[GroupedNoteList] refreshCount suppressed by throttle', {
+            label: debugLabel ?? null,
+            activeTab: debugActiveTab ?? null,
+            trigger,
+            elapsed,
+            minIntervalMs
+          })
+          return false
+        }
+        lastRefreshAtRef.current = now
+        setRefreshCount((count) => {
+          const next = count + 1
+          debugGroupedNoteList('[GroupedNoteList] refreshCount increment', {
+            label: debugLabel ?? null,
+            activeTab: debugActiveTab ?? null,
+            trigger,
+            from: count,
+            to: next
+          })
+          return next
+        })
+        return true
+      },
+      [debugActiveTab, debugLabel]
+    )
+
     const refresh = (trigger: RefreshTrigger = 'imperative-ref') => {
       debugGroupedNoteList('[GroupedNoteList] refresh requested', {
         label: debugLabel ?? null,
@@ -542,17 +575,7 @@ const GroupedNoteList = forwardRef(
       setTimeout(() => {
         // Keep existing notes while forcing a resubscribe to avoid UI flicker/empty-state flashes.
         softResubscribeRef.current = true
-        setRefreshCount((count) => {
-          const next = count + 1
-          debugGroupedNoteList('[GroupedNoteList] refreshCount increment', {
-            label: debugLabel ?? null,
-            activeTab: debugActiveTab ?? null,
-            trigger,
-            from: count,
-            to: next
-          })
-          return next
-        })
+        incrementRefreshCount(`manual:${trigger}`, 300)
       }, 500)
     }
 
@@ -788,7 +811,7 @@ const GroupedNoteList = forwardRef(
             clearTimeout(relaySyncRetryTimerRef.current)
             relaySyncRetryTimerRef.current = null
           }
-          setRefreshCount((curr) => curr + 1)
+          incrementRefreshCount('relay-close-resubscribe')
         }, delayMs)
       }
       let effectActive = true
@@ -824,7 +847,7 @@ const GroupedNoteList = forwardRef(
           emptyFinalFallbackAttemptedRef.current = false
           emptyFinalAutoRetryCountRef.current = 0
           softResubscribeRef.current = true
-          setRefreshCount((curr) => curr + 1)
+          incrementRefreshCount('relay-sync-retry')
         }, delayMs)
         return true
       }
@@ -864,7 +887,7 @@ const GroupedNoteList = forwardRef(
           // Allow another empty-final fallback cycle on the next subscribe effect.
           emptyFinalFallbackAttemptedRef.current = false
           softResubscribeRef.current = true
-          setRefreshCount((curr) => curr + 1)
+          incrementRefreshCount('empty-final-auto-retry')
         }, delayMs)
         return true
       }
@@ -1257,7 +1280,7 @@ const GroupedNoteList = forwardRef(
         })
         subc.close(`GroupedNoteList cleanup effectId=${effectId}`)
       }
-    }, [subRequests, refreshCount, showKinds, settings, timelineLabel])
+    }, [incrementRefreshCount, settings, showKinds, subRequests, refreshCount, timelineLabel])
 
     function mergeNewEvents() {
       setEvents((oldEvents) =>

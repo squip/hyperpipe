@@ -30,7 +30,12 @@ import {
   TJoinRequest
 } from '@/types/groups'
 import client from '@/services/client.service'
-import localStorageService from '@/services/local-storage.service'
+import localStorageService, {
+  ArchivedGroupFilesEntry,
+  GroupLeavePublishRetryEntry
+} from '@/services/local-storage.service'
+import { electronIpc } from '@/services/electron-ipc.service'
+import { isElectron } from '@/lib/platform'
 import { createContext, ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { useNostr } from './NostrProvider'
 import { randomString } from '@/lib/random'
@@ -46,6 +51,8 @@ const INVITE_ACCEPTED_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_v1'
 const INVITE_ACCEPTED_GROUPS_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_groups_v1'
 const JOIN_REQUESTS_HANDLED_STORAGE_KEY = 'hypertuna_join_requests_handled_v1'
 const GROUP_MEMBER_PREVIEW_TTL_MS = 2 * 60 * 1000
+const LEAVE_PUBLISH_RETRY_BASE_DELAY_MS = 5000
+const LEAVE_PUBLISH_RETRY_MAX_DELAY_MS = 60 * 60 * 1000
 
 type GroupMemberPreviewEntry = {
   members: string[]
@@ -58,6 +65,37 @@ type ProvisionalGroupMetadataEntry = {
   metadata: TGroupMetadata
   source: 'invite' | 'create' | 'update'
   updatedAt: number
+}
+
+export type LeaveGroupOptions = {
+  saveRelaySnapshot?: boolean
+  saveSharedFiles?: boolean
+  reason?: string
+}
+
+type LeaveGroupWorkerResult = {
+  relayKey?: string | null
+  publicIdentifier?: string | null
+  archiveRelaySnapshot?: {
+    status: 'saved' | 'removed' | 'skipped' | 'error'
+    archivePath?: string | null
+    error?: string | null
+  }
+  sharedFiles?: {
+    status: 'saved' | 'removed' | 'skipped' | 'error'
+    recoveredCount?: number
+    failedCount?: number
+    deletedCount?: number
+    error?: string | null
+  }
+}
+
+export type LeaveGroupResult = {
+  worker: LeaveGroupWorkerResult | null
+  queuedRetry: boolean
+  publishErrors: string[]
+  recoveredCount: number
+  failedCount: number
 }
 
 type TGroupsContext = {
@@ -82,6 +120,7 @@ type TGroupsContext = {
   saveMyGroupList: (entries: TGroupListEntry[], options?: TPublishOptions) => Promise<void>
   sendJoinRequest: (groupId: string, relay?: string, code?: string, reason?: string) => Promise<void>
   sendLeaveRequest: (groupId: string, relay?: string, reason?: string) => Promise<void>
+  leaveGroup: (groupId: string, relay?: string, options?: LeaveGroupOptions) => Promise<LeaveGroupResult>
   fetchGroupDetail: (
     groupId: string,
     relay?: string,
@@ -175,6 +214,13 @@ export const useGroups = () => {
       saveMyGroupList: async () => {},
       sendJoinRequest: async () => {},
       sendLeaveRequest: async () => {},
+      leaveGroup: async () => ({
+        worker: null,
+        queuedRetry: false,
+        publishErrors: [],
+        recoveredCount: 0,
+        failedCount: 0
+      }),
       fetchGroupDetail: async () => ({
         metadata: null,
         admins: [],
@@ -221,6 +267,8 @@ const toGroupMemberPreviewKey = (groupId: string, relay?: string) =>
 const toProvisionalGroupMetadataKey = (groupId: string, relay?: string | null) =>
   `${relay ? getBaseRelayUrl(relay) : ''}|${groupId}`
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+const getLeavePublishRetryDelayMs = (attempts: number) =>
+  Math.min(LEAVE_PUBLISH_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempts), LEAVE_PUBLISH_RETRY_MAX_DELAY_MS)
 
 const createProvisionalGroupMetadata = (args: {
   groupId: string
@@ -391,6 +439,15 @@ const extractRelayKeyFromUrl = (value?: string | null) => {
     }
   }
   return null
+}
+
+const hasRelayAuthToken = (relayUrl?: string | null) => {
+  if (!relayUrl) return false
+  try {
+    return new URL(relayUrl).searchParams.has('token')
+  } catch (_err) {
+    return /[?&]token=/.test(relayUrl)
+  }
 }
 
 const buildMembershipPublishTargets = (resolvedRelay: string | null | undefined, isPublicGroup: boolean) => {
@@ -1119,7 +1176,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           }),
           client
             .fetchEvents(relayUrls, {
-              kinds: [9000, 9001],
+              kinds: [9000, 9001, 9022],
               '#h': [groupId],
               limit: 200
             })
@@ -1238,7 +1295,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const targetRelay = relay || relayFromList || undefined
       const resolved = targetRelay ? resolveRelayUrl(targetRelay) : null
       const isInMyGroups = myGroupList.some((entry) => entry.groupId === groupId)
-      const preferRelay = (!opts?.discoveryOnly && (opts?.preferRelay || isInMyGroups) && !!resolved)
+      const relayHasAuthToken = hasRelayAuthToken(resolved)
+      const preferRelay =
+        !opts?.discoveryOnly &&
+        !!resolved &&
+        (isInMyGroups || (!!opts?.preferRelay && relayHasAuthToken))
       const groupRelays = preferRelay && resolved ? [resolved] : defaultDiscoveryRelays
 
       const time = () => performance.now()
@@ -1262,7 +1323,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         const start = time()
         try {
           return await client.fetchEvents(groupRelays, {
-            kinds: [9000, 9001],
+            kinds: [9000, 9001, 9022],
             '#h': [groupId],
             limit: 50
           })
@@ -1278,27 +1339,18 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       let effectiveMembershipEvents = membershipEvents
       let membershipFetchSource: 'group-relay' | 'fallback-discovery' | 'group-relay-empty' = 'group-relay'
       const membershipFetchTimedOutLike = primaryMembershipDuration >= 9000
-      const hasRelayAuthToken = (() => {
-        if (!resolved) return false
-        try {
-          const parsed = new URL(resolved)
-          return parsed.searchParams.has('token')
-        } catch (_err) {
-          return /[?&]token=/.test(resolved)
-        }
-      })()
       const shouldFallbackMembershipFetch =
         preferRelay &&
         resolved &&
         membershipEvents.length === 0 &&
         !membersEvt &&
-        (membershipFetchTimedOutLike || (!hasRelayAuthToken && isInMyGroups))
+        (membershipFetchTimedOutLike || (!relayHasAuthToken && isInMyGroups))
 
       if (shouldFallbackMembershipFetch) {
         let fallbackMembershipEvents: typeof membershipEvents = []
         try {
           fallbackMembershipEvents = await client.fetchEvents(defaultDiscoveryRelays, {
-            kinds: [9000, 9001],
+            kinds: [9000, 9001, 9022],
             '#h': [groupId],
             limit: 50
           })
@@ -1317,7 +1369,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           resolved,
           isInMyGroups,
           membershipFetchTimedOutLike,
-          hasRelayAuthToken,
+          hasRelayAuthToken: relayHasAuthToken,
           fallbackMembershipCount: fallbackMembershipEvents.length,
           source: membershipFetchSource
         })
@@ -1334,7 +1386,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const membershipAuthoritativeRaw =
         !!membersEvt || membersFromEvent.length > 0 || effectiveMembershipEvents.length > 0
       const fallbackDiscoveryProvisional =
-        membershipFetchSource === 'fallback-discovery' && isInMyGroups && !hasRelayAuthToken
+        membershipFetchSource === 'fallback-discovery' && isInMyGroups && !relayHasAuthToken
       const membershipAuthoritative = fallbackDiscoveryProvisional
         ? false
         : membershipAuthoritativeRaw
@@ -1348,7 +1400,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         membershipAuthoritative,
         membershipAuthoritativeRaw,
         fallbackDiscoveryProvisional,
-        hasRelayAuthToken,
+        hasRelayAuthToken: relayHasAuthToken,
         membershipFetchTimedOutLike,
         membershipFetchSource
       })
@@ -1375,7 +1427,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const targetRelay = relay || relayFromList || undefined
       const resolved = targetRelay ? resolveRelayUrl(targetRelay) : null
       const isInMyGroups = myGroupList.some((entry) => entry.groupId === groupId)
-      const preferRelay = (!opts?.discoveryOnly && (opts?.preferRelay || isInMyGroups) && !!resolved)
+      const relayHasAuthToken = hasRelayAuthToken(resolved)
+      const preferRelay =
+        !opts?.discoveryOnly &&
+        !!resolved &&
+        (isInMyGroups || (!!opts?.preferRelay && relayHasAuthToken))
       const provisionalMetadata = getProvisionalGroupMetadata(groupId, targetRelay || resolved || undefined)
       const discoveryPrivate = discoveryGroups.some((entry) => {
         if (entry.id !== groupId) return false
@@ -1493,7 +1549,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         try {
           const start = time()
           const events = await client.fetchEvents(groupRelays, {
-            kinds: [9000, 9001],
+            kinds: [9000, 9001, 9022],
             '#h': [groupId],
             limit: 50
           })
@@ -1539,7 +1595,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         let fallbackMembershipEvents: typeof membershipEvents = []
         try {
           fallbackMembershipEvents = await client.fetchEvents(defaultDiscoveryRelays, {
-            kinds: [9000, 9001],
+            kinds: [9000, 9001, 9022],
             '#h': [groupId],
             limit: 50
           })
@@ -1570,7 +1626,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         if (!latest) return evt
         if (evt.created_at > latest.created_at) return evt
         if (evt.created_at < latest.created_at) return latest
-        if (evt.kind === 9001 && latest.kind !== 9001) return evt
+        if ((evt.kind === 9001 || evt.kind === 9022) && latest.kind === 9000) return evt
         return latest
       }, null as (typeof membershipEvents)[number] | null)
       const latestMembershipTargetsPreview = latestMembershipEvent
@@ -2168,6 +2224,236 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [pubkey, publish]
   )
 
+  const sendLeaveRequest = useCallback(
+    async (groupId: string, relay?: string, reason?: string) => {
+      if (!pubkey) throw new Error('Not logged in')
+      const draftEvent: TDraftEvent = {
+        kind: 9022,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [['h', groupId]],
+        content: reason ?? ''
+      }
+
+      const resolved = relay ? resolveRelayUrl(relay) : undefined
+      await publish(draftEvent, { specifiedRelayUrls: resolved ? [resolved] : undefined })
+    },
+    [pubkey, publish, resolveRelayUrl]
+  )
+
+  const enqueueLeavePublishRetry = useCallback(
+    (entry: Omit<GroupLeavePublishRetryEntry, 'attempts' | 'nextAttemptAt' | 'updatedAt'>) => {
+      if (!pubkey) return
+      localStorageService.upsertGroupLeavePublishRetryEntry(
+        {
+          ...entry,
+          attempts: 0,
+          nextAttemptAt: Date.now() + getLeavePublishRetryDelayMs(0),
+          updatedAt: Date.now()
+        },
+        pubkey
+      )
+    },
+    [pubkey]
+  )
+
+  const flushLeavePublishRetryQueue = useCallback(
+    async (reason: string) => {
+      if (!pubkey) return
+      const queue = localStorageService.getGroupLeavePublishRetryQueue(pubkey)
+      if (!queue.length) return
+
+      let workingMyGroups = [...myGroupList]
+      const now = Date.now()
+      const nextQueue: GroupLeavePublishRetryEntry[] = []
+
+      for (const item of queue) {
+        if (item.nextAttemptAt > now) {
+          nextQueue.push(item)
+          continue
+        }
+
+        let needs9022 = !!item.needs9022
+        let needs10009 = !!item.needs10009
+        let lastError: string | null = null
+
+        if (needs9022) {
+          try {
+            await sendLeaveRequest(item.groupId, item.relay, `retry:${reason}`)
+            needs9022 = false
+          } catch (error) {
+            lastError = error instanceof Error ? error.message : String(error)
+          }
+        }
+
+        if (needs10009) {
+          try {
+            workingMyGroups = workingMyGroups.filter((entry) => entry.groupId !== item.groupId)
+            await saveMyGroupList(workingMyGroups)
+            needs10009 = false
+          } catch (error) {
+            lastError = error instanceof Error ? error.message : String(error)
+          }
+        }
+
+        if (needs9022 || needs10009) {
+          const attempts = (item.attempts || 0) + 1
+          nextQueue.push({
+            ...item,
+            needs9022,
+            needs10009,
+            attempts,
+            nextAttemptAt: Date.now() + getLeavePublishRetryDelayMs(attempts),
+            updatedAt: Date.now(),
+            lastError
+          })
+        }
+      }
+
+      localStorageService.setGroupLeavePublishRetryQueue(nextQueue, pubkey)
+    },
+    [myGroupList, pubkey, saveMyGroupList, sendLeaveRequest]
+  )
+
+  useEffect(() => {
+    if (!pubkey) return
+    flushLeavePublishRetryQueue('provider-mount').catch(() => {})
+  }, [flushLeavePublishRetryQueue, pubkey])
+
+  useEffect(() => {
+    if (!pubkey) return
+    const onOnline = () => {
+      flushLeavePublishRetryQueue('network-online').catch(() => {})
+    }
+    window.addEventListener('online', onOnline)
+    return () => window.removeEventListener('online', onOnline)
+  }, [flushLeavePublishRetryQueue, pubkey])
+
+  const leaveGroup = useCallback(
+    async (groupId: string, relay?: string, options?: LeaveGroupOptions): Promise<LeaveGroupResult> => {
+      if (!pubkey) throw new Error('Not logged in')
+
+      const saveRelaySnapshot = options?.saveRelaySnapshot !== false
+      const saveSharedFiles = options?.saveSharedFiles !== false
+      const relayFromList = myGroupList.find((entry) => entry.groupId === groupId)?.relay
+      const relayEntry = getRelayEntryForGroup(groupId)
+      const resolvedRelay = resolveRelayUrl(relay || relayFromList || relayEntry?.connectionUrl || undefined)
+      const relayKey =
+        relayEntry?.relayKey ||
+        extractRelayKeyFromUrl(relay || relayFromList || relayEntry?.connectionUrl || null) ||
+        null
+
+      if (saveSharedFiles) {
+        try {
+          const targetRelays = resolvedRelay ? [resolvedRelay] : defaultDiscoveryRelays
+          await client.fetchEvents(targetRelays, {
+            kinds: [1063],
+            '#h': [groupId],
+            limit: 4000
+          })
+        } catch (_error) {
+          // best effort prefetch only
+        }
+      }
+
+      let workerResult: LeaveGroupWorkerResult | null = null
+      if (isElectron()) {
+        const workerResponse = await electronIpc.sendToWorkerAwait({
+          message: {
+            type: 'leave-group',
+            data: {
+              relayKey,
+              publicIdentifier: groupId,
+              saveRelaySnapshot,
+              saveSharedFiles
+            }
+          },
+          timeoutMs: 180_000
+        })
+        if (!workerResponse?.success) {
+          throw new Error(workerResponse?.error || 'Failed to process leave-group worker cleanup')
+        }
+        workerResult = (workerResponse?.data || null) as LeaveGroupWorkerResult | null
+      }
+
+      const archiveRelay = resolvedRelay || relayFromList || relay || undefined
+      if (saveSharedFiles) {
+        const archiveEntry: ArchivedGroupFilesEntry = {
+          groupId,
+          relay: archiveRelay,
+          archivedAt: Date.now()
+        }
+        localStorageService.upsertArchivedGroupFilesEntry(archiveEntry, pubkey)
+      } else {
+        localStorageService.removeArchivedGroupFilesEntry(groupId, undefined, pubkey)
+      }
+
+      const nextMyGroups = myGroupList.filter((entry) => entry.groupId !== groupId)
+      setMyGroupList(nextMyGroups)
+
+      let needs9022 = true
+      let needs10009 = true
+      const publishErrors: string[] = []
+
+      try {
+        await sendLeaveRequest(groupId, resolvedRelay || relayFromList || relay, options?.reason)
+        needs9022 = false
+      } catch (error) {
+        publishErrors.push(error instanceof Error ? error.message : String(error))
+      }
+
+      try {
+        await saveMyGroupList(nextMyGroups)
+        needs10009 = false
+      } catch (error) {
+        publishErrors.push(error instanceof Error ? error.message : String(error))
+      }
+
+      let queuedRetry = false
+      if (needs9022 || needs10009) {
+        enqueueLeavePublishRetry({
+          groupId,
+          relay: resolvedRelay || relayFromList || relay,
+          needs9022,
+          needs10009,
+          lastError: publishErrors.join(' | ')
+        })
+        queuedRetry = true
+      }
+
+      invalidateGroupMemberPreview(groupId, resolvedRelay || relayFromList || relay || undefined, {
+        reason: 'leave-group'
+      })
+      refreshGroupMemberPreview(groupId, resolvedRelay || relayFromList || relay || undefined, {
+        force: true,
+        reason: 'leave-group'
+      }).catch(() => {})
+
+      flushLeavePublishRetryQueue('post-leave').catch(() => {})
+
+      const recoveredCount = Number(workerResult?.sharedFiles?.recoveredCount || 0)
+      const failedCount = Number(workerResult?.sharedFiles?.failedCount || 0)
+      return {
+        worker: workerResult,
+        queuedRetry,
+        publishErrors,
+        recoveredCount,
+        failedCount
+      }
+    },
+    [
+      enqueueLeavePublishRetry,
+      flushLeavePublishRetryQueue,
+      getRelayEntryForGroup,
+      invalidateGroupMemberPreview,
+      myGroupList,
+      pubkey,
+      refreshGroupMemberPreview,
+      resolveRelayUrl,
+      saveMyGroupList,
+      sendLeaveRequest
+    ]
+  )
+
   const processedJoinFlowsRef = useMemo(() => new Set<string>(), [])
   const announcedOpenJoinMembershipRef = useMemo(() => new Set<string>(), [])
 
@@ -2363,6 +2649,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     // Don’t force BIG_RELAY_URLS here; use normal publish routing (privacy-preserving for token-joins).
     saveMyGroupList(next).catch(() => {})
   }, [myGroupList, pubkey, saveMyGroupList, workerRelays])
+
+  useEffect(() => {
+    if (!pubkey) return
+    const archived = localStorageService.getArchivedGroupFiles(pubkey)
+    if (!archived.length) return
+    const joined = new Set(myGroupList.map((entry) => entry.groupId))
+    const next = archived.filter((entry) => !joined.has(entry.groupId))
+    if (next.length !== archived.length) {
+      localStorageService.setArchivedGroupFiles(next, pubkey)
+    }
+  }, [myGroupList, pubkey])
 
   const waitForRelayBootstrapReady = useCallback(
     async ({
@@ -2743,22 +3040,6 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       await publish(draftEvent, { specifiedRelayUrls: relayUrls })
     },
     [discoveryRelays, pubkey, publish]
-  )
-
-  const sendLeaveRequest = useCallback(
-    async (groupId: string, relay?: string, reason?: string) => {
-      if (!pubkey) throw new Error('Not logged in')
-      const draftEvent: TDraftEvent = {
-        kind: 9022,
-        created_at: Math.floor(Date.now() / 1000),
-        tags: [['h', groupId]],
-        content: reason ?? ''
-      }
-
-      const resolved = relay ? resolveRelayUrl(relay) : undefined
-      await publish(draftEvent, { specifiedRelayUrls: resolved ? [resolved] : undefined })
-    },
-    [pubkey, publish, resolveRelayUrl]
   )
 
   const sendInvites = useCallback(
@@ -3376,6 +3657,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       saveMyGroupList,
       sendJoinRequest,
       sendLeaveRequest,
+      leaveGroup,
       fetchGroupDetail,
       getProvisionalGroupMetadata,
       getGroupMemberPreview,
@@ -3511,6 +3793,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       saveMyGroupList,
       sendJoinRequest,
       sendLeaveRequest,
+      leaveGroup,
       fetchGroupDetail,
       getProvisionalGroupMetadata,
       getGroupMemberPreview,

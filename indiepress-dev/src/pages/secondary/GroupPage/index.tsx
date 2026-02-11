@@ -44,6 +44,7 @@ import {
   DialogHeader,
   DialogTitle
 } from '@/components/ui/dialog'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -57,6 +58,7 @@ import FollowButton from '@/components/FollowButton'
 import Nip05 from '@/components/Nip05'
 import { useMuteList } from '@/providers/MuteListProvider'
 import ReportDialog from '@/components/NoteOptions/ReportDialog'
+import localStorageService from '@/services/local-storage.service'
 import * as nip19 from '@nostr/tools/nip19'
 import { SimpleUserAvatar } from '@/components/UserAvatar'
 import { SimpleUsername } from '@/components/Username'
@@ -383,7 +385,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     getProvisionalGroupMetadata,
     getGroupMemberPreview,
     sendJoinRequest,
-    sendLeaveRequest,
+    leaveGroup,
     invites,
     sendInvites,
     joinRequests,
@@ -398,7 +400,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     myGroupList
   } = useGroups()
   const { pubkey, profile: nostrProfile } = useNostr()
-  const { joinFlows, startJoinFlow, relays, sendToWorker } = useWorkerBridge()
+  const { joinFlows, startJoinFlow, relays, sendToWorker, relayServerReady } = useWorkerBridge()
   const [isLoading, setIsLoading] = useState(true)
   const [activeTab, setActiveTab] = useState<'notes' | 'files' | 'members' | 'requests'>('notes')
   const [groupFileCount, setGroupFileCount] = useState<number | undefined>(undefined)
@@ -410,6 +412,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const [isComposerOpen, setIsComposerOpen] = useState(false)
   const [isMetadataDialogOpen, setIsMetadataDialogOpen] = useState(false)
   const [isSavingMeta, setIsSavingMeta] = useState(false)
+  const [isLeaveDialogOpen, setIsLeaveDialogOpen] = useState(false)
+  const [isLeavingGroup, setIsLeavingGroup] = useState(false)
+  const [leaveSaveRelaySnapshot, setLeaveSaveRelaySnapshot] = useState(true)
+  const [leaveSaveSharedFiles, setLeaveSaveSharedFiles] = useState(true)
+  const [adminLeaveNotice, setAdminLeaveNotice] = useState<{ eventId: string; pubkey: string } | null>(null)
   const [copiedRelayUrl, setCopiedRelayUrl] = useState(false)
   const [memberSearch, setMemberSearch] = useState('')
   const [isInviteDialogOpen, setIsInviteDialogOpen] = useState(false)
@@ -437,11 +444,64 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const lastRouteSubscriptionRefreshRef = useRef<string | null>(null)
   const groupRelayWarmupKeyRef = useRef<string | null>(null)
   const lastWritableRefreshKeyRef = useRef<string | null>(null)
+  const lastAdminLeaveFetchRef = useRef<{ key: string; at: number } | null>(null)
   const sendToWorkerRef = useRef(sendToWorker)
+  const relaySubscriptionRefreshThrottleRef = useRef<Map<string, number>>(new Map())
 
   useEffect(() => {
     sendToWorkerRef.current = sendToWorker
   }, [sendToWorker])
+
+  const requestRelaySubscriptionRefresh = React.useCallback(
+    ({
+      relayKey,
+      publicIdentifier,
+      reason,
+      minIntervalMs = 1500
+    }: {
+      relayKey?: string | null
+      publicIdentifier?: string | null
+      reason: string
+      minIntervalMs?: number
+    }) => {
+      const normalizedPublicIdentifier =
+        typeof publicIdentifier === 'string' && publicIdentifier.trim()
+          ? publicIdentifier.trim()
+          : null
+      const normalizedRelayKey =
+        typeof relayKey === 'string' && relayKey.trim()
+          ? relayKey.trim()
+          : null
+      if (!normalizedPublicIdentifier && !normalizedRelayKey) return false
+      if (!relayServerReady) return false
+
+      const send = sendToWorkerRef.current
+      if (!send) return false
+
+      const key = `${normalizedPublicIdentifier || ''}|${normalizedRelayKey || ''}`
+      const now = Date.now()
+      const lastSentAt = relaySubscriptionRefreshThrottleRef.current.get(key) || 0
+      if (now - lastSentAt < minIntervalMs) return false
+      relaySubscriptionRefreshThrottleRef.current.set(key, now)
+      if (relaySubscriptionRefreshThrottleRef.current.size > 64) {
+        const pruneBefore = now - 30_000
+        for (const [entryKey, ts] of relaySubscriptionRefreshThrottleRef.current.entries()) {
+          if (ts < pruneBefore) relaySubscriptionRefreshThrottleRef.current.delete(entryKey)
+        }
+      }
+
+      send({
+        type: 'refresh-relay-subscriptions',
+        data: {
+          relayKey: normalizedRelayKey,
+          publicIdentifier: normalizedPublicIdentifier,
+          reason
+        }
+      }).catch(() => {})
+      return true
+    },
+    [relayServerReady]
+  )
 
   const myGroupRelay = useMemo(
     () => (groupId ? myGroupList.find((entry) => entry.groupId === groupId)?.relay : undefined),
@@ -451,6 +511,20 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     () => !!(groupId && myGroupList.some((entry) => entry.groupId === groupId)),
     [groupId, myGroupList]
   )
+  const workerRelayEntryForGroup = useMemo(() => {
+    if (!groupId || !relays?.length) return null
+    const candidates = new Set<string>()
+    candidates.add(groupId)
+    candidates.add(groupId.replace(':', '/'))
+    candidates.add(groupId.replace('/', ':'))
+    return (
+      relays.find(
+        (entry) =>
+          (entry.publicIdentifier && candidates.has(entry.publicIdentifier)) ||
+          (entry.relayKey && candidates.has(entry.relayKey))
+      ) || null
+    )
+  }, [groupId, relays])
   const effectiveGroupRelay = useMemo(() => groupRelay || myGroupRelay, [groupRelay, myGroupRelay])
   const provisionalMeta = useMemo(
     () => (groupId ? getProvisionalGroupMetadata(groupId, effectiveGroupRelay) : null),
@@ -648,20 +722,24 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     if (!joinFlow?.writableAt || !joinFlow?.writable) return
     const writableRefreshKey = `${groupId}|${joinFlow.relayKey || ''}|${joinFlow.mode || ''}|${joinFlow.writableAt}`
     if (lastWritableRefreshKeyRef.current === writableRefreshKey) return
+    const requested = requestRelaySubscriptionRefresh({
+      relayKey: joinFlow.relayKey || null,
+      publicIdentifier: groupId,
+      reason: 'group-page-join-writable',
+      minIntervalMs: 1200
+    })
+    if (!requested) return
     lastWritableRefreshKeyRef.current = writableRefreshKey
-    const send = sendToWorkerRef.current
-    if (send) {
-      send({
-        type: 'refresh-relay-subscriptions',
-        data: {
-          relayKey: joinFlow.relayKey || null,
-          publicIdentifier: groupId,
-          reason: 'group-page-join-writable'
-        }
-      }).catch(() => {})
-    }
     setJoinRelayRefreshNonce((prev) => prev + 1)
-  }, [groupId, joinFlow?.mode, joinFlow?.relayKey, joinFlow?.relayUrl, joinFlow?.writable, joinFlow?.writableAt])
+  }, [
+    groupId,
+    joinFlow?.mode,
+    joinFlow?.relayKey,
+    joinFlow?.relayUrl,
+    joinFlow?.writable,
+    joinFlow?.writableAt,
+    requestRelaySubscriptionRefresh
+  ])
 
   const resolvedGroupRelay = useMemo(() => {
     return effectiveGroupRelay ? resolveRelayUrl(effectiveGroupRelay) : undefined
@@ -684,6 +762,16 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     }
   }
 
+  const isLocalRelayProxyUrl = (relay?: string) => {
+    if (!relay) return false
+    try {
+      const parsed = new URL(relay)
+      return parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost'
+    } catch (_err) {
+      return /^wss?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?/i.test(relay)
+    }
+  }
+
   const tokenizedResolvedGroupRelay = useMemo(() => {
     return isTokenizedRelayUrl(resolvedGroupRelay) ? resolvedGroupRelay : undefined
   }, [resolvedGroupRelay])
@@ -701,6 +789,34 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   )
 
   const activeGroupRelay = pinnedGroupRelay || tokenizedResolvedGroupRelay || fallbackGroupRelay
+  const relayRequiresAuth = workerRelayEntryForGroup?.requiresAuth === true
+  const relayHasAuthToken =
+    isTokenizedRelayUrl(activeGroupRelay) ||
+    isTokenizedRelayUrl(resolvedGroupRelay) ||
+    isTokenizedRelayUrl(workerRelayEntryForGroup?.connectionUrl)
+  const relayCandidateForGating =
+    activeGroupRelay ||
+    resolvedGroupRelay ||
+    effectiveGroupRelay ||
+    workerRelayEntryForGroup?.connectionUrl
+  const shouldWaitForAuthRelay = Boolean(groupId && relayRequiresAuth && !relayHasAuthToken)
+  const shouldWaitForLocalRelayReady = Boolean(
+    groupId &&
+    isElectron() &&
+    isLocalRelayProxyUrl(relayCandidateForGating) &&
+    !relayServerReady
+  )
+  const publishReadyRelay =
+    shouldWaitForAuthRelay || shouldWaitForLocalRelayReady
+      ? undefined
+      : activeGroupRelay || resolvedGroupRelay || effectiveGroupRelay
+
+  useEffect(() => {
+    if (!isComposerOpen) return
+    if (publishReadyRelay) return
+    setIsComposerOpen(false)
+  }, [isComposerOpen, publishReadyRelay])
+
   const closedJoinPendingStorageKey = useMemo(
     () =>
       toClosedGroupJoinPendingStorageKey({
@@ -744,7 +860,14 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     }
   }, [closedJoinPendingStorageKey])
 
-  const shouldGateGroupSubRequests = Boolean(groupId && !activeGroupRelay && BIG_RELAY_URLS.length === 0)
+  const shouldGateGroupSubRequests = Boolean(
+    groupId &&
+    (
+      shouldWaitForAuthRelay ||
+      shouldWaitForLocalRelayReady ||
+      (!activeGroupRelay && BIG_RELAY_URLS.length === 0)
+    )
+  )
 
   const groupSubRequests = useMemo(
     () =>
@@ -978,45 +1101,122 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     }
   }
 
-  const handleLeave = async () => {
+  const handleLeaveClick = () => {
+    setLeaveSaveRelaySnapshot(true)
+    setLeaveSaveSharedFiles(true)
+    setIsLeaveDialogOpen(true)
+  }
+
+  const handleLeaveConfirm = async () => {
     if (!groupId) return
+    setIsLeavingGroup(true)
+    const toastId = toast.loading('Leaving group...', {
+      description: 'Archiving/removing local data and updating group membership events.'
+    })
     try {
-      await sendLeaveRequest(groupId, effectiveGroupRelay)
+      const result = await leaveGroup(groupId, effectiveGroupRelay, {
+        saveRelaySnapshot: leaveSaveRelaySnapshot,
+        saveSharedFiles: leaveSaveSharedFiles
+      })
       clearClosedJoinRequestPending()
       setDetail((prev) =>
         prev
-          ? { ...prev, membershipStatus: 'not-member' }
+          ? {
+              ...prev,
+              membershipStatus: 'not-member',
+              members: (prev.members || []).filter((member) => member !== pubkey)
+            }
           : prev
       )
+      setIsLeaveDialogOpen(false)
+
+      if (result.queuedRetry) {
+        toast.success('Left locally, sync pending', {
+          id: toastId,
+          description:
+            "Local leave is complete. We'll retry publishing your leave updates (9022/10009) in the background."
+        })
+        return
+      }
+
+      if (!leaveSaveRelaySnapshot && !leaveSaveSharedFiles) {
+        toast.success('Group data removed', {
+          id: toastId,
+          description: 'You left the group and removed all local relay and shared file data.'
+        })
+        return
+      }
+
+      const statusDescription = (() => {
+        if (leaveSaveRelaySnapshot && leaveSaveSharedFiles) {
+          return 'Relay snapshot archived. Shared files kept locally.'
+        }
+        if (leaveSaveRelaySnapshot && !leaveSaveSharedFiles) {
+          return 'Relay snapshot archived. Shared files removed from this device.'
+        }
+        return 'Relay snapshot removed. Shared files kept locally.'
+      })()
+      const recoveryDescription =
+        result.recoveredCount > 0 || result.failedCount > 0
+          ? `Recovered ${result.recoveredCount} files, ${result.failedCount} failed.`
+          : null
+      toast.success('You left the group', {
+        id: toastId,
+        description: recoveryDescription
+          ? `${statusDescription} ${recoveryDescription}`
+          : statusDescription
+      })
     } catch (err) {
       setError((err as Error).message)
+      toast.error('Failed to leave group', {
+        id: toastId,
+        description: err instanceof Error ? err.message : String(err)
+      })
+    } finally {
+      setIsLeavingGroup(false)
     }
   }
 
-  const baseDetail =
-    detail ||
-    (fallbackMeta
-      ? {
-          metadata: fallbackMeta,
-          admins: [],
-          members: [],
-          membershipStatus: 'not-member' as const,
-          membershipAuthoritative: false,
-          membershipEventsCount: 0,
-          membersFromEventCount: 0,
-          membersSnapshotCreatedAt: null,
-          membershipFetchTimedOutLike: false,
-          membershipFetchSource: 'group-relay' as const
-        }
-      : null)
+  const dismissAdminLeaveNotice = React.useCallback(() => {
+    if (groupId && adminLeaveNotice?.eventId) {
+      localStorageService.markDismissedGroupAdminLeaveEvent(
+        `${groupId}:${adminLeaveNotice.eventId}`,
+        pubkey
+      )
+    }
+    setAdminLeaveNotice(null)
+  }, [adminLeaveNotice?.eventId, groupId, pubkey])
+
+  const baseDetail = useMemo(
+    () =>
+      detail ||
+      (fallbackMeta
+        ? {
+            metadata: fallbackMeta,
+            admins: [],
+            members: [],
+            membershipStatus: 'not-member' as const,
+            membershipAuthoritative: false,
+            membershipEventsCount: 0,
+            membersFromEventCount: 0,
+            membersSnapshotCreatedAt: null,
+            membershipFetchTimedOutLike: false,
+            membershipFetchSource: 'group-relay' as const
+          }
+        : null),
+    [detail, fallbackMeta]
+  )
   let membershipStatus = baseDetail?.membershipStatus ?? 'not-member'
   if (isInMyGroups || isCreator) {
     membershipStatus = 'member'
   }
-  const membersWithSelf = new Set(baseDetail?.members || [])
-  if (membershipStatus === 'member' && pubkey) {
-    membersWithSelf.add(pubkey)
-  }
+  const membersWithSelf = useMemo(() => {
+    const withSelf = new Set(baseDetail?.members || [])
+    if (membershipStatus === 'member' && pubkey) {
+      withSelf.add(pubkey)
+    }
+    return Array.from(withSelf)
+  }, [baseDetail?.members, membershipStatus, pubkey])
   const mockMembersConfig = useMemo(() => {
     if (process.env.NODE_ENV !== 'development') return null
     if (typeof window === 'undefined') return null
@@ -1063,7 +1263,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
 
   const effectiveDetail = useMemo(() => {
     if (!baseDetail) return null
-    const detailWithSelf = { ...baseDetail, membershipStatus, members: Array.from(membersWithSelf) }
+    const detailWithSelf = { ...baseDetail, membershipStatus, members: membersWithSelf }
     if (!mockMembersConfig) return detailWithSelf
     return {
       ...detailWithSelf,
@@ -1119,6 +1319,60 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const isAdmin =
     !!pubkey &&
     (isCreator || !!effectiveDetail?.admins?.some((admin) => admin.pubkey === pubkey))
+
+  const adminLeaveCandidatePubkeys = useMemo(() => {
+    const pubkeys = normalizePubkeyList((effectiveDetail?.admins || []).map((admin) => admin.pubkey))
+    if (effectiveDetail?.metadata?.event?.pubkey) {
+      pubkeys.push(effectiveDetail.metadata.event.pubkey)
+    }
+    return normalizePubkeyList(pubkeys)
+  }, [effectiveDetail?.admins, effectiveDetail?.metadata?.event?.pubkey])
+
+  const adminLeaveFetchKey = useMemo(() => {
+    if (!groupId || !isMember || adminLeaveCandidatePubkeys.length === 0) return null
+    const relayUrls = activeGroupRelay ? [activeGroupRelay] : BIG_RELAY_URLS
+    return `${groupId}|${relayUrls.join(',')}|${adminLeaveCandidatePubkeys.join(',')}|${pubkey || ''}`
+  }, [activeGroupRelay, adminLeaveCandidatePubkeys, groupId, isMember, pubkey])
+
+  useEffect(() => {
+    if (!groupId || !isMember) return
+    if (!adminLeaveFetchKey) return
+    if (adminLeaveCandidatePubkeys.length === 0) return
+
+    const now = Date.now()
+    const lastFetch = lastAdminLeaveFetchRef.current
+    if (lastFetch && lastFetch.key === adminLeaveFetchKey && now - lastFetch.at < 30_000) return
+    lastAdminLeaveFetchRef.current = { key: adminLeaveFetchKey, at: now }
+
+    let cancelled = false
+    const adminPubkeys = new Set(adminLeaveCandidatePubkeys)
+    const relayUrls = activeGroupRelay ? [activeGroupRelay] : BIG_RELAY_URLS
+    client
+      .fetchEvents(relayUrls, {
+        kinds: [9022],
+        '#h': [groupId],
+        limit: 200
+      })
+      .then((events) => {
+        if (cancelled) return
+        const latestAdminLeave = events
+          .filter((event) => adminPubkeys.has(event.pubkey))
+          .sort((a, b) => b.created_at - a.created_at)[0]
+        if (!latestAdminLeave) return
+        if (latestAdminLeave.pubkey === pubkey) return
+        const eventKey = `${groupId}:${latestAdminLeave.id}`
+        if (localStorageService.isGroupAdminLeaveEventDismissed(eventKey, pubkey)) return
+        setAdminLeaveNotice({
+          eventId: latestAdminLeave.id,
+          pubkey: latestAdminLeave.pubkey
+        })
+      })
+      .catch(() => {})
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeGroupRelay, adminLeaveCandidatePubkeys, adminLeaveFetchKey, groupId, isMember, pubkey])
 
   const groupMemberPreview = useMemo(
     () => (groupId ? getGroupMemberPreview(groupId, effectiveGroupRelay) : null),
@@ -1192,16 +1446,15 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     const relayKey = relayKeyForGroup || inviteRelayKey || null
     const refreshKey = `${groupId}|${relayKey || ''}`
     if (lastRouteSubscriptionRefreshRef.current === refreshKey) return
+    const requested = requestRelaySubscriptionRefresh({
+      relayKey,
+      publicIdentifier: groupId,
+      reason: 'group-page-route-enter',
+      minIntervalMs: 1500
+    })
+    if (!requested) return
     lastRouteSubscriptionRefreshRef.current = refreshKey
-    sendToWorker({
-      type: 'refresh-relay-subscriptions',
-      data: {
-        relayKey,
-        publicIdentifier: groupId,
-        reason: 'group-page-route-enter'
-      }
-    }).catch(() => {})
-  }, [groupId, inviteData?.relayKey, relayKeyForGroup, sendToWorker])
+  }, [groupId, inviteData?.relayKey, relayKeyForGroup, requestRelaySubscriptionRefresh, sendToWorker])
 
   useEffect(() => {
     if (process.env.NODE_ENV !== 'development') return
@@ -1544,7 +1797,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                         )}
                       </Button>
                       {isMember && (
-                        <Button variant="outline" size="sm" onClick={handleLeave}>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={handleLeaveClick}
+                          disabled={isLeavingGroup}
+                        >
                           <LogOut className="w-4 h-4 mr-2" />
                           {t('Leave')}
                         </Button>
@@ -1612,7 +1870,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
               </div>
               <div className="w-full">
                 {isMember ? (
-                  <Button variant="secondary" className="w-full" onClick={() => setIsComposerOpen(true)}>
+                  <Button
+                    variant="secondary"
+                    className="w-full"
+                    onClick={() => setIsComposerOpen(true)}
+                    disabled={!publishReadyRelay}
+                  >
                     {t('New Post')}
                   </Button>
                 ) : canRequestToJoinClosedGroup ? (
@@ -1767,11 +2030,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           setOpen={setIsComposerOpen}
           groupContext={{
             groupId,
-            relay: resolvedGroupRelay || effectiveGroupRelay,
+            relay: publishReadyRelay,
             name: effectiveDetail?.metadata?.name,
             picture: groupPicture
           }}
-          openFrom={resolvedGroupRelay ? [resolvedGroupRelay] : effectiveGroupRelay ? [effectiveGroupRelay] : undefined}
+          openFrom={publishReadyRelay ? [publishReadyRelay] : undefined}
         />
       )}
       {reportEvent && (
@@ -1895,6 +2158,101 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             onCancel={() => setIsMetadataDialogOpen(false)}
             saving={isSavingMeta}
           />
+        </DialogContent>
+      </Dialog>
+      <Dialog open={isLeaveDialogOpen} onOpenChange={(open) => !isLeavingGroup && setIsLeaveDialogOpen(open)}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Leave group?</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Choose what to keep on this device before leaving.
+            </p>
+            <div className="space-y-4 rounded-md border p-3">
+              <div className="flex items-start gap-3">
+                <Checkbox
+                  id="leave-save-relay-snapshot"
+                  checked={leaveSaveRelaySnapshot}
+                  onCheckedChange={(value) => setLeaveSaveRelaySnapshot(value === true)}
+                  disabled={isLeavingGroup}
+                />
+                <div className="space-y-1">
+                  <label htmlFor="leave-save-relay-snapshot" className="text-sm font-medium cursor-pointer">
+                    Save relay database snapshot
+                  </label>
+                  <p className="text-xs text-muted-foreground">
+                    A copy is archived locally, then the active relay database is removed.
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-start gap-3">
+                <Checkbox
+                  id="leave-save-shared-files"
+                  checked={leaveSaveSharedFiles}
+                  onCheckedChange={(value) => setLeaveSaveSharedFiles(value === true)}
+                  disabled={isLeavingGroup}
+                />
+                <div className="space-y-1">
+                  <label htmlFor="leave-save-shared-files" className="text-sm font-medium cursor-pointer">
+                    Save shared files in Files page
+                  </label>
+                  <p className="text-xs text-muted-foreground">
+                    Keep local copies of this group's shared files after you leave.
+                  </p>
+                </div>
+              </div>
+            </div>
+            <p className="text-xs text-destructive">
+              Unchecked items are permanently removed from this device.
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setIsLeaveDialogOpen(false)}
+                disabled={isLeavingGroup}
+              >
+                Cancel
+              </Button>
+              <Button onClick={handleLeaveConfirm} disabled={isLeavingGroup}>
+                {isLeavingGroup ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    Leaving group...
+                  </>
+                ) : (
+                  'Leave group'
+                )}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={!!adminLeaveNotice} onOpenChange={(open) => !open && dismissAdminLeaveNotice()}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Group admin left</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <p className="text-sm text-muted-foreground">
+              An admin has left this group. New members may have limited read/write access on this relay.
+            </p>
+            <p className="text-sm text-muted-foreground">
+              For full control and stability, start a new group.
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={() => {
+                  dismissAdminLeaveNotice()
+                  toast.message('Open Groups to start a new group.')
+                }}
+              >
+                Start new group
+              </Button>
+              <Button onClick={dismissAdminLeaveNotice}>Understood</Button>
+            </div>
+          </div>
         </DialogContent>
       </Dialog>
     </>

@@ -56,6 +56,9 @@ export const StorageKey = {
   FAVORITE_LISTS: 'favoriteLists',
   FAVORITE_GROUPS: 'favoriteGroups',
   GROUP_DISCOVERY_RELAYS: 'groupDiscoveryRelays',
+  GROUP_FILES_ARCHIVED_GROUPS: 'groupFilesArchivedGroups',
+  GROUP_LEAVE_PUBLISH_RETRY_QUEUE: 'groupLeavePublishRetryQueue',
+  GROUP_ADMIN_LEAVE_DISMISSED_EVENTS: 'groupAdminLeaveDismissedEvents',
   HIDE_UNTRUSTED_EVENTS: 'hideUntrustedEvents' // deprecated
 }
 

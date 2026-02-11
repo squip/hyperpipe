@@ -16,6 +16,7 @@ import {
   getRelayProfileByKey,
   getRelayProfileByPublicIdentifier,
   saveRelayProfile,
+  removeRelayProfile,
   removeRelayAuth, // <-- NEW IMPORT
   updateRelayMembers, // This is likely not used directly anymore for member_adds/removes
   updateRelayAuthToken, // <-- NEW IMPORT
@@ -23,7 +24,13 @@ import {
   calculateMembers,
   calculateAuthorizedUsers
 } from './hypertuna-relay-profile-manager-bare.mjs'
-import { loadRelayKeyMappings, activeRelays, virtualRelayKeys, keyToPublic } from './hypertuna-relay-manager-adapter.mjs'
+import {
+  loadRelayKeyMappings,
+  activeRelays,
+  virtualRelayKeys,
+  keyToPublic,
+  removeRelayMapping
+} from './hypertuna-relay-manager-adapter.mjs'
 import { getRelayAuthStore } from './relay-auth-store.mjs'
 import {
   queuePendingAuthUpdate,
@@ -47,8 +54,10 @@ import {
   getReplicationHealth,
   getCorestore,
   getRelayCorestore,
+  removeRelayCorestore,
   getLocalDrive,
-  getPfpDrive
+  getPfpDrive,
+  deleteRelayFilesByIdentifierPrefix
 } from './hyperdrive-manager.mjs';
 import { ensureMirrorsForProviders, stopAllMirrors } from './mirror-sync-manager.mjs';
 import { NostrUtils } from './nostr-utils.js';
@@ -163,6 +172,11 @@ const CLOSED_JOIN_POOL_REFRESH_MS = 30 * 60 * 1000
 const openJoinWriterPoolCache = new Map()
 const openJoinWriterPoolLocks = new Set()
 const closedJoinWriterPoolLocks = new Set()
+const RELAY_SUBSCRIPTION_REFRESH_MIN_INTERVAL_MS = 1500
+const RELAY_SUBSCRIPTION_REFRESH_CACHE_TTL_MS = 60 * 1000
+const RELAY_SUBSCRIPTION_REFRESH_MAX_TRACKED = 512
+const relaySubscriptionRefreshRecent = new Map()
+const relaySubscriptionRefreshInFlight = new Map()
 
 function resolveClosedJoinPoolEntryTtlMs(config) {
   const fromConfig =
@@ -248,6 +262,26 @@ function describeRelayIdentifierType(value) {
 function resolveRelayIdentifierPath(identifier) {
   if (!identifier || typeof identifier !== 'string') return null
   return identifier.includes(':') ? identifier.replace(':', '/') : identifier
+}
+
+function makeRelaySubscriptionRefreshKey({ relayKey = null, publicIdentifier = null } = {}) {
+  const relayPart = relayKey ? String(relayKey).trim().toLowerCase() : ''
+  const publicPart = publicIdentifier ? String(publicIdentifier).trim() : ''
+  return `${relayPart}|${publicPart}`
+}
+
+function pruneRelaySubscriptionRefreshState(now = Date.now()) {
+  for (const [key, ts] of relaySubscriptionRefreshRecent.entries()) {
+    if (!Number.isFinite(ts) || now - ts > RELAY_SUBSCRIPTION_REFRESH_CACHE_TTL_MS) {
+      relaySubscriptionRefreshRecent.delete(key)
+    }
+  }
+  if (relaySubscriptionRefreshRecent.size <= RELAY_SUBSCRIPTION_REFRESH_MAX_TRACKED) return
+  const sorted = Array.from(relaySubscriptionRefreshRecent.entries()).sort((a, b) => a[1] - b[1])
+  const overflow = relaySubscriptionRefreshRecent.size - RELAY_SUBSCRIPTION_REFRESH_MAX_TRACKED
+  for (let index = 0; index < overflow; index += 1) {
+    relaySubscriptionRefreshRecent.delete(sorted[index][0])
+  }
 }
 
 function resolveHostPeersFromGatewayStatus(status, identifier) {
@@ -4433,7 +4467,7 @@ global.syncActiveRelayCoreRefs = syncActiveRelayCoreRefs
 global.appendOpenJoinMirrorCores = appendOpenJoinMirrorCores
 global.recoverRelayDriveFile = recoverRelayDriveFile
 global.recoverConversationDriveFile = recoverConversationDriveFile
-global.requestRelaySubscriptionRefresh = async ({ relayKey = null, reason = 'manual' } = {}) => {
+global.requestRelaySubscriptionRefresh = async (relayKey = null, { reason = 'manual' } = {}) => {
   console.log('[Worker] Subscription refresh requested before relay server ready', {
     relayKey,
     reason
@@ -4459,6 +4493,231 @@ global.onRelayWritable = (payload = {}) => {
   refreshGatewayRelayRegistry(`relay-writable-${mode}`).catch((err) => {
     console.warn('[Worker] Gateway registry refresh failed after relay-writable:', err?.message || err)
   })
+}
+
+function sanitizeArchiveSegment(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return 'relay'
+  return raw.replace(/[^a-zA-Z0-9._-]+/g, '_')
+}
+
+function uniqueIdentifiers(values = []) {
+  const seen = new Set()
+  const result = []
+  for (const value of values) {
+    const normalized = typeof value === 'string' ? value.trim() : ''
+    if (!normalized || seen.has(normalized)) continue
+    seen.add(normalized)
+    result.push(normalized)
+  }
+  return result
+}
+
+async function emitRelayUpdateSnapshot(reason = 'manual') {
+  if (!relayServer) return
+  try {
+    const relays = await relayServer.getActiveRelays()
+    const relaysAuth = await addAuthInfoToRelays(relays)
+    await syncGatewayPeerMetadata(`relay-update:${reason}`, { relays: relaysAuth })
+    sendMessage({
+      type: 'relay-update',
+      relays: addMembersToRelays(relaysAuth)
+    })
+  } catch (error) {
+    console.warn('[Worker] Failed to emit relay-update snapshot', {
+      reason,
+      error: error?.message || error
+    })
+  }
+}
+
+async function disconnectRelayForCleanup({ relayKey, publicIdentifier = null, reason = 'leave-group' } = {}) {
+  if (!relayKey) {
+    return { status: 'skipped', reason: 'missing-relay-key' }
+  }
+  if (!relayServer) {
+    return { status: 'skipped', reason: 'relay-server-unavailable' }
+  }
+
+  const relayManagerInstance = activeRelays.get(relayKey)
+  if (!relayManagerInstance) {
+    return { status: 'skipped', reason: 'relay-not-active' }
+  }
+
+  try {
+    const result = await relayServer.disconnectRelay(relayKey)
+    if (!result?.success) {
+      return { status: 'error', reason: result?.error || 'disconnect-failed' }
+    }
+
+    detachRelayMirrorHooks(relayManagerInstance)
+    try {
+      const manager = await ensureBlindPeeringManager()
+      if (manager?.started) {
+        await manager.removeRelayMirror({
+          relayKey,
+          publicIdentifier,
+          autobase: relayManagerInstance?.relay || null
+        }, { reason })
+      }
+    } catch (mirrorError) {
+      console.warn('[Worker] Blind peering mirror removal failed during relay cleanup', {
+        relayKey,
+        reason,
+        error: mirrorError?.message || mirrorError
+      })
+    }
+
+    return { status: 'ok' }
+  } catch (error) {
+    if (relayManagerInstance?.relay) {
+      attachRelayMirrorHooks(relayKey, relayManagerInstance, blindPeeringManager)
+    }
+    return { status: 'error', reason: error?.message || String(error) }
+  }
+}
+
+async function collectRelayFileProviderSnapshot(relayKey) {
+  if (!relayKey) return []
+  const manager = activeRelays.get(relayKey)
+  if (!manager?.relay || typeof manager.relay.queryFilekeyIndex !== 'function') return []
+  try {
+    const fileMap = await manager.relay.queryFilekeyIndex()
+    const entries = []
+    for (const [fileHash, providerMap] of fileMap.entries()) {
+      const providers = providerMap instanceof Map
+        ? Array.from(providerMap.keys()).filter(Boolean)
+        : []
+      entries.push({ fileHash, providers })
+    }
+    return entries
+  } catch (error) {
+    console.warn('[Worker] Failed to collect relay file provider snapshot', {
+      relayKey,
+      error: error?.message || error
+    })
+    return []
+  }
+}
+
+async function recoverRelayFilesFromSnapshot({
+  relayKey,
+  publicIdentifier = null,
+  fileProviders = []
+} = {}) {
+  const primaryIdentifier = publicIdentifier || relayKey
+  if (!primaryIdentifier) return { recoveredCount: 0, failedCount: 0 }
+
+  await ensureRelayFolder(primaryIdentifier)
+  let recoveredCount = 0
+  let failedCount = 0
+
+  for (const entry of fileProviders) {
+    const fileHash = typeof entry?.fileHash === 'string' ? entry.fileHash : null
+    const providers = Array.isArray(entry?.providers) ? entry.providers : []
+    if (!fileHash) continue
+
+    let hasLocalCopy = false
+    try {
+      hasLocalCopy = !!(await getFile(primaryIdentifier, fileHash))
+      if (!hasLocalCopy && relayKey && relayKey !== primaryIdentifier) {
+        hasLocalCopy = !!(await getFile(relayKey, fileHash))
+      }
+    } catch (_) {
+      hasLocalCopy = false
+    }
+    if (hasLocalCopy) {
+      recoveredCount += 1
+      continue
+    }
+
+    let restored = false
+    for (const providerDriveKey of providers) {
+      try {
+        let data = await fetchFileFromDrive(providerDriveKey, primaryIdentifier, fileHash)
+        if (!data && relayKey && relayKey !== primaryIdentifier) {
+          data = await fetchFileFromDrive(providerDriveKey, relayKey, fileHash)
+        }
+        if (!data) continue
+        await storeFile(primaryIdentifier, fileHash, data, {
+          sourceDrive: providerDriveKey,
+          recoveredAt: Date.now(),
+          reason: 'leave-group-save-shared-files'
+        })
+        restored = true
+        break
+      } catch (_error) {
+        // continue to next provider
+      }
+    }
+
+    if (restored) {
+      recoveredCount += 1
+    } else {
+      failedCount += 1
+    }
+  }
+
+  return { recoveredCount, failedCount }
+}
+
+async function cleanupRelayLocalFilePrefixes(identifiers = []) {
+  let deletedCount = 0
+  for (const identifier of uniqueIdentifiers(identifiers)) {
+    try {
+      const result = await deleteRelayFilesByIdentifierPrefix(identifier)
+      deletedCount += Number(result?.deletedCount || 0)
+    } catch (error) {
+      console.warn('[Worker] Failed to delete local relay file prefix', {
+        identifier,
+        error: error?.message || error
+      })
+    }
+  }
+  return { deletedCount }
+}
+
+async function archiveOrRemoveRelayStorage({
+  relayStoragePath = null,
+  relayKey = null,
+  publicIdentifier = null,
+  saveRelaySnapshot = true
+} = {}) {
+  if (!relayStoragePath) {
+    return { status: 'skipped', archivePath: null }
+  }
+
+  if (saveRelaySnapshot) {
+    const storageBase = config?.storage || defaultStorageDir
+    const archiveRoot = join(storageBase, 'relay-archives')
+    const archivePath = join(
+      archiveRoot,
+      `${sanitizeArchiveSegment(publicIdentifier || relayKey || 'relay')}-${Date.now()}`
+    )
+    try {
+      await fs.mkdir(archiveRoot, { recursive: true })
+      await fs.cp(relayStoragePath, archivePath, { recursive: true, force: true })
+      await fs.rm(relayStoragePath, { recursive: true, force: true })
+      return { status: 'saved', archivePath }
+    } catch (error) {
+      return {
+        status: 'error',
+        archivePath: null,
+        error: error?.message || String(error)
+      }
+    }
+  }
+
+  try {
+    await fs.rm(relayStoragePath, { recursive: true, force: true })
+    return { status: 'removed', archivePath: null }
+  } catch (error) {
+    return {
+      status: 'error',
+      archivePath: null,
+      error: error?.message || String(error)
+    }
+  }
 }
 
 async function handleMessageObject(message) {
@@ -5202,6 +5461,151 @@ async function handleMessageObject(message) {
       }
       break
 
+    case 'leave-group': {
+      const requestId = extractMessageRequestId(message)
+      const data = (message && typeof message === 'object' ? message.data : null) || {}
+      const saveRelaySnapshot = data?.saveRelaySnapshot !== false
+      const saveSharedFiles = data?.saveSharedFiles !== false
+
+      try {
+        const requestedRelayKey =
+          normalizeRelayKeyHex(data?.relayKey) ||
+          (typeof data?.relayKey === 'string' ? data.relayKey.trim() : null) ||
+          null
+        const requestedPublicIdentifier =
+          typeof data?.publicIdentifier === 'string' && data.publicIdentifier.trim()
+            ? data.publicIdentifier.trim()
+            : null
+
+        if (!requestedRelayKey && !requestedPublicIdentifier) {
+          throw new Error('leave-group requires relayKey or publicIdentifier')
+        }
+
+        let profile = null
+        if (requestedRelayKey) {
+          profile = await getRelayProfileByKey(requestedRelayKey)
+        }
+        if (!profile && requestedPublicIdentifier) {
+          profile = await getRelayProfileByPublicIdentifier(requestedPublicIdentifier)
+        }
+
+        let resolvedRelayKey =
+          requestedRelayKey ||
+          profile?.relay_key ||
+          (requestedPublicIdentifier ? await getRelayKeyFromPublicIdentifier(requestedPublicIdentifier) : null) ||
+          null
+        let resolvedPublicIdentifier =
+          requestedPublicIdentifier ||
+          profile?.public_identifier ||
+          (resolvedRelayKey ? keyToPublic.get(resolvedRelayKey) || null : null)
+
+        if (!profile && resolvedRelayKey) {
+          profile = await getRelayProfileByKey(resolvedRelayKey)
+        }
+        if (!profile && resolvedPublicIdentifier) {
+          profile = await getRelayProfileByPublicIdentifier(resolvedPublicIdentifier)
+        }
+        if (!resolvedRelayKey && profile?.relay_key) {
+          resolvedRelayKey = profile.relay_key
+        }
+        if (!resolvedPublicIdentifier && profile?.public_identifier) {
+          resolvedPublicIdentifier = profile.public_identifier
+        }
+
+        const fileProviders = saveSharedFiles && resolvedRelayKey
+          ? await collectRelayFileProviderSnapshot(resolvedRelayKey)
+          : []
+
+        const disconnect = await disconnectRelayForCleanup({
+          relayKey: resolvedRelayKey,
+          publicIdentifier: resolvedPublicIdentifier,
+          reason: 'leave-group'
+        })
+
+        let sharedFilesResult = {
+          status: saveSharedFiles ? 'saved' : 'removed',
+          recoveredCount: 0,
+          failedCount: 0,
+          deletedCount: 0,
+          error: null
+        }
+
+        if (saveSharedFiles) {
+          try {
+            const recovered = await recoverRelayFilesFromSnapshot({
+              relayKey: resolvedRelayKey,
+              publicIdentifier: resolvedPublicIdentifier,
+              fileProviders
+            })
+            sharedFilesResult.recoveredCount = recovered.recoveredCount
+            sharedFilesResult.failedCount = recovered.failedCount
+            if (resolvedRelayKey && resolvedPublicIdentifier && resolvedRelayKey !== resolvedPublicIdentifier) {
+              const deletedLegacy = await cleanupRelayLocalFilePrefixes([resolvedRelayKey])
+              sharedFilesResult.deletedCount = deletedLegacy.deletedCount
+            }
+          } catch (error) {
+            sharedFilesResult = {
+              ...sharedFilesResult,
+              status: 'error',
+              error: error?.message || String(error)
+            }
+          }
+        } else {
+          const deleted = await cleanupRelayLocalFilePrefixes([
+            resolvedPublicIdentifier,
+            resolvedRelayKey
+          ])
+          sharedFilesResult.deletedCount = deleted.deletedCount
+        }
+
+        const relayStoragePath =
+          profile?.relay_storage ||
+          (resolvedRelayKey ? join(config?.storage || defaultStorageDir, 'relays', resolvedRelayKey) : null)
+        const relaySnapshotResult = await archiveOrRemoveRelayStorage({
+          relayStoragePath,
+          relayKey: resolvedRelayKey,
+          publicIdentifier: resolvedPublicIdentifier,
+          saveRelaySnapshot
+        })
+
+        if (resolvedRelayKey) {
+          await removeRelayCorestore(resolvedRelayKey).catch(() => {})
+        }
+
+        const authStore = getRelayAuthStore()
+        if (resolvedRelayKey) authStore.clearRelayAuth(resolvedRelayKey)
+        if (resolvedPublicIdentifier) authStore.clearRelayAuth(resolvedPublicIdentifier)
+
+        if (resolvedRelayKey) {
+          await removeRelayProfile(resolvedRelayKey).catch((error) => {
+            console.warn('[Worker] Failed to remove relay profile during leave-group', {
+              relayKey: resolvedRelayKey,
+              error: error?.message || error
+            })
+          })
+          removeRelayMapping(resolvedRelayKey, resolvedPublicIdentifier || null)
+        }
+
+        await emitRelayUpdateSnapshot('leave-group')
+
+        const responseData = {
+          relayKey: resolvedRelayKey || null,
+          publicIdentifier: resolvedPublicIdentifier || null,
+          disconnect,
+          archiveRelaySnapshot: relaySnapshotResult,
+          sharedFiles: sharedFilesResult
+        }
+
+        sendWorkerResponse(requestId, { success: true, data: responseData })
+        sendMessage({ type: 'leave-group-complete', data: responseData })
+      } catch (error) {
+        const errorMessage = error?.message || String(error)
+        sendWorkerResponse(requestId, { success: false, error: errorMessage })
+        sendMessage({ type: 'error', message: `leave-group failed: ${errorMessage}` })
+      }
+      break
+    }
+
     case 'start-join-flow':
       if (relayServer) {
         const data = (message && typeof message === 'object' ? message.data : null) || {}
@@ -5850,14 +6254,82 @@ async function handleMessageObject(message) {
           break
         }
 
-        let result = null
-        let finalRelayKey = resolvedRelayKey
-        let retryRelayKey = null
-        let retried = false
-        if (typeof global.requestRelaySubscriptionRefresh === 'function') {
-          result = await global.requestRelaySubscriptionRefresh(resolvedRelayKey, {
+        if (!relayServer || typeof global.requestRelaySubscriptionRefresh !== 'function') {
+          sendMessage({
+            type: 'refresh-relay-subscriptions:result',
+            requestId,
+            data: {
+              status: 'skipped',
+              reason: 'relay-server-unavailable',
+              publicIdentifier,
+              relayKey: resolvedRelayKey,
+              requestedRelayKey: requestedRelayKey || null,
+              resolvedRelayKey,
+              lookupSource
+            }
+          })
+          break
+        }
+
+        const refreshKey = makeRelaySubscriptionRefreshKey({
+          relayKey: resolvedRelayKey,
+          publicIdentifier
+        })
+        const now = Date.now()
+        pruneRelaySubscriptionRefreshState(now)
+        const inFlight = relaySubscriptionRefreshInFlight.get(refreshKey)
+        if (inFlight) {
+          const inFlightOutcome = await inFlight
+          sendMessage({
+            type: 'refresh-relay-subscriptions:result',
+            requestId,
+            data: {
+              status: 'ok',
+              publicIdentifier,
+              relayKey: inFlightOutcome.finalRelayKey,
+              reason,
+              result: inFlightOutcome.result || null,
+              requestedRelayKey: requestedRelayKey || null,
+              resolvedRelayKey,
+              lookupSource,
+              retried: inFlightOutcome.retried,
+              retryRelayKey: inFlightOutcome.retryRelayKey,
+              coalesced: true
+            }
+          })
+          break
+        }
+
+        const lastRefreshAt = relaySubscriptionRefreshRecent.get(refreshKey)
+        if (
+          Number.isFinite(lastRefreshAt) &&
+          now - lastRefreshAt < RELAY_SUBSCRIPTION_REFRESH_MIN_INTERVAL_MS
+        ) {
+          sendMessage({
+            type: 'refresh-relay-subscriptions:result',
+            requestId,
+            data: {
+              status: 'skipped',
+              reason: 'throttled',
+              publicIdentifier,
+              relayKey: resolvedRelayKey,
+              requestedRelayKey: requestedRelayKey || null,
+              resolvedRelayKey,
+              lookupSource,
+              throttleWindowMs: RELAY_SUBSCRIPTION_REFRESH_MIN_INTERVAL_MS,
+              lastRefreshAt
+            }
+          })
+          break
+        }
+
+        const refreshPromise = (async () => {
+          let result = await global.requestRelaySubscriptionRefresh(resolvedRelayKey, {
             reason
           })
+          let finalRelayKey = resolvedRelayKey
+          let retryRelayKey = null
+          let retried = false
           if (result?.status === 'skipped' && result?.reason === 'no-clients' && publicIdentifier) {
             for (const [candidateRelayKey, manager] of activeRelays.entries()) {
               const managerIdentifier = manager?.publicIdentifier || keyToPublic.get(candidateRelayKey) || null
@@ -5885,7 +6357,38 @@ async function handleMessageObject(message) {
               }
             }
           }
+          return {
+            result: result || null,
+            finalRelayKey,
+            retryRelayKey,
+            retried
+          }
+        })()
+
+        relaySubscriptionRefreshInFlight.set(refreshKey, refreshPromise)
+        let refreshOutcome = null
+        try {
+          refreshOutcome = await refreshPromise
+        } finally {
+          relaySubscriptionRefreshInFlight.delete(refreshKey)
         }
+        const completedAt = Date.now()
+        relaySubscriptionRefreshRecent.set(refreshKey, completedAt)
+        if (refreshOutcome?.finalRelayKey && refreshOutcome.finalRelayKey !== resolvedRelayKey) {
+          relaySubscriptionRefreshRecent.set(
+            makeRelaySubscriptionRefreshKey({
+              relayKey: refreshOutcome.finalRelayKey,
+              publicIdentifier
+            }),
+            completedAt
+          )
+        }
+        pruneRelaySubscriptionRefreshState(completedAt)
+
+        const result = refreshOutcome?.result || null
+        const finalRelayKey = refreshOutcome?.finalRelayKey || resolvedRelayKey
+        const retryRelayKey = refreshOutcome?.retryRelayKey || null
+        const retried = !!refreshOutcome?.retried
         console.log('[Worker] refresh-relay-subscriptions result', {
           reason,
           publicIdentifier,
@@ -5910,7 +6413,8 @@ async function handleMessageObject(message) {
             resolvedRelayKey,
             lookupSource,
             retried,
-            retryRelayKey
+            retryRelayKey,
+            coalesced: false
           }
         })
       } catch (err) {
@@ -6325,6 +6829,13 @@ async function main() {
       if (typeof relayServer.requestRelaySubscriptionRefresh === 'function') {
         global.requestRelaySubscriptionRefresh = relayServer.requestRelaySubscriptionRefresh
       }
+      sendMessage({
+        type: 'relay-server-ready',
+        ts: Date.now(),
+        data: {
+          mode: 'hyperswarm'
+        }
+      })
 
       if (pendingRelayRegistryRefresh) {
         refreshGatewayRelayRegistry('relay-server-ready').catch((err) => {

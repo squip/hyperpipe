@@ -25,6 +25,23 @@ import {
 } from '@/types'
 import { TStoredGroupedNotesSettings } from '@/providers/GroupedNotesProvider'
 
+export type ArchivedGroupFilesEntry = {
+  groupId: string
+  relay?: string
+  archivedAt: number
+}
+
+export type GroupLeavePublishRetryEntry = {
+  groupId: string
+  relay?: string
+  needs9022: boolean
+  needs10009: boolean
+  attempts: number
+  nextAttemptAt: number
+  lastError?: string | null
+  updatedAt: number
+}
+
 class LocalStorageService {
   static instance: LocalStorageService
 
@@ -60,6 +77,9 @@ class LocalStorageService {
   private favoriteListsMap: Record<string, string[]> = {}
   private favoriteGroupsMap: Record<string, string[]> = {}
   private groupDiscoveryRelays: string[] = []
+  private archivedGroupFilesMap: Record<string, ArchivedGroupFilesEntry[]> = {}
+  private groupLeavePublishRetryQueueMap: Record<string, GroupLeavePublishRetryEntry[]> = {}
+  private dismissedGroupAdminLeaveEventsMap: Record<string, string[]> = {}
 
   constructor() {
     if (!LocalStorageService.instance) {
@@ -220,6 +240,40 @@ class LocalStorageService {
         this.groupDiscoveryRelays = JSON.parse(groupDiscoveryRelaysStr)
       } catch {
         this.groupDiscoveryRelays = []
+      }
+    }
+
+    const archivedGroupFilesStr = window.localStorage.getItem(StorageKey.GROUP_FILES_ARCHIVED_GROUPS)
+    if (archivedGroupFilesStr) {
+      try {
+        const parsed = JSON.parse(archivedGroupFilesStr)
+        this.archivedGroupFilesMap = Array.isArray(parsed) ? { _global: parsed } : parsed
+      } catch {
+        this.archivedGroupFilesMap = {}
+      }
+    }
+
+    const groupLeaveRetryQueueStr = window.localStorage.getItem(
+      StorageKey.GROUP_LEAVE_PUBLISH_RETRY_QUEUE
+    )
+    if (groupLeaveRetryQueueStr) {
+      try {
+        const parsed = JSON.parse(groupLeaveRetryQueueStr)
+        this.groupLeavePublishRetryQueueMap = Array.isArray(parsed) ? { _global: parsed } : parsed
+      } catch {
+        this.groupLeavePublishRetryQueueMap = {}
+      }
+    }
+
+    const dismissedGroupAdminLeaveEventsStr = window.localStorage.getItem(
+      StorageKey.GROUP_ADMIN_LEAVE_DISMISSED_EVENTS
+    )
+    if (dismissedGroupAdminLeaveEventsStr) {
+      try {
+        const parsed = JSON.parse(dismissedGroupAdminLeaveEventsStr)
+        this.dismissedGroupAdminLeaveEventsMap = Array.isArray(parsed) ? { _global: parsed } : parsed
+      } catch {
+        this.dismissedGroupAdminLeaveEventsMap = {}
       }
     }
 
@@ -646,6 +700,127 @@ class LocalStorageService {
   setGroupDiscoveryRelays(relays: string[]) {
     this.groupDiscoveryRelays = relays
     window.localStorage.setItem(StorageKey.GROUP_DISCOVERY_RELAYS, JSON.stringify(relays))
+  }
+
+  getArchivedGroupFiles(pubkey?: string | null) {
+    const key = pubkey || '_global'
+    return this.archivedGroupFilesMap[key] || []
+  }
+
+  setArchivedGroupFiles(entries: ArchivedGroupFilesEntry[], pubkey?: string | null) {
+    const key = pubkey || '_global'
+    this.archivedGroupFilesMap[key] = entries
+    window.localStorage.setItem(
+      StorageKey.GROUP_FILES_ARCHIVED_GROUPS,
+      JSON.stringify(this.archivedGroupFilesMap)
+    )
+  }
+
+  upsertArchivedGroupFilesEntry(entry: ArchivedGroupFilesEntry, pubkey?: string | null) {
+    const key = pubkey || '_global'
+    const current = this.archivedGroupFilesMap[key] || []
+    const next = current.filter(
+      (item) => !(item.groupId === entry.groupId && (item.relay || '') === (entry.relay || ''))
+    )
+    next.push(entry)
+    this.archivedGroupFilesMap[key] = next
+    window.localStorage.setItem(
+      StorageKey.GROUP_FILES_ARCHIVED_GROUPS,
+      JSON.stringify(this.archivedGroupFilesMap)
+    )
+  }
+
+  removeArchivedGroupFilesEntry(groupId: string, relay?: string | null, pubkey?: string | null) {
+    const key = pubkey || '_global'
+    const current = this.archivedGroupFilesMap[key] || []
+    this.archivedGroupFilesMap[key] = current.filter((entry) => {
+      if (entry.groupId !== groupId) return true
+      if (!relay) return false
+      return (entry.relay || '') !== relay
+    })
+    window.localStorage.setItem(
+      StorageKey.GROUP_FILES_ARCHIVED_GROUPS,
+      JSON.stringify(this.archivedGroupFilesMap)
+    )
+  }
+
+  getGroupLeavePublishRetryQueue(pubkey?: string | null) {
+    const key = pubkey || '_global'
+    return this.groupLeavePublishRetryQueueMap[key] || []
+  }
+
+  setGroupLeavePublishRetryQueue(entries: GroupLeavePublishRetryEntry[], pubkey?: string | null) {
+    const key = pubkey || '_global'
+    this.groupLeavePublishRetryQueueMap[key] = entries
+    window.localStorage.setItem(
+      StorageKey.GROUP_LEAVE_PUBLISH_RETRY_QUEUE,
+      JSON.stringify(this.groupLeavePublishRetryQueueMap)
+    )
+  }
+
+  upsertGroupLeavePublishRetryEntry(entry: GroupLeavePublishRetryEntry, pubkey?: string | null) {
+    const key = pubkey || '_global'
+    const current = this.groupLeavePublishRetryQueueMap[key] || []
+    const index = current.findIndex(
+      (item) => item.groupId === entry.groupId && (item.relay || '') === (entry.relay || '')
+    )
+    if (index >= 0) {
+      const existing = current[index]
+      const nextEntry: GroupLeavePublishRetryEntry = {
+        ...existing,
+        ...entry,
+        needs9022: existing.needs9022 || entry.needs9022,
+        needs10009: existing.needs10009 || entry.needs10009
+      }
+      this.groupLeavePublishRetryQueueMap[key] = [
+        ...current.slice(0, index),
+        nextEntry,
+        ...current.slice(index + 1)
+      ]
+    } else {
+      this.groupLeavePublishRetryQueueMap[key] = [...current, entry]
+    }
+    window.localStorage.setItem(
+      StorageKey.GROUP_LEAVE_PUBLISH_RETRY_QUEUE,
+      JSON.stringify(this.groupLeavePublishRetryQueueMap)
+    )
+  }
+
+  removeGroupLeavePublishRetryEntry(groupId: string, relay?: string | null, pubkey?: string | null) {
+    const key = pubkey || '_global'
+    const current = this.groupLeavePublishRetryQueueMap[key] || []
+    this.groupLeavePublishRetryQueueMap[key] = current.filter((entry) => {
+      if (entry.groupId !== groupId) return true
+      if (!relay) return false
+      return (entry.relay || '') !== relay
+    })
+    window.localStorage.setItem(
+      StorageKey.GROUP_LEAVE_PUBLISH_RETRY_QUEUE,
+      JSON.stringify(this.groupLeavePublishRetryQueueMap)
+    )
+  }
+
+  getDismissedGroupAdminLeaveEvents(pubkey?: string | null) {
+    const key = pubkey || '_global'
+    return this.dismissedGroupAdminLeaveEventsMap[key] || []
+  }
+
+  markDismissedGroupAdminLeaveEvent(eventKey: string, pubkey?: string | null) {
+    const key = pubkey || '_global'
+    const current = this.dismissedGroupAdminLeaveEventsMap[key] || []
+    if (!current.includes(eventKey)) {
+      this.dismissedGroupAdminLeaveEventsMap[key] = [...current, eventKey]
+      window.localStorage.setItem(
+        StorageKey.GROUP_ADMIN_LEAVE_DISMISSED_EVENTS,
+        JSON.stringify(this.dismissedGroupAdminLeaveEventsMap)
+      )
+    }
+  }
+
+  isGroupAdminLeaveEventDismissed(eventKey: string, pubkey?: string | null) {
+    const key = pubkey || '_global'
+    const current = this.dismissedGroupAdminLeaveEventsMap[key] || []
+    return current.includes(eventKey)
   }
 }
 

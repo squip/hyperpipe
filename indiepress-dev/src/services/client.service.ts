@@ -57,6 +57,7 @@ class ClientService extends EventTarget {
   pubkey?: string
   followings?: Set<string>
   private authCache = new Map<string, number>()
+  private inFlightFetchEvents = new Map<string, Promise<NostrEvent[]>>()
 
   private trendingNotesCache: NostrEvent[] | null = null
 
@@ -299,6 +300,7 @@ class ClientService extends EventTarget {
       ? (explicitTimelineLabel as string)
       : 'f-timeline'
     let preliminarySub: SubCloser | undefined
+    let removeLocalPublishListener: (() => void) | undefined
     let closed = false
     const unregisterLabelSubscription = () => {
       if (!hasExplicitTimelineLabel) return
@@ -315,6 +317,8 @@ class ClientService extends EventTarget {
       abort.abort(reason ?? '<subc>')
       subc?.close?.(reason)
       preliminarySub?.close?.(reason)
+      removeLocalPublishListener?.()
+      removeLocalPublishListener = undefined
     }
     const closeReasonForReplacement = `[subscribeTimeline] replaced by ${subscriptionId}`
     if (hasExplicitTimelineLabel) {
@@ -354,6 +358,23 @@ class ClientService extends EventTarget {
     const relayUrls = Array.from(
       new Set(relayRequests.flatMap(({ urls }) => urls))
     )
+    const subscribedFilters: Filter[] = [
+      ...localFilters,
+      ...relayRequests.map(({ filter }) => filter)
+    ]
+
+    if (subscribedFilters.length > 0) {
+      const handleLocalPublish = (customEvent: Event) => {
+        const publishedEvent = (customEvent as CustomEvent<NostrEvent>).detail
+        if (!publishedEvent || !validateEvent(publishedEvent)) return
+        if (!matchFilters(subscribedFilters, publishedEvent)) return
+        onNew(publishedEvent)
+      }
+      this.addEventListener('newEvent', handleLocalPublish as EventListener)
+      removeLocalPublishListener = () => {
+        this.removeEventListener('newEvent', handleLocalPublish as EventListener)
+      }
+    }
 
     debugTimeline('[subscribeTimeline] start', {
       subscriptionId,
@@ -467,12 +488,10 @@ class ClientService extends EventTarget {
                     onNew(evt)
                   }
 
-                  if (localFilters.length) {
-                    // if we're querying local filters simultaneously with external relays
-                    // that means we want to store the results from the external relays in the local filters
-                    // for consistency
-                    this.addEventToCache(evt)
-                  }
+                  // Always persist relay timeline events locally.
+                  // Group relays are often relay-only subscriptions, so gating this on localFilters
+                  // causes click-through fetches (NotePage, replies, etc.) to miss cached events.
+                  this.addEventToCache(evt)
                 },
                 oneose() {
                   eosed = true
@@ -652,6 +671,7 @@ class ClientService extends EventTarget {
                 label: 'f-more',
                 onevent(evt) {
                   events.push(evt)
+                  this.addEventToCache(evt)
                 },
                 oneose() {
                   subc.close()
@@ -761,6 +781,43 @@ class ClientService extends EventTarget {
     set.add(relay)
   }
 
+  private buildFetchEventsRequestKey(urls: string[], filter: Filter, cache: boolean) {
+    const normalizeValue = (value: unknown): unknown => {
+      if (Array.isArray(value)) {
+        const normalized = value.map((entry) =>
+          typeof entry === 'string' ? entry.trim() : normalizeValue(entry)
+        )
+        const areScalars = normalized.every((entry) =>
+          ['string', 'number', 'boolean'].includes(typeof entry)
+        )
+        if (areScalars) {
+          return (normalized as Array<string | number | boolean>)
+            .slice()
+            .sort((left, right) => String(left).localeCompare(String(right)))
+        }
+        return normalized
+      }
+      if (value && typeof value === 'object') {
+        const out: Record<string, unknown> = {}
+        Object.keys(value as Record<string, unknown>)
+          .sort()
+          .forEach((key) => {
+            out[key] = normalizeValue((value as Record<string, unknown>)[key])
+          })
+        return out
+      }
+      return value
+    }
+
+    const normalizedUrls = Array.from(new Set(urls.map((url) => normalizeUrl(url)))).sort()
+    const normalizedFilter = normalizeValue(filter || {})
+    return JSON.stringify({
+      urls: normalizedUrls,
+      filter: normalizedFilter,
+      cache
+    })
+  }
+
   async fetchEvents(
     urls: string[],
     filter: Filter,
@@ -771,37 +828,53 @@ class ClientService extends EventTarget {
       cache?: boolean
     } = {}
   ) {
-    const relays = urls.filter((url, i) => i === 0 || urls[i - 1] !== url)
-    const events: NostrEvent[] = []
+    const relays = Array.from(new Set(urls.map((url) => normalizeUrl(url))))
+    const requestKey = this.buildFetchEventsRequestKey(relays, filter, cache)
+    const existingRequest = this.inFlightFetchEvents.get(requestKey)
+    if (existingRequest) {
+      return existingRequest
+    }
 
-    await new Promise<void>((resolve) => {
-      pool.subscribeEose(relays, filter, {
-        label: 'f-fetch-events',
-        maxWait: 10_000,
-        onauth: (async (authEvt) => {
-          if (this.signer) {
-            const evt = await this.signer!.signEvent(authEvt)
-            if (!evt) {
-              throw new Error('sign event failed')
+    const request = (async () => {
+      const events: NostrEvent[] = []
+
+      await new Promise<void>((resolve) => {
+        pool.subscribeEose(relays, filter, {
+          label: 'f-fetch-events',
+          maxWait: 10_000,
+          onauth: (async (authEvt) => {
+            if (this.signer) {
+              const evt = await this.signer!.signEvent(authEvt)
+              if (!evt) {
+                throw new Error('sign event failed')
+              }
+              return evt as VerifiedEvent
             }
-            return evt as VerifiedEvent
-          }
 
-          throw new Error("<not logged in, can't auth to relay during this.subscribeTimeline>")
-        }) as (event: EventTemplate) => Promise<VerifiedEvent>,
-        onevent: (event: NostrEvent) => {
-          events.push(event)
-          if (cache) {
-            this.addEventToCache(event)
+            throw new Error("<not logged in, can't auth to relay during this.subscribeTimeline>")
+          }) as (event: EventTemplate) => Promise<VerifiedEvent>,
+          onevent: (event: NostrEvent) => {
+            events.push(event)
+            if (cache) {
+              this.addEventToCache(event)
+            }
+          },
+          onclose(_: string[]) {
+            resolve()
           }
-        },
-        onclose(_: string[]) {
-          resolve()
-        }
+        })
       })
-    })
 
-    return events
+      return events
+    })()
+
+    this.inFlightFetchEvents.set(requestKey, request)
+    request.finally(() => {
+      if (this.inFlightFetchEvents.get(requestKey) === request) {
+        this.inFlightFetchEvents.delete(requestKey)
+      }
+    })
+    return request
   }
 
   async fetchTrendingNotes() {
@@ -882,6 +955,15 @@ class ClientService extends EventTarget {
 
     if (!filter) {
       throw new Error(`can't fetch ${idOrCode}`)
+    }
+
+    // Preserve any relay context we already observed for this event in the current session.
+    // This is important for local/group relay events where the bech32 payload may not carry hints.
+    if (Array.isArray(filter.ids) && filter.ids.length === 1) {
+      const seenRelayHints = this.getSeenEventRelayUrls(filter.ids[0])
+      if (seenRelayHints.length > 0) {
+        relayHints = Array.from(new Set([...relayHints, ...seenRelayHints]))
+      }
     }
 
     // before we try any network fetch try to load this from our local database
@@ -966,11 +1048,12 @@ class ClientService extends EventTarget {
   }
 
   private async addUsernameToIndex(profile: NostrUser) {
+    const nip05 = typeof profile.metadata.nip05 === 'string' ? profile.metadata.nip05 : ''
     const text = [
       profile.metadata.display_name?.trim() ?? '',
       profile.metadata.name?.trim() ?? '',
-      profile.metadata.nip05
-        ?.split('@')
+      nip05
+        .split('@')
         .map((s: string) => s.trim())
         .join(' ') ?? ''
     ].join(' ')

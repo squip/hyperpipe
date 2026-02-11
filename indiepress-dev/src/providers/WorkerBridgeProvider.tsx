@@ -170,6 +170,7 @@ type RelayCreatedPayload = {
 type WorkerBridgeContextValue = {
   isElectron: boolean
   ready: boolean
+  relayServerReady: boolean
   lifecycle: WorkerLifecycle
   readinessMessage: string
   autostartEnabled: boolean
@@ -359,6 +360,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
   const [lifecycle, setLifecycle] = useState<WorkerLifecycle>(() =>
     isElectron() ? 'idle' : 'unavailable'
   )
+  const [relayServerReady, setRelayServerReady] = useState(false)
   const [statusV1, setStatusV1] = useState<WorkerStatusV1 | null>(null)
   const [configAppliedV1, setConfigAppliedV1] = useState<WorkerConfigAppliedV1 | null>(null)
   const [relays, setRelays] = useState<RelayEntry[]>([])
@@ -563,6 +565,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       if (resetRestartAttempts) restartAttemptRef.current = 0
       setLastError(null)
       setLifecycle('starting')
+      setRelayServerReady(false)
 
       try {
         const config = buildWorkerConfig()
@@ -810,6 +813,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
 
       setStatusV1(null)
       setConfigAppliedV1(null)
+      setRelayServerReady(false)
       setRelays([])
       setGatewayStatus(null)
       setPublicGatewayStatus(null)
@@ -863,6 +867,24 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           const status = msg as WorkerStatusV1
           setStatusV1(status)
           setLifecycle(phaseToLifecycle(status.phase))
+          if (
+            status.phase === 'gateway-starting' ||
+            status.phase === 'gateway-ready' ||
+            status.phase === 'relays-loading' ||
+            status.phase === 'ready'
+          ) {
+            setRelayServerReady(true)
+          } else if (
+            status.phase === 'starting' ||
+            status.phase === 'waiting-config' ||
+            status.phase === 'config-applied' ||
+            status.phase === 'initializing' ||
+            status.phase === 'stopping' ||
+            status.phase === 'stopped' ||
+            status.phase === 'error'
+          ) {
+            setRelayServerReady(false)
+          }
           if (status.phase === 'ready') {
             restartAttemptRef.current = 0
           }
@@ -904,6 +926,10 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                 return next
               })
             }
+            break
+          case 'relay-server-ready':
+            setRelayServerReady(true)
+            electronIpc.sendToWorker({ type: 'get-relays' }).catch(() => {})
             break
           case 'relay-created':
             if (relayCreateResolversRef.current.length) {
@@ -1270,6 +1296,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         clearPendingEmptyRelayUpdate()
         setStatusV1(null)
         setConfigAppliedV1(null)
+        setRelayServerReady(false)
         setRelays([])
         setGatewayStatus(null)
         setPublicGatewayStatus(null)
@@ -1536,6 +1563,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     () => ({
       isElectron: isElectron(),
       ready,
+      relayServerReady,
       lifecycle,
       readinessMessage,
       autostartEnabled,
@@ -1636,6 +1664,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       publicGatewayToken,
       readinessMessage,
       ready,
+      relayServerReady,
       relays,
       sessionStopRequested,
       setAutostartEnabled,

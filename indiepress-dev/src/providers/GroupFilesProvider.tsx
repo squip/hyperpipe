@@ -5,6 +5,7 @@ import {
 } from '@/lib/group-files'
 import { useNostr } from '@/providers/NostrProvider'
 import client from '@/services/client.service'
+import localStorageService from '@/services/local-storage.service'
 import { TFeedSubRequest } from '@/types'
 import { Event as NostrEvent } from '@nostr/tools/wasm'
 import {
@@ -103,7 +104,7 @@ export function useGroupFiles() {
 }
 
 export function GroupFilesProvider({ children }: { children: ReactNode }) {
-  const { startLogin } = useNostr()
+  const { startLogin, pubkey } = useNostr()
   const {
     myGroupList,
     resolveRelayUrl,
@@ -113,8 +114,16 @@ export function GroupFilesProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(false)
   const [lastUpdated, setLastUpdated] = useState<number | null>(null)
 
+  const archivedGroupEntries = useMemo(
+    () => localStorageService.getArchivedGroupFiles(pubkey),
+    [myGroupList, pubkey]
+  )
+
   const normalizedGroupEntries = useMemo(() => {
-    const byGroupKey = new Map<string, { groupId: string; relayUrl: string | null }>()
+    const byGroupKey = new Map<
+      string,
+      { groupId: string; relayUrl: string | null; isArchived: boolean }
+    >()
 
     for (const entry of myGroupList) {
       const groupId = String(entry.groupId || '').trim()
@@ -138,11 +147,34 @@ export function GroupFilesProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      byGroupKey.set(`${relayUrl || 'local'}|${groupId}`, { groupId, relayUrl })
+      byGroupKey.set(`${relayUrl || 'local'}|${groupId}`, {
+        groupId,
+        relayUrl,
+        isArchived: false
+      })
+    }
+
+    for (const entry of archivedGroupEntries) {
+      const groupId = String(entry.groupId || '').trim()
+      if (!groupId) continue
+      const relayUrl = entry.relay ? resolveRelayUrl(entry.relay) || entry.relay : null
+      const key = `${relayUrl || 'local'}|${groupId}`
+      if (byGroupKey.has(key)) continue
+      byGroupKey.set(key, {
+        groupId,
+        relayUrl,
+        isArchived: true
+      })
     }
 
     return Array.from(byGroupKey.values())
-  }, [discoveryGroups, getProvisionalGroupMetadata, myGroupList, resolveRelayUrl])
+  }, [
+    archivedGroupEntries,
+    discoveryGroups,
+    getProvisionalGroupMetadata,
+    myGroupList,
+    resolveRelayUrl
+  ])
 
   const groupNameById = useMemo(() => {
     const map = new Map<string, string>()
@@ -169,6 +201,7 @@ export function GroupFilesProvider({ children }: { children: ReactNode }) {
   const scopedSubRequests = useMemo<TFeedSubRequest[]>(() => {
     const relayGroups = new Map<string, Set<string>>()
     for (const entry of normalizedGroupEntries) {
+      if (entry.isArchived) continue
       if (!entry.relayUrl) continue
       const groups = relayGroups.get(entry.relayUrl) || new Set<string>()
       groups.add(entry.groupId)

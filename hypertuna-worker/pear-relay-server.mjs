@@ -190,6 +190,30 @@ function stripEphemeralSubscriptions(snapshot) {
   };
 }
 
+const SUBSCRIPTION_REFRESH_MAX_ENTRIES = 128;
+
+function getSubscriptionEntryTimestamp(entry) {
+  if (!entry || typeof entry !== 'object') return -Infinity;
+  const ts = entry.last_returned_event_timestamp;
+  return Number.isFinite(ts) ? ts : -Infinity;
+}
+
+function limitSubscriptionSnapshotEntries(snapshot, maxEntries = SUBSCRIPTION_REFRESH_MAX_ENTRIES) {
+  if (!snapshot || typeof snapshot !== 'object') return snapshot;
+  if (!snapshot.subscriptions || typeof snapshot.subscriptions !== 'object') return snapshot;
+  const entries = Object.entries(snapshot.subscriptions);
+  if (entries.length <= maxEntries) return snapshot;
+  entries.sort(([, left], [, right]) => getSubscriptionEntryTimestamp(right) - getSubscriptionEntryTimestamp(left));
+  const limited = {};
+  for (const [subscriptionId, entry] of entries.slice(0, maxEntries)) {
+    limited[subscriptionId] = entry;
+  }
+  return {
+    ...snapshot,
+    subscriptions: limited
+  };
+}
+
 function mergeSubscriptionEntry(primary = {}, secondary = {}) {
   const merged = { ...secondary, ...primary };
   if (!merged.filters) {
@@ -269,7 +293,8 @@ export async function requestRelaySubscriptionRefresh(relayKey, { reason = 'writ
 
     try {
       const snapshot = await getRelaySubscriptions(relayKey, connectionKey);
-      const resetSnapshot = resetSubscriptionTimestamps(snapshot, connectionKey);
+      const compactSnapshot = limitSubscriptionSnapshotEntries(stripEphemeralSubscriptions(snapshot));
+      const resetSnapshot = resetSubscriptionTimestamps(compactSnapshot, connectionKey);
       if (resetSnapshot) {
         await updateRelaySubscriptions(relayKey, connectionKey, resetSnapshot);
         updated = true;
@@ -287,7 +312,8 @@ export async function requestRelaySubscriptionRefresh(relayKey, { reason = 'writ
     if (clientId) {
       try {
         const clientSnapshot = await getRelayClientSubscriptions(relayKey, clientId);
-        const resetClient = resetSubscriptionTimestamps(clientSnapshot, connectionKey);
+        const compactClientSnapshot = limitSubscriptionSnapshotEntries(stripEphemeralSubscriptions(clientSnapshot));
+        const resetClient = resetSubscriptionTimestamps(compactClientSnapshot, connectionKey);
         if (resetClient) {
           await updateRelayClientSubscriptions(relayKey, clientId, resetClient);
           updated = true;

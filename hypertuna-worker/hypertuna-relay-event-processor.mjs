@@ -1194,6 +1194,7 @@ async handleSubscription(connectionKey) {
     // logWithTimestamp(`handleSubscription: Active subscriptions:`, JSON.stringify(activeSubscriptions, null, 2));
     const eventsForClient = [];
     let activeSubscriptionsUpdated = JSON.parse(JSON.stringify(activeSubscriptions));
+    let removedEphemeralCount = 0;
 
     for (const [subscriptionId, subscription] of Object.entries(activeSubscriptions.subscriptions)) {
         const last_returned_event_timestamp = subscription.last_returned_event_timestamp;
@@ -1234,6 +1235,20 @@ async handleSubscription(connectionKey) {
             }
         }
         eventsForClient.push(['EOSE', subscriptionId]);
+        // One-shot fetch subscriptions must not accumulate in persisted snapshots.
+        // They are expected to complete after a single replay cycle.
+        if (this._isEphemeralSubscriptionId(subscriptionId)) {
+            delete activeSubscriptionsUpdated.subscriptions[subscriptionId];
+            removedEphemeralCount += 1;
+        }
+    }
+
+    if (removedEphemeralCount > 0) {
+        logWithTimestamp('handleSubscription: pruned ephemeral subscriptions after replay', {
+            connectionKey,
+            removedEphemeralCount,
+            remainingSubscriptions: Object.keys(activeSubscriptionsUpdated.subscriptions || {}).length
+        });
     }
     
     logWithTimestamp(`handleSubscription: Total events and EOSE messages for client:`, eventsForClient.length);
