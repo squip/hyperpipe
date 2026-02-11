@@ -3478,16 +3478,54 @@ export class GatewayService extends EventEmitter {
         const wantsDelegation = localResult?.shouldPollPeers === true && typeof subscriptionId === 'string';
 
         if (frameType === 'CLOSE' && frameSubscriptionId) {
+          const wasDelegated = connData.delegatedSubscriptions.has(frameSubscriptionId);
+          const hadPendingDelegation = connData.pendingDelegations?.has?.(frameSubscriptionId) === true;
+          const wasLocalServed = connData.localServedSubscriptions.has(frameSubscriptionId);
+          const shouldForwardClose = wasDelegated || hadPendingDelegation || !wasLocalServed;
+          let closeForwarded = false;
+          let closeForwardError = null;
+
+          if (shouldForwardClose) {
+            const closePeer = await this.findHealthyPeerForRelay(identifier, true);
+            if (closePeer) {
+              try {
+                await this.#forwardMessageToPeer({
+                  connData,
+                  healthyPeer: closePeer,
+                  identifier,
+                  rawMessage: msg,
+                  subscriptionId: frameSubscriptionId,
+                  isRetry: false
+                });
+                closeForwarded = true;
+              } catch (error) {
+                closeForwardError = error?.message || String(error);
+              }
+            } else {
+              closeForwardError = 'no healthy peers';
+            }
+          }
+
           connData.delegatedSubscriptions.delete(frameSubscriptionId);
           connData.localServedSubscriptions.delete(frameSubscriptionId);
           connData.pendingDelegations?.delete?.(frameSubscriptionId);
           connData.shouldPollPeers = (connData.delegatedSubscriptions.size > 0) ||
             (connData.pendingDelegations?.size > 0);
+          if (closeForwardError && shouldForwardClose) {
+            this.log('warn', '[PublicGateway] Failed to forward CLOSE to peer', {
+              connectionKey,
+              relayKey: connData.relayKey,
+              subscriptionId: frameSubscriptionId,
+              error: closeForwardError
+            });
+          }
           this.log('debug', '[PublicGateway] Client closed subscription', {
             connectionKey,
             relayKey: connData.relayKey,
             subscriptionId: frameSubscriptionId,
-            delegatedSubscriptions: connData.delegatedSubscriptions.size
+            delegatedSubscriptions: connData.delegatedSubscriptions.size,
+            closeForwardAttempted: shouldForwardClose,
+            closeForwarded
           });
           return;
         }
@@ -3911,16 +3949,36 @@ export class GatewayService extends EventEmitter {
       authToken
     );
 
+    let frameType = null;
+    try {
+      const parsedFrame = JSON.parse(outboundMessage);
+      if (Array.isArray(parsedFrame) && typeof parsedFrame[0] === 'string') {
+        frameType = parsedFrame[0];
+      }
+    } catch (_) {}
+
     if (subscriptionId) {
-      connData.delegatedSubscriptions.add(subscriptionId);
-      connData.localServedSubscriptions.delete(subscriptionId);
-      connData.pendingDelegations?.delete?.(subscriptionId);
-      this.log('debug', '[PublicGateway] Delegated subscription forwarded to peer', {
-        connectionKey: connData.connectionKey,
-        relayKey: identifier,
-        subscriptionId,
-        retry: isRetry
-      });
+      if (frameType === 'CLOSE') {
+        connData.delegatedSubscriptions.delete(subscriptionId);
+        connData.localServedSubscriptions.delete(subscriptionId);
+        connData.pendingDelegations?.delete?.(subscriptionId);
+        this.log('debug', '[PublicGateway] Forwarded CLOSE to peer', {
+          connectionKey: connData.connectionKey,
+          relayKey: identifier,
+          subscriptionId,
+          retry: isRetry
+        });
+      } else {
+        connData.delegatedSubscriptions.add(subscriptionId);
+        connData.localServedSubscriptions.delete(subscriptionId);
+        connData.pendingDelegations?.delete?.(subscriptionId);
+        this.log('debug', '[PublicGateway] Delegated subscription forwarded to peer', {
+          connectionKey: connData.connectionKey,
+          relayKey: identifier,
+          subscriptionId,
+          retry: isRetry
+        });
+      }
     }
 
     return responses;

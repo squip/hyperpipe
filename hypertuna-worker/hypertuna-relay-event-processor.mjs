@@ -15,6 +15,10 @@ function logWithTimestamp(message, data = null) {
   }
 }
 
+const TIMELINE_VOLATILE_FILTER_KEYS = new Set(['since', 'until', 'limit']);
+const TIMELINE_SUBSCRIPTION_STALE_TTL_MS = 20 * 60 * 1000;
+const MAX_TIMELINE_SUBSCRIPTIONS = 32;
+
 function serializeEvent(event) {
   logWithTimestamp("serializeEvent: Serializing event", event);
   const serialized = JSON.stringify([0, event.pubkey, event.created_at, event.kind, event.tags, event.content]);
@@ -333,7 +337,7 @@ export default class NostrRelay extends Autobee {
     return typeof subscriptionId === 'string' && subscriptionId.startsWith('f-timeline');
   }
 
-  _buildSubscriptionSignature(entry) {
+  _buildSubscriptionSignature(entry, { stripVolatileTimelineKeys = false } = {}) {
     if (!entry || typeof entry !== 'object') return null;
     const filters = Array.isArray(entry.filters) ? entry.filters : null;
     if (!filters || filters.length === 0) return null;
@@ -343,6 +347,9 @@ export default class NostrRelay extends Autobee {
         const normalizedFilter = {};
         const keys = Object.keys(filter).sort();
         for (const key of keys) {
+          if (stripVolatileTimelineKeys && TIMELINE_VOLATILE_FILTER_KEYS.has(key)) {
+            continue;
+          }
           const value = filter[key];
           if (Array.isArray(value)) {
             normalizedFilter[key] = [...value].sort((a, b) =>
@@ -365,9 +372,53 @@ export default class NostrRelay extends Autobee {
     return Number.isFinite(ts) ? ts : -Infinity;
   }
 
+  _subscriptionUpdatedAtMs(entry) {
+    const updatedAt = entry?.updated_at;
+    if (Number.isFinite(updatedAt)) {
+      return updatedAt;
+    }
+    const lastReturned = entry?.last_returned_event_timestamp;
+    if (Number.isFinite(lastReturned)) {
+      return lastReturned * 1000;
+    }
+    return null;
+  }
+
+  _subscriptionRecencyScore(entry) {
+    const updatedAt = this._subscriptionUpdatedAtMs(entry);
+    return Number.isFinite(updatedAt) ? updatedAt : -Infinity;
+  }
+
+  _timelineSubscriptionBaseId(subscriptionId) {
+    if (typeof subscriptionId !== 'string') return null;
+    const separatorIdx = subscriptionId.indexOf(':');
+    return separatorIdx === -1 ? subscriptionId : subscriptionId.slice(0, separatorIdx);
+  }
+
+  _isStaleTimelineSubscription(entry, nowMs, staleTimelineTtlMs) {
+    if (!Number.isFinite(staleTimelineTtlMs) || staleTimelineTtlMs <= 0) {
+      return false;
+    }
+    const updatedAt = this._subscriptionUpdatedAtMs(entry);
+    if (!Number.isFinite(updatedAt)) {
+      return false;
+    }
+    return nowMs - updatedAt > staleTimelineTtlMs;
+  }
+
+  _touchSubscriptionEntry(entry, updatedAtMs = Date.now()) {
+    const baseEntry = entry && typeof entry === 'object' ? { ...entry } : {};
+    baseEntry.updated_at = Number.isFinite(updatedAtMs) ? updatedAtMs : Date.now();
+    return baseEntry;
+  }
+
   _pruneTimelineSubscriptions(
     subscriptions,
-    { preferredSubscriptionId = null, maxTimelineSubscriptions = 32 } = {}
+    {
+      preferredSubscriptionId = null,
+      maxTimelineSubscriptions = MAX_TIMELINE_SUBSCRIPTIONS,
+      staleTimelineTtlMs = TIMELINE_SUBSCRIPTION_STALE_TTL_MS
+    } = {}
   ) {
     if (!subscriptions || typeof subscriptions !== 'object') {
       return { subscriptions: {}, removedTimelineIds: [], keptTimelineIds: [] };
@@ -376,6 +427,7 @@ export default class NostrRelay extends Autobee {
     const nonTimelineSubscriptions = {};
     const timelineEntries = [];
     const bySignature = new Map();
+    const nowMs = Date.now();
 
     for (const [subscriptionId, entry] of Object.entries(subscriptions)) {
       if (!this._isTimelineSubscriptionId(subscriptionId)) {
@@ -383,27 +435,36 @@ export default class NostrRelay extends Autobee {
         continue;
       }
       timelineEntries.push({ subscriptionId, entry });
-      const signature = this._buildSubscriptionSignature(entry) || `__id:${subscriptionId}`;
-      const existing = bySignature.get(signature);
+      if (
+        subscriptionId !== preferredSubscriptionId &&
+        this._isStaleTimelineSubscription(entry, nowMs, staleTimelineTtlMs)
+      ) {
+        continue;
+      }
+      const timelineBaseId = this._timelineSubscriptionBaseId(subscriptionId) || subscriptionId;
+      const signature =
+        this._buildSubscriptionSignature(entry, { stripVolatileTimelineKeys: true }) || '__nosig';
+      const dedupeKey = `${timelineBaseId}|${signature}`;
+      const existing = bySignature.get(dedupeKey);
       if (!existing) {
-        bySignature.set(signature, { subscriptionId, entry });
+        bySignature.set(dedupeKey, { subscriptionId, entry });
         continue;
       }
 
       const existingPreferred = existing.subscriptionId === preferredSubscriptionId;
       const incomingPreferred = subscriptionId === preferredSubscriptionId;
       if (incomingPreferred && !existingPreferred) {
-        bySignature.set(signature, { subscriptionId, entry });
+        bySignature.set(dedupeKey, { subscriptionId, entry });
         continue;
       }
       if (!incomingPreferred && existingPreferred) {
         continue;
       }
 
-      const existingTs = this._subscriptionTimestamp(existing.entry);
-      const incomingTs = this._subscriptionTimestamp(entry);
+      const existingTs = this._subscriptionRecencyScore(existing.entry);
+      const incomingTs = this._subscriptionRecencyScore(entry);
       if (incomingTs > existingTs) {
-        bySignature.set(signature, { subscriptionId, entry });
+        bySignature.set(dedupeKey, { subscriptionId, entry });
       }
     }
 
@@ -413,8 +474,8 @@ export default class NostrRelay extends Autobee {
         .sort((a, b) => {
           if (a.subscriptionId === preferredSubscriptionId) return -1;
           if (b.subscriptionId === preferredSubscriptionId) return 1;
-          const bTs = this._subscriptionTimestamp(b.entry);
-          const aTs = this._subscriptionTimestamp(a.entry);
+          const bTs = this._subscriptionRecencyScore(b.entry);
+          const aTs = this._subscriptionRecencyScore(a.entry);
           return bTs - aTs;
         })
         .slice(0, maxTimelineSubscriptions);
@@ -463,6 +524,14 @@ export default class NostrRelay extends Autobee {
       const safeBase = Number.isFinite(baseTimestamp) ? baseTimestamp : -Infinity;
       const safeIncoming = Number.isFinite(incomingTimestamp) ? incomingTimestamp : -Infinity;
       merged.last_returned_event_timestamp = Math.max(safeBase, safeIncoming);
+    }
+
+    const baseUpdatedAt = this._subscriptionUpdatedAtMs(baseEntry);
+    const incomingUpdatedAt = this._subscriptionUpdatedAtMs(incomingEntry);
+    if (Number.isFinite(baseUpdatedAt) || Number.isFinite(incomingUpdatedAt)) {
+      const safeBaseUpdated = Number.isFinite(baseUpdatedAt) ? baseUpdatedAt : -Infinity;
+      const safeIncomingUpdated = Number.isFinite(incomingUpdatedAt) ? incomingUpdatedAt : -Infinity;
+      merged.updated_at = Math.max(safeBaseUpdated, safeIncomingUpdated);
     }
 
     return merged;
@@ -1199,6 +1268,11 @@ async handleSubscription(connectionKey) {
     for (const [subscriptionId, subscription] of Object.entries(activeSubscriptions.subscriptions)) {
         const last_returned_event_timestamp = subscription.last_returned_event_timestamp;
         logWithTimestamp(`handleSubscription: Processing subscription ${subscriptionId} with last timestamp: ${last_returned_event_timestamp}`);
+        if (activeSubscriptionsUpdated.subscriptions?.[subscriptionId]) {
+            activeSubscriptionsUpdated.subscriptions[subscriptionId] = this._touchSubscriptionEntry(
+                activeSubscriptionsUpdated.subscriptions[subscriptionId]
+            );
+        }
         
         for (const filter of subscription.filters) {
             logWithTimestamp(`handleSubscription: Processing filter with last_returned_event_timestamp:`, last_returned_event_timestamp);
@@ -1330,13 +1404,14 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
       const existingSubscriptions = mergedSnapshot?.subscriptions || {};
       const existingCount = Object.keys(existingSubscriptions).length;
       const subscriptions = { ...existingSubscriptions };
+      const nowMs = Date.now();
 
       // Create or update subscription with the new structure
-      subscriptions[subscriptionId] = {
+      subscriptions[subscriptionId] = this._touchSubscriptionEntry({
         ...(subscriptions[subscriptionId] || {}),
         last_returned_event_timestamp: undefined,
         filters: filters
-      };
+      }, nowMs);
 
       const {
         subscriptions: prunedSubscriptions,
@@ -1619,7 +1694,7 @@ async handleMessage(message, sendResponse, connectionKey, clientId = null) {
         case 'CLOSE':
           logWithTimestamp(`handleMessage: Processing CLOSE message for client connection: ${connectionKey}`);
           const closeSubscriptionId = params[0];
-          await this.unsubscribe(connectionKey, closeSubscriptionId);
+          await this.unsubscribe(connectionKey, closeSubscriptionId, clientId);
           sendResponse(['NOTICE', 'Subscription closed']);
           logWithTimestamp(`handleMessage: Closed subscription ${closeSubscriptionId}`);
           break;
@@ -1635,7 +1710,7 @@ async handleMessage(message, sendResponse, connectionKey, clientId = null) {
   }
 
   // Add the missing unsubscribe method
-  async unsubscribe(connectionKey, subscriptionId) {
+  async unsubscribe(connectionKey, subscriptionId, clientId = null) {
     logWithTimestamp(`unsubscribe: Removing subscription ${subscriptionId} for connection ${connectionKey}`);
     await this._queueSubscriptionWrite(connectionKey, async () => {
       const activeSubscriptions = await this.getSubscriptions(connectionKey);
@@ -1646,12 +1721,62 @@ async handleMessage(message, sendResponse, connectionKey, clientId = null) {
       }
 
       delete activeSubscriptions.subscriptions[subscriptionId];
+      const {
+        subscriptions: prunedSubscriptions,
+        removedTimelineIds
+      } = this._pruneTimelineSubscriptions(activeSubscriptions.subscriptions || {});
+      activeSubscriptions.subscriptions = prunedSubscriptions;
 
       // Update the subscriptions in the database
       await this.append({
         type: 'subscriptions',
         subscriptions: JSON.stringify(activeSubscriptions)
       });
+      if (removedTimelineIds.length > 0) {
+        logWithTimestamp('unsubscribe: pruned timeline subscriptions in connection snapshot', {
+          connectionKey,
+          removedCount: removedTimelineIds.length
+        });
+      }
+
+      if (clientId) {
+        try {
+          const clientSubscriptions = await this.getClientSubscriptions(clientId);
+          if (clientSubscriptions?.subscriptions?.[subscriptionId]) {
+            delete clientSubscriptions.subscriptions[subscriptionId];
+            const filteredClientSubscriptions = this._filterEphemeralSubscriptions(
+              clientSubscriptions.subscriptions
+            );
+            const {
+              subscriptions: prunedClientSubscriptions,
+              removedTimelineIds
+            } = this._pruneTimelineSubscriptions(filteredClientSubscriptions);
+            const safeClientSnapshot = {
+              ...clientSubscriptions,
+              clientId,
+              connection: connectionKey,
+              subscriptions: prunedClientSubscriptions
+            };
+            await this.append({
+              type: 'client-subscriptions',
+              clientId,
+              subscriptions: JSON.stringify(safeClientSnapshot)
+            });
+            if (removedTimelineIds.length > 0) {
+              logWithTimestamp('unsubscribe: pruned timeline subscriptions in client snapshot', {
+                clientId,
+                removedCount: removedTimelineIds.length
+              });
+            }
+          }
+        } catch (error) {
+          logWithTimestamp('unsubscribe: Failed to update client snapshot', {
+            clientId,
+            subscriptionId,
+            error: error?.message || error
+          });
+        }
+      }
 
       logWithTimestamp(`unsubscribe: Successfully removed subscription ${subscriptionId}`);
     });

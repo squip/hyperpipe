@@ -158,11 +158,13 @@ function setRelayClientConnectionKey(relayKey, clientId, connectionKey) {
 function resetSubscriptionTimestamps(snapshot, connectionKey) {
   if (!snapshot || typeof snapshot !== 'object') return null;
   if (!snapshot.subscriptions || typeof snapshot.subscriptions !== 'object') return null;
+  const touchedAt = Date.now();
   const subscriptions = {};
   for (const [subscriptionId, subscription] of Object.entries(snapshot.subscriptions)) {
     subscriptions[subscriptionId] = {
       ...subscription,
-      last_returned_event_timestamp: null
+      last_returned_event_timestamp: null,
+      updated_at: touchedAt
     };
   }
   return {
@@ -176,38 +178,157 @@ function isEphemeralSubscriptionId(subscriptionId) {
   return typeof subscriptionId === 'string' && subscriptionId.startsWith('f-fetch-events');
 }
 
-function stripEphemeralSubscriptions(snapshot) {
-  if (!snapshot || typeof snapshot !== 'object') return snapshot;
-  if (!snapshot.subscriptions || typeof snapshot.subscriptions !== 'object') return snapshot;
-  const filtered = {};
-  for (const [subscriptionId, entry] of Object.entries(snapshot.subscriptions)) {
-    if (isEphemeralSubscriptionId(subscriptionId)) continue;
-    filtered[subscriptionId] = entry;
-  }
-  return {
-    ...snapshot,
-    subscriptions: filtered
-  };
+const SUBSCRIPTION_REFRESH_MAX_ENTRIES = 128;
+const SUBSCRIPTION_REFRESH_MAX_TIMELINE_ENTRIES = 32;
+const TIMELINE_SUBSCRIPTION_STALE_TTL_MS = 20 * 60 * 1000;
+const TIMELINE_VOLATILE_FILTER_KEYS = new Set(['since', 'until', 'limit']);
+
+function isTimelineSubscriptionId(subscriptionId) {
+  return typeof subscriptionId === 'string' && subscriptionId.startsWith('f-timeline');
 }
 
-const SUBSCRIPTION_REFRESH_MAX_ENTRIES = 128;
+function buildSubscriptionSignature(entry, { stripVolatileTimelineKeys = false } = {}) {
+  if (!entry || typeof entry !== 'object') return null;
+  const filters = Array.isArray(entry.filters) ? entry.filters : null;
+  if (!filters || filters.length === 0) return null;
+  try {
+    const normalized = filters.map((filter) => {
+      if (!filter || typeof filter !== 'object') return filter;
+      const normalizedFilter = {};
+      const keys = Object.keys(filter).sort();
+      for (const key of keys) {
+        if (stripVolatileTimelineKeys && TIMELINE_VOLATILE_FILTER_KEYS.has(key)) {
+          continue;
+        }
+        const value = filter[key];
+        if (Array.isArray(value)) {
+          normalizedFilter[key] = [...value].sort((a, b) =>
+            String(a).localeCompare(String(b))
+          );
+        } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+          normalizedFilter[key] = JSON.parse(JSON.stringify(value));
+        } else {
+          normalizedFilter[key] = value;
+        }
+      }
+      return normalizedFilter;
+    });
+    return JSON.stringify(normalized);
+  } catch (_) {
+    return null;
+  }
+}
+
+function getTimelineSubscriptionBaseId(subscriptionId) {
+  if (typeof subscriptionId !== 'string') return null;
+  const separatorIdx = subscriptionId.indexOf(':');
+  return separatorIdx === -1 ? subscriptionId : subscriptionId.slice(0, separatorIdx);
+}
+
+function getSubscriptionEntryUpdatedAtMs(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const updatedAt = entry.updated_at;
+  if (Number.isFinite(updatedAt)) return updatedAt;
+  const lastReturned = entry.last_returned_event_timestamp;
+  if (Number.isFinite(lastReturned)) return lastReturned * 1000;
+  return null;
+}
 
 function getSubscriptionEntryTimestamp(entry) {
-  if (!entry || typeof entry !== 'object') return -Infinity;
-  const ts = entry.last_returned_event_timestamp;
+  const ts = getSubscriptionEntryUpdatedAtMs(entry);
   return Number.isFinite(ts) ? ts : -Infinity;
 }
 
-function limitSubscriptionSnapshotEntries(snapshot, maxEntries = SUBSCRIPTION_REFRESH_MAX_ENTRIES) {
+function isStaleTimelineSubscription(entry, nowMs, staleTimelineTtlMs) {
+  if (!Number.isFinite(staleTimelineTtlMs) || staleTimelineTtlMs <= 0) {
+    return false;
+  }
+  const updatedAt = getSubscriptionEntryUpdatedAtMs(entry);
+  if (!Number.isFinite(updatedAt)) return false;
+  return nowMs - updatedAt > staleTimelineTtlMs;
+}
+
+function compactSubscriptionSnapshot(
+  snapshot,
+  {
+    preferredSubscriptionId = null,
+    maxEntries = SUBSCRIPTION_REFRESH_MAX_ENTRIES,
+    maxTimelineEntries = SUBSCRIPTION_REFRESH_MAX_TIMELINE_ENTRIES,
+    staleTimelineTtlMs = TIMELINE_SUBSCRIPTION_STALE_TTL_MS
+  } = {}
+) {
   if (!snapshot || typeof snapshot !== 'object') return snapshot;
   if (!snapshot.subscriptions || typeof snapshot.subscriptions !== 'object') return snapshot;
-  const entries = Object.entries(snapshot.subscriptions);
-  if (entries.length <= maxEntries) return snapshot;
-  entries.sort(([, left], [, right]) => getSubscriptionEntryTimestamp(right) - getSubscriptionEntryTimestamp(left));
+  const nowMs = Date.now();
+  const nonTimelineEntries = [];
+  const timelineBySignature = new Map();
+
+  for (const [subscriptionId, entry] of Object.entries(snapshot.subscriptions)) {
+    if (isEphemeralSubscriptionId(subscriptionId)) {
+      continue;
+    }
+
+    if (!isTimelineSubscriptionId(subscriptionId)) {
+      nonTimelineEntries.push([subscriptionId, entry]);
+      continue;
+    }
+
+    if (
+      subscriptionId !== preferredSubscriptionId &&
+      isStaleTimelineSubscription(entry, nowMs, staleTimelineTtlMs)
+    ) {
+      continue;
+    }
+
+    const timelineBaseId = getTimelineSubscriptionBaseId(subscriptionId) || subscriptionId;
+    const signature =
+      buildSubscriptionSignature(entry, { stripVolatileTimelineKeys: true }) || '__nosig';
+    const dedupeKey = `${timelineBaseId}|${signature}`;
+    const existing = timelineBySignature.get(dedupeKey);
+    if (!existing) {
+      timelineBySignature.set(dedupeKey, { subscriptionId, entry });
+      continue;
+    }
+
+    const existingPreferred = existing.subscriptionId === preferredSubscriptionId;
+    const incomingPreferred = subscriptionId === preferredSubscriptionId;
+    if (incomingPreferred && !existingPreferred) {
+      timelineBySignature.set(dedupeKey, { subscriptionId, entry });
+      continue;
+    }
+    if (!incomingPreferred && existingPreferred) {
+      continue;
+    }
+
+    if (getSubscriptionEntryTimestamp(entry) > getSubscriptionEntryTimestamp(existing.entry)) {
+      timelineBySignature.set(dedupeKey, { subscriptionId, entry });
+    }
+  }
+
+  const timelineEntries = Array.from(timelineBySignature.values())
+    .sort((left, right) => {
+      if (left.subscriptionId === preferredSubscriptionId) return -1;
+      if (right.subscriptionId === preferredSubscriptionId) return 1;
+      return getSubscriptionEntryTimestamp(right.entry) - getSubscriptionEntryTimestamp(left.entry);
+    })
+    .slice(0, maxTimelineEntries)
+    .map(({ subscriptionId, entry }) => [subscriptionId, entry]);
+
+  const compactedEntries = [...nonTimelineEntries, ...timelineEntries];
+
+  if (compactedEntries.length > maxEntries) {
+    compactedEntries.sort((left, right) => {
+      if (left[0] === preferredSubscriptionId) return -1;
+      if (right[0] === preferredSubscriptionId) return 1;
+      return getSubscriptionEntryTimestamp(right[1]) - getSubscriptionEntryTimestamp(left[1]);
+    });
+  }
+
   const limited = {};
-  for (const [subscriptionId, entry] of entries.slice(0, maxEntries)) {
+  for (const [subscriptionId, entry] of compactedEntries.slice(0, maxEntries)) {
     limited[subscriptionId] = entry;
   }
+
   return {
     ...snapshot,
     subscriptions: limited
@@ -226,6 +347,14 @@ function mergeSubscriptionEntry(primary = {}, secondary = {}) {
     const safePrimary = Number.isFinite(primaryTimestamp) ? primaryTimestamp : -Infinity;
     const safeSecondary = Number.isFinite(secondaryTimestamp) ? secondaryTimestamp : -Infinity;
     merged.last_returned_event_timestamp = Math.max(safePrimary, safeSecondary);
+  }
+
+  const primaryUpdatedAt = getSubscriptionEntryUpdatedAtMs(primary);
+  const secondaryUpdatedAt = getSubscriptionEntryUpdatedAtMs(secondary);
+  if (Number.isFinite(primaryUpdatedAt) || Number.isFinite(secondaryUpdatedAt)) {
+    const safePrimaryUpdated = Number.isFinite(primaryUpdatedAt) ? primaryUpdatedAt : -Infinity;
+    const safeSecondaryUpdated = Number.isFinite(secondaryUpdatedAt) ? secondaryUpdatedAt : -Infinity;
+    merged.updated_at = Math.max(safePrimaryUpdated, safeSecondaryUpdated);
   }
 
   return merged;
@@ -293,7 +422,7 @@ export async function requestRelaySubscriptionRefresh(relayKey, { reason = 'writ
 
     try {
       const snapshot = await getRelaySubscriptions(relayKey, connectionKey);
-      const compactSnapshot = limitSubscriptionSnapshotEntries(stripEphemeralSubscriptions(snapshot));
+      const compactSnapshot = compactSubscriptionSnapshot(snapshot);
       const resetSnapshot = resetSubscriptionTimestamps(compactSnapshot, connectionKey);
       if (resetSnapshot) {
         await updateRelaySubscriptions(relayKey, connectionKey, resetSnapshot);
@@ -312,7 +441,7 @@ export async function requestRelaySubscriptionRefresh(relayKey, { reason = 'writ
     if (clientId) {
       try {
         const clientSnapshot = await getRelayClientSubscriptions(relayKey, clientId);
-        const compactClientSnapshot = limitSubscriptionSnapshotEntries(stripEphemeralSubscriptions(clientSnapshot));
+        const compactClientSnapshot = compactSubscriptionSnapshot(clientSnapshot);
         const resetClient = resetSubscriptionTimestamps(compactClientSnapshot, connectionKey);
         if (resetClient) {
           await updateRelayClientSubscriptions(relayKey, clientId, resetClient);
@@ -2191,9 +2320,13 @@ function setupProtocolHandlers(protocol) {
           if (!rehydrateOk) {
             try {
               const clientSnapshotRaw = await getRelayClientSubscriptions(relayKey, clientId);
-              const clientSnapshot = stripEphemeralSubscriptions(clientSnapshotRaw);
-              const currentSnapshot = await getRelaySubscriptions(relayKey, connectionKey);
-              const mergedSnapshot = mergeSubscriptionSnapshots(currentSnapshot, clientSnapshot);
+              const clientSnapshot = compactSubscriptionSnapshot(clientSnapshotRaw);
+              const currentSnapshot = compactSubscriptionSnapshot(
+                await getRelaySubscriptions(relayKey, connectionKey)
+              );
+              const mergedSnapshot = compactSubscriptionSnapshot(
+                mergeSubscriptionSnapshots(currentSnapshot, clientSnapshot)
+              );
               const subscriptionCount = mergedSnapshot?.subscriptions
                 ? Object.keys(mergedSnapshot.subscriptions).length
                 : 0;
@@ -2261,9 +2394,13 @@ function setupProtocolHandlers(protocol) {
             if (!rehydrateOk) {
               try {
                 const stableSnapshotRaw = await getRelayClientSubscriptions(relayKey, stableClientId);
-                const stableSnapshot = stripEphemeralSubscriptions(stableSnapshotRaw);
-                const currentSnapshot = await getRelaySubscriptions(relayKey, connectionKey);
-                const mergedSnapshot = mergeSubscriptionSnapshots(currentSnapshot, stableSnapshot);
+                const stableSnapshot = compactSubscriptionSnapshot(stableSnapshotRaw);
+                const currentSnapshot = compactSubscriptionSnapshot(
+                  await getRelaySubscriptions(relayKey, connectionKey)
+                );
+                const mergedSnapshot = compactSubscriptionSnapshot(
+                  mergeSubscriptionSnapshots(currentSnapshot, stableSnapshot)
+                );
                 const subscriptionCount = mergedSnapshot?.subscriptions
                   ? Object.keys(mergedSnapshot.subscriptions).length
                   : 0;
@@ -2379,15 +2516,16 @@ function setupProtocolHandlers(protocol) {
         if (activeSubscriptionsUpdated) {
             try {
                 console.log(`[RelayServer] Updating subscriptions for connectionKey: ${connectionKey}`);
-                await updateRelaySubscriptions(relayKey, connectionKey, activeSubscriptionsUpdated);
+                const compactActiveSubscriptions = compactSubscriptionSnapshot(activeSubscriptionsUpdated);
+                await updateRelaySubscriptions(relayKey, connectionKey, compactActiveSubscriptions);
                 if (clientId) {
                     await updateRelayClientSubscriptions(relayKey, clientId, {
-                      ...activeSubscriptionsUpdated,
+                      ...compactActiveSubscriptions,
                       clientId
                     });
                     if (stableClientId && stableClientId !== clientId) {
                       await updateRelayClientSubscriptions(relayKey, stableClientId, {
-                        ...activeSubscriptionsUpdated,
+                        ...compactActiveSubscriptions,
                         clientId: stableClientId
                       });
                     }
