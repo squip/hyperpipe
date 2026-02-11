@@ -422,6 +422,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     eventId: string
     pubkey: string
   } | null>(null)
+  const [adminLeavePollTick, setAdminLeavePollTick] = useState(0)
   const [copiedRelayUrl, setCopiedRelayUrl] = useState(false)
   const [memberSearch, setMemberSearch] = useState('')
   const [isInviteDialogOpen, setIsInviteDialogOpen] = useState(false)
@@ -455,7 +456,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const lastRouteSubscriptionRefreshRef = useRef<string | null>(null)
   const groupRelayWarmupKeyRef = useRef<string | null>(null)
   const lastWritableRefreshKeyRef = useRef<string | null>(null)
-  const lastAdminLeaveFetchRef = useRef<{ key: string; at: number } | null>(null)
   const sendToWorkerRef = useRef(sendToWorker)
   const relaySubscriptionRefreshThrottleRef = useRef<Map<string, number>>(new Map())
 
@@ -1343,34 +1343,18 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     return normalizePubkeyList(pubkeys)
   }, [effectiveDetail?.admins, effectiveDetail?.metadata?.event?.pubkey])
 
-  const adminLeaveFetchKey = useMemo(() => {
-    if (!groupId || !isMember || adminLeaveCandidatePubkeys.length === 0) return null
-    const relayUrls = Array.from(
-      new Set([...(activeGroupRelay ? [activeGroupRelay] : []), ...BIG_RELAY_URLS])
-    )
-    return `${groupId}|${relayUrls.join(',')}|${adminLeaveCandidatePubkeys.join(',')}|${workerRelayEntryForGroup?.relayKey || ''}|${workerRelayEntryForGroup?.publicIdentifier || ''}|${pubkey || ''}`
-  }, [
-    activeGroupRelay,
-    adminLeaveCandidatePubkeys,
-    groupId,
-    isMember,
-    pubkey,
-    workerRelayEntryForGroup?.publicIdentifier,
-    workerRelayEntryForGroup?.relayKey
-  ])
+  useEffect(() => {
+    if (!groupId || !isMember || adminLeaveNotice) return
+    const timer = window.setInterval(() => {
+      setAdminLeavePollTick((prev) => prev + 1)
+    }, 15_000)
+    return () => window.clearInterval(timer)
+  }, [adminLeaveNotice, groupId, isMember])
 
   useEffect(() => {
     if (!groupId || !isMember) return
-    if (!adminLeaveFetchKey) return
-    if (adminLeaveCandidatePubkeys.length === 0) return
-
-    const now = Date.now()
-    const lastFetch = lastAdminLeaveFetchRef.current
-    if (lastFetch && lastFetch.key === adminLeaveFetchKey && now - lastFetch.at < 30_000) return
-    lastAdminLeaveFetchRef.current = { key: adminLeaveFetchKey, at: now }
 
     let cancelled = false
-    const adminPubkeys = new Set(adminLeaveCandidatePubkeys)
     const relayUrls = Array.from(
       new Set([...(activeGroupRelay ? [activeGroupRelay] : []), ...BIG_RELAY_URLS])
     )
@@ -1394,16 +1378,53 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           limit: 200
         })
       }
-      const batches = await Promise.all(
-        leaveFilters.map((filter) => client.fetchEvents(relayUrls, filter).catch(() => []))
+      const adminSnapshotFilters: Array<{
+        '#d'?: string[]
+        '#h'?: string[]
+        kinds: number[]
+        limit: number
+      }> = [
+        {
+          kinds: [39001],
+          '#d': [groupId],
+          limit: 200
+        },
+        {
+          kinds: [39001],
+          '#h': [groupId],
+          limit: 200
+        }
+      ]
+      const [leaveBatches, adminSnapshotBatches] = await Promise.all([
+        Promise.all(
+          leaveFilters.map((filter) => client.fetchEvents(relayUrls, filter).catch(() => []))
+        ),
+        Promise.all(
+          adminSnapshotFilters.map((filter) =>
+            client.fetchEvents(relayUrls, filter).catch(() => [])
+          )
+        )
+      ])
+      const dedupeById = (events: NostrEvent[]) => {
+        const seenIds = new Set<string>()
+        return events.filter((event) => {
+          if (!event?.id) return true
+          if (seenIds.has(event.id)) return false
+          seenIds.add(event.id)
+          return true
+        })
+      }
+      const events = dedupeById(leaveBatches.flat())
+      const adminSnapshotEvents = dedupeById(adminSnapshotBatches.flat())
+      const historicalAdminPubkeys = normalizePubkeyList(
+        adminSnapshotEvents.flatMap((event) =>
+          event.tags.filter((tag) => tag[0] === 'p' && tag[1]).map((tag) => tag[1])
+        )
       )
-      const seenIds = new Set<string>()
-      const events = batches.flat().filter((event) => {
-        if (!event?.id) return true
-        if (seenIds.has(event.id)) return false
-        seenIds.add(event.id)
-        return true
-      })
+      const adminPubkeys = new Set(
+        normalizePubkeyList([...adminLeaveCandidatePubkeys, ...historicalAdminPubkeys])
+      )
+      if (adminPubkeys.size === 0) return
       if (cancelled) return
       const latestAdminLeave = events
         .filter((event) => adminPubkeys.has(event.pubkey))
@@ -1424,7 +1445,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   }, [
     activeGroupRelay,
     adminLeaveCandidatePubkeys,
-    adminLeaveFetchKey,
+    adminLeavePollTick,
     groupId,
     isMember,
     pubkey,
