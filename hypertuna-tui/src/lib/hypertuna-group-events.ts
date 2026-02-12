@@ -1,0 +1,140 @@
+import type { Event, EventTemplate } from 'nostr-tools'
+
+export const HYPERTUNA_IDENTIFIER_TAG = 'hypertuna:relay'
+
+export const KIND_GROUP_CREATE = 9007
+export const KIND_GROUP_METADATA = 39000
+export const KIND_GROUP_ADMIN_LIST = 39001
+export const KIND_GROUP_MEMBER_LIST = 39002
+export const KIND_HYPERTUNA_RELAY = 30166
+
+export function getBaseRelayUrl(url: string): string {
+  try {
+    const parsed = new URL(url)
+    parsed.searchParams.delete('token')
+    return parsed.toString().replace(/\?$/, '')
+  } catch {
+    return String(url || '').split('?')[0]
+  }
+}
+
+function tagValue(tags: string[][], name: string): string | null {
+  const found = tags.find((tag) => tag[0] === name)
+  return typeof found?.[1] === 'string' ? found[1] : null
+}
+
+export function parseHypertunaRelayEvent30166(event: Pick<Event, 'kind' | 'tags'>): { publicIdentifier: string; wsUrl: string } | null {
+  if (event.kind !== KIND_HYPERTUNA_RELAY) return null
+  const wsUrl = tagValue(event.tags as string[][], 'd')
+  const publicIdentifier =
+    tagValue(event.tags as string[][], 'h')
+    || tagValue(event.tags as string[][], 'hypertuna')
+
+  if (!wsUrl || !publicIdentifier) return null
+
+  return {
+    publicIdentifier,
+    wsUrl
+  }
+}
+
+export function buildHypertunaDiscoveryDraftEvents(args: {
+  publicIdentifier: string
+  name: string
+  about?: string
+  isPublic: boolean
+  isOpen: boolean
+  fileSharing?: boolean
+  relayWsUrl: string
+  pictureTagUrl?: string
+}): { groupCreateEvent: EventTemplate; metadataEvent: EventTemplate; hypertunaEvent: EventTemplate } {
+  const now = Math.floor(Date.now() / 1000)
+  const fileSharingEnabled = args.fileSharing !== false
+
+  const groupTags: string[][] = [
+    ['h', args.publicIdentifier],
+    ['name', args.name],
+    ['about', args.about || ''],
+    ['hypertuna', args.publicIdentifier],
+    ['i', HYPERTUNA_IDENTIFIER_TAG],
+    [args.isPublic ? 'public' : 'private'],
+    [args.isOpen ? 'open' : 'closed'],
+    [fileSharingEnabled ? 'file-sharing-on' : 'file-sharing-off']
+  ]
+
+  if (args.pictureTagUrl) {
+    groupTags.push(['picture', args.pictureTagUrl, 'hypertuna:drive:pfp'])
+  }
+
+  const metadataTags: string[][] = [
+    ['d', args.publicIdentifier],
+    ['h', args.publicIdentifier],
+    ['name', args.name],
+    ['about', args.about || ''],
+    ['hypertuna', args.publicIdentifier],
+    ['i', HYPERTUNA_IDENTIFIER_TAG],
+    [args.isPublic ? 'public' : 'private'],
+    [args.isOpen ? 'open' : 'closed'],
+    [fileSharingEnabled ? 'file-sharing-on' : 'file-sharing-off']
+  ]
+
+  if (args.pictureTagUrl) {
+    metadataTags.push(['picture', args.pictureTagUrl, 'hypertuna:drive:pfp'])
+  }
+
+  return {
+    groupCreateEvent: {
+      kind: KIND_GROUP_CREATE,
+      created_at: now,
+      tags: groupTags,
+      content: `Created group: ${args.name}`
+    },
+    metadataEvent: {
+      kind: KIND_GROUP_METADATA,
+      created_at: now,
+      tags: metadataTags,
+      content: `Group metadata for: ${args.name}`
+    },
+    hypertunaEvent: {
+      kind: KIND_HYPERTUNA_RELAY,
+      created_at: now,
+      tags: [
+        ['d', args.relayWsUrl],
+        ['hypertuna', args.publicIdentifier],
+        ['h', args.publicIdentifier],
+        ['i', HYPERTUNA_IDENTIFIER_TAG]
+      ],
+      content: `Hypertuna relay for group: ${args.name}`
+    }
+  }
+}
+
+export function buildHypertunaAdminBootstrapDraftEvents(args: {
+  publicIdentifier: string
+  adminPubkeyHex: string
+  name: string
+}): { adminListEvent: EventTemplate; memberListEvent: EventTemplate } {
+  const now = Math.floor(Date.now() / 1000)
+  const tags: string[][] = [
+    ['h', args.publicIdentifier],
+    ['d', args.publicIdentifier],
+    ['hypertuna', args.publicIdentifier],
+    ['i', HYPERTUNA_IDENTIFIER_TAG],
+    ['p', args.adminPubkeyHex, 'admin']
+  ]
+
+  return {
+    adminListEvent: {
+      kind: KIND_GROUP_ADMIN_LIST,
+      created_at: now,
+      tags,
+      content: `Admin list for group: ${args.name}`
+    },
+    memberListEvent: {
+      kind: KIND_GROUP_MEMBER_LIST,
+      created_at: now,
+      tags,
+      content: `Member list for group: ${args.name}`
+    }
+  }
+}
