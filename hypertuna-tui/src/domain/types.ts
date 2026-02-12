@@ -145,6 +145,88 @@ export type SearchResult = {
   relay?: string
 }
 
+export type GroupViewTab = 'discover' | 'my' | 'invites'
+export type ChatViewTab = 'conversations' | 'invites'
+
+export type GroupListEntry = {
+  groupId: string
+  relay?: string
+}
+
+export type GroupJoinRequest = {
+  id: string
+  groupId: string
+  pubkey: string
+  createdAt: number
+  relay?: string
+  reason?: string
+  code?: string
+}
+
+export type InvitesInboxItem =
+  | {
+      type: 'group'
+      id: string
+      createdAt: number
+      groupId: string
+      title: string
+      relay?: string
+      token?: string
+    }
+  | {
+      type: 'chat'
+      id: string
+      createdAt: number
+      conversationId?: string | null
+      title: string
+      senderPubkey: string
+      status: ChatInvite['status']
+    }
+
+export type PaneViewportEntry = {
+  cursor: number
+  offset: number
+}
+
+export type PaneViewportMap = Record<string, PaneViewportEntry>
+
+export type PerfOperationSample = {
+  name: string
+  startedAt: number
+  durationMs: number
+  success: boolean
+  attempts: number
+}
+
+export type PerfMetrics = {
+  inFlight: number
+  queueDepth: number
+  dedupedRequests: number
+  cancelledRequests: number
+  retries: number
+  staleResponseDrops: number
+  operationSamples: PerfOperationSample[]
+  avgLatencyMs: number
+  p95LatencyMs: number
+  renderPressure: number
+  overlayEnabled: boolean
+}
+
+export type WorkerRecoveryState = {
+  enabled: boolean
+  status: 'idle' | 'scheduled' | 'recovering' | 'disabled'
+  attempt: number
+  nextDelayMs: number
+  lastExitCode: number | null
+  lastError?: string | null
+}
+
+export type FileScope = {
+  localGroupIds: string[]
+  relayGroups: Array<{ relayUrl: string; groupIds: string[] }>
+  fallbackRelays?: string[]
+}
+
 export interface AccountService {
   listAccounts(): AccountRecord[]
   getCurrentAccountPubkey(): string | null
@@ -203,6 +285,22 @@ export interface PostService {
 export interface GroupService {
   discoverGroups(relays: string[], limit?: number): Promise<GroupSummary[]>
   discoverInvites(relays: string[], pubkey: string, decrypt: (pubkey: string, ciphertext: string) => Promise<string>): Promise<GroupInvite[]>
+  loadMyGroupList(relays: string[], pubkey: string): Promise<GroupListEntry[]>
+  saveMyGroupList(relays: string[], pubkey: string, nsecHex: string, entries: GroupListEntry[]): Promise<void>
+  dismissInvite(inviteIds: Set<string>, inviteId: string): Set<string>
+  markInviteAccepted(
+    acceptedInviteIds: Set<string>,
+    acceptedGroupIds: Set<string>,
+    inviteId: string,
+    groupId?: string
+  ): { inviteIds: Set<string>; groupIds: Set<string> }
+  loadJoinRequests(
+    relays: string[],
+    groupId: string,
+    opts?: { handledKeys?: Set<string>; currentMembers?: Set<string> }
+  ): Promise<GroupJoinRequest[]>
+  approveJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void>
+  rejectJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void>
   sendInvite(input: {
     groupId: string
     relayUrl: string
@@ -236,6 +334,7 @@ export interface FileService {
     metadata?: Record<string, unknown>
   }): Promise<Record<string, unknown>>
   fetchGroupFiles(relays: string[], groupId?: string, limit?: number): Promise<GroupFileRecord[]>
+  fetchScopedGroupFiles(scope: FileScope, limit?: number): Promise<GroupFileRecord[]>
 }
 
 export interface ListService {
@@ -261,6 +360,16 @@ export interface ChatService {
   init(relays: string[]): Promise<void>
   listConversations(search?: string): Promise<ChatConversation[]>
   listInvites(search?: string): Promise<ChatInvite[]>
+  filterActionableInvites(
+    invites: ChatInvite[],
+    opts?: {
+      dismissedInviteIds?: Set<string>
+      acceptedInviteIds?: Set<string>
+      acceptedConversationIds?: Set<string>
+    }
+  ): ChatInvite[]
+  selectUnreadTotal(conversations: ChatConversation[]): number
+  selectPendingInviteCount(invites: ChatInvite[]): number
   createConversation(input: {
     title: string
     description?: string

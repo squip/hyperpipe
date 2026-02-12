@@ -1,13 +1,22 @@
 import type { EventTemplate } from 'nostr-tools'
 import type {
+  GroupJoinRequest,
   GroupInvite,
+  GroupListEntry,
   GroupService as IGroupService,
   GroupSummary
 } from './types.js'
 import { NostrClient } from './nostrClient.js'
-import { parseGroupInviteEvent, parseGroupMetadataEvent } from '../lib/groups.js'
+import { parseGroupListEvent } from '../lib/groups.js'
 import { eventNow, signDraftEvent } from '../lib/nostr.js'
 import type { WorkerHost } from '../runtime/workerHost.js'
+import {
+  applyGroupDiscoveryParity,
+  filterActionableJoinRequests,
+  parseGroupInviteWithPayload,
+  parseJoinRequestEvent
+} from './parity/groupFilters.js'
+import { HYPERTUNA_IDENTIFIER_TAG, KIND_HYPERTUNA_RELAY } from '../lib/hypertuna-group-events.js'
 
 export class GroupService implements IGroupService {
   private client: NostrClient
@@ -21,39 +30,31 @@ export class GroupService implements IGroupService {
   }
 
   async discoverGroups(relays: string[], limit = 250): Promise<GroupSummary[]> {
-    const events = await this.client.query(
-      relays,
-      {
-        kinds: [39000],
-        limit
-      },
-      5_000
-    )
+    const [metadataEvents, relayEvents] = await Promise.all([
+      this.client.query(
+        relays,
+        {
+          kinds: [39000],
+          '#i': [HYPERTUNA_IDENTIFIER_TAG],
+          limit
+        },
+        5_000
+      ),
+      this.client.query(
+        relays,
+        {
+          kinds: [KIND_HYPERTUNA_RELAY],
+          '#i': [HYPERTUNA_IDENTIFIER_TAG],
+          limit: Math.max(limit, 300)
+        },
+        5_000
+      )
+    ])
 
-    const byCoordinate = new Map<string, GroupSummary>()
-
-    for (const event of events) {
-      const parsed = parseGroupMetadataEvent(event)
-      if (!parsed.id) continue
-      const key = `${event.pubkey}:${parsed.id}`
-      const current = byCoordinate.get(key)
-      if (!current || (current.event?.created_at || 0) < event.created_at) {
-        byCoordinate.set(key, {
-          id: parsed.id,
-          relay: parsed.relay,
-          name: parsed.name,
-          about: parsed.about,
-          picture: parsed.picture,
-          isPublic: parsed.isPublic,
-          isOpen: parsed.isOpen,
-          event
-        })
-      }
-    }
-
-    return Array.from(byCoordinate.values()).sort(
-      (left, right) => (right.event?.created_at || 0) - (left.event?.created_at || 0)
-    )
+    return applyGroupDiscoveryParity({
+      metadataEvents,
+      relayEvents
+    })
   }
 
   async discoverInvites(
@@ -66,44 +67,171 @@ export class GroupService implements IGroupService {
       {
         kinds: [9009],
         '#p': [pubkey],
-        limit: 300
+        limit: 200
       },
       5_000
     )
 
-    const invites: GroupInvite[] = []
+    const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number): Promise<T> => {
+      let timeoutId: NodeJS.Timeout | null = null
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<T>((_resolve, reject) => {
+            timeoutId = setTimeout(() => {
+              reject(new Error(`invite decrypt timeout after ${timeoutMs}ms`))
+            }, timeoutMs)
+          })
+        ])
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId)
+      }
+    }
 
-    for (const event of events) {
-      const parsed = parseGroupInviteEvent(event)
-      let token: string | undefined
+    const invites = await Promise.all(events.map(async (event) => {
+      let decryptedPayload: Record<string, unknown> | null = null
 
       if (event.content) {
         try {
-          const plaintext = await decrypt(event.pubkey, event.content)
+          const plaintext = await withTimeout(decrypt(event.pubkey, event.content), 1_200)
           const payload = JSON.parse(plaintext)
-          if (typeof payload?.token === 'string') {
-            token = payload.token
+          if (payload && typeof payload === 'object') {
+            decryptedPayload = payload as Record<string, unknown>
           }
         } catch {
-          // keep invite even if content decrypt fails
+          // keep invite even if content decrypt fails or times out
         }
       }
 
-      invites.push({
-        id: event.id,
-        groupId: parsed.groupId,
-        relay: parsed.relay,
-        groupName: parsed.groupName,
-        groupPicture: parsed.groupPicture,
-        isPublic: parsed.isPublic,
-        fileSharing: parsed.fileSharing,
-        token,
-        event
+      return parseGroupInviteWithPayload({
+        event,
+        decryptedPayload
       })
-    }
+    }))
 
     invites.sort((left, right) => right.event.created_at - left.event.created_at)
     return invites
+  }
+
+  async loadMyGroupList(relays: string[], pubkey: string): Promise<GroupListEntry[]> {
+    const events = await this.client.query(
+      relays,
+      {
+        kinds: [10009],
+        authors: [pubkey],
+        limit: 1
+      },
+      5_000
+    )
+    const sorted = events.sort((left, right) => right.created_at - left.created_at)
+    const latest = sorted[0]
+    if (!latest) return []
+    return parseGroupListEvent(latest).map((entry) => ({
+      groupId: entry.groupId,
+      relay: entry.relay
+    }))
+  }
+
+  async saveMyGroupList(
+    relays: string[],
+    _pubkey: string,
+    nsecHex: string,
+    entries: GroupListEntry[]
+  ): Promise<void> {
+    const tags: string[][] = []
+    for (const entry of entries) {
+      const groupId = String(entry.groupId || '').trim()
+      if (!groupId) continue
+      const relay = String(entry.relay || '').trim()
+      if (relay) {
+        tags.push(['group', groupId, relay])
+      } else {
+        tags.push(['group', groupId])
+      }
+    }
+
+    const draft: EventTemplate = {
+      kind: 10009,
+      created_at: eventNow(),
+      tags,
+      content: ''
+    }
+
+    const event = signDraftEvent(nsecHex, draft)
+    await this.client.publish(relays, event)
+  }
+
+  dismissInvite(inviteIds: Set<string>, inviteId: string): Set<string> {
+    const normalizedInviteId = String(inviteId || '').trim()
+    if (!normalizedInviteId) return new Set(inviteIds)
+    const next = new Set(inviteIds)
+    next.add(normalizedInviteId)
+    return next
+  }
+
+  markInviteAccepted(
+    acceptedInviteIds: Set<string>,
+    acceptedGroupIds: Set<string>,
+    inviteId: string,
+    groupId?: string
+  ): { inviteIds: Set<string>; groupIds: Set<string> } {
+    const nextInviteIds = new Set(acceptedInviteIds)
+    const nextGroupIds = new Set(acceptedGroupIds)
+    const normalizedInviteId = String(inviteId || '').trim()
+    const normalizedGroupId = String(groupId || '').trim()
+
+    if (normalizedInviteId) nextInviteIds.add(normalizedInviteId)
+    if (normalizedGroupId) nextGroupIds.add(normalizedGroupId)
+
+    return {
+      inviteIds: nextInviteIds,
+      groupIds: nextGroupIds
+    }
+  }
+
+  async loadJoinRequests(
+    relays: string[],
+    groupId: string,
+    opts?: { handledKeys?: Set<string>; currentMembers?: Set<string> }
+  ): Promise<GroupJoinRequest[]> {
+    const events = await this.client.query(
+      relays,
+      {
+        kinds: [9021],
+        '#h': [groupId],
+        limit: 200
+      },
+      5_000
+    )
+
+    const parsed = events
+      .map((event) => parseJoinRequestEvent(event))
+      .filter((event): event is GroupJoinRequest => !!event)
+
+    return filterActionableJoinRequests({
+      requests: parsed,
+      handledKeys: opts?.handledKeys,
+      currentMembers: opts?.currentMembers
+    })
+  }
+
+  async approveJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void> {
+    await this.updateMembers({
+      publicIdentifier: groupId,
+      relayKey: relay && /^[a-f0-9]{64}$/i.test(relay) ? relay.toLowerCase() : undefined,
+      memberAdds: [{ pubkey, ts: Date.now() }]
+    })
+  }
+
+  async rejectJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void> {
+    await this.workerHost.send({
+      type: 'reject-join-request',
+      data: {
+        publicIdentifier: groupId,
+        relayKey: relay && /^[a-f0-9]{64}$/i.test(relay) ? relay.toLowerCase() : undefined,
+        pubkey
+      }
+    })
   }
 
   async sendInvite(input: {

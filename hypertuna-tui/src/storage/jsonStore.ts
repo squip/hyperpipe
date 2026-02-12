@@ -8,7 +8,7 @@ async function ensureParent(filePath: string): Promise<void> {
 
 export async function readJsonFile<T>(
   filePath: string,
-  schema: ZodType<T>,
+  schema: ZodType<T, any, any>,
   fallback: () => T
 ): Promise<T> {
   try {

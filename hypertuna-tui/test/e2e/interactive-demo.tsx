@@ -1,0 +1,64 @@
+import React from 'react'
+import { render } from 'ink'
+import type { RuntimeOptions } from '../../src/domain/controller.js'
+import { App, type ScriptedCommand } from '../../src/ui/App.js'
+import { MockController } from './support/mockController.js'
+
+const stayOpen = process.argv.includes('--stay-open')
+const noAnimations = process.argv.includes('--no-animations')
+
+const options: RuntimeOptions = {
+  cwd: process.cwd(),
+  storageDir: '/tmp/hypertuna-tui-e2e-demo',
+  noAnimations,
+  logLevel: 'info'
+}
+
+const commands: ScriptedCommand[] = [
+  { command: 'account profiles', delayMs: 500 },
+  { command: 'account generate walkthrough_profile' },
+  { command: 'account profiles' },
+  { command: 'account login walkthrough_profile' },
+
+  { command: 'relay refresh', delayMs: 900 },
+  { command: 'relay create walkthrough --public --open --desc scripted_demo_group' },
+  { command: 'group refresh' },
+  { command: 'copy selected' },
+  { command: 'copy command' },
+  { command: `group update-members add ${'c'.repeat(64)}` },
+  { command: `group update-auth ${'c'.repeat(64)} token-auth-demo` },
+  { command: 'group invites' },
+  { command: `group invite ${'b'.repeat(64)} token-demo` },
+  { command: 'group join-flow token-join --open' },
+  { command: 'relay join npubdemo:group token-join' },
+
+  { command: 'feed refresh 6' },
+  { command: 'post scripted walkthrough post from the terminal app' },
+  { command: `bookmark add ${'a'.repeat(64)}` },
+
+  { command: 'file refresh npubseed:group-a' },
+  { command: 'file upload npubseed:group-a /tmp/demo-upload.txt' },
+
+  { command: 'list refresh' },
+  { command: 'list create demo-pack DemoPack aaaaaaaa,bbbbbbbb,cccccccc' },
+  { command: 'list apply demo-pack' },
+
+  { command: 'chat init' },
+  { command: 'chat create DemoChat aaaaaaaa,bbbbbbbb' },
+  { command: 'chat accept chat-invite-1' },
+  { command: 'chat thread conv-seed-1' },
+  { command: 'chat send conv-seed-1 scripted chat message from walkthrough' },
+
+  { command: 'search notes feed' },
+  { command: 'relay leave npubdemo:group --archive --save-files' },
+  { command: 'goto logs' }
+]
+
+render(
+  <App
+    options={options}
+    controllerFactory={(runtimeOptions) => MockController.withSeedData(runtimeOptions)}
+    scriptedCommands={commands}
+    autoExitOnScriptComplete={!stayOpen}
+  />
+)

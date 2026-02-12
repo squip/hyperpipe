@@ -10,7 +10,12 @@
     "dev": "tsx src/cli.tsx",
     "build": "tsup src/cli.tsx --format esm --out-dir dist --clean && node scripts/add-shebang.cjs dist/cli.js",
     "start": "node dist/cli.js",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:e2e": "vitest run test/e2e",
+    "demo:e2e": "tsx test/e2e/interactive-demo.tsx",
+    "demo:e2e:stay-open": "tsx test/e2e/interactive-demo.tsx --stay-open",
+    "demo:e2e:real": "tsx test/e2e/interactive-demo-real.tsx",
+    "demo:e2e:real:stay-open": "tsx test/e2e/interactive-demo-real.tsx --stay-open"
   },
   "dependencies": {
     "ink": "^5.0.1",
@@ -23,6 +28,7 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/react": "^18.3.17",
+    "ink-testing-library": "^4.0.0",
     "tsup": "^8.3.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",

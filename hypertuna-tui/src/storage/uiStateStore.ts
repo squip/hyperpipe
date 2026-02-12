@@ -1,5 +1,18 @@
 import { readJsonFile, writeJsonFile } from './jsonStore.js'
-import { defaultUiState, type UiState, uiStateSchema } from './schema.js'
+import { defaultUiState, type AccountScopedUiState, type UiState, uiStateSchema } from './schema.js'
+
+const defaultAccountScopedUiState = (): AccountScopedUiState => ({
+  groupViewTab: 'discover',
+  chatViewTab: 'conversations',
+  paneViewport: {},
+  dismissedGroupInviteIds: [],
+  acceptedGroupInviteIds: [],
+  acceptedGroupInviteGroupIds: [],
+  dismissedChatInviteIds: [],
+  acceptedChatInviteIds: [],
+  acceptedChatInviteConversationIds: [],
+  perfOverlayEnabled: false
+})
 
 export class UiStateStore {
   private filePath: string
@@ -20,6 +33,10 @@ export class UiStateStore {
       keymap: {
         ...defaults.keymap,
         ...(loaded.keymap || {})
+      },
+      accountScoped: {
+        ...defaults.accountScoped,
+        ...(loaded.accountScoped || {})
       }
     }
   }
@@ -29,7 +46,11 @@ export class UiStateStore {
   }
 
   getState(): UiState {
-    return { ...this.state, keymap: { ...this.state.keymap } }
+    return {
+      ...this.state,
+      keymap: { ...this.state.keymap },
+      accountScoped: { ...this.state.accountScoped }
+    }
   }
 
   async patchState(patch: Partial<UiState>): Promise<UiState> {
@@ -40,9 +61,51 @@ export class UiStateStore {
       keymap: {
         ...this.state.keymap,
         ...(patch.keymap || {})
+      },
+      accountScoped: {
+        ...this.state.accountScoped,
+        ...(patch.accountScoped || {})
       }
     }
     await writeJsonFile(this.filePath, this.state)
     return this.getState()
+  }
+
+  getAccountState(userKey: string): AccountScopedUiState {
+    const key = String(userKey || '').trim().toLowerCase()
+    if (!key) return defaultAccountScopedUiState()
+    return {
+      ...defaultAccountScopedUiState(),
+      ...(this.state.accountScoped[key] || {})
+    }
+  }
+
+  async patchAccountState(
+    userKey: string,
+    patch: Partial<AccountScopedUiState>
+  ): Promise<AccountScopedUiState> {
+    await this.waitUntilReady()
+    const key = String(userKey || '').trim().toLowerCase()
+    if (!key) return defaultAccountScopedUiState()
+
+    const previous = this.getAccountState(key)
+    const next: AccountScopedUiState = {
+      ...previous,
+      ...patch,
+      paneViewport: {
+        ...previous.paneViewport,
+        ...(patch.paneViewport || {})
+      }
+    }
+
+    this.state = {
+      ...this.state,
+      accountScoped: {
+        ...this.state.accountScoped,
+        [key]: next
+      }
+    }
+    await writeJsonFile(this.filePath, this.state)
+    return next
   }
 }

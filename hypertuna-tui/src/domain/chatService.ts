@@ -144,6 +144,45 @@ export class ChatService implements IChatService {
       .filter((row): row is ChatInvite => !!row)
   }
 
+  filterActionableInvites(
+    invites: ChatInvite[],
+    opts?: {
+      dismissedInviteIds?: Set<string>
+      acceptedInviteIds?: Set<string>
+      acceptedConversationIds?: Set<string>
+    }
+  ): ChatInvite[] {
+    const dismissed = opts?.dismissedInviteIds || new Set<string>()
+    const accepted = opts?.acceptedInviteIds || new Set<string>()
+    const acceptedConversations = opts?.acceptedConversationIds || new Set<string>()
+
+    const rows = invites.filter((invite) => {
+      if (!invite.id) return false
+      if (dismissed.has(invite.id)) return false
+      if (accepted.has(invite.id)) return false
+      if (invite.conversationId && acceptedConversations.has(invite.conversationId)) return false
+      if (invite.status === 'joined') return false
+      return true
+    })
+
+    rows.sort((left, right) => {
+      if (left.createdAt !== right.createdAt) return right.createdAt - left.createdAt
+      return left.id.localeCompare(right.id)
+    })
+    return rows
+  }
+
+  selectUnreadTotal(conversations: ChatConversation[]): number {
+    return conversations.reduce((total, conversation) => {
+      const unread = Number.isFinite(conversation.unreadCount) ? Math.max(0, conversation.unreadCount) : 0
+      return total + unread
+    }, 0)
+  }
+
+  selectPendingInviteCount(invites: ChatInvite[]): number {
+    return invites.filter((invite) => invite.status !== 'joined').length
+  }
+
   async createConversation(input: {
     title: string
     description?: string
