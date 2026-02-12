@@ -16,9 +16,18 @@ import {
 } from '@/lib/group-files'
 import { useNostr } from '@/providers/NostrProvider'
 import { useReply } from '@/providers/ReplyProvider'
+import { useGroups } from '@/providers/GroupsProvider'
+import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import postEditorCache from '@/services/post-editor-cache.service'
 import { MediaUploadContext, MediaUploadResult } from '@/services/media-upload.service'
 import { TPollCreateData } from '@/types'
+import {
+  buildGroupRelayDisplayMetaMap,
+  buildGroupRelayTargets,
+  getRelayIdentity,
+  resolvePublishRelayUrls,
+  type GroupRelayTarget
+} from '@/lib/relay-targets'
 import { ImageUp, ListTodo, LoaderCircle, Settings, Smile, X } from 'lucide-react'
 import { Event } from '@nostr/tools/wasm'
 import * as kinds from '@nostr/tools/kinds'
@@ -71,6 +80,8 @@ export default function PostContent({
   const { t } = useTranslation()
   const { pubkey, publish, checkLogin } = useNostr()
   const { addReplies } = useReply()
+  const { myGroupList, discoveryGroups, getProvisionalGroupMetadata, resolveRelayUrl } = useGroups()
+  const { refreshRelaySubscriptions } = useWorkerBridge()
   const [text, setText] = useState('')
   const textareaRef = useRef<TPostTextareaHandle>(null)
   const [posting, setPosting] = useState(false)
@@ -95,6 +106,31 @@ export default function PostContent({
   const [minPow, setMinPow] = useState(0)
   const allowEmoji = useMemo(() => !isTouchDevice(), [])
   const [view, setView] = useState<'edit' | 'preview'>('edit')
+  const groupRelayTargets = useMemo<GroupRelayTarget[]>(
+    () =>
+      buildGroupRelayTargets({
+        myGroupList,
+        resolveRelayUrl,
+        getProvisionalGroupMetadata,
+        discoveryGroups
+      }),
+    [discoveryGroups, getProvisionalGroupMetadata, myGroupList, resolveRelayUrl]
+  )
+  const groupRelayDisplayMeta = useMemo(
+    () => buildGroupRelayDisplayMetaMap(groupRelayTargets),
+    [groupRelayTargets]
+  )
+  const groupRelayIdsByIdentity = useMemo(() => {
+    const groupIdsByIdentity = new Map<string, Set<string>>()
+    groupRelayTargets.forEach((target) => {
+      const relayIdentity = target.relayIdentity || getRelayIdentity(target.relayUrl)
+      if (!relayIdentity) return
+      const existing = groupIdsByIdentity.get(relayIdentity) || new Set<string>()
+      existing.add(target.groupId)
+      groupIdsByIdentity.set(relayIdentity, existing)
+    })
+    return groupIdsByIdentity
+  }, [groupRelayTargets])
   const groupUploadContext = useMemo<MediaUploadContext | undefined>(() => {
     if (!groupContext?.groupId) return undefined
     return {
@@ -132,6 +168,47 @@ export default function PostContent({
     additionalRelayUrls,
     groupContext
   ])
+
+  const resolveRelayPublishTargets = async (relayUrls: string[]) => {
+    return await resolvePublishRelayUrls({
+      relayUrls,
+      resolveRelayUrl,
+      groupRelayTargets,
+      refreshGroupRelay: async (groupId) => {
+        await refreshRelaySubscriptions({
+          publicIdentifier: groupId,
+          reason: 'post-editor-relay-publish',
+          timeoutMs: 12_000
+        })
+      }
+    })
+  }
+
+  const appendSelectedGroupHTags = (
+    draftEvent: { tags?: string[][] },
+    relayUrls: string[]
+  ) => {
+    if (!relayUrls.length || groupRelayIdsByIdentity.size === 0) return
+
+    const targetGroupIds = new Set<string>()
+    relayUrls.forEach((relayUrl) => {
+      const relayIdentity =
+        getRelayIdentity(resolveRelayUrl(relayUrl) || relayUrl) || getRelayIdentity(relayUrl)
+      if (!relayIdentity) return
+      const groupIds = groupRelayIdsByIdentity.get(relayIdentity)
+      if (!groupIds) return
+      groupIds.forEach((groupId) => targetGroupIds.add(groupId))
+    })
+
+    if (targetGroupIds.size === 0) return
+
+    draftEvent.tags = draftEvent.tags || []
+    targetGroupIds.forEach((groupId) => {
+      if (!draftEvent.tags?.some((tag) => tag[0] === 'h' && tag[1] === groupId)) {
+        draftEvent.tags?.push(['h', groupId])
+      }
+    })
+  }
 
   useEffect(() => {
     if (isFirstRender.current) {
@@ -213,13 +290,30 @@ export default function PostContent({
           }
         }
 
+        if (!groupContext) {
+          appendSelectedGroupHTags(
+            draftEvent,
+            additionalRelayUrls.length > 0 ? additionalRelayUrls : openFrom || []
+          )
+        }
+
+        let relayUrlsForProtectedPublish = additionalRelayUrls
+        if (!groupContext && additionalRelayUrls.length > 0) {
+          relayUrlsForProtectedPublish = await resolveRelayPublishTargets(additionalRelayUrls)
+        }
+
+        let groupContextRelayUrls: string[] = []
+        if (groupContext?.relay) {
+          groupContextRelayUrls = await resolveRelayPublishTargets([groupContext.relay])
+        }
+
         const newEvent = await publish(draftEvent, {
-          specifiedRelayUrls: groupContext?.relay
-            ? [groupContext.relay]
+          specifiedRelayUrls: groupContextRelayUrls.length
+            ? groupContextRelayUrls
             : isProtectedEvent
-              ? additionalRelayUrls
+              ? relayUrlsForProtectedPublish
               : undefined,
-          additionalRelayUrls: isPoll ? pollCreateData.relays : additionalRelayUrls,
+          additionalRelayUrls: isPoll ? pollCreateData.relays : relayUrlsForProtectedPublish,
           minPow
         })
         postEditorCache.clearPostCache({ defaultContent, parentEvent })
@@ -305,9 +399,13 @@ export default function PostContent({
     let lastError: unknown = null
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
+        const groupRelayUrls = await resolveRelayPublishTargets([groupContext.relay])
+        if (!groupRelayUrls.length) {
+          throw new Error('Unable to resolve group relay publish URL')
+        }
         await publish(draftEvent, {
-          specifiedRelayUrls: [groupContext.relay],
-          additionalRelayUrls: [groupContext.relay]
+          specifiedRelayUrls: groupRelayUrls,
+          additionalRelayUrls: groupRelayUrls
         })
         return
       } catch (error) {
@@ -466,6 +564,8 @@ export default function PostContent({
           setAdditionalRelayUrls={setAdditionalRelayUrls}
           parentEvent={parentEvent}
           openFrom={openFrom}
+          extraRelayUrls={groupRelayTargets.map((target) => target.relayUrl)}
+          relayDisplayMeta={groupRelayDisplayMeta}
         />
       )}
       <div className="flex items-center justify-between">

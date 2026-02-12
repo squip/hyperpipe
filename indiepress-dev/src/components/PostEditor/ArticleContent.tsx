@@ -8,6 +8,8 @@ import {
   getGroupHyperdriveUploads
 } from '@/lib/group-files'
 import { useNostr } from '@/providers/NostrProvider'
+import { useGroups } from '@/providers/GroupsProvider'
+import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import postEditorCache from '@/services/post-editor-cache.service'
 import { MediaUploadContext, MediaUploadResult } from '@/services/media-upload.service'
 import { Event } from '@nostr/tools/wasm'
@@ -18,6 +20,13 @@ import { LoaderCircle } from 'lucide-react'
 import { randomString } from '@/lib/random'
 import * as nip19 from '@nostr/tools/nip19'
 import { TDraftEvent } from '@/types'
+import {
+  buildGroupRelayDisplayMetaMap,
+  buildGroupRelayTargets,
+  getRelayIdentity,
+  resolvePublishRelayUrls,
+  type GroupRelayTarget
+} from '@/lib/relay-targets'
 import ArticleMarkdownEditor, { MetadataSnapshot } from './ArticleMarkdownEditor'
 
 type FailedUpload = {
@@ -64,6 +73,8 @@ export default function ArticleContent({
 }) {
   const { t } = useTranslation()
   const { publish, checkLogin } = useNostr()
+  const { myGroupList, discoveryGroups, getProvisionalGroupMetadata, resolveRelayUrl } = useGroups()
+  const { refreshRelaySubscriptions } = useWorkerBridge()
   const [title, setTitle] = useState('')
   const [identifier, setIdentifier] = useState('')
   const [summary, setSummary] = useState('')
@@ -86,6 +97,31 @@ export default function ArticleContent({
   const [metadataSnapshot, setMetadataSnapshot] = useState<MetadataSnapshot | null>(null)
   const [cacheHydrated, setCacheHydrated] = useState(false)
   const [templateResetKey, setTemplateResetKey] = useState(0)
+  const groupRelayTargets = useMemo<GroupRelayTarget[]>(
+    () =>
+      buildGroupRelayTargets({
+        myGroupList,
+        resolveRelayUrl,
+        getProvisionalGroupMetadata,
+        discoveryGroups
+      }),
+    [discoveryGroups, getProvisionalGroupMetadata, myGroupList, resolveRelayUrl]
+  )
+  const groupRelayDisplayMeta = useMemo(
+    () => buildGroupRelayDisplayMetaMap(groupRelayTargets),
+    [groupRelayTargets]
+  )
+  const groupRelayIdsByIdentity = useMemo(() => {
+    const groupIdsByIdentity = new Map<string, Set<string>>()
+    groupRelayTargets.forEach((target) => {
+      const relayIdentity = target.relayIdentity || getRelayIdentity(target.relayUrl)
+      if (!relayIdentity) return
+      const existing = groupIdsByIdentity.get(relayIdentity) || new Set<string>()
+      existing.add(target.groupId)
+      groupIdsByIdentity.set(relayIdentity, existing)
+    })
+    return groupIdsByIdentity
+  }, [groupRelayTargets])
   const groupUploadContext = useMemo<MediaUploadContext | undefined>(() => {
     if (!groupContext?.groupId) return undefined
     return {
@@ -348,6 +384,47 @@ export default function ArticleContent({
     return base
   }
 
+  const resolveRelayPublishTargets = async (relayUrls: string[]) => {
+    return await resolvePublishRelayUrls({
+      relayUrls,
+      resolveRelayUrl,
+      groupRelayTargets,
+      refreshGroupRelay: async (groupId) => {
+        await refreshRelaySubscriptions({
+          publicIdentifier: groupId,
+          reason: 'article-editor-relay-publish',
+          timeoutMs: 12_000
+        })
+      }
+    })
+  }
+
+  const appendSelectedGroupHTags = (
+    draftEvent: { tags?: string[][] },
+    relayUrls: string[]
+  ) => {
+    if (!relayUrls.length || groupRelayIdsByIdentity.size === 0) return
+
+    const targetGroupIds = new Set<string>()
+    relayUrls.forEach((relayUrl) => {
+      const relayIdentity =
+        getRelayIdentity(resolveRelayUrl(relayUrl) || relayUrl) || getRelayIdentity(relayUrl)
+      if (!relayIdentity) return
+      const groupIds = groupRelayIdsByIdentity.get(relayIdentity)
+      if (!groupIds) return
+      groupIds.forEach((groupId) => targetGroupIds.add(groupId))
+    })
+
+    if (targetGroupIds.size === 0) return
+
+    draftEvent.tags = draftEvent.tags || []
+    targetGroupIds.forEach((groupId) => {
+      if (!draftEvent.tags?.some((tag) => tag[0] === 'h' && tag[1] === groupId)) {
+        draftEvent.tags?.push(['h', groupId])
+      }
+    })
+  }
+
   const publishDraft = async (isDraft: boolean) => {
     await checkLogin(async () => {
       if (hasBlockingUploadFailures) {
@@ -380,18 +457,25 @@ export default function ArticleContent({
           }
         }
         let newEvent
+        const relayUrlsForPublish =
+          additionalRelayUrls.length > 0
+            ? additionalRelayUrls
+            : groupContext?.relay
+              ? [groupContext.relay]
+              : openFrom || []
+        if (!groupContext) {
+          appendSelectedGroupHTags(draftEvent, relayUrlsForPublish)
+        }
+        const resolvedRelayUrls = relayUrlsForPublish.length
+          ? await resolveRelayPublishTargets(relayUrlsForPublish)
+          : []
+
         if (onPublish) {
-          await onPublish(draftEvent, { isDraft, relayUrls: additionalRelayUrls })
+          await onPublish(draftEvent, { isDraft, relayUrls: resolvedRelayUrls })
         } else {
-          const relayUrls =
-            additionalRelayUrls.length > 0
-              ? additionalRelayUrls
-              : groupContext?.relay
-                ? [groupContext.relay]
-                : openFrom || []
           newEvent = await publish(draftEvent, {
-            specifiedRelayUrls: relayUrls.length ? relayUrls : undefined,
-            additionalRelayUrls: relayUrls
+            specifiedRelayUrls: resolvedRelayUrls.length ? resolvedRelayUrls : undefined,
+            additionalRelayUrls: resolvedRelayUrls
           })
         }
         let description: string | undefined
@@ -493,9 +577,13 @@ export default function ArticleContent({
     let lastError: unknown = null
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
+        const groupRelayUrls = await resolveRelayPublishTargets([groupContext.relay])
+        if (!groupRelayUrls.length) {
+          throw new Error('Unable to resolve group relay publish URL')
+        }
         await publish(draftEvent, {
-          specifiedRelayUrls: [groupContext.relay],
-          additionalRelayUrls: [groupContext.relay]
+          specifiedRelayUrls: groupRelayUrls,
+          additionalRelayUrls: groupRelayUrls
         })
         return
       } catch (error) {
@@ -631,6 +719,8 @@ export default function ArticleContent({
             setAdditionalRelayUrls={setAdditionalRelayUrls}
             parentEvent={existingEvent}
             openFrom={openFrom}
+            extraRelayUrls={groupRelayTargets.map((target) => target.relayUrl)}
+            relayDisplayMeta={groupRelayDisplayMeta}
           />
         )}
       </div>

@@ -44,10 +44,78 @@ const activeTimelineSubscriptionsByLabel = new Map<
   }
 >()
 const ENABLE_TIMELINE_DEBUG_LOGS = false
+const FETCH_EVENTS_MAX_CONCURRENCY = 6
+const FETCH_EVENTS_RELAY_COOLDOWN_MS = 8_000
+const RATE_LIMIT_REASON_REGEX = /too many concurrent reqs|too many requests|rate[- ]limit|429/i
 
 function debugTimeline(...args: unknown[]) {
   if (!ENABLE_TIMELINE_DEBUG_LOGS) return
   console.info(...args)
+}
+
+function sanitizeRelayTransportUrl(url: string): string | null {
+  if (typeof url !== 'string') return null
+  const normalized = normalizeUrl(url)
+  if (!normalized) return null
+  try {
+    const parsed = new URL(normalized)
+    if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') return null
+    if (!parsed.hostname) return null
+    return parsed.toString()
+  } catch {
+    return null
+  }
+}
+
+function relayHasAuthToken(url: string): boolean {
+  try {
+    const parsed = new URL(url)
+    const token = parsed.searchParams.get('token')
+    return typeof token === 'string' && token.trim().length > 0
+  } catch {
+    return false
+  }
+}
+
+function getRelayIdentity(url: string): string | null {
+  const sanitized = sanitizeRelayTransportUrl(url)
+  if (!sanitized) return null
+  try {
+    const parsed = new URL(sanitized)
+    parsed.searchParams.delete('token')
+    parsed.searchParams.sort()
+    return parsed.toString().replace(/\?$/, '')
+  } catch {
+    return sanitized
+  }
+}
+
+function preferRelayTransportUrl(current: string, next: string): string {
+  const currentHasToken = relayHasAuthToken(current)
+  const nextHasToken = relayHasAuthToken(next)
+  if (!currentHasToken && nextHasToken) return next
+  return current
+}
+
+function dedupeRelayUrlsByIdentity(relays: string[]): string[] {
+  const byIdentity = new Map<string, string>()
+  const orderedIdentities: string[] = []
+
+  for (const relay of relays) {
+    const sanitized = sanitizeRelayTransportUrl(relay)
+    if (!sanitized) continue
+    const identity = getRelayIdentity(sanitized)
+    if (!identity) continue
+    const existing = byIdentity.get(identity)
+    if (!existing) {
+      byIdentity.set(identity, sanitized)
+      orderedIdentities.push(identity)
+      continue
+    }
+    byIdentity.set(identity, preferRelayTransportUrl(existing, sanitized))
+  }
+
+  return orderedIdentities.map((identity) => byIdentity.get(identity) || '').filter(Boolean)
 }
 
 class ClientService extends EventTarget {
@@ -58,6 +126,9 @@ class ClientService extends EventTarget {
   followings?: Set<string>
   private authCache = new Map<string, number>()
   private inFlightFetchEvents = new Map<string, Promise<NostrEvent[]>>()
+  private fetchEventsActiveCount = 0
+  private fetchEventsQueue: Array<() => void> = []
+  private relayFetchCooldownUntil = new Map<string, number>()
 
   private trendingNotesCache: NostrEvent[] | null = null
 
@@ -87,6 +158,89 @@ class ClientService extends EventTarget {
     }
   }
 
+  private async withFetchEventsSlot<T>(task: () => Promise<T>): Promise<T> {
+    if (this.fetchEventsActiveCount >= FETCH_EVENTS_MAX_CONCURRENCY) {
+      await new Promise<void>((resolve) => {
+        this.fetchEventsQueue.push(resolve)
+      })
+    }
+
+    this.fetchEventsActiveCount++
+    try {
+      return await task()
+    } finally {
+      this.fetchEventsActiveCount = Math.max(0, this.fetchEventsActiveCount - 1)
+      const next = this.fetchEventsQueue.shift()
+      if (next) {
+        next()
+      }
+    }
+  }
+
+  private markRelayFetchCooldown(relay: string, durationMs = FETCH_EVENTS_RELAY_COOLDOWN_MS) {
+    const normalizedRelay = sanitizeRelayTransportUrl(relay)
+    if (!normalizedRelay) return
+    const relayKey = getRelayIdentity(normalizedRelay) || normalizedRelay
+    const until = Date.now() + durationMs
+    const current = this.relayFetchCooldownUntil.get(relayKey) || 0
+    if (until > current) {
+      this.relayFetchCooldownUntil.set(relayKey, until)
+    }
+  }
+
+  private pruneRelayFetchCooldowns(now = Date.now()) {
+    for (const [relay, until] of this.relayFetchCooldownUntil.entries()) {
+      if (until <= now) {
+        this.relayFetchCooldownUntil.delete(relay)
+      }
+    }
+  }
+
+  private resolveFetchRelayUrls(urls: string[]): string[] {
+    const normalized = dedupeRelayUrlsByIdentity(urls)
+    if (!normalized.length) return []
+    this.pruneRelayFetchCooldowns()
+    const now = Date.now()
+    return normalized.filter((relay) => {
+      const relayKey = getRelayIdentity(relay) || relay
+      return (this.relayFetchCooldownUntil.get(relayKey) || 0) <= now
+    })
+  }
+
+  private applyFetchCloseReasons(relays: string[], reasons: string[] = []) {
+    if (!Array.isArray(reasons) || reasons.length === 0 || relays.length === 0) return
+    let cooled = false
+
+    for (let i = 0; i < reasons.length; i++) {
+      const reason = String(reasons[i] || '')
+      if (!reason || !RATE_LIMIT_REASON_REGEX.test(reason)) continue
+      const directRelay = relays[i]
+      if (directRelay) {
+        this.markRelayFetchCooldown(directRelay)
+        cooled = true
+        continue
+      }
+      for (const relay of relays) {
+        if (reason.includes(relay)) {
+          this.markRelayFetchCooldown(relay)
+          cooled = true
+        }
+      }
+    }
+
+    if (!cooled && RATE_LIMIT_REASON_REGEX.test(reasons.join(' | '))) {
+      relays.forEach((relay) => this.markRelayFetchCooldown(relay))
+      cooled = true
+    }
+
+    if (cooled) {
+      debugTimeline('[fetchEvents] relay cooldown applied', {
+        relayCount: relays.length,
+        reasons
+      })
+    }
+  }
+
   async determineTargetRelays(
     event: NostrEvent,
     { specifiedRelayUrls, additionalRelayUrls }: TPublishOptions = {}
@@ -94,7 +248,10 @@ class ClientService extends EventTarget {
     if (event.kind === kinds.Report) {
       const targetEventId = event.tags.find(tagNameEquals('e'))?.[1]
       if (targetEventId) {
-        return this.getSeenEventRelayUrls(targetEventId)
+        const seenRelays = dedupeRelayUrlsByIdentity(this.getSeenEventRelayUrls(targetEventId))
+        if (seenRelays.length > 0) {
+          return seenRelays
+        }
       }
     }
 
@@ -148,7 +305,11 @@ class ClientService extends EventTarget {
       relays.push(...BIG_RELAY_URLS)
     }
 
-    return relays
+    const sanitizedRelays = dedupeRelayUrlsByIdentity(relays)
+    if (sanitizedRelays.length > 0) {
+      return sanitizedRelays
+    }
+    return dedupeRelayUrlsByIdentity(BIG_RELAY_URLS)
   }
 
   private async ensureAuth(url: string) {
@@ -349,12 +510,13 @@ class ClientService extends EventTarget {
         (req): req is Extract<TFeedSubRequest, { source: 'relays' }> => req.source === 'relays'
       )
       .map(({ urls, filter }) => ({
-        urls,
+        urls: this.resolveFetchRelayUrls(urls),
         filter: {
           ...filter,
           ...filterModification
         }
       }))
+      .filter(({ urls }) => urls.length > 0)
     const relayUrls = Array.from(
       new Set(relayRequests.flatMap(({ urls }) => urls))
     )
@@ -517,7 +679,8 @@ class ClientService extends EventTarget {
                     "<not logged in, can't auth to relay during this.subscribeTimeline>"
                   )
                 }) as (event: EventTemplate) => Promise<VerifiedEvent>,
-                onclose(reasons) {
+                onclose: (reasons) => {
+                  this.applyFetchCloseReasons(closeUrls.length ? closeUrls : relayUrls, reasons)
                   const closeReport = reasons.map((reason, index) => ({
                     url: closeUrls[index] || relayUrls[index],
                     reason
@@ -649,12 +812,13 @@ class ClientService extends EventTarget {
         (req): req is Extract<TFeedSubRequest, { source: 'relays' }> => req.source === 'relays'
       )
       .map(({ urls, filter }) => ({
-        urls,
+        urls: this.resolveFetchRelayUrls(urls),
         filter: {
           ...filter,
           ...filterModification
         }
       }))
+      .filter(({ urls }) => urls.length > 0)
     const relayUrls = Array.from(
       new Set(relayRequests.flatMap(({ urls }) => urls))
     )
@@ -669,7 +833,7 @@ class ClientService extends EventTarget {
               relayRequests.flatMap(({ urls, filter }) => urls.flatMap((url) => ({ url, filter }))),
               {
                 label: 'f-more',
-                onevent(evt) {
+                onevent: (evt) => {
                   events.push(evt)
                   this.addEventToCache(evt)
                 },
@@ -677,7 +841,8 @@ class ClientService extends EventTarget {
                   subc.close()
                   resolve(events)
                 },
-                onclose(reasons) {
+                onclose: (reasons) => {
+                  this.applyFetchCloseReasons(relayUrls, reasons)
                   const closeReport = reasons.map((reason, index) => ({
                     url: relayUrls[index],
                     reason
@@ -809,7 +974,13 @@ class ClientService extends EventTarget {
       return value
     }
 
-    const normalizedUrls = Array.from(new Set(urls.map((url) => normalizeUrl(url)))).sort()
+    const normalizedUrls = Array.from(
+      new Set(
+        urls
+          .map((url) => getRelayIdentity(url) || sanitizeRelayTransportUrl(url) || '')
+          .filter(Boolean)
+      )
+    ).sort()
     const normalizedFilter = normalizeValue(filter || {})
     return JSON.stringify({
       urls: normalizedUrls,
@@ -828,14 +999,17 @@ class ClientService extends EventTarget {
       cache?: boolean
     } = {}
   ) {
-    const relays = Array.from(new Set(urls.map((url) => normalizeUrl(url))))
+    const relays = this.resolveFetchRelayUrls(urls)
+    if (!relays.length) {
+      return []
+    }
     const requestKey = this.buildFetchEventsRequestKey(relays, filter, cache)
     const existingRequest = this.inFlightFetchEvents.get(requestKey)
     if (existingRequest) {
       return existingRequest
     }
 
-    const request = (async () => {
+    const request = this.withFetchEventsSlot(async () => {
       const events: NostrEvent[] = []
 
       await new Promise<void>((resolve) => {
@@ -859,14 +1033,15 @@ class ClientService extends EventTarget {
               this.addEventToCache(event)
             }
           },
-          onclose(_: string[]) {
+          onclose: (reasons: string[]) => {
+            this.applyFetchCloseReasons(relays, reasons)
             resolve()
           }
         })
       })
 
       return events
-    })()
+    })
 
     this.inFlightFetchEvents.set(requestKey, request)
     request.finally(() => {
@@ -977,7 +1152,7 @@ class ClientService extends EventTarget {
 
     // try the relay hints first
     if (relayHints.length) {
-      relayHints = relayHints.map(normalizeUrl)
+      relayHints = dedupeRelayUrlsByIdentity(relayHints)
       const event = await pool.get(relayHints, filter, { label: 'f-specific-event-1' })
       if (event) {
         this.addEventToCache(event)
@@ -991,6 +1166,7 @@ class ClientService extends EventTarget {
       authorRelaysUrls = (await authorRelays).items
         .filter((r) => r.write && !relayHints.includes(r.url))
         .map((r) => r.url)
+      authorRelaysUrls = dedupeRelayUrlsByIdentity(authorRelaysUrls)
       if (authorRelaysUrls.length) {
         const event = await pool.get(authorRelaysUrls, filter, { label: 'f-specific-event-2' })
         if (event) {
@@ -1001,10 +1177,10 @@ class ClientService extends EventTarget {
     }
 
     // if we got nothing or there were no hints, try the big relays (except the ones we've already tried)
-    const bigRelayHints = BIG_RELAY_URLS.filter(
-      (br) => !(relayHints.includes(br) || authorRelaysUrls.includes(br))
+    const bigRelayHints = dedupeRelayUrlsByIdentity(
+      BIG_RELAY_URLS.filter((br) => !(relayHints.includes(br) || authorRelaysUrls.includes(br)))
+        .concat(['wss://cache2.primal.net/v1'])
     )
-    bigRelayHints.push('wss://cache2.primal.net/v1')
     if (bigRelayHints.length) {
       const event = await pool.get(bigRelayHints, filter, { label: 'f-specific-event-3' })
       if (event) {
@@ -1102,15 +1278,34 @@ class ClientService extends EventTarget {
   ): Promise<TRelayList> {
     return loadRelayList(pubkey, [], forceUpdate).then((r) => {
       if (!r.event) {
-        return structuredClone(DEFAULT_RELAY_LIST)
-      } else {
+        const defaults = structuredClone(DEFAULT_RELAY_LIST)
         return {
-          write: r.items.filter((r) => r.write).map((r) => r.url),
-          read: r.items.filter((r) => r.read).map((r) => r.url),
-          originalRelays: r.items.map(({ url, read, write }) => ({
-            url,
-            scope: read && write ? 'both' : read ? 'read' : 'write'
-          }))
+          ...defaults,
+          read: dedupeRelayUrlsByIdentity(defaults.read || []),
+          write: dedupeRelayUrlsByIdentity(defaults.write || [])
+        }
+      } else {
+        const readRelays = dedupeRelayUrlsByIdentity(
+          r.items.filter((item) => item.read).map((item) => item.url)
+        )
+        const writeRelays = dedupeRelayUrlsByIdentity(
+          r.items.filter((item) => item.write).map((item) => item.url)
+        )
+        const originalRelays = r.items
+          .map(({ url, read, write }) => {
+            const normalizedUrl = sanitizeRelayTransportUrl(url)
+            if (!normalizedUrl) return null
+            return {
+              url: normalizedUrl,
+              scope: read && write ? 'both' : read ? 'read' : 'write'
+            } as const
+          })
+          .filter((relay): relay is { url: string; scope: 'read' | 'write' | 'both' } => !!relay)
+
+        return {
+          write: writeRelays,
+          read: readRelays,
+          originalRelays
         }
       }
     })
@@ -1151,21 +1346,49 @@ class ClientService extends EventTarget {
     return muteList
   }
 
-  async fetchStarterPackEvents(pubkey: string) {
-    const events = await pool.querySync(
-      BIG_RELAY_URLS,
+  async fetchStarterPackEvents(pubkey: string, extraRelayUrls: string[] = []) {
+    const relayList = await this.fetchRelayList(pubkey)
+    const relayUrls = dedupeRelayUrlsByIdentity(
+      relayList.read.concat(relayList.write).concat(extraRelayUrls).concat(BIG_RELAY_URLS)
+    )
+    if (!relayUrls.length) {
+      return []
+    }
+
+    const events = await this.fetchEvents(
+      relayUrls,
       {
         kinds: [ExtendedKind.STARTER_PACK],
         authors: [pubkey]
       },
-      { label: 'f-starter-pack' }
+      { cache: true }
     )
-    return events.sort((a, b) => b.created_at - a.created_at)
+
+    const latestByCoordinate = new Map<string, NostrEvent>()
+    for (const event of events) {
+      const dTag = event.tags.find((tag) => tag[0] === 'd')?.[1]
+      if (!dTag) continue
+      const coordinate = `${event.pubkey}:${dTag}`
+      const current = latestByCoordinate.get(coordinate)
+      if (!current || current.created_at < event.created_at) {
+        latestByCoordinate.set(coordinate, event)
+      }
+    }
+
+    return Array.from(latestByCoordinate.values()).sort((a, b) => b.created_at - a.created_at)
   }
 
-  async fetchStarterPackEvent(pubkey: string, dTag: string) {
+  async fetchStarterPackEvent(pubkey: string, dTag: string, extraRelayUrls: string[] = []) {
+    const relayList = await this.fetchRelayList(pubkey)
+    const relayUrls = dedupeRelayUrlsByIdentity(
+      relayList.read.concat(relayList.write).concat(extraRelayUrls).concat(BIG_RELAY_URLS)
+    )
+    if (!relayUrls.length) {
+      return undefined
+    }
+
     return await pool.get(
-      BIG_RELAY_URLS,
+      relayUrls,
       {
         kinds: [ExtendedKind.STARTER_PACK],
         authors: [pubkey],
@@ -1193,7 +1416,8 @@ class ClientService extends EventTarget {
       loadFavoriteRelays(pubkey).then((fav) => {
         fav.items.forEach((url) => {
           if (typeof url !== 'string') return // TODO: load these too
-          url = normalizeUrl(url)
+          url = sanitizeRelayTransportUrl(url) || ''
+          if (!url) return
           const thisurl = urls.get(url) || new Set()
           thisurl.add(pubkey)
           urls.set(url, thisurl)
@@ -1210,7 +1434,8 @@ class ClientService extends EventTarget {
       loadRelaySets(pubkey).then((favsets) => {
         Object.values(favsets).forEach((favset) => {
           favset.items.forEach((url) => {
-            url = normalizeUrl(url)
+            url = sanitizeRelayTransportUrl(url) || ''
+            if (!url) return
             const thisurl = urls.get(url) || new Set()
             thisurl.add(pubkey)
             urls.set(url, thisurl)

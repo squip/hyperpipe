@@ -137,7 +137,7 @@ function normalizeRelayUrls(relayList: { read: string[]; write: string[] } | nul
     seen.add(candidate)
     normalized.push(candidate)
   }
-  return normalized
+  return normalized.sort((left, right) => left.localeCompare(right))
 }
 
 function mergeMessages(existing: ThreadMessage[], incoming: ThreadMessage[]) {
@@ -316,6 +316,8 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
   const bufferedMessagesRef = useRef<Map<string, ThreadMessage[]>>(new Map())
   const messageCacheRef = useRef<Map<string, ThreadMessage[]>>(new Map())
   const readStateRef = useRef<Map<string, ReadState>>(new Map())
+  const recentInitRef = useRef<{ signature: string; at: number } | null>(null)
+  const initInFlightSignatureRef = useRef<string | null>(null)
   const dismissedInviteIdsRef = useRef<Set<string>>(new Set())
   const acceptedInviteIdsRef = useRef<Set<string>>(new Set())
   const acceptedInviteConversationIdsRef = useRef<Set<string>>(new Set())
@@ -937,6 +939,19 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (!isReady || !pubkey) return
+    if (!relayUrls.length) {
+      setReady(true)
+      return
+    }
+    const initSignature = `${pubkey}:${relaySignature}`
+    const now = Date.now()
+    if (recentInitRef.current?.signature === initSignature && now - recentInitRef.current.at < 10_000) {
+      return
+    }
+    if (initInFlightSignatureRef.current === initSignature) {
+      return
+    }
+
     if (!electronIpc.isElectron()) {
       setUnsupportedReason('Conversations require Electron runtime.')
       setReady(true)
@@ -950,6 +965,8 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     readStateRef.current = loadReadStateFromStorage()
 
     const init = async () => {
+      initInFlightSignatureRef.current = initSignature
+      recentInitRef.current = { signature: initSignature, at: Date.now() }
       try {
         const initData = await sendToWorkerAwait({
           type: 'marmot-init',
@@ -977,6 +994,10 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
         if (!cancelled) {
           setUnsupportedReason(error instanceof Error ? error.message : 'Failed to initialize conversations')
           setReady(true)
+        }
+      } finally {
+        if (initInFlightSignatureRef.current === initSignature) {
+          initInFlightSignatureRef.current = null
         }
       }
     }

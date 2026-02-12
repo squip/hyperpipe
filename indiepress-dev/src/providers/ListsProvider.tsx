@@ -1,8 +1,9 @@
-import { ExtendedKind } from '@/constants'
+import { BIG_RELAY_URLS, ExtendedKind } from '@/constants'
+import { dedupeRelayUrlsByIdentity } from '@/lib/relay-targets'
 import client from '@/services/client.service'
 import { TDraftEvent } from '@/types'
 import { Event } from '@nostr/tools/wasm'
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react'
+import { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef, ReactNode } from 'react'
 import { useNostr } from './NostrProvider'
 import * as kinds from '@nostr/tools/kinds'
 
@@ -12,27 +13,43 @@ export type TStarterPack = {
   description?: string
   image?: string
   pubkeys: string[]
+  relayUrls?: string[]
   event: Event
 }
 
 type TListsContext = {
   lists: TStarterPack[]
   isLoading: boolean
-  createList: (title: string, description?: string, image?: string) => Promise<Event>
+  createList: (
+    title: string,
+    description?: string,
+    image?: string,
+    pubkeys?: string[],
+    relayUrls?: string[]
+  ) => Promise<Event>
   updateList: (
     id: string,
     title: string,
     pubkeys: string[],
     description?: string,
-    image?: string
+    image?: string,
+    relayUrls?: string[]
   ) => Promise<Event>
   deleteList: (id: string) => Promise<void>
   addToList: (id: string, pubkey: string) => Promise<Event>
   removeFromList: (id: string, pubkey: string) => Promise<Event>
-  fetchLists: () => Promise<void>
+  fetchLists: (extraRelayUrls?: string[]) => Promise<void>
 }
 
 const ListsContext = createContext<TListsContext | undefined>(undefined)
+
+function areStringArraysEqual(left: string[], right: string[]) {
+  if (left.length !== right.length) return false
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i] !== right[i]) return false
+  }
+  return true
+}
 
 export const useLists = () => {
   const context = useContext(ListsContext)
@@ -46,13 +63,16 @@ export function ListsProvider({ children }: { children: ReactNode }) {
   const { pubkey: accountPubkey, publish } = useNostr()
   const [lists, setLists] = useState<TStarterPack[]>([])
   const [isLoading, setIsLoading] = useState(false)
+  const knownExtraRelayUrlsRef = useRef<string[]>([])
 
-  const parseStarterPackEvent = (event: Event): TStarterPack => {
+  const parseStarterPackEvent = useCallback((event: Event): TStarterPack | null => {
     const dTag = event.tags.find((tag) => tag[0] === 'd')?.[1] || ''
+    if (!dTag) return null
     const title = event.tags.find((tag) => tag[0] === 'title')?.[1] || 'Untitled List'
     const description = event.tags.find((tag) => tag[0] === 'description')?.[1]
     const image = event.tags.find((tag) => tag[0] === 'image')?.[1]
     const pubkeys = event.tags.filter((tag) => tag[0] === 'p').map((tag) => tag[1])
+    const relayUrls = client.getSeenEventRelayUrls(event.id, event)
 
     return {
       id: dTag,
@@ -60,40 +80,84 @@ export function ListsProvider({ children }: { children: ReactNode }) {
       description,
       image,
       pubkeys,
+      relayUrls,
       event
     }
-  }
+  }, [])
 
-  const fetchLists = async () => {
+  const dedupeAndSortLists = useCallback((starterPacks: TStarterPack[]): TStarterPack[] => {
+    const latestByKey = new Map<string, TStarterPack>()
+
+    starterPacks.forEach((list) => {
+      const key = `${list.event.pubkey}:${list.id}`
+      const current = latestByKey.get(key)
+      if (!current || current.event.created_at < list.event.created_at) {
+        latestByKey.set(key, list)
+      }
+    })
+
+    return Array.from(latestByKey.values()).sort((a, b) => b.event.created_at - a.event.created_at)
+  }, [])
+
+  const upsertListFromEvent = useCallback((event: Event, relayUrls?: string[]) => {
+    const parsed = parseStarterPackEvent(event)
+    if (!parsed) return
+    const next = relayUrls?.length
+      ? {
+          ...parsed,
+          relayUrls
+        }
+      : parsed
+    setLists((prev) => dedupeAndSortLists([next, ...prev]))
+  }, [dedupeAndSortLists, parseStarterPackEvent])
+
+  const fetchLists = useCallback(async (extraRelayUrls: string[] = []) => {
     if (!accountPubkey) return
 
     setIsLoading(true)
     try {
-      const events = await client.fetchStarterPackEvents(accountPubkey)
-      const parsedLists = events.map(parseStarterPackEvent)
-      setLists(parsedLists)
+      const mergedExtraRelayUrls = dedupeRelayUrlsByIdentity([
+        ...knownExtraRelayUrlsRef.current,
+        ...extraRelayUrls
+      ])
+      if (!areStringArraysEqual(knownExtraRelayUrlsRef.current, mergedExtraRelayUrls)) {
+        knownExtraRelayUrlsRef.current = mergedExtraRelayUrls
+      }
+
+      const events = await client.fetchStarterPackEvents(accountPubkey, mergedExtraRelayUrls)
+      const parsedLists = events
+        .map(parseStarterPackEvent)
+        .filter((list): list is TStarterPack => !!list)
+      setLists((previous) => dedupeAndSortLists([...parsedLists, ...previous]))
     } catch (error) {
       console.error('Failed to fetch lists:', error)
     } finally {
       setIsLoading(false)
     }
-  }
+  }, [accountPubkey, dedupeAndSortLists, parseStarterPackEvent])
+
+  useEffect(() => {
+    knownExtraRelayUrlsRef.current = []
+  }, [accountPubkey])
 
   useEffect(() => {
     fetchLists()
-  }, [accountPubkey])
+  }, [fetchLists])
 
-  const createList = async (
+  const createList = useCallback(async (
     title: string,
     description?: string,
-    image?: string
+    image?: string,
+    pubkeys: string[] = [],
+    relayUrls: string[] = []
   ): Promise<Event> => {
     if (!accountPubkey) throw new Error('Not logged in')
 
     const dTag = `list-${Date.now()}`
     const tags: string[][] = [
       ['d', dTag],
-      ['title', title]
+      ['title', title],
+      ...pubkeys.map((pubkey) => ['p', pubkey])
     ]
 
     if (description) {
@@ -111,17 +175,21 @@ export function ListsProvider({ children }: { children: ReactNode }) {
       content: ''
     }
 
-    const event = await publish(draftEvent)
-    await fetchLists()
+    const event = await publish(
+      draftEvent,
+      relayUrls.length ? { specifiedRelayUrls: relayUrls } : { additionalRelayUrls: BIG_RELAY_URLS }
+    )
+    upsertListFromEvent(event, relayUrls)
     return event
-  }
+  }, [accountPubkey, publish, upsertListFromEvent])
 
-  const updateList = async (
+  const updateList = useCallback(async (
     id: string,
     title: string,
     pubkeys: string[],
     description?: string,
-    image?: string
+    image?: string,
+    relayUrls: string[] = []
   ): Promise<Event> => {
     if (!accountPubkey) throw new Error('Not logged in')
 
@@ -146,12 +214,15 @@ export function ListsProvider({ children }: { children: ReactNode }) {
       content: ''
     }
 
-    const event = await publish(draftEvent)
-    await fetchLists()
+    const event = await publish(
+      draftEvent,
+      relayUrls.length ? { specifiedRelayUrls: relayUrls } : { additionalRelayUrls: BIG_RELAY_URLS }
+    )
+    upsertListFromEvent(event, relayUrls)
     return event
-  }
+  }, [accountPubkey, publish, upsertListFromEvent])
 
-  const deleteList = async (id: string): Promise<void> => {
+  const deleteList = useCallback(async (id: string): Promise<void> => {
     if (!accountPubkey) throw new Error('Not logged in')
 
     const list = lists.find((l) => l.id === id)
@@ -164,11 +235,13 @@ export function ListsProvider({ children }: { children: ReactNode }) {
       content: ''
     }
 
-    await publish(draftEvent)
-    await fetchLists()
-  }
+    await publish(draftEvent, {
+      additionalRelayUrls: BIG_RELAY_URLS
+    })
+    setLists((prev) => prev.filter((l) => l.id !== id))
+  }, [accountPubkey, lists, publish])
 
-  const addToList = async (id: string, pubkey: string): Promise<Event> => {
+  const addToList = useCallback(async (id: string, pubkey: string): Promise<Event> => {
     const list = lists.find((l) => l.id === id)
     if (!list) throw new Error('List not found')
 
@@ -177,30 +250,33 @@ export function ListsProvider({ children }: { children: ReactNode }) {
     }
 
     return updateList(id, list.title, [...list.pubkeys, pubkey], list.description, list.image)
-  }
+  }, [lists, updateList])
 
-  const removeFromList = async (id: string, pubkey: string): Promise<Event> => {
+  const removeFromList = useCallback(async (id: string, pubkey: string): Promise<Event> => {
     const list = lists.find((l) => l.id === id)
     if (!list) throw new Error('List not found')
 
     const newPubkeys = list.pubkeys.filter((p) => p !== pubkey)
 
     return updateList(id, list.title, newPubkeys, list.description, list.image)
-  }
+  }, [lists, updateList])
+
+  const contextValue = useMemo(
+    () => ({
+      lists,
+      isLoading,
+      createList,
+      updateList,
+      deleteList,
+      addToList,
+      removeFromList,
+      fetchLists
+    }),
+    [lists, isLoading, createList, updateList, deleteList, addToList, removeFromList, fetchLists]
+  )
 
   return (
-    <ListsContext.Provider
-      value={{
-        lists,
-        isLoading,
-        createList,
-        updateList,
-        deleteList,
-        addToList,
-        removeFromList,
-        fetchLists
-      }}
-    >
+    <ListsContext.Provider value={contextValue}>
       {children}
     </ListsContext.Provider>
   )

@@ -1,5 +1,6 @@
 import { BIG_RELAY_URLS, ExtendedKind } from '@/constants'
 import { getZapInfoFromEvent } from '@/lib/event-metadata'
+import { dedupeRelayUrlsByIdentity } from '@/lib/relay-targets'
 import client from '@/services/client.service'
 import dayjs from 'dayjs'
 import { Event } from '@nostr/tools/wasm'
@@ -15,6 +16,11 @@ export type TListStats = {
 class ListStatsService {
   static instance: ListStatsService
   private listStatsMap: Map<string, Partial<TListStats>> = new Map()
+  private inFlightFetchMap: Map<string, Promise<Partial<TListStats>>> = new Map()
+  private activeFetchCount = 0
+  private fetchQueue: Array<() => void> = []
+  private readonly refreshCooldownSeconds = 60
+  private readonly maxConcurrentFetches = 3
 
   constructor() {
     if (!ListStatsService.instance) {
@@ -27,71 +33,117 @@ class ListStatsService {
     return `${authorPubkey}:${dTag}`
   }
 
+  private async runWithFetchLimit<T>(task: () => Promise<T>): Promise<T> {
+    if (this.activeFetchCount >= this.maxConcurrentFetches) {
+      await new Promise<void>((resolve) => {
+        this.fetchQueue.push(resolve)
+      })
+    }
+
+    this.activeFetchCount++
+    try {
+      return await task()
+    } finally {
+      this.activeFetchCount = Math.max(0, this.activeFetchCount - 1)
+      const next = this.fetchQueue.shift()
+      if (next) next()
+    }
+  }
+
   async fetchListStats(authorPubkey: string, dTag: string, pubkey?: string | null) {
     const listKey = this.getListKey(authorPubkey, dTag)
+    const requestKey = `${listKey}:${pubkey || ''}`
+    const now = dayjs().unix()
     const oldStats = this.listStatsMap.get(listKey)
-    let since: number | undefined
-    if (oldStats?.updatedAt) {
-      since = oldStats.updatedAt
+
+    if (oldStats?.updatedAt && now - oldStats.updatedAt < this.refreshCooldownSeconds) {
+      return oldStats
     }
 
-    const [authorProfile, authorRelayList] = await Promise.all([
-      client.fetchProfile(authorPubkey),
-      client.fetchRelayList(authorPubkey)
-    ])
+    const existingRequest = this.inFlightFetchMap.get(requestKey)
+    if (existingRequest) {
+      return existingRequest
+    }
 
-    const coordinate = `${ExtendedKind.STARTER_PACK}:${authorPubkey}:${dTag}`
-    const filters: Filter[] = []
+    const request = this.runWithFetchLimit(async () => {
+      const currentStats = this.listStatsMap.get(listKey)
+      let since: number | undefined
+      if (currentStats?.updatedAt) {
+        since = currentStats.updatedAt
+      }
 
-    const lightningAddress =
-      authorProfile?.metadata?.lud16 ||
-      authorProfile?.metadata?.lud06 ||
-      (authorProfile as any)?.lightningAddress
+      const [authorProfile, authorRelayList] = await Promise.all([
+        client.fetchProfile(authorPubkey),
+        client.fetchRelayList(authorPubkey)
+      ])
 
-    if (lightningAddress) {
-      filters.push({
-        '#a': [coordinate],
-        kinds: [kinds.Zap],
-        limit: 500
-      })
+      const coordinate = `${ExtendedKind.STARTER_PACK}:${authorPubkey}:${dTag}`
+      const filters: Filter[] = []
 
-      if (pubkey) {
+      const lightningAddress =
+        authorProfile?.metadata?.lud16 ||
+        authorProfile?.metadata?.lud06 ||
+        (authorProfile as any)?.lightningAddress
+
+      if (lightningAddress) {
         filters.push({
           '#a': [coordinate],
-          '#P': [pubkey],
-          kinds: [kinds.Zap]
+          kinds: [kinds.Zap],
+          limit: 500
+        })
+
+        if (pubkey) {
+          filters.push({
+            '#a': [coordinate],
+            '#P': [pubkey],
+            kinds: [kinds.Zap]
+          })
+        }
+      }
+
+      if (since) {
+        filters.forEach((filter) => {
+          filter.since = since
         })
       }
-    }
 
-    if (since) {
-      filters.forEach((filter) => {
-        filter.since = since
-      })
-    }
-
-    if (!filters.length) {
-      return this.listStatsMap.get(listKey) ?? {}
-    }
-
-    const events: Event[] = []
-    const relays = authorRelayList.read.concat(BIG_RELAY_URLS).slice(0, 5)
-
-    for (const filter of filters) {
-      try {
-        const fetched = await client.fetchEvents(relays, filter)
-        events.push(...(fetched as Event[]))
-      } catch (error) {
-        console.error('Failed to fetch list stats', error)
+      if (!filters.length) {
+        const next = {
+          ...(currentStats ?? {}),
+          updatedAt: dayjs().unix()
+        }
+        this.listStatsMap.set(listKey, next)
+        return next
       }
-    }
 
-    this.updateListStatsByEvents(authorPubkey, dTag, events)
-    this.listStatsMap.set(listKey, {
-      ...(this.listStatsMap.get(listKey) ?? {}),
-      updatedAt: dayjs().unix()
+      const events: Event[] = []
+      const relays = dedupeRelayUrlsByIdentity(authorRelayList.read.concat(BIG_RELAY_URLS)).slice(0, 5)
+
+      for (const filter of filters) {
+        try {
+          const fetched = await client.fetchEvents(relays, filter)
+          events.push(...(fetched as Event[]))
+        } catch (error) {
+          console.error('Failed to fetch list stats', error)
+        }
+      }
+
+      this.updateListStatsByEvents(authorPubkey, dTag, events)
+      const next = {
+        ...(this.listStatsMap.get(listKey) ?? {}),
+        updatedAt: dayjs().unix()
+      }
+      this.listStatsMap.set(listKey, next)
+      return next
     })
-    return this.listStatsMap.get(listKey) ?? {}
+
+    this.inFlightFetchMap.set(requestKey, request)
+    request.finally(() => {
+      if (this.inFlightFetchMap.get(requestKey) === request) {
+        this.inFlightFetchMap.delete(requestKey)
+      }
+    })
+    return request
   }
 
   private getListStats(authorPubkey: string, dTag: string): Partial<TListStats> | undefined {

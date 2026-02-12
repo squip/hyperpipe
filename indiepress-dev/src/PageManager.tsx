@@ -37,6 +37,7 @@ import NotepadPage from './pages/primary/NotepadPage'
 import GroupsPage from './pages/primary/GroupsPage'
 import FilesPage from './pages/primary/FilesPage'
 import { NotificationProvider } from './providers/NotificationProvider'
+import { SecondaryPageContext, useSecondaryPage } from './providers/SecondaryPageProvider'
 import { useScreenSize } from './providers/ScreenSizeProvider'
 import { useTheme } from './providers/ThemeProvider'
 import { useUserPreferences } from './providers/UserPreferencesProvider'
@@ -49,12 +50,6 @@ type TPrimaryPageContext = {
   navigate: (page: TPrimaryPageName, props?: object) => void
   current: TPrimaryPageName | null
   display: boolean
-}
-
-type TSecondaryPageContext = {
-  push: (url: string) => void
-  pop: () => void
-  currentIndex: number
 }
 
 type TStackItem = {
@@ -114,8 +109,6 @@ function isPrimaryPageEnabled(page: TPrimaryPageName) {
 
 const PrimaryPageContext = createContext<TPrimaryPageContext | undefined>(undefined)
 
-const SecondaryPageContext = createContext<TSecondaryPageContext | undefined>(undefined)
-
 export function usePrimaryPage() {
   const context = useContext(PrimaryPageContext)
   if (!context) {
@@ -124,13 +117,7 @@ export function usePrimaryPage() {
   return context
 }
 
-export function useSecondaryPage() {
-  const context = useContext(SecondaryPageContext)
-  if (!context) {
-    throw new Error('usePrimaryPage must be used within a SecondaryPageContext.Provider')
-  }
-  return context
-}
+export { useSecondaryPage } from './providers/SecondaryPageProvider'
 
 export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
   const [currentPrimaryPage, setCurrentPrimaryPage] = useState<TPrimaryPageName>('home')

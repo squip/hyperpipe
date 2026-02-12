@@ -6,14 +6,27 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Card, CardContent } from '@/components/ui/card'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { useLists } from '@/providers/ListsProvider'
+import { useNostr } from '@/providers/NostrProvider'
+import { useGroups } from '@/providers/GroupsProvider'
+import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import { useSearchProfiles } from '@/hooks/useSearchProfiles'
 import { useTranslation } from 'react-i18next'
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import UserAvatar from '@/components/UserAvatar'
 import Username from '@/components/Username'
 import Nip05 from '@/components/Nip05'
 import Uploader from '@/components/PostEditor/Uploader'
+import PostRelaySelector from '@/components/PostEditor/PostRelaySelector'
+import { BIG_RELAY_URLS } from '@/constants'
+import {
+  buildGroupRelayDisplayMetaMap,
+  buildGroupRelayTargets,
+  dedupeRelayUrlsByIdentity,
+  getRelayIdentity,
+  resolvePublishRelayUrls,
+  type GroupRelayTarget
+} from '@/lib/relay-targets'
 import { Check, Plus, Search, Upload, X } from 'lucide-react'
 
 type Props = {
@@ -22,17 +35,52 @@ type Props = {
   onCancel?: () => void
 }
 
+function relaySelectionSignature(relayUrls: string[]) {
+  return dedupeRelayUrlsByIdentity(relayUrls)
+    .map((relayUrl) => getRelayIdentity(relayUrl) || relayUrl)
+    .sort()
+    .join('|')
+}
+
 export default function ListEditorForm({ listId, onSaved, onCancel }: Props) {
   const { t } = useTranslation()
   const { lists, createList, updateList } = useLists()
+  const { relayList } = useNostr()
+  const { myGroupList, discoveryGroups, getProvisionalGroupMetadata, resolveRelayUrl } = useGroups()
+  const { refreshRelaySubscriptions } = useWorkerBridge()
 
   const existingList = useMemo(() => (listId ? lists.find((l) => l.id === listId) : undefined), [listId, lists])
   const isEditing = !!listId
+  const defaultRelayUrls = useMemo(
+    () =>
+      dedupeRelayUrlsByIdentity([
+        ...(relayList?.write || []),
+        ...BIG_RELAY_URLS
+      ]),
+    [relayList?.write]
+  )
+  const groupRelayTargets = useMemo<GroupRelayTarget[]>(
+    () =>
+      buildGroupRelayTargets({
+        myGroupList,
+        resolveRelayUrl,
+        getProvisionalGroupMetadata,
+        discoveryGroups
+      }),
+    [discoveryGroups, getProvisionalGroupMetadata, myGroupList, resolveRelayUrl]
+  )
+  const groupRelayDisplayMeta = useMemo(
+    () => buildGroupRelayDisplayMetaMap(groupRelayTargets),
+    [groupRelayTargets]
+  )
 
   const [title, setTitle] = useState(existingList?.title || '')
   const [description, setDescription] = useState(existingList?.description || '')
   const [image, setImage] = useState(existingList?.image || '')
   const [selectedPubkeys, setSelectedPubkeys] = useState<string[]>(existingList?.pubkeys || [])
+  const [selectedRelayUrls, setSelectedRelayUrls] = useState<string[]>(
+    dedupeRelayUrlsByIdentity(existingList?.relayUrls || defaultRelayUrls)
+  )
   const [searchQuery, setSearchQuery] = useState('')
   const [isSaving, setIsSaving] = useState(false)
 
@@ -44,8 +92,21 @@ export default function ListEditorForm({ listId, onSaved, onCancel }: Props) {
       setDescription(existingList.description || '')
       setImage(existingList.image || '')
       setSelectedPubkeys(existingList.pubkeys)
+      setSelectedRelayUrls(
+        dedupeRelayUrlsByIdentity(existingList.relayUrls || defaultRelayUrls)
+      )
     }
-  }, [existingList])
+  }, [defaultRelayUrls, existingList])
+
+  const handleRelaySelectionChange = useCallback((nextRelayUrls: string[]) => {
+    const nextNormalized = dedupeRelayUrlsByIdentity(nextRelayUrls)
+    const nextSignature = relaySelectionSignature(nextNormalized)
+    setSelectedRelayUrls((previous) => {
+      const previousSignature = relaySelectionSignature(previous)
+      if (previousSignature === nextSignature) return previous
+      return nextNormalized
+    })
+  }, [])
 
   const handleAddPubkey = (pubkey: string) => {
     if (!selectedPubkeys.includes(pubkey)) {
@@ -57,17 +118,41 @@ export default function ListEditorForm({ listId, onSaved, onCancel }: Props) {
     setSelectedPubkeys(selectedPubkeys.filter((p) => p !== pubkey))
   }
 
+  const resolveRelayPublishTargets = async () => {
+    return await resolvePublishRelayUrls({
+      relayUrls: dedupeRelayUrlsByIdentity(selectedRelayUrls),
+      resolveRelayUrl,
+      groupRelayTargets,
+      refreshGroupRelay: async (groupId) => {
+        await refreshRelaySubscriptions({
+          publicIdentifier: groupId,
+          reason: 'list-editor-relay-publish',
+          timeoutMs: 12_000
+        })
+      }
+    })
+  }
+
   const handleSave = async () => {
     if (!title.trim()) {
       toast.error(t('Please enter a title'))
       return
     }
+    if (!selectedRelayUrls.length) {
+      toast.error(t('Select at least one relay'))
+      return
+    }
 
     setIsSaving(true)
     try {
+      const resolvedRelayUrls = await resolveRelayPublishTargets()
+      if (!resolvedRelayUrls.length) {
+        throw new Error(t('Select at least one relay'))
+      }
+
       if (isEditing && listId) {
         const { unwrap } = toast.promise(
-          updateList(listId, title, selectedPubkeys, description, image),
+          updateList(listId, title, selectedPubkeys, description, image, resolvedRelayUrls),
           {
             loading: t('Updating list...'),
             success: t('List updated!'),
@@ -76,18 +161,15 @@ export default function ListEditorForm({ listId, onSaved, onCancel }: Props) {
         )
         await unwrap()
       } else {
-        const { unwrap } = toast.promise(createList(title, description, image), {
-          loading: t('Creating list...'),
-          success: t('List created!'),
-          error: (err) => t('Failed to create list: {{error}}', { error: err.message })
-        })
-        const event = await unwrap()
-        if (selectedPubkeys.length > 0) {
-          const newListId = event.tags.find((tag) => tag[0] === 'd')?.[1]
-          if (newListId) {
-            await updateList(newListId, title, selectedPubkeys, description, image)
+        const { unwrap } = toast.promise(
+          createList(title, description, image, selectedPubkeys, resolvedRelayUrls),
+          {
+            loading: t('Creating list...'),
+            success: t('List created!'),
+            error: (err) => t('Failed to create list: {{error}}', { error: err.message })
           }
-        }
+        )
+        await unwrap()
       }
       onSaved?.()
     } catch (error) {
@@ -277,6 +359,20 @@ export default function ListEditorForm({ listId, onSaved, onCancel }: Props) {
           </Card>
         </div>
       )}
+
+      <div className="space-y-2 rounded-md border p-3">
+        <PostRelaySelector
+          allowWriteRelays={false}
+          allowRelaySets={false}
+          extraRelayUrls={[
+            ...defaultRelayUrls,
+            ...groupRelayTargets.map((target) => target.relayUrl)
+          ]}
+          relayDisplayMeta={groupRelayDisplayMeta}
+          valueRelayUrls={selectedRelayUrls}
+          onValueRelayUrlsChange={handleRelaySelectionChange}
+        />
+      </div>
 
       <div className="flex gap-2 pt-2">
         <Button onClick={handleSave} disabled={isSaving} className="flex-1">

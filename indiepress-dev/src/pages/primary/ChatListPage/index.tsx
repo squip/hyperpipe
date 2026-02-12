@@ -1,7 +1,7 @@
 import UserAvatar, { SimpleUserAvatar } from '@/components/UserAvatar'
 import { FormattedTimestamp } from '@/components/FormattedTimestamp'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
-import PostRelaySelector, { type RelayDisplayMeta } from '@/components/PostEditor/PostRelaySelector'
+import PostRelaySelector from '@/components/PostEditor/PostRelaySelector'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Check, Loader2, MessageSquare, Search, UserPlus, Users, X } from 'lucide-react'
 import { forwardRef, type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react'
@@ -10,6 +10,7 @@ import { useMessenger } from '@/providers/MessengerProvider'
 import { ChatListPanel } from '@/components/ChatConversations'
 import { useNostr } from '@/providers/NostrProvider'
 import { useGroups } from '@/providers/GroupsProvider'
+import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import { useSecondaryPage } from '@/PageManager'
 import {
   Dialog,
@@ -27,7 +28,14 @@ import { useSearchProfiles } from '@/hooks/useSearchProfiles'
 import Username from '@/components/Username'
 import Nip05 from '@/components/Nip05'
 import type { ConversationInvite, ConversationSummary, ConversationTab } from '@/lib/conversations/types'
-import { isWebsocketUrl, normalizeUrl } from '@/lib/url'
+import {
+  buildGroupRelayDisplayMetaMap,
+  buildGroupRelayTargets,
+  dedupeRelayUrlsByIdentity,
+  resolvePublishRelayUrls,
+  type GroupRelayTarget,
+  type RelayDisplayMeta
+} from '@/lib/relay-targets'
 import mediaUploadService from '@/services/media-upload.service'
 import { toast } from 'sonner'
 import type { TPageRef } from '@/types'
@@ -45,30 +53,11 @@ type CreateChatModalPayload = {
 
 const HYPERDRIVE_UPLOAD_RELAY_URL = 'http://127.0.0.1:8443'
 
-function normalizeRelayCandidate(relay: string): string | null {
-  if (typeof relay !== 'string') return null
-  const normalized = normalizeUrl(relay)
-  if (!normalized || !isWebsocketUrl(normalized)) return null
-  return normalized
-}
-
-function normalizeRelaySet(relays: string[]): string[] {
-  const seen = new Set<string>()
-  const normalized: string[] = []
-  for (const relay of relays) {
-    const candidate = normalizeRelayCandidate(relay)
-    if (!candidate || seen.has(candidate)) continue
-    seen.add(candidate)
-    normalized.push(candidate)
-  }
-  return normalized
-}
-
 function normalizeRelayListForChat(
   relayList: { read: string[]; write: string[] } | null,
   discoveryRelay?: string
 ) {
-  return normalizeRelaySet([
+  return dedupeRelayUrlsByIdentity([
     ...(relayList?.read || []),
     ...(relayList?.write || []),
     discoveryRelay || ''
@@ -146,6 +135,7 @@ const ChatListPage = forwardRef<
   const { t } = useTranslation()
   const { pubkey, relayList } = useNostr()
   const { myGroupList, discoveryGroups, getProvisionalGroupMetadata, resolveRelayUrl } = useGroups()
+  const { refreshRelaySubscriptions } = useWorkerBridge()
   const { push } = useSecondaryPage()
   const {
     conversations,
@@ -173,29 +163,21 @@ const ChatListPage = forwardRef<
     [relayList, discoveryRelay]
   )
 
-  const localGroupRelayDisplay = useMemo<Record<string, RelayDisplayMeta>>(() => {
-    const display: Record<string, RelayDisplayMeta> = {}
-    for (const entry of myGroupList) {
-      const relayCandidate = entry.relay ? resolveRelayUrl(entry.relay) || entry.relay : null
-      const normalizedRelay = normalizeRelayCandidate(relayCandidate || '')
-      if (!normalizedRelay) continue
-      if (display[normalizedRelay]) continue
+  const groupRelayTargets = useMemo<GroupRelayTarget[]>(
+    () =>
+      buildGroupRelayTargets({
+        myGroupList,
+        resolveRelayUrl,
+        getProvisionalGroupMetadata,
+        discoveryGroups
+      }),
+    [discoveryGroups, getProvisionalGroupMetadata, myGroupList, resolveRelayUrl]
+  )
 
-      const metadata =
-        getProvisionalGroupMetadata(entry.groupId, entry.relay || relayCandidate || undefined)
-        || discoveryGroups.find(
-          (group) => group.id === entry.groupId && (!entry.relay || group.relay === entry.relay)
-        )
-        || discoveryGroups.find((group) => group.id === entry.groupId)
-
-      display[normalizedRelay] = {
-        label: metadata?.name || entry.groupId,
-        imageUrl: metadata?.picture || null,
-        hideUrl: true
-      }
-    }
-    return display
-  }, [discoveryGroups, getProvisionalGroupMetadata, myGroupList, resolveRelayUrl])
+  const localGroupRelayDisplay = useMemo<Record<string, RelayDisplayMeta>>(
+    () => buildGroupRelayDisplayMetaMap(groupRelayTargets),
+    [groupRelayTargets]
+  )
 
   const query = useMemo(() => normalizeSearch(search), [search])
 
@@ -289,11 +271,27 @@ const ChatListPage = forwardRef<
 
     setCreatingConversation(true)
     try {
+      const publishRelayUrls = await resolvePublishRelayUrls({
+        relayUrls: dedupeRelayUrlsByIdentity(relayUrls),
+        resolveRelayUrl,
+        groupRelayTargets,
+        refreshGroupRelay: async (groupId) => {
+          await refreshRelaySubscriptions({
+            publicIdentifier: groupId,
+            reason: 'chat-create-relay-publish',
+            timeoutMs: 12_000
+          })
+        }
+      })
+      if (!publishRelayUrls.length) {
+        throw new Error(t('Select at least one relay'))
+      }
+
       const createResult = await createConversation({
         title: title.trim() || t('Chat'),
         description: description.trim() || undefined,
         members: uniqueMembers,
-        relayUrls: normalizeRelaySet(relayUrls),
+        relayUrls: publishRelayUrls,
         relayMode
       })
       const conversation = createResult.conversation
@@ -522,6 +520,7 @@ const ChatListPage = forwardRef<
         creating={creatingConversation}
         myPubkey={pubkey}
         defaultRelayUrls={defaultCreateRelayUrls}
+        groupRelayTargets={groupRelayTargets}
         localGroupRelayDisplay={localGroupRelayDisplay}
         onCreate={handleCreateConversation}
       />
@@ -550,6 +549,7 @@ function NewChatDialog({
   creating,
   myPubkey,
   defaultRelayUrls,
+  groupRelayTargets,
   localGroupRelayDisplay,
   onCreate
 }: {
@@ -558,6 +558,7 @@ function NewChatDialog({
   creating: boolean
   myPubkey: string | null
   defaultRelayUrls: string[]
+  groupRelayTargets: GroupRelayTarget[]
   localGroupRelayDisplay: Record<string, RelayDisplayMeta>
   onCreate: (payload: CreateChatModalPayload) => Promise<void>
 }) {
@@ -753,7 +754,7 @@ function NewChatDialog({
           <div className="space-y-2 rounded-md border p-3">
             <PostRelaySelector
               allowWriteRelays={false}
-              extraRelayUrls={[...defaultRelayUrls, ...Object.keys(localGroupRelayDisplay)]}
+              extraRelayUrls={[...defaultRelayUrls, ...groupRelayTargets.map((target) => target.relayUrl)]}
               relayDisplayMeta={localGroupRelayDisplay}
               valueRelayUrls={selectedRelayUrls}
               onValueRelayUrlsChange={setSelectedRelayUrls}

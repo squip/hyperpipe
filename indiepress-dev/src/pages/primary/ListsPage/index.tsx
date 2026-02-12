@@ -1,4 +1,4 @@
-import { useSecondaryPage } from '@/PageManager'
+import { useSecondaryPage } from '@/providers/SecondaryPageProvider'
 import UserAvatar from '@/components/UserAvatar'
 import Username from '@/components/Username'
 import NoteList from '@/components/NoteList'
@@ -8,7 +8,16 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu'
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
 import { toCreateList, toEditList } from '@/lib/link'
@@ -18,9 +27,21 @@ import { useFollowList } from '@/providers/FollowListProvider'
 import { useLists, TStarterPack } from '@/providers/ListsProvider'
 import { useNostr } from '@/providers/NostrProvider'
 import { useScreenSize } from '@/providers/ScreenSizeProvider'
+import { useGroups } from '@/providers/GroupsProvider'
+import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import { TPageRef } from '@/types'
 import client from '@/services/client.service'
 import { ExtendedKind, BIG_RELAY_URLS } from '@/constants'
+import {
+  buildGroupRelayDisplayMetaMap,
+  buildGroupRelayTargets,
+  dedupeRelayTargetsByIdentity,
+  dedupeRelayUrlsByIdentity,
+  getRelayIdentity,
+  type GroupRelayTarget,
+  type RelayDisplayMeta
+} from '@/lib/relay-targets'
+import { simplifyUrl } from '@/lib/url'
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -30,8 +51,16 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import ListEditorForm from '@/components/ListEditorForm'
 import { Event } from '@nostr/tools/wasm'
 import PullToRefresh from 'react-simple-pull-to-refresh'
+import RelayIcon from '@/components/RelayIcon'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 
 type TSortBy = 'recent' | 'zaps'
+type TDiscoverRelayOption = {
+  relayUrl: string
+  relayIdentity: string
+  meta?: RelayDisplayMeta
+}
+const GROUP_RELAY_READY_TTL_MS = 30_000
 
 const ListsPage = forwardRef((_, ref) => {
   const { t } = useTranslation()
@@ -39,10 +68,14 @@ const ListsPage = forwardRef((_, ref) => {
   useImperativeHandle(ref, () => layoutRef.current)
 
   const { pubkey, checkLogin } = useNostr()
+  const { myGroupList, discoveryGroups, getProvisionalGroupMetadata, resolveRelayUrl } = useGroups()
+  const { refreshRelaySubscriptions } = useWorkerBridge()
   const { push } = useSecondaryPage()
   const { lists, isLoading: isLoadingMyLists, deleteList, fetchLists } = useLists()
   const { followings = [], followMultiple, unfollowMultiple } = useFollowList()
   const { isSmallScreen } = useScreenSize()
+  const [selectedDiscoverRelayIdentities, setSelectedDiscoverRelayIdentities] = useState<string[]>([])
+  const [relayFilterEdited, setRelayFilterEdited] = useState(false)
 
   const [searchQuery, setSearchQuery] = useState('')
   const [isSearching, setIsSearching] = useState(false)
@@ -62,6 +95,21 @@ const ListsPage = forwardRef((_, ref) => {
   const [showSearchBar, setShowSearchBar] = useState(!isSmallScreen)
   const [createSheetOpen, setCreateSheetOpen] = useState(false)
   const [listStatsVersion, setListStatsVersion] = useState(0) // used to trigger re-sorts when stats change
+  const refreshRelaySubscriptionsRef = useRef(refreshRelaySubscriptions)
+  const resolveRelayUrlRef = useRef(resolveRelayUrl)
+  const groupRelayReadyCacheRef = useRef<Map<string, { checkedAt: number; relayUrl: string | null }>>(
+    new Map()
+  )
+  const groupRelayReadyInFlightRef = useRef<Map<string, Promise<string | null>>>(new Map())
+  const publicListsFetchInFlightRef = useRef<Promise<void> | null>(null)
+
+  useEffect(() => {
+    refreshRelaySubscriptionsRef.current = refreshRelaySubscriptions
+  }, [refreshRelaySubscriptions])
+
+  useEffect(() => {
+    resolveRelayUrlRef.current = resolveRelayUrl
+  }, [resolveRelayUrl])
 
   const parseStarterPackEvent = (event: Event): TStarterPack => {
     const dTag = event.tags.find((tag) => tag[0] === 'd')?.[1] || ''
@@ -69,6 +117,7 @@ const ListsPage = forwardRef((_, ref) => {
     const description = event.tags.find((tag) => tag[0] === 'description')?.[1]
     const image = event.tags.find((tag) => tag[0] === 'image')?.[1]
     const pubkeys = event.tags?.filter((tag) => tag[0] === 'p').map((tag) => tag[1]) || []
+    const relayUrls = client.getSeenEventRelayUrls(event.id, event)
 
     return {
       id: dTag,
@@ -76,71 +125,240 @@ const ListsPage = forwardRef((_, ref) => {
       description,
       image,
       pubkeys,
+      relayUrls,
       event
     }
   }
+
+  const dedupeLatestLists = useCallback((listItems: TStarterPack[]): TStarterPack[] => {
+    const latestByKey = new Map<string, TStarterPack>()
+    listItems.forEach((list) => {
+      const key = `${list.event.pubkey}:${list.id}`
+      const current = latestByKey.get(key)
+      if (!current || current.event.created_at < list.event.created_at) {
+        latestByKey.set(key, list)
+      }
+    })
+    return Array.from(latestByKey.values()).sort((a, b) => b.event.created_at - a.event.created_at)
+  }, [])
+
+  const groupRelayTargets = useMemo<GroupRelayTarget[]>(
+    () =>
+      buildGroupRelayTargets({
+        myGroupList,
+        resolveRelayUrl,
+        getProvisionalGroupMetadata,
+        discoveryGroups
+      }),
+    [discoveryGroups, getProvisionalGroupMetadata, myGroupList, resolveRelayUrl]
+  )
+  const groupRelayTargetsSignature = useMemo(
+    () =>
+      groupRelayTargets
+        .map((target) => `${target.groupId}:${target.relayIdentity}`)
+        .sort()
+        .join('|'),
+    [groupRelayTargets]
+  )
+  const stableGroupRelayTargets = useMemo(
+    () => groupRelayTargets,
+    [groupRelayTargetsSignature]
+  )
+
+  const groupRelayDisplayMeta = useMemo<Record<string, RelayDisplayMeta>>(
+    () => buildGroupRelayDisplayMetaMap(stableGroupRelayTargets),
+    [stableGroupRelayTargets]
+  )
+
+  const discoverFetchRelayUrls = useMemo(
+    () =>
+      dedupeRelayUrlsByIdentity([
+        ...BIG_RELAY_URLS.slice(0, 5),
+        ...stableGroupRelayTargets.map((target) => target.relayUrl)
+      ]),
+    [stableGroupRelayTargets]
+  )
+
+  const discoverRelayOptions = useMemo<TDiscoverRelayOption[]>(
+    () =>
+      dedupeRelayTargetsByIdentity(discoverFetchRelayUrls).map((target) => ({
+        ...target,
+        meta: groupRelayDisplayMeta[target.relayIdentity] || groupRelayDisplayMeta[target.relayUrl]
+      })),
+    [discoverFetchRelayUrls, groupRelayDisplayMeta]
+  )
 
   useEffect(() => {
     setShowSearchBar(!isSmallScreen)
   }, [isSmallScreen])
 
   useEffect(() => {
-    if (pubkey) {
-      fetchLists()
+    const availableIdentities = discoverRelayOptions.map((option) => option.relayIdentity)
+    const availableSet = new Set(availableIdentities)
+
+    if (!relayFilterEdited) {
+      setSelectedDiscoverRelayIdentities((previous) =>
+        areStringArraysEqual(previous, availableIdentities) ? previous : availableIdentities
+      )
+      return
     }
-  }, [pubkey])
+
+    setSelectedDiscoverRelayIdentities((previous) =>
+      {
+        const filtered = previous.filter((relayIdentity) => availableSet.has(relayIdentity))
+        return areStringArraysEqual(previous, filtered) ? previous : filtered
+      }
+    )
+  }, [discoverRelayOptions, relayFilterEdited])
 
   useEffect(() => {
     setFavoriteLists(localStorageService.getFavoriteLists(pubkey))
   }, [pubkey])
 
   useEffect(() => {
-    const loadStats = async () => {
-      if (!lists || !lists.length) return
-      await Promise.all(
-        lists.map((list) => listStatsService.fetchListStats(list.event.pubkey, list.id, pubkey))
-      )
-      setListStatsVersion((v) => v + 1)
+    const validGroupIds = new Set(stableGroupRelayTargets.map((target) => target.groupId))
+    for (const groupId of Array.from(groupRelayReadyCacheRef.current.keys())) {
+      if (!validGroupIds.has(groupId)) {
+        groupRelayReadyCacheRef.current.delete(groupId)
+      }
     }
-    loadStats()
-  }, [lists, pubkey])
-
-  const fetchPublicLists = useCallback(async () => {
-    setIsLoadingPublicLists(true)
-    try {
-      const events = await client.fetchEvents(BIG_RELAY_URLS.slice(0, 5), {
-        kinds: [ExtendedKind.STARTER_PACK],
-        limit: 50
-      })
-
-      const parsedLists: TStarterPack[] = events.map((event) => parseStarterPackEvent(event))
-      parsedLists.sort((a, b) => b.event.created_at - a.event.created_at)
-
-      const uniqueLists = parsedLists.filter(
-        (list, index, self) =>
-          index === self.findIndex((l) => l.event.pubkey === list.event.pubkey && l.id === list.id)
-      )
-
-      setAllPublicLists(uniqueLists)
-    } catch (_error) {
-      console.error('Failed to fetch public lists:', _error)
-    } finally {
-      setIsLoadingPublicLists(false)
+    for (const groupId of Array.from(groupRelayReadyInFlightRef.current.keys())) {
+      if (!validGroupIds.has(groupId)) {
+        groupRelayReadyInFlightRef.current.delete(groupId)
+      }
     }
-  }, [pubkey])
+  }, [groupRelayTargetsSignature, stableGroupRelayTargets])
+
+  const resolveReadyGroupRelayUrl = useCallback(
+    async (target: GroupRelayTarget, force = false): Promise<string | null> => {
+      const groupId = target.groupId
+      const now = Date.now()
+
+      const inFlight = groupRelayReadyInFlightRef.current.get(groupId)
+      if (inFlight) {
+        return await inFlight
+      }
+
+      if (!force) {
+        const cached = groupRelayReadyCacheRef.current.get(groupId)
+        if (cached && now - cached.checkedAt < GROUP_RELAY_READY_TTL_MS) {
+          return cached.relayUrl
+        }
+      }
+
+      const refreshPromise = (async () => {
+        try {
+          const refreshResult = await refreshRelaySubscriptionsRef.current({
+            publicIdentifier: target.groupId,
+            reason: 'lists-discover-fetch',
+            timeoutMs: 12_000
+          })
+          const status = String(refreshResult?.status || '')
+          const reason = String(refreshResult?.reason || '')
+          const relayUrl =
+            status === 'ok' || reason === 'throttled'
+              ? resolveRelayUrlRef.current(target.relayUrl) || target.relayUrl
+              : null
+          groupRelayReadyCacheRef.current.set(groupId, {
+            checkedAt: Date.now(),
+            relayUrl
+          })
+          return relayUrl
+        } catch (_error) {
+          groupRelayReadyCacheRef.current.set(groupId, {
+            checkedAt: Date.now(),
+            relayUrl: null
+          })
+          return null
+        } finally {
+          groupRelayReadyInFlightRef.current.delete(groupId)
+        }
+      })()
+
+      groupRelayReadyInFlightRef.current.set(groupId, refreshPromise)
+      return await refreshPromise
+    },
+    []
+  )
+
+  const resolveReadyGroupRelayUrls = useCallback(
+    async (force = false) => {
+      const readyGroupRelayUrls = await Promise.all(
+        stableGroupRelayTargets.map((target) => resolveReadyGroupRelayUrl(target, force))
+      )
+      return dedupeRelayUrlsByIdentity(
+        readyGroupRelayUrls.filter((relayUrl): relayUrl is string => !!relayUrl)
+      )
+    },
+    [resolveReadyGroupRelayUrl, stableGroupRelayTargets]
+  )
 
   useEffect(() => {
-    const loadStats = async () => {
-      if (!allPublicLists || !allPublicLists.length) return
-      await Promise.all(
-        allPublicLists.map((list) =>
-          listStatsService.fetchListStats(list.event.pubkey, list.id, pubkey)
-        )
-      )
-      setListStatsVersion((v) => v + 1)
+    if (!pubkey) return
+    let cancelled = false
+    ;(async () => {
+      await fetchLists()
+      if (cancelled) return
+      const readyGroupRelayUrls = await resolveReadyGroupRelayUrls()
+      if (cancelled) return
+      if (readyGroupRelayUrls.length > 0) {
+        await fetchLists(readyGroupRelayUrls)
+      }
+    })()
+    return () => {
+      cancelled = true
     }
-    loadStats()
-  }, [allPublicLists, pubkey])
+  }, [fetchLists, groupRelayTargetsSignature, pubkey, resolveReadyGroupRelayUrls])
+
+  const fetchPublicLists = useCallback(async () => {
+    if (publicListsFetchInFlightRef.current) {
+      await publicListsFetchInFlightRef.current
+      return
+    }
+
+    const run = (async () => {
+      setIsLoadingPublicLists(true)
+      try {
+        const baseRelayUrls = dedupeRelayUrlsByIdentity(BIG_RELAY_URLS.slice(0, 5))
+        const readyGroupRelayUrlsPromise = resolveReadyGroupRelayUrls()
+
+        const baseEvents = await client.fetchEvents(baseRelayUrls, {
+          kinds: [ExtendedKind.STARTER_PACK],
+          limit: 50
+        })
+        const baseLists = dedupeLatestLists(baseEvents.map((event) => parseStarterPackEvent(event)))
+        setAllPublicLists(baseLists)
+        setIsLoadingPublicLists(false)
+
+        try {
+          const readyGroupRelayUrls = await readyGroupRelayUrlsPromise
+          if (!readyGroupRelayUrls.length) return
+          const groupEvents = await client.fetchEvents(readyGroupRelayUrls, {
+            kinds: [ExtendedKind.STARTER_PACK],
+            limit: 50
+          })
+          if (!groupEvents.length) return
+          const groupLists = groupEvents.map((event) => parseStarterPackEvent(event))
+          setAllPublicLists((previous) => dedupeLatestLists([...previous, ...groupLists]))
+        } catch (error) {
+          console.warn('Failed to fetch discover lists from group relays:', error)
+        }
+      } catch (_error) {
+        console.error('Failed to fetch public lists:', _error)
+      } finally {
+        setIsLoadingPublicLists(false)
+      }
+    })()
+
+    publicListsFetchInFlightRef.current = run
+    try {
+      await run
+    } finally {
+      if (publicListsFetchInFlightRef.current === run) {
+        publicListsFetchInFlightRef.current = null
+      }
+    }
+  }, [dedupeLatestLists, resolveReadyGroupRelayUrls])
 
   useEffect(() => {
     fetchPublicLists()
@@ -223,12 +441,24 @@ const ListsPage = forwardRef((_, ref) => {
 
     setIsLoadingSelectedList(true)
     try {
-      const events = await client.fetchEvents(BIG_RELAY_URLS.slice(0, 5), {
+      const baseRelayUrls = dedupeRelayUrlsByIdentity(BIG_RELAY_URLS.slice(0, 5))
+      let events = await client.fetchEvents(baseRelayUrls, {
         kinds: [ExtendedKind.STARTER_PACK],
         authors: [ownerPubkey],
         '#d': [dTag],
         limit: 1
       })
+      if (!events.length) {
+        const readyGroupRelayUrls = await resolveReadyGroupRelayUrls()
+        if (readyGroupRelayUrls.length > 0) {
+          events = await client.fetchEvents(readyGroupRelayUrls, {
+            kinds: [ExtendedKind.STARTER_PACK],
+            authors: [ownerPubkey],
+            '#d': [dTag],
+            limit: 1
+          })
+        }
+      }
       if (events.length > 0) {
         const list = parseStarterPackEvent(events[0])
         setSelectedList(list)
@@ -325,13 +555,14 @@ const ListsPage = forwardRef((_, ref) => {
   }
 
   const handleRefresh = async () => {
+    const listFetchRelayUrls = await resolveReadyGroupRelayUrls(true)
     if (selectedList) {
       await refreshSelectedList()
-      await fetchLists()
+      await fetchLists(listFetchRelayUrls)
       await fetchPublicLists()
       return
     }
-    await Promise.all([fetchLists(), fetchPublicLists()])
+    await Promise.all([fetchLists(listFetchRelayUrls), fetchPublicLists()])
   }
 
   const renderListCard = (list: TStarterPack, isOwnList: boolean) => {
@@ -665,12 +896,76 @@ const ListsPage = forwardRef((_, ref) => {
 
   const myListObjects = useMemo(() => {
     if (!lists) return []
-    return lists.filter((list) => !favoriteLists.includes(`${list.event.pubkey}:${list.id}`))
-  }, [lists, favoriteLists])
+    return lists
+  }, [lists])
 
   const discoverListObjects = useMemo(() => {
-    return allPublicLists || []
-  }, [allPublicLists])
+    const latestByKey = new Map<string, TStarterPack>()
+    const combinedLists = [...(allPublicLists || []), ...(lists || [])]
+
+    combinedLists.forEach((list) => {
+      const key = `${list.event.pubkey}:${list.id}`
+      const current = latestByKey.get(key)
+      if (!current || current.event.created_at < list.event.created_at) {
+        latestByKey.set(key, list)
+      }
+    })
+
+    return Array.from(latestByKey.values())
+  }, [allPublicLists, lists])
+
+  const selectedDiscoverRelaySet = useMemo(
+    () => new Set(selectedDiscoverRelayIdentities),
+    [selectedDiscoverRelayIdentities]
+  )
+
+  const filteredDiscoverListObjects = useMemo(() => {
+    if (!selectedDiscoverRelayIdentities.length) return []
+    return discoverListObjects.filter((list) => {
+      const relayUrls = dedupeRelayUrlsByIdentity([
+        ...(list.relayUrls || []),
+        ...client.getSeenEventRelayUrls(list.event.id, list.event)
+      ])
+      if (!relayUrls.length) return false
+      return relayUrls.some((relayUrl) => {
+        const relayIdentity = getRelayIdentity(relayUrl)
+        if (!relayIdentity) return false
+        return selectedDiscoverRelaySet.has(relayIdentity)
+      })
+    })
+  }, [discoverListObjects, selectedDiscoverRelayIdentities.length, selectedDiscoverRelaySet])
+
+  const visibleListObjectsForSort = useMemo(() => {
+    if (searchQuery.trim()) return searchResults
+    if (activeSection === 'favorites') return favoriteListObjects
+    if (activeSection === 'my') return myListObjects
+    return filteredDiscoverListObjects
+  }, [
+    activeSection,
+    favoriteListObjects,
+    filteredDiscoverListObjects,
+    myListObjects,
+    searchQuery,
+    searchResults
+  ])
+
+  useEffect(() => {
+    if (sortBy !== 'zaps' || visibleListObjectsForSort.length === 0) return
+    let cancelled = false
+    ;(async () => {
+      await Promise.all(
+        visibleListObjectsForSort.map((list) =>
+          listStatsService.fetchListStats(list.event.pubkey, list.id, pubkey)
+        )
+      )
+      if (!cancelled) {
+        setListStatsVersion((v) => v + 1)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [pubkey, sortBy, visibleListObjectsForSort])
 
   const renderListGroup = (items: TStarterPack[]) => {
     if (!items.length) {
@@ -709,11 +1004,11 @@ const ListsPage = forwardRef((_, ref) => {
       case 'my':
         return renderListGroup(myListObjects)
       default:
-        return renderListGroup(discoverListObjects)
+        return renderListGroup(filteredDiscoverListObjects)
     }
   }, [
     activeSection,
-    discoverListObjects,
+    filteredDiscoverListObjects,
     favoriteListObjects,
     isLoadingPublicLists,
     myListObjects,
@@ -725,6 +1020,19 @@ const ListsPage = forwardRef((_, ref) => {
     isSmallScreen
   ])
 
+  const toggleDiscoverRelay = (relayIdentity: string, checked: boolean) => {
+    setRelayFilterEdited(true)
+    setSelectedDiscoverRelayIdentities((previous) => {
+      const next = new Set(previous)
+      if (checked) {
+        next.add(relayIdentity)
+      } else {
+        next.delete(relayIdentity)
+      }
+      return Array.from(next)
+    })
+  }
+
   const filterControl = (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -732,13 +1040,28 @@ const ListsPage = forwardRef((_, ref) => {
           <ListFilter className="w-4 h-4" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuItem onClick={() => setSortBy('recent')}>
-          {t('Most recent')}
-        </DropdownMenuItem>
-        <DropdownMenuItem onClick={() => setSortBy('zaps')}>
-          {t('Most zapped')}
-        </DropdownMenuItem>
+      <DropdownMenuContent align="end" className="w-72">
+        <DropdownMenuLabel>{t('Sort')}</DropdownMenuLabel>
+        <DropdownMenuRadioGroup value={sortBy} onValueChange={(value) => setSortBy(value as TSortBy)}>
+          <DropdownMenuRadioItem value="recent">{t('Most recent')}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="zaps">{t('Most zapped')}</DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+        {activeSection === 'discover' && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel>{t('Relays')}</DropdownMenuLabel>
+            {discoverRelayOptions.map((option) => (
+              <DropdownMenuCheckboxItem
+                key={option.relayIdentity}
+                checked={selectedDiscoverRelaySet.has(option.relayIdentity)}
+                onSelect={(e) => e.preventDefault()}
+                onCheckedChange={(checked) => toggleDiscoverRelay(option.relayIdentity, checked === true)}
+              >
+                <RelayFilterOption option={option} />
+              </DropdownMenuCheckboxItem>
+            ))}
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -862,7 +1185,14 @@ const ListsPage = forwardRef((_, ref) => {
           <ScrollArea className="h-full">
             <div className="p-4">
               <ListEditorForm
-                onSaved={() => setCreateSheetOpen(false)}
+                onSaved={() => {
+                  setCreateSheetOpen(false)
+                  ;(async () => {
+                    const listFetchRelayUrls = await resolveReadyGroupRelayUrls(true)
+                    await fetchLists(listFetchRelayUrls)
+                  })()
+                  fetchPublicLists()
+                }}
                 onCancel={() => setCreateSheetOpen(false)}
               />
             </div>
@@ -907,4 +1237,38 @@ function ListsPageTitlebar({
       ) : null}
     </div>
   )
+}
+
+function RelayFilterOption({ option }: { option: TDiscoverRelayOption }) {
+  const meta = option.meta
+  const isGroupRelay = !!meta?.isGroupRelay || !!meta?.hideUrl
+  const label = meta?.label?.trim() || simplifyUrl(option.relayUrl)
+  const initials = label.slice(0, 2).toUpperCase()
+
+  if (isGroupRelay) {
+    return (
+      <div className="flex min-w-0 items-center gap-2">
+        <Avatar className="h-5 w-5 shrink-0">
+          {meta?.imageUrl ? <AvatarImage src={meta.imageUrl} alt={label} /> : null}
+          <AvatarFallback className="text-[9px] font-semibold">{initials}</AvatarFallback>
+        </Avatar>
+        <div className="truncate">{label}</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      <RelayIcon url={option.relayUrl} />
+      <div className="truncate">{simplifyUrl(option.relayUrl)}</div>
+    </div>
+  )
+}
+
+function areStringArraysEqual(left: string[], right: string[]) {
+  if (left.length !== right.length) return false
+  for (let i = 0; i < left.length; i++) {
+    if (left[i] !== right[i]) return false
+  }
+  return true
 }

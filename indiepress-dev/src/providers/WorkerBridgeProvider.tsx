@@ -167,6 +167,22 @@ type RelayCreatedPayload = {
   bootstrapPublish?: RelayBootstrapPublishStatus
 }
 
+type RefreshRelaySubscriptionsResult = {
+  status?: string
+  reason?: string | null
+  publicIdentifier?: string | null
+  relayKey?: string | null
+  requestedRelayKey?: string | null
+  resolvedRelayKey?: string | null
+  lookupSource?: string | null
+  retried?: boolean
+  retryRelayKey?: string | null
+  coalesced?: boolean
+  result?: unknown
+  throttleWindowMs?: number
+  lastRefreshAt?: number
+}
+
 type WorkerBridgeContextValue = {
   isElectron: boolean
   ready: boolean
@@ -194,6 +210,12 @@ type WorkerBridgeContextValue = {
   stopWorker: () => Promise<void>
   restartWorker: () => Promise<void>
   sendToWorker: (message: unknown) => Promise<unknown>
+  refreshRelaySubscriptions: (args: {
+    relayKey?: string | null
+    publicIdentifier?: string | null
+    reason?: string
+    timeoutMs?: number
+  }) => Promise<RefreshRelaySubscriptionsResult>
   createRelay: (data: RelayCreateRequest) => Promise<RelayCreatedPayload>
   startJoinFlow: (
     publicIdentifier: string,
@@ -1036,6 +1058,30 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                 }
               }
             })
+
+            const requestId = (msg as any)?.requestId
+            if (requestId && pendingRepliesRef.current.has(requestId)) {
+              const pending = pendingRepliesRef.current.get(requestId)
+              pendingRepliesRef.current.delete(requestId)
+              if (pending) {
+                window.clearTimeout(pending.timeoutId)
+                pending.resolve(data as RefreshRelaySubscriptionsResult)
+              }
+            }
+            break
+          }
+          case 'refresh-relay-subscriptions:error': {
+            const requestId = (msg as any)?.requestId
+            if (requestId && pendingRepliesRef.current.has(requestId)) {
+              const pending = pendingRepliesRef.current.get(requestId)
+              pendingRepliesRef.current.delete(requestId)
+              if (pending) {
+                window.clearTimeout(pending.timeoutId)
+                pending.reject(
+                  new Error((msg as any)?.error || 'Relay subscription refresh failed')
+                )
+              }
+            }
             break
           }
           case 'relay-subscription-replay': {
@@ -1559,6 +1605,78 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     [getRelayPeerSet, peerDetails]
   )
 
+  const refreshRelaySubscriptionsInternal = useCallback(
+    async ({
+      relayKey,
+      publicIdentifier,
+      reason = 'manual',
+      timeoutMs = 12_000
+    }: {
+      relayKey?: string | null
+      publicIdentifier?: string | null
+      reason?: string
+      timeoutMs?: number
+    }): Promise<RefreshRelaySubscriptionsResult> => {
+      if (!isElectron()) throw new Error('Electron IPC unavailable')
+      if (!statusV1) {
+        await startWorkerInternal({ resetRestartAttempts: false })
+      }
+
+      const requestId = makeRequestId('refresh-relay-subscriptions')
+      const boundedTimeout = Number.isFinite(timeoutMs)
+        ? Math.max(1_000, Math.min(Number(timeoutMs), 120_000))
+        : 12_000
+      const payload = {
+        type: 'refresh-relay-subscriptions',
+        requestId,
+        data: {
+          relayKey: typeof relayKey === 'string' && relayKey.trim() ? relayKey.trim() : null,
+          publicIdentifier:
+            typeof publicIdentifier === 'string' && publicIdentifier.trim()
+              ? publicIdentifier.trim()
+              : null,
+          reason: typeof reason === 'string' && reason.trim() ? reason.trim() : 'manual'
+        }
+      }
+
+      const replyPromise = new Promise<RefreshRelaySubscriptionsResult>((resolve, reject) => {
+        const pendingTimeoutId = window.setTimeout(() => {
+          pendingRepliesRef.current.delete(requestId)
+          reject(new Error(`Worker reply timeout after ${boundedTimeout}ms`))
+        }, boundedTimeout)
+
+        pendingRepliesRef.current.set(requestId, {
+          resolve,
+          reject,
+          timeoutId: pendingTimeoutId,
+          type: 'refresh-relay-subscriptions'
+        })
+      })
+
+      try {
+        const sendResult = await electronIpc.sendToWorker(payload)
+        if (
+          sendResult &&
+          typeof sendResult === 'object' &&
+          'success' in sendResult &&
+          (sendResult as any).success === false
+        ) {
+          throw new Error((sendResult as any).error || 'Worker rejected message')
+        }
+      } catch (error) {
+        const pending = pendingRepliesRef.current.get(requestId)
+        if (pending) {
+          pendingRepliesRef.current.delete(requestId)
+          window.clearTimeout(pending.timeoutId)
+        }
+        throw error instanceof Error ? error : new Error(String(error))
+      }
+
+      return await replyPromise
+    },
+    [startWorkerInternal, statusV1]
+  )
+
   const value = useMemo<WorkerBridgeContextValue>(
     () => ({
       isElectron: isElectron(),
@@ -1627,27 +1745,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         }
         return res
       },
-      createRelay: async (data: RelayCreateRequest) => {
-        return await createRelayInternal(data)
-      },
-      startJoinFlow: async (
-        publicIdentifier: string,
-      opts?: {
-        fileSharing?: boolean
-        token?: string
-        relayKey?: string | null
-        relayUrl?: string | null
-        blindPeer?: {
-          publicKey?: string | null
-          encryptionKey?: string | null
-          replicationTopic?: string | null
-          maxBytes?: number | null
-        } | null
-        cores?: { key: string; role?: string | null }[]
-      }
-    ) => {
-        await startJoinFlowInternal(publicIdentifier, opts)
-      },
+      refreshRelaySubscriptions: refreshRelaySubscriptionsInternal,
+      createRelay: createRelayInternal,
+      startJoinFlow: startJoinFlowInternal,
       clearJoinFlow
     }),
     [
@@ -1666,6 +1766,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       ready,
       relayServerReady,
       relays,
+      refreshRelaySubscriptionsInternal,
       sessionStopRequested,
       setAutostartEnabled,
       startJoinFlowInternal,
