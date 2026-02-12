@@ -3,6 +3,7 @@ import { Drawer, DrawerContent } from '@/components/ui/drawer'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { simplifyUrl } from '@/lib/url'
 import { cn } from '@/lib/utils'
+import useFeedRelayOptions from '@/hooks/useFeedRelayOptions'
 import { useFavoriteRelays } from '@/providers/FavoriteRelaysProvider'
 import { useFeed } from '@/providers/FeedProvider'
 import { useScreenSize } from '@/providers/ScreenSizeProvider'
@@ -53,11 +54,19 @@ const FeedSwitcherTrigger = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivEle
     const { t } = useTranslation()
     const { feedInfo, relayUrls } = useFeed()
     const { relaySets } = useFavoriteRelays()
+    const { getRelaySelectionState } = useFeedRelayOptions()
     const activeRelaySet = useMemo(() => {
       return feedInfo.feedType === 'relays' && feedInfo.id
         ? relaySets.find((set) => set.id === feedInfo.id)
         : undefined
     }, [feedInfo, relaySets])
+    const activeRelaySelection = useMemo(
+      () =>
+        feedInfo.feedType === 'relay'
+          ? getRelaySelectionState(feedInfo.id || null)
+          : null,
+      [feedInfo.feedType, feedInfo.id, getRelaySelectionState]
+    )
     const title = useMemo(() => {
       if (feedInfo.feedType === 'following') {
         return t('Following')
@@ -66,12 +75,18 @@ const FeedSwitcherTrigger = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivEle
         return t('Choose a relay')
       }
       if (feedInfo.feedType === 'relay') {
-        return simplifyUrl(feedInfo.id ?? '')
+        const groupLabel = activeRelaySelection?.groupState?.label?.trim()
+        if (groupLabel) {
+          return activeRelaySelection?.isReadyForReq
+            ? groupLabel
+            : `${groupLabel} (${t('loading...')})`
+        }
+        return simplifyUrl(activeRelaySelection?.relayUrl || feedInfo.id || '')
       }
       if (feedInfo.feedType === 'relays') {
         return activeRelaySet?.name ?? activeRelaySet?.id
       }
-    }, [feedInfo, activeRelaySet])
+    }, [activeRelaySelection, activeRelaySet, feedInfo, relayUrls.length, t])
 
     return (
       <div

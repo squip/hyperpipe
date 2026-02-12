@@ -20,6 +20,8 @@ export type RelayEntry = {
   connectionUrl?: string
   userAuthToken?: string
   requiresAuth?: boolean
+  writable?: boolean
+  readyForReq?: boolean
   name?: string
   description?: string
   createdAt?: number

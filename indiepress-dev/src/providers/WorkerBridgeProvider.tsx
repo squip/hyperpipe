@@ -338,6 +338,8 @@ const RELAY_COMPARE_FIELDS: Array<keyof RelayEntry> = [
   'connectionUrl',
   'userAuthToken',
   'requiresAuth',
+  'writable',
+  'readyForReq',
   'registrationStatus',
   'registrationError',
   'isActive',

@@ -1,6 +1,7 @@
 import { toRelaySettings } from '@/lib/link'
 import { simplifyUrl } from '@/lib/url'
 import { SecondaryPageLink } from '@/PageManager'
+import useFeedRelayOptions, { type FeedRelayOption } from '@/hooks/useFeedRelayOptions'
 import { useFavoriteRelays } from '@/providers/FavoriteRelaysProvider'
 import { useFeed } from '@/providers/FeedProvider'
 import { useNostr } from '@/providers/NostrProvider'
@@ -8,12 +9,16 @@ import { UsersRound } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import RelayIcon from '../RelayIcon'
 import RelaySetCard from '../RelaySetCard'
+import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 
 export default function FeedSwitcher({ close }: { close?: () => void }) {
   const { t } = useTranslation()
   const { pubkey } = useNostr()
-  const { relaySets, urls } = useFavoriteRelays()
+  const { relaySets } = useFavoriteRelays()
   const { feedInfo, switchFeed } = useFeed()
+  const { relayOptions, getRelaySelectionState } = useFeedRelayOptions()
+  const activeRelayIdentity =
+    feedInfo.feedType === 'relay' ? getRelaySelectionState(feedInfo.id || null).relayIdentity : null
 
   return (
     <div className="space-y-2">
@@ -58,21 +63,53 @@ export default function FeedSwitcher({ close }: { close?: () => void }) {
             }}
           />
         ))}
-      {urls.map((relay) => (
+      {relayOptions.map((relayOption) => (
         <FeedSwitcherItem
-          key={relay}
-          isActive={feedInfo.feedType === 'relay' && feedInfo.id === relay}
+          key={relayOption.relayIdentity}
+          isActive={feedInfo.feedType === 'relay' && activeRelayIdentity === relayOption.relayIdentity}
           onClick={() => {
-            switchFeed('relay', { relay })
+            switchFeed('relay', { relay: relayOption.relayUrl })
             close?.()
           }}
         >
-          <div className="flex gap-2 items-center w-full">
-            <RelayIcon url={relay} />
-            <div className="flex-1 w-0 truncate">{simplifyUrl(relay)}</div>
-          </div>
+          <FeedRelayOptionRow relayOption={relayOption} />
         </FeedSwitcherItem>
       ))}
+    </div>
+  )
+}
+
+function FeedRelayOptionRow({ relayOption }: { relayOption: FeedRelayOption }) {
+  const meta = relayOption.displayMeta
+  if (!meta) {
+    return (
+      <div className="flex gap-2 items-center w-full">
+        <RelayIcon url={relayOption.relayUrl} />
+        <div className="flex-1 w-0 truncate">{simplifyUrl(relayOption.relayUrl)}</div>
+      </div>
+    )
+  }
+
+  const label = meta.label?.trim() || simplifyUrl(relayOption.relayUrl)
+  const initials = label.slice(0, 2).toUpperCase()
+  return (
+    <div className="flex min-w-0 items-center gap-2 w-full">
+      {meta.imageUrl ? (
+        <Avatar className="h-5 w-5 shrink-0">
+          <AvatarImage src={meta.imageUrl} alt={label} />
+          <AvatarFallback className="text-[9px] font-semibold">{initials}</AvatarFallback>
+        </Avatar>
+      ) : (
+        <RelayIcon url={relayOption.relayUrl} />
+      )}
+      <div className="min-w-0">
+        <div className="truncate">{label}</div>
+        {!meta.hideUrl ? (
+          <div className="truncate text-[11px] text-muted-foreground">
+            {simplifyUrl(relayOption.relayUrl)}
+          </div>
+        ) : null}
+      </div>
     </div>
   )
 }

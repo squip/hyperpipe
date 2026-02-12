@@ -3843,11 +3843,25 @@ async function addAuthInfoToRelays(relays) {
 
       const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`
       const connectionUrl = token ? `${baseUrl}?token=${token}` : baseUrl
+      const requiresAuth = profile.auth_config?.requiresAuth || false
+      const writable = r?.writable === true
+      let tokenPresent = !!token
+      if (!tokenPresent) {
+        try {
+          const parsedConnectionUrl = new URL(connectionUrl)
+          tokenPresent = !!parsedConnectionUrl.searchParams.get('token')
+        } catch (_err) {
+          tokenPresent = /[?&]token=/.test(connectionUrl)
+        }
+      }
+      const readyForReq = writable && (!requiresAuth || tokenPresent)
 
       console.log('[Worker][addAuthInfoToRelays]', {
         relayKey: r.relayKey,
         publicIdentifier: profile.public_identifier || null,
-        requiresAuth: !!profile.auth_config?.requiresAuth,
+        requiresAuth,
+        writable,
+        readyForReq,
         fromProfileToken: !!token, // token derived above (profile auth_adds/auth_tokens)
         fromLegacyToken: !!(profile.auth_tokens && profile.auth_tokens[config.nostr_pubkey_hex]),
         fromStoreToken: !!tokenFromStore,
@@ -3865,7 +3879,9 @@ async function addAuthInfoToRelays(relays) {
         publicIdentifier: profile.public_identifier || null,
         connectionUrl,
         userAuthToken: token,
-        requiresAuth: profile.auth_config?.requiresAuth || false,
+        requiresAuth,
+        writable,
+        readyForReq,
         registrationStatus: statusEntry?.status || 'unknown',
         registrationError: statusEntry?.error || null
       }

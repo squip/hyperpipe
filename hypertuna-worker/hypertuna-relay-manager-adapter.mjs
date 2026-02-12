@@ -2598,6 +2598,7 @@ export async function getActiveRelays() {
             connectionUrl: `${buildGatewayWebsocketBase(globalConfig || { proxy_server_address: 'localhost', proxy_websocket_protocol: 'wss' })}/${identifierPath}`,
             createdAt: profile?.created_at || profile?.joined_at || null,
             isActive: true,
+            writable: manager?.relay?.writable === true,
             isOpen: profile?.isOpen === true,
             isPublic: profile?.isPublic === true,
             isHosted: !!profile?.created_at,
