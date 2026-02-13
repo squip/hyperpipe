@@ -261,3 +261,42 @@ test('deleteLocalGroupFileOperation resolves identifier from relay key profile',
   t.is(result.deleted, true)
   t.is(result.reason, null)
 })
+
+test('downloadGroupFileOperation surfaces download write failures', async (t) => {
+  await t.exception(async () => {
+    await downloadGroupFileOperation(
+      {
+        groupId: 'npubdemo:group-f',
+        fileHash: hex64('9'),
+        fileName: 'report.bin'
+      },
+      {
+        getRelayKeyFromPublicIdentifier: async () => hex64('a'),
+        getRelayProfileByKey: async () => ({ public_identifier: 'npubdemo:group-f' }),
+        recoverRelayDriveFile: async () => ({ status: 'ok', reason: 'already-local' }),
+        getFile: async () => Buffer.from('content'),
+        writeFileToDownloads: async () => {
+          throw new Error('write failed')
+        }
+      }
+    )
+  }, /write failed/)
+})
+
+test('deleteLocalGroupFileOperation propagates delete errors', async (t) => {
+  await t.exception(async () => {
+    await deleteLocalGroupFileOperation(
+      {
+        groupId: 'npubdemo:group-g',
+        fileHash: hex64('b')
+      },
+      {
+        getRelayKeyFromPublicIdentifier: async () => hex64('c'),
+        getRelayProfileByKey: async () => ({ public_identifier: 'npubdemo:group-g' }),
+        deleteRelayFile: async () => {
+          throw new Error('delete failed')
+        }
+      }
+    )
+  }, /delete failed/)
+})

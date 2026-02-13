@@ -32,12 +32,37 @@ node dist/cli.js
 - Center list: `Up/Down/PageUp/PageDown/Home/End`
 - Right top: `Up/Down` select action/tab, `Enter` apply action
 - Right bottom: `Up/Down` scroll details, `Ctrl+U`/`Ctrl+D` page scroll
+- `Groups -> Create Group` and `Chats -> Create Chat`: center `Enter` opens inline field editor, `Enter` submits field, `Esc` cancels field editor
+- `Invites -> Send Invite`: right-bottom accepts text input, suggestion list, and `Enter` to send invite
 - `r`: refresh current section
 - `:`: open command bar
-- `Enter`: open command bar prefilled from current selection
+- `Enter` on non-form center rows: open command bar prefilled from current selection
 - `y`: copy primary selected value
 - `Y`: copy context-aware command snippet
 - `q`: quit
+
+## Left Tree Nodes
+
+- `Dashboard`
+- `Relays`
+- `Groups`
+  - `Browse Groups`
+  - `My Groups (N)`
+  - `Create Group`
+- `Chats`
+  - `Create Chat`
+- `Invites`
+  - `Group Invites (N)`
+  - `Chat Invites (N)`
+  - `Send Invite`
+- `Files (N)`
+  - `Images (N)`
+  - `Video (N)`
+  - `Audio (N)`
+  - `Docs (N)`
+  - `Other (N)`
+- `Accounts`
+- `Logs`
 
 ## Context-first copy workflow
 
@@ -79,6 +104,7 @@ node dist/cli.js
 - `group refresh`
 - `group invites`
 - `group join-flow [publicIdentifier] [token]`
+- `group request-invite [groupId] [code] [reason]`
 - `group invite [groupId] [relayUrl] <inviteePubkey> [token]`
 - `group invite-accept [inviteId]`
 - `group invite-dismiss [inviteId]`
@@ -90,11 +116,12 @@ node dist/cli.js
 - `file delete [eventId|sha256]`
 - `chat init|refresh`
 - `chat create <title> <pubkey1,pubkey2,...> [description]`
+- `chat invite [conversationId] <pubkey1,pubkey2,...>`
 - `chat accept [inviteId]`
 - `chat dismiss [inviteId]`
 - `chat thread <conversationId>`
 - `chat send <conversationId> <content>`
-- `goto <dashboard|relays|groups|groups:browse|groups:my|chats|invites|invites:group|invites:chat|files|files:images|files:video|files:audio|files:docs|files:other|accounts|logs>`
+- `goto <dashboard|relays|groups|groups:browse|groups:my|groups:create|chats|chats:create|invites|invites:group|invites:chat|invites:send|files|files:images|files:video|files:audio|files:docs|files:other|accounts|logs>`
 
 ## Tests
 
@@ -117,6 +144,7 @@ Real worker/backend walkthrough:
 ```bash
 npm run demo:e2e:real
 npm run demo:e2e:real -- --stay-open
+npm run demo:e2e:real:matrix
 ```
 
 The real walkthrough can:
@@ -140,3 +168,7 @@ Environment variable fallbacks:
 - `HYPERTUNA_TUI_PASSWORD`
 - `HYPERTUNA_TUI_INVITEE_PUBKEY`
 - `HYPERTUNA_TUI_JOIN_ID`
+
+Matrix runner output options:
+
+- `npm run demo:e2e:real:matrix -- --json-out ./artifacts/live-matrix.json`

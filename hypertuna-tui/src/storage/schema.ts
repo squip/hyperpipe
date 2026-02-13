@@ -29,10 +29,12 @@ const accountScopedUiStateSchema = z.object({
   focusPane: z.enum(['left-tree', 'center', 'right-top', 'right-bottom']).default('left-tree'),
   treeExpanded: z.object({
     groups: z.boolean().default(true),
+    chats: z.boolean().default(true),
     invites: z.boolean().default(true),
     files: z.boolean().default(true)
   }).default({
     groups: true,
+    chats: true,
     invites: true,
     files: true
   }),

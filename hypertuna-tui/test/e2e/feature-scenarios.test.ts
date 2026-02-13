@@ -26,6 +26,7 @@ describe('TUI e2e feature scenarios', () => {
     const afterCreate = controller.getState()
     expect(afterCreate.relays.length).toBe(initialRelayCount + 1)
     expect(afterCreate.groups.some((group) => group.name === 'devgroup')).toBe(true)
+    expect(afterCreate.myGroups.some((group) => group.name === 'devgroup')).toBe(true)
 
     await executeCommand(controller, 'relay join npubexternal:group token123')
     const joinedRelay = controller

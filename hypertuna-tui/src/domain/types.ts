@@ -139,6 +139,14 @@ export type ChatInvite = {
   description?: string | null
 }
 
+export type ProfileSuggestion = {
+  pubkey: string
+  name?: string | null
+  about?: string | null
+  nip05?: string | null
+  source?: 'local' | 'remote' | 'cache'
+}
+
 export type ThreadMessage = {
   id: string
   conversationId: string
@@ -247,7 +255,7 @@ export type FileDeleteResult = {
 export type NavNodeViewportMap = Record<NavNodeId, PaneViewportEntry>
 export type RightTopSelectionMap = Record<NavNodeId, number>
 export type RightBottomOffsetMap = Record<NavNodeId, number>
-export type ExpandedTreeMap = Record<'groups' | 'invites' | 'files', boolean>
+export type ExpandedTreeMap = Record<'groups' | 'chats' | 'invites' | 'files', boolean>
 
 export type FileFamilyCounts = Record<FileFamily, number>
 
@@ -404,6 +412,12 @@ export interface GroupService {
   ): Promise<GroupJoinRequest[]>
   approveJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void>
   rejectJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void>
+  sendJoinRequest(input: {
+    groupId: string
+    reason?: string
+    code?: string
+    relayTargets: string[]
+  }): Promise<Event>
   sendInvite(input: {
     groupId: string
     relayUrl: string
@@ -493,7 +507,17 @@ export interface ChatService {
     description?: string
     members: string[]
     relayUrls?: string[]
+    relayMode?: 'withFallback' | 'strict'
   }): Promise<ChatConversation>
+  inviteMembers(conversationId: string, members: string[]): Promise<{
+    conversationId: string
+    invited: string[]
+    failed: Array<{
+      pubkey: string
+      error: string
+    }>
+    conversation: ChatConversation | null
+  }>
   acceptInvite(inviteId: string): Promise<{ conversationId: string | null }>
   loadThread(conversationId: string, limit?: number): Promise<ThreadMessage[]>
   sendMessage(conversationId: string, content: string): Promise<ThreadMessage>

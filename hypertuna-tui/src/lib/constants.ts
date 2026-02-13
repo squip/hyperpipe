@@ -33,17 +33,19 @@ export type RootNavId = (typeof ROOT_NAV_ORDER)[number]
 // Backward-compatible alias retained for tests and helper tooling.
 export const SECTION_ORDER = ROOT_NAV_ORDER
 
-export const PARENT_NAV_IDS = ['groups', 'invites', 'files'] as const
+export const PARENT_NAV_IDS = ['groups', 'chats', 'invites', 'files'] as const
 export type ParentNavId = (typeof PARENT_NAV_IDS)[number]
 
-export const GROUP_CHILD_NAV_IDS = ['groups:browse', 'groups:my'] as const
-export const INVITE_CHILD_NAV_IDS = ['invites:group', 'invites:chat'] as const
+export const GROUP_CHILD_NAV_IDS = ['groups:browse', 'groups:my', 'groups:create'] as const
+export const CHAT_CHILD_NAV_IDS = ['chats:create'] as const
+export const INVITE_CHILD_NAV_IDS = ['invites:group', 'invites:chat', 'invites:send'] as const
 
 export const FILE_CHILD_NAV_IDS = FILE_FAMILY_ORDER.map((family) => `files:type:${family}`) as readonly `files:type:${FileFamily}`[]
 
 export const ALL_NAV_NODE_IDS = [
   ...ROOT_NAV_ORDER,
   ...GROUP_CHILD_NAV_IDS,
+  ...CHAT_CHILD_NAV_IDS,
   ...INVITE_CHILD_NAV_IDS,
   ...FILE_CHILD_NAV_IDS
 ] as const

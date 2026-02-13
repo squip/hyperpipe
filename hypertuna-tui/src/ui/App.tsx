@@ -42,6 +42,7 @@ export interface AppController extends CommandController {
   setFocusPane(focusPane: 'left-tree' | 'center' | 'right-top' | 'right-bottom'): Promise<void>
   setTreeExpanded(nextExpanded: {
     groups: boolean
+    chats: boolean
     invites: boolean
     files: boolean
   }): Promise<void>
@@ -57,7 +58,7 @@ export type ScriptedCommand = {
 }
 
 type FocusPane = 'left-tree' | 'center' | 'right-top' | 'right-bottom'
-type TreeExpanded = { groups: boolean; invites: boolean; files: boolean }
+type TreeExpanded = { groups: boolean; chats: boolean; invites: boolean; files: boolean }
 type ViewportMap = Record<string, { cursor: number; offset: number }>
 type OffsetMap = Record<string, number>
 type IndexMap = Record<string, number>
@@ -81,20 +82,52 @@ type CenterRow = {
     | 'group-invite'
     | 'chat-invite'
     | 'chat-conversation'
+    | 'form-field'
+    | 'form-option'
+    | 'invite-mode'
     | 'file'
     | 'account'
     | 'log'
   data: unknown
 }
 
+type GroupCreateDraft = {
+  name: string
+  about: string
+  membership: 'open' | 'closed'
+  visibility: 'public' | 'private'
+}
+
+type ChatCreateDraft = {
+  name: string
+  description: string
+  inviteMembers: string[]
+  relayUrls: string[]
+}
+
+type InviteSendMode = 'group' | 'chat'
+
+type ProfileSuggestion = {
+  pubkey: string
+  name?: string | null
+  about?: string | null
+  nip05?: string | null
+  source?: 'local' | 'remote' | 'cache'
+}
+
 const DEFAULT_TREE_EXPANDED: TreeExpanded = {
   groups: true,
+  chats: true,
   invites: true,
   files: true
 }
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
+}
+
+function isHex64(value: string | null | undefined): boolean {
+  return /^[a-f0-9]{64}$/i.test(String(value || '').trim())
 }
 
 function shortText(value: string | null | undefined, max = 80): string {
@@ -287,7 +320,7 @@ function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRo
     if (root === 'files') rootLabel = `Files (${state.filesCount})`
     if (root === 'chats') rootLabel = `Chats (${state.chatUnreadTotal + state.chatPendingInviteCount})`
 
-    const isParent = root === 'groups' || root === 'invites' || root === 'files'
+    const isParent = root === 'groups' || root === 'chats' || root === 'invites' || root === 'files'
     const parent = isParent ? (root as ParentNavId) : null
     const isExpanded = isParent ? expanded[root as ParentNavId] : false
     rows.push({
@@ -316,6 +349,25 @@ function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRo
         isParent: false,
         expanded: false
       })
+      rows.push({
+        id: 'groups:create',
+        label: 'Create Group',
+        depth: 1,
+        parent: 'groups',
+        isParent: false,
+        expanded: false
+      })
+    }
+
+    if (root === 'chats' && expanded.chats) {
+      rows.push({
+        id: 'chats:create',
+        label: 'Create Chat',
+        depth: 1,
+        parent: 'chats',
+        isParent: false,
+        expanded: false
+      })
     }
 
     if (root === 'invites' && expanded.invites) {
@@ -330,6 +382,14 @@ function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRo
       rows.push({
         id: 'invites:chat',
         label: `Chat Invites (${state.chatInvites.length})`,
+        depth: 1,
+        parent: 'invites',
+        isParent: false,
+        expanded: false
+      })
+      rows.push({
+        id: 'invites:send',
+        label: 'Send Invite',
         depth: 1,
         parent: 'invites',
         isParent: false,
@@ -393,6 +453,12 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
         label: `My Groups (${state.myGroups.length})`,
         kind: 'summary',
         data: null
+      },
+      {
+        key: 'groups:create',
+        label: 'Create Group',
+        kind: 'summary',
+        data: null
       }
     ]
   }
@@ -423,6 +489,65 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
     })
   }
 
+  if (node === 'groups:create') {
+    return [
+      {
+        key: 'groups:create:name',
+        label: 'group name',
+        kind: 'form-field',
+        data: { form: 'group-create', field: 'name' }
+      },
+      {
+        key: 'groups:create:about',
+        label: 'group description',
+        kind: 'form-field',
+        data: { form: 'group-create', field: 'about' }
+      },
+      {
+        key: 'groups:create:membership',
+        label: 'membership policy',
+        kind: 'form-field',
+        data: { form: 'group-create', field: 'membership' }
+      },
+      {
+        key: 'groups:create:membership:open',
+        label: '  open',
+        kind: 'form-option',
+        data: { form: 'group-create', field: 'membership', value: 'open' }
+      },
+      {
+        key: 'groups:create:membership:closed',
+        label: '  closed',
+        kind: 'form-option',
+        data: { form: 'group-create', field: 'membership', value: 'closed' }
+      },
+      {
+        key: 'groups:create:visibility',
+        label: 'visibility',
+        kind: 'form-field',
+        data: { form: 'group-create', field: 'visibility' }
+      },
+      {
+        key: 'groups:create:visibility:public',
+        label: '  public',
+        kind: 'form-option',
+        data: { form: 'group-create', field: 'visibility', value: 'public' }
+      },
+      {
+        key: 'groups:create:visibility:private',
+        label: '  private',
+        kind: 'form-option',
+        data: { form: 'group-create', field: 'visibility', value: 'private' }
+      },
+      {
+        key: 'groups:create:submit',
+        label: 'create',
+        kind: 'form-field',
+        data: { form: 'group-create', field: 'submit' }
+      }
+    ]
+  }
+
   if (node === 'chats') {
     return state.conversations.map((conversation, idx) => ({
       key: `${conversation.id}-${idx}`,
@@ -430,6 +555,59 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
       kind: 'chat-conversation',
       data: conversation
     }))
+  }
+
+  if (node === 'chats:create') {
+    const writableRelays = state.relays
+      .filter((entry) => entry.writable === true && entry.connectionUrl)
+      .map((entry) => ({
+        relayKey: entry.relayKey,
+        relayUrl: String(entry.connectionUrl || ''),
+        name: entry.publicIdentifier || shortId(entry.relayKey, 10)
+      }))
+    return [
+      {
+        key: 'chats:create:name',
+        label: 'chat name',
+        kind: 'form-field',
+        data: { form: 'chat-create', field: 'name' }
+      },
+      {
+        key: 'chats:create:about',
+        label: 'chat description',
+        kind: 'form-field',
+        data: { form: 'chat-create', field: 'description' }
+      },
+      {
+        key: 'chats:create:members',
+        label: 'invite members',
+        kind: 'form-field',
+        data: { form: 'chat-create', field: 'members' }
+      },
+      {
+        key: 'chats:create:relays',
+        label: 'chat relays',
+        kind: 'form-field',
+        data: { form: 'chat-create', field: 'relays' }
+      },
+      ...writableRelays.map((entry) => ({
+        key: `chats:create:relay:${entry.relayKey}`,
+        label: `  ${entry.name}`,
+        kind: 'form-option' as const,
+        data: {
+          form: 'chat-create',
+          field: 'relay',
+          value: entry.relayUrl,
+          relayKey: entry.relayKey
+        }
+      })),
+      {
+        key: 'chats:create:submit',
+        label: 'create',
+        kind: 'form-field',
+        data: { form: 'chat-create', field: 'submit' }
+      }
+    ]
   }
 
   if (node === 'invites') {
@@ -443,6 +621,12 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
       {
         key: 'invites:chat',
         label: `Chat Invites (${state.chatInvites.length})`,
+        kind: 'summary',
+        data: null
+      },
+      {
+        key: 'invites:send',
+        label: 'Send Invite',
         kind: 'summary',
         data: null
       }
@@ -465,6 +649,23 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
       kind: 'chat-invite',
       data: invite
     }))
+  }
+
+  if (node === 'invites:send') {
+    return [
+      {
+        key: 'invites:send:group',
+        label: 'Group Invite',
+        kind: 'invite-mode',
+        data: { mode: 'group' as const }
+      },
+      {
+        key: 'invites:send:chat',
+        label: 'Chat Invite',
+        kind: 'invite-mode',
+        data: { mode: 'chat' as const }
+      }
+    ]
   }
 
   if (node === 'files' || isFileTypeNodeId(node)) {
@@ -506,11 +707,18 @@ function splitNode(node: NavNodeId): boolean {
   return (
     node === 'groups:browse'
     || node === 'groups:my'
+    || node === 'groups:create'
+    || node === 'chats:create'
     || node === 'invites:group'
     || node === 'invites:chat'
+    || node === 'invites:send'
     || node === 'files'
     || isFileTypeNodeId(node)
   )
+}
+
+function isFormCenterNode(node: NavNodeId): boolean {
+  return node === 'groups:create' || node === 'chats:create' || node === 'invites:send'
 }
 
 function groupKey(groupId: string, relay?: string | null): string {
@@ -551,7 +759,19 @@ function noteRowsForGroup(state: ControllerState, group: any): any[] {
 
 function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: CenterRow | null): string[] {
   if (node === 'groups:browse') {
-    return ['Group details', 'Admin details', 'Members']
+    const group = selectedRow?.data as any
+    const actions = ['Group details', 'Admin details', 'Members']
+    if (!group) return actions
+    const isPublic = group.isPublic !== false
+    const isOpen = group.isOpen !== false
+    if (isPublic && isOpen) {
+      actions.push('Join Group')
+    } else if (isPublic && !isOpen) {
+      actions.push('Request Invite')
+    } else if (!isPublic) {
+      actions.push('Invite-only (private)')
+    }
+    return actions
   }
   if (node === 'groups:my') {
     const group = selectedRow?.data as any
@@ -565,6 +785,12 @@ function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: C
       `Files (${files})`,
       `Join Requests (${joinReq})`
     ]
+  }
+  if (node === 'groups:create') {
+    return ['name: -', 'description: -', 'membership: open', 'visibility: public']
+  }
+  if (node === 'chats:create') {
+    return ['name: -', 'description: -', 'members: 0', 'relays: 0']
   }
   if (node === 'invites:group') {
     const invite = selectedRow?.data as any
@@ -586,6 +812,26 @@ function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: C
       'Accept invite',
       'Dismiss invite'
     ]
+  }
+  if (node === 'invites:send') {
+    const mode = (selectedRow?.data as { mode?: 'group' | 'chat' } | null)?.mode || 'group'
+    const currentPubkey = String(state.session?.pubkey || '').trim().toLowerCase()
+    if (mode === 'group') {
+      const groups = state.myGroups.filter((group) => {
+        const adminPubkey = String(group.adminPubkey || '').trim().toLowerCase()
+        return Boolean(adminPubkey && currentPubkey && adminPubkey === currentPubkey)
+      })
+      if (!groups.length) return ['No admin groups available']
+      return groups.map((group) => `${shortText(group.name || group.id, 24)} · ${group.id}`)
+    }
+    const chats = state.conversations.filter((conversation) => {
+      const admins = Array.isArray(conversation.adminPubkeys)
+        ? conversation.adminPubkeys.map((pubkey) => String(pubkey || '').trim().toLowerCase())
+        : []
+      return Boolean(currentPubkey && admins.includes(currentPubkey))
+    })
+    if (!chats.length) return ['No admin chats available']
+    return chats.map((conversation) => `${shortText(conversation.title || conversation.id, 24)} · ${conversation.id}`)
   }
   if (node === 'files' || isFileTypeNodeId(node)) {
     return ['Download', 'Delete']
@@ -683,6 +929,24 @@ function splitBottomRows(
         `followers: ${Number.isFinite(profile?.followersCount) ? profile.followersCount : '-'}`
       ]
     }
+    if (selectedAction.startsWith('Join Group')) {
+      return [
+        paneActionMessage || 'Press Enter to join this group',
+        `group: ${group.name || group.id}`,
+        `visibility: ${group.isPublic === false ? 'private' : 'public'}`,
+        `membership: ${group.isOpen === false ? 'closed' : 'open'}`
+      ]
+    }
+    if (selectedAction.startsWith('Request Invite')) {
+      return [
+        paneActionMessage || 'Press Enter to request an invite',
+        `group: ${group.name || group.id}`,
+        'This will publish a join request for admin review.'
+      ]
+    }
+    if (selectedAction.startsWith('Invite-only (private)')) {
+      return ['Private group (invite-only). Join action unavailable without an invite.']
+    }
     const members = Array.isArray(group.members) ? group.members : []
     return members.length ? members.map((member: unknown) => `${member}`) : ['No member list available']
   }
@@ -714,6 +978,20 @@ function splitBottomRows(
       return requests.map((request) => `${shortId(request.pubkey, 10)} · ${new Date(request.createdAt * 1000).toLocaleString()}`)
     }
     return ['No details']
+  }
+
+  if (node === 'groups:create') {
+    return [
+      paneActionMessage || 'Use center pane to edit fields and run create.',
+      'Create workflow status will appear here.'
+    ]
+  }
+
+  if (node === 'chats:create') {
+    return [
+      paneActionMessage || 'Use center pane to edit fields and run create.',
+      'Chat creation workflow status will appear here.'
+    ]
   }
 
   if (node === 'invites:group') {
@@ -778,6 +1056,13 @@ function splitBottomRows(
     if (selectedAction.startsWith('Accept invite') || selectedAction.startsWith('Dismiss invite')) {
       return [paneActionMessage || 'Press Enter to execute this action']
     }
+  }
+
+  if (node === 'invites:send') {
+    return [
+      paneActionMessage || 'Type a username/pubkey in the invite field and press Enter to send.',
+      'Use right-top pane to select an admin-owned target.'
+    ]
   }
 
   if (node === 'files' || isFileTypeNodeId(node)) {
@@ -880,6 +1165,31 @@ export function App({
   const [paneActionMessage, setPaneActionMessage] = useState<string>('')
   const [commandInputOpen, setCommandInputOpen] = useState(false)
   const [commandInput, setCommandInput] = useState('')
+  const [fieldInputOpen, setFieldInputOpen] = useState(false)
+  const [fieldInputPrompt, setFieldInputPrompt] = useState('')
+  const [fieldInputValue, setFieldInputValue] = useState('')
+  const fieldInputContextRef = useRef<{
+    node: NavNodeId
+    field: string
+  } | null>(null)
+  const [groupCreateDraft, setGroupCreateDraft] = useState<GroupCreateDraft>({
+    name: '',
+    about: '',
+    membership: 'open',
+    visibility: 'public'
+  })
+  const [chatCreateDraft, setChatCreateDraft] = useState<ChatCreateDraft>({
+    name: '',
+    description: '',
+    inviteMembers: [],
+    relayUrls: []
+  })
+  const [inviteSendQuery, setInviteSendQuery] = useState('')
+  const [inviteSendSuggestions, setInviteSendSuggestions] = useState<ProfileSuggestion[]>([])
+  const [inviteSendSuggestionIndex, setInviteSendSuggestionIndex] = useState(0)
+  const [inviteSendBusy, setInviteSendBusy] = useState(false)
+  const [inviteSendStatus, setInviteSendStatus] = useState<string>('')
+  const inviteSearchRequestRef = useRef(0)
   const [commandMessage, setCommandMessage] = useState('Type :help for commands')
   const [hydratedScopeKey, setHydratedScopeKey] = useState<string>('')
   const initialized = state?.initialized || false
@@ -975,12 +1285,32 @@ export function App({
     setFocusPane(state.focusPane || 'left-tree')
     setTreeExpanded({
       groups: state.treeExpanded?.groups ?? true,
+      chats: state.treeExpanded?.chats ?? true,
       invites: state.treeExpanded?.invites ?? true,
       files: state.treeExpanded?.files ?? true
     })
     setNodeViewport(state.nodeViewport || {})
     setRightTopSelectionByNode(state.rightTopSelectionByNode || {})
     setRightBottomOffsetByNode(state.rightBottomOffsetByNode || {})
+    setPaneActionMessage('')
+    setGroupCreateDraft({
+      name: '',
+      about: '',
+      membership: 'open',
+      visibility: 'public'
+    })
+    setChatCreateDraft({
+      name: '',
+      description: '',
+      inviteMembers: [],
+      relayUrls: []
+    })
+    setInviteSendQuery('')
+    setInviteSendSuggestions([])
+    setInviteSendSuggestionIndex(0)
+    setInviteSendBusy(false)
+    setInviteSendStatus('')
+    closeFieldInput()
   }, [state, hydratedScopeKey])
 
   const navRows = useMemo(() => {
@@ -1020,8 +1350,100 @@ export function App({
 
   const centerRows = useMemo(() => {
     if (!state) return []
-    return centerRowsForNode(state, selectedNode)
-  }, [state, selectedNode])
+    const base = centerRowsForNode(state, selectedNode)
+    if (selectedNode === 'groups:create') {
+      return base.map((row) => {
+        if (row.key === 'groups:create:name') {
+          return {
+            ...row,
+            label: `group name: ${groupCreateDraft.name || '-'}`
+          }
+        }
+        if (row.key === 'groups:create:about') {
+          return {
+            ...row,
+            label: `group description: ${groupCreateDraft.about || '-'}`
+          }
+        }
+        if (row.key === 'groups:create:membership') {
+          return {
+            ...row,
+            label: `membership policy: ${groupCreateDraft.membership}`
+          }
+        }
+        if (row.key === 'groups:create:membership:open') {
+          return {
+            ...row,
+            label: `  ${groupCreateDraft.membership === 'open' ? '[x]' : '[ ]'} open`
+          }
+        }
+        if (row.key === 'groups:create:membership:closed') {
+          return {
+            ...row,
+            label: `  ${groupCreateDraft.membership === 'closed' ? '[x]' : '[ ]'} closed`
+          }
+        }
+        if (row.key === 'groups:create:visibility') {
+          return {
+            ...row,
+            label: `visibility: ${groupCreateDraft.visibility}`
+          }
+        }
+        if (row.key === 'groups:create:visibility:public') {
+          return {
+            ...row,
+            label: `  ${groupCreateDraft.visibility === 'public' ? '[x]' : '[ ]'} public`
+          }
+        }
+        if (row.key === 'groups:create:visibility:private') {
+          return {
+            ...row,
+            label: `  ${groupCreateDraft.visibility === 'private' ? '[x]' : '[ ]'} private`
+          }
+        }
+        return row
+      })
+    }
+    if (selectedNode === 'chats:create') {
+      return base.map((row) => {
+        if (row.key === 'chats:create:name') {
+          return {
+            ...row,
+            label: `chat name: ${chatCreateDraft.name || '-'}`
+          }
+        }
+        if (row.key === 'chats:create:about') {
+          return {
+            ...row,
+            label: `chat description: ${chatCreateDraft.description || '-'}`
+          }
+        }
+        if (row.key === 'chats:create:members') {
+          return {
+            ...row,
+            label: `invite members: ${chatCreateDraft.inviteMembers.length ? chatCreateDraft.inviteMembers.join(',') : '-'}`
+          }
+        }
+        if (row.key === 'chats:create:relays') {
+          return {
+            ...row,
+            label: `chat relays: ${chatCreateDraft.relayUrls.length}`
+          }
+        }
+        if (row.key.startsWith('chats:create:relay:')) {
+          const relayUrl = String((row.data as { value?: string })?.value || '')
+          const selected = chatCreateDraft.relayUrls.includes(relayUrl)
+          const relayName = row.label.trim()
+          return {
+            ...row,
+            label: `  ${selected ? '[x]' : '[ ]'} ${relayName.replace(/^\[.\]\s*/, '')}`
+          }
+        }
+        return row
+      })
+    }
+    return base
+  }, [state, selectedNode, groupCreateDraft, chatCreateDraft])
 
   const selectedNodeViewport = useMemo(() => {
     const current = nodeViewport[selectedNode] || { cursor: 0, offset: 0 }
@@ -1050,8 +1472,24 @@ export function App({
   const splitMode = splitNode(selectedNode)
   const rightTopActionsRows = useMemo(() => {
     if (!state) return []
+    if (selectedNode === 'groups:create') {
+      return [
+        `name: ${groupCreateDraft.name || '-'}`,
+        `description: ${groupCreateDraft.about || '-'}`,
+        `membership: ${groupCreateDraft.membership}`,
+        `visibility: ${groupCreateDraft.visibility}`
+      ]
+    }
+    if (selectedNode === 'chats:create') {
+      return [
+        `name: ${chatCreateDraft.name || '-'}`,
+        `description: ${chatCreateDraft.description || '-'}`,
+        `invite members: ${chatCreateDraft.inviteMembers.length}`,
+        `chat relays: ${chatCreateDraft.relayUrls.length}`
+      ]
+    }
     return rightTopActions(state, selectedNode, selectedCenterRow)
-  }, [state, selectedNode, selectedCenterRow])
+  }, [state, selectedNode, selectedCenterRow, groupCreateDraft, chatCreateDraft])
 
   const rightTopIndex = useMemo(() => {
     const raw = rightTopSelectionByNode[selectedNode] || 0
@@ -1073,6 +1511,38 @@ export function App({
 
   const selectedRightTopAction = rightTopActionsRows[rightTopIndex] || ''
 
+  const inviteSendMode: InviteSendMode = useMemo(() => {
+    if (selectedNode !== 'invites:send') return 'group'
+    const mode = (selectedCenterRow?.data as { mode?: InviteSendMode } | null)?.mode
+    return mode === 'chat' ? 'chat' : 'group'
+  }, [selectedNode, selectedCenterRow])
+
+  const inviteSendTargets = useMemo(() => {
+    if (!state || selectedNode !== 'invites:send') return []
+    const currentPubkey = String(state.session?.pubkey || '').trim().toLowerCase()
+    if (!currentPubkey) return []
+    if (inviteSendMode === 'group') {
+      return state.myGroups
+        .filter((group) => String(group.adminPubkey || '').trim().toLowerCase() === currentPubkey)
+        .map((group) => ({
+          kind: 'group' as const,
+          id: group.id,
+          relay: group.relay || null,
+          name: group.name || group.id
+        }))
+    }
+    return state.conversations
+      .filter((conversation) => (conversation.adminPubkeys || []).map((value) => String(value || '').trim().toLowerCase()).includes(currentPubkey))
+      .map((conversation) => ({
+        kind: 'chat' as const,
+        id: conversation.id,
+        relay: null,
+        name: conversation.title || conversation.id
+      }))
+  }, [state, selectedNode, inviteSendMode])
+
+  const selectedInviteSendTarget = inviteSendTargets[rightTopIndex] || null
+
   useEffect(() => {
     if (!state || selectedNode !== 'groups:my') return
     if (!selectedCenterRow || selectedCenterRow.kind !== 'group') return
@@ -1089,10 +1559,77 @@ export function App({
     }
   }, [state, selectedNode, selectedCenterRow, selectedRightTopAction])
 
+  useEffect(() => {
+    if (selectedNode !== 'invites:send') {
+      setInviteSendSuggestions([])
+      setInviteSendSuggestionIndex(0)
+      return
+    }
+    const query = String(inviteSendQuery || '').trim()
+    if (!query) {
+      setInviteSendSuggestions([])
+      setInviteSendSuggestionIndex(0)
+      return
+    }
+    const controller = controllerRef.current
+    if (!controller) return
+    const requestId = ++inviteSearchRequestRef.current
+    let cancelled = false
+    const timer = setTimeout(() => {
+      controller.searchProfileSuggestions(query, 10)
+        .then((results) => {
+          if (cancelled) return
+          if (requestId !== inviteSearchRequestRef.current) return
+          setInviteSendSuggestions(results || [])
+          setInviteSendSuggestionIndex(0)
+        })
+        .catch(() => {
+          if (cancelled) return
+          if (requestId !== inviteSearchRequestRef.current) return
+          setInviteSendSuggestions([])
+          setInviteSendSuggestionIndex(0)
+        })
+    }, 150)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [selectedNode, inviteSendQuery])
+
   const splitBottomRawRows = useMemo(() => {
     if (!state) return ['No data']
+    if (selectedNode === 'invites:send') {
+      const lines = [
+        `mode: ${inviteSendMode === 'group' ? 'Group Invite' : 'Chat Invite'}`,
+        `target: ${selectedInviteSendTarget ? `${selectedInviteSendTarget.name} (${selectedInviteSendTarget.id})` : '-'}`,
+        `input: ${inviteSendQuery || ''}`,
+        inviteSendBusy ? 'sending: in progress' : `status: ${inviteSendStatus || 'idle'}`
+      ]
+      if (inviteSendQuery && inviteSendSuggestions.length === 0 && !inviteSendBusy) {
+        lines.push('no suggestions')
+      }
+      inviteSendSuggestions.forEach((entry, idx) => {
+        const marker = idx === inviteSendSuggestionIndex ? '>' : ' '
+        const name = entry.name ? `${entry.name} ` : ''
+        lines.push(`${marker} ${name}${shortId(entry.pubkey, 16)}${entry.nip05 ? ` · ${entry.nip05}` : ''}`)
+      })
+      return lines
+    }
     return splitBottomRows(state, selectedNode, selectedCenterRow, selectedRightTopAction, paneActionMessage)
-  }, [state, selectedNode, selectedCenterRow, selectedRightTopAction, paneActionMessage])
+  }, [
+    state,
+    selectedNode,
+    selectedCenterRow,
+    selectedRightTopAction,
+    paneActionMessage,
+    inviteSendMode,
+    selectedInviteSendTarget,
+    inviteSendQuery,
+    inviteSendSuggestions,
+    inviteSendSuggestionIndex,
+    inviteSendBusy,
+    inviteSendStatus
+  ])
 
   const singleRightRawRows = useMemo(() => {
     if (!state) return ['No data']
@@ -1228,12 +1765,316 @@ export function App({
     return snippet || ''
   }
 
+  const closeFieldInput = (): void => {
+    setFieldInputOpen(false)
+    setFieldInputPrompt('')
+    setFieldInputValue('')
+    fieldInputContextRef.current = null
+  }
+
+  const openFieldInput = (
+    node: NavNodeId,
+    field: string,
+    prompt: string,
+    initialValue: string
+  ): void => {
+    fieldInputContextRef.current = { node, field }
+    setFieldInputPrompt(prompt)
+    setFieldInputValue(initialValue)
+    setFieldInputOpen(true)
+  }
+
+  const applyFieldInputValue = (rawValue: string): void => {
+    const context = fieldInputContextRef.current
+    if (!context) return
+    const value = String(rawValue || '')
+    if (context.node === 'groups:create') {
+      if (context.field === 'name') {
+        setGroupCreateDraft((previous) => ({ ...previous, name: value.trim() }))
+      } else if (context.field === 'about') {
+        setGroupCreateDraft((previous) => ({ ...previous, about: value.trim() }))
+      }
+      return
+    }
+    if (context.node === 'chats:create') {
+      if (context.field === 'name') {
+        setChatCreateDraft((previous) => ({ ...previous, name: value.trim() }))
+      } else if (context.field === 'description') {
+        setChatCreateDraft((previous) => ({ ...previous, description: value.trim() }))
+      } else if (context.field === 'members') {
+        const members = value
+          .split(/[,\s]+/g)
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+        setChatCreateDraft((previous) => ({ ...previous, inviteMembers: Array.from(new Set(members)) }))
+      } else if (context.field === 'relays') {
+        const relayUrls = value
+          .split(/[,\s]+/g)
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+        setChatCreateDraft((previous) => ({ ...previous, relayUrls: Array.from(new Set(relayUrls)) }))
+      }
+    }
+  }
+
+  const submitFieldInput = (submittedValue: string): void => {
+    applyFieldInputValue(submittedValue)
+    closeFieldInput()
+  }
+
+  const toggleChatRelayDraft = (relayUrl: string): void => {
+    const normalized = String(relayUrl || '').trim()
+    if (!normalized) return
+    setChatCreateDraft((previous) => {
+      if (previous.relayUrls.includes(normalized)) {
+        return {
+          ...previous,
+          relayUrls: previous.relayUrls.filter((entry) => entry !== normalized)
+        }
+      }
+      return {
+        ...previous,
+        relayUrls: [...previous.relayUrls, normalized]
+      }
+    })
+  }
+
+  const runCreateGroup = async (): Promise<void> => {
+    const controller = controllerRef.current
+    if (!controller) return
+    const name = String(groupCreateDraft.name || '').trim()
+    if (!name) {
+      setPaneActionMessage('Group name is required')
+      return
+    }
+    try {
+      setPaneActionMessage('Creating group…')
+      const result = await controller.createRelay({
+        name,
+        description: String(groupCreateDraft.about || '').trim() || undefined,
+        isOpen: groupCreateDraft.membership === 'open',
+        isPublic: groupCreateDraft.visibility === 'public',
+        fileSharing: true
+      })
+      await Promise.all([
+        controller.refreshGroups(),
+        controller.refreshRelays()
+      ])
+      const createdId = String(result.publicIdentifier || result.relayKey || name)
+      setPaneActionMessage(`Group created: ${createdId}`)
+      setGroupCreateDraft({
+        name: '',
+        about: '',
+        membership: 'open',
+        visibility: 'public'
+      })
+    } catch (error) {
+      setPaneActionMessage(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const runCreateChat = async (): Promise<void> => {
+    const controller = controllerRef.current
+    if (!controller) return
+    const title = String(chatCreateDraft.name || '').trim()
+    if (!title) {
+      setPaneActionMessage('Chat name is required')
+      return
+    }
+    try {
+      setPaneActionMessage('Creating chat…')
+      await controller.createConversation({
+        title,
+        description: String(chatCreateDraft.description || '').trim() || undefined,
+        members: Array.from(new Set(chatCreateDraft.inviteMembers.map((entry) => entry.trim()).filter(Boolean))),
+        relayUrls: chatCreateDraft.relayUrls.length ? Array.from(new Set(chatCreateDraft.relayUrls)) : undefined,
+        relayMode: 'withFallback'
+      })
+      setPaneActionMessage(`Chat created: ${title}`)
+      setChatCreateDraft({
+        name: '',
+        description: '',
+        inviteMembers: [],
+        relayUrls: []
+      })
+    } catch (error) {
+      setPaneActionMessage(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const handleFormCenterEnter = async (): Promise<void> => {
+    if (!selectedCenterRow) return
+    if (selectedNode === 'groups:create') {
+      if (selectedCenterRow.key === 'groups:create:name') {
+        openFieldInput('groups:create', 'name', 'Group name', groupCreateDraft.name)
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:about') {
+        openFieldInput('groups:create', 'about', 'Group description', groupCreateDraft.about)
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:membership') {
+        setGroupCreateDraft((previous) => ({
+          ...previous,
+          membership: previous.membership === 'open' ? 'closed' : 'open'
+        }))
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:membership:open') {
+        setGroupCreateDraft((previous) => ({ ...previous, membership: 'open' }))
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:membership:closed') {
+        setGroupCreateDraft((previous) => ({ ...previous, membership: 'closed' }))
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:visibility') {
+        setGroupCreateDraft((previous) => ({
+          ...previous,
+          visibility: previous.visibility === 'public' ? 'private' : 'public'
+        }))
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:visibility:public') {
+        setGroupCreateDraft((previous) => ({ ...previous, visibility: 'public' }))
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:visibility:private') {
+        setGroupCreateDraft((previous) => ({ ...previous, visibility: 'private' }))
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:submit') {
+        await runCreateGroup()
+      }
+      return
+    }
+
+    if (selectedNode === 'chats:create') {
+      if (selectedCenterRow.key === 'chats:create:name') {
+        openFieldInput('chats:create', 'name', 'Chat name', chatCreateDraft.name)
+        return
+      }
+      if (selectedCenterRow.key === 'chats:create:about') {
+        openFieldInput('chats:create', 'description', 'Chat description', chatCreateDraft.description)
+        return
+      }
+      if (selectedCenterRow.key === 'chats:create:members') {
+        openFieldInput('chats:create', 'members', 'Invite members (csv)', chatCreateDraft.inviteMembers.join(','))
+        return
+      }
+      if (selectedCenterRow.key === 'chats:create:relays') {
+        openFieldInput('chats:create', 'relays', 'Relay URLs (csv)', chatCreateDraft.relayUrls.join(','))
+        return
+      }
+      if (selectedCenterRow.key.startsWith('chats:create:relay:')) {
+        const relayUrl = String((selectedCenterRow.data as { value?: string })?.value || '')
+        toggleChatRelayDraft(relayUrl)
+        return
+      }
+      if (selectedCenterRow.key === 'chats:create:submit') {
+        await runCreateChat()
+      }
+      return
+    }
+
+    if (selectedNode === 'invites:send') {
+      const mode = (selectedCenterRow.data as { mode?: InviteSendMode } | null)?.mode
+      if (mode === 'chat' || mode === 'group') {
+        setInviteSendQuery('')
+        setInviteSendStatus('')
+        setInviteSendSuggestionIndex(0)
+      }
+    }
+  }
+
+  const sendInviteFromRightBottom = async (): Promise<void> => {
+    const controller = controllerRef.current
+    if (!controller || !state || selectedNode !== 'invites:send') return
+    if (inviteSendBusy) return
+    if (!selectedInviteSendTarget) {
+      setInviteSendStatus('No admin-owned target selected')
+      return
+    }
+
+    const suggestion = inviteSendSuggestions[inviteSendSuggestionIndex] || null
+    const typed = String(inviteSendQuery || '').trim()
+    const inviteePubkey = suggestion?.pubkey || (isHex64(typed) ? typed.toLowerCase() : null)
+    if (!inviteePubkey) {
+      setInviteSendStatus('Select a suggestion or enter a valid 64-char pubkey')
+      return
+    }
+
+    try {
+      setInviteSendBusy(true)
+      setInviteSendStatus('Sending invite…')
+
+      if (inviteSendMode === 'group') {
+        const group = state.myGroups.find((entry) => entry.id === selectedInviteSendTarget.id)
+        const relayUrl = String(group?.relay || selectedInviteSendTarget.relay || '').trim()
+        if (!relayUrl) {
+          throw new Error('Selected group has no relay URL')
+        }
+        await controller.sendInvite({
+          groupId: selectedInviteSendTarget.id,
+          relayUrl,
+          inviteePubkey,
+          payload: {
+            groupName: group?.name || selectedInviteSendTarget.name || selectedInviteSendTarget.id,
+            isPublic: group?.isPublic !== false,
+            fileSharing: true
+          }
+        })
+      } else {
+        const result = await controller.inviteChatMembers(selectedInviteSendTarget.id, [inviteePubkey])
+        if (result.failed?.length) {
+          throw new Error(result.failed[0]?.error || 'Invite failed')
+        }
+      }
+
+      setInviteSendStatus(`Invite sent: ${shortId(inviteePubkey, 16)}`)
+      setInviteSendQuery('')
+      setInviteSendSuggestions([])
+      setInviteSendSuggestionIndex(0)
+    } catch (error) {
+      setInviteSendStatus(error instanceof Error ? error.message : String(error))
+    } finally {
+      setInviteSendBusy(false)
+    }
+  }
+
   const executeRightTopAction = async (): Promise<void> => {
     const controller = controllerRef.current
     if (!controller || !state) return
     if (!splitMode || !selectedCenterRow || !selectedRightTopAction) return
 
     try {
+      if (selectedNode === 'groups:browse' && selectedCenterRow.kind === 'group') {
+        const group = selectedCenterRow.data as any
+        if (selectedRightTopAction.startsWith('Join Group')) {
+          setPaneActionMessage('Joining group…')
+          await controller.startJoinFlow({
+            publicIdentifier: group.id,
+            relayUrl: group.relay || undefined,
+            openJoin: group.isPublic !== false && group.isOpen !== false
+          })
+          await Promise.all([
+            controller.refreshGroups(),
+            controller.refreshRelays()
+          ])
+          setPaneActionMessage(`Joined group: ${group.name || group.id}`)
+          return
+        }
+        if (selectedRightTopAction.startsWith('Request Invite')) {
+          setPaneActionMessage('Requesting invite…')
+          await controller.requestGroupInvite({
+            groupId: group.id,
+            relay: group.relay || null
+          })
+          setPaneActionMessage(`Invite request sent for ${group.name || group.id}`)
+          return
+        }
+      }
+
       if (selectedNode === 'invites:group' && selectedCenterRow.kind === 'group-invite') {
         const invite = selectedCenterRow.data as any
         if (selectedRightTopAction.startsWith('Accept invite')) {
@@ -1303,6 +2144,15 @@ export function App({
           setPaneActionMessage(result.deleted ? 'File deleted from local storage' : `Delete failed: ${result.reason || 'unknown'}`)
           return
         }
+      }
+
+      if (selectedNode === 'invites:send') {
+        if (selectedInviteSendTarget) {
+          setPaneActionMessage(`Target selected: ${selectedInviteSendTarget.name}`)
+        } else {
+          setPaneActionMessage('Select a target and enter an invitee in details pane')
+        }
+        return
       }
 
       setPaneActionMessage(`${selectedRightTopAction} selected`)
@@ -1388,6 +2238,28 @@ export function App({
       return
     }
 
+    if (fieldInputOpen) {
+      if (key.escape) {
+        closeFieldInput()
+        return
+      }
+      if (key.return) {
+        submitFieldInput(fieldInputValue)
+        return
+      }
+      if (key.backspace || key.delete) {
+        setFieldInputValue((previous) => previous.slice(0, -1))
+        return
+      }
+      if (!key.ctrl && !key.meta && input) {
+        const sanitized = input.replace(/[\r\n\t]/g, '')
+        if (sanitized) {
+          setFieldInputValue((previous) => `${previous}${sanitized}`)
+        }
+      }
+      return
+    }
+
     if (key.ctrl && input === 'c') {
       controller.shutdown().finally(() => exit())
       return
@@ -1401,12 +2273,6 @@ export function App({
     if (input === ':') {
       setCommandInputOpen(true)
       setCommandInput('')
-      return
-    }
-
-    if (key.return && focusPaneRef.current !== 'right-top') {
-      setCommandInputOpen(true)
-      setCommandInput(prefillCommandInput())
       return
     }
 
@@ -1517,6 +2383,8 @@ export function App({
           }
           setTreeExpanded(next)
           controller.setTreeExpanded(next).catch(() => {})
+        } else {
+          controller.setSelectedNode(currentNode).catch(() => {})
         }
         return
       }
@@ -1573,6 +2441,17 @@ export function App({
         return
       }
 
+      if (key.return) {
+        if (isFormCenterNode(currentNode)) {
+          handleFormCenterEnter().catch((error) => {
+            setPaneActionMessage(error instanceof Error ? error.message : String(error))
+          })
+          return
+        }
+        setCommandInputOpen(true)
+        setCommandInput(prefillCommandInput())
+      }
+
       return
     }
 
@@ -1613,6 +2492,41 @@ export function App({
     }
 
     if (currentFocus === 'right-bottom') {
+      if (currentNode === 'invites:send') {
+        if (key.return) {
+          sendInviteFromRightBottom().catch((error) => {
+            setInviteSendStatus(error instanceof Error ? error.message : String(error))
+          })
+          return
+        }
+        if (key.upArrow) {
+          setInviteSendSuggestionIndex((previous) => clamp(previous - 1, 0, Math.max(0, inviteSendSuggestions.length - 1)))
+          return
+        }
+        if (key.downArrow) {
+          setInviteSendSuggestionIndex((previous) => clamp(previous + 1, 0, Math.max(0, inviteSendSuggestions.length - 1)))
+          return
+        }
+        if (key.backspace || key.delete) {
+          setInviteSendQuery((previous) => previous.slice(0, -1))
+          return
+        }
+        if (key.escape) {
+          setInviteSendQuery('')
+          setInviteSendSuggestions([])
+          setInviteSendSuggestionIndex(0)
+          setInviteSendStatus('')
+          return
+        }
+        if (!key.ctrl && !key.meta && input) {
+          const sanitized = input.replace(/[\r\n\t]/g, '')
+          if (sanitized) {
+            setInviteSendQuery((previous) => `${previous}${sanitized}`)
+          }
+          return
+        }
+      }
+
       const rows = wrappedRightRows.length
       const visible = rightBottomVisibleRows
       const maxOffset = Math.max(0, rows - visible)
@@ -1690,7 +2604,7 @@ export function App({
   const rightBoxRows = Math.max(6, narrowLayout ? frameRows.mainRows - navBoxRows - centerBoxRows : frameRows.mainRows)
 
   const keysLabel =
-    'Keys: `:` command, `Enter` prefill, `y` copy value, `Y` copy command, `Tab/Shift+Tab` pane focus, tree `←/→`, list `↑/↓`, right-bottom `Ctrl+U/Ctrl+D`, `r` refresh, `q` quit'
+    'Keys: `:` command, center `Enter` prefill (non-form), form `Enter` edit/submit, `y` copy value, `Y` copy command, `Tab/Shift+Tab` pane focus, tree `←/→`, list `↑/↓`, right-bottom `Ctrl+U/Ctrl+D`, `r` refresh, `q` quit'
 
   const commandStatusLabel = state.lastError
     ? `Error: ${state.lastError}`
@@ -1865,6 +2779,16 @@ export function App({
               onChange={setCommandInput}
               onSubmit={runCommand}
               placeholder="command"
+            />
+          </Box>
+        ) : fieldInputOpen ? (
+          <Box>
+            <TruncText color="yellow">{fieldInputPrompt || 'input'}:</TruncText>
+            <TextInput
+              value={fieldInputValue}
+              onChange={() => {}}
+              onSubmit={() => {}}
+              placeholder="value"
             />
           </Box>
         ) : (

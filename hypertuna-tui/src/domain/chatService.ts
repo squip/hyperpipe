@@ -188,6 +188,7 @@ export class ChatService implements IChatService {
     description?: string
     members: string[]
     relayUrls?: string[]
+    relayMode?: 'withFallback' | 'strict'
   }): Promise<ChatConversation> {
     const response = await this.command<{ conversation?: Record<string, unknown> }>(
       'marmot-create-conversation',
@@ -195,7 +196,8 @@ export class ChatService implements IChatService {
         title: input.title,
         description: input.description,
         members: input.members,
-        relayUrls: input.relayUrls
+        relayUrls: input.relayUrls,
+        relayMode: input.relayMode
       }
     )
 
@@ -205,6 +207,55 @@ export class ChatService implements IChatService {
     }
 
     return parsed
+  }
+
+  async inviteMembers(conversationId: string, members: string[]): Promise<{
+    conversationId: string
+    invited: string[]
+    failed: Array<{
+      pubkey: string
+      error: string
+    }>
+    conversation: ChatConversation | null
+  }> {
+    const response = await this.command<{
+      conversationId?: string
+      invited?: unknown[]
+      failed?: unknown[]
+      conversation?: Record<string, unknown>
+    }>(
+      'marmot-invite-members',
+      {
+        conversationId,
+        members
+      }
+    )
+
+    const conversation = response?.conversation ? parseConversation(response.conversation) : null
+    const invited = Array.isArray(response?.invited)
+      ? response.invited
+          .map((entry) => (typeof entry === 'string' ? entry.trim().toLowerCase() : ''))
+          .filter(Boolean)
+      : []
+    const failed = Array.isArray(response?.failed)
+      ? response.failed
+          .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === 'object')
+          .map((entry) => ({
+            pubkey: typeof entry.pubkey === 'string' ? entry.pubkey : '',
+            error: typeof entry.error === 'string' ? entry.error : 'Unknown invite failure'
+          }))
+          .filter((entry) => Boolean(entry.pubkey))
+      : []
+
+    return {
+      conversationId:
+        typeof response?.conversationId === 'string' && response.conversationId
+          ? response.conversationId
+          : conversationId,
+      invited,
+      failed,
+      conversation
+    }
   }
 
   async acceptInvite(inviteId: string): Promise<{ conversationId: string | null }> {

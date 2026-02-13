@@ -6167,6 +6167,7 @@ async function handleMessageObject(message) {
         }
 
         sendMessage({ type: 'provision-writer-for-invitee:result', requestId, data: responsePayload })
+        sendWorkerResponse(requestId, { success: true, data: responsePayload })
         try {
           const writerCoreHex = result?.writerCoreHex || result?.autobaseLocal || null
           console.log('[Worker] Refreshing blind-peer mirrors after invite writer', {
@@ -6220,12 +6221,14 @@ async function handleMessageObject(message) {
         })
         return result
       } catch (err) {
+        const errorMessage = err?.message || String(err)
         sendMessage({
           type: 'provision-writer-for-invitee:error',
           requestId: message?.requestId,
-          error: err?.message || String(err)
+          error: errorMessage
         })
-        return { error: err?.message || String(err) }
+        sendWorkerResponse(message?.requestId, { success: false, error: errorMessage })
+        return { error: errorMessage }
       }
       break
 

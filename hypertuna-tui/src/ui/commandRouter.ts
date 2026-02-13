@@ -127,6 +127,12 @@ export interface CommandController {
     relayUrl?: string
     openJoin?: boolean
   }): Promise<void>
+  requestGroupInvite(input: {
+    groupId: string
+    relay?: string | null
+    code?: string
+    reason?: string
+  }): Promise<void>
 
   refreshGroups(): Promise<void>
   refreshInvites(): Promise<void>
@@ -200,7 +206,25 @@ export interface CommandController {
     title: string
     description?: string
     members: string[]
+    relayUrls?: string[]
+    relayMode?: 'withFallback' | 'strict'
   }): Promise<void>
+  inviteChatMembers(conversationId: string, members: string[]): Promise<{
+    conversationId: string
+    invited: string[]
+    failed: Array<{
+      pubkey: string
+      error: string
+    }>
+    conversation: unknown | null
+  }>
+  searchProfileSuggestions(query: string, limit?: number): Promise<Array<{
+    pubkey: string
+    name?: string | null
+    about?: string | null
+    nip05?: string | null
+    source?: 'local' | 'remote' | 'cache'
+  }>>
   acceptChatInvite(inviteId: string): Promise<void>
   dismissChatInvite(inviteId: string): Promise<void>
   setChatViewTab(tab: 'conversations' | 'invites'): Promise<void>
@@ -274,13 +298,19 @@ const NAV_ALIASES: Record<string, NavNodeId> = {
   discover: 'groups:browse',
   'groups:discover': 'groups:browse',
   'groups:my': 'groups:my',
+  'groups:create': 'groups:create',
+  'create-group': 'groups:create',
   my: 'groups:my',
   chats: 'chats',
+  'chats:create': 'chats:create',
+  'create-chat': 'chats:create',
   invites: 'invites',
   'invites:group': 'invites:group',
   'group-invites': 'invites:group',
   'invites:chat': 'invites:chat',
   'chat-invites': 'invites:chat',
+  'invites:send': 'invites:send',
+  'send-invite': 'invites:send',
   files: 'files',
   'files:images': 'files:type:images',
   'files:video': 'files:type:video',
@@ -580,7 +610,7 @@ export async function executeCommand(
   if (cmd === 'help') {
     return {
       message:
-        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | relay refresh/create/join/disconnect/leave | group tab/refresh/invites/members/search/sort/filter/join-flow/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept/dismiss | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot'
+        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | relay refresh/create/join/disconnect/leave | group tab/refresh/invites/members/search/sort/filter/join-flow/request-invite/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept/dismiss | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/invite/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot'
     }
   }
 
@@ -847,6 +877,35 @@ export async function executeCommand(
       return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }
 
+    if (action === 'request-invite' || action === 'request') {
+      const selectedGroup = resolveSelectedGroup(context)
+      let groupId: string | undefined = args[2]
+      let code: string | undefined
+      let reason: string | undefined
+      if (!groupId) {
+        groupId = selectedGroup?.id
+      } else if (!looksLikeGroupIdentifier(groupId) && selectedGroup?.id) {
+        code = groupId
+        groupId = selectedGroup.id
+      } else {
+        code = args[3]
+      }
+      groupId = requireArg(groupId, 'groupId')
+      if (args.length >= 5) {
+        reason = remainder(trimmed, `${args[0]} ${args[1]} ${args[2]} ${args[3]}`)
+      } else if (args.length >= 4 && !code) {
+        reason = remainder(trimmed, `${args[0]} ${args[1]} ${args[2]}`)
+      }
+
+      await controller.requestGroupInvite({
+        groupId,
+        relay: selectedGroup?.relay || null,
+        code,
+        reason
+      })
+      return { message: `Invite request submitted for ${groupId}`, gotoNode: 'groups:browse' }
+    }
+
     throw new Error(`Unknown relay action: ${action}`)
   }
 
@@ -956,6 +1015,37 @@ export async function executeCommand(
         openJoin: args.includes('--open')
       })
       return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
+    }
+
+    if (action === 'request-invite' || action === 'request') {
+      const selectedGroup = resolveSelectedGroup(context)
+      let groupId: string | undefined = args[2]
+      let code: string | undefined
+      let reason: string | undefined
+
+      if (!groupId) {
+        groupId = selectedGroup?.id
+      } else if (!looksLikeGroupIdentifier(groupId) && selectedGroup?.id) {
+        code = groupId
+        groupId = selectedGroup.id
+      } else {
+        code = args[3]
+      }
+
+      groupId = requireArg(groupId, 'groupId')
+      if (args.length >= 5) {
+        reason = remainder(trimmed, `${args[0]} ${args[1]} ${args[2]} ${args[3]}`)
+      } else if (args.length >= 4 && !code) {
+        reason = remainder(trimmed, `${args[0]} ${args[1]} ${args[2]}`)
+      }
+
+      await controller.requestGroupInvite({
+        groupId,
+        relay: selectedGroup?.relay || null,
+        code,
+        reason
+      })
+      return { message: `Invite request submitted for ${groupId}`, gotoNode: 'groups:browse' }
     }
 
     if (action === 'invite') {
@@ -1425,9 +1515,33 @@ export async function executeCommand(
       await controller.createConversation({
         title,
         members,
-        description: args[4]
+        description: args[4],
+        relayMode: 'withFallback'
       })
       return { message: 'Conversation created', gotoNode: 'chats' }
+    }
+
+    if (action === 'invite') {
+      const selectedConversation = resolveSelectedConversation(context)
+      let conversationId: string | undefined = args[2]
+      let membersCsv: string | undefined = args[3]
+
+      if (!membersCsv) {
+        if (selectedConversation?.id) {
+          membersCsv = args[2]
+          conversationId = selectedConversation.id
+        }
+      }
+
+      conversationId = requireArg(conversationId, 'conversationId')
+      membersCsv = requireArg(membersCsv, 'members csv')
+      const members = splitCsv(membersCsv)
+      const result = await controller.inviteChatMembers(conversationId, members)
+      const failed = result.failed?.length || 0
+      if (failed > 0) {
+        return { message: `Invited ${result.invited.length} members, ${failed} failed`, gotoNode: 'chats' }
+      }
+      return { message: `Invited ${result.invited.length} members`, gotoNode: 'chats' }
     }
 
     if (action === 'accept') {

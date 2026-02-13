@@ -228,6 +228,7 @@ function emptyState(): ControllerState {
     focusPane: 'left-tree',
     treeExpanded: {
       groups: true,
+      chats: true,
       invites: true,
       files: true
     },
@@ -959,6 +960,7 @@ export class MockController implements AppController {
 
   async setTreeExpanded(nextExpanded: {
     groups: boolean
+    chats: boolean
     invites: boolean
     files: boolean
   }): Promise<void> {
@@ -1158,26 +1160,34 @@ export class MockController implements AppController {
       requiresAuth: false,
       members: this.state.session ? [this.state.session.pubkey] : []
     }
+    const createdGroup: GroupSummary = {
+      id: publicIdentifier,
+      relay: relay.connectionUrl,
+      name: input.name,
+      about: input.description,
+      picture: input.picture,
+      isPublic: input.isPublic,
+      isOpen: input.isOpen,
+      adminPubkey: this.state.session?.pubkey || null,
+      adminName: 'me',
+      members: this.state.session ? [this.state.session.pubkey] : [],
+      membersCount: this.state.session ? 1 : 0,
+      peersOnline: 0,
+      createdAt: nowSec()
+    }
+    const nextMyGroupList: GroupListEntry[] = [
+      ...this.state.myGroupList.filter((entry) => entry.groupId !== publicIdentifier),
+      {
+        groupId: publicIdentifier,
+        relay: relay.connectionUrl
+      }
+    ]
     this.patch({
       relays: [...this.state.relays, relay],
-      groups: [
-        ...this.state.groups,
-        {
-          id: publicIdentifier,
-          relay: relay.connectionUrl,
-          name: input.name,
-          about: input.description,
-          picture: input.picture,
-          isPublic: input.isPublic,
-          isOpen: input.isOpen,
-          adminPubkey: this.state.session?.pubkey || null,
-          adminName: 'me',
-          members: this.state.session ? [this.state.session.pubkey] : [],
-          membersCount: this.state.session ? 1 : 0,
-          peersOnline: 0,
-          createdAt: nowSec()
-        }
-      ]
+      groups: [createdGroup, ...this.state.groups],
+      groupDiscover: [createdGroup, ...this.state.groupDiscover],
+      myGroups: [createdGroup, ...this.state.myGroups],
+      myGroupList: nextMyGroupList
     })
     return {
       success: true,
@@ -1275,6 +1285,20 @@ export class MockController implements AppController {
       ts: nowMs(),
       level: 'info',
       message: `join-flow:${input.publicIdentifier}`
+    })
+    this.emit()
+  }
+
+  async requestGroupInvite(input: {
+    groupId: string
+    relay?: string | null
+    code?: string
+    reason?: string
+  }): Promise<void> {
+    this.state.logs.push({
+      ts: nowMs(),
+      level: 'info',
+      message: `request-invite:${input.groupId}${input.code ? `:${input.code}` : ''}`
     })
     this.emit()
   }
@@ -1917,6 +1941,8 @@ export class MockController implements AppController {
     title: string
     description?: string
     members: string[]
+    relayUrls?: string[]
+    relayMode?: 'withFallback' | 'strict'
   }): Promise<void> {
     const conversation: ChatConversation = {
       id: this.nextConversationId(),
@@ -1931,6 +1957,102 @@ export class MockController implements AppController {
     }
 
     this.patch({ conversations: [conversation, ...this.state.conversations] })
+  }
+
+  async inviteChatMembers(conversationId: string, members: string[]): Promise<{
+    conversationId: string
+    invited: string[]
+    failed: Array<{
+      pubkey: string
+      error: string
+    }>
+    conversation: ChatConversation | null
+  }> {
+    const normalizedConversationId = String(conversationId || '').trim()
+    if (!normalizedConversationId) {
+      throw new Error('conversationId is required')
+    }
+    const normalizedMembers = Array.from(new Set(
+      members.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean)
+    ))
+    const conversation = this.state.conversations.find((entry) => entry.id === normalizedConversationId) || null
+    if (!conversation) {
+      throw new Error(`Conversation not found: ${normalizedConversationId}`)
+    }
+
+    const failed: Array<{ pubkey: string; error: string }> = []
+    const invited: string[] = []
+    for (const member of normalizedMembers) {
+      if (!/^[a-f0-9]{64}$/i.test(member)) {
+        failed.push({ pubkey: member, error: 'invalid pubkey' })
+        continue
+      }
+      invited.push(member)
+    }
+
+    if (invited.length > 0) {
+      const mergedParticipants = Array.from(new Set([
+        ...conversation.participants,
+        ...invited
+      ]))
+      const updated: ChatConversation = {
+        ...conversation,
+        participants: mergedParticipants,
+        lastMessageAt: nowSec(),
+        lastMessagePreview: `invited ${invited.length} member(s)`
+      }
+      this.patch({
+        conversations: [
+          updated,
+          ...this.state.conversations.filter((entry) => entry.id !== normalizedConversationId)
+        ]
+      })
+      return {
+        conversationId: normalizedConversationId,
+        invited,
+        failed,
+        conversation: updated
+      }
+    }
+
+    return {
+      conversationId: normalizedConversationId,
+      invited,
+      failed,
+      conversation
+    }
+  }
+
+  async searchProfileSuggestions(query: string, limit = 12): Promise<Array<{
+    pubkey: string
+    name?: string | null
+    about?: string | null
+    nip05?: string | null
+    source?: 'local' | 'remote' | 'cache'
+  }>> {
+    const normalized = String(query || '').trim().toLowerCase()
+    if (!normalized) return []
+    const max = Math.max(1, Math.min(Math.trunc(limit || 12), 50))
+    const candidates = [
+      {
+        pubkey: shortPubkeySeed('alice'),
+        name: 'alice',
+        source: 'cache' as const
+      },
+      {
+        pubkey: shortPubkeySeed('bob'),
+        name: 'bob',
+        source: 'cache' as const
+      },
+      {
+        pubkey: this.state.session?.pubkey || shortPubkeySeed('self'),
+        name: 'self',
+        source: 'local' as const
+      }
+    ]
+    return candidates
+      .filter((entry) => `${entry.pubkey} ${entry.name}`.toLowerCase().includes(normalized))
+      .slice(0, max)
   }
 
   async acceptChatInvite(inviteId: string): Promise<void> {

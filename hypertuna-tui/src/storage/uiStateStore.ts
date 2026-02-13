@@ -8,6 +8,7 @@ const defaultAccountScopedUiState = (): AccountScopedUiState => ({
   focusPane: 'left-tree',
   treeExpanded: {
     groups: true,
+    chats: true,
     invites: true,
     files: true
   },

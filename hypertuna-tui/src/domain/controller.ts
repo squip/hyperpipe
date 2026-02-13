@@ -38,6 +38,7 @@ import type {
   PerfMetrics,
   RelayEntry,
   RelayListPreferences,
+  ProfileSuggestion,
   SearchMode,
   SearchResult,
   SortDirection,
@@ -162,6 +163,7 @@ export type ControllerState = {
   focusPane: PaneFocus
   treeExpanded: {
     groups: boolean
+    chats: boolean
     invites: boolean
     files: boolean
   }
@@ -485,6 +487,7 @@ export class TuiController {
     focusPane: 'left-tree',
     treeExpanded: {
       groups: true,
+      chats: true,
       invites: true,
       files: true
     },
@@ -770,6 +773,7 @@ export class TuiController {
       focusPane: scoped.focusPane as PaneFocus,
       treeExpanded: {
         groups: scoped.treeExpanded.groups,
+        chats: scoped.treeExpanded.chats ?? true,
         invites: scoped.treeExpanded.invites,
         files: scoped.treeExpanded.files
       },
@@ -809,6 +813,7 @@ export class TuiController {
     focusPane?: PaneFocus
     treeExpanded?: {
       groups: boolean
+      chats: boolean
       invites: boolean
       files: boolean
     }
@@ -1549,17 +1554,20 @@ export class TuiController {
 
   async setTreeExpanded(nextExpanded: {
     groups: boolean
+    chats: boolean
     invites: boolean
     files: boolean
   }): Promise<void> {
     const normalized = {
       groups: Boolean(nextExpanded.groups),
+      chats: Boolean(nextExpanded.chats),
       invites: Boolean(nextExpanded.invites),
       files: Boolean(nextExpanded.files)
     }
     const prev = this.state.treeExpanded
     if (
       prev.groups === normalized.groups
+      && prev.chats === normalized.chats
       && prev.invites === normalized.invites
       && prev.files === normalized.files
     ) {
@@ -2448,7 +2456,77 @@ export class TuiController {
   }): Promise<Record<string, unknown>> {
     return await this.runTask('Create relay', async () => {
       const result = await this.relayService.createRelay(input)
-      await this.refreshRelays()
+      const session = this.state.session
+      const publicIdentifier = String(result.publicIdentifier || '').trim()
+      const relayUrl = this.resolveRelayUrl(String(result.relayUrl || '')) || String(result.relayUrl || '').trim() || null
+      if (session && publicIdentifier) {
+        const nextEntries = [
+          ...this.state.myGroupList.filter((entry) => entry.groupId !== publicIdentifier),
+          {
+            groupId: publicIdentifier,
+            relay: relayUrl || undefined
+          }
+        ]
+        this.patchState({ myGroupList: nextEntries })
+        try {
+          await this.groupService.saveMyGroupList(
+            this.searchableRelayUrls(14),
+            session.pubkey,
+            session.nsecHex,
+            nextEntries
+          )
+        } catch (error) {
+          this.log('warn', `Failed to persist my-group list after create: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+
+      if (publicIdentifier && !this.rawGroupDiscover.some((group) => group.id === publicIdentifier)) {
+        const provisional: GroupSummary = {
+          id: publicIdentifier,
+          relay: relayUrl || undefined,
+          name: String(input.name || publicIdentifier),
+          about: input.description || '',
+          picture: input.picture || undefined,
+          isPublic: typeof input.isPublic === 'boolean' ? input.isPublic : true,
+          isOpen: typeof input.isOpen === 'boolean' ? input.isOpen : true,
+          adminPubkey: session?.pubkey || null,
+          adminName: null,
+          members: session?.pubkey ? [session.pubkey] : [],
+          membersCount: session?.pubkey ? 1 : 0,
+          peersOnline: 0,
+          createdAt: eventNow()
+        }
+        this.rawGroupDiscover = [provisional, ...this.rawGroupDiscover]
+        this.syncGroupView()
+      }
+
+      await Promise.all([
+        this.refreshRelays(),
+        this.refreshGroups()
+      ])
+
+      if (publicIdentifier) {
+        const hasMyGroup = this.state.myGroups.some((group) => group.id === publicIdentifier)
+        if (!hasMyGroup) {
+          const fallbackGroup =
+            this.state.groupDiscover.find((group) => group.id === publicIdentifier)
+            || this.rawGroupDiscover.find((group) => group.id === publicIdentifier)
+            || null
+          const nextMyGroupList = [
+            ...this.state.myGroupList.filter((entry) => entry.groupId !== publicIdentifier),
+            {
+              groupId: publicIdentifier,
+              relay: relayUrl || undefined
+            }
+          ]
+          this.patchState({
+            myGroupList: nextMyGroupList,
+            myGroups: fallbackGroup
+              ? [fallbackGroup, ...this.state.myGroups.filter((group) => group.id !== publicIdentifier)]
+              : this.state.myGroups
+          })
+        }
+      }
       return result
     })
   }
@@ -2532,6 +2610,31 @@ export class TuiController {
   }): Promise<void> {
     await this.runTask('Start join flow', async () => {
       await this.relayService.startJoinFlow(input)
+    })
+  }
+
+  async requestGroupInvite(input: {
+    groupId: string
+    relay?: string | null
+    code?: string
+    reason?: string
+  }): Promise<void> {
+    await this.runTask('Request group invite', async () => {
+      const groupId = String(input.groupId || '').trim()
+      if (!groupId) {
+        throw new Error('groupId is required')
+      }
+      const relay = this.resolveRelayUrl(input.relay || undefined)
+      const relayTargets = relay
+        ? uniqueRelayUrls([relay, ...this.searchableRelayUrls(16)])
+        : this.searchableRelayUrls(16)
+      await this.groupService.sendJoinRequest({
+        groupId,
+        reason: input.reason,
+        code: input.code,
+        relayTargets
+      })
+      await this.refreshJoinRequests(groupId, relay || undefined).catch(() => {})
     })
   }
 
@@ -2994,9 +3097,84 @@ export class TuiController {
 
   async approveJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void> {
     await this.runTask('Approve join request', async () => {
-      await this.groupService.approveJoinRequest(groupId, pubkey, relay)
-      const groupKey = relay ? `${relay}|${groupId}` : groupId
-      const next = (this.state.groupJoinRequests[groupKey] || []).filter((request) => request.pubkey !== pubkey)
+      const normalizedGroupId = String(groupId || '').trim()
+      const normalizedPubkey = String(pubkey || '').trim().toLowerCase()
+      if (!normalizedGroupId) {
+        throw new Error('groupId is required')
+      }
+      if (!/^[a-f0-9]{64}$/i.test(normalizedPubkey)) {
+        throw new Error(`Invalid pubkey for join request approval: ${pubkey}`)
+      }
+
+      const selectedGroup =
+        this.state.myGroups.find((entry) => entry.id === normalizedGroupId)
+        || this.state.groupDiscover.find((entry) => entry.id === normalizedGroupId)
+        || null
+      const relayUrl = this.resolveGroupRelayUrl(
+        normalizedGroupId,
+        relay || selectedGroup?.relay || null
+      ) || this.resolveRelayUrl(relay || undefined)
+      if (!relayUrl) {
+        throw new Error('Unable to resolve relay URL for invite approval')
+      }
+
+      const relayEntry = this.findConnectedRelayByIdentifier(normalizedGroupId)
+      const relayKey =
+        relay && /^[a-f0-9]{64}$/i.test(relay)
+          ? relay.toLowerCase()
+          : (relayEntry?.relayKey || null)
+      const isOpenGroup = selectedGroup?.isOpen === true
+      const token = isOpenGroup ? undefined : Buffer.from(generateSecretKey()).toString('hex').slice(0, 24)
+      const groupMembers = Array.isArray(selectedGroup?.members)
+        ? selectedGroup.members.filter((member) => /^[a-f0-9]{64}$/i.test(String(member || '').trim()))
+        : []
+      const payload: Record<string, unknown> = {
+        relayUrl,
+        relayKey: relayKey || null,
+        groupName: selectedGroup?.name || normalizedGroupId,
+        groupPicture: selectedGroup?.picture || null,
+        name: selectedGroup?.name || normalizedGroupId,
+        about: selectedGroup?.about || '',
+        isPublic: selectedGroup?.isPublic !== false,
+        fileSharing: isOpenGroup,
+        authorizedMemberPubkeys: Array.from(new Set([...groupMembers, normalizedPubkey])),
+        token: token || null
+      }
+
+      if (!isOpenGroup) {
+        const memberTs = Date.now()
+        try {
+          await this.groupService.updateAuthData({
+            relayKey: relayKey || undefined,
+            publicIdentifier: normalizedGroupId,
+            pubkey: normalizedPubkey,
+            token: token || ''
+          })
+        } catch (error) {
+          this.log('warn', `Failed updating group auth during join approval: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        try {
+          await this.groupService.updateMembers({
+            relayKey: relayKey || undefined,
+            publicIdentifier: normalizedGroupId,
+            memberAdds: [{ pubkey: normalizedPubkey, ts: memberTs }]
+          })
+        } catch (error) {
+          this.log('warn', `Failed updating members during join approval: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+
+      await this.sendInvite({
+        groupId: normalizedGroupId,
+        relayUrl,
+        inviteePubkey: normalizedPubkey,
+        token,
+        payload,
+        relayTargets: this.searchableRelayUrls(16)
+      })
+
+      const groupKey = relay ? `${relay}|${normalizedGroupId}` : normalizedGroupId
+      const next = (this.state.groupJoinRequests[groupKey] || []).filter((request) => request.pubkey !== normalizedPubkey)
       this.patchState({
         groupJoinRequests: {
           ...this.state.groupJoinRequests,
@@ -3504,13 +3682,34 @@ export class TuiController {
     title: string
     description?: string
     members: string[]
+    relayUrls?: string[]
+    relayMode?: 'withFallback' | 'strict'
   }): Promise<void> {
     await this.runTask('Create conversation', async () => {
       await this.chatService.createConversation({
         ...input,
-        relayUrls: this.currentRelayUrls()
+        relayUrls: input.relayUrls && input.relayUrls.length > 0
+          ? uniqueRelayUrls(input.relayUrls)
+          : this.currentRelayUrls(),
+        relayMode: input.relayMode || 'withFallback'
       })
       await this.refreshChats()
+    })
+  }
+
+  async inviteChatMembers(conversationId: string, members: string[]): Promise<{
+    conversationId: string
+    invited: string[]
+    failed: Array<{
+      pubkey: string
+      error: string
+    }>
+    conversation: ChatConversation | null
+  }> {
+    return await this.runTask('Invite chat members', async () => {
+      const result = await this.chatService.inviteMembers(conversationId, members)
+      await this.refreshChats()
+      return result
     })
   }
 
@@ -3563,6 +3762,130 @@ export class TuiController {
         threadMessages: [...this.state.threadMessages, sent]
       })
     })
+  }
+
+  async searchProfileSuggestions(query: string, limit = 12): Promise<ProfileSuggestion[]> {
+    const normalizedQuery = String(query || '').trim().toLowerCase()
+    const max = Math.max(1, Math.min(Math.trunc(limit || 12), 80))
+    if (!normalizedQuery) return []
+
+    const map = new Map<string, ProfileSuggestion>()
+    const addSuggestion = (row: ProfileSuggestion): void => {
+      const pubkey = String(row.pubkey || '').trim().toLowerCase()
+      if (!/^[a-f0-9]{64}$/i.test(pubkey)) return
+      const existing = map.get(pubkey)
+      if (!existing) {
+        map.set(pubkey, {
+          ...row,
+          pubkey
+        })
+        return
+      }
+      const existingNamed = Boolean(existing.name && existing.name.trim())
+      const nextNamed = Boolean(row.name && row.name.trim())
+      if (!existingNamed && nextNamed) {
+        map.set(pubkey, {
+          ...existing,
+          ...row,
+          pubkey
+        })
+      }
+    }
+
+    const localCandidates = new Set<string>()
+    for (const pubkey of Object.keys(this.state.adminProfileByPubkey)) {
+      localCandidates.add(pubkey)
+    }
+    for (const group of [...this.state.groupDiscover, ...this.state.myGroups]) {
+      if (group.adminPubkey) localCandidates.add(group.adminPubkey)
+      for (const member of group.members || []) {
+        localCandidates.add(String(member || ''))
+      }
+    }
+    for (const requests of Object.values(this.state.groupJoinRequests)) {
+      for (const request of requests) {
+        localCandidates.add(request.pubkey)
+      }
+    }
+    for (const conversation of this.state.conversations) {
+      for (const participant of conversation.participants || []) localCandidates.add(participant)
+      for (const admin of conversation.adminPubkeys || []) localCandidates.add(admin)
+    }
+    for (const invite of this.state.chatInvites) {
+      localCandidates.add(invite.senderPubkey)
+    }
+
+    for (const candidate of localCandidates) {
+      const pubkey = String(candidate || '').trim().toLowerCase()
+      if (!/^[a-f0-9]{64}$/i.test(pubkey)) continue
+      const profile = this.state.adminProfileByPubkey[pubkey]
+      const name = String(profile?.name || '').trim()
+      const about = String(profile?.bio || '').trim()
+      const haystack = `${pubkey} ${name.toLowerCase()} ${about.toLowerCase()}`
+      if (!haystack.includes(normalizedQuery)) continue
+      addSuggestion({
+        pubkey,
+        name: name || null,
+        about: about || null,
+        source: 'cache'
+      })
+    }
+
+    try {
+      const remoteEvents = await this.nostrClient.query(
+        this.searchableRelayUrls(8),
+        {
+          kinds: [0],
+          limit: Math.max(max * 6, 40)
+        },
+        4_000
+      )
+      for (const event of remoteEvents) {
+        const pubkey = String(event?.pubkey || '').trim().toLowerCase()
+        if (!/^[a-f0-9]{64}$/i.test(pubkey)) continue
+        let payload: Record<string, unknown> = {}
+        try {
+          payload = JSON.parse(event.content || '{}')
+        } catch {
+          payload = {}
+        }
+        const name = String(payload.display_name || payload.name || payload.username || '').trim()
+        const about = String(payload.about || payload.bio || '').trim()
+        const nip05 = String(payload.nip05 || '').trim()
+        const haystack = `${pubkey} ${name.toLowerCase()} ${about.toLowerCase()} ${nip05.toLowerCase()}`
+        if (!haystack.includes(normalizedQuery)) continue
+        addSuggestion({
+          pubkey,
+          name: name || null,
+          about: about || null,
+          nip05: nip05 || null,
+          source: 'remote'
+        })
+      }
+    } catch {
+      // best-effort suggestions
+    }
+
+    const score = (row: ProfileSuggestion): number => {
+      let value = 0
+      if (row.name && row.name.trim()) value += 3
+      if (row.nip05 && row.nip05.trim()) value += 2
+      if (row.about && row.about.trim()) value += 1
+      if (row.source === 'cache') value += 1
+      return value
+    }
+
+    return Array.from(map.values())
+      .sort((left, right) => {
+        const leftScore = score(left)
+        const rightScore = score(right)
+        if (leftScore !== rightScore) return rightScore - leftScore
+        const leftName = String(left.name || '')
+        const rightName = String(right.name || '')
+        if (leftName !== rightName) return leftName.localeCompare(rightName)
+        return left.pubkey.localeCompare(right.pubkey)
+      })
+      .slice(0, max)
   }
 
   async search(mode: SearchMode, query: string): Promise<void> {

@@ -1,4 +1,4 @@
-import type { EventTemplate } from 'nostr-tools'
+import type { Event, EventTemplate } from 'nostr-tools'
 import type {
   GroupJoinRequest,
   GroupInvite,
@@ -309,5 +309,29 @@ export class GroupService implements IGroupService {
     if (!sent.success) {
       throw new Error(sent.error || 'Failed to update auth data')
     }
+  }
+
+  async sendJoinRequest(input: {
+    groupId: string
+    reason?: string
+    code?: string
+    relayTargets: string[]
+  }): Promise<Event> {
+    const tags: string[][] = [['h', input.groupId]]
+    const code = String(input.code || '').trim()
+    if (code) {
+      tags.push(['code', code])
+    }
+
+    const draft: EventTemplate = {
+      kind: 9021,
+      created_at: eventNow(),
+      tags,
+      content: typeof input.reason === 'string' ? input.reason : ''
+    }
+
+    const event = signDraftEvent(this.getNsecHex(), draft)
+    await this.client.publish(input.relayTargets, event)
+    return event
   }
 }

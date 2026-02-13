@@ -37,6 +37,18 @@ function groupContext(controller: MockController, copyImpl?: CommandContext['cop
 }
 
 describe('command router context-first workflows', () => {
+  it('supports goto aliases for new tree workflow nodes', async () => {
+    const controller = createController()
+
+    const gotoCreateGroup = await executeCommand(controller, 'goto create-group')
+    const gotoCreateChat = await executeCommand(controller, 'goto chats:create')
+    const gotoSendInvite = await executeCommand(controller, 'goto send-invite')
+
+    expect(gotoCreateGroup.gotoNode).toBe('groups:create')
+    expect(gotoCreateChat.gotoNode).toBe('chats:create')
+    expect(gotoSendInvite.gotoNode).toBe('invites:send')
+  })
+
   it('uses selected group for join-flow when group id is omitted', async () => {
     const controller = createController()
     const context = groupContext(controller)
@@ -95,6 +107,34 @@ describe('command router context-first workflows', () => {
 
     await executeCommand(controller, 'chat accept', context)
     expect(controller.getState().chatInvites.some((invite) => invite.id === inviteId)).toBe(false)
+  })
+
+  it('routes group request-invite through selected group context when group id is omitted', async () => {
+    const controller = createController()
+    const context = groupContext(controller)
+    const groupId = controller.getState().groups[0]?.id
+    expect(groupId).toBeTruthy()
+
+    const result = await executeCommand(controller, 'group request-invite join-code-1 please approve', context)
+    expect(result.message).toContain(groupId)
+    expect(controller.getState().logs.some((entry) => entry.message.includes(`request-invite:${groupId}`))).toBe(true)
+  })
+
+  it('routes chat invite through selected conversation context', async () => {
+    const controller = createController()
+    const conversationId = controller.getState().conversations[0]?.id
+    expect(conversationId).toBeTruthy()
+
+    const invitee = 'b'.repeat(64)
+    const context: CommandContext = {
+      currentNode: 'chats',
+      resolveSelectedConversation: () => ({ id: conversationId as string })
+    }
+
+    const result = await executeCommand(controller, `chat invite ${invitee}`, context)
+    expect(result.message).toContain('Invited')
+    const updatedConversation = controller.getState().conversations.find((entry) => entry.id === conversationId)
+    expect(updatedConversation?.participants.includes(invitee)).toBe(true)
   })
 
   it('joins relay using selected relay when identifier is omitted', async () => {
