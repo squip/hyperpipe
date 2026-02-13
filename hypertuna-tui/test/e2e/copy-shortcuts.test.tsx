@@ -45,14 +45,14 @@ describe.sequential('TUI copy shortcuts', () => {
       <App
         options={BASE_OPTIONS}
         controllerFactory={(options) => MockController.withSeedData(options)}
-        scriptedCommands={[{ command: 'goto groups', delayMs: 50, pauseAfterMs: 50 }]}
+        scriptedCommands={[{ command: 'goto groups:my', delayMs: 50, pauseAfterMs: 50 }]}
       />
     )
 
     try {
-      await waitFor(() => frame(instance).includes('Hypertuna TUI'))
-
-      await waitFor(() => /Switched to groups/i.test(frame(instance)))
+      await waitFor(() => frame(instance).includes('Command'))
+      await waitFor(() => frame(instance).includes('Keys:'))
+      await sleep(120)
 
       instance.stdin.write('y')
       await waitFor(() => /Copied|Copy unavailable/.test(frame(instance)))

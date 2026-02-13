@@ -26,8 +26,12 @@ node dist/cli.js
 
 ## Navigation
 
-- `Tab`, `Left`, `Right`: switch sections
-- `Up`, `Down`: move selection
+- `Tab`: cycle focus `Left Tree -> Center List -> Right Top -> Right Bottom`
+- `Shift+Tab`: cycle focus in reverse
+- Left tree: `Up/Down` move cursor, `Right` expand/go child, `Left` collapse/go parent, `Enter` activate/toggle
+- Center list: `Up/Down/PageUp/PageDown/Home/End`
+- Right top: `Up/Down` select action/tab, `Enter` apply action
+- Right bottom: `Up/Down` scroll details, `Ctrl+U`/`Ctrl+D` page scroll
 - `r`: refresh current section
 - `:`: open command bar
 - `Enter`: open command bar prefilled from current selection
@@ -43,6 +47,13 @@ node dist/cli.js
 - `copy command [workflow]` copies a workflow command template for the current selection.
 - Secret material (`nsec`, tokens, writer secrets) is blocked by default.
 - Set `HYPERTUNA_TUI_ALLOW_UNSAFE_COPY=1` only for explicit debug use.
+
+## User-facing sections removed
+
+- Feed
+- Bookmarks
+- Lists
+- Search
 
 ## Core command examples
 
@@ -61,11 +72,10 @@ node dist/cli.js
 - `relay join [publicIdentifierOrRelayKey] [token]`
 - `relay disconnect <relayKey>`
 - `relay leave <publicIdentifierOrRelayKey> [--archive] [--save-files]`
-- `feed refresh [limit]`
 - `post <content>`
 - `reply <eventId> <eventPubkey> <content>`
 - `react <eventId> <eventPubkey> <reaction>`
-- `bookmark refresh|add <eventId>|remove <eventId>`
+- `group tab <discover|my>`
 - `group refresh`
 - `group invites`
 - `group join-flow [publicIdentifier] [token]`
@@ -76,17 +86,15 @@ node dist/cli.js
 - `group update-auth [relayKeyOrIdentifier] <pubkey> <token>`
 - `file refresh [groupId]`
 - `file upload <groupIdOrRelayKey> <absolutePath>`
-- `list refresh`
-- `list create <dTag> <title> <pubkey1,pubkey2,...> [description]`
-- `list apply <dTag> [authorPubkey]`
+- `file download [eventId|sha256]`
+- `file delete [eventId|sha256]`
 - `chat init|refresh`
 - `chat create <title> <pubkey1,pubkey2,...> [description]`
 - `chat accept [inviteId]`
 - `chat dismiss [inviteId]`
 - `chat thread <conversationId>`
 - `chat send <conversationId> <content>`
-- `search <notes|profiles|groups|lists> <query>`
-- `goto <dashboard|relays|feed|groups|files|lists|bookmarks|chats|search|accounts|logs>`
+- `goto <dashboard|relays|groups|groups:browse|groups:my|chats|invites|invites:group|invites:chat|files|files:images|files:video|files:audio|files:docs|files:other|accounts|logs>`
 
 ## Tests
 

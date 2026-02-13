@@ -7,6 +7,8 @@ import {
   type EventTemplate
 } from 'nostr-tools'
 
+const AUTHORITATIVE_PUBLIC_GATEWAY_URL = 'wss://hypertuna.com/relay'
+
 export function isHex64(value: string): boolean {
   return /^[a-f0-9]{64}$/.test(value)
 }
@@ -39,27 +41,41 @@ export async function nip04Decrypt(nsecHex: string, pubkey: string, ciphertext: 
   return nip04.decrypt(secret, pubkey, ciphertext)
 }
 
+function mapAuthoritativeGateway(url: URL): string | null {
+  const path = String(url.pathname || '').replace(/\/+$/, '').toLowerCase()
+  if (path !== '/public-gateway:hyperbee') {
+    return null
+  }
+  return AUTHORITATIVE_PUBLIC_GATEWAY_URL
+}
+
+export function normalizeRelayUrl(raw: string): string | null {
+  const trimmed = String(raw || '').trim()
+  if (!trimmed) return null
+
+  try {
+    const url = new URL(trimmed)
+    if (url.protocol !== 'ws:' && url.protocol !== 'wss:') return null
+    if (url.pathname.length > 1 && url.pathname.endsWith('/')) {
+      url.pathname = url.pathname.slice(0, -1)
+    }
+    url.hash = ''
+    url.searchParams.sort()
+    const mapped = mapAuthoritativeGateway(url)
+    if (mapped) return mapped
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
 export function uniqueRelayUrls(relays: string[]): string[] {
   const seen = new Set<string>()
   const out: string[] = []
 
   for (const raw of relays) {
-    const trimmed = String(raw || '').trim()
-    if (!trimmed) continue
-
-    let normalized = trimmed
-    try {
-      const url = new URL(trimmed)
-      if (url.protocol !== 'ws:' && url.protocol !== 'wss:') continue
-      if (url.pathname.length > 1 && url.pathname.endsWith('/')) {
-        url.pathname = url.pathname.slice(0, -1)
-      }
-      url.hash = ''
-      url.searchParams.sort()
-      normalized = url.toString()
-    } catch {
-      continue
-    }
+    const normalized = normalizeRelayUrl(raw)
+    if (!normalized) continue
 
     if (seen.has(normalized)) continue
     seen.add(normalized)

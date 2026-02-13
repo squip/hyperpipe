@@ -25,6 +25,23 @@ const accountScopedUiStateSchema = z.object({
     value === 'invites' ? 'discover' : value
   )),
   chatViewTab: z.enum(['conversations', 'invites']).default('conversations'),
+  selectedNode: z.string().default('dashboard'),
+  focusPane: z.enum(['left-tree', 'center', 'right-top', 'right-bottom']).default('left-tree'),
+  treeExpanded: z.object({
+    groups: z.boolean().default(true),
+    invites: z.boolean().default(true),
+    files: z.boolean().default(true)
+  }).default({
+    groups: true,
+    invites: true,
+    files: true
+  }),
+  nodeViewport: z.record(z.object({
+    cursor: z.number().int().nonnegative().default(0),
+    offset: z.number().int().nonnegative().default(0)
+  })).default({}),
+  rightTopSelectionByNode: z.record(z.number().int().nonnegative()).default({}),
+  rightBottomOffsetByNode: z.record(z.number().int().nonnegative()).default({}),
   feedSource: z.object({
     mode: z.enum(['relays', 'relay', 'following', 'group']).default('relays'),
     relayUrl: z.string().nullable().optional(),
@@ -84,6 +101,7 @@ const accountScopedUiStateSchema = z.object({
   dismissedChatInviteIds: z.array(z.string()).default([]),
   acceptedChatInviteIds: z.array(z.string()).default([]),
   acceptedChatInviteConversationIds: z.array(z.string()).default([]),
+  hiddenDeletedFileKeys: z.array(z.string()).default([]),
   perfOverlayEnabled: z.boolean().default(false)
 })
 
@@ -110,16 +128,40 @@ export const uiStateV2Schema = z.object({
   accountScoped: z.record(accountScopedUiStateSchema).default({})
 })
 
-export type UiState = z.infer<typeof uiStateV2Schema>
+export const uiStateV3Schema = z.object({
+  version: z.literal(3),
+  lastSection: z.string().default('dashboard'),
+  noAnimations: z.boolean().default(false),
+  lastCopiedValue: z.string().default(''),
+  lastCopiedMethod: z.enum(['osc52', 'pbcopy', 'wl-copy', 'xclip', 'xsel', 'none']).default('none'),
+  keymap: z.object({
+    vimNavigation: z.boolean().default(false)
+  }).default({ vimNavigation: false }),
+  accountScoped: z.record(accountScopedUiStateSchema).default({})
+})
+
+export type UiState = z.infer<typeof uiStateV3Schema>
 export type AccountScopedUiState = z.infer<typeof accountScopedUiStateSchema>
 
-export const uiStateSchema: z.ZodType<UiState, z.ZodTypeDef, unknown> = z.union([uiStateV2Schema, uiStateV1Schema]).transform((value) => {
-  if (value.version === 2) {
+export const uiStateSchema: z.ZodType<UiState, z.ZodTypeDef, unknown> = z.union([uiStateV3Schema, uiStateV2Schema, uiStateV1Schema]).transform((value) => {
+  if (value.version === 3) {
     return value
   }
 
+  if (value.version === 2) {
+    return {
+      version: 3 as const,
+      lastSection: value.lastSection,
+      noAnimations: value.noAnimations,
+      lastCopiedValue: value.lastCopiedValue,
+      lastCopiedMethod: value.lastCopiedMethod,
+      keymap: value.keymap,
+      accountScoped: value.accountScoped || {}
+    }
+  }
+
   return {
-    version: 2 as const,
+    version: 3 as const,
     lastSection: value.lastSection,
     noAnimations: value.noAnimations,
     lastCopiedValue: value.lastCopiedValue,
@@ -148,7 +190,7 @@ export function defaultAccountsFile(): AccountsFile {
 
 export function defaultUiState(): UiState {
   return {
-    version: 2,
+    version: 3,
     lastSection: 'dashboard',
     noAnimations: false,
     lastCopiedValue: '',

@@ -7,11 +7,14 @@ import type {
   AccountSession,
   ChatConversation,
   ChatInvite,
+  FileActionStatus,
+  FileFamilyCounts,
   FeedControls,
   FeedSortKey,
   FeedSourceState,
   FileControls,
   FileSortKey,
+  GroupNoteRecord,
   GroupComposeDraft,
   GroupControls,
   GroupJoinRequest,
@@ -22,6 +25,7 @@ import type {
   GroupSummary,
   InvitesInboxItem,
   LogLevel,
+  PaneFocus,
   PaneViewportMap,
   PerfMetrics,
   RelayEntry,
@@ -30,6 +34,7 @@ import type {
   StarterPack,
   ThreadMessage
 } from '../../../src/domain/types.js'
+import { FILE_FAMILY_ORDER, type NavNodeId } from '../../../src/lib/constants.js'
 import { buildInvitesInbox } from '../../../src/domain/parity/groupFilters.js'
 import {
   selectChatPendingInviteCount,
@@ -107,6 +112,25 @@ function defaultFeedControls(): FeedControls {
   }
 }
 
+function defaultFileActionStatus(): FileActionStatus {
+  return {
+    action: null,
+    state: 'idle',
+    message: null,
+    path: null,
+    updatedAt: Date.now(),
+    eventId: null,
+    sha256: null
+  }
+}
+
+function defaultFileFamilyCounts(): FileFamilyCounts {
+  return FILE_FAMILY_ORDER.reduce((acc, family) => {
+    acc[family] = 0
+    return acc
+  }, {} as FileFamilyCounts)
+}
+
 function defaultGroupControls(): GroupControls {
   return {
     query: '',
@@ -125,6 +149,28 @@ function defaultFileControls(): FileControls {
     mime: 'all',
     group: 'all'
   }
+}
+
+function classifyFileFamily(mime: string | null | undefined): (typeof FILE_FAMILY_ORDER)[number] {
+  const normalized = String(mime || '').toLowerCase()
+  if (normalized.startsWith('image/')) return 'images'
+  if (normalized.startsWith('video/')) return 'video'
+  if (normalized.startsWith('audio/')) return 'audio'
+  if (
+    normalized.includes('pdf')
+    || normalized.includes('text/')
+    || normalized.includes('json')
+    || normalized.includes('msword')
+    || normalized.includes('officedocument')
+    || normalized.includes('document')
+  ) {
+    return 'docs'
+  }
+  return 'other'
+}
+
+function fileRecordKey(file: GroupFileRecord): string {
+  return String(file.sha256 || file.eventId || `${file.groupId}:${file.fileName || ''}`).trim().toLowerCase()
 }
 
 function emptyState(): ControllerState {
@@ -175,13 +221,29 @@ function emptyState(): ControllerState {
     chatNextRetryAt: null,
     filesCount: 0,
     invitesCount: 0,
+    fileFamilyCounts: defaultFileFamilyCounts(),
     groupViewTab: 'discover',
     chatViewTab: 'conversations',
+    selectedNode: 'dashboard',
+    focusPane: 'left-tree',
+    treeExpanded: {
+      groups: true,
+      invites: true,
+      files: true
+    },
+    nodeViewport: {},
+    rightTopSelectionByNode: {},
+    rightBottomOffsetByNode: {},
     keymap: {
       vimNavigation: false
     },
     detailPaneOffsetBySection: {},
     paneViewport: {},
+    groupNotesByGroupKey: {},
+    groupFilesByGroupKey: {},
+    adminProfileByPubkey: {},
+    fileActionStatus: defaultFileActionStatus(),
+    hiddenDeletedFileKeys: [],
     composeDraft: null,
     perfMetrics: defaultPerfMetrics(),
     workerRecoveryState: {
@@ -247,6 +309,13 @@ function cloneState(state: ControllerState): ControllerState {
       Object.entries(state.groupJoinRequests).map(([key, value]) => [key, value.map((entry) => ({ ...entry }))])
     ),
     invitesInbox: state.invitesInbox.map((entry) => ({ ...entry })),
+    fileFamilyCounts: { ...state.fileFamilyCounts },
+    treeExpanded: { ...state.treeExpanded },
+    nodeViewport: Object.fromEntries(
+      Object.entries(state.nodeViewport).map(([key, value]) => [key, { ...value }])
+    ),
+    rightTopSelectionByNode: { ...state.rightTopSelectionByNode },
+    rightBottomOffsetByNode: { ...state.rightBottomOffsetByNode },
     keymap: {
       ...state.keymap
     },
@@ -254,6 +323,17 @@ function cloneState(state: ControllerState): ControllerState {
     paneViewport: Object.fromEntries(
       Object.entries(state.paneViewport).map(([key, value]) => [key, { ...value }])
     ),
+    groupNotesByGroupKey: Object.fromEntries(
+      Object.entries(state.groupNotesByGroupKey).map(([key, value]) => [key, value.map((entry) => ({ ...entry }))])
+    ),
+    groupFilesByGroupKey: Object.fromEntries(
+      Object.entries(state.groupFilesByGroupKey).map(([key, value]) => [key, value.map((entry) => ({ ...entry }))])
+    ),
+    adminProfileByPubkey: Object.fromEntries(
+      Object.entries(state.adminProfileByPubkey).map(([key, value]) => [key, { ...value }])
+    ),
+    fileActionStatus: { ...state.fileActionStatus },
+    hiddenDeletedFileKeys: [...state.hiddenDeletedFileKeys],
     composeDraft: state.composeDraft
       ? {
           ...state.composeDraft,
@@ -565,7 +645,9 @@ export class MockController implements AppController {
     const query = controls.query.toLowerCase().trim()
     const mimeFilter = controls.mime.toLowerCase().trim()
     const direction = controls.sortDirection === 'asc' ? 1 : -1
+    const hiddenKeys = new Set(this.state.hiddenDeletedFileKeys.map((entry) => String(entry || '').toLowerCase()))
     const filtered = rows.filter((row) => {
+      if (hiddenKeys.has(fileRecordKey(row))) return false
       if (controls.group !== 'all' && row.groupId !== controls.group) return false
       if (mimeFilter !== 'all') {
         const mime = String(row.mime || '').toLowerCase()
@@ -629,6 +711,18 @@ export class MockController implements AppController {
     this.state.myGroups = myGroups
     this.state.feed = this.applyFeedControls(this.rawFeed)
     this.state.files = this.applyFileControls(this.rawFiles)
+    this.state.groupFilesByGroupKey = this.state.files.reduce((acc, row) => {
+      const key = String(row.groupId || '').trim()
+      if (!key) return acc
+      if (!acc[key]) acc[key] = []
+      acc[key].push({ ...row })
+      return acc
+    }, {} as Record<string, GroupFileRecord[]>)
+    this.state.fileFamilyCounts = this.state.files.reduce((acc, row) => {
+      const family = classifyFileFamily(row.mime)
+      acc[family] += 1
+      return acc
+    }, defaultFileFamilyCounts())
     this.state.groupInvites = groupInvites
     this.state.invites = groupInvites
     this.state.chatInvites = chatInvites
@@ -853,6 +947,128 @@ export class MockController implements AppController {
       [key]: normalizedOffset
     }
     this.patch({ detailPaneOffsetBySection: next })
+  }
+
+  async setSelectedNode(nodeId: NavNodeId): Promise<void> {
+    this.patch({ selectedNode: nodeId })
+  }
+
+  async setFocusPane(focusPane: PaneFocus): Promise<void> {
+    this.patch({ focusPane })
+  }
+
+  async setTreeExpanded(nextExpanded: {
+    groups: boolean
+    invites: boolean
+    files: boolean
+  }): Promise<void> {
+    this.patch({
+      treeExpanded: {
+        ...this.state.treeExpanded,
+        ...nextExpanded
+      }
+    })
+  }
+
+  async setRightTopSelection(nodeId: string, index: number): Promise<void> {
+    const key = String(nodeId || '').trim()
+    if (!key) return
+    const next = {
+      ...this.state.rightTopSelectionByNode,
+      [key]: Math.max(0, Math.trunc(index))
+    }
+    this.patch({ rightTopSelectionByNode: next })
+  }
+
+  async refreshGroupNotes(groupId: string, relay?: string): Promise<void> {
+    const key = String(groupId || '').trim()
+    if (!key) return
+    const note: GroupNoteRecord = {
+      eventId: `note-${hex64(`${key}:${Date.now()}`).slice(0, 16)}`,
+      groupId: key,
+      relay: relay || null,
+      content: `mock group note ${new Date().toISOString()}`,
+      createdAt: nowSec(),
+      authorPubkey: this.state.session?.pubkey || shortPubkeySeed('note-author'),
+      event: makeEvent({
+        idSeed: `note:${key}:${Date.now()}`,
+        pubkey: this.state.session?.pubkey || shortPubkeySeed('note-author'),
+        kind: 1,
+        content: `mock group note for ${key}`
+      })
+    }
+    this.patch({
+      groupNotesByGroupKey: {
+        ...this.state.groupNotesByGroupKey,
+        [key]: [note, ...(this.state.groupNotesByGroupKey[key] || [])]
+      }
+    })
+  }
+
+  async downloadGroupFile(input: {
+    relayKey?: string | null
+    publicIdentifier?: string | null
+    groupId?: string | null
+    eventId?: string | null
+    fileHash: string
+    fileName?: string | null
+  }): Promise<{ savedPath: string; bytes: number; source: string }> {
+    const hash = String(input.fileHash || '').trim().toLowerCase()
+    if (!hash) throw new Error('Missing file hash')
+    const file = this.state.files.find((entry) => String(entry.sha256 || '').toLowerCase() === hash)
+      || this.rawFiles.find((entry) => String(entry.sha256 || '').toLowerCase() === hash)
+      || this.state.files.find((entry) => input.eventId && entry.eventId === input.eventId)
+    if (!file) throw new Error('File not found')
+
+    const savedPath = `/tmp/Downloads/${input.fileName || file.fileName || `${hash.slice(0, 12)}.bin`}`
+    const hidden = new Set(this.state.hiddenDeletedFileKeys.map((entry) => String(entry || '').toLowerCase()))
+    hidden.delete(hash)
+    this.patch({
+      hiddenDeletedFileKeys: Array.from(hidden),
+      fileActionStatus: {
+        action: 'download',
+        state: 'success',
+        message: 'downloaded',
+        path: savedPath,
+        updatedAt: Date.now(),
+        eventId: file.eventId,
+        sha256: hash
+      }
+    })
+    return {
+      savedPath,
+      bytes: Number(file.size || 0),
+      source: 'mock-local'
+    }
+  }
+
+  async deleteLocalGroupFile(input: {
+    relayKey?: string | null
+    publicIdentifier?: string | null
+    groupId?: string | null
+    eventId?: string | null
+    fileHash: string
+  }): Promise<{ deleted: boolean; reason?: string | null }> {
+    const hash = String(input.fileHash || '').trim().toLowerCase()
+    if (!hash) throw new Error('Missing file hash')
+    const hidden = new Set(this.state.hiddenDeletedFileKeys.map((entry) => String(entry || '').toLowerCase()))
+    hidden.add(hash)
+    this.patch({
+      hiddenDeletedFileKeys: Array.from(hidden),
+      fileActionStatus: {
+        action: 'delete',
+        state: 'success',
+        message: 'deleted locally',
+        path: null,
+        updatedAt: Date.now(),
+        eventId: input.eventId || null,
+        sha256: hash
+      }
+    })
+    return {
+      deleted: true,
+      reason: null
+    }
   }
 
   async setPerfOverlay(enabled: boolean): Promise<void> {

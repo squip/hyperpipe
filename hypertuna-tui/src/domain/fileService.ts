@@ -2,7 +2,12 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import type { Filter } from 'nostr-tools'
-import type { FileScope, FileService as IFileService } from './types.js'
+import type {
+  FileDeleteResult,
+  FileDownloadResult,
+  FileScope,
+  FileService as IFileService
+} from './types.js'
 import { NostrClient } from './nostrClient.js'
 import type { WorkerHost } from '../runtime/workerHost.js'
 import { parseGroupFileRecordFromEvent } from '../lib/group-files.js'
@@ -143,5 +148,73 @@ export class FileService implements IFileService {
       .sort((left, right) => right.uploadedAt - left.uploadedAt)
 
     return records
+  }
+
+  async downloadGroupFile(input: {
+    relayKey?: string | null
+    publicIdentifier?: string | null
+    groupId?: string | null
+    eventId?: string | null
+    fileHash: string
+    fileName?: string | null
+  }): Promise<FileDownloadResult> {
+    const payload: Record<string, unknown> = {
+      relayKey: input.relayKey || undefined,
+      publicIdentifier: input.publicIdentifier || undefined,
+      identifier: input.publicIdentifier || input.groupId || input.relayKey || undefined,
+      groupId: input.groupId || undefined,
+      eventId: input.eventId || undefined,
+      fileHash: input.fileHash,
+      fileName: input.fileName || undefined
+    }
+
+    const response = await this.workerHost.request<Record<string, unknown>>(
+      {
+        type: 'download-group-file',
+        data: payload
+      },
+      120_000
+    )
+
+    const savedPath = String(response?.savedPath || '')
+    if (!savedPath) {
+      throw new Error('Worker did not return savedPath for downloaded file')
+    }
+
+    return {
+      savedPath,
+      bytes: Number.isFinite(Number(response?.bytes)) ? Number(response?.bytes) : 0,
+      source: String(response?.source || 'unknown')
+    }
+  }
+
+  async deleteLocalGroupFile(input: {
+    relayKey?: string | null
+    publicIdentifier?: string | null
+    groupId?: string | null
+    eventId?: string | null
+    fileHash: string
+  }): Promise<FileDeleteResult> {
+    const payload: Record<string, unknown> = {
+      relayKey: input.relayKey || undefined,
+      publicIdentifier: input.publicIdentifier || undefined,
+      identifier: input.publicIdentifier || input.groupId || input.relayKey || undefined,
+      groupId: input.groupId || undefined,
+      eventId: input.eventId || undefined,
+      fileHash: input.fileHash
+    }
+
+    const response = await this.workerHost.request<Record<string, unknown>>(
+      {
+        type: 'delete-local-group-file',
+        data: payload
+      },
+      60_000
+    )
+
+    return {
+      deleted: response?.deleted !== false,
+      reason: typeof response?.reason === 'string' ? response.reason : null
+    }
   }
 }

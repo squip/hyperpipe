@@ -41,7 +41,7 @@ export class LocalGatewayServer {
     this.localIps = [primary];
   }
 
-  startServer(connectionHandler, requestHandler, onListening) {
+  async startServer(connectionHandler, requestHandler, onListening) {
     const httpHandler = typeof requestHandler === 'function'
       ? requestHandler
       : this.config.requestHandler || this.#buildDefaultRequestHandler();
@@ -63,17 +63,51 @@ export class LocalGatewayServer {
     }
 
     const httpProtocol = this.config.tlsOptions ? 'https' : 'http';
-    this.server.listen(this.config.port, this.config.listenHost, () => {
-      console.log(`[LocalGatewayServer] Listening on ${httpProtocol}://${this.config.hostname}:${this.config.port}`);
-      if (typeof onListening === 'function') {
-        Promise.resolve(onListening({
-          server: this.server,
-          wss: this.wss,
-          urls: this.getServerUrls()
-        })).catch(error => {
-          console.error('[LocalGatewayServer] onListening callback failed:', error);
+    await new Promise((resolve, reject) => {
+      const onWsError = (error) => {
+        this.wss?.off('error', onWsError);
+        this.server?.off('error', onError);
+        try {
+          this.wss?.close();
+        } catch (_) {}
+        reject(error);
+      };
+      const onError = (error) => {
+        this.server?.off('error', onError);
+        this.wss?.off('error', onWsError);
+        try {
+          this.wss?.close();
+        } catch (_) {}
+        reject(error);
+      };
+
+      this.server.once('error', onError);
+      this.wss?.once('error', onWsError);
+      this.server.listen(this.config.port, this.config.listenHost, () => {
+        this.server?.off('error', onError);
+        this.wss?.off('error', onWsError);
+        this.server?.on('error', (error) => {
+          console.error('[LocalGatewayServer] Server runtime error:', error);
         });
-      }
+        this.wss?.on('error', (error) => {
+          console.error('[LocalGatewayServer] WebSocket runtime error:', error);
+        });
+        const address = this.server?.address();
+        if (address && typeof address === 'object' && Number.isFinite(address.port)) {
+          this.config.port = Number(address.port);
+        }
+        console.log(`[LocalGatewayServer] Listening on ${httpProtocol}://${this.config.hostname}:${this.config.port}`);
+        if (typeof onListening === 'function') {
+          Promise.resolve(onListening({
+            server: this.server,
+            wss: this.wss,
+            urls: this.getServerUrls()
+          })).catch(error => {
+            console.error('[LocalGatewayServer] onListening callback failed:', error);
+          });
+        }
+        resolve();
+      });
     });
 
     return { server: this.server, wss: this.wss };

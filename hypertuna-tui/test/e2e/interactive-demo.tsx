@@ -27,21 +27,18 @@ const commands: ScriptedCommand[] = [
   { command: 'copy command' },
   { command: `group update-members add ${'c'.repeat(64)}` },
   { command: `group update-auth ${'c'.repeat(64)} token-auth-demo` },
-  { command: 'group invites' },
+  { command: 'goto invites:group' },
   { command: `group invite ${'b'.repeat(64)} token-demo` },
   { command: 'group join-flow token-join --open' },
   { command: 'relay join npubdemo:group token-join' },
 
-  { command: 'feed refresh 6' },
   { command: 'post scripted walkthrough post from the terminal app' },
-  { command: `bookmark add ${'a'.repeat(64)}` },
+  { command: 'group tab my' },
 
   { command: 'file refresh npubseed:group-a' },
   { command: 'file upload npubseed:group-a /tmp/demo-upload.txt' },
-
-  { command: 'list refresh' },
-  { command: 'list create demo-pack DemoPack aaaaaaaa,bbbbbbbb,cccccccc' },
-  { command: 'list apply demo-pack' },
+  { command: 'file download c2bb3ccfff6a5dec63bfc98b37438bd1cbf44fb16376761c797302e8392207aa' },
+  { command: 'file delete c2bb3ccfff6a5dec63bfc98b37438bd1cbf44fb16376761c797302e8392207aa' },
 
   { command: 'chat init' },
   { command: 'chat create DemoChat aaaaaaaa,bbbbbbbb' },
@@ -49,7 +46,6 @@ const commands: ScriptedCommand[] = [
   { command: 'chat thread conv-seed-1' },
   { command: 'chat send conv-seed-1 scripted chat message from walkthrough' },
 
-  { command: 'search notes feed' },
   { command: 'relay leave npubdemo:group --archive --save-files' },
   { command: 'goto logs' }
 ]

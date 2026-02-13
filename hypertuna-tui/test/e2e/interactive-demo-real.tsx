@@ -187,8 +187,6 @@ if (nsec) {
 let knownRelayKeys = new Set<string>()
 let createdGroupId: string | null = null
 let createdGroupRelay: string | null = null
-let firstFeedEventId: string | null = null
-let firstFeedEventPubkey: string | null = null
 let currentConversationId: string | null = null
 
 const commands: ScriptedCommand[] = [
@@ -230,7 +228,7 @@ const commands: ScriptedCommand[] = [
   },
   { command: 'copy selected' },
   { command: 'copy command' },
-  { command: 'group invites' },
+  { command: 'goto invites:group' },
   { command: `group update-members add ${inviteePubkey}` },
   { command: `group update-auth ${inviteePubkey} demo-auth-${suffix}` },
   {
@@ -253,34 +251,19 @@ const commands: ScriptedCommand[] = [
       return `relay join ${target} demo-join-${suffix}`
     }
   },
-  { command: 'feed refresh 20', pauseAfterMs: 900 },
-  {
-    resolveCommand: (controller) => {
-      const first = controller.getState().feed[0]
-      if (!first) return null
-      firstFeedEventId = first.id
-      firstFeedEventPubkey = first.pubkey
-      return null
-    },
-    pauseAfterMs: 250
-  },
   { command: `post "Hypertuna real-backend walkthrough post ${suffix}"` },
   {
     resolveCommand: () => {
-      if (!firstFeedEventId || !firstFeedEventPubkey) return null
-      return `reply ${firstFeedEventId} ${firstFeedEventPubkey} "walkthrough reply ${suffix}"`
+      if (!createdGroupId) return null
+      return `compose start ${createdGroupId}`
     }
   },
+  { command: `compose text "compose walkthrough note ${suffix}"` },
+  { command: 'compose publish' },
   {
     resolveCommand: () => {
-      if (!firstFeedEventId || !firstFeedEventPubkey) return null
-      return `react ${firstFeedEventId} ${firstFeedEventPubkey} +`
-    }
-  },
-  {
-    resolveCommand: () => {
-      if (!firstFeedEventId) return null
-      return `bookmark add ${firstFeedEventId}`
+      if (!createdGroupId) return null
+      return `file refresh ${createdGroupId}`
     }
   },
   { command: 'chat init' },
@@ -305,7 +288,7 @@ const commands: ScriptedCommand[] = [
       return `chat send ${currentConversationId} "walkthrough chat message ${suffix}"`
     }
   },
-  { command: 'search notes hypertuna' },
+  { command: 'invites refresh' },
   { command: 'goto logs' }
 ]
 

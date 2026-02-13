@@ -15,8 +15,11 @@ import type {
   FeedSortKey,
   FeedItem,
   FeedSourceState,
+  FileActionStatus,
   FileControls,
+  FileFamilyCounts,
   FileSortKey,
+  GroupNoteRecord,
   GroupComposeDraft,
   GroupControls,
   GroupJoinRequest,
@@ -30,6 +33,7 @@ import type {
   InvitesInboxItem,
   ListService as IListService,
   LogLevel,
+  PaneFocus,
   PaneViewportMap,
   PerfMetrics,
   RelayEntry,
@@ -55,8 +59,21 @@ import { WorkerHost, findDefaultWorkerRoot } from '../runtime/workerHost.js'
 import type { ClipboardCopyResult } from '../runtime/clipboard.js'
 import { resolveStoragePaths } from '../storage/paths.js'
 import { UiStateStore } from '../storage/uiStateStore.js'
-import { DEFAULT_DISCOVERY_RELAYS, SEARCHABLE_RELAYS } from '../lib/constants.js'
-import { uniqueRelayUrls, nip04Decrypt, nip04Encrypt, eventNow, signDraftEvent } from '../lib/nostr.js'
+import {
+  DEFAULT_DISCOVERY_RELAYS,
+  FILE_FAMILY_ORDER,
+  type FileFamily,
+  type NavNodeId,
+  SEARCHABLE_RELAYS
+} from '../lib/constants.js'
+import {
+  uniqueRelayUrls,
+  normalizeRelayUrl,
+  nip04Decrypt,
+  nip04Encrypt,
+  eventNow,
+  signDraftEvent
+} from '../lib/nostr.js'
 import { buildScopedFileScope, type ArchivedGroupEntry } from './parity/fileScope.js'
 import {
   buildInvitesInbox,
@@ -138,13 +155,33 @@ export type ControllerState = {
   chatNextRetryAt: number | null
   filesCount: number
   invitesCount: number
+  fileFamilyCounts: FileFamilyCounts
   groupViewTab: GroupViewTab
   chatViewTab: ChatViewTab
+  selectedNode: NavNodeId
+  focusPane: PaneFocus
+  treeExpanded: {
+    groups: boolean
+    invites: boolean
+    files: boolean
+  }
+  nodeViewport: PaneViewportMap
+  rightTopSelectionByNode: Record<string, number>
+  rightBottomOffsetByNode: Record<string, number>
   keymap: {
     vimNavigation: boolean
   }
   detailPaneOffsetBySection: Record<string, number>
   paneViewport: PaneViewportMap
+  groupNotesByGroupKey: Record<string, GroupNoteRecord[]>
+  groupFilesByGroupKey: Record<string, GroupFileRecord[]>
+  adminProfileByPubkey: Record<string, {
+    name: string | null
+    bio: string | null
+    followersCount: number | null
+  }>
+  fileActionStatus: FileActionStatus
+  hiddenDeletedFileKeys: string[]
   composeDraft: GroupComposeDraft | null
   perfMetrics: PerfMetrics
   workerRecoveryState: WorkerRecoveryState
@@ -258,6 +295,57 @@ function defaultFileControls(): FileControls {
     mime: 'all',
     group: 'all'
   }
+}
+
+function defaultFileActionStatus(): FileActionStatus {
+  return {
+    action: null,
+    state: 'idle',
+    message: null,
+    path: null,
+    updatedAt: Date.now(),
+    eventId: null,
+    sha256: null
+  }
+}
+
+function defaultFileFamilyCounts(): FileFamilyCounts {
+  return {
+    images: 0,
+    video: 0,
+    audio: 0,
+    docs: 0,
+    other: 0
+  }
+}
+
+function classifyFileFamily(mime?: string | null): FileFamily {
+  const normalized = String(mime || '').toLowerCase()
+  if (normalized.startsWith('image/')) return 'images'
+  if (normalized.startsWith('video/')) return 'video'
+  if (normalized.startsWith('audio/')) return 'audio'
+  if (
+    normalized.startsWith('text/')
+    || normalized.includes('json')
+    || normalized.includes('pdf')
+    || normalized.includes('markdown')
+    || normalized.includes('msword')
+    || normalized.includes('officedocument')
+  ) {
+    return 'docs'
+  }
+  return 'other'
+}
+
+function normalizeFileRecordKey(file: GroupFileRecord): string {
+  if (file.sha256) return `${file.groupId}:${file.sha256}`
+  return `${file.groupId}:${file.eventId}`
+}
+
+function groupKey(groupId: string, relay?: string | null): string {
+  const normalizedGroupId = String(groupId || '').trim()
+  const normalizedRelay = relay ? getBaseRelayUrl(relay) : ''
+  return `${normalizedRelay}|${normalizedGroupId}`
 }
 
 function maybeNpub(value: string | undefined): string | undefined {
@@ -390,13 +478,29 @@ export class TuiController {
     chatNextRetryAt: null,
     filesCount: 0,
     invitesCount: 0,
+    fileFamilyCounts: defaultFileFamilyCounts(),
     groupViewTab: 'discover',
     chatViewTab: 'conversations',
+    selectedNode: 'dashboard',
+    focusPane: 'left-tree',
+    treeExpanded: {
+      groups: true,
+      invites: true,
+      files: true
+    },
+    nodeViewport: {},
+    rightTopSelectionByNode: {},
+    rightBottomOffsetByNode: {},
     keymap: {
       vimNavigation: false
     },
     detailPaneOffsetBySection: {},
     paneViewport: {},
+    groupNotesByGroupKey: {},
+    groupFilesByGroupKey: {},
+    adminProfileByPubkey: {},
+    fileActionStatus: defaultFileActionStatus(),
+    hiddenDeletedFileKeys: [],
     composeDraft: null,
     perfMetrics: defaultPerfMetrics(),
     workerRecoveryState: defaultWorkerRecoveryState(),
@@ -486,11 +590,29 @@ export class TuiController {
         Object.entries(this.state.groupJoinRequests).map(([key, value]) => [key, value.map((row) => ({ ...row }))])
       ),
       invitesInbox: this.state.invitesInbox.map((item) => ({ ...item })),
+      fileFamilyCounts: { ...this.state.fileFamilyCounts },
+      selectedNode: this.state.selectedNode,
+      focusPane: this.state.focusPane,
+      treeExpanded: { ...this.state.treeExpanded },
+      nodeViewport: Object.fromEntries(
+        Object.entries(this.state.nodeViewport).map(([key, value]) => [key, { ...value }])
+      ),
+      rightTopSelectionByNode: { ...this.state.rightTopSelectionByNode },
+      rightBottomOffsetByNode: { ...this.state.rightBottomOffsetByNode },
       keymap: { ...this.state.keymap },
       detailPaneOffsetBySection: { ...this.state.detailPaneOffsetBySection },
       paneViewport: Object.fromEntries(
         Object.entries(this.state.paneViewport).map(([key, value]) => [key, { ...value }])
       ),
+      groupNotesByGroupKey: Object.fromEntries(
+        Object.entries(this.state.groupNotesByGroupKey).map(([key, value]) => [key, value.map((row) => ({ ...row }))])
+      ),
+      groupFilesByGroupKey: Object.fromEntries(
+        Object.entries(this.state.groupFilesByGroupKey).map(([key, value]) => [key, value.map((row) => ({ ...row }))])
+      ),
+      adminProfileByPubkey: { ...this.state.adminProfileByPubkey },
+      fileActionStatus: { ...this.state.fileActionStatus },
+      hiddenDeletedFileKeys: [...this.state.hiddenDeletedFileKeys],
       composeDraft: this.state.composeDraft
         ? {
             ...this.state.composeDraft,
@@ -614,6 +736,14 @@ export class TuiController {
     this.state.myGroups = myGroups
     this.state.invitesInbox = invitesInbox
     this.state.filesCount = selectFilesCount(this.state.files)
+    this.state.fileFamilyCounts = FILE_FAMILY_ORDER.reduce((acc, family) => {
+      acc[family] = 0
+      return acc
+    }, defaultFileFamilyCounts())
+    for (const file of this.state.files) {
+      const family = classifyFileFamily(file.mime)
+      this.state.fileFamilyCounts[family] += 1
+    }
     this.state.chatUnreadTotal = selectChatUnreadTotal(this.state.conversations)
     this.state.chatPendingInviteCount = selectChatPendingInviteCount(this.state.chatInvites)
     this.state.invitesCount = selectInvitesCount(this.state.groupInvites, this.state.chatInvites)
@@ -636,12 +766,25 @@ export class TuiController {
     this.patchState({
       groupViewTab: scoped.groupViewTab,
       chatViewTab: scoped.chatViewTab,
+      selectedNode: scoped.selectedNode as NavNodeId,
+      focusPane: scoped.focusPane as PaneFocus,
+      treeExpanded: {
+        groups: scoped.treeExpanded.groups,
+        invites: scoped.treeExpanded.invites,
+        files: scoped.treeExpanded.files
+      },
+      nodeViewport: scoped.nodeViewport && Object.keys(scoped.nodeViewport).length > 0
+        ? scoped.nodeViewport
+        : scoped.paneViewport,
+      rightTopSelectionByNode: scoped.rightTopSelectionByNode || {},
+      rightBottomOffsetByNode: scoped.rightBottomOffsetByNode || {},
       feedSource: scoped.feedSource || defaultFeedSourceState(),
       feedControls: scoped.feedControls || defaultFeedControls(),
       groupControls: scoped.groupControls || defaultGroupControls(),
       fileControls: scoped.fileControls || defaultFileControls(),
       detailPaneOffsetBySection: scoped.detailPaneOffsetBySection || {},
       paneViewport: scoped.paneViewport,
+      hiddenDeletedFileKeys: scoped.hiddenDeletedFileKeys || [],
       dismissedGroupInviteIds: scoped.dismissedGroupInviteIds,
       acceptedGroupInviteIds: scoped.acceptedGroupInviteIds,
       acceptedGroupInviteGroupIds: scoped.acceptedGroupInviteGroupIds,
@@ -662,6 +805,16 @@ export class TuiController {
   private async persistAccountScopedUiState(patch: {
     groupViewTab?: GroupViewTab
     chatViewTab?: ChatViewTab
+    selectedNode?: NavNodeId
+    focusPane?: PaneFocus
+    treeExpanded?: {
+      groups: boolean
+      invites: boolean
+      files: boolean
+    }
+    nodeViewport?: PaneViewportMap
+    rightTopSelectionByNode?: Record<string, number>
+    rightBottomOffsetByNode?: Record<string, number>
     feedSource?: FeedSourceState
     feedControls?: FeedControls
     groupControls?: GroupControls
@@ -674,6 +827,7 @@ export class TuiController {
     dismissedChatInviteIds?: string[]
     acceptedChatInviteIds?: string[]
     acceptedChatInviteConversationIds?: string[]
+    hiddenDeletedFileKeys?: string[]
     perfOverlayEnabled?: boolean
   }): Promise<void> {
     const userKey = this.currentUiScopeKey()
@@ -828,11 +982,16 @@ export class TuiController {
 
     this.workerUnsubs.push(
       this.workerHost.onExit((code) => {
+        const wasStopping = this.state.lifecycle === 'stopping'
         this.resetChatRuntimeState()
         this.patchState({
           lifecycle: 'stopped',
           readinessMessage: `Worker exited (${code})`
         })
+        if (wasStopping) {
+          this.log('info', `Worker exited with code ${code}`)
+          return
+        }
         this.log('warn', `Worker exited with code ${code}`)
         this.scheduleWorkerRecovery(code)
       })
@@ -1025,7 +1184,12 @@ export class TuiController {
       return
     }
 
-    const delayMs = Math.min(60_000, 1_000 * 2 ** Math.max(0, nextAttempt - 1))
+    const baseDelayMs = Math.min(60_000, 1_000 * 2 ** Math.max(0, nextAttempt - 1))
+    const lockConflict = this.hasRecentWorkerLockSignal()
+    const delayMs = lockConflict ? Math.max(baseDelayMs, 12_000) : baseDelayMs
+    if (lockConflict) {
+      this.log('warn', 'Detected storage lock contention; delaying worker restart to allow lock release')
+    }
     this.patchState({
       workerRecoveryState: {
         ...this.state.workerRecoveryState,
@@ -1033,7 +1197,7 @@ export class TuiController {
         attempt: nextAttempt,
         nextDelayMs: delayMs,
         lastExitCode: exitCode,
-        lastError: null
+        lastError: lockConflict ? 'Storage lock contention detected' : null
       },
       readinessMessage: `Worker exited (${exitCode}), reconnecting in ${Math.round(delayMs / 1000)}s`
     })
@@ -1371,6 +1535,40 @@ export class TuiController {
     await this.persistAccountScopedUiState({ chatViewTab: nextTab })
   }
 
+  async setSelectedNode(nodeId: NavNodeId): Promise<void> {
+    if (this.state.selectedNode === nodeId) return
+    this.patchState({ selectedNode: nodeId })
+    await this.persistAccountScopedUiState({ selectedNode: nodeId })
+  }
+
+  async setFocusPane(focusPane: PaneFocus): Promise<void> {
+    if (this.state.focusPane === focusPane) return
+    this.patchState({ focusPane })
+    await this.persistAccountScopedUiState({ focusPane })
+  }
+
+  async setTreeExpanded(nextExpanded: {
+    groups: boolean
+    invites: boolean
+    files: boolean
+  }): Promise<void> {
+    const normalized = {
+      groups: Boolean(nextExpanded.groups),
+      invites: Boolean(nextExpanded.invites),
+      files: Boolean(nextExpanded.files)
+    }
+    const prev = this.state.treeExpanded
+    if (
+      prev.groups === normalized.groups
+      && prev.invites === normalized.invites
+      && prev.files === normalized.files
+    ) {
+      return
+    }
+    this.patchState({ treeExpanded: normalized })
+    await this.persistAccountScopedUiState({ treeExpanded: normalized })
+  }
+
   async setPaneViewport(sectionKey: string, cursor: number, offset: number): Promise<void> {
     const key = String(sectionKey || '').trim()
     if (!key) return
@@ -1387,8 +1585,18 @@ export class TuiController {
         offset: normalizedOffset
       }
     }
-    this.patchState({ paneViewport: next })
-    await this.persistAccountScopedUiState({ paneViewport: next })
+    const nextNodeViewport = {
+      ...this.state.nodeViewport,
+      [key]: {
+        cursor: normalizedCursor,
+        offset: normalizedOffset
+      }
+    }
+    this.patchState({ paneViewport: next, nodeViewport: nextNodeViewport })
+    await this.persistAccountScopedUiState({
+      paneViewport: next,
+      nodeViewport: nextNodeViewport
+    })
   }
 
   async setDetailPaneOffset(sectionKey: string, offset: number): Promise<void> {
@@ -1403,8 +1611,32 @@ export class TuiController {
       ...this.state.detailPaneOffsetBySection,
       [key]: normalizedOffset
     }
-    this.patchState({ detailPaneOffsetBySection: next })
-    await this.persistAccountScopedUiState({ detailPaneOffsetBySection: next })
+    const nextRightBottom = {
+      ...this.state.rightBottomOffsetByNode,
+      [key]: normalizedOffset
+    }
+    this.patchState({
+      detailPaneOffsetBySection: next,
+      rightBottomOffsetByNode: nextRightBottom
+    })
+    await this.persistAccountScopedUiState({
+      detailPaneOffsetBySection: next,
+      rightBottomOffsetByNode: nextRightBottom
+    })
+  }
+
+  async setRightTopSelection(nodeId: string, index: number): Promise<void> {
+    const key = String(nodeId || '').trim()
+    if (!key) return
+    const normalizedIndex = Math.max(0, Math.trunc(index))
+    const existing = this.state.rightTopSelectionByNode[key]
+    if (existing === normalizedIndex) return
+    const next = {
+      ...this.state.rightTopSelectionByNode,
+      [key]: normalizedIndex
+    }
+    this.patchState({ rightTopSelectionByNode: next })
+    await this.persistAccountScopedUiState({ rightTopSelectionByNode: next })
   }
 
   async setPerfOverlay(enabled: boolean): Promise<void> {
@@ -1519,7 +1751,9 @@ export class TuiController {
     const controls = this.state.fileControls
     const query = controls.query.trim().toLowerCase()
     const mimeQuery = controls.mime.trim().toLowerCase()
+    const hiddenKeys = new Set(this.state.hiddenDeletedFileKeys)
     const filtered = files.filter((record) => {
+      if (hiddenKeys.has(normalizeFileRecordKey(record))) return false
       if (controls.group !== 'all' && record.groupId !== controls.group) return false
       if (mimeQuery !== 'all') {
         const mime = String(record.mime || '').toLowerCase()
@@ -1580,7 +1814,17 @@ export class TuiController {
 
   private syncFilesView(): void {
     const next = this.applyFileControls(this.rawFiles)
-    this.patchState({ files: next })
+    const grouped: Record<string, GroupFileRecord[]> = {}
+    for (const record of next) {
+      const key = groupKey(record.groupId, record.groupRelay || null)
+      const rows = grouped[key] || []
+      rows.push(record)
+      grouped[key] = rows
+    }
+    this.patchState({
+      files: next,
+      groupFilesByGroupKey: grouped
+    })
   }
 
   private normalizeSortDirection(direction?: string): SortDirection {
@@ -1823,6 +2067,22 @@ export class TuiController {
     return normalized.includes('relay profile not found')
   }
 
+  private hasRecentWorkerLockSignal(): boolean {
+    const recentLines = [
+      ...this.workerStderrQueue.slice(-60),
+      ...this.state.workerStderr.slice(-120)
+    ]
+    if (!recentLines.length) return false
+    return recentLines.some((line) => {
+      const normalized = String(line || '').toLowerCase()
+      return (
+        normalized.includes('elocked')
+        || normalized.includes('primary-key is locked')
+        || (normalized.includes('file is locked') && normalized.includes('primary-key'))
+      )
+    })
+  }
+
   private resolveGroupPeerCount(groupId: string, relay?: string): number {
     const candidates = new Set<string>()
     const normalizedGroupId = String(groupId || '').trim()
@@ -1953,19 +2213,31 @@ export class TuiController {
   private resolveRelayUrl(relay?: string): string | undefined {
     const normalized = String(relay || '').trim()
     if (!normalized) return undefined
+    const canonical = normalizeRelayUrl(normalized) || normalized
 
     const direct = this.state.relays.find((entry) =>
       entry.connectionUrl === normalized
+      || entry.connectionUrl === canonical
+      || (entry.connectionUrl && normalizeRelayUrl(entry.connectionUrl) === canonical)
       || entry.publicIdentifier === normalized
       || entry.relayKey === normalized
     )
-    if (direct?.connectionUrl) return direct.connectionUrl
+    if (direct?.connectionUrl) {
+      return normalizeRelayUrl(direct.connectionUrl) || direct.connectionUrl
+    }
+
+    if (normalized.includes('://')) {
+      return canonical
+    }
 
     const slashForm = normalized.replace(':', '/')
-    const slashHit = this.state.relays.find((entry) => entry.publicIdentifier === slashForm)
+    const slashHit = this.state.relays.find((entry) =>
+      entry.publicIdentifier === slashForm
+      || entry.connectionUrl === slashForm
+    )
     if (slashHit?.connectionUrl) return slashHit.connectionUrl
 
-    return normalized
+    return canonical
   }
 
   private resolveGroupRelayUrl(groupId?: string | null, fallbackRelay?: string | null): string | undefined {
@@ -2108,7 +2380,7 @@ export class TuiController {
       })
 
       await this.refreshRelays()
-    })
+    }, { dedupeKey: 'worker:start', retries: 0 })
   }
 
   async stopWorker(): Promise<void> {
@@ -2530,6 +2802,60 @@ export class TuiController {
     })
   }
 
+  private async ensureAdminProfiles(pubkeys: string[]): Promise<void> {
+    const unique = Array.from(
+      new Set(
+        pubkeys
+          .map((value) => String(value || '').trim())
+          .filter((value) => /^[a-f0-9]{64}$/i.test(value))
+      )
+    )
+    if (unique.length === 0) return
+
+    const next = { ...this.state.adminProfileByPubkey }
+    const missing = unique.filter((pubkey) => !next[pubkey])
+    if (missing.length === 0) return
+
+    try {
+      const events = await this.nostrClient.query(
+        this.searchableRelayUrls(12),
+        {
+          kinds: [0],
+          authors: missing,
+          limit: Math.max(80, Math.min(500, missing.length * 2))
+        },
+        GROUP_METADATA_TIMEOUT_MS
+      )
+      for (const event of events) {
+        if (!event?.pubkey) continue
+        if (next[event.pubkey]) continue
+        try {
+          const payload = JSON.parse(event.content || '{}')
+          const name = String(payload?.display_name || payload?.name || payload?.username || '').trim()
+          const bio = String(payload?.about || payload?.bio || '').trim()
+          const followersRaw = Number(payload?.followers || payload?.followers_count)
+          next[event.pubkey] = {
+            name: name || null,
+            bio: bio || null,
+            followersCount: Number.isFinite(followersRaw) ? followersRaw : null
+          }
+        } catch {
+          next[event.pubkey] = {
+            name: null,
+            bio: null,
+            followersCount: null
+          }
+        }
+      }
+    } catch {
+      // best-effort enrichment
+    }
+
+    this.patchState({
+      adminProfileByPubkey: next
+    })
+  }
+
   async refreshGroups(): Promise<void> {
     await this.runTask('Refresh groups', async () => {
       const discoveryRelays = this.searchableRelayUrls(18)
@@ -2543,6 +2869,11 @@ export class TuiController {
       const enrichedGroups = await this.enrichGroupMetadata(groups)
       this.rawGroupDiscover = enrichedGroups.map((group) => ({ ...group }))
       this.patchState({ myGroupList })
+      await this.ensureAdminProfiles(
+        enrichedGroups
+          .map((group) => group.adminPubkey || group.event?.pubkey || '')
+          .filter(Boolean)
+      )
       this.syncGroupView()
     }, { dedupeKey: 'refresh:groups', retries: 0 })
   }
@@ -2583,6 +2914,9 @@ export class TuiController {
         invites: filtered,
         groupInvites: filtered
       })
+      await this.ensureAdminProfiles(
+        filtered.map((invite) => invite.event?.pubkey || '').filter(Boolean)
+      )
     }, { dedupeKey: 'refresh:group-invites', retries: 0 })
   }
 
@@ -2946,6 +3280,128 @@ export class TuiController {
     })
   }
 
+  async downloadGroupFile(input: {
+    relayKey?: string | null
+    publicIdentifier?: string | null
+    groupId?: string | null
+    eventId?: string | null
+    fileHash: string
+    fileName?: string | null
+  }): Promise<{ savedPath: string; bytes: number; source: string }> {
+    return await this.runTask('Download file', async () => {
+      this.patchState({
+        fileActionStatus: {
+          action: 'download',
+          state: 'in-progress',
+          updatedAt: Date.now(),
+          eventId: input.eventId || null,
+          sha256: input.fileHash,
+          message: 'Downloading file…',
+          path: null
+        }
+      })
+      const result = await this.fileService.downloadGroupFile(input)
+      const hiddenKey = `${input.groupId || input.publicIdentifier || input.relayKey || ''}:${input.fileHash}`
+      const nextHidden = this.state.hiddenDeletedFileKeys.filter((key) => key !== hiddenKey)
+      this.patchState({
+        hiddenDeletedFileKeys: nextHidden,
+        fileActionStatus: {
+          action: 'download',
+          state: 'success',
+          updatedAt: Date.now(),
+          eventId: input.eventId || null,
+          sha256: input.fileHash,
+          message: 'Download complete',
+          path: result.savedPath
+        }
+      })
+      await this.persistAccountScopedUiState({ hiddenDeletedFileKeys: nextHidden })
+      await this.refreshGroupFiles(input.groupId || input.publicIdentifier || input.relayKey || undefined)
+      return result
+    })
+  }
+
+  async deleteLocalGroupFile(input: {
+    relayKey?: string | null
+    publicIdentifier?: string | null
+    groupId?: string | null
+    eventId?: string | null
+    fileHash: string
+  }): Promise<{ deleted: boolean; reason?: string | null }> {
+    return await this.runTask('Delete local file', async () => {
+      this.patchState({
+        fileActionStatus: {
+          action: 'delete',
+          state: 'in-progress',
+          updatedAt: Date.now(),
+          eventId: input.eventId || null,
+          sha256: input.fileHash,
+          message: 'Deleting local file…',
+          path: null
+        }
+      })
+      const result = await this.fileService.deleteLocalGroupFile(input)
+      const keyPrefix = input.groupId || input.publicIdentifier || input.relayKey || ''
+      const fileKey = `${keyPrefix}:${input.fileHash}`
+      const hiddenKeys = new Set(this.state.hiddenDeletedFileKeys)
+      hiddenKeys.add(fileKey)
+      const nextHidden = Array.from(hiddenKeys)
+      this.patchState({
+        hiddenDeletedFileKeys: nextHidden,
+        fileActionStatus: {
+          action: 'delete',
+          state: result.deleted ? 'success' : 'error',
+          updatedAt: Date.now(),
+          eventId: input.eventId || null,
+          sha256: input.fileHash,
+          message: result.deleted ? 'File deleted from local storage' : (result.reason || 'Delete failed'),
+          path: null
+        }
+      })
+      await this.persistAccountScopedUiState({ hiddenDeletedFileKeys: nextHidden })
+      this.syncFilesView()
+      return result
+    })
+  }
+
+  async refreshGroupNotes(groupId: string, relay?: string): Promise<void> {
+    await this.runTask('Refresh group notes', async () => {
+      const normalizedGroupId = String(groupId || '').trim()
+      if (!normalizedGroupId) {
+        throw new Error('groupId is required')
+      }
+      const relayCandidates = relay ? uniqueRelayUrls([relay, ...this.searchableRelayUrls()]) : this.searchableRelayUrls()
+      const events = await this.feedService.fetchFeed(
+        relayCandidates,
+        {
+          kinds: [1],
+          '#h': [normalizedGroupId],
+          limit: 350
+        },
+        FEED_REFRESH_TIMEOUT_MS
+      )
+      const notes: GroupNoteRecord[] = events
+        .map((event) => ({
+          eventId: event.id,
+          groupId: normalizedGroupId,
+          relay: relay || null,
+          content: event.content || '',
+          createdAt: Number(event.created_at || 0),
+          authorPubkey: event.pubkey,
+          event
+        }))
+        .sort((left, right) => right.createdAt - left.createdAt)
+      const key = groupKey(normalizedGroupId, relay || null)
+      const next = {
+        ...this.state.groupNotesByGroupKey,
+        [key]: notes
+      }
+      this.patchState({
+        groupNotesByGroupKey: next
+      })
+    }, { dedupeKey: `refresh:group-notes:${groupId}:${relay || ''}`, retries: 0 })
+  }
+
   async refreshGroupFiles(groupId?: string): Promise<void> {
     await this.runTask('Refresh files', async () => {
       let files: GroupFileRecord[] = []
@@ -2962,6 +3418,15 @@ export class TuiController {
         files = await this.fileService.fetchScopedGroupFiles(scope, 1_500)
       }
       this.rawFiles = files.map((file) => ({ ...file }))
+      if (groupId) {
+        const key = groupKey(groupId)
+        this.patchState({
+          groupFilesByGroupKey: {
+            ...this.state.groupFilesByGroupKey,
+            [key]: files.map((file) => ({ ...file }))
+          }
+        })
+      }
       this.syncFilesView()
     }, { dedupeKey: `refresh:files:${groupId || 'all'}`, retries: 1 })
   }

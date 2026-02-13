@@ -6,6 +6,7 @@
 import process from 'node:process'
 import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
+import os from 'node:os'
 import nodeCrypto from 'node:crypto'
 import swarmCrypto from 'hypercore-crypto'
 import b4a from 'b4a'
@@ -57,6 +58,7 @@ import {
   removeRelayCorestore,
   getLocalDrive,
   getPfpDrive,
+  deleteRelayFile,
   deleteRelayFilesByIdentifierPrefix
 } from './hyperdrive-manager.mjs';
 import { ensureMirrorsForProviders, stopAllMirrors } from './mirror-sync-manager.mjs';
@@ -68,6 +70,12 @@ import {
   updatePublicGatewaySettings,
   getCachedPublicGatewaySettings
 } from '../shared/config/PublicGatewaySettings.mjs'
+import {
+  downloadGroupFileOperation,
+  deleteLocalGroupFileOperation,
+  normalizeDownloadFileName,
+  ensureUniqueDownloadPath
+} from './group-file-ipc.mjs'
 import {
   encryptSharedSecretToString,
   decryptSharedSecretFromString
@@ -2572,6 +2580,13 @@ function cleanupRelayMirrorSubscriptions() {
   relayMirrorSubscriptions.clear()
 }
 
+function isGatewayPortInUseError(error) {
+  const code = typeof error?.code === 'string' ? error.code.toUpperCase() : ''
+  if (code === 'EADDRINUSE') return true
+  const message = String(error?.message || '').toLowerCase()
+  return message.includes('eaddrinuse') || message.includes('address already in use')
+}
+
 async function startGatewayService(options = {}) {
   await ensurePublicGatewaySettingsLoaded()
 
@@ -2763,10 +2778,13 @@ async function startGatewayService(options = {}) {
     return
   }
 
-  try {
+  const finishGatewayStart = async (startOptions) => {
     gatewaySettingsApplied = false
-    await gatewayService.start(mergedOptions)
-    gatewayOptions = mergedOptions
+    await gatewayService.start(startOptions)
+    gatewayOptions = {
+      ...startOptions,
+      port: Number(gatewayService?.config?.port) || Number(startOptions?.port) || gatewayOptions.port
+    }
     await ensureBlindPeeringManager({
       start: true,
       corestore: getCorestore(),
@@ -2775,7 +2793,25 @@ async function startGatewayService(options = {}) {
     refreshGatewayRelayRegistry('gateway-started').catch((err) => {
       console.warn('[Worker] Gateway registry refresh failed after start:', err?.message || err)
     })
+  }
+
+  try {
+    await finishGatewayStart(mergedOptions)
   } catch (error) {
+    if (isGatewayPortInUseError(error)) {
+      const retryOptions = {
+        ...mergedOptions,
+        port: 0
+      }
+      console.warn('[Worker] Gateway port already in use, retrying with dynamic port assignment')
+      try {
+        await finishGatewayStart(retryOptions)
+        return
+      } catch (retryError) {
+        console.error('[Worker] Failed to start gateway service on fallback port:', retryError)
+        throw retryError
+      }
+    }
     console.error('[Worker] Failed to start gateway service:', error)
     throw error
   }
@@ -4250,6 +4286,25 @@ async function recoverRelayDriveFile({
   }
 }
 
+async function writeFileToDownloads({ fileName, data }) {
+  const home = os.homedir()
+  const downloadsDir = process.env.HYPERTUNA_DOWNLOADS_DIR || join(home, 'Downloads')
+  await fs.mkdir(downloadsDir, { recursive: true })
+  const normalizedName = normalizeDownloadFileName({ fileName, fileHash: '' })
+  const savePath = await ensureUniqueDownloadPath(downloadsDir, normalizedName, {
+    fileAccess: async (candidate) => {
+      try {
+        await fs.access(candidate)
+        return true
+      } catch (_) {
+        return false
+      }
+    }
+  })
+  await fs.writeFile(savePath, data)
+  return savePath
+}
+
 async function syncRemotePfpMirrors() {
   if (!gatewayService?.getPeersWithPfpDrive) return
   const peers = gatewayService.getPeersWithPfpDrive()
@@ -5010,6 +5065,52 @@ async function handleMessageObject(message) {
         sendMessage({ type: 'public-gateway-status', state })
       } catch (err) {
         sendMessage({ type: 'public-gateway-error', message: err.message })
+      }
+      break
+    }
+
+    case 'download-group-file': {
+      const requestId =
+        (typeof message.requestId === 'string' && message.requestId) ||
+        (typeof message?.data?.requestId === 'string' && message.data.requestId) ||
+        null
+      try {
+        const payload = message?.data || {}
+        const response = await downloadGroupFileOperation(payload, {
+          getRelayKeyFromPublicIdentifier,
+          getRelayProfileByKey,
+          recoverRelayDriveFile,
+          getFile,
+          writeFileToDownloads
+        })
+        sendMessage({ type: 'download-group-file-complete', data: response })
+        sendWorkerResponse(requestId, { success: true, data: response })
+      } catch (err) {
+        const errorMessage = err?.message || String(err)
+        sendMessage({ type: 'download-group-file-error', error: errorMessage })
+        sendWorkerResponse(requestId, { success: false, error: errorMessage })
+      }
+      break
+    }
+
+    case 'delete-local-group-file': {
+      const requestId =
+        (typeof message.requestId === 'string' && message.requestId) ||
+        (typeof message?.data?.requestId === 'string' && message.data.requestId) ||
+        null
+      try {
+        const payload = message?.data || {}
+        const response = await deleteLocalGroupFileOperation(payload, {
+          getRelayKeyFromPublicIdentifier,
+          getRelayProfileByKey,
+          deleteRelayFile
+        })
+        sendMessage({ type: 'delete-local-group-file-complete', data: response })
+        sendWorkerResponse(requestId, { success: true, data: response })
+      } catch (err) {
+        const errorMessage = err?.message || String(err)
+        sendMessage({ type: 'delete-local-group-file-error', error: errorMessage })
+        sendWorkerResponse(requestId, { success: false, error: errorMessage })
       }
       break
     }
@@ -6881,8 +6982,7 @@ async function main() {
 	        } catch (gatewayError) {
 	          console.error('[Worker] Failed to auto-start gateway:', gatewayError)
 	          sendMessage({ type: 'gateway-error', message: gatewayError.message })
-	          sendWorkerStatus('error', 'Gateway start failed', {
-	            error: gatewayError,
+	          sendWorkerStatus('gateway-ready', 'Gateway unavailable; continuing without gateway', {
 	            statePatch: { gateway: { ready: false, running: false } }
 	          })
 	          return false

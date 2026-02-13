@@ -5,7 +5,8 @@
   "license": "Apache-2.0",
   "scripts": {
     "dev": "pear run -d .",
-    "test": "brittle test/*.test.js"
+    "test": "brittle test/*.test.js",
+    "test:ipc": "brittle test/group-file-ipc.test.js test/public-gateway-hyperbee-adapter.test.js"
   },
   "pear": {
     "name": "worker-app",

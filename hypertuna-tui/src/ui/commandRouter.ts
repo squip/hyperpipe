@@ -1,11 +1,11 @@
-import type { SearchMode } from '../domain/types.js'
+import type { NavNodeId } from '../lib/constants.js'
+import { FILE_FAMILY_ORDER } from '../lib/constants.js'
 import type { ClipboardCopyResult } from '../runtime/clipboard.js'
-import { SECTION_ORDER, type SectionId } from '../lib/constants.js'
 import { normalizeBool, splitCsv } from '../lib/format.js'
 
 export type CommandResult = {
   message: string
-  gotoSection?: SectionId
+  gotoNode?: NavNodeId
 }
 
 export type AccountProfileSummary = {
@@ -51,6 +51,8 @@ type SelectedRelayRef = {
 type SelectedFileRef = {
   eventId: string
   groupId: string
+  fileName?: string | null
+  relay?: string | null
   url?: string | null
   sha256?: string | null
 }
@@ -59,19 +61,21 @@ type SelectedConversationRef = {
   id: string
 }
 
-type SelectedFeedEventRef = {
+type SelectedNoteRef = {
   id: string
   pubkey: string
+  groupId?: string | null
 }
 
 export type CommandContext = {
-  currentSection?: SectionId
+  currentSection?: string
+  currentNode?: NavNodeId
   resolveSelectedGroup?: () => SelectedGroupRef | null
   resolveSelectedInvite?: () => SelectedInviteRef | null
   resolveSelectedRelay?: () => SelectedRelayRef | null
   resolveSelectedFile?: () => SelectedFileRef | null
   resolveSelectedConversation?: () => SelectedConversationRef | null
-  resolveSelectedFeedEvent?: () => SelectedFeedEventRef | null
+  resolveSelectedNote?: () => SelectedNoteRef | null
   copy?: (text: string) => Promise<ClipboardCopyResult>
   unsafeCopySecrets?: boolean
 }
@@ -123,27 +127,10 @@ export interface CommandController {
     relayUrl?: string
     openJoin?: boolean
   }): Promise<void>
-  acceptGroupInvite(inviteId: string): Promise<void>
-  dismissGroupInvite(inviteId: string): Promise<void>
-
-  refreshFeed(limit?: number): Promise<void>
-  setFeedSourceRelays(): Promise<void>
-  setFeedSourceFollowing(): Promise<void>
-  setFeedSourceRelaySelector(selector: string): Promise<void>
-  setFeedSourceGroupSelector(selector: string, relay?: string): Promise<void>
-  setFeedSearch(query: string): Promise<void>
-  setFeedSort(sortKey: 'createdAt' | 'kind' | 'author' | 'content', direction?: string): Promise<void>
-  setFeedKindFilter(kinds: number[] | null): Promise<void>
-  publishPost(content: string): Promise<unknown>
-  publishReply(content: string, replyToEventId: string, replyToPubkey: string): Promise<unknown>
-  publishReaction(eventId: string, eventPubkey: string, reaction: string): Promise<unknown>
-
-  refreshBookmarks(): Promise<void>
-  addBookmark(eventId: string): Promise<void>
-  removeBookmark(eventId: string): Promise<void>
 
   refreshGroups(): Promise<void>
   refreshInvites(): Promise<void>
+  refreshGroupMembers(groupId: string, relay?: string): Promise<unknown>
   sendInvite(input: {
     groupId: string
     relayUrl: string
@@ -165,11 +152,21 @@ export interface CommandController {
     pubkey: string
     token: string
   }): Promise<void>
-  refreshGroupMembers(groupId: string, relay?: string): Promise<unknown>
+  acceptGroupInvite(inviteId: string): Promise<void>
+  dismissGroupInvite(inviteId: string): Promise<void>
+  setGroupViewTab(tab: 'discover' | 'my'): Promise<void>
+  refreshJoinRequests(groupId: string, relay?: string): Promise<void>
+  approveJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void>
+  rejectJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void>
   setGroupSearch(query: string): Promise<void>
   setGroupSort(sortKey: 'name' | 'description' | 'open' | 'public' | 'admin' | 'createdAt' | 'members' | 'peers', direction?: string): Promise<void>
   setGroupVisibilityFilter(visibility: 'all' | 'public' | 'private'): Promise<void>
   setGroupJoinFilter(joinMode: 'all' | 'open' | 'closed'): Promise<void>
+
+  refreshGroupNotes(groupId: string, relay?: string): Promise<void>
+  publishPost(content: string): Promise<unknown>
+  publishReply(content: string, replyToEventId: string, replyToPubkey: string): Promise<unknown>
+  publishReaction(eventId: string, eventPubkey: string, reaction: string): Promise<unknown>
 
   refreshGroupFiles(groupId?: string): Promise<void>
   uploadGroupFile(input: {
@@ -177,20 +174,25 @@ export interface CommandController {
     publicIdentifier?: string | null
     filePath: string
   }): Promise<Record<string, unknown>>
+  downloadGroupFile(input: {
+    relayKey?: string | null
+    publicIdentifier?: string | null
+    groupId?: string | null
+    eventId?: string | null
+    fileHash: string
+    fileName?: string | null
+  }): Promise<{ savedPath: string; bytes: number; source: string }>
+  deleteLocalGroupFile(input: {
+    relayKey?: string | null
+    publicIdentifier?: string | null
+    groupId?: string | null
+    eventId?: string | null
+    fileHash: string
+  }): Promise<{ deleted: boolean; reason?: string | null }>
   setFileSearch(query: string): Promise<void>
   setFileSort(sortKey: 'fileName' | 'group' | 'uploadedAt' | 'uploadedBy' | 'size' | 'mime', direction?: string): Promise<void>
   setFileMimeFilter(mime: string): Promise<void>
   setFileGroupFilter(group: string): Promise<void>
-
-  refreshStarterPacks(): Promise<void>
-  createStarterPack(input: {
-    dTag: string
-    title: string
-    description?: string
-    image?: string
-    pubkeys: string[]
-  }): Promise<void>
-  applyStarterPack(listId: string, authorPubkey?: string): Promise<void>
 
   initChats(): Promise<void>
   refreshChats(): Promise<void>
@@ -201,26 +203,10 @@ export interface CommandController {
   }): Promise<void>
   acceptChatInvite(inviteId: string): Promise<void>
   dismissChatInvite(inviteId: string): Promise<void>
-  setGroupViewTab(tab: 'discover' | 'my'): Promise<void>
   setChatViewTab(tab: 'conversations' | 'invites'): Promise<void>
-  refreshJoinRequests(groupId: string, relay?: string): Promise<void>
-  approveJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void>
-  rejectJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void>
-  setPerfOverlay(enabled: boolean): Promise<void>
-  perfSnapshot(): {
-    inFlight: number
-    queueDepth: number
-    dedupedRequests: number
-    cancelledRequests: number
-    retries: number
-    staleResponseDrops: number
-    avgLatencyMs: number
-    p95LatencyMs: number
-    renderPressure: number
-    operationSamples: Array<{ name: string; durationMs: number; attempts: number; success: boolean }>
-  }
   loadChatThread(conversationId: string): Promise<void>
   sendChatMessage(conversationId: string, content: string): Promise<void>
+
   startComposeDraft(groupId: string, relay?: string): Promise<void>
   updateComposeText(content: string): Promise<void>
   attachComposeFile(filePath: string): Promise<void>
@@ -234,7 +220,19 @@ export interface CommandController {
   publishComposeDraft(): Promise<unknown>
   cancelComposeDraft(): Promise<void>
 
-  search(mode: SearchMode, query: string): Promise<void>
+  setPerfOverlay(enabled: boolean): Promise<void>
+  perfSnapshot(): {
+    inFlight: number
+    queueDepth: number
+    dedupedRequests: number
+    cancelledRequests: number
+    retries: number
+    staleResponseDrops: number
+    avgLatencyMs: number
+    p95LatencyMs: number
+    renderPressure: number
+    operationSamples: Array<{ name: string; durationMs: number; attempts: number; success: boolean }>
+  }
 }
 
 function tokenize(input: string): string[] {
@@ -255,15 +253,6 @@ function requireArg(value: string | undefined, name: string): string {
   return value
 }
 
-function parseSection(input: string): SectionId {
-  const normalized = input.trim().toLowerCase()
-  const section = SECTION_ORDER.find((entry) => entry === normalized)
-  if (!section) {
-    throw new Error(`Unknown section: ${input}`)
-  }
-  return section
-}
-
 function isHex64(value: string): boolean {
   return /^[a-f0-9]{64}$/i.test(value)
 }
@@ -272,9 +261,47 @@ function looksLikeGroupIdentifier(value: string): boolean {
   const normalized = String(value || '').trim()
   if (!normalized) return false
   if (normalized.includes(':')) return true
-  if (normalized.includes("'")) return true
   if (normalized.startsWith('npub')) return true
   return isHex64(normalized)
+}
+
+const NAV_ALIASES: Record<string, NavNodeId> = {
+  dashboard: 'dashboard',
+  relays: 'relays',
+  groups: 'groups',
+  'groups:browse': 'groups:browse',
+  browse: 'groups:browse',
+  discover: 'groups:browse',
+  'groups:discover': 'groups:browse',
+  'groups:my': 'groups:my',
+  my: 'groups:my',
+  chats: 'chats',
+  invites: 'invites',
+  'invites:group': 'invites:group',
+  'group-invites': 'invites:group',
+  'invites:chat': 'invites:chat',
+  'chat-invites': 'invites:chat',
+  files: 'files',
+  'files:images': 'files:type:images',
+  'files:video': 'files:type:video',
+  'files:audio': 'files:type:audio',
+  'files:docs': 'files:type:docs',
+  'files:other': 'files:type:other',
+  accounts: 'accounts',
+  logs: 'logs'
+}
+
+function parseNode(input: string): NavNodeId {
+  const normalized = input.trim().toLowerCase()
+  const alias = NAV_ALIASES[normalized]
+  if (alias) return alias
+  if (normalized.startsWith('files:type:')) {
+    const family = normalized.replace('files:type:', '')
+    if (FILE_FAMILY_ORDER.includes(family as (typeof FILE_FAMILY_ORDER)[number])) {
+      return `files:type:${family}` as NavNodeId
+    }
+  }
+  throw new Error(`Unknown navigation target: ${input}`)
 }
 
 function parseProfileSelector(selector: string, profiles: AccountProfileSummary[]): AccountProfileSummary {
@@ -349,8 +376,8 @@ export function resolveSelectedConversation(context?: CommandContext): SelectedC
   return context?.resolveSelectedConversation?.() || null
 }
 
-export function resolveSelectedFeedEvent(context?: CommandContext): SelectedFeedEventRef | null {
-  return context?.resolveSelectedFeedEvent?.() || null
+export function resolveSelectedNote(context?: CommandContext): SelectedNoteRef | null {
+  return context?.resolveSelectedNote?.() || null
 }
 
 function resolveCopyField(field: string, context?: CommandContext): { label: string; value: string } | null {
@@ -360,7 +387,7 @@ function resolveCopyField(field: string, context?: CommandContext): { label: str
   const selectedRelay = resolveSelectedRelay(context)
   const selectedFile = resolveSelectedFile(context)
   const selectedConversation = resolveSelectedConversation(context)
-  const selectedFeedEvent = resolveSelectedFeedEvent(context)
+  const selectedNote = resolveSelectedNote(context)
 
   if (normalized === 'selected' || normalized === 'primary' || normalized === 'id') {
     if (selectedGroup?.id) return { label: 'group-id', value: selectedGroup.id }
@@ -372,7 +399,7 @@ function resolveCopyField(field: string, context?: CommandContext): { label: str
     if (selectedRelay?.relayKey) return { label: 'relay-key', value: selectedRelay.relayKey }
     if (selectedFile?.groupId) return { label: 'group-id', value: selectedFile.groupId }
     if (selectedConversation?.id) return { label: 'conversation-id', value: selectedConversation.id }
-    if (selectedFeedEvent?.id) return { label: 'event-id', value: selectedFeedEvent.id }
+    if (selectedNote?.id) return { label: 'event-id', value: selectedNote.id }
     return null
   }
 
@@ -382,6 +409,7 @@ function resolveCopyField(field: string, context?: CommandContext): { label: str
       return { label: 'group-id', value: selectedInvite.groupId }
     }
     if (selectedFile?.groupId) return { label: 'group-id', value: selectedFile.groupId }
+    if (selectedNote?.groupId) return { label: 'group-id', value: selectedNote.groupId }
     return null
   }
 
@@ -411,13 +439,13 @@ function resolveCopyField(field: string, context?: CommandContext): { label: str
   }
 
   if (normalized === 'event-id' || normalized === 'event') {
-    if (selectedFeedEvent?.id) return { label: 'event-id', value: selectedFeedEvent.id }
+    if (selectedNote?.id) return { label: 'event-id', value: selectedNote.id }
     if (selectedFile?.eventId) return { label: 'event-id', value: selectedFile.eventId }
     return null
   }
 
   if (normalized === 'pubkey') {
-    if (selectedFeedEvent?.pubkey) return { label: 'pubkey', value: selectedFeedEvent.pubkey }
+    if (selectedNote?.pubkey) return { label: 'pubkey', value: selectedNote.pubkey }
     return null
   }
 
@@ -448,8 +476,8 @@ export function buildCommandSnippet(context?: CommandContext, workflow?: string)
   const selectedRelay = resolveSelectedRelay(context)
   const selectedFile = resolveSelectedFile(context)
   const selectedConversation = resolveSelectedConversation(context)
-  const selectedFeedEvent = resolveSelectedFeedEvent(context)
-  const selectedSection = context?.currentSection
+  const selectedNote = resolveSelectedNote(context)
+  const selectedNode = context?.currentNode
   const normalizedWorkflow = String(workflow || '').trim().toLowerCase()
 
   const fromWorkflow = (): string | null => {
@@ -481,20 +509,17 @@ export function buildCommandSnippet(context?: CommandContext, workflow?: string)
     if (normalizedWorkflow === 'chat-thread' && selectedConversation?.id) {
       return `chat thread ${selectedConversation.id}`
     }
-    if (normalizedWorkflow === 'reply' && selectedFeedEvent?.id) {
-      return `reply ${selectedFeedEvent.id} ${selectedFeedEvent.pubkey} <content>`
+    if (normalizedWorkflow === 'reply' && selectedNote?.id) {
+      return `reply ${selectedNote.id} ${selectedNote.pubkey} <content>`
     }
     if ((normalizedWorkflow === 'relay-join' || normalizedWorkflow === 'join')
       && (selectedRelay?.publicIdentifier || selectedRelay?.relayKey)) {
       return `relay join ${selectedRelay?.publicIdentifier || selectedRelay?.relayKey}`
     }
-    if (normalizedWorkflow === 'feed-source-group' && selectedGroup?.id) {
-      return `feed source group ${selectedGroup.id}`
-    }
     if (normalizedWorkflow === 'compose-start' && selectedGroup?.id) {
       return `compose start ${selectedGroup.id}`
     }
-    if (normalizedWorkflow === 'file-refresh' && selectedFile?.groupId) {
+    if ((normalizedWorkflow === 'file-refresh' || normalizedWorkflow === 'file-download') && selectedFile?.groupId) {
       return `file refresh ${selectedFile.groupId}`
     }
     return null
@@ -503,43 +528,36 @@ export function buildCommandSnippet(context?: CommandContext, workflow?: string)
   const byWorkflow = fromWorkflow()
   if (byWorkflow) return byWorkflow
 
-  if (selectedSection === 'groups') {
+  if (selectedNode?.startsWith('groups')) {
     if (selectedInvite?.kind === 'group') return `group invite-accept ${selectedInvite.id}`
     if (selectedGroup?.id) return `group members ${selectedGroup.id}`
     return 'group tab my'
   }
-  if (selectedSection === 'relays' && (selectedRelay?.publicIdentifier || selectedRelay?.relayKey)) {
+  if (selectedNode === 'relays' && (selectedRelay?.publicIdentifier || selectedRelay?.relayKey)) {
     return `relay join ${selectedRelay?.publicIdentifier || selectedRelay?.relayKey}`
   }
-  if (selectedSection === 'feed' && selectedFeedEvent?.id) {
-    return `reply ${selectedFeedEvent.id} ${selectedFeedEvent.pubkey} <content>`
+  if ((selectedNode === 'groups:my' || selectedNode === 'groups:browse') && selectedNote?.id) {
+    return `reply ${selectedNote.id} ${selectedNote.pubkey} <content>`
   }
-  if (selectedSection === 'feed') {
-    return 'feed source relays'
-  }
-  if (selectedSection === 'files' && selectedFile?.groupId) {
-    return `file filter group ${selectedFile.groupId}`
-  }
-  if (selectedSection === 'files') {
+  if (selectedNode?.startsWith('files')) {
+    if (selectedFile?.sha256) return `file download ${selectedFile.sha256}`
+    if (selectedFile?.groupId) return `file filter group ${selectedFile.groupId}`
     return 'file search <query>'
   }
-  if (selectedSection === 'invites') {
+  if (selectedNode === 'invites:group') {
     if (selectedInvite?.kind === 'group') return `invites accept group ${selectedInvite.id}`
+    return 'invites refresh'
+  }
+  if (selectedNode === 'invites:chat') {
     if (selectedInvite?.kind === 'chat') return `invites accept chat ${selectedInvite.id}`
     return 'invites refresh'
   }
-  if (selectedSection === 'chats') {
+  if (selectedNode === 'chats') {
     if (selectedInvite?.kind === 'chat') return `chat accept ${selectedInvite.id}`
     if (selectedConversation?.id) return `chat thread ${selectedConversation.id}`
     return 'chat refresh'
   }
-  if (selectedSection === 'bookmarks') {
-    return 'bookmark refresh'
-  }
-  if (selectedSection === 'search') {
-    return 'search notes <query>'
-  }
-  if (selectedSection === 'accounts') {
+  if (selectedNode === 'accounts') {
     return 'account profiles'
   }
 
@@ -562,15 +580,15 @@ export async function executeCommand(
   if (cmd === 'help') {
     return {
       message:
-        'Commands: help | goto <section> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | relay refresh/create/join/disconnect/leave | feed refresh/source/search/sort/filter | post/reply/react | compose start/text/attach/remove/show/publish/cancel | bookmark refresh/add/remove | group tab/refresh/invites/members/search/sort/filter/join-flow/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites accept/dismiss | file refresh/upload/search/sort/filter | list refresh/create/apply | chat tab/init/refresh/create/accept/dismiss/thread/send | perf overlay/snapshot | search <notes|profiles|groups|lists> <query>'
+        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | relay refresh/create/join/disconnect/leave | group tab/refresh/invites/members/search/sort/filter/join-flow/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept/dismiss | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot'
     }
   }
 
   if (cmd === 'goto') {
-    const section = parseSection(requireArg(args[1], 'section'))
+    const node = parseNode(requireArg(args[1], 'node'))
     return {
-      message: `Switched to ${section}`,
-      gotoSection: section
+      message: `Switched to ${node}`,
+      gotoNode: node
     }
   }
 
@@ -629,14 +647,14 @@ export async function executeCommand(
       await controller.startWorker()
       return {
         message: `Generated profile ${created.label || created.pubkey} pubkey=${created.pubkey} nsec=${created.nsec}`,
-        gotoSection: 'accounts'
+        gotoNode: 'accounts'
       }
     }
 
     if (action === 'profiles' || action === 'list') {
       const profiles = await controller.listAccountProfiles()
       if (profiles.length === 0) {
-        return { message: 'No profiles configured', gotoSection: 'accounts' }
+        return { message: 'No profiles configured', gotoNode: 'accounts' }
       }
 
       const compact = profiles
@@ -650,11 +668,11 @@ export async function executeCommand(
       if (compact.length > 165) {
         return {
           message: `Profiles loaded: ${profiles.length}. Use account login <index|pubkey|label> [password]`,
-          gotoSection: 'accounts'
+          gotoNode: 'accounts'
         }
       }
 
-      return { message: `Profiles: ${compact}`, gotoSection: 'accounts' }
+      return { message: `Profiles: ${compact}`, gotoNode: 'accounts' }
     }
 
     if (action === 'login' || action === 'auth') {
@@ -676,7 +694,7 @@ export async function executeCommand(
 
       return {
         message: `Authenticated profile ${selected.label || selected.pubkey}`,
-        gotoSection: 'accounts'
+        gotoNode: 'accounts'
       }
     }
 
@@ -686,7 +704,7 @@ export async function executeCommand(
       await controller.addNsecAccount(nsec, label)
       await controller.unlockCurrentAccount()
       await controller.startWorker()
-      return { message: 'nsec account added and unlocked', gotoSection: 'accounts' }
+      return { message: 'nsec account added and unlocked', gotoNode: 'accounts' }
     }
 
     if (action === 'add-ncryptsec') {
@@ -696,7 +714,7 @@ export async function executeCommand(
       await controller.addNcryptsecAccount(ncryptsec, password, label)
       await controller.unlockCurrentAccount(async () => password)
       await controller.startWorker()
-      return { message: 'ncryptsec account added and unlocked', gotoSection: 'accounts' }
+      return { message: 'ncryptsec account added and unlocked', gotoNode: 'accounts' }
     }
 
     if (action === 'select') {
@@ -704,25 +722,25 @@ export async function executeCommand(
       const profiles = await controller.listAccountProfiles()
       const selected = parseProfileSelector(selector, profiles)
       await controller.selectAccount(selected.pubkey)
-      return { message: `Selected account ${selected.pubkey}`, gotoSection: 'accounts' }
+      return { message: `Selected account ${selected.pubkey}`, gotoNode: 'accounts' }
     }
 
     if (action === 'unlock') {
       const password = args[2]
       await controller.unlockCurrentAccount(password ? async () => password : undefined)
       await controller.startWorker()
-      return { message: 'Account unlocked and worker started', gotoSection: 'accounts' }
+      return { message: 'Account unlocked and worker started', gotoNode: 'accounts' }
     }
 
     if (action === 'remove') {
       const pubkey = requireArg(args[2], 'pubkey')
       await controller.removeAccount(pubkey)
-      return { message: `Removed account ${pubkey}`, gotoSection: 'accounts' }
+      return { message: `Removed account ${pubkey}`, gotoNode: 'accounts' }
     }
 
     if (action === 'clear') {
       await controller.clearSession()
-      return { message: 'Session cleared', gotoSection: 'accounts' }
+      return { message: 'Session cleared', gotoNode: 'accounts' }
     }
 
     throw new Error(`Unknown account action: ${action}`)
@@ -732,15 +750,15 @@ export async function executeCommand(
     const action = requireArg(args[1], 'worker action').toLowerCase()
     if (action === 'start') {
       await controller.startWorker()
-      return { message: 'Worker started', gotoSection: 'dashboard' }
+      return { message: 'Worker started', gotoNode: 'dashboard' }
     }
     if (action === 'stop') {
       await controller.stopWorker()
-      return { message: 'Worker stopped', gotoSection: 'dashboard' }
+      return { message: 'Worker stopped', gotoNode: 'dashboard' }
     }
     if (action === 'restart') {
       await controller.restartWorker()
-      return { message: 'Worker restarted', gotoSection: 'dashboard' }
+      return { message: 'Worker restarted', gotoNode: 'dashboard' }
     }
     throw new Error(`Unknown worker action: ${action}`)
   }
@@ -750,7 +768,7 @@ export async function executeCommand(
 
     if (action === 'refresh') {
       await controller.refreshRelays()
-      return { message: 'Relays refreshed', gotoSection: 'relays' }
+      return { message: 'Relays refreshed', gotoNode: 'relays' }
     }
 
     if (action === 'create') {
@@ -767,7 +785,7 @@ export async function executeCommand(
           ? args.slice(args.indexOf('--desc') + 1).join(' ')
           : undefined
       })
-      return { message: `Relay created: ${name}`, gotoSection: 'relays' }
+      return { message: `Relay created: ${name}`, gotoNode: 'relays' }
     }
 
     if (action === 'join') {
@@ -785,13 +803,13 @@ export async function executeCommand(
         publicIdentifier: isRelayKey ? undefined : identifier,
         authToken: token
       })
-      return { message: `Join relay requested for ${identifier}`, gotoSection: 'relays' }
+      return { message: `Join relay requested for ${identifier}`, gotoNode: 'relays' }
     }
 
     if (action === 'disconnect') {
       const relayKey = requireArg(args[2], 'relayKey')
       await controller.disconnectRelay(relayKey)
-      return { message: `Relay disconnected ${relayKey}`, gotoSection: 'relays' }
+      return { message: `Relay disconnected ${relayKey}`, gotoNode: 'relays' }
     }
 
     if (action === 'leave') {
@@ -805,7 +823,7 @@ export async function executeCommand(
         saveRelaySnapshot,
         saveSharedFiles
       })
-      return { message: `Leave group requested for ${identifier}`, gotoSection: 'relays' }
+      return { message: `Leave group requested for ${identifier}`, gotoNode: 'relays' }
     }
 
     if (action === 'join-flow') {
@@ -826,164 +844,10 @@ export async function executeCommand(
         token,
         openJoin: args.includes('--open')
       })
-      return { message: `Join flow started for ${publicIdentifier}`, gotoSection: 'groups' }
+      return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }
 
     throw new Error(`Unknown relay action: ${action}`)
-  }
-
-  if (cmd === 'feed') {
-    const action = requireArg(args[1], 'feed action').toLowerCase()
-    if (action === 'refresh') {
-      const limit = args[2] ? Number(args[2]) : 120
-      await controller.refreshFeed(Number.isFinite(limit) ? limit : 120)
-      return { message: 'Feed refreshed', gotoSection: 'feed' }
-    }
-    if (action === 'source') {
-      const mode = requireArg(args[2], 'feed source mode').toLowerCase()
-      if (mode === 'relays') {
-        await controller.setFeedSourceRelays()
-        return { message: 'Feed source set to relays', gotoSection: 'feed' }
-      }
-      if (mode === 'following') {
-        await controller.setFeedSourceFollowing()
-        return { message: 'Feed source set to following', gotoSection: 'feed' }
-      }
-      if (mode === 'relay') {
-        let selector: string | undefined = args[3]
-        if (!selector) {
-          const selectedRelay = resolveSelectedRelay(context)
-          selector = selectedRelay?.connectionUrl || selectedRelay?.publicIdentifier || selectedRelay?.relayKey
-        }
-        selector = requireArg(selector, 'relay selector')
-        await controller.setFeedSourceRelaySelector(selector)
-        return { message: `Feed source set to relay ${selector}`, gotoSection: 'feed' }
-      }
-      if (mode === 'group') {
-        let selector: string | undefined = args[3]
-        const relay = args[4]
-        if (!selector) {
-          selector = resolveSelectedGroup(context)?.id
-            || (resolveSelectedInvite(context)?.kind === 'group'
-              ? (resolveSelectedInvite(context) as SelectedGroupInviteRef).groupId
-              : undefined)
-        }
-        selector = requireArg(selector, 'groupId or index')
-        await controller.setFeedSourceGroupSelector(selector, relay)
-        return { message: `Feed source set to group ${selector}`, gotoSection: 'feed' }
-      }
-      throw new Error('Feed source mode must be relays|following|relay|group')
-    }
-    if (action === 'search') {
-      const query = args[2] ? remainder(trimmed, `${args[0]} ${args[1]}`) : ''
-      if (!query || query.toLowerCase() === 'clear') {
-        await controller.setFeedSearch('')
-        return { message: 'Feed search cleared', gotoSection: 'feed' }
-      }
-      await controller.setFeedSearch(query)
-      return { message: 'Feed search updated', gotoSection: 'feed' }
-    }
-    if (action === 'sort') {
-      const sortKey = requireArg(args[2], 'sort key') as 'createdAt' | 'kind' | 'author' | 'content'
-      if (!['createdAt', 'kind', 'author', 'content'].includes(sortKey)) {
-        throw new Error('Feed sort key must be createdAt|kind|author|content')
-      }
-      const direction = args[3]
-      await controller.setFeedSort(sortKey, direction)
-      return { message: `Feed sort updated (${sortKey}${direction ? ` ${direction}` : ''})`, gotoSection: 'feed' }
-    }
-    if (action === 'filter') {
-      const target = requireArg(args[2], 'filter target').toLowerCase()
-      if (target !== 'kind') {
-        throw new Error('Feed filter target must be kind')
-      }
-      const value = requireArg(args[3], 'kind csv or all')
-      if (value.toLowerCase() === 'all') {
-        await controller.setFeedKindFilter(null)
-        return { message: 'Feed kind filter cleared', gotoSection: 'feed' }
-      }
-      const kinds = splitCsv(value).map((entry) => Number(entry)).filter((entry) => Number.isFinite(entry))
-      await controller.setFeedKindFilter(kinds)
-      return { message: `Feed kind filter set (${kinds.join(',')})`, gotoSection: 'feed' }
-    }
-    throw new Error(`Unknown feed action: ${action}`)
-  }
-
-  if (cmd === 'post') {
-    const content = remainder(trimmed, 'post')
-    if (!content) throw new Error('Post content required')
-    await controller.publishPost(content)
-    return { message: 'Post published', gotoSection: 'feed' }
-  }
-
-  if (cmd === 'reply') {
-    let eventId: string | undefined = args[1]
-    let pubkey: string | undefined = args[2]
-    let content = ''
-    const hasExplicitReplyTarget = Boolean(args[1] && args[2])
-
-    if (!hasExplicitReplyTarget) {
-      const selectedEvent = resolveSelectedFeedEvent(context)
-      eventId = selectedEvent?.id
-      pubkey = selectedEvent?.pubkey
-      content = remainder(trimmed, 'reply')
-    } else {
-      content = remainder(trimmed, `${args[0]} ${args[1]} ${args[2]}`)
-    }
-
-    eventId = requireArg(eventId, 'eventId')
-    pubkey = requireArg(pubkey, 'event pubkey')
-    if (!content) throw new Error('Reply content required')
-    await controller.publishReply(content, eventId, pubkey)
-    return { message: 'Reply published', gotoSection: 'feed' }
-  }
-
-  if (cmd === 'react') {
-    let eventId: string | undefined = args[1]
-    let pubkey: string | undefined = args[2]
-    let reaction: string | undefined = args[3]
-    if (args[1] && !args[2]) {
-      const selectedEvent = resolveSelectedFeedEvent(context)
-      if (selectedEvent && !isHex64(args[1])) {
-        eventId = selectedEvent.id
-        pubkey = selectedEvent.pubkey
-        reaction = args[1]
-      }
-    }
-    if (!eventId || !pubkey) {
-      const selectedEvent = resolveSelectedFeedEvent(context)
-      if (!eventId) eventId = selectedEvent?.id
-      if (!pubkey) pubkey = selectedEvent?.pubkey
-    }
-    eventId = requireArg(eventId, 'eventId')
-    pubkey = requireArg(pubkey, 'event pubkey')
-    reaction = requireArg(reaction, 'reaction')
-    await controller.publishReaction(eventId, pubkey, reaction)
-    return { message: 'Reaction published', gotoSection: 'feed' }
-  }
-
-  if (cmd === 'bookmark') {
-    const action = requireArg(args[1], 'bookmark action').toLowerCase()
-    if (action === 'refresh') {
-      await controller.refreshBookmarks()
-      return { message: 'Bookmarks refreshed', gotoSection: 'bookmarks' }
-    }
-    if (action === 'add') {
-      let eventId: string | undefined = args[2]
-      if (!eventId) {
-        const selectedEvent = resolveSelectedFeedEvent(context)
-        eventId = selectedEvent?.id
-      }
-      eventId = requireArg(eventId, 'eventId')
-      await controller.addBookmark(eventId)
-      return { message: 'Bookmark added', gotoSection: 'bookmarks' }
-    }
-    if (action === 'remove') {
-      const eventId = requireArg(args[2], 'eventId')
-      await controller.removeBookmark(eventId)
-      return { message: 'Bookmark removed', gotoSection: 'bookmarks' }
-    }
-    throw new Error(`Unknown bookmark action: ${action}`)
   }
 
   if (cmd === 'group') {
@@ -992,23 +856,23 @@ export async function executeCommand(
     if (action === 'tab') {
       const tab = requireArg(args[2], 'tab').toLowerCase()
       if (tab === 'invites') {
-        return { message: 'Group invites moved to Invites section', gotoSection: 'invites' }
+        return { message: 'Group invites live under Invites > Group Invites', gotoNode: 'invites:group' }
       }
       if (!['discover', 'my'].includes(tab)) {
         throw new Error('Group tab must be discover|my')
       }
       await controller.setGroupViewTab(tab as 'discover' | 'my')
-      return { message: `Group tab ${tab}`, gotoSection: 'groups' }
+      return { message: `Group tab ${tab}`, gotoNode: tab === 'my' ? 'groups:my' : 'groups:browse' }
     }
 
     if (action === 'refresh') {
       await controller.refreshGroups()
-      return { message: 'Groups refreshed', gotoSection: 'groups' }
+      return { message: 'Groups refreshed', gotoNode: 'groups:browse' }
     }
 
     if (action === 'invites') {
       await controller.refreshInvites()
-      return { message: 'Invites refreshed', gotoSection: 'groups' }
+      return { message: 'Group invites refreshed', gotoNode: 'invites:group' }
     }
 
     if (action === 'members') {
@@ -1018,17 +882,17 @@ export async function executeCommand(
       }
       groupId = requireArg(groupId, 'groupId')
       await controller.refreshGroupMembers(groupId, resolveSelectedGroup(context)?.relay || undefined)
-      return { message: `Group members refreshed for ${groupId}`, gotoSection: 'groups' }
+      return { message: `Group members refreshed for ${groupId}`, gotoNode: 'groups:my' }
     }
 
     if (action === 'search') {
       const query = args[2] ? remainder(trimmed, `${args[0]} ${args[1]}`) : ''
       if (!query || query.toLowerCase() === 'clear') {
         await controller.setGroupSearch('')
-        return { message: 'Group search cleared', gotoSection: 'groups' }
+        return { message: 'Group search cleared', gotoNode: 'groups:browse' }
       }
       await controller.setGroupSearch(query)
-      return { message: 'Group search updated', gotoSection: 'groups' }
+      return { message: 'Group search updated', gotoNode: 'groups:browse' }
     }
 
     if (action === 'sort') {
@@ -1045,7 +909,7 @@ export async function executeCommand(
         throw new Error('Group sort key must be name|description|open|public|admin|createdAt|members|peers')
       }
       await controller.setGroupSort(sortKey, args[3])
-      return { message: `Group sort updated (${sortKey}${args[3] ? ` ${args[3]}` : ''})`, gotoSection: 'groups' }
+      return { message: `Group sort updated (${sortKey}${args[3] ? ` ${args[3]}` : ''})`, gotoNode: 'groups:browse' }
     }
 
     if (action === 'filter') {
@@ -1056,14 +920,14 @@ export async function executeCommand(
           throw new Error('Visibility filter must be all|public|private')
         }
         await controller.setGroupVisibilityFilter(value as 'all' | 'public' | 'private')
-        return { message: `Group visibility filter set (${value})`, gotoSection: 'groups' }
+        return { message: `Group visibility filter set (${value})`, gotoNode: 'groups:browse' }
       }
       if (target === 'join') {
         if (!['all', 'open', 'closed'].includes(value)) {
           throw new Error('Join filter must be all|open|closed')
         }
         await controller.setGroupJoinFilter(value as 'all' | 'open' | 'closed')
-        return { message: `Group join filter set (${value})`, gotoSection: 'groups' }
+        return { message: `Group join filter set (${value})`, gotoNode: 'groups:browse' }
       }
       throw new Error('Group filter target must be visibility|join')
     }
@@ -1091,7 +955,7 @@ export async function executeCommand(
         token,
         openJoin: args.includes('--open')
       })
-      return { message: `Join flow started for ${publicIdentifier}`, gotoSection: 'groups' }
+      return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }
 
     if (action === 'invite') {
@@ -1125,7 +989,7 @@ export async function executeCommand(
           fileSharing: true
         }
       })
-      return { message: `Invite sent to ${inviteePubkey}`, gotoSection: 'groups' }
+      return { message: `Invite sent to ${inviteePubkey}`, gotoNode: 'invites:group' }
     }
 
     if (action === 'invite-accept' || action === 'accept-invite') {
@@ -1136,7 +1000,7 @@ export async function executeCommand(
       }
       inviteId = requireArg(inviteId, 'inviteId')
       await controller.acceptGroupInvite(inviteId)
-      return { message: `Group invite accepted ${inviteId}`, gotoSection: 'groups' }
+      return { message: `Group invite accepted ${inviteId}`, gotoNode: 'invites:group' }
     }
 
     if (action === 'invite-dismiss' || action === 'dismiss-invite') {
@@ -1147,7 +1011,7 @@ export async function executeCommand(
       }
       inviteId = requireArg(inviteId, 'inviteId')
       await controller.dismissGroupInvite(inviteId)
-      return { message: `Group invite dismissed ${inviteId}`, gotoSection: 'groups' }
+      return { message: `Group invite dismissed ${inviteId}`, gotoNode: 'invites:group' }
     }
 
     if (action === 'join-requests') {
@@ -1157,7 +1021,7 @@ export async function executeCommand(
       }
       groupId = requireArg(groupId, 'groupId')
       await controller.refreshJoinRequests(groupId, resolveSelectedGroup(context)?.relay || undefined)
-      return { message: `Join requests refreshed for ${groupId}`, gotoSection: 'groups' }
+      return { message: `Join requests refreshed for ${groupId}`, gotoNode: 'groups:my' }
     }
 
     if (action === 'approve') {
@@ -1170,7 +1034,7 @@ export async function executeCommand(
       groupId = requireArg(groupId, 'groupId')
       pubkey = requireArg(pubkey, 'pubkey')
       await controller.approveJoinRequest(groupId, pubkey, resolveSelectedGroup(context)?.relay || undefined)
-      return { message: `Approved join request ${pubkey}`, gotoSection: 'groups' }
+      return { message: `Approved join request ${pubkey}`, gotoNode: 'groups:my' }
     }
 
     if (action === 'reject') {
@@ -1183,7 +1047,7 @@ export async function executeCommand(
       groupId = requireArg(groupId, 'groupId')
       pubkey = requireArg(pubkey, 'pubkey')
       await controller.rejectJoinRequest(groupId, pubkey, resolveSelectedGroup(context)?.relay || undefined)
-      return { message: `Rejected join request ${pubkey}`, gotoSection: 'groups' }
+      return { message: `Rejected join request ${pubkey}`, gotoNode: 'groups:my' }
     }
 
     if (action === 'update-members') {
@@ -1211,7 +1075,7 @@ export async function executeCommand(
         memberRemoves: op === 'remove' ? [{ pubkey, ts: now }] : undefined
       })
 
-      return { message: `Membership update sent (${op} ${pubkey})`, gotoSection: 'groups' }
+      return { message: `Membership update sent (${op} ${pubkey})`, gotoNode: 'groups:my' }
     }
 
     if (action === 'update-auth') {
@@ -1238,10 +1102,64 @@ export async function executeCommand(
         token
       })
 
-      return { message: `Auth token updated for ${pubkey}`, gotoSection: 'groups' }
+      return { message: `Auth token updated for ${pubkey}`, gotoNode: 'groups:my' }
     }
 
     throw new Error(`Unknown group action: ${action}`)
+  }
+
+  if (cmd === 'invites') {
+    const action = requireArg(args[1], 'invites action').toLowerCase()
+    if (action === 'refresh') {
+      await Promise.all([controller.refreshInvites(), controller.refreshChats()])
+      return { message: 'Invites refreshed', gotoNode: 'invites:group' }
+    }
+    const target = requireArg(args[2], 'invite target').toLowerCase()
+    const inviteId = args[3]
+
+    const resolveGroupInviteId = () => {
+      if (inviteId) return inviteId
+      const selectedInvite = resolveSelectedInvite(context)
+      if (selectedInvite?.kind === 'group') return selectedInvite.id
+      return undefined
+    }
+
+    const resolveChatInviteId = () => {
+      if (inviteId) return inviteId
+      const selectedInvite = resolveSelectedInvite(context)
+      if (selectedInvite?.kind === 'chat') return selectedInvite.id
+      return undefined
+    }
+
+    if (action === 'accept') {
+      if (target === 'group') {
+        const id = requireArg(resolveGroupInviteId(), 'inviteId')
+        await controller.acceptGroupInvite(id)
+        return { message: `Accepted group invite ${id}`, gotoNode: 'invites:group' }
+      }
+      if (target === 'chat') {
+        const id = requireArg(resolveChatInviteId(), 'inviteId')
+        await controller.acceptChatInvite(id)
+        return { message: `Accepted chat invite ${id}`, gotoNode: 'invites:chat' }
+      }
+      throw new Error('Invites accept target must be group|chat')
+    }
+
+    if (action === 'dismiss') {
+      if (target === 'group') {
+        const id = requireArg(resolveGroupInviteId(), 'inviteId')
+        await controller.dismissGroupInvite(id)
+        return { message: `Dismissed group invite ${id}`, gotoNode: 'invites:group' }
+      }
+      if (target === 'chat') {
+        const id = requireArg(resolveChatInviteId(), 'inviteId')
+        await controller.dismissChatInvite(id)
+        return { message: `Dismissed chat invite ${id}`, gotoNode: 'invites:chat' }
+      }
+      throw new Error('Invites dismiss target must be group|chat')
+    }
+
+    throw new Error(`Unknown invites action: ${action}`)
   }
 
   if (cmd === 'file') {
@@ -1260,7 +1178,7 @@ export async function executeCommand(
           || selectedFile?.groupId
       }
       await controller.refreshGroupFiles(groupId)
-      return { message: 'Files refreshed', gotoSection: 'files' }
+      return { message: 'Files refreshed', gotoNode: 'files' }
     }
 
     if (action === 'upload') {
@@ -1281,17 +1199,58 @@ export async function executeCommand(
         publicIdentifier: isRelayKey ? null : identifier,
         filePath
       })
-      return { message: `Uploaded file ${filePath}`, gotoSection: 'files' }
+      return { message: `Uploaded file ${filePath}`, gotoNode: 'files' }
+    }
+
+    if (action === 'download') {
+      let selector: string | undefined = args[2]
+      const selectedFile = resolveSelectedFile(context)
+      if (!selector) {
+        selector = selectedFile?.sha256 || selectedFile?.eventId || undefined
+      }
+      selector = requireArg(selector, 'eventId or sha256')
+      const fileHash = isHex64(selector)
+        ? selector.toLowerCase()
+        : requireArg(selectedFile?.sha256 || undefined, 'selected file sha256')
+      await controller.downloadGroupFile({
+        relayKey: selectedFile?.relay && isHex64(selectedFile.relay) ? selectedFile.relay.toLowerCase() : null,
+        publicIdentifier: selectedFile?.groupId || null,
+        groupId: selectedFile?.groupId || null,
+        eventId: selectedFile?.eventId || null,
+        fileHash,
+        fileName: selectedFile?.fileName || null
+      })
+      return { message: `Downloaded ${fileHash}`, gotoNode: 'files' }
+    }
+
+    if (action === 'delete') {
+      let selector: string | undefined = args[2]
+      const selectedFile = resolveSelectedFile(context)
+      if (!selector) {
+        selector = selectedFile?.sha256 || selectedFile?.eventId || undefined
+      }
+      selector = requireArg(selector, 'eventId or sha256')
+      const fileHash = isHex64(selector)
+        ? selector.toLowerCase()
+        : requireArg(selectedFile?.sha256 || undefined, 'selected file sha256')
+      await controller.deleteLocalGroupFile({
+        relayKey: selectedFile?.relay && isHex64(selectedFile.relay) ? selectedFile.relay.toLowerCase() : null,
+        publicIdentifier: selectedFile?.groupId || null,
+        groupId: selectedFile?.groupId || null,
+        eventId: selectedFile?.eventId || null,
+        fileHash
+      })
+      return { message: `Deleted local file ${fileHash}`, gotoNode: 'files' }
     }
 
     if (action === 'search') {
       const query = args[2] ? remainder(trimmed, `${args[0]} ${args[1]}`) : ''
       if (!query || query.toLowerCase() === 'clear') {
         await controller.setFileSearch('')
-        return { message: 'File search cleared', gotoSection: 'files' }
+        return { message: 'File search cleared', gotoNode: 'files' }
       }
       await controller.setFileSearch(query)
-      return { message: 'File search updated', gotoSection: 'files' }
+      return { message: 'File search updated', gotoNode: 'files' }
     }
 
     if (action === 'sort') {
@@ -1306,7 +1265,7 @@ export async function executeCommand(
         throw new Error('File sort key must be fileName|group|uploadedAt|uploadedBy|size|mime')
       }
       await controller.setFileSort(sortKey, args[3])
-      return { message: `File sort updated (${sortKey}${args[3] ? ` ${args[3]}` : ''})`, gotoSection: 'files' }
+      return { message: `File sort updated (${sortKey}${args[3] ? ` ${args[3]}` : ''})`, gotoNode: 'files' }
     }
 
     if (action === 'filter') {
@@ -1314,47 +1273,16 @@ export async function executeCommand(
       const value = requireArg(args[3], 'filter value')
       if (target === 'mime') {
         await controller.setFileMimeFilter(value.toLowerCase() === 'all' ? 'all' : value)
-        return { message: `File mime filter set (${value})`, gotoSection: 'files' }
+        return { message: `File mime filter set (${value})`, gotoNode: 'files' }
       }
       if (target === 'group') {
         await controller.setFileGroupFilter(value.toLowerCase() === 'all' ? 'all' : value)
-        return { message: `File group filter set (${value})`, gotoSection: 'files' }
+        return { message: `File group filter set (${value})`, gotoNode: 'files' }
       }
       throw new Error('File filter target must be mime|group')
     }
 
     throw new Error(`Unknown file action: ${action}`)
-  }
-
-  if (cmd === 'list') {
-    const action = requireArg(args[1], 'list action').toLowerCase()
-
-    if (action === 'refresh') {
-      await controller.refreshStarterPacks()
-      return { message: 'Lists refreshed', gotoSection: 'lists' }
-    }
-
-    if (action === 'create') {
-      const dTag = requireArg(args[2], 'dTag')
-      const title = requireArg(args[3], 'title')
-      const pubkeys = splitCsv(requireArg(args[4], 'pubkeys csv'))
-      await controller.createStarterPack({
-        dTag,
-        title,
-        pubkeys,
-        description: args[5]
-      })
-      return { message: `Starter pack ${dTag} published`, gotoSection: 'lists' }
-    }
-
-    if (action === 'apply') {
-      const dTag = requireArg(args[2], 'dTag')
-      const author = args[3]
-      await controller.applyStarterPack(dTag, author)
-      return { message: `Applied starter pack ${dTag}`, gotoSection: 'lists' }
-    }
-
-    throw new Error(`Unknown list action: ${action}`)
   }
 
   if (cmd === 'compose') {
@@ -1371,49 +1299,102 @@ export async function executeCommand(
       }
       groupId = requireArg(groupId, 'groupId')
       await controller.startComposeDraft(groupId, relay)
-      return { message: `Compose draft started for ${groupId}`, gotoSection: 'feed' }
+      return { message: `Compose draft started for ${groupId}`, gotoNode: 'groups:my' }
     }
 
     if (action === 'text') {
       const content = remainder(trimmed, `${args[0]} ${args[1]}`)
       await controller.updateComposeText(content)
-      return { message: 'Compose draft text updated', gotoSection: 'feed' }
+      return { message: 'Compose draft text updated', gotoNode: 'groups:my' }
     }
 
     if (action === 'attach') {
       const filePath = requireArg(args[2], 'filePath')
       await controller.attachComposeFile(filePath)
-      return { message: `Attached ${filePath}`, gotoSection: 'feed' }
+      return { message: `Attached ${filePath}`, gotoNode: 'groups:my' }
     }
 
     if (action === 'remove') {
       const selector = requireArg(args[2], 'index|filePath')
       await controller.removeComposeAttachment(selector)
-      return { message: `Removed attachment ${selector}`, gotoSection: 'feed' }
+      return { message: `Removed attachment ${selector}`, gotoNode: 'groups:my' }
     }
 
     if (action === 'show') {
       const draft = controller.composeDraftSnapshot()
       if (!draft) {
-        return { message: 'No compose draft in progress', gotoSection: 'feed' }
+        return { message: 'No compose draft in progress', gotoNode: 'groups:my' }
       }
       return {
         message: `Compose draft group=${draft.groupId} relay=${draft.relay || '-'} attachments=${draft.attachments.length} contentLen=${draft.content.length}`,
-        gotoSection: 'feed'
+        gotoNode: 'groups:my'
       }
     }
 
     if (action === 'publish') {
       await controller.publishComposeDraft()
-      return { message: 'Compose draft published', gotoSection: 'feed' }
+      return { message: 'Compose draft published', gotoNode: 'groups:my' }
     }
 
     if (action === 'cancel') {
       await controller.cancelComposeDraft()
-      return { message: 'Compose draft canceled', gotoSection: 'feed' }
+      return { message: 'Compose draft canceled', gotoNode: 'groups:my' }
     }
 
     throw new Error(`Unknown compose action: ${action}`)
+  }
+
+  if (cmd === 'post') {
+    const content = remainder(trimmed, 'post')
+    if (!content) throw new Error('Post content required')
+    await controller.publishPost(content)
+    return { message: 'Post published', gotoNode: 'groups:my' }
+  }
+
+  if (cmd === 'reply') {
+    let eventId: string | undefined = args[1]
+    let pubkey: string | undefined = args[2]
+    let content = ''
+    const hasExplicitReplyTarget = Boolean(args[1] && args[2])
+
+    if (!hasExplicitReplyTarget) {
+      const selectedEvent = resolveSelectedNote(context)
+      eventId = selectedEvent?.id
+      pubkey = selectedEvent?.pubkey
+      content = remainder(trimmed, 'reply')
+    } else {
+      content = remainder(trimmed, `${args[0]} ${args[1]} ${args[2]}`)
+    }
+
+    eventId = requireArg(eventId, 'eventId')
+    pubkey = requireArg(pubkey, 'event pubkey')
+    if (!content) throw new Error('Reply content required')
+    await controller.publishReply(content, eventId, pubkey)
+    return { message: 'Reply published', gotoNode: 'groups:my' }
+  }
+
+  if (cmd === 'react') {
+    let eventId: string | undefined = args[1]
+    let pubkey: string | undefined = args[2]
+    let reaction: string | undefined = args[3]
+    if (args[1] && !args[2]) {
+      const selectedEvent = resolveSelectedNote(context)
+      if (selectedEvent && !isHex64(args[1])) {
+        eventId = selectedEvent.id
+        pubkey = selectedEvent.pubkey
+        reaction = args[1]
+      }
+    }
+    if (!eventId || !pubkey) {
+      const selectedEvent = resolveSelectedNote(context)
+      if (!eventId) eventId = selectedEvent?.id
+      if (!pubkey) pubkey = selectedEvent?.pubkey
+    }
+    eventId = requireArg(eventId, 'eventId')
+    pubkey = requireArg(pubkey, 'event pubkey')
+    reaction = requireArg(reaction, 'reaction')
+    await controller.publishReaction(eventId, pubkey, reaction)
+    return { message: 'Reaction published', gotoNode: 'groups:my' }
   }
 
   if (cmd === 'chat') {
@@ -1425,17 +1406,17 @@ export async function executeCommand(
         throw new Error('Chat tab must be conversations|invites')
       }
       await controller.setChatViewTab(tab as 'conversations' | 'invites')
-      return { message: `Chat tab ${tab}`, gotoSection: 'chats' }
+      return { message: `Chat tab ${tab}`, gotoNode: 'chats' }
     }
 
     if (action === 'init') {
       await controller.initChats()
-      return { message: 'Chat init requested (background retry enabled)', gotoSection: 'chats' }
+      return { message: 'Chat init requested (background retry enabled)', gotoNode: 'chats' }
     }
 
     if (action === 'refresh') {
       await controller.refreshChats()
-      return { message: 'Chats refreshed', gotoSection: 'chats' }
+      return { message: 'Chats refreshed', gotoNode: 'chats' }
     }
 
     if (action === 'create') {
@@ -1446,7 +1427,7 @@ export async function executeCommand(
         members,
         description: args[4]
       })
-      return { message: 'Conversation created', gotoSection: 'chats' }
+      return { message: 'Conversation created', gotoNode: 'chats' }
     }
 
     if (action === 'accept') {
@@ -1457,7 +1438,7 @@ export async function executeCommand(
       }
       inviteId = requireArg(inviteId, 'inviteId')
       await controller.acceptChatInvite(inviteId)
-      return { message: `Invite accepted ${inviteId}`, gotoSection: 'chats' }
+      return { message: `Invite accepted ${inviteId}`, gotoNode: 'invites:chat' }
     }
 
     if (action === 'dismiss') {
@@ -1468,7 +1449,7 @@ export async function executeCommand(
       }
       inviteId = requireArg(inviteId, 'inviteId')
       await controller.dismissChatInvite(inviteId)
-      return { message: `Invite dismissed ${inviteId}`, gotoSection: 'chats' }
+      return { message: `Invite dismissed ${inviteId}`, gotoNode: 'invites:chat' }
     }
 
     if (action === 'thread') {
@@ -1478,7 +1459,7 @@ export async function executeCommand(
       }
       conversationId = requireArg(conversationId, 'conversationId')
       await controller.loadChatThread(conversationId)
-      return { message: `Thread loaded ${conversationId}`, gotoSection: 'chats' }
+      return { message: `Thread loaded ${conversationId}`, gotoNode: 'chats' }
     }
 
     if (action === 'send') {
@@ -1503,78 +1484,10 @@ export async function executeCommand(
       conversationId = requireArg(conversationId, 'conversationId')
       if (!content) throw new Error('Message content required')
       await controller.sendChatMessage(conversationId, content)
-      return { message: 'Message sent', gotoSection: 'chats' }
+      return { message: 'Message sent', gotoNode: 'chats' }
     }
 
     throw new Error(`Unknown chat action: ${action}`)
-  }
-
-  if (cmd === 'search') {
-    const rawMode = requireArg(args[1], 'mode').toLowerCase()
-    const mode = rawMode as SearchMode
-    if (!['notes', 'profiles', 'groups', 'lists'].includes(mode)) {
-      throw new Error('Search mode must be notes|profiles|groups|lists')
-    }
-
-    const query = remainder(trimmed, `${args[0]} ${args[1]}`)
-    if (!query) throw new Error('Search query required')
-
-    await controller.search(mode, query)
-    return { message: `Search complete (${mode})`, gotoSection: 'search' }
-  }
-
-  if (cmd === 'invites') {
-    const action = requireArg(args[1], 'invites action').toLowerCase()
-    if (action === 'refresh') {
-      await Promise.all([controller.refreshInvites(), controller.refreshChats()])
-      return { message: 'Invites refreshed', gotoSection: 'invites' }
-    }
-    const target = requireArg(args[2], 'invite target').toLowerCase()
-    const inviteId = args[3]
-
-    const resolveGroupInviteId = () => {
-      if (inviteId) return inviteId
-      const selectedInvite = resolveSelectedInvite(context)
-      if (selectedInvite?.kind === 'group') return selectedInvite.id
-      return undefined
-    }
-
-    const resolveChatInviteId = () => {
-      if (inviteId) return inviteId
-      const selectedInvite = resolveSelectedInvite(context)
-      if (selectedInvite?.kind === 'chat') return selectedInvite.id
-      return undefined
-    }
-
-    if (action === 'accept') {
-      if (target === 'group') {
-        const id = requireArg(resolveGroupInviteId(), 'inviteId')
-        await controller.acceptGroupInvite(id)
-        return { message: `Accepted group invite ${id}`, gotoSection: 'invites' }
-      }
-      if (target === 'chat') {
-        const id = requireArg(resolveChatInviteId(), 'inviteId')
-        await controller.acceptChatInvite(id)
-        return { message: `Accepted chat invite ${id}`, gotoSection: 'invites' }
-      }
-      throw new Error('Invites accept target must be group|chat')
-    }
-
-    if (action === 'dismiss') {
-      if (target === 'group') {
-        const id = requireArg(resolveGroupInviteId(), 'inviteId')
-        await controller.dismissGroupInvite(id)
-        return { message: `Dismissed group invite ${id}`, gotoSection: 'invites' }
-      }
-      if (target === 'chat') {
-        const id = requireArg(resolveChatInviteId(), 'inviteId')
-        await controller.dismissChatInvite(id)
-        return { message: `Dismissed chat invite ${id}`, gotoSection: 'invites' }
-      }
-      throw new Error('Invites dismiss target must be group|chat')
-    }
-
-    throw new Error(`Unknown invites action: ${action}`)
   }
 
   if (cmd === 'perf') {
@@ -1600,12 +1513,9 @@ export async function executeCommand(
     if (!target || target === 'all') {
       await Promise.all([
         controller.refreshRelays(),
-        controller.refreshFeed(),
         controller.refreshGroups(),
         controller.refreshInvites(),
         controller.refreshGroupFiles(),
-        controller.refreshStarterPacks(),
-        controller.refreshBookmarks(),
         controller.refreshChats()
       ])
       return { message: 'All views refreshed' }

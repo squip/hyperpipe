@@ -73,8 +73,29 @@ export class WorkerHost {
   private currentWorkerUserKey: string | null = null
   private pendingRequests = new Map<string, PendingRequest>()
   private emitter = new EventEmitter()
+  private parentExitHooksInstalled = false
+
+  private installParentExitHooks(): void {
+    if (this.parentExitHooksInstalled) return
+    this.parentExitHooksInstalled = true
+
+    const shutdownChild = (): void => {
+      if (!this.workerProcess) return
+      try {
+        this.workerProcess.kill('SIGTERM')
+      } catch {
+        // ignore
+      }
+    }
+
+    process.on('exit', shutdownChild)
+    process.on('SIGINT', shutdownChild)
+    process.on('SIGTERM', shutdownChild)
+  }
 
   async start(config: WorkerStartConfig): Promise<StartResult> {
+    this.installParentExitHooks()
+
     const validationError = validateWorkerConfigPayload(config.config)
     if (validationError) {
       return { success: false, configSent: false, error: validationError }

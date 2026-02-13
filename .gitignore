@@ -41,7 +41,9 @@ build/Release
 hypertuna-worker/node_modules/
 hypertuna-worker/test/*
 !hypertuna-worker/test/blind-peering-manager.test.js
+!hypertuna-worker/test/group-file-ipc.test.js
 !hypertuna-worker/test/plugin-marketplace-download.test.js
+!hypertuna-worker/test/public-gateway-hyperbee-adapter.test.js
 hypertuna-worker/package-lock.json
 hypertuna-desktop/node_modules/
 public-gateway/node_modules/

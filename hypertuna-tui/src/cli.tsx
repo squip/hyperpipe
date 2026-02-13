@@ -75,14 +75,30 @@ const app = render(
   }
 )
 
+let shuttingDown = false
+
+function shutdown(exitCode = 0): void {
+  if (shuttingDown) return
+  shuttingDown = true
+  try {
+    app.unmount()
+  } catch {
+    // best effort
+  }
+  setTimeout(() => {
+    process.exit(exitCode)
+  }, 400).unref()
+}
+
+process.on('SIGINT', () => shutdown(0))
+process.on('SIGTERM', () => shutdown(0))
+
 process.on('unhandledRejection', (error) => {
   process.stderr.write(`Unhandled rejection: ${String(error)}\n`)
-  app.unmount()
-  process.exit(1)
+  shutdown(1)
 })
 
 process.on('uncaughtException', (error) => {
   process.stderr.write(`Uncaught exception: ${String(error)}\n`)
-  app.unmount()
-  process.exit(1)
+  shutdown(1)
 })

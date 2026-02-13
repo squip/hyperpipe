@@ -4,6 +4,16 @@ import { defaultUiState, type AccountScopedUiState, type UiState, uiStateSchema 
 const defaultAccountScopedUiState = (): AccountScopedUiState => ({
   groupViewTab: 'discover',
   chatViewTab: 'conversations',
+  selectedNode: 'dashboard',
+  focusPane: 'left-tree',
+  treeExpanded: {
+    groups: true,
+    invites: true,
+    files: true
+  },
+  nodeViewport: {},
+  rightTopSelectionByNode: {},
+  rightBottomOffsetByNode: {},
   feedSource: {
     mode: 'relays',
     relayUrl: null,
@@ -38,6 +48,7 @@ const defaultAccountScopedUiState = (): AccountScopedUiState => ({
   dismissedChatInviteIds: [],
   acceptedChatInviteIds: [],
   acceptedChatInviteConversationIds: [],
+  hiddenDeletedFileKeys: [],
   perfOverlayEnabled: false
 })
 
@@ -106,10 +117,37 @@ export class UiStateStore {
       (raw as { groupViewTab?: string }).groupViewTab === 'my'
         ? 'my'
         : 'discover'
+    const rawNodeViewport = ((raw as { nodeViewport?: Record<string, { cursor?: number; offset?: number }> }).nodeViewport || {})
+    const normalizedNodeViewport = Object.fromEntries(
+      Object.entries(rawNodeViewport).map(([key, value]) => ([
+        key,
+        {
+          cursor: Math.max(0, Math.trunc(Number(value?.cursor || 0))),
+          offset: Math.max(0, Math.trunc(Number(value?.offset || 0)))
+        }
+      ]))
+    )
+
     return {
       ...defaultAccountScopedUiState(),
       ...raw,
-      groupViewTab: normalizedGroupViewTab
+      groupViewTab: normalizedGroupViewTab,
+      treeExpanded: {
+        ...defaultAccountScopedUiState().treeExpanded,
+        ...((raw as { treeExpanded?: Record<string, boolean> }).treeExpanded || {})
+      },
+      nodeViewport: {
+        ...defaultAccountScopedUiState().nodeViewport,
+        ...normalizedNodeViewport
+      },
+      rightTopSelectionByNode: {
+        ...defaultAccountScopedUiState().rightTopSelectionByNode,
+        ...((raw as { rightTopSelectionByNode?: Record<string, number> }).rightTopSelectionByNode || {})
+      },
+      rightBottomOffsetByNode: {
+        ...defaultAccountScopedUiState().rightBottomOffsetByNode,
+        ...((raw as { rightBottomOffsetByNode?: Record<string, number> }).rightBottomOffsetByNode || {})
+      }
     }
   }
 
@@ -128,6 +166,22 @@ export class UiStateStore {
       paneViewport: {
         ...previous.paneViewport,
         ...(patch.paneViewport || {})
+      },
+      nodeViewport: {
+        ...previous.nodeViewport,
+        ...(patch.nodeViewport || {})
+      },
+      rightTopSelectionByNode: {
+        ...previous.rightTopSelectionByNode,
+        ...(patch.rightTopSelectionByNode || {})
+      },
+      rightBottomOffsetByNode: {
+        ...previous.rightBottomOffsetByNode,
+        ...(patch.rightBottomOffsetByNode || {})
+      },
+      treeExpanded: {
+        ...previous.treeExpanded,
+        ...(patch.treeExpanded || {})
       }
     }
 

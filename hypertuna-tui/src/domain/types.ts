@@ -1,4 +1,5 @@
 import type { Event, Filter } from 'nostr-tools'
+import type { FileFamily, NavNodeId } from '../lib/constants.js'
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
@@ -210,6 +211,46 @@ export type PaneViewportEntry = {
 
 export type PaneViewportMap = Record<string, PaneViewportEntry>
 
+export type PaneFocus = 'left-tree' | 'center' | 'right-top' | 'right-bottom'
+
+export type GroupNoteRecord = {
+  eventId: string
+  groupId: string
+  relay?: string | null
+  content: string
+  createdAt: number
+  authorPubkey: string
+  event: Event
+}
+
+export type FileActionStatus = {
+  action: 'download' | 'delete' | null
+  state: 'idle' | 'in-progress' | 'success' | 'error'
+  message?: string | null
+  path?: string | null
+  updatedAt: number
+  eventId?: string | null
+  sha256?: string | null
+}
+
+export type FileDownloadResult = {
+  savedPath: string
+  bytes: number
+  source: string
+}
+
+export type FileDeleteResult = {
+  deleted: boolean
+  reason?: string | null
+}
+
+export type NavNodeViewportMap = Record<NavNodeId, PaneViewportEntry>
+export type RightTopSelectionMap = Record<NavNodeId, number>
+export type RightBottomOffsetMap = Record<NavNodeId, number>
+export type ExpandedTreeMap = Record<'groups' | 'invites' | 'files', boolean>
+
+export type FileFamilyCounts = Record<FileFamily, number>
+
 export type FeedSortKey = 'createdAt' | 'kind' | 'author' | 'content'
 export type GroupSortKey = 'name' | 'description' | 'open' | 'public' | 'admin' | 'createdAt' | 'members' | 'peers'
 export type FileSortKey = 'fileName' | 'group' | 'uploadedAt' | 'uploadedBy' | 'size' | 'mime'
@@ -397,6 +438,21 @@ export interface FileService {
   }): Promise<Record<string, unknown>>
   fetchGroupFiles(relays: string[], groupId?: string, limit?: number): Promise<GroupFileRecord[]>
   fetchScopedGroupFiles(scope: FileScope, limit?: number): Promise<GroupFileRecord[]>
+  downloadGroupFile(input: {
+    relayKey?: string | null
+    publicIdentifier?: string | null
+    groupId?: string | null
+    eventId?: string | null
+    fileHash: string
+    fileName?: string | null
+  }): Promise<FileDownloadResult>
+  deleteLocalGroupFile(input: {
+    relayKey?: string | null
+    publicIdentifier?: string | null
+    groupId?: string | null
+    eventId?: string | null
+    fileHash: string
+  }): Promise<FileDeleteResult>
 }
 
 export interface ListService {

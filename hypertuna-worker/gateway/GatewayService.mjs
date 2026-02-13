@@ -1703,7 +1703,10 @@ export class GatewayService extends EventEmitter {
       return;
     }
 
-    const port = Number(config.port) || DEFAULT_PORT;
+    const parsedPort = Number(config.port);
+    const port = Number.isFinite(parsedPort) && parsedPort >= 0
+      ? parsedPort
+      : DEFAULT_PORT;
     const hostname = config.hostname || 'localhost';
     const listenHost = config.listenHost || '127.0.0.1';
     this.log('info', `Starting gateway on port ${port}`);
@@ -1719,38 +1722,70 @@ export class GatewayService extends EventEmitter {
       listenHost
     });
 
-    await this.gatewayServer.init();
+    try {
+      await this.gatewayServer.init();
 
-    this.setupRoutes();
+      this.setupRoutes();
 
-    const { server, wss } = this.gatewayServer.startServer(
-      (ws, req) => this.handleGatewayWebSocketConnection(ws, req),
-      this.app,
-      () => this.log('info', `Gateway listening on port ${port}`)
-    );
+      const { server, wss } = await this.gatewayServer.startServer(
+        (ws, req) => this.handleGatewayWebSocketConnection(ws, req),
+        this.app,
+        () => this.log('info', `Gateway listening on port ${this.gatewayServer?.config?.port || port}`)
+      );
 
-    this.server = server;
-    this.wss = wss;
-    await this.connectionPool.initialize();
-    this.config = {
-      hostname,
-      port,
-      listenHost,
-      urls: this.gatewayServer.getServerUrls()
-    };
+      this.server = server;
+      this.wss = wss;
+      await this.connectionPool.initialize();
+      this.config = {
+        hostname,
+        port: this.gatewayServer?.config?.port || port,
+        listenHost,
+        urls: this.gatewayServer.getServerUrls()
+      };
 
-    this.isRunning = true;
-    this.startedAt = Date.now();
-    this.healthState.startTime = this.startedAt;
-    this.healthState.services.gatewayStatus = 'online';
-    this.healthState.services.hyperswarmStatus = 'connected';
+      this.isRunning = true;
+      this.startedAt = Date.now();
+      this.healthState.startTime = this.startedAt;
+      this.healthState.services.gatewayStatus = 'online';
+      this.healthState.services.hyperswarmStatus = 'connected';
 
-    this.healthInterval = setInterval(() => {
-      this.healthState.lastCheck = Date.now();
+      this.healthInterval = setInterval(() => {
+        this.healthState.lastCheck = Date.now();
+        this.emit('status', this.getStatus());
+      }, 30000);
+
       this.emit('status', this.getStatus());
-    }, 30000);
-
-    this.emit('status', this.getStatus());
+    } catch (error) {
+      this.log('error', `Gateway failed to start: ${error?.message || error}`);
+      if (this.healthInterval) {
+        clearInterval(this.healthInterval);
+        this.healthInterval = null;
+      }
+      try {
+        await this.connectionPool.destroy();
+      } catch (_) {}
+      if (this.wss) {
+        try {
+          await new Promise(resolve => this.wss.close(resolve));
+        } catch (_) {}
+        this.wss = null;
+      }
+      if (this.server) {
+        try {
+          await new Promise(resolve => this.server.close(resolve));
+        } catch (_) {}
+        this.server = null;
+      }
+      this.app = null;
+      this.gatewayServer = null;
+      this.config = null;
+      this.isRunning = false;
+      this.startedAt = null;
+      this.healthState.status = 'offline';
+      this.healthState.services.gatewayStatus = 'offline';
+      this.healthState.services.hyperswarmStatus = 'disconnected';
+      throw error;
+    }
   }
 
   async stop() {

@@ -654,6 +654,48 @@ export async function fileExists(identifier, fileHash) {
   }
 }
 
+/**
+ * Delete one local relay file (identifier + file hash) from Hyperdrive.
+ * Returns deleted=false when the file does not exist locally.
+ * @param {string} identifier
+ * @param {string} fileHash
+ * @returns {Promise<{deleted:boolean, reason?:string}>}
+ */
+export async function deleteRelayFile (identifier, fileHash) {
+  const normalizedIdentifier = normalizeIdentifier(identifier)
+  const normalizedHash = String(fileHash || '').trim().toLowerCase()
+  if (!normalizedIdentifier || !normalizedHash) {
+    return { deleted: false, reason: 'invalid-identifier-or-file-hash' }
+  }
+  if (!drive) throw new Error('Hyperdrive not initialized')
+
+  const key = relayFilePath(normalizedIdentifier, normalizedHash)
+  let exists = false
+  try {
+    exists = await drive.exists(key)
+  } catch (err) {
+    const isClosing = isClosingCoreError(err) || isStoreClosedError(err)
+    if (!isClosing || !(store || storageDir) || !localDriveKeyHex) throw err
+    const ok = await reopenLocalDriveIfClosing()
+    if (!ok) throw err
+    exists = await drive.exists(key)
+  }
+
+  if (!exists) return { deleted: false, reason: 'not-found' }
+
+  try {
+    await drive.del(key)
+    return { deleted: true }
+  } catch (err) {
+    const isClosing = isClosingCoreError(err) || isStoreClosedError(err)
+    if (!isClosing || !(store || storageDir) || !localDriveKeyHex) throw err
+    const ok = await reopenLocalDriveIfClosing()
+    if (!ok) throw err
+    await drive.del(key)
+    return { deleted: true }
+  }
+}
+
 export async function deleteRelayFilesByIdentifierPrefix (identifier) {
   const normalizedIdentifier = normalizeIdentifier(identifier)
   if (!normalizedIdentifier) return { deletedCount: 0 }

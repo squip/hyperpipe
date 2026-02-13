@@ -4,7 +4,6 @@ import { cleanup, render } from 'ink-testing-library'
 import { App } from '../../src/ui/App.js'
 import type { RuntimeOptions } from '../../src/domain/controller.js'
 import { MockController } from './support/mockController.js'
-import { SECTION_ORDER } from '../../src/lib/constants.js'
 
 const BASE_OPTIONS: RuntimeOptions = {
   cwd: process.cwd(),
@@ -38,8 +37,7 @@ function lastFrame(instance: RenderInstance): string {
 
 function hasBorderAccumulation(frame: string): boolean {
   const lines = frame.split('\n')
-  const headerIndex = lines.findIndex((line) => line.includes('Hypertuna TUI'))
-  const scan = headerIndex > 0 ? lines.slice(0, headerIndex) : lines.slice(0, 8)
+  const scan = lines.slice(0, 12)
   let borderStreak = 0
   for (const line of scan) {
     const normalized = line.trim()
@@ -57,11 +55,10 @@ function hasBorderAccumulation(frame: string): boolean {
 function expectStableLayout(instance: RenderInstance): void {
   const frame = lastFrame(instance)
   const lines = frame.split('\n')
-
   expect(lines.length).toBeGreaterThan(8)
-  expect(frame).toContain('Hypertuna TUI')
   expect(frame).toContain('Command')
   expect(frame).toContain('Keys:')
+  expect(frame).toContain('Ready · node:')
   expect(hasBorderAccumulation(frame)).toBe(false)
 }
 
@@ -70,7 +67,7 @@ afterEach(() => {
 })
 
 describe.sequential('TUI e2e layout stability', () => {
-  it('keeps three-pane shell stable during rapid navigation', async () => {
+  it('keeps shell stable during rapid focus and tree/list navigation', async () => {
     const instance = render(
       <App
         options={BASE_OPTIONS}
@@ -79,9 +76,8 @@ describe.sequential('TUI e2e layout stability', () => {
     )
 
     try {
-      await waitFor(() => lastFrame(instance).includes('Hypertuna TUI'))
-      await waitFor(() => lastFrame(instance).includes('Runtime Summary'))
-
+      await waitFor(() => lastFrame(instance).includes('Command'))
+      await waitFor(() => lastFrame(instance).includes('Keys:'))
       expectStableLayout(instance)
 
       for (let i = 0; i < 30; i += 1) {
@@ -90,19 +86,20 @@ describe.sequential('TUI e2e layout stability', () => {
         expectStableLayout(instance)
       }
 
-      for (let i = 0; i < SECTION_ORDER.length + 2; i += 1) {
-        if (lastFrame(instance).includes('Logs')) break
-        instance.stdin.write('\t')
-        await sleep(10)
-      }
-      expect(lastFrame(instance)).toContain('Logs')
+      instance.stdin.write('\u001b[B')
+      await sleep(30)
+      instance.stdin.write('\u001b[C')
+      await sleep(30)
+      instance.stdin.write('\u001b[C')
+      await sleep(30)
+      expectStableLayout(instance)
       expect(instance.stderr.frames.length).toBe(0)
     } finally {
       instance.unmount()
     }
   })
 
-  it('updates live panes through controller actions without layout corruption', async () => {
+  it('updates tree/split panes through controller actions without corruption', async () => {
     const controller = MockController.withSeedData(BASE_OPTIONS)
     const instance = render(
       <App
@@ -112,53 +109,22 @@ describe.sequential('TUI e2e layout stability', () => {
     )
 
     try {
-      await waitFor(() => lastFrame(instance).includes('Hypertuna TUI'))
-
-      instance.stdin.write(':')
-      await sleep(30)
-      instance.stdin.write('\u001B')
-      await sleep(30)
+      await waitFor(() => lastFrame(instance).includes('Command'))
       expectStableLayout(instance)
 
       await controller.refreshRelays()
-      await controller.refreshFeed(5)
-      await controller.publishPost('layout_test_post')
       await controller.refreshGroups()
+      await controller.refreshInvites()
       await controller.refreshGroupFiles('npubseed:group-a')
-      await controller.refreshStarterPacks()
+      await controller.refreshGroupNotes('npubseed:group-a')
       await controller.refreshChats()
-      await controller.search('notes', 'feed')
-
-      for (let i = 0; i < SECTION_ORDER.length + 2; i += 1) {
-        if (lastFrame(instance).includes('Search Results (notes)')) break
-        instance.stdin.write('\t')
-        await sleep(20)
-      }
-
-      await waitFor(() => lastFrame(instance).includes('Search Results (notes)'))
-      const frameAfterSearch = lastFrame(instance)
-      expect(frameAfterSearch).toContain('query: feed')
-
-      instance.stdin.write('\t')
-      await sleep(20)
-      expect(lastFrame(instance)).toContain('Accounts')
-
-      instance.stdin.write('\t')
-      await sleep(20)
-      expect(lastFrame(instance)).toContain('Logs')
 
       for (let i = 0; i < 16; i += 1) {
-        await Promise.all([
-          controller.refreshFeed(10),
-          controller.refreshGroups(),
-          controller.refreshGroupFiles('npubseed:group-a')
-        ])
         instance.stdin.write('\t')
         await sleep(12)
         expectStableLayout(instance)
       }
 
-      expectStableLayout(instance)
       expect(instance.stderr.frames.length).toBe(0)
     } finally {
       instance.unmount()

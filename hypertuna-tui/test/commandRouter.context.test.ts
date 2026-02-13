@@ -16,7 +16,7 @@ function createController(): MockController {
 
 function groupContext(controller: MockController, copyImpl?: CommandContext['copy']): CommandContext {
   return {
-    currentSection: 'groups',
+    currentNode: 'groups:my',
     resolveSelectedGroup: () => {
       const group = controller.getState().groups[0]
       if (!group) return null
@@ -81,7 +81,7 @@ describe('command router context-first workflows', () => {
     expect(inviteId).toBeTruthy()
 
     const context: CommandContext = {
-      currentSection: 'chats',
+      currentNode: 'invites:chat',
       resolveSelectedInvite: () => {
         const invite = controller.getState().chatInvites[0]
         if (!invite) return null
