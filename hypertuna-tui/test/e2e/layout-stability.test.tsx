@@ -36,6 +36,24 @@ function lastFrame(instance: RenderInstance): string {
   return stripAnsi(instance.lastFrame() || '')
 }
 
+function hasBorderAccumulation(frame: string): boolean {
+  const lines = frame.split('\n')
+  const headerIndex = lines.findIndex((line) => line.includes('Hypertuna TUI'))
+  const scan = headerIndex > 0 ? lines.slice(0, headerIndex) : lines.slice(0, 8)
+  let borderStreak = 0
+  for (const line of scan) {
+    const normalized = line.trim()
+    if (!normalized) continue
+    if (/^[\u2500-\u257f\s]+$/.test(normalized)) {
+      borderStreak += 1
+      if (borderStreak > 3) return true
+      continue
+    }
+    borderStreak = 0
+  }
+  return false
+}
+
 function expectStableLayout(instance: RenderInstance): void {
   const frame = lastFrame(instance)
   const lines = frame.split('\n')
@@ -44,6 +62,7 @@ function expectStableLayout(instance: RenderInstance): void {
   expect(frame).toContain('Hypertuna TUI')
   expect(frame).toContain('Command')
   expect(frame).toContain('Keys:')
+  expect(hasBorderAccumulation(frame)).toBe(false)
 }
 
 afterEach(() => {
@@ -127,6 +146,17 @@ describe.sequential('TUI e2e layout stability', () => {
       instance.stdin.write('\t')
       await sleep(20)
       expect(lastFrame(instance)).toContain('Logs')
+
+      for (let i = 0; i < 16; i += 1) {
+        await Promise.all([
+          controller.refreshFeed(10),
+          controller.refreshGroups(),
+          controller.refreshGroupFiles('npubseed:group-a')
+        ])
+        instance.stdin.write('\t')
+        await sleep(12)
+        expectStableLayout(instance)
+      }
 
       expectStableLayout(instance)
       expect(instance.stderr.frames.length).toBe(0)

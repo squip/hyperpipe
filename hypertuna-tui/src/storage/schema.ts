@@ -21,8 +21,59 @@ export type AccountsFile = z.infer<typeof accountsFileSchema>
 export type AccountRecordSchema = z.infer<typeof accountRecordSchema>
 
 const accountScopedUiStateSchema = z.object({
-  groupViewTab: z.enum(['discover', 'my', 'invites']).default('discover'),
+  groupViewTab: z.enum(['discover', 'my', 'invites']).default('discover').transform((value) => (
+    value === 'invites' ? 'discover' : value
+  )),
   chatViewTab: z.enum(['conversations', 'invites']).default('conversations'),
+  feedSource: z.object({
+    mode: z.enum(['relays', 'relay', 'following', 'group']).default('relays'),
+    relayUrl: z.string().nullable().optional(),
+    groupId: z.string().nullable().optional(),
+    label: z.string().optional()
+  }).default({
+    mode: 'relays',
+    relayUrl: null,
+    groupId: null,
+    label: 'All Relays'
+  }),
+  feedControls: z.object({
+    query: z.string().default(''),
+    sortKey: z.enum(['createdAt', 'kind', 'author', 'content']).default('createdAt'),
+    sortDirection: z.enum(['asc', 'desc']).default('desc'),
+    kindFilter: z.array(z.number().int()).nullable().default(null)
+  }).default({
+    query: '',
+    sortKey: 'createdAt',
+    sortDirection: 'desc',
+    kindFilter: null
+  }),
+  groupControls: z.object({
+    query: z.string().default(''),
+    sortKey: z.enum(['name', 'description', 'open', 'public', 'admin', 'createdAt', 'members', 'peers']).default('members'),
+    sortDirection: z.enum(['asc', 'desc']).default('desc'),
+    visibility: z.enum(['all', 'public', 'private']).default('all'),
+    joinMode: z.enum(['all', 'open', 'closed']).default('all')
+  }).default({
+    query: '',
+    sortKey: 'members',
+    sortDirection: 'desc',
+    visibility: 'all',
+    joinMode: 'all'
+  }),
+  fileControls: z.object({
+    query: z.string().default(''),
+    sortKey: z.enum(['fileName', 'group', 'uploadedAt', 'uploadedBy', 'size', 'mime']).default('uploadedAt'),
+    sortDirection: z.enum(['asc', 'desc']).default('desc'),
+    mime: z.string().default('all'),
+    group: z.string().default('all')
+  }).default({
+    query: '',
+    sortKey: 'uploadedAt',
+    sortDirection: 'desc',
+    mime: 'all',
+    group: 'all'
+  }),
+  detailPaneOffsetBySection: z.record(z.number().int().nonnegative()).default({}),
   paneViewport: z.record(z.object({
     cursor: z.number().int().nonnegative().default(0),
     offset: z.number().int().nonnegative().default(0)

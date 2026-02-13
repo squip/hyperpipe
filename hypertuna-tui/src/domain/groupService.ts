@@ -38,7 +38,7 @@ export class GroupService implements IGroupService {
           '#i': [HYPERTUNA_IDENTIFIER_TAG],
           limit
         },
-        5_000
+        2_800
       ),
       this.client.query(
         relays,
@@ -47,7 +47,7 @@ export class GroupService implements IGroupService {
           '#i': [HYPERTUNA_IDENTIFIER_TAG],
           limit: Math.max(limit, 300)
         },
-        5_000
+        2_800
       )
     ])
 
@@ -121,7 +121,7 @@ export class GroupService implements IGroupService {
         authors: [pubkey],
         limit: 1
       },
-      5_000
+      2_500
     )
     const sorted = events.sort((left, right) => right.created_at - left.created_at)
     const latest = sorted[0]

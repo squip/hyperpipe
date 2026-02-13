@@ -26,6 +26,7 @@ export interface AppController extends CommandController {
   getState(): ControllerState
   shutdown(): Promise<void>
   setPaneViewport(sectionKey: string, cursor: number, offset: number): Promise<void>
+  setDetailPaneOffset(sectionKey: string, offset: number): Promise<void>
 }
 
 export type ScriptedCommand = {
@@ -38,6 +39,7 @@ export type ScriptedCommand = {
 
 type SelectionState = Record<SectionId, number>
 type OffsetState = Record<SectionId, number>
+type DetailPaneOffsetState = Record<SectionId, number>
 
 const initialSelection: SelectionState = {
   dashboard: 0,
@@ -69,6 +71,21 @@ const initialOffsets: OffsetState = {
   logs: 0
 }
 
+const initialDetailOffsets: DetailPaneOffsetState = {
+  dashboard: 0,
+  relays: 0,
+  feed: 0,
+  groups: 0,
+  invites: 0,
+  files: 0,
+  lists: 0,
+  bookmarks: 0,
+  chats: 0,
+  search: 0,
+  accounts: 0,
+  logs: 0
+}
+
 function nextSection(current: SectionId, delta: 1 | -1): SectionId {
   const index = SECTION_ORDER.indexOf(current)
   const next = (index + delta + SECTION_ORDER.length) % SECTION_ORDER.length
@@ -85,7 +102,6 @@ function sectionLength(state: ControllerState, section: SectionId): number {
       return state.feed.length
     case 'groups':
       if (state.groupViewTab === 'my') return state.myGroups.length
-      if (state.groupViewTab === 'invites') return state.groupInvites.length
       return state.groupDiscover.length
     case 'invites':
       return state.invitesInbox.length
@@ -233,6 +249,366 @@ function relaysReadyCount(state: ControllerState): number {
   return state.relays.filter((relay) => relay.readyForReq).length
 }
 
+function feedSourceLabel(state: ControllerState): string {
+  const source = state.feedSource
+  if (source.mode === 'relay') return `relay:${source.relayUrl || source.label || '-'}`
+  if (source.mode === 'following') return 'following'
+  if (source.mode === 'group') return `group:${source.groupId || '-'}`
+  return 'relays'
+}
+
+function feedControlsLabel(state: ControllerState): string {
+  const controls = state.feedControls
+  const query = controls.query ? ` q="${shortText(controls.query, 18)}"` : ''
+  const kinds = controls.kindFilter?.length ? ` kind=${controls.kindFilter.join(',')}` : ''
+  return `sort=${controls.sortKey}/${controls.sortDirection}${query}${kinds}`
+}
+
+function groupControlsLabel(state: ControllerState): string {
+  const controls = state.groupControls
+  const query = controls.query ? ` q="${shortText(controls.query, 18)}"` : ''
+  const filters = ` vis=${controls.visibility} join=${controls.joinMode}`
+  return `sort=${controls.sortKey}/${controls.sortDirection}${filters}${query}`
+}
+
+function fileControlsLabel(state: ControllerState): string {
+  const controls = state.fileControls
+  const query = controls.query ? ` q="${shortText(controls.query, 18)}"` : ''
+  const filters = ` mime=${controls.mime} group=${controls.group}`
+  return `sort=${controls.sortKey}/${controls.sortDirection}${filters}${query}`
+}
+
+function commandStatusLabel(state: ControllerState, options: RuntimeOptions): string {
+  if (state.lastError) return `error: ${shortText(state.lastError, 140)}`
+  if (state.busyTask) return `${options.noAnimations ? 'working' : 'working…'} ${state.busyTask}`
+  return `ready · feed:${state.feed.length} groups:${state.groupDiscover.length} files:${state.files.length}`
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value))
+}
+
+function wrapText(input: string, width: number): string[] {
+  const lines = String(input || '').split('\n')
+  const wrapped: string[] = []
+  const maxWidth = Math.max(10, width)
+  for (const line of lines) {
+    const safeLine = line.replace(/\t/g, '  ')
+    if (!safeLine) {
+      wrapped.push('')
+      continue
+    }
+    let remaining = safeLine
+    while (remaining.length > maxWidth) {
+      wrapped.push(remaining.slice(0, maxWidth))
+      remaining = remaining.slice(maxWidth)
+    }
+    wrapped.push(remaining)
+  }
+  return wrapped
+}
+
+function splitLayoutRows(totalRows: number): {
+  mainRows: number
+  commandRows: number
+  keysRows: number
+  statusRows: number
+} {
+  const commandRows = 3
+  const keysRows = 1
+  const statusRows = 1
+  const reserved = commandRows + keysRows + statusRows
+  const mainRows = Math.max(8, totalRows - reserved)
+  return {
+    mainRows,
+    commandRows,
+    keysRows,
+    statusRows
+  }
+}
+
+function detailPaneTitle(section: SectionId): string {
+  switch (section) {
+    case 'dashboard':
+      return 'Details'
+    case 'relays':
+      return 'Relay Detail'
+    case 'feed':
+      return 'Event Detail'
+    case 'groups':
+      return 'Group Detail'
+    case 'invites':
+      return 'Invite Detail'
+    case 'files':
+      return 'File Detail'
+    case 'lists':
+      return 'Starter Pack Detail'
+    case 'bookmarks':
+      return 'Bookmark Detail'
+    case 'chats':
+      return 'Conversation Detail'
+    case 'search':
+      return 'Search Detail'
+    case 'accounts':
+      return 'Account Detail'
+    case 'logs':
+      return 'Logs'
+  }
+}
+
+function detailPaneRows(
+  state: ControllerState,
+  section: SectionId,
+  selectedIndex: number
+): string[] {
+  if (section === 'dashboard') {
+    return [
+      `Current account: ${state.currentAccountPubkey ? shortId(state.currentAccountPubkey, 10) : 'none'}`,
+      `Session: ${state.session ? shortId(state.session.pubkey, 10) : 'locked'}`,
+      `Worker: ${state.lifecycle}`,
+      `Status: ${shortText(state.readinessMessage, 120)}`,
+      `Stdout lines: ${state.workerStdout.length}`,
+      `Stderr lines: ${state.workerStderr.length}`,
+      `Recovery: ${state.workerRecoveryState.status} (attempt ${state.workerRecoveryState.attempt})`,
+      `Perf: avg ${state.perfMetrics.avgLatencyMs.toFixed(1)}ms / p95 ${state.perfMetrics.p95LatencyMs.toFixed(1)}ms`,
+      `Clipboard: ${state.lastCopiedMethod || 'none'}`,
+      `Last copied: ${state.lastCopiedValue ? shortText(state.lastCopiedValue, 80) : '-'}`
+    ]
+  }
+
+  if (section === 'relays') {
+    const relay = state.relays[selectedIndex]
+    if (!relay) return ['No relay selected']
+    return [
+      `relayKey: ${shortId(relay.relayKey, 20)}`,
+      `identifier: ${relay.publicIdentifier || '-'}`,
+      `url: ${relay.connectionUrl || '-'}`,
+      `writable: ${String(Boolean(relay.writable))}`,
+      `requiresAuth: ${String(Boolean(relay.requiresAuth))}`,
+      `readyForReq: ${String(Boolean(relay.readyForReq))}`,
+      `members: ${relay.members?.length || 0}`,
+      'Commands: relay refresh | relay create | relay join | relay disconnect | relay leave',
+      'Feed source: feed source relay <relayUrl|publicIdentifier|relayKey>'
+    ]
+  }
+
+  if (section === 'feed') {
+    const event = state.feed[selectedIndex]
+    const source = state.feedSource
+    const sourceLines = [
+      `source: ${feedSourceLabel(state)}`,
+      `resolved relays (${state.activeFeedRelays.length}): ${
+        state.activeFeedRelays.length ? state.activeFeedRelays.join(', ') : '-'
+      }`,
+      `controls: ${feedControlsLabel(state)}`
+    ]
+    if (!event) {
+      return [
+        ...sourceLines,
+        'No event selected',
+        `my groups (${state.myGroups.length}):`,
+        ...state.myGroups.slice(0, 24).map((group, idx) => `${idx + 1}. ${group.name} (${group.id})`),
+        'Commands: feed source relays|following|relay <selector>|group <groupId|index> [relay]',
+        'Commands: feed search <query|clear> | feed sort <createdAt|kind|author|content> [asc|desc]',
+        'Commands: feed filter kind <csv|all>'
+      ]
+    }
+    return [
+      ...sourceLines,
+      `id: ${event.id}`,
+      `pubkey: ${event.pubkey}`,
+      `kind: ${event.kind}`,
+      `created: ${new Date(event.created_at * 1000).toLocaleString()}`,
+      `tags: ${event.tags.length}`,
+      `content: ${event.content || ''}`,
+      `my groups (${state.myGroups.length}):`,
+      ...state.myGroups.slice(0, 12).map((group, idx) => `${idx + 1}. ${group.name} (${group.id})`),
+      'Commands: post | reply | react | bookmark add/remove',
+      `Compose: ${state.composeDraft ? `active for ${state.composeDraft.groupId} attachments=${state.composeDraft.attachments.length}` : 'none'}`,
+      'Compose commands: compose start|text|attach|remove|show|publish|cancel'
+    ]
+  }
+
+  if (section === 'groups') {
+    const rows = state.groupViewTab === 'my' ? state.myGroups : state.groupDiscover
+    const group = rows[selectedIndex]
+    if (!group) {
+      return [
+        'No group selected',
+        `controls: ${groupControlsLabel(state)}`,
+        'Commands: group tab discover|my | group members [groupId] | group search <query|clear>',
+        'Commands: group sort <name|description|open|public|admin|createdAt|members|peers> [asc|desc]',
+        'Commands: group filter visibility <all|public|private> | group filter join <all|open|closed>'
+      ]
+    }
+    const members = group.members || []
+    return [
+      `id: ${group.id}`,
+      `name: ${group.name}`,
+      `visibility: ${group.isPublic === false ? 'private' : 'public'}`,
+      `join: ${group.isOpen ? 'open' : 'closed'}`,
+      `relay: ${group.relay || '-'}`,
+      `admin: ${group.adminName || shortId(group.adminPubkey || '', 8) || '-'}`,
+      `members: ${group.membersCount || members.length || 0}`,
+      `peers online: ${group.peersOnline || 0}`,
+      `createdAt: ${group.createdAt ? new Date(group.createdAt * 1000).toLocaleString() : '-'}`,
+      `about: ${group.about || '-'}`,
+      'members:',
+      ...(members.length ? members.map((member, idx) => `${idx + 1}. ${member}`) : ['-']),
+      `controls: ${groupControlsLabel(state)}`,
+      `pending invites: ${state.groupInvites.length}`,
+      `join requests: ${Object.values(state.groupJoinRequests).reduce((total, list) => total + list.length, 0)}`,
+      'Commands: group members [groupId] | group join-flow | group invite | group update-members | group update-auth'
+    ]
+  }
+
+  if (section === 'invites') {
+    const invite = state.invitesInbox[selectedIndex]
+    if (!invite) {
+      return ['No invite selected', 'Commands: invites refresh | invites accept group|chat [id] | invites dismiss group|chat [id]']
+    }
+    if (invite.type === 'group') {
+      return [
+        'type: group',
+        `id: ${invite.id}`,
+        `groupId: ${invite.groupId}`,
+        `title: ${invite.title}`,
+        `relay: ${invite.relay || '-'}`,
+        `token: ${invite.token || '-'}`,
+        'Commands: invites accept group [id] | invites dismiss group [id]'
+      ]
+    }
+    return [
+      'type: chat',
+      `id: ${invite.id}`,
+      `title: ${invite.title}`,
+      `status: ${invite.status}`,
+      `conversationId: ${invite.conversationId || '-'}`,
+      `sender: ${invite.senderPubkey}`,
+      'Commands: invites accept chat [id] | invites dismiss chat [id]'
+    ]
+  }
+
+  if (section === 'files') {
+    const file = state.files[selectedIndex]
+    if (!file) {
+      return [
+        'No file selected',
+        `controls: ${fileControlsLabel(state)}`,
+        'Commands: file refresh [groupId] | file upload <groupId> <filePath>',
+        'Commands: file search <query|clear> | file sort <fileName|group|uploadedAt|uploadedBy|size|mime> [asc|desc]',
+        'Commands: file filter mime <all|prefix> | file filter group <all|groupId>'
+      ]
+    }
+    return [
+      `group: ${file.groupId}`,
+      `groupName: ${file.groupName || '-'}`,
+      `name: ${file.fileName}`,
+      `mime: ${file.mime || '-'}`,
+      `size: ${file.size || 0}`,
+      `uploadedAt: ${new Date(file.uploadedAt * 1000).toLocaleString()}`,
+      `uploadedBy: ${file.uploadedBy}`,
+      `sha256: ${file.sha256 || '-'}`,
+      `url: ${file.url || '-'}`,
+      `controls: ${fileControlsLabel(state)}`,
+      'Commands: file refresh | file upload | file search/sort/filter'
+    ]
+  }
+
+  if (section === 'lists') {
+    const list = state.lists[selectedIndex]
+    if (!list) return ['No list selected', 'Commands: list refresh | list create | list apply']
+    return [
+      `dTag: ${list.id}`,
+      `title: ${list.title}`,
+      `pubkeys: ${list.pubkeys.length}`,
+      `author: ${shortId(list.event.pubkey, 10)}`,
+      `description: ${list.description || '-'}`,
+      'Commands: list refresh | list create | list apply'
+    ]
+  }
+
+  if (section === 'bookmarks') {
+    const eventId = state.bookmarks.eventIds[selectedIndex]
+    return [
+      `eventId: ${eventId || '-'}`,
+      'Commands: bookmark refresh | bookmark add | bookmark remove'
+    ]
+  }
+
+  if (section === 'chats') {
+    const conversation = state.chatViewTab === 'conversations' ? state.conversations[selectedIndex] : null
+    const invite = state.chatViewTab === 'invites' ? state.chatInvites[selectedIndex] : null
+    const retrySeconds = state.chatNextRetryAt
+      ? Math.max(0, Math.ceil((state.chatNextRetryAt - Date.now()) / 1000))
+      : null
+    const lines = [
+      `chat runtime: ${state.chatRuntimeState}${retrySeconds !== null ? ` (retry ${retrySeconds}s)` : ''}`,
+      state.chatWarning ? `warning: ${state.chatWarning}` : '',
+      `pending chat invites: ${state.chatPendingInviteCount}`,
+      `unread total: ${state.chatUnreadTotal}`
+    ].filter(Boolean)
+    if (conversation) {
+      return [
+        `id: ${conversation.id}`,
+        `title: ${conversation.title}`,
+        `participants: ${conversation.participants.length}`,
+        `admins: ${conversation.adminPubkeys.length}`,
+        `unread: ${conversation.unreadCount}`,
+        `preview: ${conversation.lastMessagePreview || '-'}`,
+        ...lines,
+        'Commands: chat init | chat refresh | chat create | chat thread | chat send'
+      ]
+    }
+    if (invite) {
+      return [
+        `inviteId: ${invite.id}`,
+        `title: ${invite.title || '-'}`,
+        `sender: ${invite.senderPubkey}`,
+        `status: ${invite.status}`,
+        `conversationId: ${invite.conversationId || '-'}`,
+        ...lines,
+        'Commands: chat accept [inviteId] | chat dismiss [inviteId]'
+      ]
+    }
+    return ['No conversation selected', ...lines, 'Commands: chat init | chat refresh']
+  }
+
+  if (section === 'search') {
+    const result = state.searchResults[selectedIndex]
+    if (!result) return ['No result selected', 'Command: search <notes|profiles|groups|lists> <query>']
+    return [
+      `mode: ${result.mode}`,
+      `event id: ${result.event.id}`,
+      `author: ${result.event.pubkey}`,
+      `content: ${result.event.content || '-'}`,
+      'Command: search <notes|profiles|groups|lists> <query>'
+    ]
+  }
+
+  if (section === 'accounts') {
+    const account = state.accounts[selectedIndex]
+    if (!account) {
+      return ['No account selected', 'Commands: account generate | profiles | login | add-nsec | add-ncryptsec | select | unlock | remove | clear']
+    }
+    return [
+      `pubkey: ${account.pubkey}`,
+      `signer: ${account.signerType}`,
+      `label: ${account.label || '-'}`,
+      `created: ${new Date(account.createdAt).toLocaleString()}`,
+      `updated: ${new Date(account.updatedAt).toLocaleString()}`,
+      'Commands: account generate | profiles | login | add-nsec | add-ncryptsec | select | unlock | remove | clear'
+    ]
+  }
+
+  return [
+    `stdout: ${state.workerStdout.length}`,
+    `stderr: ${state.workerStderr.length}`,
+    `entries: ${state.logs.length}`,
+    'Use Up/Down to inspect log stream in center pane.'
+  ]
+}
+
 function resolveSelectedGroupForContext(
   state: ControllerState,
   section: SectionId,
@@ -240,7 +616,6 @@ function resolveSelectedGroupForContext(
 ): { id: string; relay?: string | null } | null {
   if (section !== 'groups') return null
   const rows = state.groupViewTab === 'my' ? state.myGroups : state.groupDiscover
-  if (state.groupViewTab === 'invites') return null
   if (selectedIndex < 0 || selectedIndex >= rows.length) return null
   const group = rows[selectedIndex]
   if (!group) return null
@@ -258,19 +633,6 @@ function resolveSelectedInviteForContext(
   | { kind: 'group'; id: string; groupId: string; relay?: string | null; token?: string | null }
   | { kind: 'chat'; id: string; conversationId?: string | null }
   | null {
-  if (section === 'groups') {
-    if (state.groupViewTab !== 'invites') return null
-    const invite = state.groupInvites[selectedIndex]
-    if (!invite) return null
-    return {
-      kind: 'group',
-      id: invite.id,
-      groupId: invite.groupId,
-      relay: invite.relay || null,
-      token: invite.token || null
-    }
-  }
-
   if (section === 'chats') {
     if (state.chatViewTab !== 'invites') return null
     const invite = state.chatInvites[selectedIndex]
@@ -421,15 +783,18 @@ function renderCenterPane(
     const rows = state.feed.slice(offset, offset + visibleRows)
     return (
       <Box flexDirection="column">
-        <Text color="cyan">Feed</Text>
+        <Text color="cyan">
+          Feed [{feedSourceLabel(state)}] relays:{state.activeFeedRelays.length}
+        </Text>
+        <Text dimColor>{feedControlsLabel(state)}</Text>
         {state.feed.length === 0 ? <Text dimColor>No feed events</Text> : null}
         {rows.map((event, localIdx) => {
           const idx = offset + localIdx
           const selected = idx === selectedIndex
-          const content = shortText(event.content || '', 68)
+          const content = shortText(event.content || '', 64)
           return (
             <Text key={event.id} color={selected ? 'green' : undefined}>
-              {selected ? '>' : ' '} {shortId(event.id, 6)} · {shortId(event.pubkey, 6)} · {content}
+              {selected ? '>' : ' '} {shortId(event.id, 6)} · k{event.kind} · {shortId(event.pubkey, 6)} · {content}
             </Text>
           )
         })}
@@ -440,34 +805,26 @@ function renderCenterPane(
   if (section === 'groups') {
     const rows = state.groupViewTab === 'my'
       ? state.myGroups
-      : state.groupViewTab === 'invites'
-        ? state.groupInvites
-        : state.groupDiscover
+      : state.groupDiscover
     const visible = rows.slice(offset, offset + visibleRows)
     return (
       <Box flexDirection="column">
         <Text color="cyan">
-          Groups [{state.groupViewTab}] d:{state.groupDiscover.length} m:{state.myGroups.length} i:{state.groupInvites.length}
+          Groups [{state.groupViewTab}] d:{state.groupDiscover.length} m:{state.myGroups.length}
         </Text>
+        <Text dimColor>{groupControlsLabel(state)}</Text>
         {rows.length === 0 ? <Text dimColor>No groups in this tab</Text> : null}
         {visible.map((row, localIdx) => {
           const idx = offset + localIdx
           const selected = idx === selectedIndex
-          if (state.groupViewTab === 'invites') {
-            const invite = row as unknown as typeof state.groupInvites[number]
-            const mode = invite.fileSharing === false ? 'closed' : 'open'
-            return (
-              <Text key={`${invite.id}-${idx}`} color={selected ? 'green' : undefined}>
-                {selected ? '>' : ' '} invite · {shortText(invite.groupName || invite.groupId, 24)} · {mode}
-              </Text>
-            )
-          }
-
           const group = row as unknown as typeof state.groupDiscover[number]
           const mode = `${group.isPublic === false ? 'private' : 'public'} / ${group.isOpen ? 'open' : 'closed'}`
+          const admin = group.adminName || shortId(group.adminPubkey || '', 6)
+          const members = group.membersCount || group.members?.length || 0
+          const peers = group.peersOnline || 0
           return (
             <Text key={`${group.id}-${group.event?.id || idx}`} color={selected ? 'green' : undefined}>
-              {selected ? '>' : ' '} {shortText(group.name, 26)} · {mode}
+              {selected ? '>' : ' '} {shortText(group.name, 18)} · {mode} · admin:{shortText(admin || '-', 8)} · m:{members} · p:{peers}
             </Text>
           )
         })}
@@ -480,6 +837,7 @@ function renderCenterPane(
     return (
       <Box flexDirection="column">
         <Text color="cyan">Group Files</Text>
+        <Text dimColor>{fileControlsLabel(state)}</Text>
         {state.files.length === 0 ? <Text dimColor>No file metadata events</Text> : null}
         {rows.map((file, localIdx) => {
           const idx = offset + localIdx
@@ -654,286 +1012,34 @@ function renderCenterPane(
   )
 }
 
-function renderDetailPane(state: ControllerState, section: SectionId, selectedIndex: number): React.ReactNode {
-  if (section === 'dashboard') {
-    return (
-      <Box flexDirection="column">
-        <TruncText color="magenta">Details</TruncText>
-        <TruncText>Current account: {state.currentAccountPubkey ? shortId(state.currentAccountPubkey, 10) : 'none'}</TruncText>
-        <TruncText>Session: {state.session ? shortId(state.session.pubkey, 10) : 'locked'}</TruncText>
-        <TruncText>Worker: {state.lifecycle}</TruncText>
-        <TruncText>Status: {shortText(state.readinessMessage, 40)}</TruncText>
-        <TruncText>Stdout lines: {state.workerStdout.length}</TruncText>
-        <TruncText>Stderr lines: {state.workerStderr.length}</TruncText>
-        <TruncText>Recovery: {state.workerRecoveryState.status} (attempt {state.workerRecoveryState.attempt})</TruncText>
-        <TruncText>Perf: avg {state.perfMetrics.avgLatencyMs.toFixed(1)}ms / p95 {state.perfMetrics.p95LatencyMs.toFixed(1)}ms</TruncText>
-        <TruncText>Clipboard: {state.lastCopiedMethod || 'none'}</TruncText>
-        <TruncText>Last copied: {state.lastCopiedValue ? shortText(state.lastCopiedValue, 36) : '-'}</TruncText>
-      </Box>
-    )
-  }
-
-  if (section === 'relays') {
-    const relay = state.relays[selectedIndex]
-    return (
-      <Box flexDirection="column">
-        <TruncText color="magenta">Relay Detail</TruncText>
-        {!relay ? <TruncText dimColor>No relay selected</TruncText> : null}
-        {relay ? (
-          <>
-            <TruncText>relayKey: {shortId(relay.relayKey, 14)}</TruncText>
-            <TruncText>identifier: {relay.publicIdentifier || '-'}</TruncText>
-            <TruncText>writable: {String(Boolean(relay.writable))}</TruncText>
-            <TruncText>requiresAuth: {String(Boolean(relay.requiresAuth))}</TruncText>
-            <TruncText>readyForReq: {String(Boolean(relay.readyForReq))}</TruncText>
-            <TruncText>members: {relay.members?.length || 0}</TruncText>
-          </>
-        ) : null}
-        <TruncText dimColor>Commands: relay refresh | relay create | relay join | relay disconnect | relay leave</TruncText>
-      </Box>
-    )
-  }
-
-  if (section === 'feed') {
-    const event = state.feed[selectedIndex]
-    return (
-      <Box flexDirection="column">
-        <TruncText color="magenta">Event Detail</TruncText>
-        {!event ? <TruncText dimColor>No event selected</TruncText> : null}
-        {event ? (
-          <>
-            <TruncText>id: {shortId(event.id, 14)}</TruncText>
-            <TruncText>pubkey: {shortId(event.pubkey, 14)}</TruncText>
-            <TruncText>kind: {event.kind}</TruncText>
-            <TruncText>created: {new Date(event.created_at * 1000).toLocaleString()}</TruncText>
-            <TruncText>tags: {event.tags.length}</TruncText>
-            <TruncText>{shortText(event.content, 180)}</TruncText>
-          </>
-        ) : null}
-        <TruncText dimColor>Commands: post | reply | react | bookmark add/remove</TruncText>
-      </Box>
-    )
-  }
-
-  if (section === 'groups') {
-    const rows = state.groupViewTab === 'my'
-      ? state.myGroups
-      : state.groupViewTab === 'invites'
-        ? state.groupInvites
-        : state.groupDiscover
-    const group = state.groupViewTab !== 'invites'
-      ? rows[selectedIndex] as typeof state.groupDiscover[number] | undefined
-      : undefined
-    const invite = state.groupViewTab === 'invites'
-      ? rows[selectedIndex] as typeof state.groupInvites[number] | undefined
-      : undefined
-    return (
-      <Box flexDirection="column">
-        <TruncText color="magenta">Group Detail</TruncText>
-        {!group && !invite ? <TruncText dimColor>No group selected</TruncText> : null}
-        {group ? (
-          <>
-            <TruncText>id: {group.id}</TruncText>
-            <TruncText>name: {group.name}</TruncText>
-            <TruncText>visibility: {group.isPublic === false ? 'private' : 'public'}</TruncText>
-            <TruncText>join: {group.isOpen ? 'open' : 'closed'}</TruncText>
-            <TruncText>relay: {group.relay || '-'}</TruncText>
-            <TruncText>{shortText(group.about, 140)}</TruncText>
-          </>
-        ) : null}
-        {invite ? (
-          <>
-            <TruncText>inviteId: {invite.id}</TruncText>
-            <TruncText>groupId: {invite.groupId}</TruncText>
-            <TruncText>group: {invite.groupName || invite.groupId}</TruncText>
-            <TruncText>relay: {invite.relay || '-'}</TruncText>
-            <TruncText>mode: {invite.fileSharing === false ? 'closed' : 'open'}</TruncText>
-          </>
-        ) : null}
-        <TruncText>pending invites: {state.groupInvites.length}</TruncText>
-        <TruncText>join requests: {Object.values(state.groupJoinRequests).reduce((total, rows) => total + rows.length, 0)}</TruncText>
-        <TruncText dimColor>Tabs: group tab discover|my|invites</TruncText>
-        <TruncText dimColor>Quick Actions (Groups): join-flow | invite | update-members | update-auth</TruncText>
-        <TruncText dimColor>Quick Actions (Invites): invite-accept | invite-dismiss | copy group-id</TruncText>
-        <TruncText dimColor>Commands: group refresh | group tab | group invites | group join-flow | group invite | group join-requests | group approve | group reject | group invite-accept | group invite-dismiss | group update-members | group update-auth</TruncText>
-      </Box>
-    )
-  }
-
-  if (section === 'invites') {
-    const invite = state.invitesInbox[selectedIndex]
-    return (
-      <Box flexDirection="column">
-        <TruncText color="magenta">Invite Detail</TruncText>
-        {!invite ? <TruncText dimColor>No invite selected</TruncText> : null}
-        {invite?.type === 'group' ? (
-          <>
-            <TruncText>type: group</TruncText>
-            <TruncText>id: {invite.id}</TruncText>
-            <TruncText>groupId: {invite.groupId}</TruncText>
-            <TruncText>title: {shortText(invite.title, 42)}</TruncText>
-            <TruncText>relay: {invite.relay || '-'}</TruncText>
-          </>
-        ) : null}
-        {invite?.type === 'chat' ? (
-          <>
-            <TruncText>type: chat</TruncText>
-            <TruncText>id: {invite.id}</TruncText>
-            <TruncText>title: {shortText(invite.title, 42)}</TruncText>
-            <TruncText>status: {invite.status}</TruncText>
-            <TruncText>conversationId: {invite.conversationId || '-'}</TruncText>
-          </>
-        ) : null}
-        <TruncText dimColor>Commands: invites refresh | invites accept group|chat [id] | invites dismiss group|chat [id]</TruncText>
-      </Box>
-    )
-  }
-
-  if (section === 'files') {
-    const file = state.files[selectedIndex]
-    return (
-      <Box flexDirection="column">
-        <TruncText color="magenta">File Detail</TruncText>
-        {!file ? <TruncText dimColor>No file selected</TruncText> : null}
-        {file ? (
-          <>
-            <TruncText>group: {file.groupId}</TruncText>
-            <TruncText>name: {file.fileName}</TruncText>
-            <TruncText>mime: {file.mime || '-'}</TruncText>
-            <TruncText>size: {file.size || 0}</TruncText>
-            <TruncText>uploader: {shortId(file.uploadedBy, 8)}</TruncText>
-            <TruncText>url: {shortText(file.url, 120)}</TruncText>
-          </>
-        ) : null}
-        <TruncText dimColor>Quick Actions: copy group-id | copy sha256 | copy url</TruncText>
-        <TruncText dimColor>Commands: file refresh | file upload</TruncText>
-      </Box>
-    )
-  }
-
-  if (section === 'lists') {
-    const list = state.lists[selectedIndex]
-    return (
-      <Box flexDirection="column">
-        <TruncText color="magenta">Starter Pack Detail</TruncText>
-        {!list ? <TruncText dimColor>No list selected</TruncText> : null}
-        {list ? (
-          <>
-            <TruncText>dTag: {list.id}</TruncText>
-            <TruncText>title: {list.title}</TruncText>
-            <TruncText>pubkeys: {list.pubkeys.length}</TruncText>
-            <TruncText>author: {shortId(list.event.pubkey, 10)}</TruncText>
-            <TruncText>{shortText(list.description, 140)}</TruncText>
-          </>
-        ) : null}
-        <TruncText dimColor>Commands: list refresh | list create | list apply</TruncText>
-      </Box>
-    )
-  }
-
-  if (section === 'bookmarks') {
-    const eventId = state.bookmarks.eventIds[selectedIndex]
-    return (
-      <Box flexDirection="column">
-        <TruncText color="magenta">Bookmark Detail</TruncText>
-        {!eventId ? <TruncText dimColor>No bookmark selected</TruncText> : <TruncText>eventId: {eventId}</TruncText>}
-        <TruncText dimColor>Commands: bookmark refresh | bookmark add | bookmark remove</TruncText>
-      </Box>
-    )
-  }
-
-  if (section === 'chats') {
-    const conversation = state.chatViewTab === 'conversations' ? state.conversations[selectedIndex] : null
-    const invite = state.chatViewTab === 'invites' ? state.chatInvites[selectedIndex] : null
-    const retrySeconds = state.chatNextRetryAt
-      ? Math.max(0, Math.ceil((state.chatNextRetryAt - Date.now()) / 1000))
-      : null
-    return (
-      <Box flexDirection="column">
-        <TruncText color="magenta">Conversation Detail</TruncText>
-        {!conversation && !invite ? <TruncText dimColor>No conversation selected</TruncText> : null}
-        {conversation ? (
-          <>
-            <TruncText>id: {shortId(conversation.id, 10)}</TruncText>
-            <TruncText>title: {conversation.title}</TruncText>
-            <TruncText>participants: {conversation.participants.length}</TruncText>
-            <TruncText>admins: {conversation.adminPubkeys.length}</TruncText>
-            <TruncText>unread: {conversation.unreadCount}</TruncText>
-            <TruncText>{shortText(conversation.lastMessagePreview, 140)}</TruncText>
-          </>
-        ) : null}
-        {invite ? (
-          <>
-            <TruncText>inviteId: {shortId(invite.id, 10)}</TruncText>
-            <TruncText>title: {invite.title || '-'}</TruncText>
-            <TruncText>sender: {shortId(invite.senderPubkey, 10)}</TruncText>
-            <TruncText>status: {invite.status}</TruncText>
-            <TruncText>conversationId: {invite.conversationId || '-'}</TruncText>
-          </>
-        ) : null}
-        <TruncText>
-          chat runtime: {state.chatRuntimeState}
-          {retrySeconds !== null ? ` (retry ${retrySeconds}s)` : ''}
-        </TruncText>
-        {state.chatWarning ? <TruncText color="yellow">{shortText(state.chatWarning, 120)}</TruncText> : null}
-        <TruncText>pending chat invites: {state.chatPendingInviteCount}</TruncText>
-        <TruncText>unread total: {state.chatUnreadTotal}</TruncText>
-        <TruncText dimColor>Tabs: chat tab conversations|invites</TruncText>
-        <TruncText dimColor>Quick Actions (Chats): open thread | send message | copy conversation-id</TruncText>
-        <TruncText dimColor>Quick Actions (Invites): accept | dismiss | copy invite-id</TruncText>
-        <TruncText dimColor>Commands: chat init | chat refresh | chat create | chat accept | chat dismiss | chat thread | chat send</TruncText>
-      </Box>
-    )
-  }
-
-  if (section === 'search') {
-    const result = state.searchResults[selectedIndex]
-    return (
-      <Box flexDirection="column">
-        <TruncText color="magenta">Search Detail</TruncText>
-        {!result ? <TruncText dimColor>No result selected</TruncText> : null}
-        {result ? (
-          <>
-            <TruncText>mode: {result.mode}</TruncText>
-            <TruncText>event id: {shortId(result.event.id, 12)}</TruncText>
-            <TruncText>author: {shortId(result.event.pubkey, 12)}</TruncText>
-            <TruncText>{shortText(result.event.content, 180)}</TruncText>
-          </>
-        ) : null}
-        <TruncText dimColor>Command: search &lt;notes|profiles|groups|lists&gt; &lt;query&gt;</TruncText>
-      </Box>
-    )
-  }
-
-  if (section === 'accounts') {
-    const account = state.accounts[selectedIndex]
-    return (
-      <Box flexDirection="column">
-        <TruncText color="magenta">Account Detail</TruncText>
-        {!account ? <TruncText dimColor>No account selected</TruncText> : null}
-        {account ? (
-          <>
-            <TruncText>pubkey: {account.pubkey}</TruncText>
-            <TruncText>signer: {account.signerType}</TruncText>
-            <TruncText>label: {account.label || '-'}</TruncText>
-            <TruncText>created: {new Date(account.createdAt).toLocaleString()}</TruncText>
-            <TruncText>updated: {new Date(account.updatedAt).toLocaleString()}</TruncText>
-          </>
-        ) : null}
-        <TruncText dimColor>
-          Commands: account generate | profiles | login | add-nsec | add-ncryptsec | select | unlock | remove | clear
-        </TruncText>
-      </Box>
-    )
-  }
+function renderDetailPane(
+  state: ControllerState,
+  section: SectionId,
+  selectedIndex: number,
+  offset: number,
+  visibleRows: number,
+  width: number
+): React.ReactNode {
+  const title = detailPaneTitle(section)
+  const rawRows = detailPaneRows(state, section, selectedIndex)
+  const wrappedRows = rawRows.flatMap((row) => wrapText(row, Math.max(16, width - 4)))
+  const usableRows = Math.max(1, visibleRows - 1)
+  const maxOffset = Math.max(0, wrappedRows.length - usableRows)
+  const clampedOffset = Math.max(0, Math.min(offset, maxOffset))
+  const visible = wrappedRows.slice(clampedOffset, clampedOffset + usableRows)
 
   return (
     <Box flexDirection="column">
-      <TruncText color="magenta">Logs</TruncText>
-      <TruncText>stdout: {state.workerStdout.length}</TruncText>
-      <TruncText>stderr: {state.workerStderr.length}</TruncText>
-      <TruncText>entries: {state.logs.length}</TruncText>
-      <TruncText dimColor>Use Up/Down to inspect log stream in center pane.</TruncText>
+      <Text color="magenta">{title}</Text>
+      {visible.length === 0 ? <Text dimColor>None</Text> : null}
+      {visible.map((line, idx) => {
+        const dim = line.startsWith('Commands:') || line.startsWith('Compose:') || line.startsWith('Feed source:')
+        return (
+          <Text key={`${idx}-${line.slice(0, 24)}`} dimColor={dim}>
+            {line}
+          </Text>
+        )
+      })}
     </Box>
   )
 }
@@ -1001,6 +1107,7 @@ export function App({
   const [section, setSection] = useState<SectionId>('dashboard')
   const [selection, setSelection] = useState<SelectionState>(initialSelection)
   const [offsets, setOffsets] = useState<OffsetState>(initialOffsets)
+  const [detailOffsets, setDetailOffsets] = useState<DetailPaneOffsetState>(initialDetailOffsets)
   const [commandInputOpen, setCommandInputOpen] = useState(false)
   const [commandInput, setCommandInput] = useState('')
   const [commandMessage, setCommandMessage] = useState('Type :help for commands')
@@ -1009,6 +1116,7 @@ export function App({
   const sectionRef = useRef<SectionId>('dashboard')
   const selectionRef = useRef<SelectionState>(initialSelection)
   const offsetsRef = useRef<OffsetState>(initialOffsets)
+  const detailOffsetsRef = useRef<DetailPaneOffsetState>(initialDetailOffsets)
 
   useEffect(() => {
     exitRef.current = exit
@@ -1067,9 +1175,49 @@ export function App({
   }, [section, selection, state])
 
   const narrowLayout = stdoutWidth < 132
-  const topPaneHeight = Math.max(14, stdoutHeight - 8)
-  const centerVisibleRows = Math.max(4, (narrowLayout ? Math.floor((topPaneHeight - 6) / 2) : topPaneHeight - 4))
+  const frameHeight = Math.max(14, stdoutHeight)
+  const frameRows = splitLayoutRows(frameHeight)
   const commandMessageMax = Math.max(24, stdoutWidth - 20)
+
+  const navPaneWidth = 28
+  const detailPaneWidth = narrowLayout
+    ? Math.max(24, stdoutWidth - 2)
+    : clamp(Math.floor(stdoutWidth * 0.34), 44, 72)
+  const centerPaneWidth = narrowLayout
+    ? Math.max(24, stdoutWidth - 2)
+    : Math.max(34, stdoutWidth - navPaneWidth - detailPaneWidth - 2)
+
+  let narrowNavRows = clamp(Math.floor(frameRows.mainRows * 0.28), 4, 10)
+  let narrowDetailRows = clamp(Math.floor(frameRows.mainRows * 0.34), 4, 12)
+  let narrowCenterRows = frameRows.mainRows - narrowNavRows - narrowDetailRows
+  if (narrowCenterRows < 4) {
+    let deficit = 4 - narrowCenterRows
+    const shrinkDetail = Math.min(deficit, Math.max(0, narrowDetailRows - 4))
+    narrowDetailRows -= shrinkDetail
+    deficit -= shrinkDetail
+    const shrinkNav = Math.min(deficit, Math.max(0, narrowNavRows - 4))
+    narrowNavRows -= shrinkNav
+    narrowCenterRows = Math.max(4, frameRows.mainRows - narrowNavRows - narrowDetailRows)
+  }
+
+  const centerPaneHeightRows = narrowLayout ? narrowCenterRows : frameRows.mainRows
+  const detailPaneHeightRows = narrowLayout ? narrowDetailRows : frameRows.mainRows
+  const centerVisibleRows = Math.max(3, centerPaneHeightRows - 2)
+  const detailVisibleRows = Math.max(3, detailPaneHeightRows - 2)
+  const detailWrapWidth = Math.max(16, detailPaneWidth - 4)
+
+  const detailWrappedRows = useMemo(() => {
+    if (!state) return []
+    const rows = detailPaneRows(state, section, selectedIndex)
+    return rows.flatMap((row) => wrapText(row, detailWrapWidth))
+  }, [detailWrapWidth, section, selectedIndex, state])
+
+  const normalizedDetailOffset = useMemo(() => {
+    const current = detailOffsets[section] || 0
+    const usableRows = Math.max(1, detailVisibleRows - 1)
+    const maxOffset = Math.max(0, detailWrappedRows.length - usableRows)
+    return clamp(current, 0, maxOffset)
+  }, [detailOffsets, detailVisibleRows, detailWrappedRows.length, section])
 
   const normalizedViewport = useMemo(() => {
     if (!state) {
@@ -1096,8 +1244,13 @@ export function App({
   }, [offsets])
 
   useEffect(() => {
+    detailOffsetsRef.current = detailOffsets
+  }, [detailOffsets])
+
+  useEffect(() => {
     if (!state) return
     const incoming = state.paneViewport || {}
+    const incomingDetailOffsets = state.detailPaneOffsetBySection || {}
     setSelection((prev) => {
       let changed = false
       const next = { ...prev }
@@ -1119,6 +1272,20 @@ export function App({
         if (!saved) continue
         if (typeof saved.offset === 'number' && prev[key] !== saved.offset) {
           next[key] = Math.max(0, Math.trunc(saved.offset))
+          changed = true
+        }
+      }
+      return changed ? next : prev
+    })
+    setDetailOffsets((prev) => {
+      let changed = false
+      const next = { ...prev }
+      for (const key of SECTION_ORDER) {
+        const saved = incomingDetailOffsets[key]
+        if (typeof saved !== 'number') continue
+        const normalized = Math.max(0, Math.trunc(saved))
+        if (prev[key] !== normalized) {
+          next[key] = normalized
           changed = true
         }
       }
@@ -1178,11 +1345,21 @@ export function App({
         [section]: normalizedViewport.offset
       }))
     }
+    if (normalizedDetailOffset !== detailOffsets[section]) {
+      setDetailOffsets((prev) => ({
+        ...prev,
+        [section]: normalizedDetailOffset
+      }))
+    }
     const controller = controllerRef.current
     if (controller) {
       controller.setPaneViewport(section, normalizedViewport.selectedIndex, normalizedViewport.offset).catch(() => {})
+      const persistedDetailOffset = state.detailPaneOffsetBySection?.[section] || 0
+      if (persistedDetailOffset !== normalizedDetailOffset) {
+        controller.setDetailPaneOffset(section, normalizedDetailOffset).catch(() => {})
+      }
     }
-  }, [state, normalizedViewport, section, selection, offsets])
+  }, [state, normalizedViewport, normalizedDetailOffset, section, selection, offsets, detailOffsets])
 
   useEffect(() => {
     if (!initialized) return
@@ -1327,6 +1504,20 @@ export function App({
       }))
     }
 
+    const moveDetail = (delta: number): void => {
+      const currentSection = sectionRef.current
+      const currentOffset = detailOffsetsRef.current[currentSection] || 0
+      const usableRows = Math.max(1, detailVisibleRows - 1)
+      const maxOffset = Math.max(0, detailWrappedRows.length - usableRows)
+      const nextOffset = clamp(currentOffset + Math.trunc(delta), 0, maxOffset)
+      if (nextOffset === currentOffset) return
+      setDetailOffsets((prev) => ({
+        ...prev,
+        [currentSection]: nextOffset
+      }))
+      controller.setDetailPaneOffset(currentSection, nextOffset).catch(() => {})
+    }
+
     const vimNavEnabled = Boolean(state?.keymap?.vimNavigation)
 
     if (key.upArrow || (vimNavEnabled && input === 'k')) {
@@ -1349,6 +1540,16 @@ export function App({
       return
     }
 
+    if ((key.ctrl && input === 'u') || input === '{') {
+      moveDetail(-Math.max(1, Math.floor(detailVisibleRows / 2)))
+      return
+    }
+
+    if ((key.ctrl && input === 'd') || input === '}') {
+      moveDetail(Math.max(1, Math.floor(detailVisibleRows / 2)))
+      return
+    }
+
     const maybeHome = (key as unknown as { home?: boolean }).home
     const maybeEnd = (key as unknown as { end?: boolean }).end
 
@@ -1367,7 +1568,7 @@ export function App({
 
     if (input === '[' || input === ']') {
       if (section === 'groups') {
-        const tabs: Array<'discover' | 'my' | 'invites'> = ['discover', 'my', 'invites']
+        const tabs: Array<'discover' | 'my'> = ['discover', 'my']
         const index = tabs.indexOf(state?.groupViewTab || 'discover')
         const next = tabs[(index + (input === ']' ? 1 : -1) + tabs.length) % tabs.length]
         controller.setGroupViewTab(next).then(() => {
@@ -1440,16 +1641,18 @@ export function App({
     )
   }
 
+  const keysLabel = 'Keys: `:` command, `Enter` prefill, `y` copy value, `Y` copy command, `Tab/←/→` section, `↑/↓` list, `Ctrl+U/Ctrl+D` detail scroll, `r` refresh, `q` quit'
+
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" height={frameHeight} overflow="hidden">
       {narrowLayout ? (
-        <Box flexDirection="column">
-          <Box borderStyle="round" borderColor="cyan" paddingX={1} height={Math.max(9, Math.floor(topPaneHeight * 0.3))}>
+        <Box flexDirection="column" height={frameRows.mainRows}>
+          <Box borderStyle="round" borderColor="cyan" paddingX={1} height={narrowNavRows} overflow="hidden">
             <Box flexDirection="column">
               <TruncText color="cyan">Hypertuna TUI</TruncText>
               <TruncText dimColor>account: {state.currentAccountPubkey ? shortId(state.currentAccountPubkey, 8) : 'none'}</TruncText>
               <TruncText dimColor>session: {state.session ? 'unlocked' : 'locked'} · worker: {state.lifecycle}</TruncText>
-              <TruncText dimColor>{shortText(state.readinessMessage, Math.max(20, stdoutWidth - 6))}</TruncText>
+              <TruncText dimColor>{shortText(state.readinessMessage, Math.max(20, stdoutWidth - 8))}</TruncText>
               <TruncText dimColor>
                 section: {navLabel(section)}
                 {section === 'dashboard' ? ' · Runtime Summary' : ''}
@@ -1457,7 +1660,7 @@ export function App({
             </Box>
           </Box>
 
-          <Box marginTop={1} borderStyle="round" borderColor="blue" paddingX={1} height={Math.max(8, Math.floor(topPaneHeight * 0.35))}>
+          <Box borderStyle="round" borderColor="blue" paddingX={1} height={centerPaneHeightRows} overflow="hidden">
             {renderCenterPane(
               state,
               section,
@@ -1467,13 +1670,20 @@ export function App({
             )}
           </Box>
 
-          <Box marginTop={1} borderStyle="round" borderColor="magenta" paddingX={1} height={Math.max(8, Math.floor(topPaneHeight * 0.35))} overflow="hidden">
-            {renderDetailPane(state, section, normalizedViewport.selectedIndex)}
+          <Box borderStyle="round" borderColor="magenta" paddingX={1} height={detailPaneHeightRows} overflow="hidden">
+            {renderDetailPane(
+              state,
+              section,
+              normalizedViewport.selectedIndex,
+              normalizedDetailOffset,
+              detailVisibleRows,
+              detailPaneWidth
+            )}
           </Box>
         </Box>
       ) : (
-        <Box height={topPaneHeight}>
-          <Box width={28} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
+        <Box height={frameRows.mainRows}>
+          <Box width={navPaneWidth} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1} overflow="hidden">
             <TruncText color="cyan">Hypertuna TUI</TruncText>
             <TruncText dimColor>account: {state.currentAccountPubkey ? shortId(state.currentAccountPubkey, 8) : 'none'}</TruncText>
             <TruncText dimColor>session: {state.session ? 'unlocked' : 'locked'}</TruncText>
@@ -1489,7 +1699,7 @@ export function App({
             </Box>
           </Box>
 
-          <Box flexGrow={1} marginX={1} borderStyle="round" borderColor="blue" paddingX={1}>
+          <Box width={centerPaneWidth} borderStyle="round" borderColor="blue" paddingX={1} overflow="hidden">
             {renderCenterPane(
               state,
               section,
@@ -1499,13 +1709,20 @@ export function App({
             )}
           </Box>
 
-          <Box width={50} flexDirection="column" borderStyle="round" borderColor="magenta" paddingX={1} overflow="hidden">
-            {renderDetailPane(state, section, normalizedViewport.selectedIndex)}
+          <Box width={detailPaneWidth} flexDirection="column" borderStyle="round" borderColor="magenta" paddingX={1} overflow="hidden">
+            {renderDetailPane(
+              state,
+              section,
+              normalizedViewport.selectedIndex,
+              normalizedDetailOffset,
+              detailVisibleRows,
+              detailPaneWidth
+            )}
           </Box>
         </Box>
       )}
 
-      <Box marginTop={1} borderStyle="round" borderColor="gray" paddingX={1} overflow="hidden">
+      <Box borderStyle="round" borderColor="gray" paddingX={1} height={frameRows.commandRows} overflow="hidden">
         {commandInputOpen ? (
           <Box>
             <TruncText color="yellow">:</TruncText>
@@ -1524,25 +1741,16 @@ export function App({
         )}
       </Box>
 
-      <Box marginTop={1}>
-        <TruncText dimColor>
-          Keys: `:` command, `Enter` prefill command, `y` copy value, `Y` copy command, `Tab/←/→` switch section, `↑/↓` move, `r` refresh, `q` quit
-        </TruncText>
+      <Box height={frameRows.keysRows} overflow="hidden">
+        <TruncText dimColor>{shortText(keysLabel, Math.max(32, stdoutWidth - 2))}</TruncText>
       </Box>
 
-      {state.busyTask ? (
-        <Box>
-          <TruncText color="cyan">
-            {options.noAnimations ? 'Working' : <Spinner type="dots" />} {state.busyTask}
-          </TruncText>
-        </Box>
-      ) : null}
-
-      {state.lastError ? (
-        <Box>
-          <TruncText color="red">Error: {state.lastError}</TruncText>
-        </Box>
-      ) : null}
+      <Box height={frameRows.statusRows} overflow="hidden">
+        {state.busyTask && !options.noAnimations ? <Spinner type="dots" /> : null}
+        <TruncText color={state.lastError ? 'red' : state.busyTask ? 'cyan' : 'gray'}>
+          {shortText(commandStatusLabel(state, options), Math.max(30, stdoutWidth - 2))}
+        </TruncText>
+      </Box>
     </Box>
   )
 }

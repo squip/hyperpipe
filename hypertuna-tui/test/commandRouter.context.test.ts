@@ -122,7 +122,7 @@ describe('command router context-first workflows', () => {
     expect(selectedResult.message).toContain('Copied')
     expect(commandResult.message).toContain('Copied')
     expect(copiedValues[0]).toBe(groupId)
-    expect(copiedValues[1]).toBe(`group join-flow ${groupId}`)
+    expect(copiedValues[1]).toBe(`group members ${groupId}`)
   })
 
   it('blocks sensitive copy fields by default', async () => {

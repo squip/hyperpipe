@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import path from 'node:path'
-import type { Event } from 'nostr-tools'
+import { promises as fs } from 'node:fs'
+import type { Event, Filter } from 'nostr-tools'
 import { generateSecretKey, nip19 } from 'nostr-tools'
 import { AccountService } from './accountService.js'
 import type {
@@ -10,11 +11,20 @@ import type {
   ChatViewTab,
   ChatConversation,
   ChatInvite,
+  FeedControls,
+  FeedSortKey,
   FeedItem,
+  FeedSourceState,
+  FileControls,
+  FileSortKey,
+  GroupComposeDraft,
+  GroupControls,
   GroupJoinRequest,
   GroupListEntry,
+  GroupSortKey,
   GroupViewTab,
   GroupFileRecord,
+  GroupDraftAttachment,
   GroupInvite,
   GroupSummary,
   InvitesInboxItem,
@@ -23,8 +33,10 @@ import type {
   PaneViewportMap,
   PerfMetrics,
   RelayEntry,
+  RelayListPreferences,
   SearchMode,
   SearchResult,
+  SortDirection,
   StarterPack,
   ThreadMessage,
   WorkerRecoveryState
@@ -44,7 +56,7 @@ import type { ClipboardCopyResult } from '../runtime/clipboard.js'
 import { resolveStoragePaths } from '../storage/paths.js'
 import { UiStateStore } from '../storage/uiStateStore.js'
 import { DEFAULT_DISCOVERY_RELAYS, SEARCHABLE_RELAYS } from '../lib/constants.js'
-import { uniqueRelayUrls, nip04Decrypt, nip04Encrypt } from '../lib/nostr.js'
+import { uniqueRelayUrls, nip04Decrypt, nip04Encrypt, eventNow, signDraftEvent } from '../lib/nostr.js'
 import { buildScopedFileScope, type ArchivedGroupEntry } from './parity/fileScope.js'
 import {
   buildInvitesInbox,
@@ -57,6 +69,9 @@ import {
   selectFilesCount,
   selectInvitesCount
 } from './parity/counters.js'
+import { parseGroupAdminsEvent, parseGroupMembersEvent } from '../lib/groups.js'
+import { createGroupFileMetadataDraftEvent } from '../lib/group-files.js'
+import { getBaseRelayUrl } from '../lib/hypertuna-group-events.js'
 
 export type RuntimeOptions = {
   cwd: string
@@ -90,10 +105,17 @@ export type ControllerState = {
   lifecycle: WorkerLifecycle
   readinessMessage: string
   relays: RelayEntry[]
+  relayListPreferences: RelayListPreferences
+  gatewayPeerCounts: Record<string, number>
   feed: FeedItem[]
+  feedSource: FeedSourceState
+  activeFeedRelays: string[]
+  feedControls: FeedControls
   groups: GroupSummary[]
+  groupControls: GroupControls
   invites: GroupInvite[]
   files: GroupFileRecord[]
+  fileControls: FileControls
   lists: StarterPack[]
   bookmarks: BookmarkList
   conversations: ChatConversation[]
@@ -121,7 +143,9 @@ export type ControllerState = {
   keymap: {
     vimNavigation: boolean
   }
+  detailPaneOffsetBySection: Record<string, number>
   paneViewport: PaneViewportMap
+  composeDraft: GroupComposeDraft | null
   perfMetrics: PerfMetrics
   workerRecoveryState: WorkerRecoveryState
   dismissedGroupInviteIds: string[]
@@ -198,6 +222,44 @@ function defaultWorkerRecoveryState(): WorkerRecoveryState {
   }
 }
 
+function defaultFeedSourceState(): FeedSourceState {
+  return {
+    mode: 'relays',
+    relayUrl: null,
+    groupId: null,
+    label: 'All Relays'
+  }
+}
+
+function defaultFeedControls(): FeedControls {
+  return {
+    query: '',
+    sortKey: 'createdAt',
+    sortDirection: 'desc',
+    kindFilter: null
+  }
+}
+
+function defaultGroupControls(): GroupControls {
+  return {
+    query: '',
+    sortKey: 'members',
+    sortDirection: 'desc',
+    visibility: 'all',
+    joinMode: 'all'
+  }
+}
+
+function defaultFileControls(): FileControls {
+  return {
+    query: '',
+    sortKey: 'uploadedAt',
+    sortDirection: 'desc',
+    mime: 'all',
+    group: 'all'
+  }
+}
+
 function maybeNpub(value: string | undefined): string | undefined {
   if (!value) return undefined
   try {
@@ -206,6 +268,45 @@ function maybeNpub(value: string | undefined): string | undefined {
     return undefined
   }
 }
+
+function guessMimeFromPath(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase()
+  switch (ext) {
+    case '.png':
+      return 'image/png'
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg'
+    case '.gif':
+      return 'image/gif'
+    case '.webp':
+      return 'image/webp'
+    case '.txt':
+      return 'text/plain'
+    case '.md':
+      return 'text/markdown'
+    case '.json':
+      return 'application/json'
+    case '.pdf':
+      return 'application/pdf'
+    case '.mp4':
+      return 'video/mp4'
+    case '.mov':
+      return 'video/quicktime'
+    case '.mp3':
+      return 'audio/mpeg'
+    default:
+      return 'application/octet-stream'
+  }
+}
+
+const MAX_FEED_RELAYS = 18
+const MAX_SEARCH_RELAYS = 24
+const MAX_GROUP_ENRICH_RELAYS = 12
+const MAX_GROUP_ENRICH_ITEMS = 120
+const RELAY_REFRESH_TIMEOUT_MS = 9_000
+const FEED_REFRESH_TIMEOUT_MS = 4_000
+const GROUP_METADATA_TIMEOUT_MS = 2_500
 
 export class TuiController {
   private options: RuntimeOptions
@@ -236,6 +337,11 @@ export class TuiController {
   private inviteRefreshToken = 0
   private chatRetryTimer: NodeJS.Timeout | null = null
   private chatInitInFlight = false
+  private rawFeed: FeedItem[] = []
+  private rawGroupDiscover: GroupSummary[] = []
+  private rawFiles: GroupFileRecord[] = []
+  private feedLimit = 120
+  private profileNameCache = new Map<string, string>()
 
   private state: ControllerState = {
     initialized: false,
@@ -245,10 +351,20 @@ export class TuiController {
     lifecycle: 'stopped',
     readinessMessage: 'Stopped',
     relays: [],
+    relayListPreferences: {
+      read: [],
+      write: []
+    },
+    gatewayPeerCounts: {},
     feed: [],
+    feedSource: defaultFeedSourceState(),
+    activeFeedRelays: [],
+    feedControls: defaultFeedControls(),
     groups: [],
+    groupControls: defaultGroupControls(),
     invites: [],
     files: [],
+    fileControls: defaultFileControls(),
     lists: [],
     bookmarks: {
       event: null,
@@ -279,7 +395,9 @@ export class TuiController {
     keymap: {
       vimNavigation: false
     },
+    detailPaneOffsetBySection: {},
     paneViewport: {},
+    composeDraft: null,
     perfMetrics: defaultPerfMetrics(),
     workerRecoveryState: defaultWorkerRecoveryState(),
     dismissedGroupInviteIds: [],
@@ -334,10 +452,23 @@ export class TuiController {
       ...this.state,
       accounts: this.state.accounts.map((account) => ({ ...account })),
       relays: this.state.relays.map((relay) => ({ ...relay })),
+      relayListPreferences: {
+        read: [...this.state.relayListPreferences.read],
+        write: [...this.state.relayListPreferences.write]
+      },
+      gatewayPeerCounts: { ...this.state.gatewayPeerCounts },
       feed: [...this.state.feed],
+      feedSource: { ...this.state.feedSource },
+      activeFeedRelays: [...this.state.activeFeedRelays],
+      feedControls: {
+        ...this.state.feedControls,
+        kindFilter: this.state.feedControls.kindFilter ? [...this.state.feedControls.kindFilter] : null
+      },
       groups: this.state.groups.map((group) => ({ ...group })),
+      groupControls: { ...this.state.groupControls },
       invites: this.state.invites.map((invite) => ({ ...invite })),
       files: this.state.files.map((file) => ({ ...file })),
+      fileControls: { ...this.state.fileControls },
       lists: this.state.lists.map((list) => ({ ...list })),
       bookmarks: {
         event: this.state.bookmarks.event,
@@ -356,9 +487,16 @@ export class TuiController {
       ),
       invitesInbox: this.state.invitesInbox.map((item) => ({ ...item })),
       keymap: { ...this.state.keymap },
+      detailPaneOffsetBySection: { ...this.state.detailPaneOffsetBySection },
       paneViewport: Object.fromEntries(
         Object.entries(this.state.paneViewport).map(([key, value]) => [key, { ...value }])
       ),
+      composeDraft: this.state.composeDraft
+        ? {
+            ...this.state.composeDraft,
+            attachments: this.state.composeDraft.attachments.map((entry) => ({ ...entry }))
+          }
+        : null,
       perfMetrics: {
         ...this.state.perfMetrics,
         operationSamples: this.state.perfMetrics.operationSamples.map((sample) => ({ ...sample }))
@@ -498,6 +636,11 @@ export class TuiController {
     this.patchState({
       groupViewTab: scoped.groupViewTab,
       chatViewTab: scoped.chatViewTab,
+      feedSource: scoped.feedSource || defaultFeedSourceState(),
+      feedControls: scoped.feedControls || defaultFeedControls(),
+      groupControls: scoped.groupControls || defaultGroupControls(),
+      fileControls: scoped.fileControls || defaultFileControls(),
+      detailPaneOffsetBySection: scoped.detailPaneOffsetBySection || {},
       paneViewport: scoped.paneViewport,
       dismissedGroupInviteIds: scoped.dismissedGroupInviteIds,
       acceptedGroupInviteIds: scoped.acceptedGroupInviteIds,
@@ -510,11 +653,20 @@ export class TuiController {
         overlayEnabled: scoped.perfOverlayEnabled
       }
     })
+
+    if (this.rawFeed.length > 0) this.syncFeedView()
+    if (this.rawGroupDiscover.length > 0) this.syncGroupView()
+    if (this.rawFiles.length > 0) this.syncFilesView()
   }
 
   private async persistAccountScopedUiState(patch: {
     groupViewTab?: GroupViewTab
     chatViewTab?: ChatViewTab
+    feedSource?: FeedSourceState
+    feedControls?: FeedControls
+    groupControls?: GroupControls
+    fileControls?: FileControls
+    detailPaneOffsetBySection?: Record<string, number>
     paneViewport?: PaneViewportMap
     dismissedGroupInviteIds?: string[]
     acceptedGroupInviteIds?: string[]
@@ -613,11 +765,29 @@ export class TuiController {
           return
         }
 
+        if (event.type === 'gateway-status') {
+          const status = (event as { status?: unknown }).status
+          const gatewayPeerCounts = this.parseGatewayPeerCounts(status)
+          this.patchState({ gatewayPeerCounts })
+          if (this.rawGroupDiscover.length > 0) {
+            this.syncGroupView()
+          }
+          return
+        }
+
         if (event.type === 'error') {
           const message =
             typeof (event as { message?: string }).message === 'string'
               ? (event as { message?: string }).message || 'Worker error'
               : event.error || 'Worker error'
+
+          if (this.isNonFatalWorkerError(message)) {
+            this.patchState({
+              lastError: message
+            })
+            this.log('warn', message)
+            return
+          }
 
           this.patchState({
             lastError: message,
@@ -1190,7 +1360,7 @@ export class TuiController {
   }
 
   async setGroupViewTab(tab: GroupViewTab): Promise<void> {
-    const nextTab: GroupViewTab = ['discover', 'my', 'invites'].includes(tab) ? tab : 'discover'
+    const nextTab: GroupViewTab = tab === 'my' ? 'my' : 'discover'
     this.patchState({ groupViewTab: nextTab })
     await this.persistAccountScopedUiState({ groupViewTab: nextTab })
   }
@@ -1221,6 +1391,22 @@ export class TuiController {
     await this.persistAccountScopedUiState({ paneViewport: next })
   }
 
+  async setDetailPaneOffset(sectionKey: string, offset: number): Promise<void> {
+    const key = String(sectionKey || '').trim()
+    if (!key) return
+    const normalizedOffset = Math.max(0, Math.trunc(offset))
+    const existing = this.state.detailPaneOffsetBySection[key]
+    if (typeof existing === 'number' && existing === normalizedOffset) {
+      return
+    }
+    const next = {
+      ...this.state.detailPaneOffsetBySection,
+      [key]: normalizedOffset
+    }
+    this.patchState({ detailPaneOffsetBySection: next })
+    await this.persistAccountScopedUiState({ detailPaneOffsetBySection: next })
+  }
+
   async setPerfOverlay(enabled: boolean): Promise<void> {
     this.patchState({
       perfMetrics: {
@@ -1238,12 +1424,530 @@ export class TuiController {
     }
   }
 
-  private currentRelayUrls(): string[] {
-    const workerRelays = this.state.relays
-      .map((entry) => entry.connectionUrl)
-      .filter((entry): entry is string => typeof entry === 'string' && !!entry)
+  private applyFeedControls(feed: FeedItem[]): FeedItem[] {
+    const controls = this.state.feedControls
+    const query = controls.query.trim().toLowerCase()
+    const kindSet = controls.kindFilter && controls.kindFilter.length
+      ? new Set(controls.kindFilter)
+      : null
 
-    return uniqueRelayUrls([...workerRelays, ...DEFAULT_DISCOVERY_RELAYS])
+    const filtered = feed.filter((event) => {
+      if (kindSet && !kindSet.has(event.kind)) return false
+      if (!query) return true
+      if (event.content.toLowerCase().includes(query)) return true
+      if (event.id.toLowerCase().includes(query)) return true
+      if (event.pubkey.toLowerCase().includes(query)) return true
+      return event.tags.some((tag) => tag.some((part) => String(part || '').toLowerCase().includes(query)))
+    })
+
+    const direction = controls.sortDirection === 'asc' ? 1 : -1
+    filtered.sort((left, right) => {
+      switch (controls.sortKey) {
+        case 'kind':
+          return direction * (left.kind - right.kind)
+        case 'author':
+          return direction * left.pubkey.localeCompare(right.pubkey)
+        case 'content':
+          return direction * left.content.localeCompare(right.content)
+        case 'createdAt':
+        default:
+          if (left.created_at !== right.created_at) {
+            return direction * (left.created_at - right.created_at)
+          }
+          return direction * left.id.localeCompare(right.id)
+      }
+    })
+
+    return filtered
+  }
+
+  private applyGroupControls(groups: GroupSummary[]): GroupSummary[] {
+    const controls = this.state.groupControls
+    const query = controls.query.trim().toLowerCase()
+    const filtered = groups.filter((group) => {
+      if (controls.visibility === 'public' && group.isPublic === false) return false
+      if (controls.visibility === 'private' && group.isPublic !== false) return false
+      if (controls.joinMode === 'open' && group.isOpen === false) return false
+      if (controls.joinMode === 'closed' && group.isOpen !== false) return false
+      if (!query) return true
+      const fields = [
+        group.name,
+        group.about || '',
+        group.id,
+        group.adminName || '',
+        group.adminPubkey || ''
+      ]
+      return fields.some((value) => String(value || '').toLowerCase().includes(query))
+    })
+
+    const direction = controls.sortDirection === 'asc' ? 1 : -1
+    filtered.sort((left, right) => {
+      const leftAdmin = (left.adminName || left.adminPubkey || '').toLowerCase()
+      const rightAdmin = (right.adminName || right.adminPubkey || '').toLowerCase()
+      const leftCreatedAt = Number(left.createdAt || left.event?.created_at || 0)
+      const rightCreatedAt = Number(right.createdAt || right.event?.created_at || 0)
+      const leftMembers = Number(left.membersCount || left.members?.length || 0)
+      const rightMembers = Number(right.membersCount || right.members?.length || 0)
+      const leftPeers = Number(left.peersOnline || 0)
+      const rightPeers = Number(right.peersOnline || 0)
+
+      switch (controls.sortKey) {
+        case 'name':
+          return direction * left.name.localeCompare(right.name)
+        case 'description':
+          return direction * String(left.about || '').localeCompare(String(right.about || ''))
+        case 'open':
+          return direction * ((left.isOpen ? 1 : 0) - (right.isOpen ? 1 : 0))
+        case 'public':
+          return direction * ((left.isPublic === false ? 0 : 1) - (right.isPublic === false ? 0 : 1))
+        case 'admin':
+          return direction * leftAdmin.localeCompare(rightAdmin)
+        case 'createdAt':
+          return direction * (leftCreatedAt - rightCreatedAt)
+        case 'peers':
+          return direction * (leftPeers - rightPeers)
+        case 'members':
+        default:
+          return direction * (leftMembers - rightMembers)
+      }
+    })
+
+    return filtered
+  }
+
+  private applyFileControls(files: GroupFileRecord[]): GroupFileRecord[] {
+    const controls = this.state.fileControls
+    const query = controls.query.trim().toLowerCase()
+    const mimeQuery = controls.mime.trim().toLowerCase()
+    const filtered = files.filter((record) => {
+      if (controls.group !== 'all' && record.groupId !== controls.group) return false
+      if (mimeQuery !== 'all') {
+        const mime = String(record.mime || '').toLowerCase()
+        if (!mime.startsWith(mimeQuery)) return false
+      }
+      if (!query) return true
+      const fields = [
+        record.fileName,
+        record.groupId,
+        record.groupName || '',
+        record.url || '',
+        record.uploadedBy,
+        record.mime || '',
+        record.sha256 || ''
+      ]
+      return fields.some((value) => String(value || '').toLowerCase().includes(query))
+    })
+
+    const direction = controls.sortDirection === 'asc' ? 1 : -1
+    filtered.sort((left, right) => {
+      switch (controls.sortKey) {
+        case 'fileName':
+          return direction * left.fileName.localeCompare(right.fileName)
+        case 'group':
+          return direction * String(left.groupName || left.groupId).localeCompare(String(right.groupName || right.groupId))
+        case 'uploadedBy':
+          return direction * left.uploadedBy.localeCompare(right.uploadedBy)
+        case 'size':
+          return direction * (Number(left.size || 0) - Number(right.size || 0))
+        case 'mime':
+          return direction * String(left.mime || '').localeCompare(String(right.mime || ''))
+        case 'uploadedAt':
+        default:
+          return direction * (left.uploadedAt - right.uploadedAt)
+      }
+    })
+
+    return filtered
+  }
+
+  private syncFeedView(): void {
+    const next = this.applyFeedControls(this.rawFeed)
+    this.patchState({ feed: next })
+  }
+
+  private syncGroupView(): void {
+    const withLivePeers = this.rawGroupDiscover.map((group) => ({
+      ...group,
+      membersCount: Number(group.membersCount || group.members?.length || 0),
+      peersOnline: this.resolveGroupPeerCount(group.id, group.relay)
+    }))
+    const next = this.applyGroupControls(withLivePeers)
+    this.patchState({
+      groups: next,
+      groupDiscover: next
+    })
+  }
+
+  private syncFilesView(): void {
+    const next = this.applyFileControls(this.rawFiles)
+    this.patchState({ files: next })
+  }
+
+  private normalizeSortDirection(direction?: string): SortDirection {
+    return String(direction || '').toLowerCase() === 'asc' ? 'asc' : 'desc'
+  }
+
+  async setFeedSource(input: FeedSourceState): Promise<void> {
+    const next: FeedSourceState = {
+      mode: input.mode,
+      relayUrl: input.relayUrl || null,
+      groupId: input.groupId || null,
+      label: input.label || undefined
+    }
+    this.patchState({ feedSource: next })
+    await this.persistAccountScopedUiState({ feedSource: next })
+    await this.refreshFeed(this.feedLimit)
+  }
+
+  async setFeedSourceRelays(): Promise<void> {
+    await this.setFeedSource({
+      mode: 'relays',
+      relayUrl: null,
+      groupId: null,
+      label: 'All Relays'
+    })
+  }
+
+  async setFeedSourceFollowing(): Promise<void> {
+    await this.setFeedSource({
+      mode: 'following',
+      relayUrl: null,
+      groupId: null,
+      label: 'Following'
+    })
+  }
+
+  async setFeedSourceRelaySelector(selector: string): Promise<void> {
+    const normalized = String(selector || '').trim()
+    if (!normalized) {
+      throw new Error('Relay selector is required')
+    }
+    const relayUrl = this.resolveRelayUrl(normalized)
+    if (!relayUrl) {
+      throw new Error(`Unable to resolve relay selector: ${normalized}`)
+    }
+    await this.setFeedSource({
+      mode: 'relay',
+      relayUrl,
+      groupId: null,
+      label: relayUrl
+    })
+  }
+
+  private resolveGroupSelector(selector: string): { groupId: string; relay?: string | null } | null {
+    const normalized = String(selector || '').trim()
+    if (!normalized) return null
+    if (/^\d+$/.test(normalized)) {
+      const index = Math.max(0, Number.parseInt(normalized, 10) - 1)
+      const fromMyGroups = this.state.myGroups[index] || this.state.groupDiscover[index]
+      if (!fromMyGroups) return null
+      return {
+        groupId: fromMyGroups.id,
+        relay: fromMyGroups.relay || null
+      }
+    }
+    const direct = this.state.groupDiscover.find((group) => group.id === normalized)
+      || this.state.myGroups.find((group) => group.id === normalized)
+    if (direct) {
+      return {
+        groupId: direct.id,
+        relay: direct.relay || null
+      }
+    }
+    return {
+      groupId: normalized,
+      relay: null
+    }
+  }
+
+  async setFeedSourceGroupSelector(selector: string, relay?: string): Promise<void> {
+    const resolved = this.resolveGroupSelector(selector)
+    if (!resolved?.groupId) {
+      throw new Error(`Unable to resolve group selector: ${selector}`)
+    }
+    const relayUrl = this.resolveGroupRelayUrl(resolved.groupId, relay || resolved.relay || null)
+    await this.setFeedSource({
+      mode: 'group',
+      groupId: resolved.groupId,
+      relayUrl: relayUrl || relay || resolved.relay || null,
+      label: resolved.groupId
+    })
+  }
+
+  async setFeedSearch(query: string): Promise<void> {
+    const next = {
+      ...this.state.feedControls,
+      query: String(query || '').trim()
+    }
+    this.patchState({ feedControls: next })
+    await this.persistAccountScopedUiState({ feedControls: next })
+    this.syncFeedView()
+  }
+
+  async setFeedSort(sortKey: FeedSortKey, direction?: string): Promise<void> {
+    const next = {
+      ...this.state.feedControls,
+      sortKey,
+      sortDirection: direction ? this.normalizeSortDirection(direction) : this.state.feedControls.sortDirection
+    }
+    this.patchState({ feedControls: next })
+    await this.persistAccountScopedUiState({ feedControls: next })
+    this.syncFeedView()
+  }
+
+  async setFeedKindFilter(kinds: number[] | null): Promise<void> {
+    const uniqueKinds = kinds && kinds.length
+      ? Array.from(new Set(kinds.map((kind) => Number(kind)).filter(Number.isFinite)))
+      : null
+    const next = {
+      ...this.state.feedControls,
+      kindFilter: uniqueKinds
+    }
+    this.patchState({ feedControls: next })
+    await this.persistAccountScopedUiState({ feedControls: next })
+    this.syncFeedView()
+  }
+
+  async setGroupSearch(query: string): Promise<void> {
+    const next = {
+      ...this.state.groupControls,
+      query: String(query || '').trim()
+    }
+    this.patchState({ groupControls: next })
+    await this.persistAccountScopedUiState({ groupControls: next })
+    this.syncGroupView()
+  }
+
+  async setGroupSort(sortKey: GroupSortKey, direction?: string): Promise<void> {
+    const next = {
+      ...this.state.groupControls,
+      sortKey,
+      sortDirection: direction ? this.normalizeSortDirection(direction) : this.state.groupControls.sortDirection
+    }
+    this.patchState({ groupControls: next })
+    await this.persistAccountScopedUiState({ groupControls: next })
+    this.syncGroupView()
+  }
+
+  async setGroupVisibilityFilter(visibility: GroupControls['visibility']): Promise<void> {
+    const next = {
+      ...this.state.groupControls,
+      visibility
+    }
+    this.patchState({ groupControls: next })
+    await this.persistAccountScopedUiState({ groupControls: next })
+    this.syncGroupView()
+  }
+
+  async setGroupJoinFilter(joinMode: GroupControls['joinMode']): Promise<void> {
+    const next = {
+      ...this.state.groupControls,
+      joinMode
+    }
+    this.patchState({ groupControls: next })
+    await this.persistAccountScopedUiState({ groupControls: next })
+    this.syncGroupView()
+  }
+
+  async setFileSearch(query: string): Promise<void> {
+    const next = {
+      ...this.state.fileControls,
+      query: String(query || '').trim()
+    }
+    this.patchState({ fileControls: next })
+    await this.persistAccountScopedUiState({ fileControls: next })
+    this.syncFilesView()
+  }
+
+  async setFileSort(sortKey: FileSortKey, direction?: string): Promise<void> {
+    const next = {
+      ...this.state.fileControls,
+      sortKey,
+      sortDirection: direction ? this.normalizeSortDirection(direction) : this.state.fileControls.sortDirection
+    }
+    this.patchState({ fileControls: next })
+    await this.persistAccountScopedUiState({ fileControls: next })
+    this.syncFilesView()
+  }
+
+  async setFileMimeFilter(mime: string): Promise<void> {
+    const next = {
+      ...this.state.fileControls,
+      mime: String(mime || '').trim() || 'all'
+    }
+    this.patchState({ fileControls: next })
+    await this.persistAccountScopedUiState({ fileControls: next })
+    this.syncFilesView()
+  }
+
+  async setFileGroupFilter(group: string): Promise<void> {
+    const next = {
+      ...this.state.fileControls,
+      group: String(group || '').trim() || 'all'
+    }
+    this.patchState({ fileControls: next })
+    await this.persistAccountScopedUiState({ fileControls: next })
+    this.syncFilesView()
+  }
+
+  private normalizeRelayForCompare(value?: string | null): string {
+    const normalized = String(value || '').trim()
+    if (!normalized) return ''
+    try {
+      return getBaseRelayUrl(normalized)
+    } catch {
+      return normalized
+    }
+  }
+
+  private parseGatewayPeerCounts(status: unknown): Record<string, number> {
+    if (!status || typeof status !== 'object') return {}
+    const rawMap = (status as { peerRelayMap?: Record<string, { peerCount?: number; peers?: unknown[] }> }).peerRelayMap
+    if (!rawMap || typeof rawMap !== 'object') return {}
+
+    const output: Record<string, number> = {}
+    for (const [key, value] of Object.entries(rawMap)) {
+      const peerCount = Number(value?.peerCount)
+      if (Number.isFinite(peerCount) && peerCount >= 0) {
+        output[key] = Math.max(output[key] || 0, peerCount)
+        continue
+      }
+      const peers = Array.isArray(value?.peers) ? value.peers.length : 0
+      output[key] = Math.max(output[key] || 0, peers)
+    }
+    return output
+  }
+
+  private isNonFatalWorkerError(message: string): boolean {
+    const normalized = String(message || '').toLowerCase()
+    return normalized.includes('relay profile not found')
+  }
+
+  private resolveGroupPeerCount(groupId: string, relay?: string): number {
+    const candidates = new Set<string>()
+    const normalizedGroupId = String(groupId || '').trim()
+    if (normalizedGroupId) {
+      candidates.add(normalizedGroupId)
+      candidates.add(normalizedGroupId.replace(':', '/'))
+      candidates.add(normalizedGroupId.replace('/', ':'))
+    }
+    const normalizedRelay = this.normalizeRelayForCompare(relay || undefined)
+    if (normalizedRelay) {
+      candidates.add(normalizedRelay)
+      const resolved = this.resolveRelayUrl(normalizedRelay)
+      if (resolved) {
+        candidates.add(resolved)
+        candidates.add(this.normalizeRelayForCompare(resolved))
+      }
+    }
+
+    let best = 0
+    for (const candidate of candidates) {
+      const direct = this.state.gatewayPeerCounts[candidate]
+      if (Number.isFinite(direct)) {
+        best = Math.max(best, Number(direct))
+      }
+    }
+
+    if (best > 0) return best
+
+    for (const [key, value] of Object.entries(this.state.gatewayPeerCounts)) {
+      if (!Number.isFinite(value)) continue
+      for (const candidate of candidates) {
+        if (!candidate) continue
+        if (key.includes(candidate) || candidate.includes(key)) {
+          best = Math.max(best, Number(value))
+        }
+      }
+    }
+
+    return best
+  }
+
+  private getWorkerReadableRelayUrls(): string[] {
+    const urls: string[] = []
+    for (const entry of this.state.relays) {
+      if (!entry.connectionUrl) continue
+      const isReady = entry.readyForReq === true
+      const isWritable = entry.writable === true
+      const noAuthRequired = entry.requiresAuth !== true
+      if (isReady || isWritable || noAuthRequired) {
+        urls.push(entry.connectionUrl)
+      }
+    }
+    return uniqueRelayUrls(urls)
+  }
+
+  private getWorkerWritableRelayUrls(): string[] {
+    const urls = this.state.relays
+      .filter((entry) => entry.connectionUrl && entry.writable === true)
+      .map((entry) => String(entry.connectionUrl || ''))
+    return uniqueRelayUrls(urls)
+  }
+
+  private getJoinedGroupRelayUrls(): string[] {
+    const candidateRelays = new Set<string>()
+    for (const entry of this.state.myGroupList) {
+      const relay = this.resolveRelayUrl(entry.relay)
+      if (relay) candidateRelays.add(relay)
+      const match = this.state.groupDiscover.find((group) => group.id === entry.groupId && group.relay)
+      if (match?.relay) {
+        const resolved = this.resolveRelayUrl(match.relay)
+        if (resolved) candidateRelays.add(resolved)
+      }
+    }
+    return uniqueRelayUrls(Array.from(candidateRelays))
+  }
+
+  private currentRelayUrls(): string[] {
+    const joinedGroupRelays = this.getJoinedGroupRelayUrls()
+    return uniqueRelayUrls([
+      ...this.getWorkerReadableRelayUrls(),
+      ...this.state.relayListPreferences.read,
+      ...joinedGroupRelays,
+      ...DEFAULT_DISCOVERY_RELAYS
+    ])
+  }
+
+  private currentWriteRelayUrls(): string[] {
+    return uniqueRelayUrls([
+      ...this.getWorkerWritableRelayUrls(),
+      ...this.state.relayListPreferences.write,
+      ...DEFAULT_DISCOVERY_RELAYS
+    ])
+  }
+
+  private limitRelayTargets(relays: string[], maxTargets = MAX_SEARCH_RELAYS): string[] {
+    const targets = uniqueRelayUrls(relays)
+    const max = Math.max(1, Math.trunc(maxTargets))
+    if (targets.length <= max) return targets
+    return targets.slice(0, max)
+  }
+
+  private relayIdentifierVariants(identifier?: string | null): string[] {
+    const normalized = String(identifier || '').trim()
+    if (!normalized) return []
+    const variants = new Set<string>([normalized])
+    if (normalized.includes(':')) {
+      variants.add(normalized.replace(':', '/'))
+    }
+    if (normalized.includes('/')) {
+      variants.add(normalized.replace('/', ':'))
+    }
+    return Array.from(variants).filter(Boolean)
+  }
+
+  private findConnectedRelayByIdentifier(identifier?: string | null): RelayEntry | undefined {
+    const candidates = new Set<string>(this.relayIdentifierVariants(identifier))
+    if (!candidates.size) return undefined
+    return this.state.relays.find((entry) => {
+      const relayCandidates = [
+        entry.publicIdentifier,
+        entry.relayKey,
+        entry.connectionUrl
+      ].map((value) => String(value || '').trim()).filter(Boolean)
+      return relayCandidates.some((candidate) => candidates.has(candidate))
+    })
   }
 
   private resolveRelayUrl(relay?: string): string | undefined {
@@ -1264,8 +1968,96 @@ export class TuiController {
     return normalized
   }
 
-  private searchableRelayUrls(): string[] {
-    return uniqueRelayUrls([...this.currentRelayUrls(), ...SEARCHABLE_RELAYS])
+  private resolveGroupRelayUrl(groupId?: string | null, fallbackRelay?: string | null): string | undefined {
+    const normalizedGroupId = String(groupId || '').trim()
+    if (!normalizedGroupId && !fallbackRelay) return undefined
+    const fromSource = this.resolveRelayUrl(fallbackRelay || undefined)
+    if (fromSource) return fromSource
+    if (!normalizedGroupId) return undefined
+
+    const inMyList = this.state.myGroupList.find((entry) => entry.groupId === normalizedGroupId)
+    const fromMyList = this.resolveRelayUrl(inMyList?.relay)
+    if (fromMyList) return fromMyList
+
+    const discovered = this.state.groupDiscover.find((group) => group.id === normalizedGroupId)
+    const fromDiscover = this.resolveRelayUrl(discovered?.relay)
+    if (fromDiscover) return fromDiscover
+
+    const relayRow = this.state.relays.find((relay) =>
+      relay.publicIdentifier === normalizedGroupId || relay.relayKey === normalizedGroupId
+    )
+    const fromRelayRow = this.resolveRelayUrl(relayRow?.connectionUrl || relayRow?.publicIdentifier)
+    return fromRelayRow
+  }
+
+  private async refreshRelayListPreferences(): Promise<void> {
+    const session = this.state.session
+    if (!session) return
+
+    try {
+      const events = await this.nostrClient.query(
+        this.searchableRelayUrls(14),
+        {
+          kinds: [10002],
+          authors: [session.pubkey],
+          limit: 3
+        },
+        2_500
+      )
+      const latest = events.sort((left, right) => right.created_at - left.created_at)[0]
+      if (!latest) return
+
+      const read = new Set<string>()
+      const write = new Set<string>()
+      for (const tag of latest.tags) {
+        if (!Array.isArray(tag) || tag[0] !== 'r' || typeof tag[1] !== 'string') continue
+        const relayUrl = this.resolveRelayUrl(tag[1]) || tag[1]
+        const scope = typeof tag[2] === 'string' ? tag[2].trim().toLowerCase() : ''
+        if (!scope || scope === 'read') read.add(relayUrl)
+        if (!scope || scope === 'write') write.add(relayUrl)
+      }
+
+      this.patchState({
+        relayListPreferences: {
+          read: uniqueRelayUrls(Array.from(read)),
+          write: uniqueRelayUrls(Array.from(write))
+        }
+      })
+    } catch (error) {
+      this.log('debug', `Relay-list preferences unavailable: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  private resolveFeedRelayUrls(): string[] {
+    const source = this.state.feedSource
+    if (source.mode === 'relay') {
+      const relayUrl = this.resolveRelayUrl(source.relayUrl || undefined)
+      return relayUrl ? [relayUrl] : []
+    }
+
+    if (source.mode === 'group') {
+      const relayUrl = this.resolveGroupRelayUrl(source.groupId || null, source.relayUrl || null)
+      if (relayUrl) return [relayUrl]
+      return this.limitRelayTargets(this.currentRelayUrls(), MAX_FEED_RELAYS)
+    }
+
+    return this.limitRelayTargets(this.currentRelayUrls(), MAX_FEED_RELAYS)
+  }
+
+  private async loadFollowListPubkeys(): Promise<string[]> {
+    const session = this.state.session
+    if (!session) return []
+    try {
+      const follows = await this.listService.loadFollowList(this.searchableRelayUrls(16), session.pubkey)
+      return Array.from(new Set(follows.filter(Boolean)))
+    } catch (error) {
+      this.log('warn', `Unable to load follow list: ${error instanceof Error ? error.message : String(error)}`)
+      return []
+    }
+  }
+
+  private searchableRelayUrls(maxTargets = MAX_SEARCH_RELAYS): string[] {
+    return this.limitRelayTargets([...this.currentRelayUrls(), ...SEARCHABLE_RELAYS], maxTargets)
   }
 
   async startWorker(): Promise<void> {
@@ -1347,15 +2139,31 @@ export class TuiController {
         }
       }
 
-      const relays = await this.withTimeout(
-        this.relayService.getRelays(),
-        25_000,
-        'Relay refresh'
-      )
-      this.patchState({
-        relays: relays as RelayEntry[]
-      })
-    }, { dedupeKey: 'refresh:relays', retries: 1 })
+      let relays: RelayEntry[] | null = null
+      try {
+        relays = await this.withTimeout(
+          this.relayService.getRelays(),
+          RELAY_REFRESH_TIMEOUT_MS,
+          'Relay refresh'
+        ) as RelayEntry[]
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (this.state.relays.length > 0) {
+          this.log('warn', `Relay refresh timed out; using cached relay snapshot (${message})`)
+        } else {
+          throw error
+        }
+      }
+
+      if (relays && relays.length >= 0) {
+        this.patchState({
+          relays: relays as RelayEntry[]
+        })
+      }
+
+      await this.refreshRelayListPreferences()
+      await this.workerHost.send({ type: 'get-gateway-status' }).catch(() => {})
+    }, { dedupeKey: 'refresh:relays', retries: 0 })
   }
 
   async createRelay(input: {
@@ -1381,9 +2189,63 @@ export class TuiController {
     fileSharing?: boolean
   }): Promise<Record<string, unknown>> {
     return await this.runTask('Join relay', async () => {
-      const result = await this.relayService.joinRelay(input)
-      await this.refreshRelays()
-      return result
+      const normalizedPublicIdentifier = String(input.publicIdentifier || '').trim()
+
+      const joinOnce = async (candidate: typeof input): Promise<Record<string, unknown>> => {
+        const result = await this.relayService.joinRelay(candidate)
+        await this.refreshRelays()
+        return result
+      }
+
+      const existingRelay = this.findConnectedRelayByIdentifier(normalizedPublicIdentifier)
+      if (existingRelay && existingRelay.connectionUrl && existingRelay.readyForReq) {
+        this.log('info', `Relay already connected for ${normalizedPublicIdentifier}; skipping join`)
+        return {
+          relayKey: existingRelay.relayKey,
+          publicIdentifier: existingRelay.publicIdentifier || normalizedPublicIdentifier,
+          relayUrl: existingRelay.connectionUrl,
+          alreadyJoined: true
+        }
+      }
+
+      try {
+        return await joinOnce(input)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        const profileMissing = message.toLowerCase().includes('relay profile not found')
+        if (!profileMissing || !normalizedPublicIdentifier) {
+          throw error
+        }
+
+        const variants = this.relayIdentifierVariants(normalizedPublicIdentifier)
+          .filter((variant) => variant !== normalizedPublicIdentifier)
+
+        for (const variant of variants) {
+          try {
+            this.log('warn', `Retrying join with identifier variant ${variant}`)
+            return await joinOnce({
+              ...input,
+              publicIdentifier: variant
+            })
+          } catch {
+            // keep trying identifier variants
+          }
+        }
+
+        const connectedAfterFailure = this.findConnectedRelayByIdentifier(normalizedPublicIdentifier)
+        if (connectedAfterFailure?.connectionUrl) {
+          this.log('warn', `Join reported profile missing but relay is available locally (${normalizedPublicIdentifier})`)
+          return {
+            relayKey: connectedAfterFailure.relayKey,
+            publicIdentifier: connectedAfterFailure.publicIdentifier || normalizedPublicIdentifier,
+            relayUrl: connectedAfterFailure.connectionUrl,
+            alreadyJoined: true,
+            recoveredFromProfileLookup: true
+          }
+        }
+
+        throw error
+      }
     })
   }
 
@@ -1423,23 +2285,56 @@ export class TuiController {
 
   async refreshFeed(limit = 120): Promise<void> {
     await this.runTask('Refresh feed', async () => {
-      const relays = this.currentRelayUrls()
-      const feed = await this.feedService.fetchFeed(
+      this.feedLimit = Math.max(1, Math.trunc(limit || 120))
+      const relays = this.resolveFeedRelayUrls()
+      const kinds = [1, 6, 7, 20, 21, 22]
+      const filter: Filter = {
+        kinds,
+        limit: this.feedLimit
+      }
+
+      if (this.state.feedSource.mode === 'group' && this.state.feedSource.groupId) {
+        filter['#h'] = [this.state.feedSource.groupId]
+      }
+
+      let followSet: Set<string> | null = null
+      if (this.state.feedSource.mode === 'following') {
+        const follows = await this.loadFollowListPubkeys()
+        followSet = new Set(follows)
+      }
+
+      if (!relays.length) {
+        this.rawFeed = []
+        this.patchState({
+          activeFeedRelays: []
+        })
+        this.syncFeedView()
+        return
+      }
+
+      let feed = await this.feedService.fetchFeed(
         relays,
-        {
-          kinds: [1, 6, 7, 20, 21, 22],
-          limit
-        },
-        5_000
+        filter,
+        FEED_REFRESH_TIMEOUT_MS
       )
-      this.patchState({ feed })
+
+      if (followSet) {
+        feed = feed.filter((event) => followSet?.has(event.pubkey))
+      }
+
+      this.rawFeed = feed
+      this.patchState({
+        activeFeedRelays: relays
+      })
+      this.syncFeedView()
     })
   }
 
   async publishPost(content: string): Promise<Event> {
     return await this.runTask('Publish post', async () => {
-      const event = await this.postService.publishTextNote(content, this.currentRelayUrls())
-      this.patchState({ feed: [event, ...this.state.feed] })
+      const event = await this.postService.publishTextNote(content, this.currentWriteRelayUrls())
+      this.rawFeed = [event, ...this.rawFeed]
+      this.syncFeedView()
       return event
     })
   }
@@ -1450,7 +2345,7 @@ export class TuiController {
         content,
         replyToEventId,
         replyToPubkey,
-        this.currentRelayUrls()
+        this.currentWriteRelayUrls()
       )
     })
   }
@@ -1461,7 +2356,7 @@ export class TuiController {
         eventId,
         eventPubkey,
         reaction,
-        this.currentRelayUrls()
+        this.currentWriteRelayUrls()
       )
     })
   }
@@ -1477,7 +2372,7 @@ export class TuiController {
   async addBookmark(eventId: string): Promise<void> {
     await this.runTask('Add bookmark', async () => {
       const nextIds = this.bookmarkService.addBookmark(this.state.bookmarks, eventId)
-      const event = await this.bookmarkService.publishBookmarks(nextIds, this.currentRelayUrls())
+      const event = await this.bookmarkService.publishBookmarks(nextIds, this.currentWriteRelayUrls())
       this.patchState({ bookmarks: { event, eventIds: nextIds } })
     })
   }
@@ -1485,7 +2380,7 @@ export class TuiController {
   async removeBookmark(eventId: string): Promise<void> {
     await this.runTask('Remove bookmark', async () => {
       const nextIds = this.bookmarkService.removeBookmark(this.state.bookmarks, eventId)
-      const event = await this.bookmarkService.publishBookmarks(nextIds, this.currentRelayUrls())
+      const event = await this.bookmarkService.publishBookmarks(nextIds, this.currentWriteRelayUrls())
       this.patchState({ bookmarks: { event, eventIds: nextIds } })
     })
   }
@@ -1503,21 +2398,153 @@ export class TuiController {
     }, { dedupeKey: 'refresh:my-group-list', retries: 1 })
   }
 
+  private readTagValue(tags: string[][], key: string): string | null {
+    const hit = tags.find((tag) => tag[0] === key && typeof tag[1] === 'string')
+    return typeof hit?.[1] === 'string' ? hit[1] : null
+  }
+
+  private groupIdentifierFromEvent(event: Event): string | null {
+    const byD = this.readTagValue(event.tags, 'd')
+    if (byD) return byD
+    const byH = this.readTagValue(event.tags, 'h')
+    if (byH) return byH
+    return null
+  }
+
+  private async enrichGroupMetadata(groups: GroupSummary[]): Promise<GroupSummary[]> {
+    if (!groups.length) return []
+    const groupIds = Array.from(new Set(groups.map((group) => String(group.id || '').trim()).filter(Boolean)))
+    if (!groupIds.length) {
+      return groups.map((group) => ({
+        ...group,
+        membersCount: Number(group.membersCount || group.members?.length || 0),
+        peersOnline: this.resolveGroupPeerCount(group.id, group.relay),
+        createdAt: group.createdAt || group.event?.created_at || null
+      }))
+    }
+
+    const targetGroupIds = groupIds.slice(0, MAX_GROUP_ENRICH_ITEMS)
+    const targetGroupSet = new Set(targetGroupIds)
+    const relays = this.searchableRelayUrls(MAX_GROUP_ENRICH_RELAYS)
+    const limit = Math.max(120, targetGroupIds.length * 3)
+    if (!relays.length || !targetGroupIds.length) {
+      return groups.map((group) => ({
+        ...group,
+        membersCount: Number(group.membersCount || group.members?.length || 0),
+        peersOnline: this.resolveGroupPeerCount(group.id, group.relay),
+        createdAt: group.createdAt || group.event?.created_at || null
+      }))
+    }
+
+    const safeQuery = async (filter: Filter): Promise<Event[]> => {
+      try {
+        return await this.nostrClient.query(relays, filter, GROUP_METADATA_TIMEOUT_MS)
+      } catch {
+        return []
+      }
+    }
+
+    const [adminsByD, adminsByH, membersByD, membersByH] = await Promise.all([
+      safeQuery({ kinds: [39001], '#d': targetGroupIds, limit }),
+      safeQuery({ kinds: [39001], '#h': targetGroupIds, limit }),
+      safeQuery({ kinds: [39002], '#d': targetGroupIds, limit }),
+      safeQuery({ kinds: [39002], '#h': targetGroupIds, limit })
+    ])
+
+    const latestAdminByGroup = new Map<string, Event>()
+    const latestMembersByGroup = new Map<string, Event>()
+    const registerLatest = (target: Map<string, Event>, event: Event) => {
+      const groupId = this.groupIdentifierFromEvent(event)
+      if (!groupId) return
+      const existing = target.get(groupId)
+      if (!existing || (existing.created_at || 0) < (event.created_at || 0)) {
+        target.set(groupId, event)
+      }
+    }
+
+    for (const event of [...adminsByD, ...adminsByH]) {
+      registerLatest(latestAdminByGroup, event)
+    }
+    for (const event of [...membersByD, ...membersByH]) {
+      registerLatest(latestMembersByGroup, event)
+    }
+
+    const adminPubkeys = Array.from(new Set(
+      Array.from(latestAdminByGroup.values())
+        .flatMap((event) => parseGroupAdminsEvent(event))
+        .map((entry) => String(entry.pubkey || '').trim())
+        .filter(Boolean)
+    )).slice(0, 220)
+
+    if (adminPubkeys.length > 0) {
+      try {
+        const profiles = await this.nostrClient.query(
+          relays,
+          {
+            kinds: [0],
+            authors: adminPubkeys,
+            limit: Math.max(80, Math.min(420, adminPubkeys.length * 2))
+          },
+          GROUP_METADATA_TIMEOUT_MS
+        )
+        for (const profile of profiles) {
+          try {
+            const parsed = JSON.parse(profile.content || '{}')
+            const name = String(parsed?.display_name || parsed?.name || parsed?.username || '').trim()
+            if (name) this.profileNameCache.set(profile.pubkey, name)
+          } catch {
+            // ignore invalid metadata json
+          }
+        }
+      } catch {
+        // optional enrichment
+      }
+    }
+
+    return groups.map((group) => {
+      if (!targetGroupSet.has(group.id)) {
+        return {
+          ...group,
+          membersCount: Number(group.membersCount || group.members?.length || 0),
+          peersOnline: this.resolveGroupPeerCount(group.id, group.relay),
+          createdAt: group.createdAt || group.event?.created_at || null
+        }
+      }
+      const adminEvent = latestAdminByGroup.get(group.id)
+      const memberEvent = latestMembersByGroup.get(group.id)
+      const admins = adminEvent ? parseGroupAdminsEvent(adminEvent) : []
+      const members = memberEvent ? parseGroupMembersEvent(memberEvent) : []
+      const adminPubkey = admins[0]?.pubkey || group.adminPubkey || group.event?.pubkey || null
+      const adminName = adminPubkey ? (this.profileNameCache.get(adminPubkey) || null) : null
+      const peersOnline = this.resolveGroupPeerCount(group.id, group.relay)
+      const createdAt = group.createdAt || group.event?.created_at || null
+      return {
+        ...group,
+        adminPubkey,
+        adminName,
+        members,
+        membersCount: members.length,
+        peersOnline,
+        createdAt
+      }
+    })
+  }
+
   async refreshGroups(): Promise<void> {
     await this.runTask('Refresh groups', async () => {
+      const discoveryRelays = this.searchableRelayUrls(18)
+      const myListRelays = this.searchableRelayUrls(14)
       const [groups, myGroupList] = await Promise.all([
-        this.groupService.discoverGroups(this.searchableRelayUrls()),
+        this.groupService.discoverGroups(discoveryRelays, 220),
         this.state.session
-          ? this.groupService.loadMyGroupList(this.searchableRelayUrls(), this.state.session.pubkey)
+          ? this.groupService.loadMyGroupList(myListRelays, this.state.session.pubkey)
           : Promise.resolve(this.state.myGroupList)
       ])
-
-      this.patchState({
-        groups,
-        groupDiscover: groups,
-        myGroupList
-      })
-    }, { dedupeKey: 'refresh:groups', retries: 1 })
+      const enrichedGroups = await this.enrichGroupMetadata(groups)
+      this.rawGroupDiscover = enrichedGroups.map((group) => ({ ...group }))
+      this.patchState({ myGroupList })
+      this.syncGroupView()
+    }, { dedupeKey: 'refresh:groups', retries: 0 })
   }
 
   async refreshInvites(): Promise<void> {
@@ -1702,6 +2729,211 @@ export class TuiController {
     })
   }
 
+  async refreshGroupMembers(groupId: string, relay?: string): Promise<GroupSummary | null> {
+    return await this.runTask('Refresh group members', async () => {
+      const normalizedGroupId = String(groupId || '').trim()
+      if (!normalizedGroupId) {
+        throw new Error('groupId is required')
+      }
+      const existing = this.rawGroupDiscover.find((group) => group.id === normalizedGroupId)
+      const seed: GroupSummary = existing || {
+        id: normalizedGroupId,
+        relay,
+        name: normalizedGroupId,
+        about: '',
+        isPublic: true,
+        isOpen: true
+      }
+      const [enriched] = await this.enrichGroupMetadata([{
+        ...seed,
+        relay: relay || seed.relay
+      }])
+      if (!enriched) return null
+
+      let replaced = false
+      this.rawGroupDiscover = this.rawGroupDiscover.map((group) => {
+        if (group.id !== enriched.id) return group
+        replaced = true
+        return enriched
+      })
+      if (!replaced) {
+        this.rawGroupDiscover = [enriched, ...this.rawGroupDiscover]
+      }
+      this.syncGroupView()
+      return enriched
+    })
+  }
+
+  async startComposeDraft(groupId: string, relay?: string): Promise<void> {
+    const normalizedGroupId = String(groupId || '').trim()
+    if (!normalizedGroupId) {
+      throw new Error('groupId is required')
+    }
+    const resolvedRelay = this.resolveGroupRelayUrl(normalizedGroupId, relay || null)
+    const nextDraft: GroupComposeDraft = {
+      groupId: normalizedGroupId,
+      relay: resolvedRelay || relay || null,
+      content: '',
+      attachments: []
+    }
+    this.patchState({ composeDraft: nextDraft })
+  }
+
+  async updateComposeText(content: string): Promise<void> {
+    const draft = this.state.composeDraft
+    if (!draft) throw new Error('No compose draft in progress')
+    this.patchState({
+      composeDraft: {
+        ...draft,
+        content
+      }
+    })
+  }
+
+  async attachComposeFile(filePath: string): Promise<void> {
+    const draft = this.state.composeDraft
+    if (!draft) throw new Error('No compose draft in progress')
+    const resolvedPath = path.resolve(filePath)
+    const stats = await fs.stat(resolvedPath)
+    if (!stats.isFile()) {
+      throw new Error('Attachment path is not a file')
+    }
+    const fileName = path.basename(resolvedPath)
+    const nextAttachment: GroupDraftAttachment = {
+      filePath: resolvedPath,
+      fileName,
+      mime: guessMimeFromPath(resolvedPath),
+      size: stats.size
+    }
+    this.patchState({
+      composeDraft: {
+        ...draft,
+        attachments: [...draft.attachments, nextAttachment]
+      }
+    })
+  }
+
+  async removeComposeAttachment(selector: string): Promise<void> {
+    const draft = this.state.composeDraft
+    if (!draft) throw new Error('No compose draft in progress')
+    const normalized = String(selector || '').trim()
+    if (!normalized) throw new Error('Attachment selector is required')
+    const index = Number.parseInt(normalized, 10)
+    const nextAttachments = Number.isFinite(index)
+      ? draft.attachments.filter((_entry, idx) => idx !== index)
+      : draft.attachments.filter((entry) =>
+        entry.filePath !== normalized && entry.fileName !== normalized
+      )
+    this.patchState({
+      composeDraft: {
+        ...draft,
+        attachments: nextAttachments
+      }
+    })
+  }
+
+  composeDraftSnapshot(): GroupComposeDraft | null {
+    if (!this.state.composeDraft) return null
+    return {
+      ...this.state.composeDraft,
+      attachments: this.state.composeDraft.attachments.map((entry) => ({ ...entry }))
+    }
+  }
+
+  async cancelComposeDraft(): Promise<void> {
+    this.patchState({ composeDraft: null })
+  }
+
+  async publishComposeDraft(): Promise<Event> {
+    return await this.runTask('Publish compose draft', async () => {
+      const session = this.requireSession()
+      const draft = this.state.composeDraft
+      if (!draft) throw new Error('No compose draft in progress')
+
+      if (!draft.content.trim() && draft.attachments.length === 0) {
+        throw new Error('Compose draft has no content or attachments')
+      }
+
+      const relayUrl = this.resolveGroupRelayUrl(draft.groupId, draft.relay || null)
+      const publishRelays = relayUrl
+        ? uniqueRelayUrls([relayUrl, ...this.currentWriteRelayUrls()])
+        : this.currentWriteRelayUrls()
+
+      if (!publishRelays.length) {
+        throw new Error('No relay targets available for compose publish')
+      }
+
+      const uploadResults: Array<Record<string, unknown>> = []
+      for (const attachment of draft.attachments) {
+        const upload = await this.fileService.uploadFile({
+          publicIdentifier: draft.groupId,
+          filePath: attachment.filePath,
+          metadata: {
+            source: 'group-hyperdrive'
+          }
+        })
+        uploadResults.push(upload)
+      }
+
+      const tags: string[][] = [['h', draft.groupId]]
+      if (uploadResults.length > 0) {
+        tags.push(['i', 'hypertuna:drive'])
+      }
+
+      for (const upload of uploadResults) {
+        const uploadRecord = upload as Record<string, unknown>
+        const url = String(uploadRecord.url || uploadRecord.gatewayUrl || '').trim()
+        if (!url) continue
+        tags.push(['r', url, 'hypertuna:drive'])
+
+        const imeta: string[] = [`url ${url}`]
+        const uploadSize = Number(uploadRecord.size)
+        if (typeof uploadRecord.mime === 'string' && uploadRecord.mime) imeta.push(`m ${uploadRecord.mime}`)
+        if (typeof uploadRecord.sha256 === 'string' && uploadRecord.sha256) imeta.push(`x ${uploadRecord.sha256}`)
+        if (typeof uploadRecord.ox === 'string' && uploadRecord.ox) imeta.push(`ox ${uploadRecord.ox}`)
+        if (Number.isFinite(uploadSize)) imeta.push(`size ${uploadSize}`)
+        if (typeof uploadRecord.dim === 'string' && uploadRecord.dim) imeta.push(`dim ${uploadRecord.dim}`)
+        if (imeta.length > 0) {
+          tags.push(['imeta', ...imeta])
+        }
+      }
+
+      const draftEvent = {
+        kind: 1,
+        created_at: eventNow(),
+        tags,
+        content: draft.content
+      }
+
+      const noteEvent = signDraftEvent(session.nsecHex, draftEvent)
+      await this.nostrClient.publish(publishRelays, noteEvent)
+
+      for (const upload of uploadResults) {
+        const uploadRecord = upload as Record<string, unknown>
+        const url = String(uploadRecord.url || uploadRecord.gatewayUrl || '').trim()
+        if (!url) continue
+        const uploadSize = Number(uploadRecord.size)
+        const fileMetadataDraft = createGroupFileMetadataDraftEvent({
+          url,
+          groupId: draft.groupId,
+          mime: typeof uploadRecord.mime === 'string' ? uploadRecord.mime : undefined,
+          sha256: typeof uploadRecord.sha256 === 'string' ? uploadRecord.sha256 : undefined,
+          ox: typeof uploadRecord.ox === 'string' ? uploadRecord.ox : undefined,
+          size: Number.isFinite(uploadSize) ? uploadSize : undefined,
+          dim: typeof uploadRecord.dim === 'string' ? uploadRecord.dim : undefined,
+          alt: typeof uploadRecord.fileId === 'string' ? uploadRecord.fileId : undefined
+        })
+        const metadataEvent = signDraftEvent(session.nsecHex, fileMetadataDraft)
+        await this.nostrClient.publish(publishRelays, metadataEvent)
+      }
+
+      this.patchState({ composeDraft: null })
+      await this.refreshFeed(this.feedLimit)
+      await this.refreshGroupFiles(draft.groupId)
+      return noteEvent
+    })
+  }
+
   async uploadGroupFile(input: {
     relayKey?: string | null
     publicIdentifier?: string | null
@@ -1729,7 +2961,8 @@ export class TuiController {
         })
         files = await this.fileService.fetchScopedGroupFiles(scope, 1_500)
       }
-      this.patchState({ files })
+      this.rawFiles = files.map((file) => ({ ...file }))
+      this.syncFilesView()
     }, { dedupeKey: `refresh:files:${groupId || 'all'}`, retries: 1 })
   }
 

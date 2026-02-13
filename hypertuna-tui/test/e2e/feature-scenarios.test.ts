@@ -66,7 +66,7 @@ describe('TUI e2e feature scenarios', () => {
     await executeCommand(controller, `react ${firstFeed?.id} ${firstFeed?.pubkey} +`)
 
     const stateAfterPublish = controller.getState()
-    expect(stateAfterPublish.feed[0]?.kind).toBe(7)
+    expect(stateAfterPublish.feed.some((event) => event.kind === 7 && event.content === '+')).toBe(true)
     expect(stateAfterPublish.feed.some((event) => event.content === 'e2e_post_content')).toBe(true)
     expect(stateAfterPublish.feed.some((event) => event.content === 'e2e_reply_content')).toBe(true)
 

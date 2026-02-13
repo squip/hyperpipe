@@ -7,8 +7,16 @@ import type {
   AccountSession,
   ChatConversation,
   ChatInvite,
+  FeedControls,
+  FeedSortKey,
+  FeedSourceState,
+  FileControls,
+  FileSortKey,
+  GroupComposeDraft,
+  GroupControls,
   GroupJoinRequest,
   GroupListEntry,
+  GroupSortKey,
   GroupFileRecord,
   GroupInvite,
   GroupSummary,
@@ -81,6 +89,44 @@ function defaultPerfMetrics(): PerfMetrics {
   }
 }
 
+function defaultFeedSource(): FeedSourceState {
+  return {
+    mode: 'relays',
+    relayUrl: null,
+    groupId: null,
+    label: 'All Relays'
+  }
+}
+
+function defaultFeedControls(): FeedControls {
+  return {
+    query: '',
+    sortKey: 'createdAt',
+    sortDirection: 'desc',
+    kindFilter: null
+  }
+}
+
+function defaultGroupControls(): GroupControls {
+  return {
+    query: '',
+    sortKey: 'members',
+    sortDirection: 'desc',
+    visibility: 'all',
+    joinMode: 'all'
+  }
+}
+
+function defaultFileControls(): FileControls {
+  return {
+    query: '',
+    sortKey: 'uploadedAt',
+    sortDirection: 'desc',
+    mime: 'all',
+    group: 'all'
+  }
+}
+
 function emptyState(): ControllerState {
   return {
     initialized: false,
@@ -90,10 +136,20 @@ function emptyState(): ControllerState {
     lifecycle: 'stopped',
     readinessMessage: 'Stopped',
     relays: [],
+    relayListPreferences: {
+      read: [],
+      write: []
+    },
+    gatewayPeerCounts: {},
     feed: [],
+    feedSource: defaultFeedSource(),
+    activeFeedRelays: [],
+    feedControls: defaultFeedControls(),
     groups: [],
+    groupControls: defaultGroupControls(),
     invites: [],
     files: [],
+    fileControls: defaultFileControls(),
     lists: [],
     bookmarks: {
       event: null,
@@ -124,7 +180,9 @@ function emptyState(): ControllerState {
     keymap: {
       vimNavigation: false
     },
+    detailPaneOffsetBySection: {},
     paneViewport: {},
+    composeDraft: null,
     perfMetrics: defaultPerfMetrics(),
     workerRecoveryState: {
       enabled: true,
@@ -155,10 +213,23 @@ function cloneState(state: ControllerState): ControllerState {
     ...state,
     accounts: state.accounts.map((entry) => ({ ...entry })),
     relays: state.relays.map((entry) => ({ ...entry })),
+    relayListPreferences: {
+      read: [...state.relayListPreferences.read],
+      write: [...state.relayListPreferences.write]
+    },
+    gatewayPeerCounts: { ...state.gatewayPeerCounts },
     feed: [...state.feed],
+    feedSource: { ...state.feedSource },
+    activeFeedRelays: [...state.activeFeedRelays],
+    feedControls: {
+      ...state.feedControls,
+      kindFilter: state.feedControls.kindFilter ? [...state.feedControls.kindFilter] : null
+    },
     groups: state.groups.map((entry) => ({ ...entry })),
+    groupControls: { ...state.groupControls },
     invites: state.invites.map((entry) => ({ ...entry })),
     files: state.files.map((entry) => ({ ...entry })),
+    fileControls: { ...state.fileControls },
     lists: state.lists.map((entry) => ({ ...entry })),
     bookmarks: {
       event: state.bookmarks.event,
@@ -179,9 +250,16 @@ function cloneState(state: ControllerState): ControllerState {
     keymap: {
       ...state.keymap
     },
+    detailPaneOffsetBySection: { ...state.detailPaneOffsetBySection },
     paneViewport: Object.fromEntries(
       Object.entries(state.paneViewport).map(([key, value]) => [key, { ...value }])
     ),
+    composeDraft: state.composeDraft
+      ? {
+          ...state.composeDraft,
+          attachments: state.composeDraft.attachments.map((entry) => ({ ...entry }))
+        }
+      : null,
     perfMetrics: {
       ...state.perfMetrics,
       operationSamples: state.perfMetrics.operationSamples.map((entry) => ({ ...entry }))
@@ -209,6 +287,9 @@ export class MockController implements AppController {
 
   private relayCounter = 1
   private conversationCounter = 1
+  private rawFeed: Event[] = []
+  private rawGroups: GroupSummary[] = []
+  private rawFiles: GroupFileRecord[] = []
 
   constructor(options: RuntimeOptions, state?: Partial<ControllerState>) {
     this.options = options
@@ -226,7 +307,24 @@ export class MockController implements AppController {
       chatInvites: state?.chatInvites || [],
       threadMessages: state?.threadMessages || [],
       searchResults: state?.searchResults || [],
-      bookmarks: state?.bookmarks || { event: null, eventIds: [] }
+      bookmarks: state?.bookmarks || { event: null, eventIds: [] },
+      relayListPreferences: state?.relayListPreferences || { read: [], write: [] },
+      gatewayPeerCounts: state?.gatewayPeerCounts || {},
+      feedSource: state?.feedSource || defaultFeedSource(),
+      activeFeedRelays: state?.activeFeedRelays || [],
+      feedControls: state?.feedControls || defaultFeedControls(),
+      groupControls: state?.groupControls || defaultGroupControls(),
+      fileControls: state?.fileControls || defaultFileControls(),
+      detailPaneOffsetBySection: state?.detailPaneOffsetBySection || {},
+      composeDraft: state?.composeDraft || null
+    }
+    this.rawFeed = [...this.state.feed]
+    this.rawGroups = [...(this.state.groupDiscover.length ? this.state.groupDiscover : this.state.groups)]
+    this.rawFiles = [...this.state.files]
+    if (!this.state.activeFeedRelays.length) {
+      this.state.activeFeedRelays = this.state.relays
+        .map((relay) => relay.connectionUrl)
+        .filter((value): value is string => Boolean(value))
     }
     this.refreshDerivedState()
   }
@@ -285,6 +383,12 @@ export class MockController implements AppController {
         about: 'seed about',
         isPublic: true,
         isOpen: true,
+        adminPubkey: pubkey,
+        adminName: 'seed-admin',
+        members: [pubkey, shortPubkeySeed('peer-group')],
+        membersCount: 2,
+        peersOnline: 1,
+        createdAt: nowSec() - 200,
         event: makeEvent({ idSeed: 'group-a', pubkey, kind: 39000, content: '' })
       }
     ]
@@ -368,6 +472,7 @@ export class MockController implements AppController {
       relays,
       feed,
       groups,
+      myGroupList: [{ groupId: groups[0].id, relay: groups[0].relay }],
       invites,
       files,
       lists: [starter],
@@ -399,12 +504,100 @@ export class MockController implements AppController {
     }
   }
 
+  private applyFeedControls(rows: Event[]): Event[] {
+    const controls = this.state.feedControls
+    const query = controls.query.toLowerCase().trim()
+    const kindSet = controls.kindFilter?.length ? new Set(controls.kindFilter) : null
+    const direction = controls.sortDirection === 'asc' ? 1 : -1
+    const filtered = rows.filter((event) => {
+      if (kindSet && !kindSet.has(event.kind)) return false
+      if (!query) return true
+      return event.content.toLowerCase().includes(query)
+        || event.id.toLowerCase().includes(query)
+        || event.pubkey.toLowerCase().includes(query)
+    })
+    filtered.sort((left, right) => {
+      if (controls.sortKey === 'kind') return direction * (left.kind - right.kind)
+      if (controls.sortKey === 'author') return direction * left.pubkey.localeCompare(right.pubkey)
+      if (controls.sortKey === 'content') return direction * left.content.localeCompare(right.content)
+      if (left.created_at !== right.created_at) return direction * (left.created_at - right.created_at)
+      return direction * left.id.localeCompare(right.id)
+    })
+    return filtered
+  }
+
+  private applyGroupControls(rows: GroupSummary[]): GroupSummary[] {
+    const controls = this.state.groupControls
+    const query = controls.query.toLowerCase().trim()
+    const direction = controls.sortDirection === 'asc' ? 1 : -1
+    const filtered = rows.filter((group) => {
+      if (controls.visibility === 'public' && group.isPublic === false) return false
+      if (controls.visibility === 'private' && group.isPublic !== false) return false
+      if (controls.joinMode === 'open' && group.isOpen === false) return false
+      if (controls.joinMode === 'closed' && group.isOpen !== false) return false
+      if (!query) return true
+      return [group.id, group.name, group.about || '', group.adminName || '', group.adminPubkey || '']
+        .some((value) => value.toLowerCase().includes(query))
+    })
+    filtered.sort((left, right) => {
+      const leftAdmin = `${left.adminName || left.adminPubkey || ''}`.toLowerCase()
+      const rightAdmin = `${right.adminName || right.adminPubkey || ''}`.toLowerCase()
+      const leftCreated = Number(left.createdAt || left.event?.created_at || 0)
+      const rightCreated = Number(right.createdAt || right.event?.created_at || 0)
+      const leftMembers = Number(left.membersCount || left.members?.length || 0)
+      const rightMembers = Number(right.membersCount || right.members?.length || 0)
+      const leftPeers = Number(left.peersOnline || 0)
+      const rightPeers = Number(right.peersOnline || 0)
+      if (controls.sortKey === 'name') return direction * left.name.localeCompare(right.name)
+      if (controls.sortKey === 'description') return direction * String(left.about || '').localeCompare(String(right.about || ''))
+      if (controls.sortKey === 'open') return direction * ((left.isOpen ? 1 : 0) - (right.isOpen ? 1 : 0))
+      if (controls.sortKey === 'public') return direction * ((left.isPublic === false ? 0 : 1) - (right.isPublic === false ? 0 : 1))
+      if (controls.sortKey === 'admin') return direction * leftAdmin.localeCompare(rightAdmin)
+      if (controls.sortKey === 'createdAt') return direction * (leftCreated - rightCreated)
+      if (controls.sortKey === 'peers') return direction * (leftPeers - rightPeers)
+      return direction * (leftMembers - rightMembers)
+    })
+    return filtered
+  }
+
+  private applyFileControls(rows: GroupFileRecord[]): GroupFileRecord[] {
+    const controls = this.state.fileControls
+    const query = controls.query.toLowerCase().trim()
+    const mimeFilter = controls.mime.toLowerCase().trim()
+    const direction = controls.sortDirection === 'asc' ? 1 : -1
+    const filtered = rows.filter((row) => {
+      if (controls.group !== 'all' && row.groupId !== controls.group) return false
+      if (mimeFilter !== 'all') {
+        const mime = String(row.mime || '').toLowerCase()
+        if (!mime.startsWith(mimeFilter)) return false
+      }
+      if (!query) return true
+      return [
+        row.fileName,
+        row.groupId,
+        row.groupName || '',
+        row.uploadedBy,
+        row.mime || '',
+        row.url || ''
+      ].some((value) => value.toLowerCase().includes(query))
+    })
+    filtered.sort((left, right) => {
+      if (controls.sortKey === 'fileName') return direction * left.fileName.localeCompare(right.fileName)
+      if (controls.sortKey === 'group') return direction * left.groupId.localeCompare(right.groupId)
+      if (controls.sortKey === 'uploadedBy') return direction * left.uploadedBy.localeCompare(right.uploadedBy)
+      if (controls.sortKey === 'size') return direction * (Number(left.size || 0) - Number(right.size || 0))
+      if (controls.sortKey === 'mime') return direction * String(left.mime || '').localeCompare(String(right.mime || ''))
+      return direction * (left.uploadedAt - right.uploadedAt)
+    })
+    return filtered
+  }
+
   private refreshDerivedState(): void {
     const groupsById = new Map<string, GroupSummary>()
-    for (const group of [...this.state.groupDiscover, ...this.state.groups]) {
+    for (const group of this.rawGroups.length ? this.rawGroups : [...this.state.groupDiscover, ...this.state.groups]) {
       groupsById.set(group.id, group)
     }
-    const groups = Array.from(groupsById.values())
+    const groups = this.applyGroupControls(Array.from(groupsById.values()))
 
     const inviteById = new Map<string, GroupInvite>()
     for (const invite of [...this.state.invites, ...this.state.groupInvites]) {
@@ -434,6 +627,8 @@ export class MockController implements AppController {
     this.state.groups = groups
     this.state.myGroupList = myList
     this.state.myGroups = myGroups
+    this.state.feed = this.applyFeedControls(this.rawFeed)
+    this.state.files = this.applyFileControls(this.rawFiles)
     this.state.groupInvites = groupInvites
     this.state.invites = groupInvites
     this.state.chatInvites = chatInvites
@@ -453,6 +648,16 @@ export class MockController implements AppController {
   }
 
   private patch(patch: Partial<ControllerState>): void {
+    if (patch.feed) {
+      this.rawFeed = patch.feed.map((event) => ({ ...event }))
+    }
+    if (patch.groups || patch.groupDiscover) {
+      const nextGroups = patch.groupDiscover || patch.groups || []
+      this.rawGroups = nextGroups.map((group) => ({ ...group }))
+    }
+    if (patch.files) {
+      this.rawFiles = patch.files.map((file) => ({ ...file }))
+    }
     this.state = {
       ...this.state,
       ...patch
@@ -608,8 +813,8 @@ export class MockController implements AppController {
     })
   }
 
-  async setGroupViewTab(tab: 'discover' | 'my' | 'invites'): Promise<void> {
-    const next = ['discover', 'my', 'invites'].includes(tab) ? tab : 'discover'
+  async setGroupViewTab(tab: 'discover' | 'my'): Promise<void> {
+    const next = tab === 'my' ? 'my' : 'discover'
     this.patch({ groupViewTab: next })
   }
 
@@ -635,6 +840,19 @@ export class MockController implements AppController {
       }
     }
     this.patch({ paneViewport: next })
+  }
+
+  async setDetailPaneOffset(sectionKey: string, offset: number): Promise<void> {
+    const key = String(sectionKey || '').trim()
+    if (!key) return
+    const normalizedOffset = Math.max(0, Math.trunc(offset))
+    const current = this.state.detailPaneOffsetBySection[key]
+    if (typeof current === 'number' && current === normalizedOffset) return
+    const next = {
+      ...this.state.detailPaneOffsetBySection,
+      [key]: normalizedOffset
+    }
+    this.patch({ detailPaneOffsetBySection: next })
   }
 
   async setPerfOverlay(enabled: boolean): Promise<void> {
@@ -735,7 +953,13 @@ export class MockController implements AppController {
           about: input.description,
           picture: input.picture,
           isPublic: input.isPublic,
-          isOpen: input.isOpen
+          isOpen: input.isOpen,
+          adminPubkey: this.state.session?.pubkey || null,
+          adminName: 'me',
+          members: this.state.session ? [this.state.session.pubkey] : [],
+          membersCount: this.state.session ? 1 : 0,
+          peersOnline: 0,
+          createdAt: nowSec()
         }
       ]
     })
@@ -841,16 +1065,127 @@ export class MockController implements AppController {
 
   async refreshFeed(limit = 120): Promise<void> {
     const pubkey = this.state.session?.pubkey || shortPubkeySeed('anonymous')
-    const events = Array.from({ length: Math.min(10, limit) }).map((_, idx) =>
-      makeEvent({
-        idSeed: `feed-refresh-${idx}`,
-        pubkey,
-        kind: 1,
-        content: `feed message ${idx}`,
-        createdAt: nowSec() - idx
+    const source = this.state.feedSource
+    const selectedGroupId = source.mode === 'group' ? source.groupId || this.state.groups[0]?.id || null : null
+    const relays = source.mode === 'relay'
+      ? [source.relayUrl || 'wss://relay.mock/source']
+      : source.mode === 'group'
+        ? [source.relayUrl || this.state.groups.find((group) => group.id === selectedGroupId)?.relay || 'wss://relay.mock/group']
+        : this.state.relays.map((relay) => relay.connectionUrl).filter((value): value is string => Boolean(value))
+
+    const events = Array.from({ length: Math.min(10, limit) }).map((_, idx) => {
+      const author = source.mode === 'following'
+        ? shortPubkeySeed(`following-${idx % 3}`)
+        : idx % 2 === 0
+          ? pubkey
+          : shortPubkeySeed(`peer-${idx}`)
+      const tags = selectedGroupId ? [['h', selectedGroupId]] : []
+      return makeEvent({
+        idSeed: `feed-refresh-${source.mode}-${idx}`,
+        pubkey: author,
+        kind: idx % 4 === 0 ? 7 : 1,
+        content: selectedGroupId ? `group ${selectedGroupId} message ${idx}` : `feed message ${idx}`,
+        createdAt: nowSec() - idx,
+        tags
       })
+    })
+    this.patch({
+      feed: events,
+      activeFeedRelays: relays
+    })
+  }
+
+  async setFeedSourceRelays(): Promise<void> {
+    this.patch({
+      feedSource: {
+        mode: 'relays',
+        relayUrl: null,
+        groupId: null,
+        label: 'All Relays'
+      }
+    })
+    await this.refreshFeed(this.rawFeed.length || 10)
+  }
+
+  async setFeedSourceFollowing(): Promise<void> {
+    this.patch({
+      feedSource: {
+        mode: 'following',
+        relayUrl: null,
+        groupId: null,
+        label: 'Following'
+      }
+    })
+    await this.refreshFeed(this.rawFeed.length || 10)
+  }
+
+  async setFeedSourceRelaySelector(selector: string): Promise<void> {
+    const normalized = String(selector || '').trim()
+    if (!normalized) throw new Error('relay selector required')
+    const relay = this.state.relays.find((entry) =>
+      entry.connectionUrl === normalized
+      || entry.publicIdentifier === normalized
+      || entry.relayKey === normalized
     )
-    this.patch({ feed: events })
+    const relayUrl = relay?.connectionUrl || normalized
+    this.patch({
+      feedSource: {
+        mode: 'relay',
+        relayUrl,
+        groupId: null,
+        label: relay?.publicIdentifier || relay?.relayKey || relayUrl
+      }
+    })
+    await this.refreshFeed(this.rawFeed.length || 10)
+  }
+
+  async setFeedSourceGroupSelector(selector: string, relay?: string): Promise<void> {
+    const normalized = String(selector || '').trim()
+    if (!normalized) throw new Error('group selector required')
+    const index = Number.parseInt(normalized, 10)
+    const fromIndex = Number.isFinite(index)
+      ? (this.state.myGroups[index - 1] || this.state.groups[index - 1])
+      : null
+    const group = fromIndex || this.state.groups.find((entry) => entry.id === normalized)
+    const groupId = group?.id || normalized
+    const relayUrl = relay || group?.relay || null
+    this.patch({
+      feedSource: {
+        mode: 'group',
+        relayUrl,
+        groupId,
+        label: group?.name || groupId
+      }
+    })
+    await this.refreshFeed(this.rawFeed.length || 10)
+  }
+
+  async setFeedSearch(query: string): Promise<void> {
+    this.patch({
+      feedControls: {
+        ...this.state.feedControls,
+        query: String(query || '').trim()
+      }
+    })
+  }
+
+  async setFeedSort(sortKey: FeedSortKey, direction?: string): Promise<void> {
+    this.patch({
+      feedControls: {
+        ...this.state.feedControls,
+        sortKey,
+        sortDirection: String(direction || '').toLowerCase() === 'asc' ? 'asc' : 'desc'
+      }
+    })
+  }
+
+  async setFeedKindFilter(kinds: number[] | null): Promise<void> {
+    this.patch({
+      feedControls: {
+        ...this.state.feedControls,
+        kindFilter: kinds && kinds.length ? Array.from(new Set(kinds.map((kind) => Number(kind)).filter(Number.isFinite))) : null
+      }
+    })
   }
 
   async publishPost(content: string): Promise<unknown> {
@@ -929,6 +1264,12 @@ export class MockController implements AppController {
         about: 'group from refresh',
         isPublic: true,
         isOpen: true,
+        adminPubkey: this.state.session?.pubkey || shortPubkeySeed('anonymous'),
+        adminName: 'refreshed-admin',
+        members: [this.state.session?.pubkey || shortPubkeySeed('anonymous')],
+        membersCount: 1,
+        peersOnline: 0,
+        createdAt: nowSec() - 120,
         event: makeEvent({
           idSeed: 'group-refresh',
           pubkey: this.state.session?.pubkey || shortPubkeySeed('anonymous'),
@@ -1080,6 +1421,76 @@ export class MockController implements AppController {
     this.emit()
   }
 
+  async refreshGroupMembers(groupId: string, _relay?: string): Promise<GroupSummary | null> {
+    const normalized = String(groupId || '').trim()
+    if (!normalized) {
+      throw new Error('groupId is required')
+    }
+    const existing = this.rawGroups.find((group) => group.id === normalized)
+    const target = existing || this.state.groups.find((group) => group.id === normalized)
+    const nextMembers = target?.members?.length
+      ? target.members
+      : [this.state.session?.pubkey || shortPubkeySeed('anonymous'), shortPubkeySeed(`member:${normalized}`)]
+    const updated: GroupSummary = {
+      ...(target || {
+        id: normalized,
+        name: normalized,
+        relay: _relay || undefined,
+        isPublic: true,
+        isOpen: true
+      }),
+      members: nextMembers,
+      membersCount: nextMembers.length,
+      adminPubkey: target?.adminPubkey || this.state.session?.pubkey || null,
+      adminName: target?.adminName || 'group-admin',
+      peersOnline: Math.max(0, Number(target?.peersOnline || 0))
+    }
+
+    const deduped = this.rawGroups.filter((group) => group.id !== normalized)
+    this.patch({
+      groups: [updated, ...deduped],
+      groupDiscover: [updated, ...deduped]
+    })
+    return updated
+  }
+
+  async setGroupSearch(query: string): Promise<void> {
+    this.patch({
+      groupControls: {
+        ...this.state.groupControls,
+        query: String(query || '').trim()
+      }
+    })
+  }
+
+  async setGroupSort(sortKey: GroupSortKey, direction?: string): Promise<void> {
+    this.patch({
+      groupControls: {
+        ...this.state.groupControls,
+        sortKey,
+        sortDirection: String(direction || '').toLowerCase() === 'asc' ? 'asc' : 'desc'
+      }
+    })
+  }
+
+  async setGroupVisibilityFilter(visibility: 'all' | 'public' | 'private'): Promise<void> {
+    this.patch({
+      groupControls: {
+        ...this.state.groupControls,
+        visibility
+      }
+    })
+  }
+
+  async setGroupJoinFilter(joinMode: 'all' | 'open' | 'closed'): Promise<void> {
+    this.patch({
+      groupControls: {
+        ...this.state.groupControls,
+        joinMode
+      }
+    })
+  }
+
   async refreshGroupFiles(groupId?: string): Promise<void> {
     if (this.state.files.length) {
       this.emit()
@@ -1145,6 +1556,43 @@ export class MockController implements AppController {
       url: record.url,
       sha256: record.sha256
     }
+  }
+
+  async setFileSearch(query: string): Promise<void> {
+    this.patch({
+      fileControls: {
+        ...this.state.fileControls,
+        query: String(query || '').trim()
+      }
+    })
+  }
+
+  async setFileSort(sortKey: FileSortKey, direction?: string): Promise<void> {
+    this.patch({
+      fileControls: {
+        ...this.state.fileControls,
+        sortKey,
+        sortDirection: String(direction || '').toLowerCase() === 'asc' ? 'asc' : 'desc'
+      }
+    })
+  }
+
+  async setFileMimeFilter(mime: string): Promise<void> {
+    this.patch({
+      fileControls: {
+        ...this.state.fileControls,
+        mime: String(mime || '').trim() || 'all'
+      }
+    })
+  }
+
+  async setFileGroupFilter(group: string): Promise<void> {
+    this.patch({
+      fileControls: {
+        ...this.state.fileControls,
+        group: String(group || '').trim() || 'all'
+      }
+    })
   }
 
   async refreshStarterPacks(): Promise<void> {
@@ -1334,6 +1782,129 @@ export class MockController implements AppController {
     this.patch({
       threadMessages: [...this.state.threadMessages, message]
     })
+  }
+
+  async startComposeDraft(groupId: string, relay?: string): Promise<void> {
+    const normalizedGroupId = String(groupId || '').trim()
+    if (!normalizedGroupId) throw new Error('groupId is required')
+    const targetGroup = this.state.groups.find((group) => group.id === normalizedGroupId)
+    const nextDraft: GroupComposeDraft = {
+      groupId: normalizedGroupId,
+      relay: relay || targetGroup?.relay || null,
+      content: '',
+      attachments: []
+    }
+    this.patch({ composeDraft: nextDraft })
+  }
+
+  async updateComposeText(content: string): Promise<void> {
+    if (!this.state.composeDraft) {
+      throw new Error('No compose draft in progress')
+    }
+    this.patch({
+      composeDraft: {
+        ...this.state.composeDraft,
+        content
+      }
+    })
+  }
+
+  async attachComposeFile(filePath: string): Promise<void> {
+    if (!this.state.composeDraft) {
+      throw new Error('No compose draft in progress')
+    }
+    const normalizedPath = String(filePath || '').trim()
+    if (!normalizedPath) throw new Error('filePath is required')
+    const fileName = normalizedPath.split('/').pop() || 'attachment.bin'
+    const nextAttachments = [
+      ...this.state.composeDraft.attachments,
+      {
+        filePath: normalizedPath,
+        fileName
+      }
+    ]
+    this.patch({
+      composeDraft: {
+        ...this.state.composeDraft,
+        attachments: nextAttachments
+      }
+    })
+  }
+
+  async removeComposeAttachment(selector: string): Promise<void> {
+    if (!this.state.composeDraft) {
+      throw new Error('No compose draft in progress')
+    }
+    const normalized = String(selector || '').trim()
+    if (!normalized) throw new Error('attachment selector required')
+    const index = Number.parseInt(normalized, 10)
+    const nextAttachments = Number.isFinite(index)
+      ? this.state.composeDraft.attachments.filter((_entry, idx) => idx !== index)
+      : this.state.composeDraft.attachments.filter((entry) =>
+        entry.filePath !== normalized && entry.fileName !== normalized
+      )
+    this.patch({
+      composeDraft: {
+        ...this.state.composeDraft,
+        attachments: nextAttachments
+      }
+    })
+  }
+
+  composeDraftSnapshot(): GroupComposeDraft | null {
+    if (!this.state.composeDraft) return null
+    return {
+      ...this.state.composeDraft,
+      attachments: this.state.composeDraft.attachments.map((entry) => ({ ...entry }))
+    }
+  }
+
+  async publishComposeDraft(): Promise<unknown> {
+    const draft = this.state.composeDraft
+    if (!draft) throw new Error('No compose draft in progress')
+    const author = this.state.session?.pubkey || shortPubkeySeed('anonymous')
+    const uploadRecords: GroupFileRecord[] = draft.attachments.map((attachment, idx) => ({
+      eventId: `compose-file-${hex64(`${draft.groupId}:${attachment.filePath}:${idx}`)}`,
+      event: makeEvent({
+        idSeed: `compose-file:${draft.groupId}:${idx}`,
+        pubkey: author,
+        kind: 1063,
+        content: ''
+      }),
+      url: `https://example.com/uploads/${attachment.fileName}`,
+      groupId: draft.groupId,
+      groupRelay: draft.relay || null,
+      groupName: this.state.groups.find((group) => group.id === draft.groupId)?.name || draft.groupId,
+      fileName: attachment.fileName,
+      mime: attachment.mime || 'application/octet-stream',
+      size: attachment.size || null,
+      uploadedAt: nowSec(),
+      uploadedBy: author,
+      sha256: hex64(attachment.fileName)
+    }))
+
+    const postEvent = makeEvent({
+      idSeed: `compose-post:${draft.groupId}:${draft.content}`,
+      pubkey: author,
+      kind: 1,
+      content: draft.content,
+      tags: [
+        ['h', draft.groupId],
+        ...uploadRecords.map((record) => ['r', record.url, 'hypertuna:drive'])
+      ]
+    })
+
+    this.patch({
+      feed: [postEvent, ...this.rawFeed],
+      files: [...uploadRecords, ...this.rawFiles],
+      composeDraft: null
+    })
+
+    return postEvent
+  }
+
+  async cancelComposeDraft(): Promise<void> {
+    this.patch({ composeDraft: null })
   }
 
   async search(mode: SearchMode, query: string): Promise<void> {

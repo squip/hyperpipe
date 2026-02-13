@@ -19,7 +19,7 @@ export class RelayService implements IRelayService {
     const event = await waitForWorkerEvent(
       this.workerHost,
       (msg) => msg.type === 'relay-update' && Array.isArray((msg as { relays?: unknown }).relays),
-      20_000
+      8_000
     )
 
     return ((event as unknown as { relays?: RelayEntry[] }).relays || [])

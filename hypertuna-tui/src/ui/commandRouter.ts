@@ -127,6 +127,13 @@ export interface CommandController {
   dismissGroupInvite(inviteId: string): Promise<void>
 
   refreshFeed(limit?: number): Promise<void>
+  setFeedSourceRelays(): Promise<void>
+  setFeedSourceFollowing(): Promise<void>
+  setFeedSourceRelaySelector(selector: string): Promise<void>
+  setFeedSourceGroupSelector(selector: string, relay?: string): Promise<void>
+  setFeedSearch(query: string): Promise<void>
+  setFeedSort(sortKey: 'createdAt' | 'kind' | 'author' | 'content', direction?: string): Promise<void>
+  setFeedKindFilter(kinds: number[] | null): Promise<void>
   publishPost(content: string): Promise<unknown>
   publishReply(content: string, replyToEventId: string, replyToPubkey: string): Promise<unknown>
   publishReaction(eventId: string, eventPubkey: string, reaction: string): Promise<unknown>
@@ -158,6 +165,11 @@ export interface CommandController {
     pubkey: string
     token: string
   }): Promise<void>
+  refreshGroupMembers(groupId: string, relay?: string): Promise<unknown>
+  setGroupSearch(query: string): Promise<void>
+  setGroupSort(sortKey: 'name' | 'description' | 'open' | 'public' | 'admin' | 'createdAt' | 'members' | 'peers', direction?: string): Promise<void>
+  setGroupVisibilityFilter(visibility: 'all' | 'public' | 'private'): Promise<void>
+  setGroupJoinFilter(joinMode: 'all' | 'open' | 'closed'): Promise<void>
 
   refreshGroupFiles(groupId?: string): Promise<void>
   uploadGroupFile(input: {
@@ -165,6 +177,10 @@ export interface CommandController {
     publicIdentifier?: string | null
     filePath: string
   }): Promise<Record<string, unknown>>
+  setFileSearch(query: string): Promise<void>
+  setFileSort(sortKey: 'fileName' | 'group' | 'uploadedAt' | 'uploadedBy' | 'size' | 'mime', direction?: string): Promise<void>
+  setFileMimeFilter(mime: string): Promise<void>
+  setFileGroupFilter(group: string): Promise<void>
 
   refreshStarterPacks(): Promise<void>
   createStarterPack(input: {
@@ -185,7 +201,7 @@ export interface CommandController {
   }): Promise<void>
   acceptChatInvite(inviteId: string): Promise<void>
   dismissChatInvite(inviteId: string): Promise<void>
-  setGroupViewTab(tab: 'discover' | 'my' | 'invites'): Promise<void>
+  setGroupViewTab(tab: 'discover' | 'my'): Promise<void>
   setChatViewTab(tab: 'conversations' | 'invites'): Promise<void>
   refreshJoinRequests(groupId: string, relay?: string): Promise<void>
   approveJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void>
@@ -205,6 +221,18 @@ export interface CommandController {
   }
   loadChatThread(conversationId: string): Promise<void>
   sendChatMessage(conversationId: string, content: string): Promise<void>
+  startComposeDraft(groupId: string, relay?: string): Promise<void>
+  updateComposeText(content: string): Promise<void>
+  attachComposeFile(filePath: string): Promise<void>
+  removeComposeAttachment(selector: string): Promise<void>
+  composeDraftSnapshot(): {
+    groupId: string
+    relay?: string | null
+    content: string
+    attachments: Array<{ filePath: string; fileName: string }>
+  } | null
+  publishComposeDraft(): Promise<unknown>
+  cancelComposeDraft(): Promise<void>
 
   search(mode: SearchMode, query: string): Promise<void>
 }
@@ -460,6 +488,12 @@ export function buildCommandSnippet(context?: CommandContext, workflow?: string)
       && (selectedRelay?.publicIdentifier || selectedRelay?.relayKey)) {
       return `relay join ${selectedRelay?.publicIdentifier || selectedRelay?.relayKey}`
     }
+    if (normalizedWorkflow === 'feed-source-group' && selectedGroup?.id) {
+      return `feed source group ${selectedGroup.id}`
+    }
+    if (normalizedWorkflow === 'compose-start' && selectedGroup?.id) {
+      return `compose start ${selectedGroup.id}`
+    }
     if (normalizedWorkflow === 'file-refresh' && selectedFile?.groupId) {
       return `file refresh ${selectedFile.groupId}`
     }
@@ -471,7 +505,8 @@ export function buildCommandSnippet(context?: CommandContext, workflow?: string)
 
   if (selectedSection === 'groups') {
     if (selectedInvite?.kind === 'group') return `group invite-accept ${selectedInvite.id}`
-    if (selectedGroup?.id) return `group join-flow ${selectedGroup.id}`
+    if (selectedGroup?.id) return `group members ${selectedGroup.id}`
+    return 'group tab my'
   }
   if (selectedSection === 'relays' && (selectedRelay?.publicIdentifier || selectedRelay?.relayKey)) {
     return `relay join ${selectedRelay?.publicIdentifier || selectedRelay?.relayKey}`
@@ -479,17 +514,24 @@ export function buildCommandSnippet(context?: CommandContext, workflow?: string)
   if (selectedSection === 'feed' && selectedFeedEvent?.id) {
     return `reply ${selectedFeedEvent.id} ${selectedFeedEvent.pubkey} <content>`
   }
-  if (selectedSection === 'files' && selectedFile?.groupId) {
-    return `file refresh ${selectedFile.groupId}`
+  if (selectedSection === 'feed') {
+    return 'feed source relays'
   }
-  if (selectedSection === 'chats') {
-    if (selectedInvite?.kind === 'chat') return `chat accept ${selectedInvite.id}`
-    if (selectedConversation?.id) return `chat thread ${selectedConversation.id}`
+  if (selectedSection === 'files' && selectedFile?.groupId) {
+    return `file filter group ${selectedFile.groupId}`
+  }
+  if (selectedSection === 'files') {
+    return 'file search <query>'
   }
   if (selectedSection === 'invites') {
     if (selectedInvite?.kind === 'group') return `invites accept group ${selectedInvite.id}`
     if (selectedInvite?.kind === 'chat') return `invites accept chat ${selectedInvite.id}`
     return 'invites refresh'
+  }
+  if (selectedSection === 'chats') {
+    if (selectedInvite?.kind === 'chat') return `chat accept ${selectedInvite.id}`
+    if (selectedConversation?.id) return `chat thread ${selectedConversation.id}`
+    return 'chat refresh'
   }
   if (selectedSection === 'bookmarks') {
     return 'bookmark refresh'
@@ -520,7 +562,7 @@ export async function executeCommand(
   if (cmd === 'help') {
     return {
       message:
-        'Commands: help | goto <section> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | relay refresh/create/join/disconnect/leave | feed refresh | post/reply/react | bookmark refresh/add/remove | group tab/refresh/invites/join-flow/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites accept/dismiss | file refresh/upload | list refresh/create/apply | chat tab/init/refresh/create/accept/dismiss/thread/send | perf overlay/snapshot | search <notes|profiles|groups|lists> <query>'
+        'Commands: help | goto <section> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | relay refresh/create/join/disconnect/leave | feed refresh/source/search/sort/filter | post/reply/react | compose start/text/attach/remove/show/publish/cancel | bookmark refresh/add/remove | group tab/refresh/invites/members/search/sort/filter/join-flow/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites accept/dismiss | file refresh/upload/search/sort/filter | list refresh/create/apply | chat tab/init/refresh/create/accept/dismiss/thread/send | perf overlay/snapshot | search <notes|profiles|groups|lists> <query>'
     }
   }
 
@@ -797,6 +839,73 @@ export async function executeCommand(
       await controller.refreshFeed(Number.isFinite(limit) ? limit : 120)
       return { message: 'Feed refreshed', gotoSection: 'feed' }
     }
+    if (action === 'source') {
+      const mode = requireArg(args[2], 'feed source mode').toLowerCase()
+      if (mode === 'relays') {
+        await controller.setFeedSourceRelays()
+        return { message: 'Feed source set to relays', gotoSection: 'feed' }
+      }
+      if (mode === 'following') {
+        await controller.setFeedSourceFollowing()
+        return { message: 'Feed source set to following', gotoSection: 'feed' }
+      }
+      if (mode === 'relay') {
+        let selector: string | undefined = args[3]
+        if (!selector) {
+          const selectedRelay = resolveSelectedRelay(context)
+          selector = selectedRelay?.connectionUrl || selectedRelay?.publicIdentifier || selectedRelay?.relayKey
+        }
+        selector = requireArg(selector, 'relay selector')
+        await controller.setFeedSourceRelaySelector(selector)
+        return { message: `Feed source set to relay ${selector}`, gotoSection: 'feed' }
+      }
+      if (mode === 'group') {
+        let selector: string | undefined = args[3]
+        const relay = args[4]
+        if (!selector) {
+          selector = resolveSelectedGroup(context)?.id
+            || (resolveSelectedInvite(context)?.kind === 'group'
+              ? (resolveSelectedInvite(context) as SelectedGroupInviteRef).groupId
+              : undefined)
+        }
+        selector = requireArg(selector, 'groupId or index')
+        await controller.setFeedSourceGroupSelector(selector, relay)
+        return { message: `Feed source set to group ${selector}`, gotoSection: 'feed' }
+      }
+      throw new Error('Feed source mode must be relays|following|relay|group')
+    }
+    if (action === 'search') {
+      const query = args[2] ? remainder(trimmed, `${args[0]} ${args[1]}`) : ''
+      if (!query || query.toLowerCase() === 'clear') {
+        await controller.setFeedSearch('')
+        return { message: 'Feed search cleared', gotoSection: 'feed' }
+      }
+      await controller.setFeedSearch(query)
+      return { message: 'Feed search updated', gotoSection: 'feed' }
+    }
+    if (action === 'sort') {
+      const sortKey = requireArg(args[2], 'sort key') as 'createdAt' | 'kind' | 'author' | 'content'
+      if (!['createdAt', 'kind', 'author', 'content'].includes(sortKey)) {
+        throw new Error('Feed sort key must be createdAt|kind|author|content')
+      }
+      const direction = args[3]
+      await controller.setFeedSort(sortKey, direction)
+      return { message: `Feed sort updated (${sortKey}${direction ? ` ${direction}` : ''})`, gotoSection: 'feed' }
+    }
+    if (action === 'filter') {
+      const target = requireArg(args[2], 'filter target').toLowerCase()
+      if (target !== 'kind') {
+        throw new Error('Feed filter target must be kind')
+      }
+      const value = requireArg(args[3], 'kind csv or all')
+      if (value.toLowerCase() === 'all') {
+        await controller.setFeedKindFilter(null)
+        return { message: 'Feed kind filter cleared', gotoSection: 'feed' }
+      }
+      const kinds = splitCsv(value).map((entry) => Number(entry)).filter((entry) => Number.isFinite(entry))
+      await controller.setFeedKindFilter(kinds)
+      return { message: `Feed kind filter set (${kinds.join(',')})`, gotoSection: 'feed' }
+    }
     throw new Error(`Unknown feed action: ${action}`)
   }
 
@@ -882,10 +991,13 @@ export async function executeCommand(
 
     if (action === 'tab') {
       const tab = requireArg(args[2], 'tab').toLowerCase()
-      if (!['discover', 'my', 'invites'].includes(tab)) {
-        throw new Error('Group tab must be discover|my|invites')
+      if (tab === 'invites') {
+        return { message: 'Group invites moved to Invites section', gotoSection: 'invites' }
       }
-      await controller.setGroupViewTab(tab as 'discover' | 'my' | 'invites')
+      if (!['discover', 'my'].includes(tab)) {
+        throw new Error('Group tab must be discover|my')
+      }
+      await controller.setGroupViewTab(tab as 'discover' | 'my')
       return { message: `Group tab ${tab}`, gotoSection: 'groups' }
     }
 
@@ -897,6 +1009,63 @@ export async function executeCommand(
     if (action === 'invites') {
       await controller.refreshInvites()
       return { message: 'Invites refreshed', gotoSection: 'groups' }
+    }
+
+    if (action === 'members') {
+      let groupId: string | undefined = args[2]
+      if (!groupId) {
+        groupId = resolveSelectedGroup(context)?.id
+      }
+      groupId = requireArg(groupId, 'groupId')
+      await controller.refreshGroupMembers(groupId, resolveSelectedGroup(context)?.relay || undefined)
+      return { message: `Group members refreshed for ${groupId}`, gotoSection: 'groups' }
+    }
+
+    if (action === 'search') {
+      const query = args[2] ? remainder(trimmed, `${args[0]} ${args[1]}`) : ''
+      if (!query || query.toLowerCase() === 'clear') {
+        await controller.setGroupSearch('')
+        return { message: 'Group search cleared', gotoSection: 'groups' }
+      }
+      await controller.setGroupSearch(query)
+      return { message: 'Group search updated', gotoSection: 'groups' }
+    }
+
+    if (action === 'sort') {
+      const sortKey = requireArg(args[2], 'sort key') as
+        | 'name'
+        | 'description'
+        | 'open'
+        | 'public'
+        | 'admin'
+        | 'createdAt'
+        | 'members'
+        | 'peers'
+      if (!['name', 'description', 'open', 'public', 'admin', 'createdAt', 'members', 'peers'].includes(sortKey)) {
+        throw new Error('Group sort key must be name|description|open|public|admin|createdAt|members|peers')
+      }
+      await controller.setGroupSort(sortKey, args[3])
+      return { message: `Group sort updated (${sortKey}${args[3] ? ` ${args[3]}` : ''})`, gotoSection: 'groups' }
+    }
+
+    if (action === 'filter') {
+      const target = requireArg(args[2], 'filter target').toLowerCase()
+      const value = requireArg(args[3], 'filter value').toLowerCase()
+      if (target === 'visibility') {
+        if (!['all', 'public', 'private'].includes(value)) {
+          throw new Error('Visibility filter must be all|public|private')
+        }
+        await controller.setGroupVisibilityFilter(value as 'all' | 'public' | 'private')
+        return { message: `Group visibility filter set (${value})`, gotoSection: 'groups' }
+      }
+      if (target === 'join') {
+        if (!['all', 'open', 'closed'].includes(value)) {
+          throw new Error('Join filter must be all|open|closed')
+        }
+        await controller.setGroupJoinFilter(value as 'all' | 'open' | 'closed')
+        return { message: `Group join filter set (${value})`, gotoSection: 'groups' }
+      }
+      throw new Error('Group filter target must be visibility|join')
     }
 
     if (action === 'join-flow') {
@@ -1115,6 +1284,45 @@ export async function executeCommand(
       return { message: `Uploaded file ${filePath}`, gotoSection: 'files' }
     }
 
+    if (action === 'search') {
+      const query = args[2] ? remainder(trimmed, `${args[0]} ${args[1]}`) : ''
+      if (!query || query.toLowerCase() === 'clear') {
+        await controller.setFileSearch('')
+        return { message: 'File search cleared', gotoSection: 'files' }
+      }
+      await controller.setFileSearch(query)
+      return { message: 'File search updated', gotoSection: 'files' }
+    }
+
+    if (action === 'sort') {
+      const sortKey = requireArg(args[2], 'sort key') as
+        | 'fileName'
+        | 'group'
+        | 'uploadedAt'
+        | 'uploadedBy'
+        | 'size'
+        | 'mime'
+      if (!['fileName', 'group', 'uploadedAt', 'uploadedBy', 'size', 'mime'].includes(sortKey)) {
+        throw new Error('File sort key must be fileName|group|uploadedAt|uploadedBy|size|mime')
+      }
+      await controller.setFileSort(sortKey, args[3])
+      return { message: `File sort updated (${sortKey}${args[3] ? ` ${args[3]}` : ''})`, gotoSection: 'files' }
+    }
+
+    if (action === 'filter') {
+      const target = requireArg(args[2], 'filter target').toLowerCase()
+      const value = requireArg(args[3], 'filter value')
+      if (target === 'mime') {
+        await controller.setFileMimeFilter(value.toLowerCase() === 'all' ? 'all' : value)
+        return { message: `File mime filter set (${value})`, gotoSection: 'files' }
+      }
+      if (target === 'group') {
+        await controller.setFileGroupFilter(value.toLowerCase() === 'all' ? 'all' : value)
+        return { message: `File group filter set (${value})`, gotoSection: 'files' }
+      }
+      throw new Error('File filter target must be mime|group')
+    }
+
     throw new Error(`Unknown file action: ${action}`)
   }
 
@@ -1147,6 +1355,65 @@ export async function executeCommand(
     }
 
     throw new Error(`Unknown list action: ${action}`)
+  }
+
+  if (cmd === 'compose') {
+    const action = requireArg(args[1], 'compose action').toLowerCase()
+
+    if (action === 'start') {
+      let groupId: string | undefined = args[2]
+      const relay = args[3]
+      if (!groupId) {
+        groupId = resolveSelectedGroup(context)?.id
+          || (resolveSelectedInvite(context)?.kind === 'group'
+            ? (resolveSelectedInvite(context) as SelectedGroupInviteRef).groupId
+            : undefined)
+      }
+      groupId = requireArg(groupId, 'groupId')
+      await controller.startComposeDraft(groupId, relay)
+      return { message: `Compose draft started for ${groupId}`, gotoSection: 'feed' }
+    }
+
+    if (action === 'text') {
+      const content = remainder(trimmed, `${args[0]} ${args[1]}`)
+      await controller.updateComposeText(content)
+      return { message: 'Compose draft text updated', gotoSection: 'feed' }
+    }
+
+    if (action === 'attach') {
+      const filePath = requireArg(args[2], 'filePath')
+      await controller.attachComposeFile(filePath)
+      return { message: `Attached ${filePath}`, gotoSection: 'feed' }
+    }
+
+    if (action === 'remove') {
+      const selector = requireArg(args[2], 'index|filePath')
+      await controller.removeComposeAttachment(selector)
+      return { message: `Removed attachment ${selector}`, gotoSection: 'feed' }
+    }
+
+    if (action === 'show') {
+      const draft = controller.composeDraftSnapshot()
+      if (!draft) {
+        return { message: 'No compose draft in progress', gotoSection: 'feed' }
+      }
+      return {
+        message: `Compose draft group=${draft.groupId} relay=${draft.relay || '-'} attachments=${draft.attachments.length} contentLen=${draft.content.length}`,
+        gotoSection: 'feed'
+      }
+    }
+
+    if (action === 'publish') {
+      await controller.publishComposeDraft()
+      return { message: 'Compose draft published', gotoSection: 'feed' }
+    }
+
+    if (action === 'cancel') {
+      await controller.cancelComposeDraft()
+      return { message: 'Compose draft canceled', gotoSection: 'feed' }
+    }
+
+    throw new Error(`Unknown compose action: ${action}`)
   }
 
   if (cmd === 'chat') {

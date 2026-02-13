@@ -70,7 +70,7 @@ const app = render(
     }
   }),
   {
-    patchConsole: false,
+    patchConsole: true,
     exitOnCtrlC: false
   }
 )

@@ -4,6 +4,33 @@ import { defaultUiState, type AccountScopedUiState, type UiState, uiStateSchema 
 const defaultAccountScopedUiState = (): AccountScopedUiState => ({
   groupViewTab: 'discover',
   chatViewTab: 'conversations',
+  feedSource: {
+    mode: 'relays',
+    relayUrl: null,
+    groupId: null,
+    label: 'All Relays'
+  },
+  feedControls: {
+    query: '',
+    sortKey: 'createdAt',
+    sortDirection: 'desc',
+    kindFilter: null
+  },
+  groupControls: {
+    query: '',
+    sortKey: 'members',
+    sortDirection: 'desc',
+    visibility: 'all',
+    joinMode: 'all'
+  },
+  fileControls: {
+    query: '',
+    sortKey: 'uploadedAt',
+    sortDirection: 'desc',
+    mime: 'all',
+    group: 'all'
+  },
+  detailPaneOffsetBySection: {},
   paneViewport: {},
   dismissedGroupInviteIds: [],
   acceptedGroupInviteIds: [],
@@ -74,9 +101,15 @@ export class UiStateStore {
   getAccountState(userKey: string): AccountScopedUiState {
     const key = String(userKey || '').trim().toLowerCase()
     if (!key) return defaultAccountScopedUiState()
+    const raw = this.state.accountScoped[key] || {}
+    const normalizedGroupViewTab =
+      (raw as { groupViewTab?: string }).groupViewTab === 'my'
+        ? 'my'
+        : 'discover'
     return {
       ...defaultAccountScopedUiState(),
-      ...(this.state.accountScoped[key] || {})
+      ...raw,
+      groupViewTab: normalizedGroupViewTab
     }
   }
 

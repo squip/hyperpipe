@@ -43,6 +43,20 @@ export type RelayEntry = {
 
 export type FeedItem = Event
 
+export type FeedSourceMode = 'relays' | 'relay' | 'following' | 'group'
+
+export type FeedSourceState = {
+  mode: FeedSourceMode
+  relayUrl?: string | null
+  groupId?: string | null
+  label?: string
+}
+
+export type RelayListPreferences = {
+  read: string[]
+  write: string[]
+}
+
 export type GroupSummary = {
   id: string
   relay?: string
@@ -51,6 +65,12 @@ export type GroupSummary = {
   picture?: string
   isPublic?: boolean
   isOpen?: boolean
+  adminPubkey?: string | null
+  adminName?: string | null
+  members?: string[]
+  membersCount?: number
+  peersOnline?: number
+  createdAt?: number | null
   event?: Event
 }
 
@@ -145,7 +165,7 @@ export type SearchResult = {
   relay?: string
 }
 
-export type GroupViewTab = 'discover' | 'my' | 'invites'
+export type GroupViewTab = 'discover' | 'my'
 export type ChatViewTab = 'conversations' | 'invites'
 
 export type GroupListEntry = {
@@ -189,6 +209,48 @@ export type PaneViewportEntry = {
 }
 
 export type PaneViewportMap = Record<string, PaneViewportEntry>
+
+export type FeedSortKey = 'createdAt' | 'kind' | 'author' | 'content'
+export type GroupSortKey = 'name' | 'description' | 'open' | 'public' | 'admin' | 'createdAt' | 'members' | 'peers'
+export type FileSortKey = 'fileName' | 'group' | 'uploadedAt' | 'uploadedBy' | 'size' | 'mime'
+export type SortDirection = 'asc' | 'desc'
+
+export type FeedControls = {
+  query: string
+  sortKey: FeedSortKey
+  sortDirection: SortDirection
+  kindFilter: number[] | null
+}
+
+export type GroupControls = {
+  query: string
+  sortKey: GroupSortKey
+  sortDirection: SortDirection
+  visibility: 'all' | 'public' | 'private'
+  joinMode: 'all' | 'open' | 'closed'
+}
+
+export type FileControls = {
+  query: string
+  sortKey: FileSortKey
+  sortDirection: SortDirection
+  mime: 'all' | string
+  group: 'all' | string
+}
+
+export type GroupDraftAttachment = {
+  filePath: string
+  fileName: string
+  mime?: string | null
+  size?: number | null
+}
+
+export type GroupComposeDraft = {
+  groupId: string
+  relay?: string | null
+  content: string
+  attachments: GroupDraftAttachment[]
+}
 
 export type PerfOperationSample = {
   name: string

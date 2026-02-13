@@ -236,14 +236,14 @@ const commands: ScriptedCommand[] = [
   {
     resolveCommand: () => {
       if (!createdGroupId || !createdGroupRelay) return null
-      return `group invite ${inviteePubkey} demo-token-${suffix}`
+      return `group invite ${createdGroupId} ${createdGroupRelay} ${inviteePubkey} demo-token-${suffix}`
     }
   },
   {
     resolveCommand: () => {
       const target = joinId || createdGroupId
       if (!target) return null
-      return `group join-flow demo-join-${suffix} --open`
+      return `group join-flow ${target} demo-join-${suffix} --open`
     }
   },
   {
@@ -322,7 +322,7 @@ render(
     autoExitOnScriptComplete={!parsed.values['stay-open']}
   />,
   {
-    patchConsole: false,
+    patchConsole: true,
     exitOnCtrlC: false
   }
 )
