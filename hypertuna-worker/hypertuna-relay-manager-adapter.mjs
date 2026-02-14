@@ -2574,8 +2574,10 @@ export async function getActiveRelays() {
     
     const activeRelayList = [];
     const profiles = await getAllRelayProfiles();
+    const activeRelayKeys = new Set();
     
     for (const [key, manager] of activeRelays.entries()) {
+        activeRelayKeys.add(key);
         // Get peer count if available
         let peerCount = 0;
         if (manager && manager.peers && manager.peers.size) {
@@ -2599,6 +2601,34 @@ export async function getActiveRelays() {
             createdAt: profile?.created_at || profile?.joined_at || null,
             isActive: true,
             writable: manager?.relay?.writable === true,
+            isOpen: profile?.isOpen === true,
+            isPublic: profile?.isPublic === true,
+            isHosted: !!profile?.created_at,
+            isJoined: !!profile?.joined_at && !profile?.created_at
+        });
+    }
+
+    // Include profile-backed relays that may not currently be hydrated in-memory yet.
+    // This keeps UI relay metadata stable across restarts/recovery and post-create races.
+    for (const profile of profiles) {
+        const relayKey = profile?.relay_key;
+        if (!relayKey || activeRelayKeys.has(relayKey)) continue;
+        if (profile?.is_active === false) continue;
+
+        const identifierPath = profile?.public_identifier
+            ? profile.public_identifier.replace(':', '/')
+            : relayKey;
+
+        activeRelayList.push({
+            relayKey,
+            publicIdentifier: profile?.public_identifier || null,
+            peerCount: 0,
+            name: profile?.name || `Relay ${relayKey.substring(0, 8)}`,
+            description: profile?.description || '',
+            connectionUrl: `${buildGatewayWebsocketBase(globalConfig || { proxy_server_address: 'localhost', proxy_websocket_protocol: 'wss' })}/${identifierPath}`,
+            createdAt: profile?.created_at || profile?.joined_at || null,
+            isActive: true,
+            writable: false,
             isOpen: profile?.isOpen === true,
             isPublic: profile?.isPublic === true,
             isHosted: !!profile?.created_at,

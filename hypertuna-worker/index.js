@@ -5433,6 +5433,8 @@ async function handleMessageObject(message) {
 
     case 'create-relay':
       console.log('[Worker] Create relay requested:', message.data)
+      {
+        const requestId = extractMessageRequestId(message)
       if (relayServer) {
         try {
           const result = await relayServer.createRelay(message.data)
@@ -5442,6 +5444,13 @@ async function handleMessageObject(message) {
 
           sendMessage({
             type: 'relay-created',
+            data: {
+              ...result,
+              members: relayMembers.get(result.relayKey) || []
+            }
+          })
+          sendWorkerResponse(requestId, {
+            success: true,
             data: {
               ...result,
               members: relayMembers.get(result.relayKey) || []
@@ -5476,17 +5485,28 @@ async function handleMessageObject(message) {
             type: 'error',
             message: `Failed to create relay: ${err.message}`
           })
+          sendWorkerResponse(requestId, {
+            success: false,
+            error: err?.message || String(err)
+          })
         }
       } else {
         sendMessage({
           type: 'error',
           message: 'Relay server not initialized'
         })
+        sendWorkerResponse(requestId, {
+          success: false,
+          error: 'Relay server not initialized'
+        })
+      }
       }
       break
 
     case 'join-relay':
       console.log('[Worker] Join relay requested:', message.data)
+      {
+        const requestId = extractMessageRequestId(message)
       if (relayServer) {
         try {
           const result = await relayServer.joinRelay(message.data)
@@ -5496,6 +5516,13 @@ async function handleMessageObject(message) {
 
           sendMessage({
             type: 'relay-joined',
+            data: {
+              ...result,
+              members: relayMembers.get(result.relayKey) || []
+            }
+          })
+          sendWorkerResponse(requestId, {
+            success: true,
             data: {
               ...result,
               members: relayMembers.get(result.relayKey) || []
@@ -5521,12 +5548,21 @@ async function handleMessageObject(message) {
             type: 'error',
             message: `Failed to join relay: ${err.message}`
           })
+          sendWorkerResponse(requestId, {
+            success: false,
+            error: err?.message || String(err)
+          })
         }
       } else {
         sendMessage({
           type: 'error',
           message: 'Relay server not initialized'
         })
+        sendWorkerResponse(requestId, {
+          success: false,
+          error: 'Relay server not initialized'
+        })
+      }
       }
       break
 

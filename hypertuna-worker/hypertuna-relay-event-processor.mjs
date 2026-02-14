@@ -1494,6 +1494,12 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
           });
         }
       }
+      if (this._isEphemeralSubscriptionId(subscriptionId)) {
+        // One-shot fetch subscriptions are expected to be high volume.
+        // Suppress success NOTICE chatter to keep clients responsive.
+        return null;
+      }
+
       return ['NOTICE', `Subscription ${subscriptionId} created/updated successfully`];
     });
   }
@@ -1688,7 +1694,9 @@ async handleMessage(message, sendResponse, connectionKey, clientId = null) {
           const activeSubscriptions = await this.getSubscriptions(connectionKey);
           const publishSubResult = await this.publishSubscription(connectionKey, message, activeSubscriptions, clientId);
           logWithTimestamp(`handleMessage: REQ publish result:`, JSON.stringify(publishSubResult, null, 2));
-          sendResponse(publishSubResult);
+          if (publishSubResult) {
+            sendResponse(publishSubResult);
+          }
           break;
   
         case 'CLOSE':

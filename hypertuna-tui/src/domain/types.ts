@@ -79,10 +79,35 @@ export type GroupInvite = {
   id: string
   groupId: string
   relay?: string
+  relayUrl?: string | null
+  relayKey?: string | null
   groupName?: string
   groupPicture?: string
+  name?: string
+  about?: string
   isPublic?: boolean
   fileSharing?: boolean
+  authorizedMemberPubkeys?: string[]
+  blindPeer?: {
+    publicKey?: string | null
+    encryptionKey?: string | null
+    replicationTopic?: string | null
+    maxBytes?: number | null
+  } | null
+  cores?: Array<{
+    key: string
+    role?: string | null
+  }>
+  writerCore?: string | null
+  writerCoreHex?: string | null
+  autobaseLocal?: string | null
+  writerSecret?: string | null
+  fastForward?: {
+    key?: string | null
+    length?: number | null
+    signedLength?: number | null
+    timeoutMs?: number | null
+  } | null
   token?: string
   event: Event
 }
@@ -373,6 +398,27 @@ export interface RelayService {
     relayKey?: string
     relayUrl?: string
     openJoin?: boolean
+    hostPeers?: string[]
+    blindPeer?: {
+      publicKey?: string | null
+      encryptionKey?: string | null
+      replicationTopic?: string | null
+      maxBytes?: number | null
+    } | null
+    cores?: Array<{
+      key: string
+      role?: string | null
+    }>
+    writerCore?: string | null
+    writerCoreHex?: string | null
+    autobaseLocal?: string | null
+    writerSecret?: string | null
+    fastForward?: {
+      key?: string | null
+      length?: number | null
+      signedLength?: number | null
+      timeoutMs?: number | null
+    } | null
   }): Promise<void>
   disconnectRelay(relayKey: string, publicIdentifier?: string): Promise<void>
   leaveGroup(input: {

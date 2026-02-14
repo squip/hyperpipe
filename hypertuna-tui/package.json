@@ -16,7 +16,8 @@
     "demo:e2e:stay-open": "tsx test/e2e/interactive-demo.tsx --stay-open",
     "demo:e2e:real": "tsx test/e2e/interactive-demo-real.tsx",
     "demo:e2e:real:stay-open": "tsx test/e2e/interactive-demo-real.tsx --stay-open",
-    "demo:e2e:real:matrix": "tsx test/e2e/live-workflow-matrix-real.tsx"
+    "demo:e2e:real:matrix": "tsx test/e2e/live-workflow-matrix-real.tsx",
+    "demo:e2e:real:two-user": "tsx test/e2e/live-two-user-workflows-real.tsx"
   },
   "dependencies": {
     "ink": "^5.0.1",

@@ -7,6 +7,7 @@ export type LiveSubscription = {
 
 export class NostrClient {
   private pool: SimplePool
+  private querySequence = 0
 
   constructor() {
     this.pool = new SimplePool({
@@ -14,12 +15,19 @@ export class NostrClient {
     })
   }
 
+  private nextQueryId(): string {
+    this.querySequence = (this.querySequence + 1) % 1_000_000
+    return `f-fetch-events-${Date.now().toString(36)}-${this.querySequence.toString(36)}`
+  }
+
   async query(relays: string[], filter: Filter, maxWaitMs = 4_000): Promise<Event[]> {
     const targets = uniqueRelayUrls(relays)
     if (!targets.length) return []
 
     return this.pool.querySync(targets, filter, {
-      maxWait: maxWaitMs
+      maxWait: maxWaitMs,
+      id: this.nextQueryId(),
+      label: 'hypertuna-tui-query'
     })
   }
 

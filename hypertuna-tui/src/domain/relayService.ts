@@ -1,7 +1,6 @@
 import type { RelayService as IRelayService } from './types.js'
 import type { RelayEntry } from './types.js'
 import type { WorkerHost } from '../runtime/workerHost.js'
-import { waitForWorkerEvent } from '../runtime/waitForWorkerEvent.js'
 
 export class RelayService implements IRelayService {
   private workerHost: WorkerHost
@@ -10,16 +9,59 @@ export class RelayService implements IRelayService {
     this.workerHost = workerHost
   }
 
-  async getRelays(): Promise<RelayEntry[]> {
-    const sent = await this.workerHost.send({ type: 'get-relays' })
-    if (!sent.success) {
-      throw new Error(sent.error || 'Failed to request relays')
-    }
+  private async sendAndWaitForEvent<T extends Record<string, unknown>>(
+    command: Record<string, unknown>,
+    predicate: (message: Record<string, unknown>) => boolean,
+    timeoutMs: number,
+    sendError: string
+  ): Promise<T> {
+    const timeout = Math.max(1_000, Math.min(Math.trunc(timeoutMs || 0), 300_000))
 
-    const event = await waitForWorkerEvent(
-      this.workerHost,
+    return await new Promise<T>((resolve, reject) => {
+      let settled = false
+      const off = this.workerHost.onMessage((raw) => {
+        if (settled) return
+        if (!raw || typeof raw !== 'object') return
+        const message = raw as Record<string, unknown>
+        if (!predicate(message)) return
+        settled = true
+        clearTimeout(timeoutId)
+        off()
+        resolve(message as T)
+      })
+
+      const timeoutId = setTimeout(() => {
+        if (settled) return
+        settled = true
+        off()
+        reject(new Error(`Timed out waiting for worker event after ${timeout}ms`))
+      }, timeout)
+
+      this.workerHost.send(command as any)
+        .then((sent) => {
+          if (settled) return
+          if (sent.success) return
+          settled = true
+          clearTimeout(timeoutId)
+          off()
+          reject(new Error(sent.error || sendError))
+        })
+        .catch((error) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timeoutId)
+          off()
+          reject(error instanceof Error ? error : new Error(String(error)))
+        })
+    })
+  }
+
+  async getRelays(): Promise<RelayEntry[]> {
+    const event = await this.sendAndWaitForEvent<{ relays?: RelayEntry[] }>(
+      { type: 'get-relays' },
       (msg) => msg.type === 'relay-update' && Array.isArray((msg as { relays?: unknown }).relays),
-      8_000
+      8_000,
+      'Failed to request relays'
     )
 
     return ((event as unknown as { relays?: RelayEntry[] }).relays || [])
@@ -33,22 +75,28 @@ export class RelayService implements IRelayService {
     fileSharing?: boolean
     picture?: string
   }): Promise<Record<string, unknown>> {
-    const sent = await this.workerHost.send({
-      type: 'create-relay',
-      data: {
-        ...input
+    let event: Record<string, unknown>
+    try {
+      event = await this.sendAndWaitForEvent<Record<string, unknown>>(
+        {
+          type: 'create-relay',
+          data: {
+            ...input
+          }
+        },
+        (msg) => msg.type === 'relay-created' || msg.type === 'error',
+        25_000,
+        'Failed to send create-relay command'
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (message.includes('Timed out waiting for worker event')) {
+        return {
+          pending: true
+        }
       }
-    })
-
-    if (!sent.success) {
-      throw new Error(sent.error || 'Failed to send create-relay command')
+      throw error
     }
-
-    const event = await waitForWorkerEvent(
-      this.workerHost,
-      (msg) => msg.type === 'relay-created' || msg.type === 'error',
-      60_000
-    )
 
     if (event.type === 'error') {
       throw new Error(String((event as { message?: string }).message || 'create-relay failed'))
@@ -64,21 +112,16 @@ export class RelayService implements IRelayService {
     authToken?: string
     fileSharing?: boolean
   }): Promise<Record<string, unknown>> {
-    const sent = await this.workerHost.send({
-      type: 'join-relay',
-      data: {
-        ...input
-      }
-    })
-
-    if (!sent.success) {
-      throw new Error(sent.error || 'Failed to send join-relay command')
-    }
-
-    const event = await waitForWorkerEvent(
-      this.workerHost,
+    const event = await this.sendAndWaitForEvent<Record<string, unknown>>(
+      {
+        type: 'join-relay',
+        data: {
+          ...input
+        }
+      },
       (msg) => msg.type === 'relay-joined' || msg.type === 'error',
-      90_000
+      90_000,
+      'Failed to send join-relay command'
     )
 
     if (event.type === 'error') {
@@ -96,6 +139,27 @@ export class RelayService implements IRelayService {
     relayKey?: string
     relayUrl?: string
     openJoin?: boolean
+    hostPeers?: string[]
+    blindPeer?: {
+      publicKey?: string | null
+      encryptionKey?: string | null
+      replicationTopic?: string | null
+      maxBytes?: number | null
+    } | null
+    cores?: Array<{
+      key: string
+      role?: string | null
+    }>
+    writerCore?: string | null
+    writerCoreHex?: string | null
+    autobaseLocal?: string | null
+    writerSecret?: string | null
+    fastForward?: {
+      key?: string | null
+      length?: number | null
+      signedLength?: number | null
+      timeoutMs?: number | null
+    } | null
   }): Promise<void> {
     const sent = await this.workerHost.send({
       type: 'start-join-flow',

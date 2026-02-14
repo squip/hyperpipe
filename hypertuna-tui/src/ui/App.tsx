@@ -1200,6 +1200,7 @@ export function App({
   const nodeViewportRef = useRef<ViewportMap>({})
   const rightTopSelectionRef = useRef<IndexMap>({})
   const rightBottomOffsetRef = useRef<OffsetMap>({})
+  const myGroupPaneLoadKeyRef = useRef<string>('')
 
   useEffect(() => {
     exitRef.current = exit
@@ -1544,18 +1545,30 @@ export function App({
   const selectedInviteSendTarget = inviteSendTargets[rightTopIndex] || null
 
   useEffect(() => {
-    if (!state || selectedNode !== 'groups:my') return
+    if (!state || selectedNode !== 'groups:my') {
+      myGroupPaneLoadKeyRef.current = ''
+      return
+    }
     if (!selectedCenterRow || selectedCenterRow.kind !== 'group') return
     const group = selectedCenterRow.data as any
     const controller = controllerRef.current
     if (!controller || !group?.id) return
 
-    if (selectedRightTopAction.startsWith('Notes')) {
-      controller.refreshGroupNotes(group.id, group.relay || undefined).catch(() => {})
-    } else if (selectedRightTopAction.startsWith('Files')) {
+    const actionName = selectedRightTopAction
+    if (!actionName.startsWith('Notes') && !actionName.startsWith('Files') && !actionName.startsWith('Join Requests')) {
+      return
+    }
+    const relay = String(group.relay || '').trim()
+    const key = `${group.id}|${relay}|${actionName}`
+    if (myGroupPaneLoadKeyRef.current === key) return
+    myGroupPaneLoadKeyRef.current = key
+
+    if (actionName.startsWith('Notes')) {
+      controller.refreshGroupNotes(group.id, relay || undefined).catch(() => {})
+    } else if (actionName.startsWith('Files')) {
       controller.refreshGroupFiles(group.id).catch(() => {})
-    } else if (selectedRightTopAction.startsWith('Join Requests')) {
-      controller.refreshJoinRequests(group.id, group.relay || undefined).catch(() => {})
+    } else if (actionName.startsWith('Join Requests')) {
+      controller.refreshJoinRequests(group.id, relay || undefined).catch(() => {})
     }
   }, [state, selectedNode, selectedCenterRow, selectedRightTopAction])
 
@@ -2021,7 +2034,7 @@ export function App({
           payload: {
             groupName: group?.name || selectedInviteSendTarget.name || selectedInviteSendTarget.id,
             isPublic: group?.isPublic !== false,
-            fileSharing: true
+            fileSharing: group?.isOpen !== false
           }
         })
       } else {

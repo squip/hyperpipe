@@ -5,6 +5,7 @@ import React from 'react'
 import { render } from 'ink'
 import { App } from './ui/App.js'
 import type { LogLevel, } from './domain/types.js'
+import { resolveDesktopParityStorageDir } from './storage/defaultStorageDir.js'
 
 function parseLogLevel(value: string | undefined): LogLevel {
   const normalized = String(value || 'info').trim().toLowerCase()
@@ -57,7 +58,7 @@ if (parsed.values.help) {
 const cwd = process.cwd()
 const storageDir = parsed.values['storage-dir']
   ? path.resolve(cwd, parsed.values['storage-dir'])
-  : path.resolve(cwd, '.tui-data')
+  : resolveDesktopParityStorageDir(cwd)
 
 const app = render(
   React.createElement(App, {

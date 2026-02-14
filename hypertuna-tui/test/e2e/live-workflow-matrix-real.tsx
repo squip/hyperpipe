@@ -3,6 +3,7 @@ import { constants as fsConstants, promises as fs } from 'node:fs'
 import { parseArgs } from 'node:util'
 import { TuiController, type RuntimeOptions } from '../../src/domain/controller.js'
 import type { LogLevel } from '../../src/domain/types.js'
+import { resolveDesktopParityStorageDir } from '../../src/storage/defaultStorageDir.js'
 
 type CheckStatus = 'PASS' | 'FAIL' | 'SKIP'
 type RowStatus = 'PASS' | 'FAIL' | 'SKIP'
@@ -111,7 +112,7 @@ const parsed = parseArgs({
 const cwd = process.cwd()
 const storageDir = parsed.values['storage-dir']
   ? path.resolve(cwd, parsed.values['storage-dir'])
-  : path.resolve(cwd, '.tui-data')
+  : resolveDesktopParityStorageDir(cwd)
 const inviteePubkey = String(
   parsed.values['invitee-pubkey']
   || process.env.HYPERTUNA_TUI_INVITEE_PUBKEY
@@ -460,6 +461,12 @@ try {
   process.stderr.write(`live workflow matrix failed: ${error instanceof Error ? error.message : String(error)}\n`)
   process.exitCode = 1
 } finally {
-  await controller.shutdown().catch(() => {})
+  const shutdownGraceMs = 4_000
+  await Promise.race([
+    controller.shutdown().catch(() => {}),
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, shutdownGraceMs)
+    })
+  ])
   process.exit(process.exitCode || 0)
 }

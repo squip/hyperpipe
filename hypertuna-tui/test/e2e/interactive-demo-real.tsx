@@ -5,6 +5,8 @@ import React from 'react'
 import { render } from 'ink'
 import { App, type ScriptedCommand } from '../../src/ui/App.js'
 import type { LogLevel } from '../../src/domain/types.js'
+import { resolveDesktopParityStorageDir } from '../../src/storage/defaultStorageDir.js'
+import { resolveStoragePaths } from '../../src/storage/paths.js'
 
 function parseLogLevel(value: string | undefined): LogLevel {
   const normalized = String(value || 'info').trim().toLowerCase()
@@ -142,14 +144,14 @@ if (ncryptsec && !password) {
 const cwd = process.cwd()
 const storageDir = parsed.values['storage-dir']
   ? path.resolve(cwd, parsed.values['storage-dir'])
-  : path.resolve(cwd, '.tui-data')
+  : resolveDesktopParityStorageDir(cwd)
 
 const suffix = Date.now().toString(36)
 const demoGroupName = `tui-demo-${suffix}`
 const demoChatTitle = `TuiDemoChat-${suffix}`
 const generatedProfileName = `real-demo-${suffix}`
 
-const accountsFilePath = path.join(storageDir, 'accounts.json')
+const accountsFilePath = resolveStoragePaths(storageDir).accountsFile
 const stored = await readStoredAccounts(accountsFilePath)
 const storedAccounts = Array.isArray(stored?.accounts) ? stored.accounts : []
 

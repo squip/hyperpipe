@@ -58,6 +58,7 @@ import { SearchService } from './searchService.js'
 import { NostrClient } from './nostrClient.js'
 import { WorkerHost, findDefaultWorkerRoot } from '../runtime/workerHost.js'
 import type { ClipboardCopyResult } from '../runtime/clipboard.js'
+import { waitForWorkerEvent } from '../runtime/waitForWorkerEvent.js'
 import { resolveStoragePaths } from '../storage/paths.js'
 import { UiStateStore } from '../storage/uiStateStore.js'
 import {
@@ -397,6 +398,24 @@ const MAX_GROUP_ENRICH_ITEMS = 120
 const RELAY_REFRESH_TIMEOUT_MS = 9_000
 const FEED_REFRESH_TIMEOUT_MS = 4_000
 const GROUP_METADATA_TIMEOUT_MS = 2_500
+const LOCAL_PROFILE_CACHE_TTL_MS = 5_000
+const CREATE_RELAY_RECONCILE_TIMEOUT_MS = 90_000
+const CREATE_RELAY_RECONCILE_POLL_MS = 1_500
+
+type LocalRelayProfileSnapshot = {
+  relayKey: string
+  publicIdentifier: string
+  relayUrl: string
+  name: string
+  about: string
+  picture?: string
+  isPublic: boolean
+  isOpen: boolean
+  adminPubkey?: string | null
+  members: string[]
+  membersCount: number
+  createdAt: number | null
+}
 
 export class TuiController {
   private options: RuntimeOptions
@@ -432,6 +451,8 @@ export class TuiController {
   private rawFiles: GroupFileRecord[] = []
   private feedLimit = 120
   private profileNameCache = new Map<string, string>()
+  private localProfileCache: { loadedAt: number; entries: LocalRelayProfileSnapshot[] } | null = null
+  private gatewayPeerRelayMap: Record<string, string[]> = {}
 
   private state: ControllerState = {
     initialized: false,
@@ -727,9 +748,51 @@ export class TuiController {
     }
   }
 
+  private fallbackGroupNameFromIdentifier(identifier: string): string {
+    const normalized = String(identifier || '').trim()
+    if (!normalized) return 'Unnamed Group'
+    const slashParts = normalized.split('/')
+    const colonParts = normalized.split(':')
+    const candidate = (colonParts.length > 1
+      ? colonParts[colonParts.length - 1]
+      : slashParts[slashParts.length - 1]) || normalized
+    try {
+      const decoded = decodeURIComponent(candidate)
+      return decoded.trim() || normalized
+    } catch {
+      return candidate.trim() || normalized
+    }
+  }
+
   private refreshDerivedCollections(): void {
-    const myGroupListIds = new Set(this.state.myGroupList.map((entry) => entry.groupId))
-    const myGroups = this.state.groupDiscover.filter((group) => myGroupListIds.has(group.id))
+    const discoverById = new Map(this.state.groupDiscover.map((group) => [group.id, group]))
+    const myGroups: GroupSummary[] = []
+    const seenGroupIds = new Set<string>()
+    for (const entry of this.state.myGroupList) {
+      const groupId = String(entry.groupId || '').trim()
+      if (!groupId || seenGroupIds.has(groupId)) continue
+      seenGroupIds.add(groupId)
+
+      const discovered = discoverById.get(groupId)
+      if (discovered) {
+        myGroups.push(discovered)
+        continue
+      }
+
+      const relay = this.resolveRelayUrl(entry.relay) || String(entry.relay || '').trim() || undefined
+      myGroups.push({
+        id: groupId,
+        relay,
+        name: this.fallbackGroupNameFromIdentifier(groupId),
+        about: '',
+        isPublic: true,
+        isOpen: true,
+        members: [],
+        membersCount: 0,
+        peersOnline: this.resolveGroupPeerCount(groupId, relay),
+        createdAt: null
+      })
+    }
 
     const invitesInbox = buildInvitesInbox({
       groupInvites: this.state.groupInvites,
@@ -927,6 +990,8 @@ export class TuiController {
         if (event.type === 'gateway-status') {
           const status = (event as { status?: unknown }).status
           const gatewayPeerCounts = this.parseGatewayPeerCounts(status)
+          const gatewayPeerRelayMap = this.parseGatewayPeerRelayMap(status)
+          this.gatewayPeerRelayMap = gatewayPeerRelayMap
           this.patchState({ gatewayPeerCounts })
           if (this.rawGroupDiscover.length > 0) {
             this.syncGroupView()
@@ -1191,10 +1256,26 @@ export class TuiController {
 
     const baseDelayMs = Math.min(60_000, 1_000 * 2 ** Math.max(0, nextAttempt - 1))
     const lockConflict = this.hasRecentWorkerLockSignal()
-    const delayMs = lockConflict ? Math.max(baseDelayMs, 12_000) : baseDelayMs
     if (lockConflict) {
-      this.log('warn', 'Detected storage lock contention; delaying worker restart to allow lock release')
+      const lockMessage =
+        'Storage is locked by another Hypertuna worker instance. Close the other instance, then restart the worker.'
+      this.patchState({
+        lifecycle: 'error',
+        readinessMessage: lockMessage,
+        lastError: 'ELOCKED: File is locked',
+        workerRecoveryState: {
+          ...this.state.workerRecoveryState,
+          status: 'disabled',
+          attempt: nextAttempt,
+          nextDelayMs: 0,
+          lastExitCode: exitCode,
+          lastError: lockMessage
+        }
+      })
+      this.log('error', lockMessage)
+      return
     }
+    const delayMs = baseDelayMs
     this.patchState({
       workerRecoveryState: {
         ...this.state.workerRecoveryState,
@@ -1395,6 +1476,135 @@ export class TuiController {
       this.emitter.on('change', onChange)
       onChange()
     })
+  }
+
+  private async pause(ms: number): Promise<void> {
+    const timeout = Math.max(25, Math.min(Math.trunc(ms), 60_000))
+    await new Promise<void>((resolve) => {
+      setTimeout(() => resolve(), timeout)
+    })
+  }
+
+  private isStorageLockErrorMessage(message: string): boolean {
+    const normalized = String(message || '').toLowerCase()
+    if (!normalized) return false
+    return (
+      normalized.includes('elocked')
+      || normalized.includes('file is locked')
+      || normalized.includes('primary-key is locked')
+      || normalized.includes('storage lock')
+    )
+  }
+
+  private async ensureWorkerReadyForOperation(reason: string): Promise<void> {
+    const session = this.state.session
+    if (!session) {
+      throw new Error(`Unable to run ${reason}: account session is locked`)
+    }
+    const maxAttempts = 3
+    let lastError: string | null = null
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const shouldStart =
+          !this.workerHost.isRunning()
+          || this.state.lifecycle === 'stopped'
+          || this.state.lifecycle === 'error'
+
+        if (shouldStart) {
+          await this.startWorker()
+        }
+
+        if (
+          this.state.lifecycle === 'starting'
+          || this.state.lifecycle === 'initializing'
+          || this.state.lifecycle === 'stopping'
+        ) {
+          await this.waitForLifecycleReady(45_000)
+        }
+
+        if (this.workerHost.isRunning() && this.state.lifecycle === 'ready') {
+          return
+        }
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error)
+      }
+
+      if (this.workerHost.isRunning() && this.state.lifecycle === 'ready') {
+        return
+      }
+
+      if (attempt < maxAttempts) {
+        const detail = lastError ? `: ${lastError}` : ''
+        this.log(
+          'warn',
+          `Worker not ready for ${reason} (attempt ${attempt}/${maxAttempts})${detail}; restarting worker`
+        )
+        await this.stopWorker().catch(() => {})
+        await this.pause(500)
+      }
+    }
+
+    throw new Error(`Unable to run ${reason}: worker not ready${lastError ? ` (${lastError})` : ''}`)
+  }
+
+  private relayIdentityKey(entry: RelayEntry): string {
+    const byIdentifier = String(entry.publicIdentifier || '').trim()
+    if (byIdentifier) return byIdentifier
+    return String(entry.relayKey || '').trim().toLowerCase()
+  }
+
+  private async reconcilePendingCreatedRelay(input: {
+    name: string
+    knownRelayKeys: Set<string>
+    timeoutMs?: number
+  }): Promise<{ publicIdentifier: string; relayUrl: string | null } | null> {
+    const targetName = String(input.name || '').trim()
+    if (!targetName) return null
+
+    const timeoutMs = Math.max(
+      10_000,
+      Math.min(Math.trunc(input.timeoutMs || CREATE_RELAY_RECONCILE_TIMEOUT_MS), 300_000)
+    )
+    const startedAt = Date.now()
+
+    while (Date.now() - startedAt < timeoutMs) {
+      this.localProfileCache = null
+      await this.refreshRelays().catch(() => {})
+
+      for (const relay of this.state.relays) {
+        const identityKey = this.relayIdentityKey(relay)
+        if (!identityKey || input.knownRelayKeys.has(identityKey)) continue
+        const relayName = String(relay.name || '').trim()
+        if (relayName !== targetName) continue
+        const publicIdentifier = String(relay.publicIdentifier || '').trim()
+        if (!publicIdentifier) continue
+        return {
+          publicIdentifier,
+          relayUrl: this.resolveRelayUrl(relay.connectionUrl || undefined)
+            || String(relay.connectionUrl || '').trim()
+            || null
+        }
+      }
+
+      const localProfiles = await this.readLocalRelayProfiles().catch(() => [])
+      for (const profile of localProfiles) {
+        const identityKey = profile.publicIdentifier || profile.relayKey
+        if (!identityKey || input.knownRelayKeys.has(identityKey)) continue
+        const profileName = String(profile.name || '').trim()
+        if (profileName !== targetName) continue
+        return {
+          publicIdentifier: profile.publicIdentifier,
+          relayUrl: this.resolveRelayUrl(profile.relayUrl || undefined)
+            || String(profile.relayUrl || '').trim()
+            || null
+        }
+      }
+
+      await this.pause(CREATE_RELAY_RECONCILE_POLL_MS)
+    }
+
+    return null
   }
 
   async addNsecAccount(nsec: string, label?: string): Promise<void> {
@@ -2070,6 +2280,119 @@ export class TuiController {
     return output
   }
 
+  private parseGatewayPeerRelayMap(status: unknown): Record<string, string[]> {
+    if (!status || typeof status !== 'object') return {}
+    const rawMap = (status as { peerRelayMap?: Record<string, { peers?: unknown[] }> }).peerRelayMap
+    if (!rawMap || typeof rawMap !== 'object') return {}
+
+    const output: Record<string, string[]> = {}
+    for (const [key, value] of Object.entries(rawMap)) {
+      const peers = Array.isArray(value?.peers)
+        ? value.peers
+          .map((entry) => String(entry || '').trim().toLowerCase())
+          .filter(Boolean)
+        : []
+      output[key] = Array.from(new Set(peers))
+    }
+    return output
+  }
+
+  private resolveGatewayHostPeers(args: {
+    publicIdentifier?: string | null
+    relayKey?: string | null
+    relayUrl?: string | null
+  }): string[] {
+    const candidates = new Set<string>()
+    const identifier = String(args.publicIdentifier || '').trim()
+    for (const variant of this.relayIdentifierVariants(identifier)) {
+      candidates.add(variant)
+      candidates.add(variant.replace(':', '/'))
+      candidates.add(variant.replace('/', ':'))
+    }
+
+    const relayKey = String(args.relayKey || '').trim().toLowerCase()
+    if (relayKey) {
+      candidates.add(relayKey)
+    }
+
+    const relayUrl = this.resolveRelayUrl(args.relayUrl || undefined)
+    if (relayUrl) {
+      const normalized = this.normalizeRelayForCompare(relayUrl)
+      if (normalized) candidates.add(normalized)
+      try {
+        const parsed = new URL(relayUrl)
+        const relayPath = parsed.pathname.replace(/^\/+/, '')
+        if (relayPath) {
+          candidates.add(relayPath)
+          candidates.add(relayPath.replace('/', ':'))
+          candidates.add(relayPath.replace(':', '/'))
+        }
+      } catch {
+        // ignore invalid relay URL parsing
+      }
+    }
+
+    const peers = new Set<string>()
+    for (const [key, entries] of Object.entries(this.gatewayPeerRelayMap)) {
+      if (!Array.isArray(entries) || entries.length === 0) continue
+      const normalizedKey = String(key || '').trim()
+      if (!normalizedKey) continue
+      const matches = Array.from(candidates).some((candidate) => {
+        if (!candidate) return false
+        if (normalizedKey === candidate) return true
+        if (normalizedKey.includes(candidate)) return true
+        if (candidate.includes(normalizedKey)) return true
+        return false
+      })
+      if (!matches) continue
+      for (const peer of entries) {
+        const normalizedPeer = String(peer || '').trim().toLowerCase()
+        if (normalizedPeer) peers.add(normalizedPeer)
+      }
+    }
+    return Array.from(peers)
+  }
+
+  private async refreshGatewayStatusSnapshot(timeoutMs = 3_500): Promise<{ running: boolean }> {
+    await this.workerHost.send({ type: 'get-gateway-status' }).catch(() => {})
+    try {
+      const event = await waitForWorkerEvent(
+        this.workerHost,
+        (msg) => msg.type === 'gateway-status',
+        timeoutMs
+      )
+      const status = (event as { status?: unknown }).status
+      const gatewayPeerCounts = this.parseGatewayPeerCounts(status)
+      const gatewayPeerRelayMap = this.parseGatewayPeerRelayMap(status)
+      this.gatewayPeerRelayMap = gatewayPeerRelayMap
+      this.patchState({ gatewayPeerCounts })
+      const running = Boolean((status as { running?: boolean } | null | undefined)?.running)
+      return { running }
+    } catch {
+      return { running: false }
+    }
+  }
+
+  private async ensureGatewayParityReady(args?: {
+    reason?: string
+    refreshPublicGateway?: boolean
+  }): Promise<void> {
+    if (!this.workerHost.isRunning()) return
+
+    const reason = String(args?.reason || 'relay-op').trim() || 'relay-op'
+    const initial = await this.refreshGatewayStatusSnapshot(3_500)
+    if (!initial.running) {
+      this.log('debug', `Gateway not running before ${reason}; starting gateway`)
+      await this.workerHost.send({ type: 'start-gateway', options: {} }).catch(() => {})
+      await this.refreshGatewayStatusSnapshot(8_000)
+    }
+
+    await this.workerHost.send({ type: 'get-public-gateway-status' }).catch(() => {})
+    if (args?.refreshPublicGateway) {
+      await this.workerHost.send({ type: 'refresh-public-gateway-all' }).catch(() => {})
+    }
+  }
+
   private isNonFatalWorkerError(message: string): boolean {
     const normalized = String(message || '').toLowerCase()
     return normalized.includes('relay profile not found')
@@ -2130,6 +2453,142 @@ export class TuiController {
     }
 
     return best
+  }
+
+  private inferGatewayBaseUrl(): string {
+    const sample = this.state.relays.find((entry) => entry.connectionUrl)?.connectionUrl || null
+    if (sample) {
+      try {
+        const parsed = new URL(sample)
+        return `${parsed.protocol}//${parsed.host}`
+      } catch {
+        // fall through
+      }
+    }
+    return 'ws://127.0.0.1:8443'
+  }
+
+  private async readLocalRelayProfiles(): Promise<LocalRelayProfileSnapshot[]> {
+    const now = Date.now()
+    if (this.localProfileCache && now - this.localProfileCache.loadedAt <= LOCAL_PROFILE_CACHE_TTL_MS) {
+      return this.localProfileCache.entries
+    }
+
+    const usersDir = path.join(this.options.storageDir, 'users')
+    let userDirs: Array<{ name: string }> = []
+    try {
+      const entries = await fs.readdir(usersDir, { withFileTypes: true })
+      userDirs = entries.filter((entry) => entry.isDirectory()).map((entry) => ({ name: entry.name }))
+    } catch {
+      this.localProfileCache = { loadedAt: now, entries: [] }
+      return []
+    }
+
+    const gatewayBase = this.inferGatewayBaseUrl()
+    const byPublicIdentifier = new Map<string, LocalRelayProfileSnapshot>()
+
+    for (const dir of userDirs) {
+      const profilePath = path.join(usersDir, dir.name, 'relay-profiles.json')
+      let parsed: unknown = null
+      try {
+        const raw = await fs.readFile(profilePath, 'utf8')
+        parsed = JSON.parse(raw)
+      } catch {
+        continue
+      }
+
+      const relays = Array.isArray((parsed as { relays?: unknown[] })?.relays)
+        ? (parsed as { relays: unknown[] }).relays
+        : []
+
+      for (const relay of relays) {
+        if (!relay || typeof relay !== 'object') continue
+        const row = relay as Record<string, unknown>
+        const relayKey = String(row.relay_key || '').trim().toLowerCase()
+        const publicIdentifier = String(row.public_identifier || '').trim()
+        if (!relayKey || !publicIdentifier) continue
+
+        const createdAtRaw = String(row.created_at || row.joined_at || '').trim()
+        const createdAtMs = createdAtRaw ? Date.parse(createdAtRaw) : NaN
+        const createdAt = Number.isFinite(createdAtMs) ? Math.floor(createdAtMs / 1000) : null
+        const members = Array.isArray(row.members)
+          ? row.members.map((member) => String(member || '').trim()).filter(Boolean)
+          : []
+        const relayUrl = `${gatewayBase}/${publicIdentifier.replace(':', '/')}`
+        const next: LocalRelayProfileSnapshot = {
+          relayKey,
+          publicIdentifier,
+          relayUrl,
+          name: String(row.name || publicIdentifier).trim() || publicIdentifier,
+          about: String(row.description || '').trim(),
+          picture: typeof row.picture === 'string' ? row.picture.trim() : undefined,
+          isPublic: row.isPublic === true,
+          isOpen: row.isOpen === true,
+          adminPubkey: typeof row.admin_pubkey === 'string' ? row.admin_pubkey.trim() : null,
+          members,
+          membersCount: members.length,
+          createdAt
+        }
+
+        const existing = byPublicIdentifier.get(publicIdentifier)
+        if (!existing) {
+          byPublicIdentifier.set(publicIdentifier, next)
+          continue
+        }
+
+        const existingCreatedAt = Number(existing.createdAt || 0)
+        const nextCreatedAt = Number(next.createdAt || 0)
+        if (nextCreatedAt >= existingCreatedAt) {
+          byPublicIdentifier.set(publicIdentifier, {
+            ...existing,
+            ...next,
+            members: next.members.length ? next.members : existing.members,
+            membersCount: next.membersCount || existing.membersCount
+          })
+        }
+      }
+    }
+
+    const entries = Array.from(byPublicIdentifier.values())
+    this.localProfileCache = { loadedAt: now, entries }
+    return entries
+  }
+
+  private async resolveRelayKeyForIdentifier(identifier?: string | null): Promise<string | null> {
+    const normalized = String(identifier || '').trim()
+    if (!normalized) return null
+
+    const connected = this.findConnectedRelayByIdentifier(normalized)
+    if (connected?.relayKey) return connected.relayKey
+
+    const variants = new Set(this.relayIdentifierVariants(normalized))
+    const localProfiles = await this.readLocalRelayProfiles()
+    for (const profile of localProfiles) {
+      if (variants.has(profile.publicIdentifier) || variants.has(profile.relayKey)) {
+        return profile.relayKey
+      }
+    }
+    return null
+  }
+
+  private async loadLocalDiscoveryGroups(): Promise<GroupSummary[]> {
+    const localProfiles = await this.readLocalRelayProfiles()
+    return localProfiles
+      .filter((profile) => profile.isPublic)
+      .map((profile) => ({
+        id: profile.publicIdentifier,
+        relay: profile.relayUrl,
+        name: profile.name,
+        about: profile.about,
+        picture: profile.picture,
+        isPublic: profile.isPublic,
+        isOpen: profile.isOpen,
+        adminPubkey: profile.adminPubkey || null,
+        members: [...profile.members],
+        membersCount: profile.membersCount,
+        peersOnline: this.resolveGroupPeerCount(profile.publicIdentifier, profile.relayUrl),
+        createdAt: profile.createdAt
+      }))
   }
 
   private getWorkerReadableRelayUrls(): string[] {
@@ -2388,6 +2847,12 @@ export class TuiController {
       })
 
       await this.refreshRelays()
+      await this.ensureGatewayParityReady({
+        reason: 'worker-start',
+        refreshPublicGateway: true
+      }).catch((error) => {
+        this.log('warn', `Gateway parity preflight failed during worker start: ${error instanceof Error ? error.message : String(error)}`)
+      })
     }, { dedupeKey: 'worker:start', retries: 0 })
   }
 
@@ -2442,7 +2907,7 @@ export class TuiController {
       }
 
       await this.refreshRelayListPreferences()
-      await this.workerHost.send({ type: 'get-gateway-status' }).catch(() => {})
+      await this.refreshGatewayStatusSnapshot(2_500).catch(() => {})
     }, { dedupeKey: 'refresh:relays', retries: 0 })
   }
 
@@ -2455,10 +2920,38 @@ export class TuiController {
     picture?: string
   }): Promise<Record<string, unknown>> {
     return await this.runTask('Create relay', async () => {
+      await this.ensureWorkerReadyForOperation('create relay')
+
+      const knownRelayKeys = new Set(
+        this.state.relays
+          .map((entry) => this.relayIdentityKey(entry))
+          .filter(Boolean)
+      )
+
+      await this.ensureGatewayParityReady({
+        reason: 'create-relay',
+        refreshPublicGateway: true
+      }).catch(() => {})
+
       const result = await this.relayService.createRelay(input)
       const session = this.state.session
-      const publicIdentifier = String(result.publicIdentifier || '').trim()
-      const relayUrl = this.resolveRelayUrl(String(result.relayUrl || '')) || String(result.relayUrl || '').trim() || null
+      let publicIdentifier = String(result.publicIdentifier || '').trim()
+      let relayUrl = this.resolveRelayUrl(String(result.relayUrl || '')) || String(result.relayUrl || '').trim() || null
+      if (!publicIdentifier) {
+        const reconciled = await this.reconcilePendingCreatedRelay({
+          name: input.name,
+          knownRelayKeys
+        })
+        if (reconciled) {
+          publicIdentifier = reconciled.publicIdentifier
+          relayUrl = reconciled.relayUrl || relayUrl
+        }
+      }
+      const normalizedResult = {
+        ...result,
+        ...(publicIdentifier ? { publicIdentifier } : {}),
+        ...(relayUrl ? { relayUrl } : {})
+      }
       if (session && publicIdentifier) {
         const nextEntries = [
           ...this.state.myGroupList.filter((entry) => entry.groupId !== publicIdentifier),
@@ -2500,10 +2993,13 @@ export class TuiController {
         this.syncGroupView()
       }
 
-      await Promise.all([
-        this.refreshRelays(),
-        this.refreshGroups()
-      ])
+      this.localProfileCache = null
+      void this.refreshRelays().catch((error) => {
+        this.log('warn', `Background relay refresh after create failed: ${error instanceof Error ? error.message : String(error)}`)
+      })
+      void this.refreshGroups().catch((error) => {
+        this.log('warn', `Background group refresh after create failed: ${error instanceof Error ? error.message : String(error)}`)
+      })
 
       if (publicIdentifier) {
         const hasMyGroup = this.state.myGroups.some((group) => group.id === publicIdentifier)
@@ -2527,7 +3023,7 @@ export class TuiController {
           })
         }
       }
-      return result
+      return normalizedResult
     })
   }
 
@@ -2539,10 +3035,18 @@ export class TuiController {
     fileSharing?: boolean
   }): Promise<Record<string, unknown>> {
     return await this.runTask('Join relay', async () => {
+      await this.ensureWorkerReadyForOperation('join relay')
+
+      await this.ensureGatewayParityReady({
+        reason: 'join-relay',
+        refreshPublicGateway: true
+      }).catch(() => {})
+
       const normalizedPublicIdentifier = String(input.publicIdentifier || '').trim()
 
       const joinOnce = async (candidate: typeof input): Promise<Record<string, unknown>> => {
         const result = await this.relayService.joinRelay(candidate)
+        this.localProfileCache = null
         await this.refreshRelays()
         return result
       }
@@ -2607,9 +3111,62 @@ export class TuiController {
     relayKey?: string
     relayUrl?: string
     openJoin?: boolean
+    hostPeers?: string[]
+    blindPeer?: {
+      publicKey?: string | null
+      encryptionKey?: string | null
+      replicationTopic?: string | null
+      maxBytes?: number | null
+    } | null
+    cores?: Array<{
+      key: string
+      role?: string | null
+    }>
+    writerCore?: string | null
+    writerCoreHex?: string | null
+    autobaseLocal?: string | null
+    writerSecret?: string | null
+    fastForward?: {
+      key?: string | null
+      length?: number | null
+      signedLength?: number | null
+      timeoutMs?: number | null
+    } | null
   }): Promise<void> {
     await this.runTask('Start join flow', async () => {
-      await this.relayService.startJoinFlow(input)
+      await this.ensureWorkerReadyForOperation('start join flow')
+
+      await this.ensureGatewayParityReady({
+        reason: 'start-join-flow',
+        refreshPublicGateway: true
+      }).catch((error) => {
+        this.log('warn', `Gateway parity preflight failed before join flow: ${error instanceof Error ? error.message : String(error)}`)
+      })
+
+      const normalizedIdentifier = String(input.publicIdentifier || '').trim()
+      const relayKey =
+        (typeof input.relayKey === 'string' && /^[a-f0-9]{64}$/i.test(input.relayKey.trim())
+          ? input.relayKey.trim().toLowerCase()
+          : null)
+        || await this.resolveRelayKeyForIdentifier(normalizedIdentifier)
+        || undefined
+      const relayUrl = String(input.relayUrl || '').trim() || undefined
+      const hostPeers = Array.from(new Set([
+        ...(Array.isArray(input.hostPeers) ? input.hostPeers : []).map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean),
+        ...this.resolveGatewayHostPeers({
+          publicIdentifier: normalizedIdentifier,
+          relayKey: relayKey || null,
+          relayUrl: relayUrl || null
+        })
+      ]))
+
+      await this.relayService.startJoinFlow({
+        ...input,
+        relayKey,
+        relayUrl,
+        hostPeers: hostPeers.length ? hostPeers : undefined
+      })
+      this.localProfileCache = null
     })
   }
 
@@ -2620,11 +3177,32 @@ export class TuiController {
     reason?: string
   }): Promise<void> {
     await this.runTask('Request group invite', async () => {
+      await this.ensureWorkerReadyForOperation('request group invite')
+
+      await this.ensureGatewayParityReady({
+        reason: 'request-group-invite',
+        refreshPublicGateway: true
+      }).catch(() => {})
+
       const groupId = String(input.groupId || '').trim()
       if (!groupId) {
         throw new Error('groupId is required')
       }
       const relay = this.resolveRelayUrl(input.relay || undefined)
+      const relayKey = await this.resolveRelayKeyForIdentifier(groupId)
+      void this.relayService.startJoinFlow({
+        publicIdentifier: groupId,
+        relayKey: relayKey || undefined,
+        relayUrl: relay || undefined,
+        isOpen: false,
+        openJoin: false,
+        fileSharing: true
+      }).then(() => {
+        this.localProfileCache = null
+      }).catch((error) => {
+        this.log('warn', `Join-flow request invite fallback to event publish: ${error instanceof Error ? error.message : String(error)}`)
+      })
+
       const relayTargets = relay
         ? uniqueRelayUrls([relay, ...this.searchableRelayUrls(16)])
         : this.searchableRelayUrls(16)
@@ -2635,7 +3213,7 @@ export class TuiController {
         relayTargets
       })
       await this.refreshJoinRequests(groupId, relay || undefined).catch(() => {})
-    })
+    }, { dedupeKey: 'group:request-invite', retries: 1, retryBaseDelayMs: 1_000 })
   }
 
   async disconnectRelay(relayKey: string, publicIdentifier?: string): Promise<void> {
@@ -2963,13 +3541,37 @@ export class TuiController {
     await this.runTask('Refresh groups', async () => {
       const discoveryRelays = this.searchableRelayUrls(18)
       const myListRelays = this.searchableRelayUrls(14)
-      const [groups, myGroupList] = await Promise.all([
+      const [groups, myGroupList, localGroups] = await Promise.all([
         this.groupService.discoverGroups(discoveryRelays, 220),
         this.state.session
           ? this.groupService.loadMyGroupList(myListRelays, this.state.session.pubkey)
-          : Promise.resolve(this.state.myGroupList)
+          : Promise.resolve(this.state.myGroupList),
+        this.loadLocalDiscoveryGroups().catch(() => [])
       ])
-      const enrichedGroups = await this.enrichGroupMetadata(groups)
+      const groupMap = new Map<string, GroupSummary>()
+      for (const group of localGroups) {
+        if (!group?.id) continue
+        groupMap.set(group.id, { ...group })
+      }
+      for (const group of groups) {
+        if (!group?.id) continue
+        const existing = groupMap.get(group.id)
+        groupMap.set(group.id, {
+          ...(existing || {}),
+          ...group,
+          relay: group.relay || existing?.relay,
+          members: Array.isArray(group.members) && group.members.length
+            ? group.members
+            : (existing?.members || []),
+          membersCount:
+            Number(group.membersCount || 0)
+            || Number(existing?.membersCount || 0)
+            || Number(group.members?.length || 0)
+        })
+      }
+
+      const mergedGroups = Array.from(groupMap.values())
+      const enrichedGroups = await this.enrichGroupMetadata(mergedGroups)
       this.rawGroupDiscover = enrichedGroups.map((group) => ({ ...group }))
       this.patchState({ myGroupList })
       await this.ensureAdminProfiles(
@@ -3033,9 +3635,17 @@ export class TuiController {
       await this.startJoinFlow({
         publicIdentifier: target.groupId,
         token: target.token,
-        relayUrl: target.relay,
+        relayKey: target.relayKey || undefined,
+        relayUrl: target.relayUrl || target.relay,
         fileSharing: target.fileSharing,
-        openJoin: !target.token && target.fileSharing !== false
+        openJoin: !target.token && target.fileSharing !== false,
+        blindPeer: target.blindPeer || undefined,
+        cores: target.cores || undefined,
+        writerCore: target.writerCore || undefined,
+        writerCoreHex: target.writerCoreHex || undefined,
+        autobaseLocal: target.autobaseLocal || undefined,
+        writerSecret: target.writerSecret || undefined,
+        fastForward: target.fastForward || undefined
       })
 
       const accepted = this.groupService.markInviteAccepted(
@@ -3207,9 +3817,158 @@ export class TuiController {
     relayTargets?: string[]
   }): Promise<void> {
     await this.runTask('Send invite', async () => {
+      await this.ensureWorkerReadyForOperation('send invite')
+
       const session = this.requireSession()
+      const normalizedGroupId = String(input.groupId || '').trim()
+      const normalizedInvitee = String(input.inviteePubkey || '').trim().toLowerCase()
+      if (!normalizedGroupId) throw new Error('groupId is required')
+      if (!/^[a-f0-9]{64}$/i.test(normalizedInvitee)) {
+        throw new Error(`Invalid invitee pubkey: ${input.inviteePubkey}`)
+      }
+
+      await this.ensureGatewayParityReady({
+        reason: 'send-invite',
+        refreshPublicGateway: true
+      }).catch((error) => {
+        this.log('warn', `Gateway parity preflight failed before send invite: ${error instanceof Error ? error.message : String(error)}`)
+      })
+
+      const resolvedRelayKey =
+        await this.resolveRelayKeyForIdentifier(normalizedGroupId)
+        || this.findConnectedRelayByIdentifier(normalizedGroupId)?.relayKey
+        || null
+      const resolvedRelayUrl =
+        String(input.relayUrl || '').trim()
+        || this.resolveGroupRelayUrl(normalizedGroupId, input.relayUrl || null)
+        || ''
+      if (!resolvedRelayUrl) {
+        throw new Error('Unable to resolve relay URL for invite')
+      }
+
+      const payloadInput = input.payload as Record<string, unknown>
+      const isOpenGroup = input.token
+        ? false
+        : (typeof payloadInput.fileSharing === 'boolean' ? payloadInput.fileSharing : true)
+      const inviteTokenCandidate = String(
+        input.token
+        || (typeof payloadInput.token === 'string' ? payloadInput.token : '')
+      ).trim()
+      const inviteToken = inviteTokenCandidate || (!isOpenGroup
+        ? Buffer.from(generateSecretKey()).toString('hex').slice(0, 24)
+        : '')
+
+      if (!isOpenGroup && inviteToken) {
+        try {
+          await this.groupService.updateAuthData({
+            relayKey: resolvedRelayKey || undefined,
+            publicIdentifier: normalizedGroupId,
+            pubkey: normalizedInvitee,
+            token: inviteToken
+          })
+        } catch (error) {
+          this.log('warn', `Failed to update auth data while sending invite: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        try {
+          await this.groupService.updateMembers({
+            relayKey: resolvedRelayKey || undefined,
+            publicIdentifier: normalizedGroupId,
+            memberAdds: [{ pubkey: normalizedInvitee, ts: Date.now() }]
+          })
+        } catch (error) {
+          this.log('warn', `Failed to update members while sending invite: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+
+      let writerProvision: Record<string, unknown> | null = null
+      if (!isOpenGroup && resolvedRelayKey) {
+        try {
+          writerProvision = await this.workerHost.request<Record<string, unknown>>(
+            {
+              type: 'provision-writer-for-invitee',
+              data: {
+                relayKey: resolvedRelayKey,
+                publicIdentifier: normalizedGroupId,
+                inviteePubkey: normalizedInvitee,
+                useWriterPool: true
+              }
+            },
+            90_000
+          )
+        } catch (error) {
+          const inviteePreview = normalizedInvitee ? `${normalizedInvitee.slice(0, 12)}…` : 'unknown'
+          this.log('warn', `Failed to provision writer for invitee ${inviteePreview}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+
+      const writerCore = typeof writerProvision?.writerCore === 'string' ? writerProvision.writerCore : null
+      let writerCoreHex = typeof writerProvision?.writerCoreHex === 'string' ? writerProvision.writerCoreHex : null
+      let autobaseLocal = typeof writerProvision?.autobaseLocal === 'string' ? writerProvision.autobaseLocal : null
+      if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
+      if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
+      const writerSecret = typeof writerProvision?.writerSecret === 'string' ? writerProvision.writerSecret : null
+      const fastForward = writerProvision?.fastForward && typeof writerProvision.fastForward === 'object'
+        ? writerProvision.fastForward
+        : null
+
+      const mergedCores = new Map<string, { key: string; role?: string | null }>()
+      const upsertCore = (key: string, role?: string | null): void => {
+        const normalized = String(key || '').trim()
+        if (!normalized) return
+        const existing = mergedCores.get(normalized)
+        if (!existing) {
+          mergedCores.set(normalized, { key: normalized, role: role || null })
+          return
+        }
+        if (!existing.role && role) {
+          mergedCores.set(normalized, { ...existing, role })
+        }
+      }
+
+      const payloadCores = Array.isArray(payloadInput.cores)
+        ? payloadInput.cores
+        : []
+      for (const entry of payloadCores) {
+        if (!entry || typeof entry !== 'object') continue
+        const row = entry as Record<string, unknown>
+        upsertCore(String(row.key || '').trim(), typeof row.role === 'string' ? row.role : null)
+      }
+      const poolCoreRefs = Array.isArray(writerProvision?.poolCoreRefs)
+        ? writerProvision.poolCoreRefs
+        : []
+      for (const coreRef of poolCoreRefs) {
+        upsertCore(String(coreRef || '').trim(), 'autobase-writer')
+      }
+      upsertCore(writerCoreHex || autobaseLocal || writerCore || '', 'autobase-writer')
+
+      const payload = {
+        ...payloadInput,
+        relayUrl: resolvedRelayUrl,
+        relayKey: resolvedRelayKey || payloadInput.relayKey || null,
+        token: inviteToken || null,
+        writerCore: writerCore || payloadInput.writerCore || null,
+        writerCoreHex: writerCoreHex || payloadInput.writerCoreHex || payloadInput.writer_core_hex || null,
+        autobaseLocal: autobaseLocal || payloadInput.autobaseLocal || payloadInput.autobase_local || null,
+        writerSecret: writerSecret || payloadInput.writerSecret || null,
+        fastForward: fastForward || payloadInput.fastForward || payloadInput.fast_forward || null,
+        authorizedMemberPubkeys: Array.from(new Set(
+          [
+            ...(Array.isArray(payloadInput.authorizedMemberPubkeys) ? payloadInput.authorizedMemberPubkeys : []),
+            ...(Array.isArray(payloadInput.authorizedMembers) ? payloadInput.authorizedMembers : []),
+            normalizedInvitee
+          ]
+            .map((entry) => String(entry || '').trim().toLowerCase())
+            .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+        )),
+        cores: mergedCores.size > 0 ? Array.from(mergedCores.values()) : payloadInput.cores || undefined
+      }
+
       await this.groupService.sendInvite({
         ...input,
+        token: inviteToken || undefined,
+        inviteePubkey: normalizedInvitee,
+        relayUrl: resolvedRelayUrl,
+        payload,
         relayTargets: input.relayTargets && input.relayTargets.length
           ? input.relayTargets
           : this.searchableRelayUrls(),

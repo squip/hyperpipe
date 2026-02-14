@@ -126,6 +126,27 @@ export interface CommandController {
     relayKey?: string
     relayUrl?: string
     openJoin?: boolean
+    hostPeers?: string[]
+    blindPeer?: {
+      publicKey?: string | null
+      encryptionKey?: string | null
+      replicationTopic?: string | null
+      maxBytes?: number | null
+    } | null
+    cores?: Array<{
+      key: string
+      role?: string | null
+    }>
+    writerCore?: string | null
+    writerCoreHex?: string | null
+    autobaseLocal?: string | null
+    writerSecret?: string | null
+    fastForward?: {
+      key?: string | null
+      length?: number | null
+      signedLength?: number | null
+      timeoutMs?: number | null
+    } | null
   }): Promise<void>
   requestGroupInvite(input: {
     groupId: string

@@ -134,23 +134,137 @@ export function parseGroupInviteWithPayload(args: {
       : typeof payload.picture === 'string'
         ? payload.picture
         : parsed.groupPicture
-  const relay =
+  const relayUrl =
     typeof payload.relayUrl === 'string'
       ? payload.relayUrl
-      : typeof payload.relay === 'string'
-        ? payload.relay
-        : parsed.relay
+      : typeof payload.relay_url === 'string'
+        ? payload.relay_url
+        : typeof payload.relay === 'string'
+          ? payload.relay
+          : null
+  const relay = relayUrl || parsed.relay
+  const relayKey =
+    typeof payload.relayKey === 'string'
+      ? payload.relayKey
+      : typeof payload.relay_key === 'string'
+        ? payload.relay_key
+        : null
   const token = typeof payload.token === 'string' ? payload.token : undefined
   const fileSharing = typeof payload.fileSharing === 'boolean' ? payload.fileSharing : parsed.fileSharing
   const isPublic = typeof payload.isPublic === 'boolean' ? payload.isPublic : parsed.isPublic
+  const about =
+    typeof payload.about === 'string'
+      ? payload.about
+      : parsed.about
+
+  const authorizedMemberPubkeysRaw = Array.isArray(payload.authorizedMemberPubkeys)
+    ? payload.authorizedMemberPubkeys
+    : Array.isArray(payload.authorizedMembers)
+      ? payload.authorizedMembers
+      : Array.isArray(payload.memberPubkeys)
+        ? payload.memberPubkeys
+        : []
+  const authorizedMemberPubkeys = authorizedMemberPubkeysRaw
+    .map((entry) => String(entry || '').trim().toLowerCase())
+    .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+
+  const normalizeBlindPeer = (value: unknown): GroupInvite['blindPeer'] => {
+    if (!value || typeof value !== 'object') return null
+    const candidate = value as Record<string, unknown>
+    const maxBytesRaw = Number(candidate.maxBytes)
+    return {
+      publicKey: typeof candidate.publicKey === 'string'
+        ? candidate.publicKey
+        : typeof candidate.public_key === 'string'
+          ? candidate.public_key
+          : null,
+      encryptionKey: typeof candidate.encryptionKey === 'string'
+        ? candidate.encryptionKey
+        : typeof candidate.encryption_key === 'string'
+          ? candidate.encryption_key
+          : null,
+      replicationTopic: typeof candidate.replicationTopic === 'string'
+        ? candidate.replicationTopic
+        : typeof candidate.replication_topic === 'string'
+          ? candidate.replication_topic
+          : null,
+      maxBytes: Number.isFinite(maxBytesRaw) ? maxBytesRaw : null
+    }
+  }
+
+  const blindPeer = normalizeBlindPeer(payload.blindPeer)
+  const cores = Array.isArray(payload.cores)
+    ? payload.cores
+      .map((entry) => {
+        if (!entry || typeof entry !== 'object') return null
+        const row = entry as Record<string, unknown>
+        const key = String(row.key || '').trim()
+        if (!key) return null
+        return {
+          key,
+          role: typeof row.role === 'string' ? row.role : null
+        }
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => !!entry)
+    : undefined
+
+  const writerCore = typeof payload.writerCore === 'string' ? payload.writerCore : null
+  let writerCoreHex =
+    typeof payload.writerCoreHex === 'string'
+      ? payload.writerCoreHex
+      : typeof payload.writer_core_hex === 'string'
+        ? payload.writer_core_hex
+        : null
+  let autobaseLocal =
+    typeof payload.autobaseLocal === 'string'
+      ? payload.autobaseLocal
+      : typeof payload.autobase_local === 'string'
+        ? payload.autobase_local
+        : null
+  if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
+  if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
+  const writerSecret = typeof payload.writerSecret === 'string' ? payload.writerSecret : null
+
+  const fastForwardPayload =
+    payload.fastForward && typeof payload.fastForward === 'object'
+      ? payload.fastForward as Record<string, unknown>
+      : payload.fast_forward && typeof payload.fast_forward === 'object'
+        ? payload.fast_forward as Record<string, unknown>
+        : null
+  const fastForward = fastForwardPayload
+    ? {
+        key: typeof fastForwardPayload.key === 'string' ? fastForwardPayload.key : null,
+        length: Number.isFinite(Number(fastForwardPayload.length)) ? Number(fastForwardPayload.length) : null,
+        signedLength: Number.isFinite(Number(fastForwardPayload.signedLength))
+          ? Number(fastForwardPayload.signedLength)
+          : null,
+        timeoutMs: Number.isFinite(Number(fastForwardPayload.timeoutMs))
+          ? Number(fastForwardPayload.timeoutMs)
+          : Number.isFinite(Number(fastForwardPayload.timeout))
+            ? Number(fastForwardPayload.timeout)
+            : null
+      }
+    : null
 
   return {
     ...parsed,
     relay,
+    relayUrl: relayUrl || null,
+    relayKey,
     groupName,
     groupPicture,
+    name: groupName,
+    about,
     fileSharing,
     isPublic,
+    authorizedMemberPubkeys: authorizedMemberPubkeys.length ? authorizedMemberPubkeys : undefined,
+    blindPeer,
+    cores,
+    writerCore,
+    writerCoreHex,
+    autobaseLocal,
+    writerSecret,
+    fastForward,
     token
   }
 }

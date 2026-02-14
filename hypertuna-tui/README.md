@@ -145,6 +145,7 @@ Real worker/backend walkthrough:
 npm run demo:e2e:real
 npm run demo:e2e:real -- --stay-open
 npm run demo:e2e:real:matrix
+npm run demo:e2e:real:two-user
 ```
 
 The real walkthrough can:
@@ -172,3 +173,4 @@ Environment variable fallbacks:
 Matrix runner output options:
 
 - `npm run demo:e2e:real:matrix -- --json-out ./artifacts/live-matrix.json`
+- `npm run demo:e2e:real:two-user -- --json-out ./artifacts/live-two-user.json`

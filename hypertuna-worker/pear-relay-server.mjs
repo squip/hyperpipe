@@ -14,6 +14,7 @@ import { initializeChallengeManager, getChallengeManager } from './challenge-man
 import { getRelayAuthStore } from './relay-auth-store.mjs';
 import { nobleSecp256k1 } from './pure-secp256k1-bare.js';
 import { NostrUtils } from './nostr-utils.js';
+import { SimplePool } from 'nostr-tools/pool';
 import { updateRelayAuthToken } from './hypertuna-relay-profile-manager-bare.mjs';
 import { applyPendingAuthUpdates } from './pending-auth.mjs';
 import HypercoreId from 'hypercore-id-encoding';
@@ -73,6 +74,7 @@ const KIND_GROUP_ADMIN_LIST = 39001;
 const KIND_GROUP_MEMBER_LIST = 39002;
 const KIND_HYPERTUNA_RELAY = 30166;
 const CREATE_RELAY_BOOTSTRAP_MAX_ATTEMPTS = 3;
+const CREATE_RELAY_DISCOVERY_RELAYS = ['wss://hypertuna.com/relay'];
 
 function isHex64(value) {
   return typeof value === 'string' && /^[0-9a-fA-F]{64}$/.test(value.trim());
@@ -2917,6 +2919,79 @@ function buildCreateRelayBootstrapDraftEvents({
   ];
 }
 
+function isPublishAckSuccessful(message) {
+  if (typeof message !== 'string') return true;
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return true;
+  if (normalized.startsWith('ok')) return true;
+
+  const failureIndicators = [
+    'connection failure',
+    'failed',
+    'error',
+    'timeout',
+    'closed',
+    'rejected',
+    'not defined'
+  ];
+  return !failureIndicators.some((indicator) => normalized.includes(indicator));
+}
+
+async function publishEventToDiscoveryRelays(event, relayUrls = CREATE_RELAY_DISCOVERY_RELAYS) {
+  const targets = Array.from(new Set(
+    (Array.isArray(relayUrls) ? relayUrls : [])
+      .map((relayUrl) => String(relayUrl || '').trim())
+      .filter(Boolean)
+  ));
+  if (!targets.length) {
+    return {
+      ok: false,
+      published: [],
+      failed: []
+    };
+  }
+
+  const pool = new SimplePool({
+    enablePing: true,
+    enableReconnect: true
+  });
+
+  try {
+    const writes = pool.publish(targets, event, { maxWait: 12_000 });
+    const settled = await Promise.allSettled(writes);
+    const published = [];
+    const failed = [];
+
+    for (let index = 0; index < settled.length; index += 1) {
+      const result = settled[index];
+      const relayUrl = targets[index] || null;
+      if (result?.status === 'fulfilled' && isPublishAckSuccessful(result?.value)) {
+        published.push(relayUrl);
+      } else {
+        failed.push({
+          relay: relayUrl,
+          error:
+            result?.status === 'fulfilled'
+              ? String(result?.value || 'publish failed')
+              : (result?.reason?.message || String(result?.reason || 'publish failed'))
+        });
+      }
+    }
+
+    return {
+      ok: published.length > 0,
+      published,
+      failed
+    };
+  } finally {
+    try {
+      pool.destroy();
+    } catch (_) {
+      // noop
+    }
+  }
+}
+
 async function publishCreateRelayBootstrapEvents({
   relayKey,
   publicIdentifier,
@@ -2969,6 +3044,17 @@ async function publishCreateRelayBootstrapEvents({
           config.nostr_nsec_hex
         );
         await publishEventToRelay(canonicalIdentifier, signed);
+        const discoveryPublish = await publishEventToDiscoveryRelays(signed);
+        if (!discoveryPublish.ok) {
+          const failureReason = discoveryPublish.failed
+            .map((entry) => `${entry.relay || 'unknown'}:${entry.error}`)
+            .join(', ') || 'no discovery relay accepted event';
+          console.warn('[RelayServer] Discovery relay publish failed (continuing with local bootstrap)', {
+            relayIdentifier: canonicalIdentifier,
+            kind: signed.kind,
+            error: failureReason
+          });
+        }
         published.push({ kind: signed.kind, id: signed.id });
       }
       return {
