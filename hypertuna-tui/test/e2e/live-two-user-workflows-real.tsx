@@ -367,6 +367,23 @@ try {
           status: hasTokenizedRelayUrl(joinedRelay.connectionUrl) ? 'PASS' : 'FAIL',
           evidence: joinedRelay.connectionUrl || 'missing connectionUrl'
         })
+        try {
+          const joinedGroup = await waitFor('user2 My Groups includes joined public/open group', async () => {
+            await controller.refreshGroups()
+            return controller.getState().myGroups.find((entry) => entry.id === groupId) || null
+          }, { timeoutMs: 60_000, intervalMs: 1_500 })
+          checks.push({
+            name: 'user2 My Groups hydrated after public/open join',
+            status: 'PASS',
+            evidence: joinedGroup.id
+          })
+        } catch (error) {
+          checks.push({
+            name: 'user2 My Groups hydrated after public/open join',
+            status: 'FAIL',
+            evidence: error instanceof Error ? error.message : String(error)
+          })
+        }
       } catch (error) {
         checks.push({
           name: 'user2 joined public/open group relay',
@@ -495,6 +512,23 @@ try {
           status: hasTokenizedRelayUrl(joinedRelay.connectionUrl) ? 'PASS' : 'FAIL',
           evidence: joinedRelay.connectionUrl || 'missing connectionUrl'
         })
+        try {
+          const joinedGroup = await waitFor('requesting user My Groups includes accepted invite group', async () => {
+            await controller.refreshGroups()
+            return controller.getState().myGroups.find((entry) => entry.id === groupId) || null
+          }, { timeoutMs: 60_000, intervalMs: 1_500 })
+          checks.push({
+            name: 'request-invite user My Groups hydrated after accept',
+            status: 'PASS',
+            evidence: joinedGroup.id
+          })
+        } catch (error) {
+          checks.push({
+            name: 'request-invite user My Groups hydrated after accept',
+            status: 'FAIL',
+            evidence: error instanceof Error ? error.message : String(error)
+          })
+        }
       } catch (error) {
         checks.push({
           name: 'request-invite accept joins relay with tokenized URL',
@@ -573,6 +607,23 @@ try {
           status: hasTokenizedRelayUrl(joinedRelay.connectionUrl) ? 'PASS' : 'FAIL',
           evidence: joinedRelay.connectionUrl || 'missing connectionUrl'
         })
+        try {
+          const joinedGroup = await waitFor('user2 My Groups includes direct-invite group', async () => {
+            await controller.refreshGroups()
+            return controller.getState().myGroups.find((entry) => entry.id === groupId) || null
+          }, { timeoutMs: 60_000, intervalMs: 1_500 })
+          checks.push({
+            name: 'direct-invite user My Groups hydrated after accept',
+            status: 'PASS',
+            evidence: joinedGroup.id
+          })
+        } catch (error) {
+          checks.push({
+            name: 'direct-invite user My Groups hydrated after accept',
+            status: 'FAIL',
+            evidence: error instanceof Error ? error.message : String(error)
+          })
+        }
       } catch (error) {
         checks.push({
           name: 'direct invite accept joins relay with tokenized URL',

@@ -351,6 +351,12 @@ function groupKey(groupId: string, relay?: string | null): string {
   return `${normalizedRelay}|${normalizedGroupId}`
 }
 
+function groupListEntryKey(entry: GroupListEntry): string {
+  const groupId = String(entry.groupId || '').trim()
+  const relay = String(entry.relay || '').trim()
+  return `${groupId}|${relay}`
+}
+
 function maybeNpub(value: string | undefined): string | undefined {
   if (!value) return undefined
   try {
@@ -762,6 +768,60 @@ export class TuiController {
     } catch {
       return candidate.trim() || normalized
     }
+  }
+
+  private looksLikeGroupIdentifier(value?: string | null): boolean {
+    const normalized = String(value || '').trim()
+    if (!normalized) return false
+    if (normalized.includes('://')) return false
+    if (/^[a-f0-9]{64}$/i.test(normalized)) return false
+    return normalized.includes(':') || normalized.includes('/')
+  }
+
+  private deriveMyGroupListFromConnectedRelays(): GroupListEntry[] {
+    const entries: GroupListEntry[] = []
+    const seen = new Set<string>()
+    for (const relay of this.state.relays) {
+      if (relay.writable !== true) continue
+      const groupId = String(relay.publicIdentifier || '').trim()
+      if (!this.looksLikeGroupIdentifier(groupId)) continue
+      const relayUrl = this.resolveRelayUrl(relay.connectionUrl || undefined)
+        || String(relay.connectionUrl || '').trim()
+        || undefined
+      const entry: GroupListEntry = { groupId, relay: relayUrl }
+      const key = groupListEntryKey(entry)
+      if (seen.has(key)) continue
+      seen.add(key)
+      entries.push(entry)
+    }
+    return entries
+  }
+
+  private mergeMyGroupList(primary: GroupListEntry[], secondary: GroupListEntry[]): GroupListEntry[] {
+    const merged: GroupListEntry[] = []
+    const byGroup = new Map<string, GroupListEntry>()
+
+    const ingest = (entry: GroupListEntry): void => {
+      const groupId = String(entry.groupId || '').trim()
+      if (!groupId) return
+      const relay = this.resolveRelayUrl(entry.relay || undefined)
+        || String(entry.relay || '').trim()
+        || undefined
+      const normalized: GroupListEntry = { groupId, relay }
+      const existing = byGroup.get(groupId)
+      if (!existing) {
+        byGroup.set(groupId, normalized)
+        merged.push(normalized)
+        return
+      }
+      if (!existing.relay && normalized.relay) {
+        existing.relay = normalized.relay
+      }
+    }
+
+    for (const entry of primary) ingest(entry)
+    for (const entry of secondary) ingest(entry)
+    return merged
   }
 
   private refreshDerivedCollections(): void {
@@ -3541,13 +3601,16 @@ export class TuiController {
     await this.runTask('Refresh groups', async () => {
       const discoveryRelays = this.searchableRelayUrls(18)
       const myListRelays = this.searchableRelayUrls(14)
-      const [groups, myGroupList, localGroups] = await Promise.all([
+      const [groups, loadedMyGroupList, localGroups] = await Promise.all([
         this.groupService.discoverGroups(discoveryRelays, 220),
         this.state.session
           ? this.groupService.loadMyGroupList(myListRelays, this.state.session.pubkey)
           : Promise.resolve(this.state.myGroupList),
         this.loadLocalDiscoveryGroups().catch(() => [])
       ])
+      const relayBackfillEntries = this.deriveMyGroupListFromConnectedRelays()
+      const myGroupList = this.mergeMyGroupList(loadedMyGroupList, relayBackfillEntries)
+
       const groupMap = new Map<string, GroupSummary>()
       for (const group of localGroups) {
         if (!group?.id) continue
@@ -3574,6 +3637,21 @@ export class TuiController {
       const enrichedGroups = await this.enrichGroupMetadata(mergedGroups)
       this.rawGroupDiscover = enrichedGroups.map((group) => ({ ...group }))
       this.patchState({ myGroupList })
+
+      const loadedKeys = new Set(loadedMyGroupList.map((entry) => groupListEntryKey(entry)))
+      const mergedKeys = new Set(myGroupList.map((entry) => groupListEntryKey(entry)))
+      const addedByBackfill = mergedKeys.size > loadedKeys.size
+      if (addedByBackfill && this.state.session) {
+        await this.groupService.saveMyGroupList(
+          this.searchableRelayUrls(14),
+          this.state.session.pubkey,
+          this.state.session.nsecHex,
+          myGroupList
+        ).catch((error) => {
+          this.log('warn', `Failed to persist backfilled my-group list: ${error instanceof Error ? error.message : String(error)}`)
+        })
+      }
+
       await this.ensureAdminProfiles(
         enrichedGroups
           .map((group) => group.adminPubkey || group.event?.pubkey || '')
