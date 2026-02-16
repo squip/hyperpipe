@@ -602,7 +602,7 @@ async function fetchMirrorMetadataFromGateway(identifier, { reason = 'join-fallb
 
   for (const origin of origins) {
     if (!origin) continue;
-    const url = `${origin.replace(/\/$/, '')}/api/relays/${encodeURIComponent(identifier)}/mirror`;
+    const url = `${origin.replace(/\/$/, '')}/api/v2/relays/${encodeURIComponent(identifier)}/mirror`;
     try {
       console.log('[RelayServer] Mirror metadata request', {
         identifier,

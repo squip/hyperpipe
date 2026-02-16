@@ -3,6 +3,7 @@ import * as c from 'compact-encoding';
 import { EventEmitter } from 'node:events';
 
 const REQUEST_TIMEOUT = 30000; // 30 seconds
+const CONTROL_RPC_PREFIX = '/rpc/';
 
 const httpMessageEncoding = {
   preencode(state, m) {
@@ -117,7 +118,7 @@ export class RelayProtocol extends EventEmitter {
     const handshake = {
       version: '2.0',
       isServer: this.isServer,
-      capabilities: ['http', 'websocket', 'health', 'telemetry']
+      capabilities: ['http', 'websocket', 'health', 'telemetry', 'control-rpc']
     };
 
     if (this.handshakeData && typeof this.handshakeData === 'object') {
@@ -374,6 +375,68 @@ export class RelayProtocol extends EventEmitter {
   // Register request handler
   registerHandler(path, handler) {
     this.handle(path, handler);
+  }
+
+  registerControlMethod(methodName, handler) {
+    if (!methodName || typeof methodName !== 'string') {
+      throw new Error('methodName is required for registerControlMethod');
+    }
+    if (typeof handler !== 'function') {
+      throw new Error('handler must be a function');
+    }
+    const path = `${CONTROL_RPC_PREFIX}${methodName}`;
+    this.handle(path, async (request) => {
+      let body = null;
+      if (request?.body && request.body.length) {
+        try {
+          body = JSON.parse(Buffer.from(request.body).toString('utf8'));
+        } catch (error) {
+          return {
+            statusCode: 400,
+            headers: { 'content-type': 'application/json' },
+            body: Buffer.from(JSON.stringify({ error: 'invalid-json-body' }))
+          };
+        }
+      }
+
+      const result = await handler(body || {}, request);
+      if (result && typeof result === 'object' && Object.prototype.hasOwnProperty.call(result, 'statusCode')) {
+        return {
+          statusCode: result.statusCode,
+          headers: result.headers || { 'content-type': 'application/json' },
+          body: Buffer.isBuffer(result.body)
+            ? result.body
+            : Buffer.from(JSON.stringify(result.body || {}))
+        };
+      }
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify(result ?? null))
+      };
+    });
+  }
+
+  async callControlMethod(methodName, payload = {}) {
+    if (!methodName || typeof methodName !== 'string') {
+      throw new Error('methodName is required for callControlMethod');
+    }
+    const response = await this.sendRequest({
+      method: 'POST',
+      path: `${CONTROL_RPC_PREFIX}${methodName}`,
+      headers: { 'content-type': 'application/json' },
+      body: Buffer.from(JSON.stringify(payload || {}))
+    });
+    const text = Buffer.from(response.body || Buffer.alloc(0)).toString('utf8');
+    const parsed = text.length ? JSON.parse(text) : null;
+    if (response.statusCode >= 400) {
+      const errorMessage = parsed?.error || `Control method failed with status ${response.statusCode}`;
+      const error = new Error(errorMessage);
+      error.statusCode = response.statusCode;
+      error.payload = parsed;
+      throw error;
+    }
+    return parsed;
   }
   
   // Destroy protocol

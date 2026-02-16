@@ -6,9 +6,17 @@
   "main": "src/index.mjs",
   "scripts": {
     "dev": "node --env-file=.env.local src/index.mjs",
+    "start:http-local": "node ./bin/start-http-local.mjs",
     "start": "node src/index.mjs",
     "lint": "eslint src --ext .js,.mjs",
     "test": "node --test",
+    "test:live:control": "node ./bin/live-control-plane-e2e.mjs",
+    "test:live:federation": "node ./bin/live-federation-e2e.mjs",
+    "test:live:worker": "node ./bin/live-worker-gateway-e2e.mjs",
+    "test:live:matrix": "node ./bin/live-matrix-e2e.mjs",
+    "test:live:matrix:smoke": "node ./bin/live-matrix-e2e.mjs --profile smoke",
+    "test:live:matrix:full": "node ./bin/live-matrix-e2e.mjs --profile full",
+    "test:live:matrix:soak": "node ./bin/live-matrix-e2e.mjs --profile soak",
     "blind-peer:status": "node ./bin/blind-peer-status.mjs"
   },
   "dependencies": {

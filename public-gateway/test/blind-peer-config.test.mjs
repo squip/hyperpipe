@@ -13,6 +13,9 @@ test('blind peer defaults disabled with sane limits', () => {
 
 test('blind peer overrides are normalised', () => {
   const config = loadConfig({
+    registration: {
+      relayGcAfterMs: 90 * 24 * 60 * 60 * 1000
+    },
     blindPeer: {
       enabled: true,
       storageDir: '/tmp/blind-peer',
@@ -29,12 +32,15 @@ test('blind peer overrides are normalised', () => {
   assert.equal(config.blindPeer.maxBytes, 1024);
   assert.equal(config.blindPeer.gcIntervalMs, 10_000);
   assert.equal(config.blindPeer.dedupeBatchSize, 50);
-  assert.equal(config.blindPeer.staleCoreTtlMs, 5_000);
+  assert.equal(config.blindPeer.staleCoreTtlMs, 90 * 24 * 60 * 60 * 1000);
   assert.equal(config.blindPeer.trustedPeersPersistPath, '/tmp/trusted.json');
 });
 
 test('blind peer negative values fall back to defaults', () => {
   const config = loadConfig({
+    registration: {
+      relayGcAfterMs: 90 * 24 * 60 * 60 * 1000
+    },
     blindPeer: {
       enabled: true,
       maxBytes: -5,
@@ -48,5 +54,5 @@ test('blind peer negative values fall back to defaults', () => {
   assert.equal(config.blindPeer.maxBytes, 25 * 1024 ** 3);
   assert.equal(config.blindPeer.gcIntervalMs, 300000);
   assert.equal(config.blindPeer.dedupeBatchSize, 100);
-  assert.equal(config.blindPeer.staleCoreTtlMs, 7 * 24 * 60 * 60 * 1000);
+  assert.equal(config.blindPeer.staleCoreTtlMs, 90 * 24 * 60 * 60 * 1000);
 });

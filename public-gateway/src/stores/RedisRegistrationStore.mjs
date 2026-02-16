@@ -23,8 +23,11 @@ class RedisRegistrationStore {
     this.prefix = prefix.endsWith(':') ? prefix : `${prefix}:`;
     this.tokenPrefix = `${this.prefix}tokens:`;
     this.openJoinPrefix = `${this.prefix}open-join:`;
+    this.closedJoinPrefix = `${this.prefix}closed-join:`;
     this.openJoinAliasPrefix = `${this.prefix}open-join-aliases:`;
     this.mirrorPrefix = `${this.prefix}mirrors:`;
+    this.writerEnvelopePrefix = `${this.prefix}writer-envelope:`;
+    this.leaseCertificatePrefix = `${this.prefix}lease-cert:`;
     this.aliasPrefix = `${this.prefix}aliases:`;
     this.logger = logger || console;
     this.client = createClient({ url: this.url });
@@ -65,12 +68,38 @@ class RedisRegistrationStore {
     return `${this.openJoinAliasPrefix}${identifier}`;
   }
 
+  #closedJoinKey(relayKey) {
+    return `${this.closedJoinPrefix}${relayKey}`;
+  }
+
   #mirrorKey(relayKey) {
     return `${this.mirrorPrefix}${relayKey}`;
   }
 
+  #writerEnvelopeKey(relayKey, leaseId) {
+    return `${this.writerEnvelopePrefix}${relayKey}:${leaseId}`;
+  }
+
+  #leaseCertificateKey(relayKey, slotKey) {
+    return `${this.leaseCertificatePrefix}${relayKey}:${slotKey}`;
+  }
+
   #aliasKey(identifier) {
     return `${this.aliasPrefix}${identifier}`;
+  }
+
+  async #deleteByPrefix(prefix) {
+    await this.#ensureConnected();
+    let cursor = '0';
+    do {
+      const result = await this.client.scan(cursor, { MATCH: `${prefix}*`, COUNT: 200 });
+      cursor = result.cursor;
+      const keys = result.keys || [];
+      if (keys.length) {
+        // eslint-disable-next-line no-await-in-loop
+        await this.client.del(...keys);
+      }
+    } while (cursor !== '0');
   }
 
   async upsertRelay(relayKey, payload) {
@@ -104,6 +133,9 @@ class RedisRegistrationStore {
     await this.client.del(this.#key(relayKey));
     await this.client.del(this.#tokenKey(relayKey));
     await this.clearOpenJoinPool(relayKey);
+    await this.clearClosedJoinPool(relayKey);
+    await this.#deleteByPrefix(this.#writerEnvelopeKey(relayKey, ''));
+    await this.#deleteByPrefix(this.#leaseCertificateKey(relayKey, ''));
   }
 
   pruneExpired() {
@@ -211,6 +243,142 @@ class RedisRegistrationStore {
     const aliases = Array.isArray(pool?.aliases) ? pool.aliases : [];
     if (aliases.length) {
       await this.clearOpenJoinAliases(relayKey, aliases);
+    }
+  }
+
+  async storeClosedJoinPool(relayKey, pool = {}) {
+    if (!relayKey) return;
+    await this.#ensureConnected();
+    const payload = JSON.stringify({
+      entries: Array.isArray(pool.entries) ? pool.entries : [],
+      updatedAt: pool.updatedAt || Date.now(),
+      publicIdentifier: typeof pool.publicIdentifier === 'string' ? pool.publicIdentifier : null,
+      relayUrl: typeof pool.relayUrl === 'string' ? pool.relayUrl : null,
+      relayCores: Array.isArray(pool.relayCores) ? pool.relayCores : [],
+      metadata: pool.metadata && typeof pool.metadata === 'object' ? pool.metadata : null
+    });
+    const ttlSeconds = Number.isFinite(this.openJoinPoolTtlSeconds)
+      ? this.openJoinPoolTtlSeconds
+      : this.ttlSeconds;
+    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+      await this.client.set(this.#closedJoinKey(relayKey), payload, { EX: ttlSeconds });
+    } else {
+      await this.client.set(this.#closedJoinKey(relayKey), payload);
+    }
+  }
+
+  async getClosedJoinPool(relayKey) {
+    await this.#ensureConnected();
+    const value = await this.client.get(this.#closedJoinKey(relayKey));
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse redis closed-join pool payload', { relayKey, error: error.message });
+      return null;
+    }
+  }
+
+  async takeClosedJoinLease(relayKey) {
+    await this.#ensureConnected();
+    const pool = await this.getClosedJoinPool(relayKey);
+    if (!pool) return null;
+    const now = Date.now();
+    const entries = Array.isArray(pool.entries) ? pool.entries : [];
+    const nextEntries = entries.filter((entry) => !entry?.expiresAt || entry.expiresAt > now);
+    const lease = nextEntries.shift() || null;
+    if (nextEntries.length) {
+      await this.storeClosedJoinPool(relayKey, {
+        ...pool,
+        entries: nextEntries,
+        updatedAt: pool.updatedAt || now
+      });
+    } else {
+      await this.clearClosedJoinPool(relayKey);
+    }
+    return lease;
+  }
+
+  async clearClosedJoinPool(relayKey) {
+    await this.#ensureConnected();
+    await this.client.del(this.#closedJoinKey(relayKey));
+  }
+
+  async storeWriterEnvelope(relayKey, envelope = {}) {
+    if (!relayKey || !envelope || typeof envelope !== 'object') return;
+    await this.#ensureConnected();
+    const leaseId = typeof envelope.leaseId === 'string' ? envelope.leaseId : null;
+    if (!leaseId) return;
+    const ttlMs = Number(envelope.expiresAt) - Date.now();
+    const ttlSeconds = Number.isFinite(ttlMs) && ttlMs > 0
+      ? Math.max(1, Math.ceil(ttlMs / 1000))
+      : null;
+    const payload = JSON.stringify({
+      ...envelope,
+      relayKey,
+      storedAt: Date.now()
+    });
+    const key = this.#writerEnvelopeKey(relayKey, leaseId);
+    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+      await this.client.set(key, payload, { EX: ttlSeconds });
+    } else {
+      await this.client.set(key, payload);
+    }
+  }
+
+  async getWriterEnvelope(relayKey, leaseId) {
+    if (!relayKey || !leaseId) return null;
+    await this.#ensureConnected();
+    const value = await this.client.get(this.#writerEnvelopeKey(relayKey, leaseId));
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse writer envelope payload', {
+        relayKey,
+        leaseId,
+        error: error.message
+      });
+      return null;
+    }
+  }
+
+  async storeLeaseCertificate(relayKey, certificate = {}) {
+    if (!relayKey || !certificate || typeof certificate !== 'object') return;
+    await this.#ensureConnected();
+    const slotKey = typeof certificate.slotKey === 'string' ? certificate.slotKey : null;
+    if (!slotKey) return;
+    const ttlMs = Number(certificate.expiresAt) - Date.now();
+    const ttlSeconds = Number.isFinite(ttlMs) && ttlMs > 0
+      ? Math.max(1, Math.ceil(ttlMs / 1000))
+      : null;
+    const payload = JSON.stringify({
+      ...certificate,
+      relayKey,
+      storedAt: Date.now()
+    });
+    const key = this.#leaseCertificateKey(relayKey, slotKey);
+    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+      await this.client.set(key, payload, { EX: ttlSeconds });
+    } else {
+      await this.client.set(key, payload);
+    }
+  }
+
+  async getLeaseCertificate(relayKey, slotKey) {
+    if (!relayKey || !slotKey) return null;
+    await this.#ensureConnected();
+    const value = await this.client.get(this.#leaseCertificateKey(relayKey, slotKey));
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse lease certificate payload', {
+        relayKey,
+        slotKey,
+        error: error.message
+      });
+      return null;
     }
   }
 
@@ -339,8 +507,11 @@ class RedisRegistrationStore {
     const excludePrefixes = [
       this.tokenPrefix,
       this.openJoinPrefix,
+      this.closedJoinPrefix,
       this.openJoinAliasPrefix,
       this.mirrorPrefix,
+      this.writerEnvelopePrefix,
+      this.leaseCertificatePrefix,
       this.aliasPrefix
     ];
     let cursor = '0';

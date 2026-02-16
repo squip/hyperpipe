@@ -3,6 +3,7 @@ import WebSocket from 'ws';
 import url from 'node:url';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import { schnorr } from '@noble/curves/secp256k1';
 
 import LocalGatewayServer from './LocalGatewayServer.mjs';
 import {
@@ -21,6 +22,9 @@ import PublicGatewayDiscoveryClient from './PublicGatewayDiscoveryClient.mjs';
 import PublicGatewayRelayClient from './PublicGatewayRelayClient.mjs';
 import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGatewayHyperbeeAdapter.mjs';
 import PublicGatewayVirtualRelayManager from './PublicGatewayVirtualRelayManager.mjs';
+import GatewayControlClientPool from '../../shared/public-gateway/GatewayControlClientPool.mjs';
+import { CONTROL_METHODS } from '../../shared/public-gateway/ControlPlaneMethods.mjs';
+import { TrustPolicyEngine as GatewayTrustPolicyEngine } from '../../shared/public-gateway/TrustPolicyEngine.mjs';
 import {
   registerVirtualRelay,
   unregisterVirtualRelay
@@ -37,6 +41,14 @@ const DEFAULT_PORT = 8443;
 const PUBLIC_GATEWAY_RELAY_KEY = 'public-gateway:hyperbee';
 const PUBLIC_GATEWAY_RELAY_PATH = 'relay';
 const PUBLIC_GATEWAY_RELAY_PATH_ALIASES = ['public-gateway/hyperbee'];
+const CONTROL_SESSION_REQUIRED_METHODS = new Set([
+  CONTROL_METHODS.RELAY_REGISTER,
+  CONTROL_METHODS.OPEN_JOIN_POOL_SYNC,
+  CONTROL_METHODS.OPEN_JOIN_LEASE_CLAIM,
+  CONTROL_METHODS.OPEN_JOIN_APPEND_CORES,
+  CONTROL_METHODS.CLOSED_JOIN_POOL_SYNC,
+  CONTROL_METHODS.CLOSED_JOIN_LEASE_CLAIM
+]);
 
 function guessContentType(fileName = '') {
   const lower = typeof fileName === 'string' ? fileName.toLowerCase() : '';
@@ -245,6 +257,9 @@ export class GatewayService extends EventEmitter {
     this.openJoinPoolProvider = typeof options.openJoinPoolProvider === 'function'
       ? options.openJoinPoolProvider
       : null;
+    this.closedJoinPoolProvider = typeof options.closedJoinPoolProvider === 'function'
+      ? options.closedJoinPoolProvider
+      : null;
     this.publicGatewayRelayState = new Map();
     this.relayCoreCache = new Map();
     this.blindPeerSummary = null;
@@ -287,6 +302,29 @@ export class GatewayService extends EventEmitter {
     this.getCurrentPubkey = typeof options.getCurrentPubkey === 'function'
       ? options.getCurrentPubkey
       : () => options.currentPubkey || null;
+    this.getCurrentPrivateKey = typeof options.getCurrentPrivateKey === 'function'
+      ? options.getCurrentPrivateKey
+      : () => options.currentPrivateKey || null;
+    this.getGatewayFollowedPubkeys = typeof options.getGatewayFollowedPubkeys === 'function'
+      ? options.getGatewayFollowedPubkeys
+      : null;
+    this.getGatewayFollowerPubkeys = typeof options.getGatewayFollowerPubkeys === 'function'
+      ? options.getGatewayFollowerPubkeys
+      : null;
+    this.getGatewayAttestations = typeof options.getGatewayAttestations === 'function'
+      ? options.getGatewayAttestations
+      : null;
+    this.gatewayControlClientPool = null;
+    this.gatewayControlSessions = new Map();
+    this.gatewayTrustPolicyEngine = new GatewayTrustPolicyEngine({
+      policy: this.publicGatewaySettings?.trustPolicy || {},
+      logger: this.loggerBridge || console
+    });
+    this.gatewayTrustContextSnapshot = {
+      followsByMe: new Set(),
+      followersOfMe: new Set(),
+      attestations: []
+    };
 
     this.#configurePublicGateway();
   }
@@ -316,17 +354,93 @@ export class GatewayService extends EventEmitter {
       ? selectionRaw
       : '';
 
+    const normalizeGatewayMap = (gatewaysInput) => {
+      if (!gatewaysInput || typeof gatewaysInput !== 'object' || Array.isArray(gatewaysInput)) {
+        return {};
+      }
+      const normalized = {};
+      for (const [rawId, candidate] of Object.entries(gatewaysInput)) {
+        if (!candidate || typeof candidate !== 'object') continue;
+        const id = typeof candidate.id === 'string' && candidate.id.trim()
+          ? candidate.id.trim()
+          : (typeof rawId === 'string' && rawId.trim() ? rawId.trim() : null);
+        if (!id) continue;
+        normalized[id] = {
+          id,
+          swarmPublicKey: typeof candidate.swarmPublicKey === 'string' ? candidate.swarmPublicKey.trim() : null,
+          controlTopic: typeof candidate.controlTopic === 'string' ? candidate.controlTopic.trim() : null,
+          baseUrl: typeof candidate.baseUrl === 'string' ? candidate.baseUrl.trim() : null,
+          wsUrl: typeof candidate.wsUrl === 'string' ? candidate.wsUrl.trim() : null,
+          health: candidate.health === 'offline'
+            ? 'offline'
+            : (candidate.health === 'degraded' ? 'degraded' : 'healthy'),
+          trust: candidate.trust === 'blocked'
+            ? 'blocked'
+            : (candidate.trust === 'trusted' ? 'trusted' : 'candidate'),
+          latencyMs: Number.isFinite(Number(candidate.latencyMs)) ? Math.round(Number(candidate.latencyMs)) : null,
+          lastSeenAt: Number.isFinite(Number(candidate.lastSeenAt)) ? Math.round(Number(candidate.lastSeenAt)) : null
+        };
+      }
+      return normalized;
+    };
+
+    const preferredGatewayIds = Array.isArray(rawConfig?.preferredGatewayIds)
+      ? rawConfig.preferredGatewayIds
+          .map((value) => (typeof value === 'string' ? value.trim() : null))
+          .filter(Boolean)
+      : [];
+
     const config = {
       enabled: rawConfig?.enabled ?? envEnabled,
+      networkMode: typeof rawConfig?.networkMode === 'string'
+        ? rawConfig.networkMode.trim().toLowerCase()
+        : 'permissionless-wot',
+      federationId: typeof rawConfig?.federationId === 'string'
+        ? rawConfig.federationId.trim() || null
+        : null,
       selectionMode,
       selectedGatewayId: typeof rawConfig?.selectedGatewayId === 'string'
         ? rawConfig.selectedGatewayId.trim() || null
+        : null,
+      activeGatewayId: typeof rawConfig?.activeGatewayId === 'string'
+        ? rawConfig.activeGatewayId.trim() || null
         : null,
       baseUrl: typeof rawConfig?.baseUrl === 'string' ? rawConfig.baseUrl.trim() : '',
       sharedSecret: typeof rawConfig?.sharedSecret === 'string' ? rawConfig.sharedSecret.trim() : '',
       preferredBaseUrl: typeof rawConfig?.preferredBaseUrl === 'string'
         ? rawConfig.preferredBaseUrl.trim()
         : '',
+      gateways: normalizeGatewayMap(rawConfig?.gateways),
+      preferredGatewayIds,
+      trustPolicy: rawConfig?.trustPolicy && typeof rawConfig.trustPolicy === 'object'
+        ? {
+            explicitAllowlist: Array.isArray(rawConfig.trustPolicy.explicitAllowlist)
+              ? rawConfig.trustPolicy.explicitAllowlist
+                  .map((value) => (typeof value === 'string' ? value.trim() : null))
+                  .filter(Boolean)
+              : [],
+            requireFollowedByMe: rawConfig.trustPolicy.requireFollowedByMe !== false,
+            requireMutualFollow: rawConfig.trustPolicy.requireMutualFollow === true,
+            minTrustedAttestations: Number.isFinite(Number(rawConfig.trustPolicy.minTrustedAttestations))
+              ? Math.max(0, Math.round(Number(rawConfig.trustPolicy.minTrustedAttestations)))
+              : 0,
+            acceptedAttestorPubkeys: Array.isArray(rawConfig.trustPolicy.acceptedAttestorPubkeys)
+              ? rawConfig.trustPolicy.acceptedAttestorPubkeys
+                  .map((value) => (typeof value === 'string' ? value.trim() : null))
+                  .filter(Boolean)
+              : [],
+            maxDescriptorAgeMs: Number.isFinite(Number(rawConfig.trustPolicy.maxDescriptorAgeMs))
+              ? Math.max(60_000, Math.round(Number(rawConfig.trustPolicy.maxDescriptorAgeMs)))
+              : 6 * 60 * 60 * 1000
+          }
+        : {
+            explicitAllowlist: [],
+            requireFollowedByMe: true,
+            requireMutualFollow: false,
+            minTrustedAttestations: 0,
+            acceptedAttestorPubkeys: [],
+            maxDescriptorAgeMs: 6 * 60 * 60 * 1000
+          },
       defaultTokenTtl,
       tokenRefreshWindowSeconds,
       resolvedGatewayId: rawConfig?.resolvedGatewayId || null,
@@ -361,14 +475,14 @@ export class GatewayService extends EventEmitter {
     }
 
     if (!config.preferredBaseUrl) {
-      config.preferredBaseUrl = config.baseUrl || envBaseUrl || 'https://hypertuna.com';
+      config.preferredBaseUrl = config.baseUrl || envBaseUrl || '';
     }
 
     if (config.selectionMode === 'default') {
-      config.baseUrl = config.preferredBaseUrl || envBaseUrl || 'https://hypertuna.com';
+      config.baseUrl = config.preferredBaseUrl || envBaseUrl || '';
       config.selectedGatewayId = null;
     } else if (config.selectionMode === 'manual' && !config.baseUrl) {
-      config.baseUrl = envBaseUrl || config.preferredBaseUrl || 'https://hypertuna.com';
+      config.baseUrl = envBaseUrl || config.preferredBaseUrl || '';
     }
 
     if (envBaseUrl && envSecret) {
@@ -382,7 +496,11 @@ export class GatewayService extends EventEmitter {
     }
 
     if (!config.baseUrl && config.selectionMode !== 'default') {
-      config.baseUrl = config.preferredBaseUrl || envBaseUrl || 'https://hypertuna.com';
+      config.baseUrl = config.preferredBaseUrl || envBaseUrl || '';
+    }
+
+    if (!config.activeGatewayId && config.selectedGatewayId) {
+      config.activeGatewayId = config.selectedGatewayId;
     }
 
     const blindPeerConfig = this.#normalizeBlindPeerConfig(rawConfig, this.publicGatewaySettings);
@@ -450,15 +568,473 @@ export class GatewayService extends EventEmitter {
     return trimmed.length ? trimmed : null;
   }
 
+  #normalizeGatewayCandidate(source = {}, fallbackId = null) {
+    if (!source || typeof source !== 'object') return null;
+    const id = this.#sanitizeOptionalString(source.id) || this.#sanitizeOptionalString(fallbackId);
+    if (!id) return null;
+    const baseUrl = this.#sanitizeOptionalString(source.baseUrl || source.publicUrl || source.controlBaseUrl);
+    const wsUrl = this.#sanitizeOptionalString(source.wsUrl);
+    const controlTopic = this.#sanitizeOptionalString(source.controlTopic || source.topic);
+    const swarmPublicKey = this.#sanitizeOptionalString(
+      source.swarmPublicKey
+      || source.gatewayPubkey
+      || source?.controlP2P?.swarmPublicKey
+    );
+    const trust = source.trust === 'blocked'
+      ? 'blocked'
+      : source.trust === 'trusted'
+        ? 'trusted'
+        : 'candidate';
+    const health = source.health === 'offline'
+      ? 'offline'
+      : source.health === 'degraded'
+        ? 'degraded'
+        : 'healthy';
+    if (!baseUrl && !swarmPublicKey) return null;
+    return {
+      id,
+      baseUrl,
+      wsUrl,
+      controlTopic,
+      swarmPublicKey,
+      trust,
+      health,
+      latencyMs: Number.isFinite(Number(source.latencyMs)) ? Math.round(Number(source.latencyMs)) : null,
+      lastSeenAt: Number.isFinite(Number(source.lastSeenAt)) ? Math.round(Number(source.lastSeenAt)) : null
+    };
+  }
+
+  #buildGatewayControlCandidates(config = this.publicGatewaySettings || {}, { skipTrustPolicy = false } = {}) {
+    const candidates = {};
+    const explicitAllowlist = Array.isArray(config?.trustPolicy?.explicitAllowlist)
+      ? config.trustPolicy.explicitAllowlist
+          .map((value) => (typeof value === 'string' ? value.trim() : null))
+          .filter(Boolean)
+      : [];
+    const hasExplicitAllowlist = explicitAllowlist.length > 0;
+    const isGatewayAllowed = (gatewayId) => !hasExplicitAllowlist || explicitAllowlist.includes(gatewayId);
+
+    const configured = config?.gateways && typeof config.gateways === 'object'
+      ? config.gateways
+      : {};
+    for (const [gatewayId, source] of Object.entries(configured)) {
+      const normalized = this.#normalizeGatewayCandidate(source, gatewayId);
+      if (!normalized) continue;
+      if (normalized.trust === 'blocked' || normalized.health === 'offline') continue;
+      if (!isGatewayAllowed(normalized.id)) continue;
+      candidates[normalized.id] = normalized;
+    }
+
+    const discovered = Array.isArray(this.discoveredGateways) ? this.discoveredGateways : [];
+    for (const source of discovered) {
+      const fallbackId = this.#sanitizeOptionalString(source?.gatewayId || source?.id);
+      const normalized = this.#normalizeGatewayCandidate({
+        id: fallbackId,
+        baseUrl: source?.publicUrl || source?.baseUrl || null,
+        wsUrl: source?.wsUrl || null,
+        swarmPublicKey: source?.swarmPublicKey || source?.gatewayId || null,
+        health: source?.isExpired ? 'degraded' : 'healthy',
+        trust: 'candidate',
+        lastSeenAt: source?.lastSeenAt || null
+      }, fallbackId);
+      if (!normalized) continue;
+      if (!isGatewayAllowed(normalized.id)) continue;
+      if (!candidates[normalized.id]) {
+        candidates[normalized.id] = normalized;
+      } else {
+        candidates[normalized.id] = {
+          ...candidates[normalized.id],
+          baseUrl: candidates[normalized.id].baseUrl || normalized.baseUrl,
+          wsUrl: candidates[normalized.id].wsUrl || normalized.wsUrl,
+          swarmPublicKey: candidates[normalized.id].swarmPublicKey || normalized.swarmPublicKey,
+          controlTopic: candidates[normalized.id].controlTopic || normalized.controlTopic,
+          lastSeenAt: Math.max(candidates[normalized.id].lastSeenAt || 0, normalized.lastSeenAt || 0) || null
+        };
+      }
+    }
+
+    const allowHttpFallback = config?.selectionMode === 'manual' || config?.networkMode === 'legacy-discovery';
+    const fallbackBaseUrl = allowHttpFallback
+      ? this.#sanitizeOptionalString(config?.baseUrl || config?.preferredBaseUrl)
+      : null;
+    if (fallbackBaseUrl) {
+      const fallbackId = this.#sanitizeOptionalString(config?.activeGatewayId || config?.resolvedGatewayId) || 'gateway-http-fallback';
+      if (!isGatewayAllowed(fallbackId)) {
+        return candidates;
+      }
+      if (!candidates[fallbackId]) {
+        candidates[fallbackId] = {
+          id: fallbackId,
+          baseUrl: fallbackBaseUrl,
+          wsUrl: this.#sanitizeOptionalString(config?.resolvedWsUrl || null),
+          controlTopic: null,
+          swarmPublicKey: null,
+          trust: 'candidate',
+          health: 'healthy',
+          latencyMs: null,
+          lastSeenAt: null
+        };
+      }
+    }
+
+    this.gatewayTrustPolicyEngine?.updatePolicy?.(config?.trustPolicy || {});
+    const trustPolicy = this.gatewayTrustPolicyEngine?.policy || {};
+    const trustContext = this.gatewayTrustContextSnapshot || {
+      followsByMe: new Set(),
+      followersOfMe: new Set(),
+      attestations: []
+    };
+    const followsByMe = trustContext.followsByMe instanceof Set
+      ? trustContext.followsByMe
+      : new Set(Array.isArray(trustContext.followsByMe) ? trustContext.followsByMe : []);
+    const followersOfMe = trustContext.followersOfMe instanceof Set
+      ? trustContext.followersOfMe
+      : new Set(Array.isArray(trustContext.followersOfMe) ? trustContext.followersOfMe : []);
+    const attestations = Array.isArray(trustContext.attestations) ? trustContext.attestations : [];
+    const hasSocialContext = followsByMe.size > 0 || followersOfMe.size > 0 || attestations.length > 0;
+    const requiresTrustEvidence = false;
+    const allowBootstrapWithoutEvidence = !hasSocialContext && !hasExplicitAllowlist;
+
+    if (!skipTrustPolicy && requiresTrustEvidence && !allowBootstrapWithoutEvidence) {
+      for (const [gatewayId, candidate] of Object.entries(candidates)) {
+        const evaluation = this.gatewayTrustPolicyEngine.evaluateGateway({
+          gatewayPubkey: gatewayId,
+          issuedAt: Number.isFinite(Number(candidate?.lastSeenAt))
+            ? Number(candidate.lastSeenAt)
+            : Date.now(),
+          expiresAt: Number.isFinite(Number(candidate?.lastSeenAt))
+            ? Number(candidate.lastSeenAt) + (trustPolicy.maxDescriptorAgeMs || (6 * 60 * 60 * 1000))
+            : (Date.now() + (trustPolicy.maxDescriptorAgeMs || (6 * 60 * 60 * 1000)))
+        }, {
+          followsByMe,
+          followersOfMe,
+          attestations
+        });
+        if (!evaluation?.trusted) {
+          delete candidates[gatewayId];
+        }
+      }
+    }
+
+    return candidates;
+  }
+
+  #preferredGatewayOrder(config = this.publicGatewaySettings || {}) {
+    const ids = [];
+    const pushId = (value) => {
+      const id = this.#sanitizeOptionalString(value);
+      if (!id) return;
+      if (!ids.includes(id)) ids.push(id);
+    };
+
+    pushId(config?.activeGatewayId);
+    pushId(config?.resolvedGatewayId);
+    pushId(config?.selectedGatewayId);
+    if (Array.isArray(config?.preferredGatewayIds)) {
+      for (const value of config.preferredGatewayIds) pushId(value);
+    }
+    return ids;
+  }
+
+  #ensureGatewayControlClientPool(config = this.publicGatewaySettings || {}, options = {}) {
+    if (!this.gatewayControlClientPool) {
+      this.gatewayControlClientPool = new GatewayControlClientPool({
+        gateways: {},
+        preferredGatewayIds: [],
+        connectionPool: this.connectionPool,
+        logger: this.loggerBridge || console
+      });
+    }
+    this.gatewayControlClientPool.logger = this.loggerBridge || console;
+    this.gatewayControlClientPool.updateGateways({
+      gateways: this.#buildGatewayControlCandidates(config, options),
+      preferredGatewayIds: this.#preferredGatewayOrder(config)
+    });
+    return this.gatewayControlClientPool;
+  }
+
+  #hasGatewayControlTransport(config = this.publicGatewaySettings || {}) {
+    const pool = this.#ensureGatewayControlClientPool(config, { skipTrustPolicy: true });
+    const snapshot = pool.getGatewaySnapshot?.() || {};
+    return Object.keys(snapshot.gateways || {}).length > 0;
+  }
+
+  async #signControlChallenge(challenge, privateKeyHex) {
+    const digest = crypto.createHash('sha256').update(String(challenge)).digest('hex');
+    const signature = await schnorr.sign(digest, privateKeyHex);
+    return Buffer.from(signature).toString('hex');
+  }
+
+  #getGatewayControlSession(gatewayId) {
+    if (!gatewayId || !this.gatewayControlSessions?.has(gatewayId)) return null;
+    const session = this.gatewayControlSessions.get(gatewayId);
+    if (!session || !session.accessToken) return null;
+    if (Number.isFinite(Number(session.expiresAt)) && (Number(session.expiresAt) - Date.now()) <= 30_000) {
+      this.gatewayControlSessions.delete(gatewayId);
+      return null;
+    }
+    return session;
+  }
+
+  async #ensureGatewayControlSession(gatewayId = null) {
+    const workerPubkey = this.getCurrentPubkey?.() || null;
+    const workerPrivateKey = this.getCurrentPrivateKey?.() || null;
+    if (!workerPubkey || !workerPrivateKey) {
+      throw new Error('Worker identity is required for gateway control auth');
+    }
+
+    const pool = this.#ensureGatewayControlClientPool(this.publicGatewaySettings);
+    const poolSnapshot = pool.getGatewaySnapshot?.() || {};
+    const availableGatewayIds = Object.keys(poolSnapshot.gateways || {});
+    const targetGatewayId = this.#sanitizeOptionalString(gatewayId)
+      || this.#sanitizeOptionalString(this.publicGatewaySettings?.activeGatewayId)
+      || this.#sanitizeOptionalString(this.publicGatewaySettings?.resolvedGatewayId)
+      || availableGatewayIds[0]
+      || null;
+    if (!targetGatewayId) {
+      throw new Error('No gateway available for control auth session');
+    }
+
+    const cached = this.#getGatewayControlSession(targetGatewayId);
+    if (cached) {
+      return { ...cached, gatewayId: targetGatewayId };
+    }
+
+    const challengeResult = await pool.request(CONTROL_METHODS.AUTH_CHALLENGE, {
+      workerPubkey
+    }, {
+      hedged: false,
+      gatewayId: targetGatewayId,
+      onlyGateway: true
+    });
+    const challengeGatewayId = challengeResult?.gatewayId || targetGatewayId;
+    const challengePayload = challengeResult?.data || {};
+    const challenge = this.#sanitizeOptionalString(challengePayload?.challenge);
+    if (!challenge) {
+      throw new Error('Gateway control auth challenge missing');
+    }
+
+    const signature = await this.#signControlChallenge(challenge, workerPrivateKey);
+    const sessionResult = await pool.request(CONTROL_METHODS.AUTH_SESSION, {
+      challenge,
+      workerPubkey,
+      signature
+    }, {
+      hedged: false,
+      gatewayId: challengeGatewayId,
+      onlyGateway: true
+    });
+    const sessionPayload = sessionResult?.data || {};
+    const accessToken = this.#sanitizeOptionalString(sessionPayload?.accessToken);
+    if (!accessToken) {
+      throw new Error('Gateway control auth session token missing');
+    }
+
+    const session = {
+      accessToken,
+      expiresAt: Number.isFinite(Number(sessionPayload?.expiresAt))
+        ? Math.round(Number(sessionPayload.expiresAt))
+        : (Date.now() + (25 * 60 * 1000)),
+      gatewayPubkey: this.#sanitizeOptionalString(sessionPayload?.gatewayPubkey) || null
+    };
+    this.gatewayControlSessions.set(challengeGatewayId, session);
+    if (this.publicGatewaySettings) {
+      this.publicGatewaySettings.activeGatewayId = challengeGatewayId;
+    }
+    return { ...session, gatewayId: challengeGatewayId };
+  }
+
+  async requestPublicGatewayControl(methodName, payload = {}, options = {}) {
+    if (!methodName || typeof methodName !== 'string') {
+      throw new Error('methodName is required');
+    }
+    const pool = this.#ensureGatewayControlClientPool(this.publicGatewaySettings);
+    const needsSession = CONTROL_SESSION_REQUIRED_METHODS.has(methodName);
+    const requestPayload = payload && typeof payload === 'object' ? { ...payload } : {};
+    let gatewayId = this.#sanitizeOptionalString(options?.gatewayId)
+      || this.#sanitizeOptionalString(this.publicGatewaySettings?.activeGatewayId)
+      || this.#sanitizeOptionalString(this.publicGatewaySettings?.resolvedGatewayId)
+      || null;
+
+    if (needsSession && !requestPayload.accessToken && !requestPayload.access_token) {
+      const session = await this.#ensureGatewayControlSession(gatewayId);
+      gatewayId = session.gatewayId || gatewayId;
+      requestPayload.accessToken = session.accessToken;
+    }
+
+    const requestOptions = {
+      ...options,
+      gatewayId,
+      onlyGateway: options?.onlyGateway === true,
+      hedged: options?.hedged
+    };
+
+    try {
+      const response = await pool.request(methodName, requestPayload, requestOptions);
+      const responseGatewayId = this.#sanitizeOptionalString(response?.gatewayId);
+      if (responseGatewayId && this.publicGatewaySettings?.gateways && this.publicGatewaySettings.gateways[responseGatewayId]) {
+        const snapshot = pool.getGatewaySnapshot?.() || {};
+        const observed = snapshot?.gateways?.[responseGatewayId] || {};
+        this.publicGatewaySettings.gateways[responseGatewayId] = {
+          ...this.publicGatewaySettings.gateways[responseGatewayId],
+          health: observed.health || 'healthy',
+          latencyMs: Number.isFinite(Number(observed.latencyMs)) ? Math.round(Number(observed.latencyMs)) : null,
+          lastSeenAt: Number.isFinite(Number(observed.lastSeenAt)) ? Math.round(Number(observed.lastSeenAt)) : Date.now()
+        };
+      }
+      return response;
+    } catch (error) {
+      const message = String(error?.message || '');
+      const isAuthError = message.includes('invalid-session') || Number(error?.statusCode) === 401;
+      if (!needsSession || !isAuthError || !gatewayId) {
+        throw error;
+      }
+      this.gatewayControlSessions.delete(gatewayId);
+      const session = await this.#ensureGatewayControlSession(gatewayId);
+      requestPayload.accessToken = session.accessToken;
+      return await pool.request(methodName, requestPayload, {
+        ...requestOptions,
+        gatewayId: session.gatewayId || gatewayId,
+        onlyGateway: true,
+        hedged: false
+      });
+    }
+  }
+
+  async #registerRelayWithGatewayControl(relayKey, payload = {}) {
+    const result = await this.requestPublicGatewayControl(CONTROL_METHODS.RELAY_REGISTER, {
+      relayKey,
+      ...(payload || {})
+    }, {
+      hedged: false
+    });
+    return {
+      success: true,
+      ...(result?.data || {})
+    };
+  }
+
+  async #updateOpenJoinPoolWithGatewayControl(relayKey, entries = [], options = {}) {
+    const payload = {
+      relayKey,
+      entries: Array.isArray(entries) ? entries : [],
+      updatedAt: options.updatedAt || Date.now(),
+      targetSize: Number.isFinite(options.targetSize) ? Math.trunc(options.targetSize) : undefined,
+      publicIdentifier: options.publicIdentifier || undefined,
+      relayUrl: options.relayUrl || undefined,
+      relayCores: Array.isArray(options.relayCores) ? options.relayCores : undefined,
+      metadata: options.metadata && typeof options.metadata === 'object' ? options.metadata : undefined,
+      aliases: Array.isArray(options.aliases) ? options.aliases : undefined
+    };
+
+    const result = await this.requestPublicGatewayControl(CONTROL_METHODS.OPEN_JOIN_POOL_SYNC, payload, {
+      hedged: false
+    });
+    return result?.data || null;
+  }
+
+  async #updateClosedJoinPoolWithGatewayControl(relayKey, entries = [], options = {}) {
+    const payload = {
+      relayKey,
+      entries: Array.isArray(entries) ? entries : [],
+      updatedAt: options.updatedAt || Date.now(),
+      publicIdentifier: options.publicIdentifier || undefined,
+      relayUrl: options.relayUrl || undefined,
+      relayCores: Array.isArray(options.relayCores) ? options.relayCores : undefined,
+      metadata: options.metadata && typeof options.metadata === 'object' ? options.metadata : undefined
+    };
+
+    const result = await this.requestPublicGatewayControl(CONTROL_METHODS.CLOSED_JOIN_POOL_SYNC, payload, {
+      hedged: false
+    });
+    return result?.data || null;
+  }
+
+  async #syncClosedJoinPool(relayKey, metadata) {
+    if (!this.closedJoinPoolProvider) {
+      return;
+    }
+    const hasControlCandidates = this.#hasGatewayControlTransport(this.publicGatewaySettings);
+    if (!hasControlCandidates) {
+      return;
+    }
+    if (this.#isPublicGatewayRelayKey(relayKey)) {
+      return;
+    }
+    if (metadata?.isOpen === true || metadata?.isHosted === false || metadata?.isJoined === true) {
+      return;
+    }
+
+    try {
+      const metadataIdentifier = typeof metadata?.identifier === 'string' ? metadata.identifier : null;
+      const relayUrl = typeof metadata?.connectionUrl === 'string'
+        ? metadata.connectionUrl
+        : (typeof metadata?.relayUrl === 'string' ? metadata.relayUrl : null);
+      const relayCores = await this.#collectRelayCoreMetadata(relayKey, metadataIdentifier || null) || [];
+      const target = await this.closedJoinPoolProvider({
+        relayKey,
+        publicIdentifier: metadataIdentifier,
+        metadata,
+        mode: 'target-only',
+        needed: 0
+      });
+      const needed = Number.isFinite(Number(target?.needed))
+        ? Math.max(0, Math.trunc(Number(target.needed)))
+        : 0;
+      let provision = null;
+      let entries = Array.isArray(target?.entries) ? target.entries : [];
+      if (needed > 0) {
+        provision = await this.closedJoinPoolProvider({
+          relayKey,
+          publicIdentifier: metadataIdentifier,
+          metadata,
+          needed,
+          targetSize: Number.isFinite(Number(target?.targetSize))
+            ? Math.max(1, Math.trunc(Number(target.targetSize)))
+            : undefined,
+          mode: 'provision'
+        });
+        entries = Array.isArray(provision?.entries) ? provision.entries : entries;
+      }
+      if (!entries.length) {
+        return;
+      }
+
+      await this.#updateClosedJoinPoolWithGatewayControl(relayKey, entries, {
+        updatedAt: provision?.updatedAt || Date.now(),
+        publicIdentifier: provision?.publicIdentifier || target?.publicIdentifier || metadataIdentifier || null,
+        relayUrl,
+        relayCores,
+        metadata: {
+          identifier: metadataIdentifier || null,
+          isOpen: metadata?.isOpen ?? null,
+          isPublic: metadata?.isPublic ?? null,
+          isHosted: metadata?.isHosted ?? null,
+          isJoined: metadata?.isJoined ?? null,
+          metadataUpdatedAt: metadata?.metadataUpdatedAt ?? null,
+          gatewayPath: metadata?.gatewayPath || null,
+          relayUrl: relayUrl || null
+        }
+      });
+    } catch (error) {
+      this.log('warn', `[PublicGateway] Closed join pool sync failed relay=${relayKey}: ${error?.message || error}`);
+    }
+  }
+
   #configurePublicGateway() {
     const config = this.publicGatewaySettings || { enabled: false };
+    this.gatewayTrustPolicyEngine?.updatePolicy?.(config?.trustPolicy || {});
     const hasBaseUrl = !!(config.baseUrl && String(config.baseUrl).trim());
+    const hasGatewayCatalog = !!(config.gateways && Object.keys(config.gateways).length);
     const hasSharedSecret = !!(config.sharedSecret && String(config.sharedSecret).trim());
+    const hasWorkerIdentity = !!(this.getCurrentPubkey?.() && this.getCurrentPrivateKey?.());
 
     console.info('[PublicGateway] Registrar config', {
       enabled: !!config.enabled,
       hasBaseUrl,
+      hasGatewayCatalog,
       hasSharedSecret,
+      hasWorkerIdentity,
       baseUrl: hasBaseUrl ? config.baseUrl : null
     });
 
@@ -474,19 +1050,32 @@ export class GatewayService extends EventEmitter {
       this.hyperbeeAdapter.logger = this.loggerBridge;
     }
 
-    if (config.enabled && config.baseUrl && config.sharedSecret) {
-      this.publicGatewayRegistrar = new PublicGatewayRegistrar({
-        baseUrl: config.baseUrl,
-        sharedSecret: config.sharedSecret,
-        logger: this.loggerBridge
-      });
-      this.publicGatewayWsBase = this.#computePublicGatewayWsBase(config.baseUrl);
+    const hasControlEndpoints = hasBaseUrl || hasGatewayCatalog;
+    const canUseControl = hasControlEndpoints && (hasSharedSecret || hasWorkerIdentity);
+    const localDisabledReason = (!canUseControl && config.enabled && hasControlEndpoints && !hasSharedSecret && !hasWorkerIdentity)
+      ? 'Worker identity is required for v2 gateway control auth'
+      : null;
+
+    if (config.enabled && canUseControl) {
+      this.publicGatewayRegistrar = hasBaseUrl
+        ? new PublicGatewayRegistrar({
+          baseUrl: config.baseUrl,
+          sharedSecret: config.sharedSecret,
+          logger: this.loggerBridge,
+          getWorkerPubkey: () => this.getCurrentPubkey?.() || null,
+          getWorkerPrivateKey: () => this.getCurrentPrivateKey?.() || null,
+          getWorkerEncryptPubkey: () => null
+        })
+        : null;
+      this.publicGatewayWsBase = hasBaseUrl ? this.#computePublicGatewayWsBase(config.baseUrl) : null;
+      this.#ensureGatewayControlClientPool(config);
     } else {
       this.publicGatewayRegistrar = null;
       this.publicGatewayWsBase = null;
       this.#clearAllRelayTokens();
+      this.#ensureGatewayControlClientPool(config);
     }
-    this.discoveryDisabledReason = config.disabledReason || null;
+    this.discoveryDisabledReason = config.disabledReason || localDisabledReason || null;
     if (config.disabledReason) {
       this.discoveryWarning = null;
     }
@@ -502,6 +1091,7 @@ export class GatewayService extends EventEmitter {
       this.discoveryClient = new PublicGatewayDiscoveryClient({ logger: this.loggerBridge });
       this.discoveryClient.on('updated', (catalog) => {
         this.discoveredGateways = catalog;
+        this.#ensureGatewayControlClientPool(this.publicGatewaySettings);
         if (this.publicGatewaySettings?.enabled) {
           this.#scheduleDiscoveryConfigRefresh();
         }
@@ -524,6 +1114,205 @@ export class GatewayService extends EventEmitter {
     } catch (error) {
       throw error;
     }
+  }
+
+  async #refreshGatewayCatalogFromControlPlane(config = this.publicGatewaySettings || {}) {
+    const pool = this.#ensureGatewayControlClientPool(config, { skipTrustPolicy: true });
+    const snapshot = pool.getGatewaySnapshot?.() || {};
+    const gatewayIds = Object.keys(snapshot.gateways || {});
+    if (!gatewayIds.length) {
+      return {
+        gateways: config?.gateways && typeof config.gateways === 'object' ? { ...config.gateways } : {},
+        trustedGatewayIds: [],
+        catalogFetched: false
+      };
+    }
+
+    const descriptorMap = new Map();
+    const attestationList = [];
+
+    const normalizeDescriptor = (entry = null) => {
+      if (!entry || typeof entry !== 'object') return null;
+      if (typeof entry.gatewayPubkey === 'string' && entry.gatewayPubkey.trim()) {
+        return {
+          ...entry,
+          gatewayPubkey: entry.gatewayPubkey.trim()
+        };
+      }
+      const gatewayPubkey = this.#sanitizeOptionalString(entry.id);
+      if (!gatewayPubkey) return null;
+      return {
+        gatewayPubkey,
+        issuedAt: Number.isFinite(Number(entry.lastSeenAt)) ? Math.round(Number(entry.lastSeenAt)) : Date.now(),
+        expiresAt: Number.isFinite(Number(entry.expiresAt))
+          ? Math.round(Number(entry.expiresAt))
+          : (Date.now() + (6 * 60 * 60 * 1000)),
+        controlP2P: {
+          topic: this.#sanitizeOptionalString(entry.controlTopic) || null,
+          protocol: 'gateway-control-v2',
+          swarmPublicKey: this.#sanitizeOptionalString(entry.swarmPublicKey) || null
+        },
+        controlHttp: this.#sanitizeOptionalString(entry.baseUrl)
+          ? { baseUrl: this.#sanitizeOptionalString(entry.baseUrl) }
+          : null,
+        bridgeHttp: this.#sanitizeOptionalString(entry.wsUrl)
+          ? { baseUrl: this.#sanitizeOptionalString(entry.wsUrl) }
+          : null
+      };
+    };
+
+    for (const gatewayId of gatewayIds) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const result = await pool.request(CONTROL_METHODS.MESH_CATALOG_READ, {}, {
+          hedged: false,
+          gatewayId,
+          onlyGateway: true,
+          timeoutMs: 5000
+        });
+        const catalog = result?.data && typeof result.data === 'object' ? result.data : {};
+        let descriptors = [];
+        if (Array.isArray(catalog.descriptors)) {
+          descriptors = catalog.descriptors;
+        } else if (Array.isArray(catalog.trusted)) {
+          descriptors = catalog.trusted;
+        } else if (catalog.gateways && typeof catalog.gateways === 'object') {
+          descriptors = Object.values(catalog.gateways);
+        }
+
+        for (const descriptorEntry of descriptors) {
+          const descriptor = normalizeDescriptor(descriptorEntry);
+          if (!descriptor?.gatewayPubkey) continue;
+          const current = descriptorMap.get(descriptor.gatewayPubkey);
+          if (!current || (Number(descriptor.issuedAt) || 0) >= (Number(current.issuedAt) || 0)) {
+            descriptorMap.set(descriptor.gatewayPubkey, descriptor);
+          }
+        }
+
+        if (Array.isArray(catalog.attestations)) {
+          attestationList.push(...catalog.attestations);
+        }
+      } catch (error) {
+        this.log('debug', `[PublicGateway] Control catalog request failed gateway=${gatewayId}: ${error?.message || error}`);
+      }
+    }
+
+    const descriptors = Array.from(descriptorMap.values());
+    let followsByMe = [];
+    let followersOfMe = [];
+    let externalAttestations = [];
+    try {
+      if (typeof this.getGatewayFollowedPubkeys === 'function') {
+        followsByMe = await Promise.resolve(this.getGatewayFollowedPubkeys()) || [];
+      }
+      if (typeof this.getGatewayFollowerPubkeys === 'function') {
+        followersOfMe = await Promise.resolve(this.getGatewayFollowerPubkeys()) || [];
+      }
+      if (typeof this.getGatewayAttestations === 'function') {
+        externalAttestations = await Promise.resolve(this.getGatewayAttestations()) || [];
+      }
+    } catch (error) {
+      this.log('debug', `[PublicGateway] Failed to load trust context: ${error?.message || error}`);
+    }
+
+    const followSet = followsByMe instanceof Set ? followsByMe : new Set(Array.isArray(followsByMe) ? followsByMe : []);
+    const followerSet = followersOfMe instanceof Set ? followersOfMe : new Set(Array.isArray(followersOfMe) ? followersOfMe : []);
+    const allAttestations = [
+      ...attestationList,
+      ...(Array.isArray(externalAttestations) ? externalAttestations : [])
+    ];
+    this.gatewayTrustContextSnapshot = {
+      followsByMe: new Set(followSet),
+      followersOfMe: new Set(followerSet),
+      attestations: [...allAttestations]
+    };
+
+    if (!descriptors.length) {
+      return {
+        gateways: config?.gateways && typeof config.gateways === 'object' ? { ...config.gateways } : {},
+        trustedGatewayIds: [],
+        catalogFetched: false
+      };
+    }
+
+    this.gatewayTrustPolicyEngine.updatePolicy(config?.trustPolicy || {});
+    let filtered = this.gatewayTrustPolicyEngine.filterTrustedGateways(descriptors, {
+      followsByMe: followSet,
+      followersOfMe: followerSet,
+      attestations: allAttestations
+    });
+
+    const hasSocialContext = followSet.size > 0 || followerSet.size > 0 || allAttestations.length > 0;
+    const hasExplicitAllowlist = Array.isArray(config?.trustPolicy?.explicitAllowlist)
+      && config.trustPolicy.explicitAllowlist.length > 0;
+
+    if (!filtered.trusted.length && !hasSocialContext && !hasExplicitAllowlist) {
+      filtered = {
+        trusted: descriptors.map((descriptor) => ({
+          descriptor,
+          evaluation: {
+            trusted: true,
+            reason: 'no-social-graph-context'
+          }
+        })),
+        rejected: []
+      };
+    }
+
+    const nextGateways = config?.gateways && typeof config.gateways === 'object'
+      ? { ...config.gateways }
+      : {};
+    for (const entry of filtered.trusted) {
+      const descriptor = entry?.descriptor || {};
+      const gatewayId = this.#sanitizeOptionalString(descriptor.gatewayPubkey);
+      if (!gatewayId) continue;
+      nextGateways[gatewayId] = {
+        ...(nextGateways[gatewayId] || {}),
+        id: gatewayId,
+        nostrPubkey: gatewayId,
+        swarmPublicKey: this.#sanitizeOptionalString(descriptor?.controlP2P?.swarmPublicKey) || null,
+        controlTopic: this.#sanitizeOptionalString(descriptor?.controlP2P?.topic) || null,
+        baseUrl: this.#sanitizeOptionalString(descriptor?.controlHttp?.baseUrl) || null,
+        wsUrl: this.#sanitizeOptionalString(descriptor?.bridgeHttp?.baseUrl) || null,
+        trust: 'trusted',
+        health: 'healthy',
+        lastSeenAt: Number.isFinite(Number(descriptor?.issuedAt))
+          ? Math.round(Number(descriptor.issuedAt))
+          : Date.now()
+      };
+    }
+    for (const entry of filtered.rejected || []) {
+      const descriptor = entry?.descriptor || {};
+      const gatewayId = this.#sanitizeOptionalString(descriptor.gatewayPubkey);
+      if (!gatewayId || !nextGateways[gatewayId]) continue;
+      nextGateways[gatewayId] = {
+        ...nextGateways[gatewayId],
+        trust: 'blocked'
+      };
+    }
+
+    this.discoveredGateways = filtered.trusted.map((entry) => {
+      const descriptor = entry?.descriptor || {};
+      return {
+        gatewayId: descriptor.gatewayPubkey || null,
+        publicUrl: descriptor?.controlHttp?.baseUrl || null,
+        wsUrl: descriptor?.bridgeHttp?.baseUrl || null,
+        swarmPublicKey: descriptor?.controlP2P?.swarmPublicKey || null,
+        controlTopic: descriptor?.controlP2P?.topic || null,
+        displayName: descriptor.gatewayPubkey || null,
+        region: null,
+        isExpired: false,
+        lastSeenAt: descriptor?.issuedAt || Date.now()
+      };
+    });
+
+    return {
+      gateways: nextGateways,
+      trustedGatewayIds: filtered.trusted
+        .map((entry) => this.#sanitizeOptionalString(entry?.descriptor?.gatewayPubkey))
+        .filter(Boolean),
+      catalogFetched: true
+    };
   }
 
   #scheduleDiscoveryConfigRefresh() {
@@ -714,7 +1503,8 @@ export class GatewayService extends EventEmitter {
   async #refreshRelayToken(relayKey, { force = false } = {}) {
     if (!relayKey) return;
     const state = this.publicGatewayRelayState.get(relayKey);
-    const isBridgeEnabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    const isBridgeEnabled = this.publicGatewaySettings?.enabled
+      && (this.publicGatewayRegistrar?.isBridgeTokenEnabled?.() ?? this.publicGatewayRegistrar?.isEnabled?.());
     if (!isBridgeEnabled || !state || state.status !== 'registered') {
       this.#clearRelayToken(relayKey);
       this.#emitPublicGatewayStatus();
@@ -877,12 +1667,96 @@ export class GatewayService extends EventEmitter {
       return config;
     }
 
+    try {
+      const catalog = await this.#refreshGatewayCatalogFromControlPlane(config);
+      if (catalog?.catalogFetched && catalog?.gateways && typeof catalog.gateways === 'object') {
+        config.gateways = catalog.gateways;
+      }
+    } catch (error) {
+      this.log('debug', `[PublicGateway] Control catalog refresh failed: ${error?.message || error}`);
+    }
+
+    if ((!config.gateways || !Object.keys(config.gateways).length)
+      && config.baseUrl
+      && (config.selectionMode === 'manual' || config.networkMode === 'legacy-discovery')) {
+      const fallbackId = this.#sanitizeOptionalString(config.activeGatewayId || config.resolvedGatewayId) || 'gateway-http-fallback';
+      config.gateways = {
+        [fallbackId]: {
+          id: fallbackId,
+          baseUrl: config.baseUrl,
+          wsUrl: config.resolvedWsUrl || null,
+          swarmPublicKey: null,
+          controlTopic: null,
+          trust: 'candidate',
+          health: 'healthy'
+        }
+      };
+      if (!config.activeGatewayId) {
+        config.activeGatewayId = fallbackId;
+      }
+    }
+
+    const configuredGateways = Object.values(config.gateways || {})
+      .filter((gateway) => gateway
+        && (
+          (typeof gateway.baseUrl === 'string' && gateway.baseUrl.trim().length)
+          || (typeof gateway.swarmPublicKey === 'string' && gateway.swarmPublicKey.trim().length)
+        )
+        && gateway.trust !== 'blocked'
+        && gateway.health !== 'offline');
+    if (configuredGateways.length) {
+      const preferredSet = new Set(config.preferredGatewayIds || []);
+      const pickById = (gatewayId) => configuredGateways.find((entry) => entry.id === gatewayId) || null;
+      const sortByScore = (a, b) => {
+        const aPreferred = preferredSet.has(a.id) ? 0 : 1;
+        const bPreferred = preferredSet.has(b.id) ? 0 : 1;
+        if (aPreferred !== bPreferred) return aPreferred - bPreferred;
+        const aHealth = a.health === 'healthy' ? 0 : 1;
+        const bHealth = b.health === 'healthy' ? 0 : 1;
+        if (aHealth !== bHealth) return aHealth - bHealth;
+        const aLatency = Number.isFinite(Number(a.latencyMs)) ? Number(a.latencyMs) : Number.MAX_SAFE_INTEGER;
+        const bLatency = Number.isFinite(Number(b.latencyMs)) ? Number(b.latencyMs) : Number.MAX_SAFE_INTEGER;
+        return aLatency - bLatency;
+      };
+
+      const selectedGateway =
+        pickById(config.activeGatewayId)
+        || pickById(config.selectedGatewayId)
+        || [...configuredGateways].sort(sortByScore)[0]
+        || null;
+
+      if (selectedGateway) {
+        if (selectedGateway?.baseUrl) {
+          config.baseUrl = selectedGateway.baseUrl.trim();
+        }
+        config.activeGatewayId = selectedGateway.id;
+        config.resolvedGatewayId = selectedGateway.id;
+        config.resolvedDisplayName = selectedGateway.id;
+        config.resolvedWsUrl = selectedGateway.wsUrl || null;
+        config.resolvedAt = Date.now();
+        config.resolvedFromDiscovery = false;
+        config.disabledReason = null;
+        return config;
+      }
+    }
+
     if (config.selectionMode === 'manual') {
-      if (!config.baseUrl || !config.sharedSecret) {
+      if (!config.baseUrl && !configuredGateways.length) {
         config.enabled = false;
-        config.disabledReason = 'Manual configuration requires base URL and shared secret';
+        config.disabledReason = 'Manual configuration requires a base URL or control-capable gateway';
         config.baseUrl = '';
         config.sharedSecret = '';
+      }
+      return config;
+    }
+
+    const allowLegacyDiscovery = config.selectionMode === 'discovered' || config.networkMode === 'legacy-discovery';
+    if (!allowLegacyDiscovery) {
+      const hasManualBase = !!(config.baseUrl && (config.selectionMode === 'manual' || config.networkMode === 'legacy-discovery'));
+      if (!configuredGateways.length && !hasManualBase) {
+        config.disabledReason = 'No trusted gateway descriptors available for control plane';
+      } else {
+        config.disabledReason = null;
       }
       return config;
     }
@@ -905,13 +1779,14 @@ export class GatewayService extends EventEmitter {
 
     const ensureEntrySecret = async (entry) => {
       if (!entry) return null;
+      if (!entry.secretUrl) return entry;
       try {
         await this.discoveryClient.ensureSecret(entry.gatewayId);
         refreshCatalog();
         return this.discoveryClient.getGatewayById(entry.gatewayId);
       } catch (error) {
         this.log('warn', `[PublicGateway] Failed to retrieve shared secret for gateway ${entry.gatewayId}: ${error.message}`);
-        return null;
+        return entry;
       }
     };
 
@@ -932,15 +1807,15 @@ export class GatewayService extends EventEmitter {
       }
 
       resolvedEntry = await ensureEntrySecret(entry);
-      if (!resolvedEntry || !resolvedEntry.sharedSecret) {
+      if (!resolvedEntry || !resolvedEntry.publicUrl) {
         config.disabledReason = entry.isExpired
           ? 'Selected public gateway advertisement expired'
-          : 'Unable to retrieve shared secret for selected gateway';
+          : 'Selected public gateway is unavailable';
         config.sharedSecret = '';
         return config;
       }
     } else {
-      const preferredUrl = config.preferredBaseUrl || config.baseUrl || 'https://hypertuna.com';
+      const preferredUrl = config.preferredBaseUrl || config.baseUrl || '';
       let entry = this.discoveryClient.findGatewayByUrl(preferredUrl);
       if (entry && entry.isExpired) {
         entry = null;
@@ -948,27 +1823,27 @@ export class GatewayService extends EventEmitter {
 
       resolvedEntry = await ensureEntrySecret(entry);
 
-      if (!resolvedEntry || !resolvedEntry.sharedSecret) {
+      if (!resolvedEntry || !resolvedEntry.publicUrl) {
         const candidates = (this.discoveryClient.getGateways() || [])
-          .filter((candidate) => candidate.sharedSecret && !candidate.isExpired);
+          .filter((candidate) => candidate.publicUrl && !candidate.isExpired);
         if (candidates.length) {
           resolvedEntry = await ensureEntrySecret(candidates[0]);
-          if (resolvedEntry && resolvedEntry.sharedSecret) {
+          if (resolvedEntry?.publicUrl) {
             config.resolvedFallback = true;
           }
         }
       }
 
-      if (!resolvedEntry || !resolvedEntry.sharedSecret) {
+      if (!resolvedEntry || !resolvedEntry.publicUrl) {
         this.discoveryWarning = 'No open public gateways available; using cached discovery state';
-        this.log('debug', '[PublicGateway] Discovery catalog empty; reusing cached gateway credentials');
+        this.log('debug', '[PublicGateway] Discovery catalog empty; reusing cached gateway metadata');
         restorePreviousResolved();
         return config;
       }
     }
 
     config.baseUrl = resolvedEntry.publicUrl || config.baseUrl || config.preferredBaseUrl;
-    config.sharedSecret = resolvedEntry.sharedSecret || '';
+    config.sharedSecret = resolvedEntry.sharedSecret || config.sharedSecret || '';
     config.resolvedGatewayId = resolvedEntry.gatewayId;
     config.resolvedSecretVersion = resolvedEntry.sharedSecretVersion || null;
     config.resolvedSharedSecretHash = resolvedEntry.secretHash || null;
@@ -1100,7 +1975,8 @@ export class GatewayService extends EventEmitter {
   }
 
   async #syncPublicGatewayRelay(relayKey, { forceTokenRefresh = false } = {}) {
-    const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    const enabled = this.publicGatewaySettings?.enabled
+      && this.#hasGatewayControlTransport(this.publicGatewaySettings);
 
     if (!enabled) {
       this.publicGatewayRelayState.delete(relayKey);
@@ -1176,60 +2052,24 @@ export class GatewayService extends EventEmitter {
     }
 
     if (!peers.length) {
-      if (metadataCopy?.isOpen === true) {
-        const payload = {
-          peers,
-          metadata: metadataCopy
-        };
-        if (relayCores?.length) {
-          payload.relayCores = relayCores;
-          payload.relayCoresMode = 'merge';
-        }
-        try {
-          const registrationResult = await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
-          if (!registrationResult?.success) {
-            throw new Error(registrationResult?.error || 'Registration rejected by gateway');
-          }
-          await this.#syncOpenJoinPool(relayKey, metadataCopy);
-          this.publicGatewayRelayState.set(relayKey, {
-            relayKey,
-            status: 'offline',
-            peerCount: 0,
-            lastSyncedAt: now,
-            message: 'No peers connected',
-            metadata: metadataCopy,
-            peers: [],
-            blindPeer: this.blindPeerSummary || null,
-            relayCores: relayCores || [],
-            localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
-              ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
-              : null,
-            requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
-          });
-        } catch (error) {
-          this.publicGatewayRelayState.set(relayKey, {
-            relayKey,
-            status: 'error',
-            peerCount: 0,
-            lastSyncedAt: now,
-            message: error.message,
-            metadata: metadataCopy,
-            peers: [],
-            blindPeer: this.blindPeerSummary || null,
-            relayCores: relayCores || [],
-            localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
-              ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
-              : null,
-            requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
-          });
-          this.log('warn', `[PublicGateway] Failed to register offline relay ${relayKey}: ${error.message}`);
-        }
-        this.#clearRelayToken(relayKey);
-        this.#emitPublicGatewayStatus();
-        return;
+      const payload = {
+        peers,
+        metadata: metadataCopy
+      };
+      if (relayCores?.length) {
+        payload.relayCores = relayCores;
+        payload.relayCoresMode = 'merge';
       }
       try {
-        await this.publicGatewayRegistrar.unregisterRelay(relayKey);
+        const registrationResult = await this.#registerRelayWithGatewayControl(relayKey, payload);
+        if (!registrationResult?.success) {
+          throw new Error(registrationResult?.error || 'Registration rejected by gateway');
+        }
+        if (metadataCopy?.isOpen === true) {
+          await this.#syncOpenJoinPool(relayKey, metadataCopy);
+        } else {
+          await this.#syncClosedJoinPool(relayKey, metadataCopy);
+        }
         this.publicGatewayRelayState.set(relayKey, {
           relayKey,
           status: 'offline',
@@ -1261,7 +2101,7 @@ export class GatewayService extends EventEmitter {
             : null,
           requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
         });
-        this.log('warn', `[PublicGateway] Failed to unregister relay ${relayKey}: ${error.message}`);
+        this.log('warn', `[PublicGateway] Failed to register offline relay ${relayKey}: ${error.message}`);
       }
       this.#clearRelayToken(relayKey);
       this.#emitPublicGatewayStatus();
@@ -1278,7 +2118,7 @@ export class GatewayService extends EventEmitter {
     }
 
     try {
-      const registrationResult = await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
+      const registrationResult = await this.#registerRelayWithGatewayControl(relayKey, payload);
       if (!registrationResult?.success) {
         throw new Error(registrationResult?.error || 'Registration rejected by gateway');
       }
@@ -1336,7 +2176,11 @@ export class GatewayService extends EventEmitter {
         });
       }
 
-      await this.#syncOpenJoinPool(relayKey, metadataCopy);
+      if (metadataCopy?.isOpen === true) {
+        await this.#syncOpenJoinPool(relayKey, metadataCopy);
+      } else {
+        await this.#syncClosedJoinPool(relayKey, metadataCopy);
+      }
 
       if (this.#isPublicGatewayRelayKey(relayKey)) {
         await this.#registerPublicGatewayVirtualRelay(metadataCopy);
@@ -1802,6 +2646,7 @@ export class GatewayService extends EventEmitter {
       clearTimeout(timer);
     }
     this.eventCheckTimers.clear();
+    this.gatewayControlSessions.clear();
 
     for (const { ws } of this.wsConnections.values()) {
       try { ws.close(); } catch (_) {}
@@ -1846,7 +2691,7 @@ export class GatewayService extends EventEmitter {
     }
 
     const config = this.publicGatewaySettings || {};
-    const enabled = !!(config.enabled && this.publicGatewayRegistrar?.isEnabled?.());
+    const enabled = !!(config.enabled && this.#hasGatewayControlTransport(config));
     const summary = this.blindPeerSummary;
     const defaultKeys = Array.isArray(config.blindPeerKeys) ? config.blindPeerKeys.filter(Boolean) : [];
     const manualKeys = Array.isArray(config.blindPeerManualKeys) ? config.blindPeerManualKeys.filter(Boolean) : [];
@@ -1856,6 +2701,12 @@ export class GatewayService extends EventEmitter {
 
     return {
       enabled,
+      networkMode: config.networkMode || 'permissionless-wot',
+      federationId: config.federationId || null,
+      gateways: config.gateways || {},
+      preferredGatewayIds: Array.isArray(config.preferredGatewayIds) ? config.preferredGatewayIds : [],
+      activeGatewayId: config.activeGatewayId || null,
+      trustPolicy: config.trustPolicy || null,
       selectionMode: config.selectionMode || 'default',
       selectedGatewayId: config.selectedGatewayId || null,
       preferredBaseUrl: config.preferredBaseUrl || null,
@@ -1945,8 +2796,10 @@ export class GatewayService extends EventEmitter {
       console.info('[PublicGateway] Open join pool sync skipped: missing provider', { relayKey });
       return;
     }
-    if (!this.publicGatewayRegistrar?.isEnabled?.()) {
-      console.info('[PublicGateway] Open join pool sync skipped: registrar disabled', {
+    const controlSnapshot = this.#ensureGatewayControlClientPool(this.publicGatewaySettings).getGatewaySnapshot?.() || {};
+    const hasControlCandidates = Object.keys(controlSnapshot.gateways || {}).length > 0;
+    if (!hasControlCandidates) {
+      console.info('[PublicGateway] Open join pool sync skipped: control transport unavailable', {
         relayKey,
         enabled: !!this.publicGatewaySettings?.enabled
       });
@@ -2066,7 +2919,7 @@ export class GatewayService extends EventEmitter {
         });
       };
 
-      let report = await this.publicGatewayRegistrar.updateOpenJoinPool(poolRelayKey, [], {
+      let report = await this.#updateOpenJoinPoolWithGatewayControl(poolRelayKey, [], {
         updatedAt: Date.now(),
         targetSize,
         publicIdentifier: poolPublicIdentifier || null,
@@ -2111,7 +2964,7 @@ export class GatewayService extends EventEmitter {
           return;
         }
         const updatedAt = provision.updatedAt || Date.now();
-        report = await this.publicGatewayRegistrar.updateOpenJoinPool(poolRelayKey, entries, {
+        report = await this.#updateOpenJoinPoolWithGatewayControl(poolRelayKey, entries, {
           updatedAt,
           targetSize,
           publicIdentifier: poolPublicIdentifier || null,
@@ -2148,7 +3001,8 @@ export class GatewayService extends EventEmitter {
   }
 
   async resyncPublicGateway() {
-    const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    const enabled = this.publicGatewaySettings?.enabled
+      && this.#hasGatewayControlTransport(this.publicGatewaySettings);
     if (!enabled) {
       this.publicGatewayRelayState.clear();
       this.#clearAllRelayTokens();
@@ -2184,7 +3038,8 @@ export class GatewayService extends EventEmitter {
     this.publicGatewaySettings = await this.#resolvePublicGatewayConfig(mergedConfig);
     this.#configurePublicGateway();
 
-    const isEnabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    const isEnabled = this.publicGatewaySettings?.enabled
+      && this.#hasGatewayControlTransport(this.publicGatewaySettings);
 
     if (isEnabled) {
       try {
@@ -2197,12 +3052,17 @@ export class GatewayService extends EventEmitter {
       this.#clearAllRelayTokens();
     }
 
-    const previousHash = previousSettings?.resolvedSharedSecretHash || null;
-    const nextHash = this.publicGatewaySettings?.resolvedSharedSecretHash || null;
-    const statusChanged = Boolean(previousSettings?.enabled) !== Boolean(this.publicGatewaySettings?.enabled);
-    const secretChanged = previousHash !== nextHash && nextHash !== null;
+    let previousSnapshot = '';
+    let nextSnapshot = '';
+    try {
+      previousSnapshot = JSON.stringify(previousSettings || {});
+      nextSnapshot = JSON.stringify(this.publicGatewaySettings || {});
+    } catch (_) {
+      previousSnapshot = '';
+      nextSnapshot = '';
+    }
 
-    if (statusChanged || secretChanged) {
+    if (previousSnapshot !== nextSnapshot) {
       try {
         await updatePublicGatewaySettings(this.publicGatewaySettings);
       } catch (error) {
@@ -2218,7 +3078,8 @@ export class GatewayService extends EventEmitter {
       throw new Error('relayKey is required');
     }
 
-    if (!this.publicGatewayRegistrar?.isEnabled?.() || !this.publicGatewaySettings?.enabled) {
+    const bridgeTokenEnabled = this.publicGatewayRegistrar?.isBridgeTokenEnabled?.() ?? this.publicGatewayRegistrar?.isEnabled?.();
+    if (!bridgeTokenEnabled || !this.publicGatewaySettings?.enabled) {
       throw new Error('Public gateway bridge is disabled');
     }
 

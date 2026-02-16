@@ -70,6 +70,7 @@ import {
   updatePublicGatewaySettings,
   getCachedPublicGatewaySettings
 } from '../shared/config/PublicGatewaySettings.mjs'
+import { CONTROL_METHODS } from '../shared/public-gateway/ControlPlaneMethods.mjs'
 import {
   downloadGroupFileOperation,
   deleteLocalGroupFileOperation,
@@ -860,16 +861,104 @@ function collectPublicGatewayOrigins() {
   }
 
   const settings = publicGatewaySettings || {}
+  const gateways = settings.gateways && typeof settings.gateways === 'object'
+    ? settings.gateways
+    : {}
+
+  const orderedGatewayIds = []
+  const pushGatewayId = (candidate) => {
+    if (typeof candidate !== 'string') return
+    const trimmed = candidate.trim()
+    if (!trimmed || orderedGatewayIds.includes(trimmed)) return
+    orderedGatewayIds.push(trimmed)
+  }
+
+  pushGatewayId(settings.activeGatewayId)
+  if (Array.isArray(settings.preferredGatewayIds)) {
+    for (const gatewayId of settings.preferredGatewayIds) pushGatewayId(gatewayId)
+  }
+  for (const gatewayId of Object.keys(gateways)) pushGatewayId(gatewayId)
+
+  for (const gatewayId of orderedGatewayIds) {
+    const gateway = gateways[gatewayId]
+    if (!gateway || gateway.health === 'offline' || gateway.trust === 'blocked') continue
+    addOrigin(gateway.baseUrl)
+    addOrigin(gateway.wsUrl)
+  }
+
   addOrigin(settings.preferredBaseUrl)
   addOrigin(settings.baseUrl)
   addOrigin(settings.resolvedWsUrl)
   addOrigin(publicGatewayStatusCache?.wsBase)
 
-  if (origins.size === 0) {
-    origins.add('https://hypertuna.com')
-  }
-
   return Array.from(origins)
+}
+
+async function requestPublicGatewayControl(methodName, payload = {}, options = {}) {
+  if (!gatewayService || typeof gatewayService.requestPublicGatewayControl !== 'function') {
+    return { status: 'skipped', reason: 'gateway-service-control-unavailable' }
+  }
+  try {
+    const result = await gatewayService.requestPublicGatewayControl(methodName, payload, options)
+    return {
+      status: 'ok',
+      result
+    }
+  } catch (error) {
+    return {
+      status: 'error',
+      reason: error?.message || String(error || 'control-request-failed'),
+      error
+    }
+  }
+}
+
+function normalizeGatewayTrustFixture(raw = {}) {
+  const normalizeSet = (value) => {
+    const list = Array.isArray(value) ? value : []
+    return Array.from(new Set(list
+      .map((entry) => (typeof entry === 'string' ? entry.trim() : null))
+      .filter(Boolean)))
+  }
+  const normalizeAttestation = (entry = {}) => {
+    if (!entry || typeof entry !== 'object') return null
+    const attestorPubkey = typeof entry.attestorPubkey === 'string' ? entry.attestorPubkey.trim() : null
+    const targetPubkey = typeof entry.targetPubkey === 'string' ? entry.targetPubkey.trim() : null
+    if (!attestorPubkey || !targetPubkey) return null
+    return {
+      attestorPubkey,
+      targetPubkey,
+      issuedAt: Number.isFinite(Number(entry.issuedAt)) ? Math.round(Number(entry.issuedAt)) : Date.now(),
+      expiresAt: Number.isFinite(Number(entry.expiresAt)) ? Math.round(Number(entry.expiresAt)) : null,
+      score: Number.isFinite(Number(entry.score)) ? Number(entry.score) : 1,
+      sourceEventId: typeof entry.sourceEventId === 'string' ? entry.sourceEventId.trim() : null
+    }
+  }
+  return {
+    followsByMe: normalizeSet(raw.followsByMe),
+    followersOfMe: normalizeSet(raw.followersOfMe),
+    attestations: Array.isArray(raw.attestations)
+      ? raw.attestations.map(normalizeAttestation).filter(Boolean)
+      : []
+  }
+}
+
+function resolveControlMethodName(candidate) {
+  if (typeof candidate !== 'string') return null
+  const direct = candidate.trim()
+  if (!direct) return null
+  if (direct.startsWith('gateway.control.')) return direct
+  if (Object.prototype.hasOwnProperty.call(CONTROL_METHODS, direct)) {
+    return CONTROL_METHODS[direct]
+  }
+  const upper = direct
+    .replace(/[.\-/]/g, '_')
+    .replace(/([a-z])([A-Z])/g, '$1_$2')
+    .toUpperCase()
+  if (Object.prototype.hasOwnProperty.call(CONTROL_METHODS, upper)) {
+    return CONTROL_METHODS[upper]
+  }
+  return null
 }
 
 async function ensureConversationFileIndex(storageRoot = null) {
@@ -1301,6 +1390,24 @@ async function ensureClosedJoinWriterPool({
     })
   }
 
+  if (mode === 'target-only') {
+    const cached = await getRelayWriterPool(poolKey)
+    const now = Date.now()
+    const entries = pruneWriterPoolEntries(cached.entries, now)
+    if ((cached.entries || []).length !== entries.length) {
+      await setRelayWriterPool(poolKey, entries, cached.updatedAt || now)
+    }
+    const neededCount = Math.max(resolvedTarget - entries.length, 0)
+    return {
+      entries,
+      updatedAt: cached.updatedAt || null,
+      targetSize: resolvedTarget,
+      needed: neededCount,
+      relayKey: canonicalRelayKey || normalizedRelayKey || null,
+      publicIdentifier: canonicalPublicIdentifier || normalizedPublicIdentifier || null
+    }
+  }
+
   if (!relayServer?.provisionWriterForInvitee) return null
   if (closedJoinWriterPoolLocks.has(poolKey)) {
     console.warn('[Worker] Closed join pool skipped: lock active', {
@@ -1685,47 +1792,34 @@ async function fetchOpenJoinChallenge(relayIdentifier, { origin, purpose = null 
   if (!relayIdentifier) {
     return { status: 'skipped', reason: 'missing-relay-identifier' }
   }
-  if (!origin) {
-    return { status: 'skipped', reason: 'missing-origin' }
-  }
-  const fetchImpl = globalThis.fetch
-  if (typeof fetchImpl !== 'function') {
-    return { status: 'skipped', reason: 'fetch-unavailable' }
-  }
-  const base = origin.replace(/\/$/, '')
-  const encodedRelay = encodeURIComponent(relayIdentifier)
-  const query = purpose ? `?purpose=${encodeURIComponent(purpose)}` : ''
-  const url = `${base}/api/relays/${encodedRelay}/open-join/challenge${query}`
-  const controller = typeof AbortController === 'function' ? new AbortController() : null
-  const timer = controller
-    ? setTimeout(() => controller.abort(), OPEN_JOIN_APPEND_CORES_TIMEOUT_MS)
-    : null
-  try {
-    const response = await fetchImpl(url, { signal: controller?.signal })
-    if (!response.ok) {
-      let body = null
-      try {
-        body = await response.text()
-      } catch (_) {}
+  const controlResult = await requestPublicGatewayControl(
+    CONTROL_METHODS.OPEN_JOIN_CHALLENGE,
+    {
+      relayKey: relayIdentifier,
+      purpose: purpose || undefined
+    },
+    {
+      hedged: true
+    }
+  )
+  if (controlResult?.status === 'ok') {
+    const data = controlResult?.result?.data || null
+    if (data && typeof data === 'object' && data.challenge) {
       return {
-        status: 'error',
-        reason: `challenge status ${response.status}`,
-        origin: base,
-        body: body ? body.slice(0, 200) : null
+        status: 'ok',
+        origin: data?.gateway || origin || null,
+        transport: controlResult?.result?.transport || null,
+        gatewayId: controlResult?.result?.gatewayId || null,
+        data
       }
     }
-    const data = await response.json().catch(() => null)
-    if (!data || typeof data !== 'object') {
-      return { status: 'error', reason: 'challenge invalid payload', origin: base }
-    }
-    if (!data?.challenge) {
-      return { status: 'error', reason: 'challenge missing', origin: base }
-    }
-    return { status: 'ok', origin: base, data }
-  } catch (error) {
-    return { status: 'error', reason: error?.message || 'challenge failed', origin: base }
-  } finally {
-    if (timer) clearTimeout(timer)
+  }
+  return {
+    status: controlResult?.status || 'error',
+    reason: controlResult?.reason || 'challenge-control-failed',
+    origin: origin || null,
+    transport: controlResult?.result?.transport || null,
+    gatewayId: controlResult?.result?.gatewayId || null
   }
 }
 
@@ -1740,10 +1834,6 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
   }
   if (!config?.nostr_nsec_hex) {
     return { status: 'skipped', reason: 'missing-nostr-credentials' }
-  }
-  const fetchImpl = globalThis.fetch
-  if (typeof fetchImpl !== 'function') {
-    return { status: 'skipped', reason: 'fetch-unavailable' }
   }
 
   const normalizedEntries = Array.isArray(cores)
@@ -1764,129 +1854,70 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
   }
 
   const originList = Array.isArray(origins) && origins.length ? origins : collectPublicGatewayOrigins()
-  const encodedRelay = encodeURIComponent(relayIdentifier)
   let lastError = null
 
-  for (const origin of originList) {
-    if (!origin) continue
-    const base = origin.replace(/\/$/, '')
-    const challengeResult = await fetchOpenJoinChallenge(relayIdentifier, {
-      origin: base,
+  const controlChallengeResult = await requestPublicGatewayControl(
+    CONTROL_METHODS.OPEN_JOIN_CHALLENGE,
+    {
+      relayKey: relayIdentifier,
       purpose: OPEN_JOIN_APPEND_CORES_PURPOSE
-    })
-    if (!challengeResult || challengeResult.status !== 'ok') {
-      lastError = new Error(challengeResult?.reason || 'challenge failed')
-      console.warn('[Worker] Open join append challenge failed', {
-        relayIdentifier,
-        origin: base,
-        reason: challengeResult?.reason || null
-      })
-      continue
+    },
+    {
+      hedged: true
     }
-    const challengeData = challengeResult.data
-    const challenge = challengeData?.challenge || null
-    if (!challenge) {
-      lastError = new Error('challenge missing')
-      continue
-    }
-    const resolvedPublicIdentifier = publicIdentifier || challengeData?.publicIdentifier || relayIdentifier
-    const tags = [
-      ['relay', base],
-      ['challenge', challenge],
-      ['purpose', OPEN_JOIN_APPEND_CORES_PURPOSE]
-    ]
-    if (resolvedPublicIdentifier) {
-      tags.push(['h', resolvedPublicIdentifier])
-    }
-    const unsigned = {
-      kind: 22242,
-      created_at: Math.floor(Date.now() / 1000),
-      pubkey: authPubkey,
-      tags,
-      content: ''
-    }
-    const authEvent = await NostrUtils.signEvent(unsigned, config.nostr_nsec_hex)
-    let authVerified = null
+  )
+  if (controlChallengeResult?.status === 'ok') {
     try {
-      authVerified = await NostrUtils.verifySignature(authEvent)
-    } catch (error) {
-      authVerified = false
-      console.warn('[Worker] Open join append auth event verification threw', {
-        relayIdentifier,
-        origin: base,
-        error: error?.message || error
-      })
-    }
-    if (authVerified === false) {
-      console.warn('[Worker] Open join append auth event verification failed', {
-        relayIdentifier,
-        origin: base,
-        pubkeyPrefix: authEvent?.pubkey ? String(authEvent.pubkey).slice(0, 12) : null,
-        idPrefix: authEvent?.id ? String(authEvent.id).slice(0, 12) : null,
-        sigPrefix: authEvent?.sig ? String(authEvent.sig).slice(0, 12) : null
-      })
-    }
+      const challengeData = controlChallengeResult.result?.data || {}
+      const challenge = challengeData?.challenge || null
+      if (challenge) {
+        const controlOrigin = challengeData?.gateway || originList[0] || null
+        const resolvedPublicIdentifier = publicIdentifier || challengeData?.publicIdentifier || relayIdentifier
+        const tags = [
+          ['relay', controlOrigin || ''],
+          ['challenge', challenge],
+          ['purpose', OPEN_JOIN_APPEND_CORES_PURPOSE]
+        ]
+        if (resolvedPublicIdentifier) {
+          tags.push(['h', resolvedPublicIdentifier])
+        }
+        const authEvent = await NostrUtils.signEvent({
+          kind: 22242,
+          created_at: Math.floor(Date.now() / 1000),
+          pubkey: authPubkey,
+          tags,
+          content: ''
+        }, config.nostr_nsec_hex)
 
-    const appendUrl = `${base}/api/relays/${encodedRelay}/open-join/append-cores`
-    const payload = {
-      authEvent,
-      cores: normalizedEntries
-    }
-    if (resolvedPublicIdentifier) payload.publicIdentifier = resolvedPublicIdentifier
-
-    const controller = typeof AbortController === 'function' ? new AbortController() : null
-    const timer = controller
-      ? setTimeout(() => controller.abort(), OPEN_JOIN_APPEND_CORES_TIMEOUT_MS)
-      : null
-    try {
-      const response = await fetchImpl(appendUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: controller?.signal
-      })
-      if (!response.ok) {
-        let body = null
-        try {
-          body = await response.text()
-        } catch (_) {}
-        lastError = new Error(`open-join-append status ${response.status}`)
-        console.warn('[Worker] Open join append request failed', {
-          relayIdentifier,
-          origin: base,
-          status: response.status,
-          body: body ? body.slice(0, 200) : null
-        })
-        continue
+        const appendResult = await requestPublicGatewayControl(
+          CONTROL_METHODS.OPEN_JOIN_APPEND_CORES,
+          {
+            relayKey: relayIdentifier,
+            authEvent,
+            cores: normalizedEntries,
+            publicIdentifier: resolvedPublicIdentifier || undefined
+          },
+          {
+            hedged: false,
+            gatewayId: controlChallengeResult.result?.gatewayId || undefined
+          }
+        )
+        if (appendResult?.status === 'ok' && appendResult?.result?.data) {
+          return {
+            status: 'ok',
+            origin: controlOrigin || null,
+            transport: appendResult.result?.transport || null,
+            gatewayId: appendResult.result?.gatewayId || null,
+            data: appendResult.result.data
+          }
+        }
+        lastError = new Error(appendResult?.reason || 'open-join-append-control-failed')
       }
-      const data = await response.json().catch(() => null)
-      if (!data || typeof data !== 'object') {
-        lastError = new Error('open-join-append invalid payload')
-        console.warn('[Worker] Open join append response invalid payload', {
-          relayIdentifier,
-          origin: base
-        })
-        continue
-      }
-      console.log('[Worker] Open join append response', {
-        relayIdentifier,
-        origin: base,
-        added: data?.added ?? null,
-        ignored: data?.ignored ?? null,
-        rejected: data?.rejected ?? null,
-        total: data?.total ?? null
-      })
-      return { status: 'ok', origin: base, data }
     } catch (error) {
       lastError = error
-      console.warn('[Worker] Open join append request threw', {
-        relayIdentifier,
-        origin: base,
-        error: error?.message || error
-      })
-    } finally {
-      if (timer) clearTimeout(timer)
     }
+  } else if (controlChallengeResult?.status === 'error') {
+    lastError = controlChallengeResult.error || new Error(controlChallengeResult.reason || 'control-challenge-failed')
   }
 
   return {
@@ -1936,10 +1967,6 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
   if (!config?.nostr_nsec_hex) {
     return { status: 'skipped', reason: 'missing-nostr-credentials' }
   }
-  const fetchImpl = globalThis.fetch
-  if (typeof fetchImpl !== 'function') {
-    return { status: 'skipped', reason: 'fetch-unavailable' }
-  }
 
   const originList = Array.isArray(origins) && origins.length ? origins : collectPublicGatewayOrigins()
   console.log('[Worker] Open join bootstrap start', {
@@ -1948,7 +1975,6 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
     origins: originList,
     reason
   })
-  const encodedRelay = encodeURIComponent(relayIdentifier)
   let lastError = null
   let authPubkey = null
 
@@ -1961,164 +1987,65 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
     return { status: 'skipped', reason: 'nostr-pubkey-derivation-failed' }
   }
 
-  for (const origin of originList) {
-    if (!origin) continue
-    const base = origin.replace(/\/$/, '')
-    const controller = typeof AbortController === 'function' ? new AbortController() : null
-    const timer = controller
-      ? setTimeout(() => controller.abort(), OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS)
-      : null
+  const controlChallengeResult = await requestPublicGatewayControl(
+    CONTROL_METHODS.OPEN_JOIN_CHALLENGE,
+    {
+      relayKey: relayIdentifier
+    },
+    {
+      hedged: true
+    }
+  )
+  if (controlChallengeResult?.status === 'ok') {
     try {
-      const challengeUrl = `${base}/api/relays/${encodedRelay}/open-join/challenge`
-      const challengeResponse = await fetchImpl(challengeUrl, { signal: controller?.signal })
-      if (!challengeResponse.ok) {
-        let body = null
-        try {
-          body = await challengeResponse.text()
-        } catch (_) {}
-        console.warn('[Worker] Open join challenge failed', {
-          relayIdentifier,
-          origin: base,
-          status: challengeResponse.status,
-          body: body ? body.slice(0, 200) : null
-        })
-        lastError = new Error(`challenge status ${challengeResponse.status}`)
-        continue
-      }
-      const challengeData = await challengeResponse.json().catch(() => null)
-      if (!challengeData || typeof challengeData !== 'object') {
-        console.warn('[Worker] Open join challenge invalid payload', {
-          relayIdentifier,
-          origin: base
-        })
-        lastError = new Error('challenge invalid payload')
-        continue
-      }
+      const challengeData = controlChallengeResult.result?.data || {}
       const challenge = challengeData?.challenge || null
-      if (!challenge) {
-        console.warn('[Worker] Open join challenge missing', {
-          relayIdentifier,
-          origin: base
-        })
-        lastError = new Error('challenge missing')
-        continue
-      }
+      if (challenge) {
+        const publicIdentifier = challengeData?.publicIdentifier || relayIdentifier
+        const controlOrigin = challengeData?.gateway || originList[0] || null
+        const tags = [
+          ['relay', controlOrigin || ''],
+          ['challenge', challenge]
+        ]
+        if (publicIdentifier) {
+          tags.push(['h', publicIdentifier])
+        }
+        const authEvent = await NostrUtils.signEvent({
+          kind: 22242,
+          created_at: Math.floor(Date.now() / 1000),
+          pubkey: authPubkey,
+          tags,
+          content: ''
+        }, config.nostr_nsec_hex)
 
-      const publicIdentifier = challengeData?.publicIdentifier || relayIdentifier
-      console.log('[Worker] Open join challenge ok', {
-        relayIdentifier,
-        origin: base,
-        relayKey: challengeData?.relayKey ? String(challengeData.relayKey).slice(0, 16) : null,
-        relayKeyType: describeRelayIdentifierType(challengeData?.relayKey),
-        publicIdentifier,
-        expiresAt: challengeData?.expiresAt || null
-      })
-      const tags = [
-        ['relay', base],
-        ['challenge', challenge]
-      ]
-      if (publicIdentifier) {
-        tags.push(['h', publicIdentifier])
-      }
-      const unsigned = {
-        kind: 22242,
-        created_at: Math.floor(Date.now() / 1000),
-        pubkey: authPubkey,
-        tags,
-        content: ''
-      }
-      const authEvent = await NostrUtils.signEvent(unsigned, config.nostr_nsec_hex)
-      let authVerified = null
-      try {
-        authVerified = await NostrUtils.verifySignature(authEvent)
-      } catch (error) {
-        authVerified = false
-        console.warn('[Worker] Open join auth event verification threw', {
-          relayIdentifier,
-          origin: base,
-          error: error?.message || error
-        })
-      }
-      if (authVerified === false) {
-        console.warn('[Worker] Open join auth event verification failed', {
-          relayIdentifier,
-          origin: base,
-          pubkeyPrefix: authEvent?.pubkey ? String(authEvent.pubkey).slice(0, 12) : null,
-          idPrefix: authEvent?.id ? String(authEvent.id).slice(0, 12) : null,
-          sigPrefix: authEvent?.sig ? String(authEvent.sig).slice(0, 12) : null
-        })
-      }
-      console.log('[Worker] Open join auth event signed', {
-        relayIdentifier,
-        origin: base,
-        verified: authVerified,
-        pubkeyPrefix: authEvent?.pubkey ? String(authEvent.pubkey).slice(0, 12) : null,
-        idPrefix: authEvent?.id ? String(authEvent.id).slice(0, 12) : null,
-        sigPrefix: authEvent?.sig ? String(authEvent.sig).slice(0, 12) : null,
-        tagCount: Array.isArray(authEvent?.tags) ? authEvent.tags.length : 0
-      })
+        const leaseResult = await requestPublicGatewayControl(
+          CONTROL_METHODS.OPEN_JOIN_LEASE_CLAIM,
+          {
+            relayKey: relayIdentifier,
+            authEvent
+          },
+          {
+            hedged: false,
+            gatewayId: controlChallengeResult.result?.gatewayId || undefined
+          }
+        )
 
-      const joinUrl = `${base}/api/relays/${encodedRelay}/open-join`
-      const joinResponse = await fetchImpl(joinUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ authEvent })
-      })
-      if (!joinResponse.ok) {
-        let body = null
-        try {
-          body = await joinResponse.text()
-        } catch (_) {}
-        console.warn('[Worker] Open join request failed', {
-          relayIdentifier,
-          origin: base,
-          status: joinResponse.status,
-          body: body ? body.slice(0, 200) : null
-        })
-        lastError = new Error(`open-join status ${joinResponse.status}`)
-        continue
-      }
-      const data = await joinResponse.json().catch(() => null)
-      if (!data || typeof data !== 'object') {
-        console.warn('[Worker] Open join response invalid payload', {
-          relayIdentifier,
-          origin: base
-        })
-        lastError = new Error('open-join invalid payload')
-        continue
-      }
-      const dataBlindPeer = data.blindPeer || data.blind_peer || null
-      console.log('[Worker] Open join bootstrap response', {
-        relayIdentifier,
-        origin: base,
-        relayKey: previewValue(data.relayKey || data.relay_key, 16),
-        relayKeyType: describeRelayIdentifierType(data.relayKey || data.relay_key),
-        publicIdentifier: data.publicIdentifier || data.public_identifier || null,
-        hasWriterCore: !!data.writerCore,
-        hasWriterCoreHex: !!(data.writerCoreHex || data.writer_core_hex),
-        hasAutobaseLocal: !!(data.autobaseLocal || data.autobase_local),
-        writerCorePrefix: previewValue(data.writerCore, 16),
-        writerCoreHexPrefix: previewValue(
-          data.writerCoreHex || data.writer_core_hex || data.autobaseLocal || data.autobase_local,
-          16
-        ),
-        writerSecretLen: data.writerSecret ? String(data.writerSecret).length : 0,
-        coreRefsCount: Array.isArray(data.cores) ? data.cores.length : 0,
-        blindPeerKey: previewValue(dataBlindPeer?.publicKey, 16),
-        blindPeerHasEncryptionKey: !!dataBlindPeer?.encryptionKey,
-        issuedAt: data.issuedAt ?? null,
-        expiresAt: data.expiresAt ?? null
-      })
-      return {
-        status: 'ok',
-        origin: base,
-        data
+        if (leaseResult?.status === 'ok' && leaseResult?.result?.data) {
+          return {
+            status: 'ok',
+            origin: controlOrigin || null,
+            transport: leaseResult.result?.transport || null,
+            gatewayId: leaseResult.result?.gatewayId || null,
+            data: leaseResult.result.data
+          }
+        }
+        lastError = new Error(leaseResult?.reason || 'open-join-lease-control-failed')
       }
     } catch (error) {
       lastError = error
-    } finally {
-      if (timer) clearTimeout(timer)
     }
+  } else if (controlChallengeResult?.status === 'error') {
+    lastError = controlChallengeResult.error || new Error(controlChallengeResult.reason || 'control-open-join-failed')
   }
 
   return {
@@ -2132,56 +2059,32 @@ async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mi
   if (!relayKey) {
     return { status: 'skipped', reason: 'missing-relay-key' }
   }
-  const relayKeyType = describeRelayIdentifierType(relayKey)
-  const fetchImpl = globalThis.fetch
-  if (typeof fetchImpl !== 'function') {
-    return { status: 'skipped', reason: 'fetch-unavailable' }
-  }
-
   const originList = Array.isArray(origins) && origins.length ? origins : collectPublicGatewayOrigins()
-  const encodedRelay = encodeURIComponent(relayKey)
   let lastError = null
 
-  for (const origin of originList) {
-    if (!origin) continue
-    const url = `${origin.replace(/\/$/, '')}/api/relays/${encodedRelay}/mirror`
-    const controller = typeof AbortController === 'function' ? new AbortController() : null
-    const timer = controller
-      ? setTimeout(() => controller.abort(), BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS)
-      : null
-    try {
-      console.log('[Worker] Mirror metadata request', {
-        relayKey,
-        relayKeyType,
-        origin,
-        reason
-      })
-      const response = await fetchImpl(url, { signal: controller?.signal })
-      if (!response.ok) {
-        lastError = new Error(`status ${response.status}`)
-        continue
-      }
-      const data = await response.json().catch(() => null)
-      if (!data || typeof data !== 'object') {
-        lastError = new Error('invalid-payload')
-        continue
-      }
-      const mirrorBlindPeer = data.blindPeer || data.blind_peer || null
-      console.log('[Worker] Mirror metadata response', {
-        relayKey,
-        origin,
-        resolvedRelayKey: previewValue(data.relayKey || data.relay_key, 16),
-        publicIdentifier: data.publicIdentifier || data.public_identifier || null,
-        coreRefsCount: Array.isArray(data.cores) ? data.cores.length : 0,
-        blindPeerKey: previewValue(mirrorBlindPeer?.publicKey, 16),
-        blindPeerHasEncryptionKey: !!mirrorBlindPeer?.encryptionKey
-      })
-      return { status: 'ok', origin, data }
-    } catch (error) {
-      lastError = error
-    } finally {
-      if (timer) clearTimeout(timer)
+  const controlMirrorResult = await requestPublicGatewayControl(
+    CONTROL_METHODS.MIRROR_READ,
+    {
+      relayKey
+    },
+    {
+      hedged: true
     }
+  )
+  if (controlMirrorResult?.status === 'ok') {
+    const data = controlMirrorResult?.result?.data || null
+    if (data && typeof data === 'object') {
+      return {
+        status: 'ok',
+        origin: data?.gateway || originList[0] || null,
+        transport: controlMirrorResult?.result?.transport || null,
+        gatewayId: controlMirrorResult?.result?.gatewayId || null,
+        data
+      }
+    }
+    lastError = new Error('control-mirror-invalid-payload')
+  } else if (controlMirrorResult?.status === 'error') {
+    lastError = controlMirrorResult.error || new Error(controlMirrorResult.reason || 'control-mirror-failed')
   }
 
   if (lastError) {
@@ -2594,8 +2497,13 @@ async function startGatewayService(options = {}) {
     gatewayService = new GatewayService({
       publicGateway: publicGatewaySettings,
       getCurrentPubkey: () => config?.nostr_pubkey_hex || null,
+      getCurrentPrivateKey: () => config?.nostr_nsec_hex || null,
       getOwnPeerPublicKey: () => config?.swarmPublicKey || deriveSwarmPublicKey(config),
-      openJoinPoolProvider: ensureOpenJoinWriterPool
+      getGatewayFollowedPubkeys: () => gatewayTrustFixture?.followsByMe || [],
+      getGatewayFollowerPubkeys: () => gatewayTrustFixture?.followersOfMe || [],
+      getGatewayAttestations: () => gatewayTrustFixture?.attestations || [],
+      openJoinPoolProvider: ensureOpenJoinWriterPool,
+      closedJoinPoolProvider: ensureClosedJoinWriterPool
     })
     global.gatewayService = gatewayService
     gatewayService.on('log', (entry) => {
@@ -2890,6 +2798,7 @@ let gatewaySettingsApplied = false
 let gatewayOptions = { port: 8443, hostname: '127.0.0.1', listenHost: '127.0.0.1' }
 let publicGatewaySettings = null
 let publicGatewayStatusCache = null
+let gatewayTrustFixture = normalizeGatewayTrustFixture({})
 let pendingGatewayMetadataSync = false
 let marmotService = null
 let conversationFileIndex = null
@@ -4986,6 +4895,60 @@ async function handleMessageObject(message) {
         sendMessage({ type: 'public-gateway-config', config: next })
       } catch (err) {
         sendMessage({ type: 'public-gateway-error', message: err.message })
+      }
+      break
+    }
+
+    case 'set-gateway-trust-fixture': {
+      const requestId = extractMessageRequestId(message)
+      try {
+        const payload = message?.data && typeof message.data === 'object' ? message.data : {}
+        gatewayTrustFixture = normalizeGatewayTrustFixture(payload?.fixture || {})
+        if (gatewayService) {
+          await gatewayService.updatePublicGatewayConfig(publicGatewaySettings || {})
+          publicGatewayStatusCache = gatewayService.getPublicGatewayState()
+          sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
+        }
+        sendMessage({ type: 'gateway-trust-fixture', fixture: gatewayTrustFixture })
+        sendWorkerResponse(requestId, { success: true, data: gatewayTrustFixture })
+      } catch (err) {
+        sendWorkerResponse(requestId, { success: false, error: err?.message || String(err) })
+        sendMessage({ type: 'public-gateway-error', message: err?.message || String(err) })
+      }
+      break
+    }
+
+    case 'get-gateway-trust-fixture': {
+      const fixture = gatewayTrustFixture || normalizeGatewayTrustFixture({})
+      sendMessage({ type: 'gateway-trust-fixture', fixture })
+      sendWorkerResponse(extractMessageRequestId(message), { success: true, data: fixture })
+      break
+    }
+
+    case 'run-control-method': {
+      const requestId = extractMessageRequestId(message)
+      try {
+        const payloadRoot = message?.data && typeof message.data === 'object' ? message.data : {}
+        const methodName = resolveControlMethodName(payloadRoot?.method || payloadRoot?.methodName)
+        if (!methodName) throw new Error('Unknown control method')
+        const payload = payloadRoot?.payload && typeof payloadRoot.payload === 'object' ? payloadRoot.payload : {}
+        const options = payloadRoot?.options && typeof payloadRoot.options === 'object' ? payloadRoot.options : {}
+        const result = await requestPublicGatewayControl(methodName, payload, options)
+        if (result?.status !== 'ok') {
+          throw result?.error || new Error(result?.reason || 'control-request-failed')
+        }
+        sendWorkerResponse(requestId, {
+          success: true,
+          data: {
+            methodName,
+            ...(result?.result || {})
+          }
+        })
+      } catch (err) {
+        sendWorkerResponse(requestId, {
+          success: false,
+          error: err?.message || String(err)
+        })
       }
       break
     }

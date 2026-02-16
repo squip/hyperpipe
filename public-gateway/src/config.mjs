@@ -5,6 +5,76 @@ const LEGACY_PUBLIC_GATEWAY_PATH = 'public-gateway/hyperbee';
 
 const DEFAULT_BLIND_PEER_MAX_BYTES = 25 * 1024 ** 3;
 
+function parseJsonEnv(value) {
+  if (!value || typeof value !== 'string') return null;
+  try {
+    return JSON.parse(value);
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeTrustPolicyInput(input = null) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const normalizeList = (values) => {
+    if (!Array.isArray(values)) return [];
+    return Array.from(new Set(values
+      .map((entry) => (typeof entry === 'string' ? entry.trim() : null))
+      .filter(Boolean)));
+  };
+
+  return {
+    explicitAllowlist: normalizeList(input.explicitAllowlist),
+    requireFollowedByMe: input.requireFollowedByMe !== false,
+    requireMutualFollow: input.requireMutualFollow === true,
+    minTrustedAttestations: Number.isFinite(Number(input.minTrustedAttestations))
+      ? Math.max(0, Math.round(Number(input.minTrustedAttestations)))
+      : 0,
+    acceptedAttestorPubkeys: normalizeList(input.acceptedAttestorPubkeys),
+    maxDescriptorAgeMs: Number.isFinite(Number(input.maxDescriptorAgeMs))
+      ? Math.max(60_000, Math.round(Number(input.maxDescriptorAgeMs)))
+      : (6 * 60 * 60 * 1000)
+  };
+}
+
+function normalizeTrustContextInput(input = null) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return {
+      followsByMe: [],
+      followersOfMe: [],
+      attestations: []
+    };
+  }
+  const normalizeList = (values) => {
+    if (!Array.isArray(values)) return [];
+    return Array.from(new Set(values
+      .map((entry) => (typeof entry === 'string' ? entry.trim() : null))
+      .filter(Boolean)));
+  };
+  const normalizeAttestation = (entry = {}) => {
+    if (!entry || typeof entry !== 'object') return null;
+    const attestorPubkey = typeof entry.attestorPubkey === 'string' ? entry.attestorPubkey.trim() : null;
+    const targetPubkey = typeof entry.targetPubkey === 'string' ? entry.targetPubkey.trim() : null;
+    if (!attestorPubkey || !targetPubkey) return null;
+    return {
+      attestorPubkey,
+      targetPubkey,
+      issuedAt: Number.isFinite(Number(entry.issuedAt)) ? Math.round(Number(entry.issuedAt)) : Date.now(),
+      expiresAt: Number.isFinite(Number(entry.expiresAt)) ? Math.round(Number(entry.expiresAt)) : null,
+      score: Number.isFinite(Number(entry.score)) ? Number(entry.score) : 1,
+      sourceEventId: typeof entry.sourceEventId === 'string' ? entry.sourceEventId.trim() : null
+    };
+  };
+
+  return {
+    followsByMe: normalizeList(input.followsByMe),
+    followersOfMe: normalizeList(input.followersOfMe),
+    attestations: Array.isArray(input.attestations)
+      ? input.attestations.map(normalizeAttestation).filter(Boolean)
+      : []
+  };
+}
+
 const DEFAULT_CONFIG = {
   host: '0.0.0.0',
   port: Number(process.env.PORT) || 4430,
@@ -22,6 +92,7 @@ const DEFAULT_CONFIG = {
     sharedSecret: process.env.GATEWAY_REGISTRATION_SECRET || null,
     redisUrl: process.env.GATEWAY_REGISTRATION_REDIS || null,
     redisPrefix: process.env.GATEWAY_REGISTRATION_REDIS_PREFIX || 'gateway:registrations:',
+    allowMemoryFallback: process.env.GATEWAY_REGISTRATION_ALLOW_MEMORY_FALLBACK === 'true',
     cacheTtlSeconds: Number(process.env.GATEWAY_REGISTRATION_TTL || 1800),
     mirrorTtlSeconds: Number(process.env.GATEWAY_MIRROR_METADATA_TTL || 86400),
     openJoinPoolTtlSeconds: Number(process.env.GATEWAY_OPEN_JOIN_POOL_TTL || 21600),
@@ -85,7 +156,9 @@ const DEFAULT_CONFIG = {
     challengeTtlMs: Number(process.env.GATEWAY_OPEN_JOIN_CHALLENGE_TTL_MS) || (2 * 60 * 1000),
     authWindowSeconds: Number(process.env.GATEWAY_OPEN_JOIN_AUTH_WINDOW || 300),
     maxPoolSize: Number(process.env.GATEWAY_OPEN_JOIN_MAX_POOL || 100)
-  }
+  },
+  trustPolicy: normalizeTrustPolicyInput(parseJsonEnv(process.env.GATEWAY_TRUST_POLICY_JSON)),
+  trustContext: normalizeTrustContextInput(parseJsonEnv(process.env.GATEWAY_TRUST_CONTEXT_JSON))
 };
 
 async function loadTlsOptions(tlsConfig) {
@@ -145,7 +218,9 @@ function loadConfig(overrides = {}) {
     openJoin: {
       ...DEFAULT_CONFIG.openJoin,
       ...(overrides.openJoin || {})
-    }
+    },
+    trustPolicy: normalizeTrustPolicyInput(overrides.trustPolicy || DEFAULT_CONFIG.trustPolicy),
+    trustContext: normalizeTrustContextInput(overrides.trustContext || DEFAULT_CONFIG.trustContext)
   };
 
   if (!merged.publicBaseUrl) {

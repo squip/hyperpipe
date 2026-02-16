@@ -1,0 +1,64 @@
+version: '3.9'
+
+services:
+  redis-a:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-b:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  gateway-a:
+    build:
+      context: ../../..
+      dockerfile: public-gateway/Dockerfile
+    depends_on:
+      redis-a:
+        condition: service_healthy
+    ports:
+      - "${GW_A_HOST_PORT}:4430"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 4430
+      GATEWAY_TLS_ENABLED: "false"
+      GATEWAY_PUBLIC_URL: ${GW_A_PUBLIC_URL}
+      GATEWAY_NOSTR_PUBKEY: ${GW_A_ID}
+      GATEWAY_FEDERATION_GATEWAY_ID: ${GW_A_ID}
+      GATEWAY_FEDERATION_MANIFEST_JSON: ${GW_A_MANIFEST_JSON}
+      GATEWAY_REGISTRATION_REDIS: redis://redis-a:6379
+      GATEWAY_REGISTRATION_ALLOW_MEMORY_FALLBACK: "false"
+      GATEWAY_TRUST_POLICY_JSON: ${GW_A_TRUST_POLICY_JSON}
+      GATEWAY_TRUST_CONTEXT_JSON: ${GW_A_TRUST_CONTEXT_JSON}
+
+  gateway-b:
+    build:
+      context: ../../..
+      dockerfile: public-gateway/Dockerfile
+    depends_on:
+      redis-b:
+        condition: service_healthy
+    ports:
+      - "${GW_B_HOST_PORT}:4430"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 4430
+      GATEWAY_TLS_ENABLED: "false"
+      GATEWAY_PUBLIC_URL: ${GW_B_PUBLIC_URL}
+      GATEWAY_NOSTR_PUBKEY: ${GW_B_ID}
+      GATEWAY_FEDERATION_GATEWAY_ID: ${GW_B_ID}
+      GATEWAY_FEDERATION_MANIFEST_JSON: ${GW_B_MANIFEST_JSON}
+      GATEWAY_REGISTRATION_REDIS: redis://redis-b:6379
+      GATEWAY_REGISTRATION_ALLOW_MEMORY_FALLBACK: "false"
+      GATEWAY_TRUST_POLICY_JSON: ${GW_B_TRUST_POLICY_JSON}
+      GATEWAY_TRUST_CONTEXT_JSON: ${GW_B_TRUST_CONTEXT_JSON}

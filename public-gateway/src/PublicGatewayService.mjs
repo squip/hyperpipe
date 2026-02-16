@@ -1,6 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import express from 'express';
 import WebSocket, { WebSocketServer } from 'ws';
@@ -15,11 +15,15 @@ import {
   getEventsFromPeerHyperswarm,
   requestFileFromPeer
 } from '../../shared/public-gateway/HyperswarmClient.mjs';
+import GatewayControlClientPool from '../../shared/public-gateway/GatewayControlClientPool.mjs';
 import { computeSecretHash } from '../../shared/public-gateway/GatewayDiscovery.mjs';
 import {
+  issueEd25519SessionToken,
+  verifyEd25519SessionToken,
   verifySignature,
   verifyClientToken
 } from '../../shared/auth/PublicGatewayTokens.mjs';
+import { CONTROL_METHODS } from '../../shared/public-gateway/ControlPlaneMethods.mjs';
 import {
   metricsMiddleware,
   sessionGauge,
@@ -50,9 +54,22 @@ import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGate
 import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hyperbeeReplicationChannel.mjs';
 import BlindPeerService from './blind-peer/BlindPeerService.mjs';
 import BlindPeerReplicaManager from './blind-peer/BlindPeerReplicaManager.mjs';
+import NostrGatewayDirectory from './discovery/NostrGatewayDirectory.mjs';
+import { TrustPolicyEngine } from './trust/TrustPolicyEngine.mjs';
+import RelayAuthorityPolicyService from './policy/RelayAuthorityPolicyService.mjs';
+import WriterEnvelopeService from './crypto/WriterEnvelopeService.mjs';
+import ControlHttpFallbackHandlers from './control/ControlHttpFallbackHandlers.mjs';
+import ControlRpcHandlers from './control/ControlRpcHandlers.mjs';
+import FederationManifestService from './mesh/FederationManifestService.mjs';
+import GatewayMeshProtocol from './mesh/GatewayMeshProtocol.mjs';
+import FederatedEventLog from './state/FederatedEventLog.mjs';
+import ProjectionStore from './state/ProjectionStore.mjs';
+import LeaseConsensusService from './leases/LeaseConsensusService.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores';
+const CLOSED_JOIN_LEASE_PURPOSE = 'closed-join';
+const CONTROL_SESSION_TTL_SECONDS = 60 * 30;
 
 function safeString(value) {
   if (typeof value === 'string') return value;
@@ -91,6 +108,68 @@ class PublicGatewayService {
     this.sharedSecretVersion = this.explicitSharedSecretVersion;
     this.secretEndpointPath = this.#normalizeSecretPath(this.discoveryConfig?.secretPath);
     this.wsBaseUrl = this.#computeWsBase(this.config.publicBaseUrl);
+    this.controlChallenges = new Map();
+    this.controlSessionTtlSeconds = Number.isFinite(Number(this.config?.control?.sessionTtlSeconds))
+      ? Math.max(60, Math.round(Number(this.config.control.sessionTtlSeconds)))
+      : CONTROL_SESSION_TTL_SECONDS;
+    const configuredSessionPrivateKey = this.config?.control?.sessionPrivateKeyPem
+      || process.env.GATEWAY_CONTROL_SESSION_PRIVATE_KEY
+      || null;
+    const configuredSessionPublicKey = this.config?.control?.sessionPublicKeyPem
+      || process.env.GATEWAY_CONTROL_SESSION_PUBLIC_KEY
+      || null;
+    if (configuredSessionPrivateKey && configuredSessionPublicKey) {
+      this.controlSessionPrivateKey = configuredSessionPrivateKey;
+      this.controlSessionPublicKey = configuredSessionPublicKey;
+    } else {
+      const generated = generateKeyPairSync('ed25519');
+      this.controlSessionPrivateKey = generated.privateKey;
+      this.controlSessionPublicKey = generated.publicKey;
+    }
+    this.nostrGatewayDirectory = new NostrGatewayDirectory({ logger: this.logger });
+    this.trustPolicyEngine = new TrustPolicyEngine({
+      policy: this.config?.trustPolicy || {},
+      logger: this.logger
+    });
+    this.relayAuthorityPolicyService = new RelayAuthorityPolicyService({
+      logger: this.logger,
+      store: this.registrationStore,
+      defaultGatewayPubkey: this.#deriveLocalGatewayPubkey()
+    });
+    this.writerEnvelopeService = new WriterEnvelopeService({ logger: this.logger });
+    this.controlRpcHandlers = new ControlRpcHandlers({
+      logger: this.logger,
+      delegates: this.#buildControlRpcDelegates()
+    });
+    this.federationManifestService = new FederationManifestService({
+      config: this.config?.federation || {},
+      logger: this.logger
+    });
+    this.federatedEventLog = new FederatedEventLog({ logger: this.logger });
+    this.projectionStore = new ProjectionStore({
+      registrationStore: this.registrationStore,
+      eventLog: this.federatedEventLog,
+      logger: this.logger
+    });
+    const manifest = this.federationManifestService.getManifest();
+    const gatewayPublicKeys = {};
+    for (const gateway of manifest?.gateways || []) {
+      if (!gateway?.id || !gateway?.publicKeyPem) continue;
+      gatewayPublicKeys[gateway.id] = gateway.publicKeyPem;
+    }
+    this.leaseConsensusService = new LeaseConsensusService({
+      manifestService: this.federationManifestService,
+      eventLog: this.federatedEventLog,
+      logger: this.logger,
+      gatewayId: this.#deriveLocalGatewayPubkey(),
+      gatewayPrivateKey: this.controlSessionPrivateKey,
+      gatewayPublicKeys,
+      requestVote: async ({ voter, proposal }) => this.#requestLeaseVoteFromGateway(voter, proposal)
+    });
+    this.gatewayMeshProtocol = new GatewayMeshProtocol({
+      logger: this.logger,
+      manifestService: this.federationManifestService
+    });
     this.gatewayAdvertiser = null;
     if (this.discoveryConfig?.enabled && this.discoveryConfig.openAccess && this.sharedSecret) {
       this.gatewayAdvertiser = new GatewayAdvertiser({
@@ -153,6 +232,14 @@ class PublicGatewayService {
     this.relayPeerIndex = new Map();
     this.peerMetadata = new Map();
     this.peerRawPublicKeys = new Map();
+    this.meshGatewayProtocols = new Map();
+    this.federationControlClientPool = new GatewayControlClientPool({
+      gateways: this.#buildFederationGatewayMap(),
+      preferredGatewayIds: [],
+      connectionPool: this.connectionPool,
+      logger: this.logger
+    });
+    this.meshStateSyncInterval = null;
     this.peerHyperbeeReplications = new Map();
     this.publicGatewayStatusUpdatedAt = null;
     this.blindPeerService = null;
@@ -214,6 +301,9 @@ class PublicGatewayService {
   async init() {
     this.#setupHttpServer();
     await this.connectionPool.initialize();
+    this.#refreshLocalGatewayDescriptor();
+    this.#refreshFederationControlClientPool();
+    this.#startMeshStateSyncLoop();
     if (Number.isFinite(this.config?.registration?.relayGcAfterMs) && this.config.registration.relayGcAfterMs > 0) {
       this.logger?.info?.('[PublicGateway] Relay GC policy enabled', {
         relayGcAfterMs: this.config.registration.relayGcAfterMs,
@@ -258,6 +348,14 @@ class PublicGatewayService {
       await this.blindPeerService.initialize();
       await this.#initializeBlindPeerReplicaManager();
     }
+    if (this.projectionStore) {
+      await this.projectionStore.rebuildFromLog().catch((error) => {
+        this.logger?.warn?.('[PublicGateway] Failed to rebuild projection store from log', {
+          error: error?.message || error
+        });
+      });
+      this.projectionStore.start();
+    }
     this.logger.info('PublicGatewayService initialized');
   }
 
@@ -299,6 +397,8 @@ class PublicGatewayService {
   }
 
   async stop() {
+    this.#stopMeshStateSyncLoop();
+
     if (this.healthInterval) {
       clearInterval(this.healthInterval);
       this.healthInterval = null;
@@ -363,6 +463,7 @@ class PublicGatewayService {
     await this.blindPeerService?.stop();
     await this.blindPeerReplicaManager?.stop();
     this.blindPeerReplicaManager = null;
+    this.projectionStore?.stop?.();
 
     for (const timer of this.dispatcherAssignmentTimers.values()) {
       clearTimeout(timer);
@@ -499,11 +600,562 @@ class PublicGatewayService {
     app.post('/api/relay-tokens/refresh', (req, res) => this.#handleTokenRefresh(req, res));
     app.post('/api/relay-tokens/revoke', (req, res) => this.#handleTokenRevoke(req, res));
 
+    const controlHttpHandlers = new ControlHttpFallbackHandlers({
+      app,
+      logger: this.logger,
+      delegates: this.#buildControlHttpDelegates()
+    });
+    controlHttpHandlers.register();
+
     const serverFactory = this.tlsOptions ? https.createServer : http.createServer;
     this.server = serverFactory(this.tlsOptions || {}, app);
 
     this.wss = new WebSocketServer({ server: this.server });
     this.wss.on('connection', (ws, req) => this.#handleWebSocket(ws, req));
+  }
+
+  #deriveLocalGatewayPubkey() {
+    const configured = this.config?.identity?.nostrPubkey || process.env.GATEWAY_NOSTR_PUBKEY || null;
+    if (typeof configured === 'string' && configured.trim()) {
+      return configured.trim();
+    }
+    const poolPubkey = this.connectionPool?.getPublicKey?.() || null;
+    if (typeof poolPubkey === 'string' && poolPubkey.trim()) {
+      return poolPubkey.trim();
+    }
+    return null;
+  }
+
+  #refreshLocalGatewayDescriptor() {
+    const gatewayPubkey = this.#deriveLocalGatewayPubkey();
+    if (!gatewayPubkey) return;
+    const now = Date.now();
+    this.nostrGatewayDirectory.upsertDescriptor({
+      gatewayPubkey,
+      issuedAt: now,
+      expiresAt: now + (60 * 60 * 1000),
+      controlP2P: {
+        topic: this.config?.control?.topic || 'hypertuna-gateway-control-v2',
+        protocol: 'gateway-control-v2',
+        swarmPublicKey: gatewayPubkey
+      },
+      controlHttp: this.config?.publicBaseUrl ? { baseUrl: this.config.publicBaseUrl } : null,
+      bridgeHttp: this.config?.publicBaseUrl ? { baseUrl: this.config.publicBaseUrl } : null,
+      stateFeeds: [],
+      capabilities: ['control', 'open-join', 'closed-join', 'mirror'],
+      descriptorVersion: 1
+    });
+    this.#refreshFederationControlClientPool();
+  }
+
+  #buildFederationGatewayMap() {
+    const gateways = {};
+    const normalizeSwarmPublicKey = (value) => {
+      if (typeof value !== 'string') return null;
+      const trimmed = value.trim().toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(trimmed)) return null;
+      return trimmed;
+    };
+    const addGateway = (entry = {}) => {
+      const id = typeof entry?.id === 'string' && entry.id.trim()
+        ? entry.id.trim()
+        : (typeof entry?.gatewayPubkey === 'string' && entry.gatewayPubkey.trim()
+            ? entry.gatewayPubkey.trim()
+            : null);
+      if (!id) return;
+      const existing = gateways[id] || {};
+      const swarmPublicKey = existing.swarmPublicKey
+        || entry?.controlP2P?.swarmPublicKey
+        || entry?.swarmPublicKey
+        || null;
+      const controlTopic = existing.controlTopic
+        || entry?.controlP2P?.topic
+        || entry?.controlTopic
+        || null;
+      const baseUrl = existing.baseUrl
+        || entry?.controlHttp?.baseUrl
+        || entry?.baseUrl
+        || null;
+      const wsUrl = existing.wsUrl
+        || entry?.bridgeHttp?.baseUrl
+        || entry?.wsUrl
+        || null;
+      gateways[id] = {
+        ...existing,
+        id,
+        swarmPublicKey: normalizeSwarmPublicKey(swarmPublicKey),
+        controlTopic: typeof controlTopic === 'string' && controlTopic.trim() ? controlTopic.trim() : null,
+        baseUrl: typeof baseUrl === 'string' && baseUrl.trim() ? baseUrl.trim() : null,
+        wsUrl: typeof wsUrl === 'string' && wsUrl.trim() ? wsUrl.trim() : null,
+        health: existing.health || 'healthy'
+      };
+    };
+
+    const manifest = this.federationManifestService?.getManifest?.();
+    for (const gateway of manifest?.gateways || []) {
+      addGateway({
+        id: gateway?.id || null,
+        swarmPublicKey: gateway?.swarmPublicKey || gateway?.controlP2P?.swarmPublicKey || null,
+        controlTopic: gateway?.controlP2P?.topic || null,
+        controlHttp: gateway?.controlHttp || null,
+        bridgeHttp: gateway?.bridgeHttp || null
+      });
+    }
+
+    const catalog = this.nostrGatewayDirectory?.buildCatalog?.({ includeExpired: false });
+    for (const descriptor of catalog?.descriptors || []) {
+      addGateway({
+        id: descriptor?.gatewayPubkey || null,
+        controlP2P: descriptor?.controlP2P || null,
+        controlHttp: descriptor?.controlHttp || null,
+        bridgeHttp: descriptor?.bridgeHttp || null
+      });
+    }
+
+    return gateways;
+  }
+
+  #refreshFederationControlClientPool() {
+    const gateways = this.#buildFederationGatewayMap();
+    this.federationControlClientPool?.updateGateways?.({
+      gateways,
+      preferredGatewayIds: []
+    });
+  }
+
+  #buildTrustEvaluationContext({ catalogAttestations = [] } = {}) {
+    const contextConfig = this.config?.trustContext && typeof this.config.trustContext === 'object'
+      ? this.config.trustContext
+      : {};
+    const followsByMe = new Set(
+      (Array.isArray(contextConfig.followsByMe) ? contextConfig.followsByMe : [])
+        .map((entry) => (typeof entry === 'string' ? entry.trim() : null))
+        .filter(Boolean)
+    );
+    const followersOfMe = new Set(
+      (Array.isArray(contextConfig.followersOfMe) ? contextConfig.followersOfMe : [])
+        .map((entry) => (typeof entry === 'string' ? entry.trim() : null))
+        .filter(Boolean)
+    );
+    const attestations = [
+      ...(Array.isArray(contextConfig.attestations) ? contextConfig.attestations : []),
+      ...(Array.isArray(catalogAttestations) ? catalogAttestations : [])
+    ].filter((entry) => entry && typeof entry === 'object');
+    return {
+      followsByMe,
+      followersOfMe,
+      attestations
+    };
+  }
+
+  #filterTrustedGatewayDescriptors(descriptors = [], { catalogAttestations = [] } = {}) {
+    const context = this.#buildTrustEvaluationContext({ catalogAttestations });
+    let filtered = this.trustPolicyEngine.filterTrustedGateways(descriptors, context);
+    const hasSocialContext = context.followsByMe.size > 0
+      || context.followersOfMe.size > 0
+      || context.attestations.length > 0;
+    const hasExplicitAllowlist = Array.isArray(this.trustPolicyEngine?.policy?.explicitAllowlist)
+      && this.trustPolicyEngine.policy.explicitAllowlist.length > 0;
+    if (!filtered.trusted.length && !hasSocialContext && !hasExplicitAllowlist) {
+      filtered = {
+        trusted: descriptors.map((descriptor) => ({
+          descriptor,
+          evaluation: {
+            trusted: true,
+            reason: 'no-social-graph-context'
+          }
+        })),
+        rejected: []
+      };
+    }
+    return filtered;
+  }
+
+  #trustedFederationGatewayIds(gatewaySnapshot = {}) {
+    const catalog = this.nostrGatewayDirectory?.buildCatalog?.({ includeExpired: false }) || {
+      descriptors: [],
+      attestations: []
+    };
+    const descriptorMap = new Map();
+    for (const descriptor of catalog.descriptors || []) {
+      if (!descriptor?.gatewayPubkey) continue;
+      descriptorMap.set(descriptor.gatewayPubkey, descriptor);
+    }
+    const snapshotGateways = Object.values(gatewaySnapshot || {});
+    for (const gateway of snapshotGateways) {
+      const gatewayId = typeof gateway?.id === 'string' ? gateway.id.trim() : null;
+      if (!gatewayId || descriptorMap.has(gatewayId)) continue;
+      descriptorMap.set(gatewayId, {
+        gatewayPubkey: gatewayId,
+        issuedAt: Number.isFinite(Number(gateway?.lastSeenAt)) ? Math.round(Number(gateway.lastSeenAt)) : Date.now(),
+        expiresAt: Date.now() + (60 * 60 * 1000),
+        controlP2P: {
+          topic: gateway?.controlTopic || null,
+          protocol: 'gateway-control-v2',
+          swarmPublicKey: gateway?.swarmPublicKey || null
+        },
+        controlHttp: gateway?.baseUrl ? { baseUrl: gateway.baseUrl } : null,
+        bridgeHttp: gateway?.wsUrl ? { baseUrl: gateway.wsUrl } : null
+      });
+    }
+    const filtered = this.#filterTrustedGatewayDescriptors(
+      Array.from(descriptorMap.values()),
+      { catalogAttestations: catalog.attestations || [] }
+    );
+    return new Set(filtered.trusted
+      .map((entry) => entry?.descriptor?.gatewayPubkey || null)
+      .filter(Boolean));
+  }
+
+  async #syncMeshCatalogFromFederationGateways() {
+    const pool = this.federationControlClientPool;
+    if (!pool?.request) return;
+    const localGatewayId = this.#deriveLocalGatewayPubkey();
+    const snapshot = pool.getGatewaySnapshot?.() || {};
+    const trustedGatewayIds = this.#trustedFederationGatewayIds(snapshot.gateways || {});
+    for (const gateway of Object.values(snapshot.gateways || {})) {
+      const gatewayId = typeof gateway?.id === 'string' ? gateway.id.trim() : null;
+      if (!gatewayId || gatewayId === localGatewayId) continue;
+      if (!trustedGatewayIds.has(gatewayId)) continue;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const response = await pool.request(CONTROL_METHODS.MESH_CATALOG_READ, {}, {
+          gatewayId,
+          onlyGateway: true,
+          hedged: false,
+          timeoutMs: 5000
+        });
+        const payload = response?.data && typeof response.data === 'object' ? response.data : {};
+        const descriptors = Array.isArray(payload?.descriptors)
+          ? payload.descriptors
+          : (Array.isArray(payload?.trusted) ? payload.trusted : []);
+        for (const descriptor of descriptors) {
+          this.nostrGatewayDirectory.upsertDescriptor(descriptor);
+        }
+        if (Array.isArray(payload?.attestations)) {
+          for (const attestation of payload.attestations) {
+            this.nostrGatewayDirectory.addAttestation(attestation);
+          }
+        }
+      } catch (error) {
+        this.logger?.debug?.('[PublicGateway] Federation catalog pull failed', {
+          gatewayId,
+          error: error?.message || error
+        });
+      }
+    }
+    this.#refreshFederationControlClientPool();
+  }
+
+  async #syncMeshStateFromFederationGateways() {
+    const pool = this.federationControlClientPool;
+    if (!pool?.request) return;
+    const localGatewayId = this.#deriveLocalGatewayPubkey();
+    const snapshot = pool.getGatewaySnapshot?.() || {};
+    const trustedGatewayIds = this.#trustedFederationGatewayIds(snapshot.gateways || {});
+    for (const gateway of Object.values(snapshot.gateways || {})) {
+      const gatewayId = typeof gateway?.id === 'string' ? gateway.id.trim() : null;
+      if (!gatewayId || gatewayId === localGatewayId) continue;
+      if (!trustedGatewayIds.has(gatewayId)) continue;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const response = await pool.request(CONTROL_METHODS.MESH_STATE_READ, {
+          sinceSequence: 0,
+          limit: 5000
+        }, {
+          gatewayId,
+          onlyGateway: true,
+          hedged: false,
+          timeoutMs: 5000
+        });
+        const events = Array.isArray(response?.data?.events) ? response.data.events : [];
+        for (const event of events) {
+          const sourceGatewayId = typeof event?.metadata?.sourceGatewayId === 'string'
+            ? event.metadata.sourceGatewayId
+            : null;
+          if (sourceGatewayId && !this.#isManifestGateway(sourceGatewayId)) continue;
+          const appended = this.federatedEventLog.appendExternal(event, {
+            sourcePeerKey: gatewayId
+          });
+          if (appended?.eventType === 'LeaseCertificateCommitted') {
+            this.leaseConsensusService?.ingestCertificate?.(appended?.payload?.certificate || {});
+          }
+        }
+      } catch (error) {
+        this.logger?.debug?.('[PublicGateway] Federation state pull failed', {
+          gatewayId,
+          error: error?.message || error
+        });
+      }
+    }
+  }
+
+  #startMeshStateSyncLoop() {
+    this.#stopMeshStateSyncLoop();
+    const sync = async () => {
+      try {
+        await this.#syncMeshCatalogFromFederationGateways();
+        await this.#syncMeshStateFromFederationGateways();
+      } catch (error) {
+        this.logger?.debug?.('[PublicGateway] Mesh state sync loop failed', {
+          error: error?.message || error
+        });
+      }
+    };
+    this.meshStateSyncInterval = setInterval(sync, 15_000);
+    this.meshStateSyncInterval.unref?.();
+    sync().catch((error) => {
+      this.logger?.debug?.('[PublicGateway] Initial mesh sync failed', {
+        error: error?.message || error
+      });
+    });
+  }
+
+  #stopMeshStateSyncLoop() {
+    if (this.meshStateSyncInterval) {
+      clearInterval(this.meshStateSyncInterval);
+      this.meshStateSyncInterval = null;
+    }
+  }
+
+  #pruneControlChallenges() {
+    if (!this.controlChallenges?.size) return;
+    const now = Date.now();
+    for (const [challenge, entry] of this.controlChallenges.entries()) {
+      if (!entry?.expiresAt || entry.expiresAt <= now) {
+        this.controlChallenges.delete(challenge);
+      }
+    }
+  }
+
+  #issueControlChallenge({ workerPubkey = null, workerEncryptPubkey = null } = {}) {
+    this.#pruneControlChallenges();
+    const challenge = randomBytes(16).toString('hex');
+    const issuedAt = Date.now();
+    const expiresAt = issuedAt + 120_000;
+    this.controlChallenges.set(challenge, {
+      challenge,
+      issuedAt,
+      expiresAt,
+      workerPubkey: typeof workerPubkey === 'string' ? workerPubkey.trim() : null,
+      workerEncryptPubkey: typeof workerEncryptPubkey === 'string' ? workerEncryptPubkey.trim() : null
+    });
+    return { challenge, issuedAt, expiresAt };
+  }
+
+  #consumeControlChallenge(challenge, workerPubkey = null) {
+    if (typeof challenge !== 'string' || !challenge.trim()) return null;
+    this.#pruneControlChallenges();
+    const entry = this.controlChallenges.get(challenge);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      this.controlChallenges.delete(challenge);
+      return null;
+    }
+    const expectedPubkey = typeof workerPubkey === 'string' ? workerPubkey.trim() : null;
+    if (entry.workerPubkey && expectedPubkey && entry.workerPubkey !== expectedPubkey) {
+      return null;
+    }
+    this.controlChallenges.delete(challenge);
+    return entry;
+  }
+
+  #verifyChallengeSignature({ challenge, workerPubkey, signature }) {
+    const sigBytes = hexToBytes(signature);
+    const pubkeyBytes = hexToBytes(workerPubkey);
+    if (!sigBytes || !pubkeyBytes) return false;
+    const digest = createHash('sha256').update(String(challenge)).digest('hex');
+    const msgBytes = hexToBytes(digest);
+    if (!msgBytes) return false;
+    try {
+      return schnorr.verify(sigBytes, msgBytes, pubkeyBytes);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  #extractBearerToken(req) {
+    const authorization = req?.headers?.authorization || req?.headers?.Authorization || null;
+    if (typeof authorization === 'string' && authorization.toLowerCase().startsWith('bearer ')) {
+      const token = authorization.slice(7).trim();
+      if (token) return token;
+    }
+
+    const headerToken = req?.headers?.['x-control-access-token']
+      || req?.headers?.['X-Control-Access-Token']
+      || null;
+    if (typeof headerToken === 'string' && headerToken.trim()) {
+      return headerToken.trim();
+    }
+
+    const bodyToken = typeof req?.body?.accessToken === 'string'
+      ? req.body.accessToken.trim()
+      : (typeof req?.body?.access_token === 'string' ? req.body.access_token.trim() : null);
+    if (bodyToken) {
+      return bodyToken;
+    }
+
+    return null;
+  }
+
+  #verifyControlSession(req, { required = false } = {}) {
+    const token = this.#extractBearerToken(req);
+    if (!token) {
+      return required ? null : { optional: true };
+    }
+    const payload = verifyEd25519SessionToken(
+      token,
+      this.controlSessionPublicKey,
+      {
+        issuer: this.#deriveLocalGatewayPubkey() || 'public-gateway'
+      }
+    );
+    return payload || null;
+  }
+
+  #controlSessionPublicKeyPem() {
+    if (typeof this.controlSessionPublicKey === 'string') {
+      return this.controlSessionPublicKey;
+    }
+    try {
+      return this.controlSessionPublicKey.export({ format: 'pem', type: 'spki' }).toString();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  #buildControlHttpDelegates() {
+    return {
+      discoveryCatalog: this.#handleDiscoveryCatalog.bind(this),
+      meshStateRead: this.#handleMeshStateRead.bind(this),
+      meshStateAppend: this.#handleMeshStateAppend.bind(this),
+      meshLeaseVote: this.#handleMeshLeaseVote.bind(this),
+      relayPolicyRead: this.#handleRelayPolicyRead.bind(this),
+      authChallenge: this.#handleControlAuthChallenge.bind(this),
+      authSession: this.#handleControlAuthSession.bind(this),
+      relayRegister: this.#handleRelayRegistrationV2.bind(this),
+      mirrorRead: this.#handleRelayMirrorMetadata.bind(this),
+      openJoinChallenge: this.#handleOpenJoinChallenge.bind(this),
+      openJoinPoolSync: this.#handleOpenJoinPoolUpdate.bind(this),
+      openJoinLeaseClaim: this.#handleOpenJoinRequest.bind(this),
+      openJoinAppendCores: this.#handleOpenJoinAppendCores.bind(this),
+      closedJoinPoolSync: this.#handleClosedJoinPoolUpdate.bind(this),
+      closedJoinLeaseClaim: this.#handleClosedJoinLeaseClaim.bind(this)
+    };
+  }
+
+  #buildControlRpcDelegates() {
+    return {
+      discoveryCatalogRpc: async () => this.#invokeHandlerAsRpc(this.#handleDiscoveryCatalog, {}),
+      meshStateReadRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleMeshStateRead, {
+        query: {
+          sinceSequence: payload?.sinceSequence,
+          limit: payload?.limit
+        }
+      }),
+      meshStateAppendRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleMeshStateAppend, {
+        body: payload
+      }),
+      meshLeaseVoteRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleMeshLeaseVote, {
+        body: payload
+      }),
+      relayPolicyReadRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleRelayPolicyRead, {
+        params: { relayKey: payload?.relayKey }
+      }),
+      authChallengeRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleControlAuthChallenge, {
+        body: payload
+      }),
+      authSessionRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleControlAuthSession, {
+        body: payload
+      }),
+      relayRegisterRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleRelayRegistrationV2, {
+        body: payload
+      }),
+      mirrorReadRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleRelayMirrorMetadata, {
+        params: { relayKey: payload?.relayKey }
+      }),
+      openJoinChallengeRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleOpenJoinChallenge, {
+        params: { relayKey: payload?.relayKey },
+        query: { purpose: payload?.purpose || null }
+      }),
+      openJoinPoolSyncRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleOpenJoinPoolUpdate, {
+        params: { relayKey: payload?.relayKey },
+        body: payload
+      }),
+      openJoinLeaseClaimRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleOpenJoinRequest, {
+        params: { relayKey: payload?.relayKey },
+        body: payload
+      }),
+      openJoinAppendCoresRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleOpenJoinAppendCores, {
+        params: { relayKey: payload?.relayKey },
+        body: payload
+      }),
+      closedJoinPoolSyncRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleClosedJoinPoolUpdate, {
+        params: { relayKey: payload?.relayKey },
+        body: payload
+      }),
+      closedJoinLeaseClaimRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleClosedJoinLeaseClaim, {
+        params: { relayKey: payload?.relayKey },
+        body: payload
+      })
+    };
+  }
+
+  async #invokeHandlerAsRpc(handler, {
+    params = {},
+    query = {},
+    body = {},
+    headers = {}
+  } = {}) {
+    const req = {
+      params: params || {},
+      query: query || {},
+      body: body || {},
+      headers: headers || {},
+      header: (name) => {
+        if (!name || typeof name !== 'string') return undefined;
+        const key = name.toLowerCase();
+        return req.headers[key] ?? req.headers[name];
+      }
+    };
+
+    return await new Promise((resolve, reject) => {
+      const res = {
+        statusCode: 200,
+        headersSent: false,
+        headers: {},
+        status(code) {
+          this.statusCode = code;
+          return this;
+        },
+        setHeader(key, value) {
+          this.headers[key] = value;
+        },
+        json(payload) {
+          this.headersSent = true;
+          resolve({ statusCode: this.statusCode || 200, body: payload });
+          return this;
+        },
+        send(payload) {
+          this.headersSent = true;
+          resolve({ statusCode: this.statusCode || 200, body: payload });
+          return this;
+        },
+        end(payload) {
+          this.headersSent = true;
+          resolve({ statusCode: this.statusCode || 200, body: payload || null });
+          return this;
+        }
+      };
+
+      Promise.resolve(handler.call(this, req, res))
+        .then((maybeValue) => {
+          if (!res.headersSent) {
+            resolve({ statusCode: res.statusCode || 200, body: maybeValue ?? null });
+          }
+        })
+        .catch(reject);
+    });
   }
 
   async #initializeBlindPeerReplicaManager() {
@@ -2846,6 +3498,591 @@ class PublicGatewayService {
     }, '[PublicGateway] Replica status updated');
   }
 
+  #isManifestGateway(gatewayId) {
+    if (typeof gatewayId !== 'string' || !gatewayId.trim()) return false;
+    const permissioned = this.config?.federation?.permissioned === true;
+    if (!permissioned) return true;
+    const manifest = this.federationManifestService?.getManifest?.();
+    const gateways = Array.isArray(manifest?.gateways) ? manifest.gateways : [];
+    if (!gateways.length) return true;
+    return gateways.some((entry) => entry?.id === gatewayId.trim());
+  }
+
+  async #appendFederatedEvent(eventType, payload = {}, metadata = {}) {
+    if (!this.federatedEventLog?.append || !eventType) return null;
+    const gatewayId = this.#deriveLocalGatewayPubkey() || null;
+    const event = this.federatedEventLog.append(eventType, payload, {
+      ...(metadata && typeof metadata === 'object' ? metadata : {}),
+      sourceGatewayId: gatewayId
+    });
+    await this.#broadcastFederatedEvent(event).catch((error) => {
+      this.logger?.debug?.('[PublicGateway] Federated event broadcast failed', {
+        eventType,
+        sequence: event?.sequence || null,
+        error: error?.message || error
+      });
+    });
+    return event;
+  }
+
+  async #broadcastFederatedEvent(event) {
+    if (!event || typeof event !== 'object') return;
+    await this.gatewayMeshProtocol?.broadcastControl?.(CONTROL_METHODS.MESH_STATE_APPEND, {
+      event
+    });
+
+    const pool = this.federationControlClientPool;
+    if (!pool?.request) return;
+    const localGatewayId = this.#deriveLocalGatewayPubkey();
+    const snapshot = pool.getGatewaySnapshot?.() || {};
+    const tasks = [];
+    for (const gateway of Object.values(snapshot.gateways || {})) {
+      const gatewayId = typeof gateway?.id === 'string' ? gateway.id.trim() : null;
+      if (!gatewayId || gatewayId === localGatewayId) continue;
+      if (this.meshGatewayProtocols.has(gatewayId)) continue;
+      tasks.push(
+        pool.request(CONTROL_METHODS.MESH_STATE_APPEND, { event }, {
+          gatewayId,
+          onlyGateway: true,
+          hedged: false,
+          timeoutMs: 5000
+        }).catch((error) => {
+          this.logger?.debug?.('[PublicGateway] Federated HTTP fanout failed', {
+            gatewayId,
+            eventId: event?.id || null,
+            error: error?.message || error
+          });
+          return null;
+        })
+      );
+    }
+    if (tasks.length) {
+      await Promise.all(tasks);
+    }
+  }
+
+  async #syncMeshCatalogFromProtocol(peerKey, protocol) {
+    if (!protocol || typeof protocol.callControlMethod !== 'function') return;
+    try {
+      const response = await protocol.callControlMethod(CONTROL_METHODS.MESH_CATALOG_READ, {});
+      const descriptors = Array.isArray(response?.descriptors)
+        ? response.descriptors
+        : (Array.isArray(response?.trusted) ? response.trusted : []);
+      for (const descriptor of descriptors) {
+        this.nostrGatewayDirectory.upsertDescriptor(descriptor);
+      }
+      if (Array.isArray(response?.attestations)) {
+        for (const attestation of response.attestations) {
+          this.nostrGatewayDirectory.addAttestation(attestation);
+        }
+      }
+      this.#refreshFederationControlClientPool();
+    } catch (error) {
+      this.logger?.debug?.('[PublicGateway] Mesh catalog sync failed', {
+        peerKey,
+        error: error?.message || error
+      });
+    }
+  }
+
+  async #syncMeshStateFromProtocol(peerKey, protocol) {
+    if (!protocol || typeof protocol.callControlMethod !== 'function') return;
+    try {
+      const response = await protocol.callControlMethod(CONTROL_METHODS.MESH_STATE_READ, {
+        sinceSequence: 0,
+        limit: 5000
+      });
+      const events = Array.isArray(response?.events) ? response.events : [];
+      for (const event of events) {
+        const sourceGatewayId = typeof event?.metadata?.sourceGatewayId === 'string'
+          ? event.metadata.sourceGatewayId
+          : null;
+        if (sourceGatewayId && !this.#isManifestGateway(sourceGatewayId)) continue;
+        const appended = this.federatedEventLog.appendExternal(event, {
+          sourcePeerKey: peerKey
+        });
+        if (appended?.eventType === 'LeaseCertificateCommitted') {
+          this.leaseConsensusService?.ingestCertificate?.(appended?.payload?.certificate || {});
+        }
+      }
+    } catch (error) {
+      this.logger?.debug?.('[PublicGateway] Mesh state sync failed', {
+        peerKey,
+        error: error?.message || error
+      });
+    }
+  }
+
+  async #handleMeshStateRead(req, res) {
+    const sinceSequenceRaw = req?.query?.sinceSequence ?? req?.body?.sinceSequence;
+    const limitRaw = req?.query?.limit ?? req?.body?.limit;
+    const sinceSequence = Number.isFinite(Number(sinceSequenceRaw))
+      ? Math.max(0, Math.trunc(Number(sinceSequenceRaw)))
+      : 0;
+    const limit = Number.isFinite(Number(limitRaw))
+      ? Math.max(1, Math.trunc(Number(limitRaw)))
+      : 1000;
+    const events = this.federatedEventLog?.list?.({ sinceSequence, limit }) || [];
+    const checkpoint = this.federatedEventLog?.checkpoint?.() || {
+      sequence: 0,
+      eventId: null,
+      timestamp: null
+    };
+    return res.json({
+      events,
+      checkpoint
+    });
+  }
+
+  async #handleMeshStateAppend(req, res) {
+    const event = req?.body?.event && typeof req.body.event === 'object'
+      ? req.body.event
+      : (req?.body && typeof req.body === 'object' ? req.body : null);
+    if (!event || typeof event !== 'object') {
+      return res.status(400).json({ error: 'event is required' });
+    }
+    const sourceGatewayId = typeof event?.metadata?.sourceGatewayId === 'string'
+      ? event.metadata.sourceGatewayId.trim()
+      : null;
+    if (sourceGatewayId && !this.#isManifestGateway(sourceGatewayId)) {
+      return res.status(403).json({ error: 'unauthorized-source-gateway' });
+    }
+    const appended = this.federatedEventLog?.appendExternal?.(event, {
+      sourcePeerKey: req?.headers?.['x-peer-key'] || null
+    });
+    if (appended?.eventType === 'LeaseCertificateCommitted') {
+      this.leaseConsensusService?.ingestCertificate?.(appended?.payload?.certificate || {});
+    }
+    return res.json({
+      status: appended ? 'appended' : 'duplicate',
+      sequence: appended?.sequence || null
+    });
+  }
+
+  async #requestLeaseVoteFromGateway(voter = {}, proposal = {}) {
+    const voterGatewayId = typeof voter?.id === 'string' ? voter.id.trim() : null;
+    if (!voterGatewayId) {
+      throw new Error('missing-voter-gateway-id');
+    }
+
+    const protocol = this.meshGatewayProtocols.get(voterGatewayId) || null;
+    if (protocol && typeof protocol.callControlMethod === 'function') {
+      const response = await protocol.callControlMethod(CONTROL_METHODS.MESH_LEASE_VOTE, {
+        proposal
+      });
+      if (!response || typeof response !== 'object') {
+        throw new Error(`invalid-vote-response:${voterGatewayId}`);
+      }
+      return response;
+    }
+
+    const pool = this.federationControlClientPool;
+    if (!pool?.request) {
+      throw new Error(`voter-unreachable:${voterGatewayId}`);
+    }
+    const response = await pool.request(CONTROL_METHODS.MESH_LEASE_VOTE, {
+      proposal
+    }, {
+      gatewayId: voterGatewayId,
+      onlyGateway: true,
+      hedged: false,
+      timeoutMs: 5000
+    });
+    const data = response?.data;
+    if (!data || typeof data !== 'object') {
+      throw new Error(`invalid-vote-response:${voterGatewayId}`);
+    }
+    return data;
+  }
+
+  async #handleMeshLeaseVote(req, res) {
+    const proposal = req?.body?.proposal && typeof req.body.proposal === 'object'
+      ? req.body.proposal
+      : (req?.body && typeof req.body === 'object' ? req.body : null);
+    if (!proposal) {
+      return res.status(400).json({ error: 'proposal is required' });
+    }
+    const vote = await this.leaseConsensusService.voteOnProposal(proposal, {
+      voterGatewayId: this.#deriveLocalGatewayPubkey()
+    });
+    return res.json(vote);
+  }
+
+  async #handleDiscoveryCatalog(_req, res) {
+    const catalog = this.nostrGatewayDirectory.buildCatalog({ includeExpired: false });
+    const filtered = this.#filterTrustedGatewayDescriptors(catalog.descriptors, {
+      catalogAttestations: catalog.attestations
+    });
+
+    const trustedDescriptors = filtered.trusted.map((entry) => entry.descriptor);
+    const gateways = {};
+    for (const descriptor of trustedDescriptors) {
+      gateways[descriptor.gatewayPubkey] = {
+        id: descriptor.gatewayPubkey,
+        nostrPubkey: descriptor.gatewayPubkey,
+        swarmPublicKey: descriptor?.controlP2P?.swarmPublicKey || null,
+        controlTopic: descriptor?.controlP2P?.topic || null,
+        baseUrl: descriptor?.controlHttp?.baseUrl || null,
+        wsUrl: descriptor?.bridgeHttp?.baseUrl || null,
+        trust: 'trusted',
+        health: 'healthy',
+        lastSeenAt: descriptor.issuedAt || Date.now()
+      };
+    }
+
+    return res.json({
+      networkMode: 'permissionless-wot',
+      generatedAt: Date.now(),
+      manifest: this.federationManifestService?.getManifest?.() || null,
+      trustPolicy: this.trustPolicyEngine?.policy || {},
+      descriptors: catalog.descriptors,
+      attestations: catalog.attestations,
+      trusted: trustedDescriptors,
+      rejected: filtered.rejected.map((entry) => ({
+        gatewayPubkey: entry?.descriptor?.gatewayPubkey || null,
+        reason: entry?.evaluation?.reason || 'rejected'
+      })),
+      gateways
+    });
+  }
+
+  async #handleRelayPolicyRead(req, res) {
+    const relayKey = req.params?.relayKey;
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+    const policy = await this.relayAuthorityPolicyService.getPolicy(relayKey);
+    return res.json({
+      relayKey,
+      policy
+    });
+  }
+
+  async #handleControlAuthChallenge(req, res) {
+    const workerPubkey = typeof req?.body?.workerPubkey === 'string'
+      ? req.body.workerPubkey.trim()
+      : null;
+    const workerEncryptPubkey = typeof req?.body?.workerEncryptPubkey === 'string'
+      ? req.body.workerEncryptPubkey.trim()
+      : null;
+    const challenge = this.#issueControlChallenge({
+      workerPubkey,
+      workerEncryptPubkey
+    });
+    return res.json({
+      ...challenge,
+      gatewayPubkey: this.#deriveLocalGatewayPubkey(),
+      sessionPublicKey: this.#controlSessionPublicKeyPem()
+    });
+  }
+
+  async #handleControlAuthSession(req, res) {
+    const challenge = typeof req?.body?.challenge === 'string' ? req.body.challenge.trim() : null;
+    const workerPubkey = typeof req?.body?.workerPubkey === 'string' ? req.body.workerPubkey.trim() : null;
+    const workerEncryptPubkey = typeof req?.body?.workerEncryptPubkey === 'string'
+      ? req.body.workerEncryptPubkey.trim()
+      : null;
+    const signature = typeof req?.body?.signature === 'string'
+      ? req.body.signature.trim()
+      : (typeof req?.body?.sig === 'string' ? req.body.sig.trim() : null);
+    if (!challenge || !workerPubkey || !signature) {
+      return res.status(400).json({ error: 'challenge, workerPubkey and signature are required' });
+    }
+
+    const challengeEntry = this.#consumeControlChallenge(challenge, workerPubkey);
+    if (!challengeEntry) {
+      return res.status(401).json({ error: 'invalid-challenge' });
+    }
+
+    const validSig = this.#verifyChallengeSignature({ challenge, workerPubkey, signature });
+    if (!validSig) {
+      return res.status(401).json({ error: 'invalid-signature' });
+    }
+
+    const issuedAtSec = Math.floor(Date.now() / 1000);
+    const expiresAtSec = issuedAtSec + this.controlSessionTtlSeconds;
+    const accessToken = issueEd25519SessionToken({
+      iss: this.#deriveLocalGatewayPubkey() || 'public-gateway',
+      sub: workerPubkey,
+      workerPubkey,
+      workerEncryptPubkey: workerEncryptPubkey || challengeEntry.workerEncryptPubkey || null,
+      gatewayPubkey: this.#deriveLocalGatewayPubkey() || null
+    }, this.controlSessionPrivateKey, {
+      ttlSeconds: this.controlSessionTtlSeconds
+    });
+
+    return res.json({
+      accessToken,
+      tokenType: 'Bearer',
+      issuedAt: issuedAtSec * 1000,
+      expiresAt: expiresAtSec * 1000,
+      gatewayPubkey: this.#deriveLocalGatewayPubkey(),
+      sessionPublicKey: this.#controlSessionPublicKeyPem()
+    });
+  }
+
+  async #handleRelayRegistrationV2(req, res) {
+    const sessionPayload = this.#verifyControlSession(req, { required: true });
+    if (!sessionPayload) {
+      return res.status(401).json({ error: 'invalid-session' });
+    }
+
+    const registration = req?.body?.registration && typeof req.body.registration === 'object'
+      ? req.body.registration
+      : req?.body;
+
+    if (!registration || typeof registration !== 'object') {
+      return res.status(400).json({ error: 'registration payload required' });
+    }
+    if (!registration.relayKey) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+
+    try {
+      const relayCoreMetadata = Array.isArray(registration.relayCores)
+        ? registration.relayCores
+            .filter((entry) => entry && typeof entry === 'object' && entry.key)
+            .map((entry) => ({
+              key: entry.key,
+              role: typeof entry.role === 'string' ? entry.role : null
+            }))
+        : null;
+      const relayCoreModeRaw = typeof registration?.relayCoresMode === 'string'
+        ? registration.relayCoresMode.trim().toLowerCase()
+        : null;
+      const mergeRelayCores = relayCoreModeRaw === 'merge'
+        || relayCoreModeRaw === 'append'
+        || registration?.mergeRelayCores === true;
+      const existing = mergeRelayCores
+        ? await this.registrationStore.getRelay(registration.relayKey)
+        : null;
+      const upsertPayload = relayCoreMetadata
+        ? { ...registration, relayCores: relayCoreMetadata }
+        : { ...registration };
+      if (mergeRelayCores) {
+        const existingRelayCores = Array.isArray(existing?.relayCores) ? existing.relayCores : [];
+        const incomingRelayCores = relayCoreMetadata || [];
+        const mergeResult = this.#mergeOpenJoinCoreEntries(existingRelayCores, incomingRelayCores, {
+          maxTotal: this.openJoinConfig?.maxRelayCores || null
+        });
+        upsertPayload.relayCores = mergeResult.merged;
+      }
+      const stamped = this.#stampRelayActivity(upsertPayload, this.#resolveRelayPeerCount(upsertPayload));
+      await this.registrationStore.upsertRelay(registration.relayKey, stamped);
+      const mirrorPayload = this.#buildMirrorMetadataPayload(stamped, registration.relayKey);
+      await this.#storeMirrorMetadataPayload(registration.relayKey, mirrorPayload);
+      await this.#appendFederatedEvent('RelayRegistered', {
+        relayKey: registration.relayKey,
+        record: stamped
+      });
+      await this.#appendFederatedEvent('MirrorManifestUpdated', {
+        relayKey: registration.relayKey,
+        data: mirrorPayload
+      });
+      this.#storeRelayAliases(registration.relayKey, stamped).catch((error) => {
+        this.logger?.warn?.({
+          relayKey: registration.relayKey,
+          error: error?.message || error
+        }, '[PublicGateway] Failed to store relay aliases');
+      });
+      const hyperbeeInfo = this.#getRelayHostInfo();
+      return res.json({
+        status: 'ok',
+        relayKey: registration.relayKey,
+        hyperbee: hyperbeeInfo,
+        blindPeer: this.#getBlindPeerSummary()
+      });
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] V2 relay registration failed', {
+        relayKey: registration?.relayKey || null,
+        error: error?.message || error
+      });
+      return res.status(500).json({ error: 'registration-failed' });
+    }
+  }
+
+  async #handleClosedJoinPoolUpdate(req, res) {
+    const sessionPayload = this.#verifyControlSession(req, { required: true });
+    if (!sessionPayload) {
+      return res.status(401).json({ error: 'invalid-session' });
+    }
+
+    const relayKey = req.params?.relayKey || req?.body?.relayKey || req?.body?.payload?.relayKey || null;
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+
+    const payload = req?.body?.payload && typeof req.body.payload === 'object'
+      ? req.body.payload
+      : (req.body || {});
+    const entriesRaw = Array.isArray(payload?.entries) ? payload.entries : [];
+    const now = Date.now();
+    const ttlMs = this.openJoinConfig?.poolEntryTtlMs || (30 * 24 * 60 * 60 * 1000);
+    const maxPool = this.openJoinConfig?.maxPoolSize || 50;
+    const entries = [];
+
+    for (const entry of entriesRaw) {
+      if (!entry || typeof entry !== 'object') continue;
+      const writerCore = typeof entry.writerCore === 'string' ? entry.writerCore : null;
+      const writerCoreHex = typeof entry.writerCoreHex === 'string'
+        ? entry.writerCoreHex
+        : (typeof entry.autobaseLocal === 'string' ? entry.autobaseLocal : null);
+      const envelope = this.writerEnvelopeService.normalizeEnvelope(
+        entry.writerEnvelope || entry.envelope || null
+      );
+      if (!writerCore || !writerCoreHex || !envelope) continue;
+      const issuedAt = Number.isFinite(Number(entry.issuedAt)) ? Math.round(Number(entry.issuedAt)) : now;
+      const expiresAt = Number.isFinite(Number(entry.expiresAt)) ? Math.round(Number(entry.expiresAt)) : (issuedAt + ttlMs);
+      if (expiresAt <= now) continue;
+      entries.push({
+        writerCore,
+        writerCoreHex,
+        autobaseLocal: writerCoreHex,
+        writerEnvelope: envelope,
+        issuedAt,
+        expiresAt
+      });
+      if (entries.length >= maxPool) break;
+    }
+
+    const updatedAt = Number.isFinite(Number(payload.updatedAt)) ? Math.round(Number(payload.updatedAt)) : now;
+    await this.registrationStore.storeClosedJoinPool?.(relayKey, {
+      entries,
+      updatedAt,
+      publicIdentifier: typeof payload.publicIdentifier === 'string' ? payload.publicIdentifier : null,
+      relayUrl: typeof payload.relayUrl === 'string' ? payload.relayUrl : null,
+      relayCores: Array.isArray(payload.relayCores) ? payload.relayCores : [],
+      metadata: payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : null
+    });
+    await this.#appendFederatedEvent('ClosedJoinPoolUpdated', {
+      relayKey,
+      pool: {
+        entries,
+        updatedAt,
+        publicIdentifier: typeof payload.publicIdentifier === 'string' ? payload.publicIdentifier : null,
+        relayUrl: typeof payload.relayUrl === 'string' ? payload.relayUrl : null,
+        relayCores: Array.isArray(payload.relayCores) ? payload.relayCores : [],
+        metadata: payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : null
+      }
+    });
+
+    return res.json({
+      status: 'ok',
+      relayKey,
+      stored: entries.length,
+      updatedAt
+    });
+  }
+
+  async #handleClosedJoinLeaseClaim(req, res) {
+    const sessionPayload = this.#verifyControlSession(req, { required: true });
+    if (!sessionPayload) {
+      return res.status(401).json({ error: 'invalid-session' });
+    }
+
+    const relayKey = req.params?.relayKey || req?.body?.relayKey || null;
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+
+    const authEvent = req.body?.authEvent || req.body?.event || null;
+    if (authEvent && typeof authEvent === 'object') {
+      const challengeTag = this.#extractTagValue(authEvent.tags, 'challenge');
+      if (!challengeTag) {
+        return res.status(400).json({ error: 'missing-challenge' });
+      }
+      const challengeEntry = this.#consumeOpenJoinChallenge(challengeTag, relayKey, CLOSED_JOIN_LEASE_PURPOSE);
+      if (!challengeEntry) {
+        return res.status(401).json({ error: 'invalid-challenge' });
+      }
+      const verification = await this.#verifyOpenJoinAuthEvent(authEvent, {
+        challenge: challengeTag,
+        relayKey,
+        publicIdentifier: challengeEntry?.publicIdentifier || relayKey,
+        purpose: CLOSED_JOIN_LEASE_PURPOSE
+      });
+      if (!verification.ok) {
+        return res.status(401).json({ error: verification.error || 'auth-invalid' });
+      }
+    }
+
+    const lease = await this.registrationStore.takeClosedJoinLease?.(relayKey);
+    if (!lease) {
+      return res.status(409).json({ error: 'closed-join-empty' });
+    }
+
+    const recipientPubkey = typeof req.body?.recipientPubkey === 'string'
+      ? req.body.recipientPubkey.trim()
+      : (typeof req.body?.requesterEncryptPubkey === 'string' ? req.body.requesterEncryptPubkey.trim() : null);
+    const leaseId = typeof lease.leaseId === 'string' && lease.leaseId
+      ? lease.leaseId
+      : randomBytes(12).toString('hex');
+    const purpose = CLOSED_JOIN_LEASE_PURPOSE;
+
+    let envelope = this.writerEnvelopeService.normalizeEnvelope(
+      lease.writerEnvelope || lease.envelope || null
+    );
+    if (!envelope && typeof lease.writerSecret === 'string' && recipientPubkey) {
+      envelope = this.writerEnvelopeService.wrapWriterSecret({
+        writerSecret: lease.writerSecret,
+        recipientPubkey,
+        leaseId,
+        relayKey,
+        purpose,
+        ttlMs: Math.max(1, (Number(lease.expiresAt) || (Date.now() + 300_000)) - Date.now())
+      });
+    }
+    if (!envelope) {
+      return res.status(409).json({ error: 'writer-envelope-unavailable' });
+    }
+
+    const writerCoreKey = lease.writerCoreHex || lease.autobaseLocal || lease.writerCore || null;
+    if (!writerCoreKey) {
+      return res.status(409).json({ error: 'writer-core-missing' });
+    }
+
+    const consensusResult = await this.leaseConsensusService.proposeLease({
+      relayKey,
+      writerCoreKey,
+      purpose,
+      leaseId,
+      requesterNostrPubkey: authEvent?.pubkey || sessionPayload?.workerPubkey || sessionPayload?.sub || 'unknown',
+      requesterEncryptPubkey: recipientPubkey || sessionPayload?.workerEncryptPubkey || null
+    });
+    if (!consensusResult?.granted || !consensusResult?.certificate) {
+      return res.status(409).json({ error: consensusResult?.reason || 'lease-quorum-failed' });
+    }
+    const certificate = consensusResult.certificate;
+    if (!this.leaseConsensusService.validateCertificate(certificate)) {
+      return res.status(409).json({ error: 'invalid-lease-certificate' });
+    }
+
+    await this.registrationStore.storeWriterEnvelope?.(relayKey, envelope);
+    await this.registrationStore.storeLeaseCertificate?.(relayKey, certificate);
+    await this.#appendFederatedEvent('WriterEnvelopePublished', {
+      relayKey,
+      envelope
+    });
+    await this.#appendFederatedEvent('LeaseCertificateCommitted', {
+      relayKey,
+      slotKey: certificate.slotKey,
+      certificate
+    });
+
+    return res.json({
+      relayKey,
+      leaseId,
+      purpose,
+      writerCore: lease.writerCore || null,
+      writerCoreHex: lease.writerCoreHex || lease.autobaseLocal || null,
+      autobaseLocal: lease.autobaseLocal || lease.writerCoreHex || null,
+      issuedAt: lease.issuedAt || Date.now(),
+      expiresAt: lease.expiresAt || envelope.expiresAt || null,
+      writerEnvelope: envelope,
+      certificate
+    });
+  }
+
   #handleDispatcherAssignment({ jobId, peerId, assignedAt, job }) {
     const relayKey = job?.relayKey || job?.requester?.relayKey || null;
     const filters = Array.isArray(job?.filters) ? job.filters : [];
@@ -3179,6 +4416,10 @@ class PublicGatewayService {
 
     try {
       const result = await this.tokenService.revokeToken(relayKey, { reason: payload?.reason });
+      await this.#appendFederatedEvent('TokenRevoked', {
+        relayKey,
+        reason: payload?.reason || null
+      });
       this.tokenMetrics.revokeCounter.inc({ result: 'success' });
       const disconnected = this.#broadcastTokenRevocation(relayKey, {
         reason: payload?.reason || null,
@@ -3573,7 +4814,16 @@ class PublicGatewayService {
     record.blindPeer = this.#getBlindPeerSummary();
     const stamped = this.#stampRelayActivity(record, this.#resolveRelayPeerCount(record));
     await this.registrationStore.upsertRelay(relayKey, stamped);
-    await this.#storeMirrorMetadataPayload(relayKey, this.#buildMirrorMetadataPayload(stamped, relayKey));
+    const mirrorPayload = this.#buildMirrorMetadataPayload(stamped, relayKey);
+    await this.#storeMirrorMetadataPayload(relayKey, mirrorPayload);
+    await this.#appendFederatedEvent('RelayRegistered', {
+      relayKey,
+      record: stamped
+    });
+    await this.#appendFederatedEvent('MirrorManifestUpdated', {
+      relayKey,
+      data: mirrorPayload
+    });
     this.#storeRelayAliases(relayKey, stamped).catch((error) => {
       this.logger?.warn?.('[PublicGateway] Failed to store relay aliases', {
         relayKey,
@@ -3623,13 +4873,15 @@ class PublicGatewayService {
   }
 
   async #handleRelayRegistration(req, res) {
-    if (!this.sharedSecret) {
-      return res.status(503).json({ error: 'Registration disabled' });
-    }
+    const body = req.body || {};
+    const hasSignedEnvelope = !!(body?.registration && body?.signature);
+    const registration = hasSignedEnvelope
+      ? body.registration
+      : (body?.registration && typeof body.registration === 'object' ? body.registration : body);
+    const signature = hasSignedEnvelope ? body.signature : null;
 
-    const { registration, signature } = req.body || {};
-    if (!registration || !signature) {
-      return res.status(400).json({ error: 'Missing registration payload or signature' });
+    if (!registration || typeof registration !== 'object') {
+      return res.status(400).json({ error: 'Missing registration payload' });
     }
 
     if (!registration.relayKey) {
@@ -3646,9 +4898,14 @@ class PublicGatewayService {
           }))
       : null;
 
-    const valid = verifySignature(registration, signature, this.sharedSecret);
-    if (!valid) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    if (hasSignedEnvelope) {
+      if (!this.sharedSecret) {
+        return res.status(503).json({ error: 'Registration disabled' });
+      }
+      const valid = verifySignature(registration, signature, this.sharedSecret);
+      if (!valid) {
+        return res.status(401).json({ error: 'Invalid signature' });
+      }
     }
 
     try {
@@ -3674,10 +4931,16 @@ class PublicGatewayService {
       }
       const stamped = this.#stampRelayActivity(upsertPayload, this.#resolveRelayPeerCount(upsertPayload));
       await this.registrationStore.upsertRelay(registration.relayKey, stamped);
-      await this.#storeMirrorMetadataPayload(
-        registration.relayKey,
-        this.#buildMirrorMetadataPayload(stamped, registration.relayKey)
-      );
+      const mirrorPayload = this.#buildMirrorMetadataPayload(stamped, registration.relayKey);
+      await this.#storeMirrorMetadataPayload(registration.relayKey, mirrorPayload);
+      await this.#appendFederatedEvent('RelayRegistered', {
+        relayKey: registration.relayKey,
+        record: stamped
+      });
+      await this.#appendFederatedEvent('MirrorManifestUpdated', {
+        relayKey: registration.relayKey,
+        data: mirrorPayload
+      });
       this.#storeRelayAliases(registration.relayKey, stamped).catch((error) => {
         this.logger?.warn?.({
           relayKey: registration.relayKey,
@@ -3697,23 +4960,23 @@ class PublicGatewayService {
   }
 
   async #handleRelayDeletion(req, res) {
-    if (!this.sharedSecret) {
-      return res.status(503).json({ error: 'Registration disabled' });
-    }
-
     const relayKey = req.params?.relayKey;
     if (!relayKey) {
       return res.status(400).json({ error: 'relayKey param is required' });
     }
 
     const signature = req.headers['x-signature'];
-    if (!signature) {
-      return res.status(401).json({ error: 'Missing signature' });
-    }
-
-    const valid = verifySignature({ relayKey }, signature, this.sharedSecret);
-    if (!valid) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    const hasLegacySignature = !!(signature && this.sharedSecret);
+    if (hasLegacySignature) {
+      const valid = verifySignature({ relayKey }, signature, this.sharedSecret);
+      if (!valid) {
+        return res.status(401).json({ error: 'Invalid signature' });
+      }
+    } else {
+      const sessionPayload = this.#verifyControlSession(req, { required: true });
+      if (!sessionPayload) {
+        return res.status(401).json({ error: 'invalid-session' });
+      }
     }
 
     try {
@@ -3848,13 +5111,29 @@ class PublicGatewayService {
     if (!this.openJoinConfig?.enabled) {
       return res.status(503).json({ error: 'open-join-disabled' });
     }
-    if (!this.sharedSecret) {
-      return res.status(503).json({ error: 'registration-disabled' });
+
+    const body = req.body || {};
+    const hasSignedEnvelope = !!(body?.payload && body?.signature);
+    const payload = hasSignedEnvelope
+      ? body.payload
+      : (body?.payload && typeof body.payload === 'object' ? body.payload : body);
+    if (!payload || typeof payload !== 'object') {
+      return res.status(400).json({ error: 'payload is required' });
     }
 
-    const { payload, signature } = req.body || {};
-    if (!this.#verifySignedPayload(payload, signature)) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    if (hasSignedEnvelope) {
+      if (!this.sharedSecret) {
+        return res.status(503).json({ error: 'registration-disabled' });
+      }
+      const signature = body.signature;
+      if (!this.#verifySignedPayload(payload, signature)) {
+        return res.status(401).json({ error: 'Invalid signature' });
+      }
+    } else {
+      const sessionPayload = this.#verifyControlSession(req, { required: true });
+      if (!sessionPayload) {
+        return res.status(401).json({ error: 'invalid-session' });
+      }
     }
 
     const relayKey = payload?.relayKey || req.params?.relayKey;
@@ -4073,7 +5352,23 @@ class PublicGatewayService {
     }, relayKey);
     if (mirrorPayload) {
       await this.#storeMirrorMetadataPayload(relayKey, mirrorPayload);
+      await this.#appendFederatedEvent('MirrorManifestUpdated', {
+        relayKey,
+        data: mirrorPayload
+      });
     }
+    await this.#appendFederatedEvent('OpenJoinPoolUpdated', {
+      relayKey,
+      pool: {
+        entries: mergedEntries,
+        updatedAt,
+        publicIdentifier: poolPublicIdentifier || null,
+        relayUrl: poolRelayUrl || null,
+        relayCores: poolRelayCores,
+        metadata: poolMetadata,
+        aliases: poolAliases
+      }
+    });
 
     const total = mergedEntries.length;
     const needed = Math.max(targetSize - total, 0);
@@ -4113,7 +5408,7 @@ class PublicGatewayService {
     }
     const rawPurpose = typeof req.query?.purpose === 'string' ? req.query.purpose.trim() : null;
     const purpose = rawPurpose || null;
-    if (purpose && purpose !== OPEN_JOIN_APPEND_CORES_PURPOSE) {
+    if (purpose && purpose !== OPEN_JOIN_APPEND_CORES_PURPOSE && purpose !== CLOSED_JOIN_LEASE_PURPOSE) {
       return res.status(400).json({ error: 'invalid-purpose' });
     }
 
@@ -4275,6 +5570,33 @@ class PublicGatewayService {
         ? lease.autobaseLocal
         : (typeof lease.autobase_local === 'string' ? lease.autobase_local : null);
       const resolvedAutobaseLocal = autobaseLocal || writerCoreHex || null;
+      const writerCoreKey = resolvedAutobaseLocal || lease.writerCore || null;
+      if (!writerCoreKey) {
+        return res.status(409).json({ error: 'writer-core-missing' });
+      }
+      const consensusResult = await this.leaseConsensusService.proposeLease({
+        relayKey,
+        writerCoreKey,
+        purpose: 'open-join',
+        leaseId: typeof lease?.leaseId === 'string' ? lease.leaseId : null,
+        requesterNostrPubkey: verification?.pubkey || authEvent?.pubkey || 'unknown',
+        requesterEncryptPubkey: typeof req?.body?.requesterEncryptPubkey === 'string'
+          ? req.body.requesterEncryptPubkey.trim()
+          : null
+      });
+      if (!consensusResult?.granted || !consensusResult?.certificate) {
+        return res.status(409).json({ error: consensusResult?.reason || 'lease-quorum-failed' });
+      }
+      const certificate = consensusResult.certificate;
+      if (!this.leaseConsensusService.validateCertificate(certificate)) {
+        return res.status(409).json({ error: 'invalid-lease-certificate' });
+      }
+      await this.registrationStore.storeLeaseCertificate?.(relayKey, certificate);
+      await this.#appendFederatedEvent('LeaseCertificateCommitted', {
+        relayKey,
+        slotKey: certificate.slotKey,
+        certificate
+      });
       this.logger?.info?.('[PublicGateway] Open join lease issued', {
         relayKey,
         relayKeyType,
@@ -4297,6 +5619,7 @@ class PublicGatewayService {
         writerSecret: lease.writerSecret,
         issuedAt: lease.issuedAt || null,
         expiresAt: lease.expiresAt || null,
+        certificate,
         ...(mirrorPayload || {})
       });
     } catch (error) {
@@ -4397,10 +5720,18 @@ class PublicGatewayService {
       if (updatedPool.aliases.length && typeof this.registrationStore?.storeOpenJoinAliases === 'function') {
         await this.registrationStore.storeOpenJoinAliases(relayKey, updatedPool.aliases);
       }
+      await this.#appendFederatedEvent('OpenJoinAppendCoresUpdated', {
+        relayKey,
+        relayCores: mergeResult.merged
+      });
 
       const mirrorPayload = this.#buildOpenJoinMirrorPayloadFromPool(updatedPool, relayKey);
       if (mirrorPayload) {
         await this.#storeMirrorMetadataPayload(relayKey, mirrorPayload);
+        await this.#appendFederatedEvent('MirrorManifestUpdated', {
+          relayKey,
+          data: mirrorPayload
+        });
       }
 
       this.logger?.info?.('[PublicGateway] Open join core append', {
@@ -4562,9 +5893,18 @@ class PublicGatewayService {
       }
     });
 
+    this.controlRpcHandlers?.registerProtocol?.(protocol);
+
     const cleanup = () => {
       this.peerMetadata.delete(publicKey);
       this.#detachHyperbeeReplication(publicKey);
+      this.gatewayMeshProtocol?.detachProtocol?.(publicKey);
+      for (const [gatewayId, mappedProtocol] of this.meshGatewayProtocols.entries()) {
+        if (mappedProtocol === protocol) {
+          this.meshGatewayProtocols.delete(gatewayId);
+          this.gatewayMeshProtocol?.detachProtocol?.(gatewayId);
+        }
+      }
       // Trusted peers persist until explicit revocation logic runs.
     };
     protocol.once('close', cleanup);
@@ -4576,6 +5916,8 @@ class PublicGatewayService {
       role: 'gateway',
       isGateway: true,
       gatewayReplica: false,
+      gatewayPubkey: this.#deriveLocalGatewayPubkey() || null,
+      gatewayControlTopic: this.config?.control?.topic || 'hypertuna-gateway-control-v2',
       dispatcherEnabled: !!this.featureFlags?.dispatcherEnabled,
       hyperbeeRelayEnabled: this.#isHyperbeeRelayEnabled(),
       isServer: !!isServer
@@ -4700,6 +6042,30 @@ class PublicGatewayService {
         hyperbeeLag: Number(handshake.hyperbeeLag) || 0,
         queueDepth: Number(handshake.queueDepth) || 0,
         reportedAt: Date.now()
+      });
+      return;
+    }
+
+    const isGatewayPeer = handshake?.isGateway === true || handshake?.role === 'gateway';
+    if (isGatewayPeer) {
+      const gatewayId = typeof handshake?.gatewayPubkey === 'string' && handshake.gatewayPubkey.trim()
+        ? handshake.gatewayPubkey.trim()
+        : publicKey;
+      this.gatewayMeshProtocol?.attachProtocol?.(gatewayId, protocol);
+      this.meshGatewayProtocols.set(gatewayId, protocol);
+      this.#syncMeshCatalogFromProtocol(publicKey, protocol).catch((error) => {
+        this.logger?.debug?.('[PublicGateway] Mesh catalog sync failed during handshake', {
+          peer: publicKey,
+          gatewayId,
+          error: error?.message || error
+        });
+      });
+      this.#syncMeshStateFromProtocol(publicKey, protocol).catch((error) => {
+        this.logger?.debug?.('[PublicGateway] Mesh state sync failed during handshake', {
+          peer: publicKey,
+          gatewayId,
+          error: error?.message || error
+        });
       });
     }
   }

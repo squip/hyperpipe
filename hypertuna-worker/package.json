@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "pear run -d .",
     "test": "brittle test/*.test.js",
-    "test:ipc": "brittle test/group-file-ipc.test.js test/public-gateway-hyperbee-adapter.test.js"
+    "test:ipc": "brittle test/group-file-ipc.test.js test/public-gateway-hyperbee-adapter.test.js",
+    "test:live:gateway": "node ../public-gateway/bin/live-worker-gateway-e2e.mjs"
   },
   "pear": {
     "name": "worker-app",

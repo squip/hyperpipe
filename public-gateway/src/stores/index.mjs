@@ -2,6 +2,8 @@ import MemoryRegistrationStore from './MemoryRegistrationStore.mjs';
 import RedisRegistrationStore from './RedisRegistrationStore.mjs';
 
 async function createRegistrationStore(config = {}, logger) {
+  const allowMemoryFallback = config?.allowMemoryFallback === true;
+
   if (config?.redisUrl) {
     try {
       const store = new RedisRegistrationStore({
@@ -19,6 +21,12 @@ async function createRegistrationStore(config = {}, logger) {
       logger?.info?.('Using Redis registration store');
       return store;
     } catch (error) {
+      if (!allowMemoryFallback) {
+        logger?.error?.('Failed to initialize Redis registration store and fallback is disabled', {
+          error: error.message
+        });
+        throw error;
+      }
       logger?.error?.('Failed to initialize Redis registration store, falling back to memory cache', { error: error.message });
     }
   }

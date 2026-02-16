@@ -14,7 +14,10 @@ class MemoryRegistrationStore {
     this.items = new Map();
     this.tokenMetadata = new Map();
     this.openJoinPools = new Map();
+    this.closedJoinPools = new Map();
     this.mirrorMetadata = new Map();
+    this.writerEnvelopes = new Map();
+    this.leaseCertificates = new Map();
     this.relayAliases = new Map();
     this.relayAliasIndex = new Map();
     this.openJoinAliases = new Map();
@@ -48,6 +51,9 @@ class MemoryRegistrationStore {
     this.items.delete(relayKey);
     this.tokenMetadata.delete(relayKey);
     this.openJoinPools.delete(relayKey);
+    this.closedJoinPools.delete(relayKey);
+    this.writerEnvelopes.delete(relayKey);
+    this.leaseCertificates.delete(relayKey);
     this.removeRelayAliases(relayKey);
     this.clearOpenJoinAliases(relayKey);
   }
@@ -82,9 +88,38 @@ class MemoryRegistrationStore {
       }
     }
 
+    for (const [key, pool] of this.closedJoinPools.entries()) {
+      if (pool?.expiresAt && pool.expiresAt <= now) {
+        this.closedJoinPools.delete(key);
+        continue;
+      }
+      const entries = Array.isArray(pool?.entries) ? pool.entries : [];
+      const nextEntries = entries.filter((entry) => !entry?.expiresAt || entry.expiresAt > now);
+      if (nextEntries.length) {
+        this.closedJoinPools.set(key, { ...pool, entries: nextEntries });
+      } else {
+        this.closedJoinPools.delete(key);
+      }
+    }
+
     for (const [key, record] of this.mirrorMetadata.entries()) {
       if (record?.expiresAt && record.expiresAt <= now) {
         this.mirrorMetadata.delete(key);
+      }
+    }
+
+    for (const [relayKey, envelopeMap] of this.writerEnvelopes.entries()) {
+      if (!(envelopeMap instanceof Map)) {
+        this.writerEnvelopes.delete(relayKey);
+        continue;
+      }
+      for (const [leaseId, envelope] of envelopeMap.entries()) {
+        if (envelope?.expiresAt && envelope.expiresAt <= now) {
+          envelopeMap.delete(leaseId);
+        }
+      }
+      if (envelopeMap.size === 0) {
+        this.writerEnvelopes.delete(relayKey);
       }
     }
 
@@ -196,6 +231,105 @@ class MemoryRegistrationStore {
   async clearOpenJoinPool(relayKey) {
     this.openJoinPools.delete(relayKey);
     this.clearOpenJoinAliases(relayKey);
+  }
+
+  async storeClosedJoinPool(relayKey, pool = {}) {
+    if (!relayKey) return;
+    const now = Date.now();
+    const poolTtlSeconds = Number.isFinite(this.openJoinPoolTtlSeconds)
+      ? this.openJoinPoolTtlSeconds
+      : this.ttlSeconds;
+    const record = {
+      entries: Array.isArray(pool.entries) ? pool.entries : [],
+      updatedAt: pool.updatedAt || now,
+      publicIdentifier: typeof pool.publicIdentifier === 'string' ? pool.publicIdentifier : null,
+      relayUrl: typeof pool.relayUrl === 'string' ? pool.relayUrl : null,
+      relayCores: Array.isArray(pool.relayCores) ? pool.relayCores : [],
+      metadata: pool.metadata && typeof pool.metadata === 'object' ? pool.metadata : null,
+      expiresAt: Number.isFinite(poolTtlSeconds) && poolTtlSeconds > 0
+        ? now + poolTtlSeconds * 1000
+        : null
+    };
+    this.closedJoinPools.set(relayKey, record);
+  }
+
+  async getClosedJoinPool(relayKey) {
+    const record = this.closedJoinPools.get(relayKey);
+    if (!record) return null;
+    if (record.expiresAt && record.expiresAt <= Date.now()) {
+      this.closedJoinPools.delete(relayKey);
+      return null;
+    }
+    return record;
+  }
+
+  async takeClosedJoinLease(relayKey) {
+    const record = await this.getClosedJoinPool(relayKey);
+    if (!record) return null;
+    const now = Date.now();
+    const entries = Array.isArray(record.entries) ? record.entries : [];
+    const nextEntries = entries.filter((entry) => !entry?.expiresAt || entry.expiresAt > now);
+    const lease = nextEntries.shift() || null;
+    if (nextEntries.length) {
+      this.closedJoinPools.set(relayKey, { ...record, entries: nextEntries, updatedAt: record.updatedAt || now });
+    } else {
+      this.closedJoinPools.delete(relayKey);
+    }
+    return lease;
+  }
+
+  async clearClosedJoinPool(relayKey) {
+    this.closedJoinPools.delete(relayKey);
+  }
+
+  async storeWriterEnvelope(relayKey, envelope = {}) {
+    if (!relayKey || !envelope || typeof envelope !== 'object') return;
+    const leaseId = typeof envelope.leaseId === 'string' ? envelope.leaseId : null;
+    if (!leaseId) return;
+    let perRelay = this.writerEnvelopes.get(relayKey);
+    if (!(perRelay instanceof Map)) {
+      perRelay = new Map();
+      this.writerEnvelopes.set(relayKey, perRelay);
+    }
+    perRelay.set(leaseId, {
+      ...envelope,
+      storedAt: Date.now()
+    });
+  }
+
+  async getWriterEnvelope(relayKey, leaseId) {
+    if (!relayKey || !leaseId) return null;
+    const perRelay = this.writerEnvelopes.get(relayKey);
+    if (!(perRelay instanceof Map)) return null;
+    const envelope = perRelay.get(leaseId);
+    if (!envelope) return null;
+    if (envelope.expiresAt && envelope.expiresAt <= Date.now()) {
+      perRelay.delete(leaseId);
+      return null;
+    }
+    return envelope;
+  }
+
+  async storeLeaseCertificate(relayKey, certificate = {}) {
+    if (!relayKey || !certificate || typeof certificate !== 'object') return;
+    const slotKey = typeof certificate.slotKey === 'string' ? certificate.slotKey : null;
+    if (!slotKey) return;
+    let perRelay = this.leaseCertificates.get(relayKey);
+    if (!(perRelay instanceof Map)) {
+      perRelay = new Map();
+      this.leaseCertificates.set(relayKey, perRelay);
+    }
+    perRelay.set(slotKey, {
+      ...certificate,
+      storedAt: Date.now()
+    });
+  }
+
+  async getLeaseCertificate(relayKey, slotKey) {
+    if (!relayKey || !slotKey) return null;
+    const perRelay = this.leaseCertificates.get(relayKey);
+    if (!(perRelay instanceof Map)) return null;
+    return perRelay.get(slotKey) || null;
   }
 
   async storeOpenJoinAliases(relayKey, aliases = []) {

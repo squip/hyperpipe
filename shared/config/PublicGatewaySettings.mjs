@@ -2,10 +2,23 @@ const VALID_SELECTION_MODES = new Set(['default', 'discovered', 'manual']);
 
 const DEFAULT_SETTINGS = Object.freeze({
   enabled: true,
+  networkMode: 'permissionless-wot',
+  federationId: null,
   selectionMode: 'default',
   selectedGatewayId: null,
-  preferredBaseUrl: 'https://hypertuna.com',
-  baseUrl: 'https://hypertuna.com',
+  preferredBaseUrl: '',
+  baseUrl: '',
+  gateways: {},
+  preferredGatewayIds: [],
+  activeGatewayId: null,
+  trustPolicy: {
+    explicitAllowlist: [],
+    requireFollowedByMe: true,
+    requireMutualFollow: false,
+    minTrustedAttestations: 0,
+    acceptedAttestorPubkeys: [],
+    maxDescriptorAgeMs: 6 * 60 * 60 * 1000
+  },
   sharedSecret: '',
   delegateReqToPeers: false,
   blindPeerEnabled: false,
@@ -54,9 +67,26 @@ function isNodeProcess() {
 
 function normalizeSettings(raw = {}) {
   const normalized = {};
+  const normalizeString = (value) => (typeof value === 'string' ? value.trim() : null);
+  const normalizeStringList = (values) => {
+    const list = Array.isArray(values) ? values : [values];
+    return Array.from(new Set(list.map(normalizeString).filter(Boolean)));
+  };
 
   if (typeof raw.enabled === 'boolean') {
     normalized.enabled = raw.enabled;
+  }
+
+  if (typeof raw.networkMode === 'string') {
+    const mode = raw.networkMode.trim().toLowerCase();
+    if (mode) {
+      normalized.networkMode = mode;
+    }
+  }
+
+  if (typeof raw.federationId === 'string') {
+    const federationId = raw.federationId.trim();
+    normalized.federationId = federationId || null;
   }
 
   if (typeof raw.selectionMode === 'string') {
@@ -69,6 +99,61 @@ function normalizeSettings(raw = {}) {
   if (typeof raw.selectedGatewayId === 'string') {
     const value = raw.selectedGatewayId.trim();
     normalized.selectedGatewayId = value || null;
+  }
+
+  if (typeof raw.activeGatewayId === 'string') {
+    const value = raw.activeGatewayId.trim();
+    normalized.activeGatewayId = value || null;
+  }
+
+  if (raw.preferredGatewayIds != null) {
+    normalized.preferredGatewayIds = normalizeStringList(raw.preferredGatewayIds);
+  }
+
+  if (raw.gateways && typeof raw.gateways === 'object' && !Array.isArray(raw.gateways)) {
+    const gateways = {};
+    for (const [rawId, candidate] of Object.entries(raw.gateways)) {
+      if (!candidate || typeof candidate !== 'object') continue;
+      const id = normalizeString(candidate.id) || normalizeString(rawId);
+      if (!id) continue;
+      gateways[id] = {
+        id,
+        nostrPubkey: normalizeString(candidate.nostrPubkey) || null,
+        swarmPublicKey: normalizeString(candidate.swarmPublicKey) || null,
+        controlTopic: normalizeString(candidate.controlTopic) || null,
+        baseUrl: normalizeString(candidate.baseUrl) || null,
+        wsUrl: normalizeString(candidate.wsUrl) || null,
+        trust: candidate.trust === 'blocked'
+          ? 'blocked'
+          : candidate.trust === 'trusted'
+            ? 'trusted'
+            : 'candidate',
+        health: candidate.health === 'offline'
+          ? 'offline'
+          : candidate.health === 'degraded'
+            ? 'degraded'
+            : 'healthy',
+        latencyMs: Number.isFinite(Number(candidate.latencyMs)) ? Math.round(Number(candidate.latencyMs)) : null,
+        lastSeenAt: Number.isFinite(Number(candidate.lastSeenAt)) ? Math.round(Number(candidate.lastSeenAt)) : null
+      };
+    }
+    normalized.gateways = gateways;
+  }
+
+  if (raw.trustPolicy && typeof raw.trustPolicy === 'object') {
+    const trustPolicy = {
+      explicitAllowlist: normalizeStringList(raw.trustPolicy.explicitAllowlist || []),
+      requireFollowedByMe: raw.trustPolicy.requireFollowedByMe !== false,
+      requireMutualFollow: raw.trustPolicy.requireMutualFollow === true,
+      minTrustedAttestations: Number.isFinite(Number(raw.trustPolicy.minTrustedAttestations))
+        ? Math.max(0, Math.round(Number(raw.trustPolicy.minTrustedAttestations)))
+        : 0,
+      acceptedAttestorPubkeys: normalizeStringList(raw.trustPolicy.acceptedAttestorPubkeys || []),
+      maxDescriptorAgeMs: Number.isFinite(Number(raw.trustPolicy.maxDescriptorAgeMs))
+        ? Math.max(60_000, Math.round(Number(raw.trustPolicy.maxDescriptorAgeMs)))
+        : (6 * 60 * 60 * 1000)
+    };
+    normalized.trustPolicy = trustPolicy;
   }
 
   if (typeof raw.baseUrl === 'string') {
@@ -280,6 +365,79 @@ function normalizeSettings(raw = {}) {
 function withDefaults(raw = {}) {
   const normalized = normalizeSettings(raw);
   const merged = { ...DEFAULT_SETTINGS, ...normalized };
+  const sanitizeString = (value) => {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed.length ? trimmed : null;
+  };
+
+  if (!merged.networkMode || typeof merged.networkMode !== 'string') {
+    merged.networkMode = DEFAULT_SETTINGS.networkMode;
+  }
+  merged.networkMode = merged.networkMode.trim().toLowerCase() || DEFAULT_SETTINGS.networkMode;
+
+  merged.federationId = sanitizeString(merged.federationId);
+  merged.activeGatewayId = sanitizeString(merged.activeGatewayId);
+
+  if (!merged.gateways || typeof merged.gateways !== 'object' || Array.isArray(merged.gateways)) {
+    merged.gateways = {};
+  }
+  const nextGateways = {};
+  for (const [rawId, candidate] of Object.entries(merged.gateways)) {
+    if (!candidate || typeof candidate !== 'object') continue;
+    const id = sanitizeString(candidate.id) || sanitizeString(rawId);
+    if (!id) continue;
+    nextGateways[id] = {
+      id,
+      nostrPubkey: sanitizeString(candidate.nostrPubkey),
+      swarmPublicKey: sanitizeString(candidate.swarmPublicKey),
+      controlTopic: sanitizeString(candidate.controlTopic),
+      baseUrl: sanitizeString(candidate.baseUrl),
+      wsUrl: sanitizeString(candidate.wsUrl),
+      trust: candidate.trust === 'blocked'
+        ? 'blocked'
+        : candidate.trust === 'trusted'
+          ? 'trusted'
+          : 'candidate',
+      health: candidate.health === 'offline'
+        ? 'offline'
+        : candidate.health === 'degraded'
+          ? 'degraded'
+          : 'healthy',
+      latencyMs: Number.isFinite(Number(candidate.latencyMs)) ? Math.round(Number(candidate.latencyMs)) : null,
+      lastSeenAt: Number.isFinite(Number(candidate.lastSeenAt)) ? Math.round(Number(candidate.lastSeenAt)) : null
+    };
+  }
+  merged.gateways = nextGateways;
+
+  merged.preferredGatewayIds = Array.isArray(merged.preferredGatewayIds)
+    ? Array.from(new Set(merged.preferredGatewayIds
+        .map((value) => sanitizeString(value))
+        .filter(Boolean)))
+    : [];
+  if (merged.activeGatewayId && !merged.gateways[merged.activeGatewayId]) {
+    merged.activeGatewayId = null;
+  }
+
+  if (!merged.trustPolicy || typeof merged.trustPolicy !== 'object') {
+    merged.trustPolicy = { ...DEFAULT_SETTINGS.trustPolicy };
+  }
+  merged.trustPolicy = {
+    explicitAllowlist: Array.isArray(merged.trustPolicy.explicitAllowlist)
+      ? Array.from(new Set(merged.trustPolicy.explicitAllowlist.map((value) => sanitizeString(value)).filter(Boolean)))
+      : [],
+    requireFollowedByMe: merged.trustPolicy.requireFollowedByMe !== false,
+    requireMutualFollow: merged.trustPolicy.requireMutualFollow === true,
+    minTrustedAttestations: Number.isFinite(Number(merged.trustPolicy.minTrustedAttestations))
+      ? Math.max(0, Math.round(Number(merged.trustPolicy.minTrustedAttestations)))
+      : 0,
+    acceptedAttestorPubkeys: Array.isArray(merged.trustPolicy.acceptedAttestorPubkeys)
+      ? Array.from(new Set(merged.trustPolicy.acceptedAttestorPubkeys.map((value) => sanitizeString(value)).filter(Boolean)))
+      : [],
+    maxDescriptorAgeMs: Number.isFinite(Number(merged.trustPolicy.maxDescriptorAgeMs))
+      ? Math.max(60_000, Math.round(Number(merged.trustPolicy.maxDescriptorAgeMs)))
+      : (6 * 60 * 60 * 1000)
+  };
 
   if (!merged.preferredBaseUrl) {
     merged.preferredBaseUrl = DEFAULT_SETTINGS.preferredBaseUrl;
@@ -346,12 +504,6 @@ function withDefaults(raw = {}) {
   ensurePositive('dispatcherReassignLagBlocks', DEFAULT_SETTINGS.dispatcherReassignLagBlocks);
   ensurePositive('dispatcherCircuitBreakerThreshold', DEFAULT_SETTINGS.dispatcherCircuitBreakerThreshold);
   ensurePositive('dispatcherCircuitBreakerTimeoutMs', DEFAULT_SETTINGS.dispatcherCircuitBreakerTimeoutMs);
-
-  const sanitizeString = (value) => {
-    if (typeof value !== 'string') return null;
-    const trimmed = value.trim();
-    return trimmed.length ? trimmed : null;
-  };
 
   merged.blindPeerEnabled = !!merged.blindPeerEnabled;
   merged.blindPeerKeys = Array.isArray(merged.blindPeerKeys)
