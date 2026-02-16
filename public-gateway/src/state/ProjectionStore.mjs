@@ -83,6 +83,21 @@ class ProjectionStore {
             await this.registrationStore.storeLeaseCertificate(payload.relayKey, payload.certificate || {});
           }
           break;
+        case 'RelayAuthorityPolicyUpdated':
+          if (payload.relayKey && this.registrationStore?.storeRelayPolicy) {
+            await this.registrationStore.storeRelayPolicy(payload.relayKey, payload.policy || {});
+          }
+          break;
+        case 'JoinMaterialBundlePublished':
+          if (payload.relayKey && payload.purpose && this.registrationStore?.storeBridgeJoinBundle) {
+            await this.registrationStore.storeBridgeJoinBundle(payload.relayKey, payload.purpose, payload.bundle || {});
+          }
+          break;
+        case 'BridgeReceiptCommitted':
+          if (payload.relayKey && payload.purpose && this.registrationStore?.storeBridgeReceipt) {
+            await this.registrationStore.storeBridgeReceipt(payload.relayKey, payload.purpose, payload.receipt || {});
+          }
+          break;
         case 'TokenRevoked':
           if (payload.relayKey && this.registrationStore?.clearTokenMetadata) {
             await this.registrationStore.clearTokenMetadata(payload.relayKey);

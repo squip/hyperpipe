@@ -27,7 +27,10 @@ const DEFAULT_THRESHOLDS = {
   'mirror.read': 2000,
   'auth.challenge_session': 2500,
   'open_join.lease_claim': 5000,
-  'closed_join.lease_claim': 5000
+  'closed_join.lease_claim': 5000,
+  'join_to_writable.open.p95': 45000,
+  'join_to_writable.closed.p95': 60000,
+  'key_mismatch_detection': 10000
 };
 
 function parseArgs(argv = process.argv.slice(2)) {
@@ -202,7 +205,9 @@ async function main() {
       logger: (line) => workerBLog.push(line, { echo: false })
     });
 
-    const gatewayConfig = cluster.workerGatewayConfig();
+    const gatewayConfig = cluster.workerGatewayConfig({
+      transportMode: options.transportMode
+    });
     await workerCreator.configurePublicGateway(gatewayConfig);
     await workerJoiner.configurePublicGateway(gatewayConfig);
 

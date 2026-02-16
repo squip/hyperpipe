@@ -5,6 +5,10 @@ const CONTROL_METHODS = Object.freeze({
   MESH_LEASE_VOTE: 'gateway.control.mesh.lease.vote',
   AUTH_CHALLENGE: 'gateway.control.auth.challenge',
   AUTH_SESSION: 'gateway.control.auth.session',
+  RELAY_AUTHORITY_READ: 'gateway.control.relay.authority.read',
+  RELAY_AUTHORITY_UPSERT: 'gateway.control.relay.authority.upsert',
+  BRIDGE_BUNDLE_READ: 'gateway.control.bridge.bundle.read',
+  BRIDGE_BUNDLE_PUSH: 'gateway.control.bridge.bundle.push',
   RELAY_POLICY_READ: 'gateway.control.relay.policy.read',
   RELAY_REGISTER: 'gateway.control.relay.register',
   MIRROR_READ: 'gateway.control.mirror.read',
@@ -19,6 +23,8 @@ const CONTROL_METHODS = Object.freeze({
 const READ_METHODS = new Set([
   CONTROL_METHODS.MESH_CATALOG_READ,
   CONTROL_METHODS.MESH_STATE_READ,
+  CONTROL_METHODS.RELAY_AUTHORITY_READ,
+  CONTROL_METHODS.BRIDGE_BUNDLE_READ,
   CONTROL_METHODS.RELAY_POLICY_READ,
   CONTROL_METHODS.MIRROR_READ,
   CONTROL_METHODS.OPEN_JOIN_CHALLENGE
@@ -29,6 +35,8 @@ const WRITE_METHODS = new Set([
   CONTROL_METHODS.AUTH_SESSION,
   CONTROL_METHODS.MESH_STATE_APPEND,
   CONTROL_METHODS.MESH_LEASE_VOTE,
+  CONTROL_METHODS.RELAY_AUTHORITY_UPSERT,
+  CONTROL_METHODS.BRIDGE_BUNDLE_PUSH,
   CONTROL_METHODS.RELAY_REGISTER,
   CONTROL_METHODS.OPEN_JOIN_POOL_SYNC,
   CONTROL_METHODS.OPEN_JOIN_LEASE_CLAIM,
@@ -71,6 +79,30 @@ function resolveHttpFallbackRequest(method, payload = {}) {
       return { method: 'POST', path: '/api/v2/auth/challenge', body: payload };
     case CONTROL_METHODS.AUTH_SESSION:
       return { method: 'POST', path: '/api/v2/auth/session', body: payload };
+    case CONTROL_METHODS.RELAY_AUTHORITY_READ:
+      return {
+        method: 'GET',
+        path: `/api/v2/relays/${encodeRelayKey(payload.relayKey)}/authority`,
+        body: null
+      };
+    case CONTROL_METHODS.RELAY_AUTHORITY_UPSERT:
+      return {
+        method: 'PUT',
+        path: `/api/v2/relays/${encodeRelayKey(payload.relayKey)}/authority`,
+        body: payload
+      };
+    case CONTROL_METHODS.BRIDGE_BUNDLE_READ:
+      return {
+        method: 'POST',
+        path: `/api/v2/bridge/relays/${encodeRelayKey(payload.relayKey)}/bundle/read`,
+        body: payload
+      };
+    case CONTROL_METHODS.BRIDGE_BUNDLE_PUSH:
+      return {
+        method: 'POST',
+        path: `/api/v2/bridge/relays/${encodeRelayKey(payload.relayKey)}/bundle/push`,
+        body: payload
+      };
     case CONTROL_METHODS.RELAY_POLICY_READ:
       return {
         method: 'GET',

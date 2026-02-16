@@ -119,6 +119,12 @@ function getRelayWritableGate(relayKey) {
   return { available: true, writable };
 }
 
+function assertJoinRelaySuccess(result, context = 'join-relay') {
+  if (result?.success) return result;
+  const message = result?.error || 'Join relay failed';
+  throw new Error(`[${context}] ${message}`);
+}
+
 
 // Global state
 let config = null;
@@ -1037,6 +1043,17 @@ function handlePeerConnection(stream, peerInfo) {
   const publicKey = peerInfo.publicKey.toString('hex');
   const normalizedKey = publicKey.toLowerCase();
   console.log('[RelayServer] Setting up protocol for peer:', publicKey);
+
+  // Secret-stream can emit ECONNRESET on remote disconnect; consume and log
+  // to avoid process-level unhandled error crashes.
+  try {
+    stream.on('error', (error) => {
+      console.warn('[RelayServer] Peer stream error', {
+        peer: publicKey.substring(0, 8),
+        error: error?.message || error
+      });
+    });
+  } catch (_) {}
   
   // Track the peer
   connectedPeers.set(normalizedKey, {
@@ -4172,6 +4189,52 @@ function updateMetrics(success = true) {
   }
 }
 
+async function attemptControlPlaneGatewayRegistration(relayProfileInfo = null, reason = 'gateway-registration-fallback') {
+  const gatewayService = global.gatewayService || null;
+  if (!gatewayService) {
+    return { ok: false, reason: 'gateway-service-unavailable' };
+  }
+
+  const relayKey = relayProfileInfo?.relay_key || relayProfileInfo?.relayKey || null;
+  try {
+    if (typeof global.refreshGatewayRelayRegistry === 'function') {
+      await global.refreshGatewayRelayRegistry(`relay-server-${reason}`);
+    }
+  } catch (error) {
+    console.warn('[RelayServer] Gateway registry refresh before control fallback failed', {
+      relayKey,
+      reason,
+      error: error?.message || error
+    });
+  }
+
+  try {
+    if (relayKey && typeof gatewayService.syncPublicGatewayRelay === 'function') {
+      await gatewayService.syncPublicGatewayRelay(relayKey, { forceTokenRefresh: true });
+    } else if (typeof gatewayService.resyncPublicGateway === 'function') {
+      await gatewayService.resyncPublicGateway();
+    } else {
+      return { ok: false, reason: 'control-sync-unavailable' };
+    }
+    console.log('[RelayServer] Gateway registration fallback succeeded via control plane', {
+      relayKey,
+      reason
+    });
+    return { ok: true, relayKey };
+  } catch (error) {
+    console.warn('[RelayServer] Gateway registration fallback failed via control plane', {
+      relayKey,
+      reason,
+      error: error?.message || error
+    });
+    return {
+      ok: false,
+      reason: 'control-fallback-failed',
+      error: error?.message || String(error)
+    };
+  }
+}
+
 // Register with gateway using Hyperswarm
 async function registerWithGateway(relayProfileInfo = null, options = {}) {
   const { skipQueue = false } = options || {};
@@ -4442,6 +4505,14 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     }
 
     if (!gatewayConnection) {
+      const controlFallback = await attemptControlPlaneGatewayRegistration(relayProfileInfo, 'connection-unavailable');
+      if (controlFallback.ok) {
+        console.log('[RelayServer] Gateway registration completed via control fallback (no legacy connection)', {
+          relayKey: relayProfileInfo?.relay_key || relayProfileInfo?.relayKey || null
+        });
+        console.log('[RelayServer] ========================================');
+        return { acknowledged: true, fallback: 'control-plane' };
+      }
       console.log('[RelayServer] Gateway connection unavailable - queuing registration for later processing', {
         skipQueue,
         pendingCount: pendingRegistrations.length,
@@ -4550,6 +4621,12 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     return { acknowledged: true, ack };
   } catch (error) {
     console.error('[RelayServer] Gateway registration via Hyperswarm FAILED:', error.message);
+    const controlFallback = await attemptControlPlaneGatewayRegistration(relayProfileInfo, 'legacy-registration-error');
+    if (controlFallback.ok) {
+      console.log('[RelayServer] Registration recovered via control-plane fallback after legacy failure');
+      console.log('[RelayServer] ========================================');
+      return { acknowledged: true, fallback: 'control-plane' };
+    }
     if (!skipQueue) {
       pendingRegistrations.push(relayProfileInfo || null);
       console.log('[RelayServer] Registration re-queued due to failure', {
@@ -4677,7 +4754,7 @@ export async function createRelay(options) {
         elapsedMs: relayWaitResult?.elapsedMs ?? null
       });
 
-      if (relayWaitResult?.ok && global.sendMessage) {
+      if (relayWaitResult?.ok && relayWaitResult?.writable && global.sendMessage) {
         const relayWritablePayload = {
           relayKey: result.relayKey,
           publicIdentifier: result.publicIdentifier || null,
@@ -5189,7 +5266,7 @@ export async function startJoinAuthentication(options) {
           reason: 'blind-peer-fallback'
         });
 
-        await joinRelayManager({
+        const joinResult = await joinRelayManager({
           relayKey: fallbackRelayKey,
           config,
           fileSharing,
@@ -5207,6 +5284,7 @@ export async function startJoinAuthentication(options) {
           suppressInitMessage: true,
           useSharedCorestore: true
         });
+        assertJoinRelaySuccess(joinResult, 'blind-peer-fallback');
         await applyPendingAuthUpdates(updateRelayAuthToken, fallbackRelayKey, publicIdentifier);
 
         let joinedProfile = await getRelayProfileByKey(fallbackRelayKey);
@@ -5368,7 +5446,7 @@ export async function startJoinAuthentication(options) {
         const connectionUrl = inviteToken ? `${baseUrl}?token=${inviteToken}` : baseUrl;
         const resolvedRelayUrl = inviteRelayUrl || connectionUrl;
 
-        if (relayWaitResult?.ok && global.sendMessage) {
+        if (relayWaitResult?.ok && relayWaitResult?.writable && global.sendMessage) {
           console.log('[RelayServer] Emitting relay-writable (blind-peer fallback)', {
             relayKey: fallbackRelayKey,
             publicIdentifier,
@@ -5550,7 +5628,7 @@ export async function startJoinAuthentication(options) {
           reason: 'open-offline'
         });
 
-        await joinRelayManager({
+        const joinResult = await joinRelayManager({
           relayKey: fallbackRelayKey,
           config,
           fileSharing,
@@ -5568,6 +5646,7 @@ export async function startJoinAuthentication(options) {
           suppressInitMessage: true,
           useSharedCorestore: true
         });
+        assertJoinRelaySuccess(joinResult, 'open-offline');
         await applyPendingAuthUpdates(updateRelayAuthToken, fallbackRelayKey, publicIdentifier);
 
         let joinedProfile = await getRelayProfileByKey(fallbackRelayKey);
@@ -5600,7 +5679,7 @@ export async function startJoinAuthentication(options) {
         const connectionUrl = provisionalToken ? `${baseUrl}?token=${provisionalToken}` : baseUrl;
         const resolvedRelayUrl = inviteRelayUrl || connectionUrl;
 
-        if (relayWaitResult?.ok && global.sendMessage) {
+        if (relayWaitResult?.ok && relayWaitResult?.writable && global.sendMessage) {
           console.log('[RelayServer] Emitting relay-writable (open join offline)', {
             relayKey: fallbackRelayKey,
             publicIdentifier,
@@ -5812,7 +5891,7 @@ export async function startJoinAuthentication(options) {
     });
 
     // Join the relay locally so we have a profile and key mapping
-    await joinRelayManager({
+    const joinResult = await joinRelayManager({
       relayKey,
       config,
       fileSharing,
@@ -5824,8 +5903,10 @@ export async function startJoinAuthentication(options) {
       blindPeer,
       coreRefs: directCoreRefs,
       fastForward,
-      expectedWriterKey: finalExpectedWriterKey
+      expectedWriterKey: finalExpectedWriterKey,
+      useSharedCorestore: true
     });
+    assertJoinRelaySuccess(joinResult, 'direct-join');
     await applyPendingAuthUpdates(updateRelayAuthToken, relayKey, finalIdentifier);
 
     // Ensure the joined relay profile has the public identifier recorded
@@ -5853,7 +5934,7 @@ export async function startJoinAuthentication(options) {
       expectedWriterActive: directWaitResult?.expectedWriterActive ?? null,
       elapsedMs: directWaitResult?.elapsedMs ?? null
     });
-    if (directWaitResult?.ok && global.sendMessage) {
+    if (directWaitResult?.ok && directWaitResult?.writable && global.sendMessage) {
       console.log('[RelayServer] Emitting relay-writable (direct join)', {
         relayKey,
         publicIdentifier: finalIdentifier,

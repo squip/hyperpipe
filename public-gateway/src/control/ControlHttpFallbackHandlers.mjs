@@ -13,6 +13,10 @@ class ControlHttpFallbackHandlers {
     this.app.get('/api/v2/mesh/state', (req, res) => this.#invoke('meshStateRead', req, res));
     this.app.post('/api/v2/mesh/state/append', (req, res) => this.#invoke('meshStateAppend', req, res));
     this.app.post('/api/v2/mesh/lease/vote', (req, res) => this.#invoke('meshLeaseVote', req, res));
+    this.app.get('/api/v2/relays/:relayKey/authority', (req, res) => this.#invoke('relayAuthorityRead', req, res));
+    this.app.put('/api/v2/relays/:relayKey/authority', (req, res) => this.#invoke('relayAuthorityUpsert', req, res));
+    this.app.post('/api/v2/bridge/relays/:relayKey/bundle/read', (req, res) => this.#invoke('bridgeBundleRead', req, res));
+    this.app.post('/api/v2/bridge/relays/:relayKey/bundle/push', (req, res) => this.#invoke('bridgeBundlePush', req, res));
     this.app.get('/api/v2/relays/:relayKey/policy', (req, res) => this.#invoke('relayPolicyRead', req, res));
 
     this.app.post('/api/v2/auth/challenge', (req, res) => this.#invoke('authChallenge', req, res));

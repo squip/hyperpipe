@@ -364,13 +364,17 @@ class DockerGatewayCluster {
     }
   }
 
-  workerGatewayConfig() {
+  workerGatewayConfig({ transportMode = null } = {}) {
     assert(this.env, 'cluster not initialized');
+    const normalizedTransportMode = typeof transportMode === 'string' && transportMode.trim()
+      ? transportMode.trim().toLowerCase()
+      : 'p2p-first';
     return {
       federationId: this.federationId,
       enabled: true,
       networkMode: 'permissionless-wot',
       selectionMode: 'manual',
+      controlTransportMode: normalizedTransportMode,
       selectedGatewayId: this.gatewayIds.a,
       activeGatewayId: this.gatewayIds.a,
       baseUrl: this.gatewayBaseUrl('a'),

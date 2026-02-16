@@ -71,6 +71,7 @@ import {
   getCachedPublicGatewaySettings
 } from '../shared/config/PublicGatewaySettings.mjs'
 import { CONTROL_METHODS } from '../shared/public-gateway/ControlPlaneMethods.mjs'
+import { validateJoinMaterialBundle } from '../shared/public-gateway/JoinMaterialVerifier.mjs'
 import {
   downloadGroupFileOperation,
   deleteLocalGroupFileOperation,
@@ -139,11 +140,11 @@ const defaultStorageDir = process.env.STORAGE_DIR || pearRuntime?.config?.storag
 const userKey = process.env.USER_KEY || null
 const BLIND_PEERING_METADATA_FILENAME = 'blind-peering-metadata.json'
 const BLIND_PEER_REHYDRATION_TIMEOUT_MS = 60000
-const BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS = 90000
+const BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS = 8000
 const BLIND_PEER_REHYDRATION_RETRIES = 1
 const BLIND_PEER_REHYDRATION_BACKOFF_MS = 5000
-const BLIND_PEER_JOIN_REHYDRATION_RETRIES = 1
-const BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS = 7000
+const BLIND_PEER_JOIN_REHYDRATION_RETRIES = 0
+const BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS = 1000
 const BLIND_PEER_MIRROR_METADATA_REFRESH_MS = 1 * 60 * 1000
 const BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS = 8000
 const OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS = 8000
@@ -186,6 +187,7 @@ const RELAY_SUBSCRIPTION_REFRESH_CACHE_TTL_MS = 60 * 1000
 const RELAY_SUBSCRIPTION_REFRESH_MAX_TRACKED = 512
 const relaySubscriptionRefreshRecent = new Map()
 const relaySubscriptionRefreshInFlight = new Map()
+const relayJoinDiagnostics = new Map()
 
 function resolveClosedJoinPoolEntryTtlMs(config) {
   const fromConfig =
@@ -941,6 +943,265 @@ function normalizeGatewayTrustFixture(raw = {}) {
       ? raw.attestations.map(normalizeAttestation).filter(Boolean)
       : []
   }
+}
+
+function normalizeJoinDiagString(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed.length ? trimmed : null
+}
+
+function snapshotRelayJoinDiagnostic(record = null) {
+  if (!record || typeof record !== 'object') return null
+  return {
+    id: record.id || null,
+    relayKey: record.relayKey || null,
+    publicIdentifier: record.publicIdentifier || null,
+    mode: record.mode || null,
+    joinStartedAtMs: record.joinStartedAtMs || null,
+    joinAuthAtMs: record.joinAuthAtMs || null,
+    relayWritableAtMs: record.relayWritableAtMs || null,
+    joinToWritableMs: Number.isFinite(Number(record.joinToWritableMs)) ? Math.round(Number(record.joinToWritableMs)) : null,
+    joinAuthToWritableMs: Number.isFinite(Number(record.joinAuthToWritableMs)) ? Math.round(Number(record.joinAuthToWritableMs)) : null,
+    writable: typeof record.writable === 'boolean' ? record.writable : null,
+    expectedWriterActive: typeof record.expectedWriterActive === 'boolean' ? record.expectedWriterActive : null,
+    validation: record.validation && typeof record.validation === 'object'
+      ? {
+          ok: record.validation.ok !== false,
+          errors: Array.isArray(record.validation.errors) ? [...record.validation.errors] : [],
+          checkedAtMs: Number.isFinite(Number(record.validation.checkedAtMs))
+            ? Math.round(Number(record.validation.checkedAtMs))
+            : null
+        }
+      : null,
+    material: record.material && typeof record.material === 'object'
+      ? { ...record.material }
+      : null,
+    lastError: record.lastError || null,
+    updatedAtMs: Number.isFinite(Number(record.updatedAtMs)) ? Math.round(Number(record.updatedAtMs)) : Date.now()
+  }
+}
+
+function findRelayJoinDiagnostic({ relayKey = null, publicIdentifier = null } = {}) {
+  const normalizedRelayKey = normalizeJoinDiagString(relayKey)
+  const normalizedIdentifier = normalizeJoinDiagString(publicIdentifier)
+  for (const record of relayJoinDiagnostics.values()) {
+    if (normalizedRelayKey && record?.relayKey === normalizedRelayKey) return record
+    if (normalizedIdentifier && record?.publicIdentifier === normalizedIdentifier) return record
+  }
+  return null
+}
+
+function updateRelayJoinDiagnostic({
+  relayKey = null,
+  publicIdentifier = null,
+  mode = null,
+  patch = {}
+} = {}) {
+  const normalizedRelayKey = normalizeJoinDiagString(relayKey)
+  const normalizedIdentifier = normalizeJoinDiagString(publicIdentifier)
+  let record = findRelayJoinDiagnostic({
+    relayKey: normalizedRelayKey,
+    publicIdentifier: normalizedIdentifier
+  })
+  if (!record) {
+    record = {
+      id: nodeCrypto.randomBytes(8).toString('hex'),
+      relayKey: normalizedRelayKey,
+      publicIdentifier: normalizedIdentifier,
+      mode: mode || null,
+      joinStartedAtMs: null,
+      joinAuthAtMs: null,
+      relayWritableAtMs: null,
+      joinToWritableMs: null,
+      joinAuthToWritableMs: null,
+      writable: null,
+      expectedWriterActive: null,
+      validation: null,
+      material: null,
+      lastError: null,
+      updatedAtMs: Date.now()
+    }
+    relayJoinDiagnostics.set(record.id, record)
+  }
+
+  if (normalizedRelayKey) record.relayKey = normalizedRelayKey
+  if (normalizedIdentifier) record.publicIdentifier = normalizedIdentifier
+  if (mode) record.mode = mode
+
+  if (patch && typeof patch === 'object') {
+    Object.assign(record, patch)
+  }
+
+  if (Number.isFinite(Number(record.joinStartedAtMs)) && Number.isFinite(Number(record.relayWritableAtMs))) {
+    record.joinToWritableMs = Math.max(0, Math.round(Number(record.relayWritableAtMs) - Number(record.joinStartedAtMs)))
+  }
+  if (Number.isFinite(Number(record.joinAuthAtMs)) && Number.isFinite(Number(record.relayWritableAtMs))) {
+    record.joinAuthToWritableMs = Math.max(0, Math.round(Number(record.relayWritableAtMs) - Number(record.joinAuthAtMs)))
+  }
+  record.updatedAtMs = Date.now()
+  relayJoinDiagnostics.set(record.id, record)
+  return snapshotRelayJoinDiagnostic(record)
+}
+
+function getRelayJoinDiagnosticsSnapshot({ relayKey = null, publicIdentifier = null } = {}) {
+  const normalizedRelayKey = normalizeJoinDiagString(relayKey)
+  const normalizedIdentifier = normalizeJoinDiagString(publicIdentifier)
+  if (normalizedRelayKey || normalizedIdentifier) {
+    const match = findRelayJoinDiagnostic({
+      relayKey: normalizedRelayKey,
+      publicIdentifier: normalizedIdentifier
+    })
+    return match ? snapshotRelayJoinDiagnostic(match) : null
+  }
+  return Array.from(relayJoinDiagnostics.values())
+    .map((entry) => snapshotRelayJoinDiagnostic(entry))
+    .filter(Boolean)
+    .sort((a, b) => (Number(b?.updatedAtMs) || 0) - (Number(a?.updatedAtMs) || 0))
+}
+
+function trackRelayJoinDiagnosticsState(message) {
+  if (!message || typeof message !== 'object') return
+  const type = normalizeJoinDiagString(message.type)
+  const data = message?.data && typeof message.data === 'object' ? message.data : {}
+  if (type === 'join-auth-success') {
+    updateRelayJoinDiagnostic({
+      relayKey: data?.relayKey || null,
+      publicIdentifier: data?.publicIdentifier || null,
+      mode: typeof data?.mode === 'string' ? data.mode : null,
+      patch: {
+        joinAuthAtMs: Date.now(),
+        lastError: null
+      }
+    })
+    return
+  }
+  if (type === 'relay-writable') {
+    const writable = typeof data?.writable === 'boolean' ? data.writable : null
+    const patch = {
+      writable,
+      expectedWriterActive: typeof data?.expectedWriterActive === 'boolean' ? data.expectedWriterActive : null
+    }
+    if (writable === true) {
+      patch.relayWritableAtMs = Date.now()
+    }
+    updateRelayJoinDiagnostic({
+      relayKey: data?.relayKey || null,
+      publicIdentifier: data?.publicIdentifier || null,
+      mode: typeof data?.mode === 'string' ? data.mode : null,
+      patch
+    })
+    return
+  }
+  if (type === 'join-auth-error') {
+    updateRelayJoinDiagnostic({
+      relayKey: data?.relayKey || null,
+      publicIdentifier: data?.publicIdentifier || null,
+      patch: {
+        lastError: normalizeJoinDiagString(data?.error) || 'join-auth-error'
+      }
+    })
+  }
+}
+
+function validateJoinMaterialConsistency({
+  relayKey = null,
+  publicIdentifier = null,
+  mode = 'open',
+  writerCore = null,
+  writerCoreHex = null,
+  autobaseLocal = null,
+  writerSecret = null,
+  writerEnvelope = null,
+  coreRefs = [],
+  fastForward = null,
+  blindPeer = null,
+  certificate = null
+} = {}) {
+  const purpose = mode === 'closed' ? 'closed-join' : 'open-join'
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey) || normalizeJoinDiagString(relayKey)
+  const normalizedIdentifier = normalizeJoinDiagString(publicIdentifier)
+  const normalizedWriterCore = normalizeCoreRef(writerCore) || normalizeJoinDiagString(writerCore)
+  const normalizedWriterCoreHex = normalizeCoreRef(writerCoreHex) || normalizeJoinDiagString(writerCoreHex)
+  const normalizedAutobaseLocal = normalizeCoreRef(autobaseLocal) || normalizeJoinDiagString(autobaseLocal)
+  const normalizedCoreRefs = normalizeCoreRefList(coreRefs)
+  const normalizedFastForwardKey = normalizeCoreRef(fastForward?.key || null)
+  const normalizedBlindPeer = sanitizeBlindPeerMeta(blindPeer)
+  const normalizedCertificate = certificate && typeof certificate === 'object'
+    ? { ...certificate }
+    : null
+
+  const errors = []
+  if (normalizedWriterCoreHex && normalizedAutobaseLocal && normalizedWriterCoreHex !== normalizedAutobaseLocal) {
+    errors.push('writer-tuple-mismatch')
+  }
+
+  const canonicalWriterKey = normalizedWriterCoreHex || normalizedAutobaseLocal || normalizedWriterCore || null
+  if (canonicalWriterKey && normalizedCoreRefs.length && !normalizedCoreRefs.includes(canonicalWriterKey)) {
+    errors.push('writer-key-missing-from-core-refs')
+  }
+  if (normalizedFastForwardKey && normalizedCoreRefs.length && !normalizedCoreRefs.includes(normalizedFastForwardKey)) {
+    errors.push('fast-forward-key-missing-from-core-refs')
+  }
+
+  let bundleValidation = null
+  if (normalizedCertificate) {
+    bundleValidation = validateJoinMaterialBundle({
+      relayKey: normalizedRelayKey || normalizedIdentifier || null,
+      purpose,
+      mirror: {
+        coreRefs: normalizedCoreRefs,
+        publicIdentifier: normalizedIdentifier || normalizedRelayKey || null,
+        blindPeer: normalizedBlindPeer || null,
+        fastForward: fastForward && typeof fastForward === 'object' ? { ...fastForward } : null
+      },
+      lease: {
+        writerCore: normalizedWriterCore || null,
+        writerCoreHex: normalizedWriterCoreHex || normalizedAutobaseLocal || null,
+        autobaseLocal: normalizedAutobaseLocal || normalizedWriterCoreHex || null,
+        certificate: normalizedCertificate
+      },
+      openJoin: purpose === 'open-join' ? { writerSecret: normalizeJoinDiagString(writerSecret) || null } : undefined,
+      closedJoin: purpose === 'closed-join'
+        ? { writerEnvelope: writerEnvelope && typeof writerEnvelope === 'object' ? writerEnvelope : null }
+        : undefined
+    }, {
+      expectedRelayKey: normalizedRelayKey || normalizedIdentifier || null,
+      expectedPurpose: purpose,
+      requireWritableMaterial: false
+    })
+    if (!bundleValidation?.ok) {
+      const bundleErrors = (bundleValidation?.errors || []).filter((entry) => entry !== 'missing-blind-peer-public-key')
+      errors.push(...bundleErrors)
+    }
+  }
+
+  return {
+    ok: errors.length === 0,
+    errors: Array.from(new Set(errors)),
+    purpose,
+    canonicalWriterKey,
+    normalizedCoreRefs,
+    fastForwardKey: normalizedFastForwardKey,
+    hasBlindPeer: !!normalizedBlindPeer?.publicKey,
+    hasCertificate: !!normalizedCertificate,
+    bundleValidation
+  }
+}
+
+function buildJoinBlindPeerReadinessRefs({
+  relayKey = null,
+  coreRefs = [],
+  fastForward = null
+} = {}) {
+  const normalizedCoreRefs = normalizeCoreRefList(coreRefs)
+  const seeded = normalizeCoreRefList([
+    relayKey,
+    fastForward?.key || null,
+    normalizedCoreRefs[0] || null
+  ])
+  if (seeded.length) return seeded
+  return normalizedCoreRefs.slice(0, 1)
 }
 
 function resolveControlMethodName(candidate) {
@@ -3278,6 +3539,15 @@ function trackOpenJoinReauthState(message) {
     return
   }
 
+  if (message.type === 'relay-writable') {
+    const identifier = message?.data?.publicIdentifier
+    if (!identifier) return
+    if (message?.data?.writable === false) return
+    pendingOpenJoinReauth.delete(identifier)
+    openJoinContexts.delete(identifier)
+    return
+  }
+
   if (message.type === 'join-auth-error') {
     const identifier = message?.data?.publicIdentifier
     if (!identifier) return
@@ -3313,7 +3583,7 @@ async function maybeReauthOpenJoins(status) {
         relayKey: entry?.relayKey || undefined,
         relayUrl: entry?.relayUrl || undefined,
         hostPeers,
-        openJoin: false
+        openJoin: true
       })
     } catch (err) {
       console.warn('[Worker] Open join reauth attempt failed', err?.message || err)
@@ -3327,6 +3597,7 @@ const sendMessage = (message) => {
 
   trackRegistrationStatus(message)
   trackOpenJoinReauthState(message)
+  trackRelayJoinDiagnosticsState(message)
 
   if (workerPipe) {
     const messageStr = JSON.stringify(message) + '\n'
@@ -4445,6 +4716,7 @@ global.resolveRelayMirrorCoreRefs = resolveRelayMirrorCoreRefs
 global.getRelayMirrorCoreRefsCache = getRelayMirrorCoreRefsCache
 global.syncActiveRelayCoreRefs = syncActiveRelayCoreRefs
 global.appendOpenJoinMirrorCores = appendOpenJoinMirrorCores
+global.refreshGatewayRelayRegistry = refreshGatewayRelayRegistry
 global.recoverRelayDriveFile = recoverRelayDriveFile
 global.recoverConversationDriveFile = recoverConversationDriveFile
 global.requestRelaySubscriptionRefresh = async (relayKey = null, { reason = 'manual' } = {}) => {
@@ -4455,6 +4727,14 @@ global.requestRelaySubscriptionRefresh = async (relayKey = null, { reason = 'man
   return { status: 'skipped', reason: 'relay-server-unavailable' }
 }
 global.onRelayWritable = (payload = {}) => {
+  if (payload?.writable === false) {
+    console.log('[Worker] Ignoring non-writable relay-writable signal', {
+      mode: payload?.mode ? String(payload.mode) : 'unknown',
+      relayKey: payload?.relayKey || null,
+      publicIdentifier: payload?.publicIdentifier || null
+    })
+    return
+  }
   const mode = payload?.mode ? String(payload.mode) : 'unknown'
   const relayKey = payload?.relayKey || null
   console.log('[Worker] Relay writable received; refreshing gateway registry', {
@@ -4922,6 +5202,21 @@ async function handleMessageObject(message) {
       const fixture = gatewayTrustFixture || normalizeGatewayTrustFixture({})
       sendMessage({ type: 'gateway-trust-fixture', fixture })
       sendWorkerResponse(extractMessageRequestId(message), { success: true, data: fixture })
+      break
+    }
+
+    case 'get-relay-join-diagnostics': {
+      const requestId = extractMessageRequestId(message)
+      try {
+        const payload = message?.data && typeof message.data === 'object' ? message.data : {}
+        const diagnostics = getRelayJoinDiagnosticsSnapshot({
+          relayKey: payload?.relayKey || null,
+          publicIdentifier: payload?.publicIdentifier || null
+        })
+        sendWorkerResponse(requestId, { success: true, data: diagnostics })
+      } catch (err) {
+        sendWorkerResponse(requestId, { success: false, error: err?.message || String(err) })
+      }
       break
     }
 
@@ -5728,6 +6023,8 @@ async function handleMessageObject(message) {
         const publicIdentifier = data.publicIdentifier
         const fileSharing = data.fileSharing
         const openJoin = data.openJoin === true
+        const joinMode = openJoin ? 'open' : 'closed'
+        const joinStartedAtMs = Date.now()
         const isOpen =
           typeof data.isOpen === 'boolean'
             ? data.isOpen
@@ -5735,6 +6032,22 @@ async function handleMessageObject(message) {
               ? true
               : undefined
         const inviteToken = typeof data.token === 'string' ? data.token.trim() : null
+        updateRelayJoinDiagnostic({
+          relayKey: data?.relayKey || null,
+          publicIdentifier,
+          mode: joinMode,
+          patch: {
+            joinStartedAtMs,
+            joinAuthAtMs: null,
+            relayWritableAtMs: null,
+            joinToWritableMs: null,
+            joinAuthToWritableMs: null,
+            writable: null,
+            expectedWriterActive: null,
+            validation: null,
+            lastError: null
+          }
+        })
         let joinBlindPeeringManager = null
         let joinRelayIdentifierForTracking = null
         try {
@@ -5746,6 +6059,12 @@ async function handleMessageObject(message) {
           let joinRelayUrl = data.relayUrl || null
           let writerCore = data.writerCore || null
           let writerSecret = data.writerSecret || null
+          let writerEnvelope = data?.writerEnvelope && typeof data.writerEnvelope === 'object'
+            ? { ...data.writerEnvelope }
+            : (data?.envelope && typeof data.envelope === 'object' ? { ...data.envelope } : null)
+          let certificate = data?.certificate && typeof data.certificate === 'object'
+            ? { ...data.certificate }
+            : null
           let writerCoreHex =
             data.writerCoreHex ||
             data.writer_core_hex ||
@@ -5779,6 +6098,8 @@ async function handleMessageObject(message) {
             writerCorePrefix: previewValue(writerCore, 16),
             writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
             writerSecretLen: writerSecret ? String(writerSecret).length : 0,
+            hasWriterEnvelope: !!writerEnvelope,
+            hasCertificate: !!certificate,
             hasFastForward: !!fastForward
           })
 
@@ -5815,6 +6136,12 @@ async function handleMessageObject(message) {
                     autobaseLocal = String(bootstrapData.autobaseLocal || bootstrapData.autobase_local)
                   }
                   if (!writerSecret && bootstrapData.writerSecret) writerSecret = String(bootstrapData.writerSecret)
+                  if (!writerEnvelope && bootstrapData.writerEnvelope && typeof bootstrapData.writerEnvelope === 'object') {
+                    writerEnvelope = { ...bootstrapData.writerEnvelope }
+                  }
+                  if (!certificate && bootstrapData.certificate && typeof bootstrapData.certificate === 'object') {
+                    certificate = { ...bootstrapData.certificate }
+                  }
                   if (!blindPeer && bootstrapBlindPeer) blindPeer = bootstrapBlindPeer
                   if (!coreRefs.length && bootstrapCoreRefs.length) coreRefs = bootstrapCoreRefs
                   if (bootstrapWriterCoreRefs.length) {
@@ -5848,6 +6175,8 @@ async function handleMessageObject(message) {
                     writerCorePrefix: previewValue(writerCore, 16),
                     writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
                     writerSecretLen: writerSecret ? String(writerSecret).length : 0,
+                    hasWriterEnvelope: !!writerEnvelope,
+                    hasCertificate: !!certificate,
                     blindPeerKey: previewValue(blindPeer?.publicKey, 16),
                     blindPeerHasEncryptionKey: !!blindPeer?.encryptionKey
                   })
@@ -5901,6 +6230,12 @@ async function handleMessageObject(message) {
                     autobaseLocal = String(mirrorData.autobaseLocal || mirrorData.autobase_local)
                   }
                   if (!writerSecret && mirrorData.writerSecret) writerSecret = String(mirrorData.writerSecret)
+                  if (!writerEnvelope && mirrorData.writerEnvelope && typeof mirrorData.writerEnvelope === 'object') {
+                    writerEnvelope = { ...mirrorData.writerEnvelope }
+                  }
+                  if (!certificate && mirrorData.certificate && typeof mirrorData.certificate === 'object') {
+                    certificate = { ...mirrorData.certificate }
+                  }
                   if (openJoin && publicIdentifier) {
                     recordOpenJoinContext({
                       publicIdentifier,
@@ -5919,6 +6254,8 @@ async function handleMessageObject(message) {
                     hasWriterCore: !!writerCore,
                     hasWriterCoreHex: !!writerCoreHex,
                     hasAutobaseLocal: !!autobaseLocal,
+                    hasWriterEnvelope: !!writerEnvelope,
+                    hasCertificate: !!certificate,
                     origin: mirrorResult?.origin || null,
                     writerSecretLen: writerSecret ? String(writerSecret).length : 0,
                     blindPeerKey: previewValue(blindPeer?.publicKey, 16),
@@ -5955,78 +6292,124 @@ async function handleMessageObject(message) {
             }
           }
 
-          // Blind-peer fallback: if no host peers but mirror info provided, hydrate mirrors and trust the mirror key.
-          if ((!hostPeers || hostPeers.length === 0) && blindPeer && blindPeer.publicKey) {
+          let blindPeerReadiness = null
+
+          // Blind-peer prefetch: trust and hydrate mirror data whenever blind-peer
+          // metadata is present, even if direct host peers are also available.
+          if (blindPeer && blindPeer.publicKey) {
             try {
               const manager = await ensureBlindPeeringManager()
               if (manager) {
+                const hadDirectHostPeers = Array.isArray(hostPeers) && hostPeers.length > 0
                 manager.markTrustedMirrors([blindPeer.publicKey])
                 const relayIdentifier = joinRelayKey || publicIdentifier
-                joinBlindPeeringManager = manager
-                joinRelayIdentifierForTracking = relayIdentifier
-                if (typeof manager.markJoinStart === 'function') {
-                  manager.markJoinStart({
-                    relayKey: relayIdentifier,
-                    publicIdentifier,
-                    reason: 'join-flow'
+                if (relayIdentifier) {
+                  joinBlindPeeringManager = manager
+                  joinRelayIdentifierForTracking = relayIdentifier
+                  if (typeof manager.markJoinStart === 'function') {
+                    manager.markJoinStart({
+                      relayKey: relayIdentifier,
+                      publicIdentifier,
+                      reason: 'join-flow'
+                    })
+                  }
+                  const relayCorestore = getRelayCorestore(relayIdentifier, {
+                    storageBase: config?.storage || defaultStorageDir
                   })
-                }
-                const relayCorestore = getRelayCorestore(relayIdentifier, {
-                  storageBase: config?.storage || defaultStorageDir
-                })
-                console.log('[Worker] Blind-peer join flow: using relay corestore', {
-                  relayIdentifier,
-                  corestoreId: relayCorestore?.__ht_id || null,
-                  storagePath: relayCorestore?.__ht_storage_path || null
-                })
-                manager.ensureRelayMirror({
-                  relayKey: relayIdentifier,
-                  publicIdentifier,
-                  reason: 'join-flow',
-                  coreRefs,
-                  corestore: relayCorestore
-                })
-                console.log('[Worker] Blind-peer join flow: refreshing mirrors', {
-                  relayIdentifier,
-                  coreRefsCount: coreRefs.length,
-                  timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
-                  coreRefsPreview: coreRefs.map((key) => String(key).slice(0, 16))
-                })
-                await manager.refreshFromBlindPeers('join-flow')
-                if (typeof manager.primeRelayCoreRefs === 'function' && coreRefs.length) {
-                  const primeSummary = await manager.primeRelayCoreRefs({
+                  console.log('[Worker] Blind-peer join flow: using relay corestore', {
+                    relayKey: relayIdentifier,
+                    corestoreId: relayCorestore?.__ht_id || null,
+                    storagePath: relayCorestore?.__ht_storage_path || null
+                  })
+                  manager.ensureRelayMirror({
                     relayKey: relayIdentifier,
                     publicIdentifier,
-                    coreRefs,
-                    timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
                     reason: 'join-flow',
+                    coreRefs,
                     corestore: relayCorestore
                   })
-                  console.log('[Worker] Blind-peer join flow: core prefetch completed', {
+                  console.log('[Worker] Blind-peer join flow: refreshing mirrors', {
                     relayIdentifier,
-                    status: primeSummary?.status ?? null,
-                    synced: primeSummary?.synced ?? null,
-                    failed: primeSummary?.failed ?? null,
-                    connected: primeSummary?.connected ?? null
+                    coreRefsCount: coreRefs.length,
+                    timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
+                    coreRefsPreview: coreRefs.map((key) => String(key).slice(0, 16))
                   })
+                  await manager.refreshFromBlindPeers('join-flow')
+                  if (typeof manager.primeRelayCoreRefs === 'function' && coreRefs.length) {
+                    const primeSummary = await manager.primeRelayCoreRefs({
+                      relayKey: relayIdentifier,
+                      publicIdentifier,
+                      coreRefs,
+                      timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
+                      reason: 'join-flow',
+                      corestore: relayCorestore
+                    })
+                    console.log('[Worker] Blind-peer join flow: core prefetch completed', {
+                      relayIdentifier,
+                      status: primeSummary?.status ?? null,
+                      synced: primeSummary?.synced ?? null,
+                      failed: primeSummary?.failed ?? null,
+                      connected: primeSummary?.connected ?? null
+                    })
+                  }
+                  const rehydrateSummary = await rehydrateMirrorsWithRetry(manager, {
+                    reason: 'join-flow',
+                    timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
+                    retries: BLIND_PEER_JOIN_REHYDRATION_RETRIES,
+                    backoffMs: BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS
+                  })
+                  console.log('[Worker] Blind-peer join flow: rehydration completed', {
+                    relayIdentifier,
+                    status: rehydrateSummary?.status ?? null,
+                    synced: rehydrateSummary?.synced ?? null,
+                    failed: rehydrateSummary?.failed ?? null
+                  })
+                  if (typeof manager.assessRelayCoreRefs === 'function') {
+                    const readinessRefs = buildJoinBlindPeerReadinessRefs({
+                      relayKey: relayIdentifier,
+                      coreRefs,
+                      fastForward
+                    })
+                    blindPeerReadiness = manager.assessRelayCoreRefs({
+                      relayKey: relayIdentifier,
+                      publicIdentifier,
+                      coreRefs: readinessRefs,
+                      corestore: relayCorestore,
+                      requireRemoteForEmpty: true
+                    })
+                    console.log('[Worker] Blind-peer join flow: readiness assessment', {
+                      relayIdentifier,
+                      status: blindPeerReadiness?.status ?? null,
+                      ready: blindPeerReadiness?.ready ?? null,
+                      total: blindPeerReadiness?.total ?? null,
+                      unavailable: Array.isArray(blindPeerReadiness?.unavailable)
+                        ? blindPeerReadiness.unavailable.map((entry) => ({
+                          ref: typeof entry?.ref === 'string' ? entry.ref.slice(0, 16) : null,
+                          reason: entry?.reason || null
+                        }))
+                        : []
+                    })
+                    if (blindPeerReadiness?.status === 'error' && !hadDirectHostPeers) {
+                      const unavailableRefs = (blindPeerReadiness.unavailable || [])
+                        .map((entry) => (typeof entry?.ref === 'string' ? entry.ref.slice(0, 16) : null))
+                        .filter(Boolean)
+                      throw new Error(`join-material-unavailable-from-blind-peer:${unavailableRefs.join(',') || 'no-core-signal'}`)
+                    }
+                  }
+                  if (!hadDirectHostPeers) {
+                    hostPeers = [String(blindPeer.publicKey).toLowerCase()]
+                    console.log('[Worker] Using blind-peer mirror as host peer for join flow', {
+                      relayIdentifier,
+                      coreRefsCount: coreRefs.length
+                    })
+                  } else {
+                    console.log('[Worker] Blind-peer mirror primed while retaining direct host peers', {
+                      relayIdentifier,
+                      hostPeersCount: hostPeers.length,
+                      coreRefsCount: coreRefs.length
+                    })
+                  }
                 }
-                const rehydrateSummary = await rehydrateMirrorsWithRetry(manager, {
-                  reason: 'join-flow',
-                  timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
-                  retries: BLIND_PEER_JOIN_REHYDRATION_RETRIES,
-                  backoffMs: BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS
-                })
-                console.log('[Worker] Blind-peer join flow: rehydration completed', {
-                  relayIdentifier,
-                  status: rehydrateSummary?.status ?? null,
-                  synced: rehydrateSummary?.synced ?? null,
-                  failed: rehydrateSummary?.failed ?? null
-                })
-                hostPeers = [String(blindPeer.publicKey).toLowerCase()]
-                console.log('[Worker] Using blind-peer mirror as host peer for join flow', {
-                  relayIdentifier,
-                  coreRefsCount: coreRefs.length
-                })
               }
             } catch (err) {
               console.warn('[Worker] Blind-peer fallback failed', err?.message || err)
@@ -6039,6 +6422,78 @@ async function handleMessageObject(message) {
 
           if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
           if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
+          const canonicalWriterRef = normalizeCoreRef(writerCoreHex || autobaseLocal || writerCore || null)
+          if (canonicalWriterRef && !coreRefs.includes(canonicalWriterRef)) {
+            coreRefs = mergeCoreRefLists(coreRefs, [canonicalWriterRef])
+            writerCoreRefs = mergeCoreRefLists(writerCoreRefs, [canonicalWriterRef])
+            console.log('[Worker] Join flow canonical writer core ref appended', {
+              relayKey: previewValue(joinRelayKey, 16),
+              publicIdentifier,
+              mode: joinMode,
+              canonicalWriterRef: previewValue(canonicalWriterRef, 16),
+              coreRefsCount: coreRefs.length,
+              writerCoreRefsCount: writerCoreRefs.length
+            })
+          }
+
+          const joinMaterialValidation = validateJoinMaterialConsistency({
+            relayKey: joinRelayKey || null,
+            publicIdentifier,
+            mode: joinMode,
+            writerCore,
+            writerCoreHex,
+            autobaseLocal,
+            writerSecret,
+            writerEnvelope,
+            coreRefs,
+            fastForward,
+            blindPeer,
+            certificate
+          })
+          updateRelayJoinDiagnostic({
+            relayKey: joinRelayKey || null,
+            publicIdentifier,
+            mode: joinMode,
+            patch: {
+              validation: {
+                ok: joinMaterialValidation.ok,
+                errors: joinMaterialValidation.errors,
+                checkedAtMs: Date.now()
+              },
+              blindPeerReadiness: blindPeerReadiness
+                ? {
+                  status: blindPeerReadiness.status || null,
+                  ready: Number.isFinite(Number(blindPeerReadiness.ready))
+                    ? Math.round(Number(blindPeerReadiness.ready))
+                    : null,
+                  total: Number.isFinite(Number(blindPeerReadiness.total))
+                    ? Math.round(Number(blindPeerReadiness.total))
+                    : null,
+                  unavailable: Array.isArray(blindPeerReadiness.unavailable)
+                    ? blindPeerReadiness.unavailable.map((entry) => ({
+                      ref: typeof entry?.ref === 'string' ? entry.ref : null,
+                      reason: entry?.reason || null
+                    }))
+                    : []
+                }
+                : null,
+              material: {
+                purpose: joinMaterialValidation.purpose,
+                writerCore: writerCore || null,
+                writerCoreHex: writerCoreHex || null,
+                autobaseLocal: autobaseLocal || null,
+                canonicalWriterKey: joinMaterialValidation.canonicalWriterKey || null,
+                coreRefsCount: Array.isArray(coreRefs) ? coreRefs.length : 0,
+                writerCoreRefsCount: Array.isArray(writerCoreRefs) ? writerCoreRefs.length : 0,
+                hasBlindPeer: joinMaterialValidation.hasBlindPeer,
+                hasFastForward: !!fastForward,
+                hasCertificate: joinMaterialValidation.hasCertificate
+              }
+            }
+          })
+          if (!joinMaterialValidation.ok) {
+            throw new Error(`join-material-invalid:${joinMaterialValidation.errors.join(',')}`)
+          }
 
           console.info('[Worker] Start join flow resolved', {
             publicIdentifier,
@@ -6055,6 +6510,8 @@ async function handleMessageObject(message) {
             writerCorePrefix: previewValue(writerCore, 16),
             writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
             writerSecretLen: writerSecret ? String(writerSecret).length : 0,
+            hasWriterEnvelope: !!writerEnvelope,
+            hasCertificate: !!certificate,
             hasFastForward: !!fastForward
           })
 
@@ -6074,6 +6531,8 @@ async function handleMessageObject(message) {
             writerCoreHex,
             autobaseLocal,
             writerSecret,
+            writerEnvelope,
+            certificate,
             fastForward
           })
           if (joinBlindPeeringManager && joinRelayIdentifierForTracking && typeof joinBlindPeeringManager.markJoinEnd === 'function') {
@@ -6693,18 +7152,9 @@ async function cleanup() {
   }
   conversationFileIndex = null
 
-  if (relayServer && relayServer.shutdownRelayServer) {
-    console.log('[Worker] Stopping relay server...')
-    await relayServer.shutdownRelayServer()
-  }
-
-  try { await stopGatewayService() } catch (_) {}
-
-  // Stop all mirror watchers
-  cleanupRelayMirrorSubscriptions()
-  try { await stopAllMirrors() } catch (_) {}
-
-  if (blindPeeringManager) {
+  // Stop blind-peering before tearing down relay/hyperswarm services to avoid
+  // in-flight blind-peering addCore tasks racing with stream shutdown.
+  if (blindPeeringManager?.started) {
     try {
       await blindPeeringManager.clearAllMirrors({ reason: 'shutdown' })
     } catch (err) {
@@ -6717,6 +7167,25 @@ async function cleanup() {
     }
     lastBlindPeerFingerprint = null
     lastDispatcherAssignmentFingerprint = null
+  }
+
+  if (relayServer && relayServer.shutdownRelayServer) {
+    console.log('[Worker] Stopping relay server...')
+    await relayServer.shutdownRelayServer()
+  }
+
+  try { await stopGatewayService() } catch (_) {}
+
+  // Stop all mirror watchers
+  cleanupRelayMirrorSubscriptions()
+  try { await stopAllMirrors() } catch (_) {}
+
+  if (blindPeeringManager && blindPeeringManager.started) {
+    try {
+      await blindPeeringManager.stop()
+    } catch (err) {
+      console.warn('[Worker] Failed to stop blind peering manager:', err?.message || err)
+    }
   }
   
   if (workerPipe) {

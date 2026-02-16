@@ -11,6 +11,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   gateways: {},
   preferredGatewayIds: [],
   activeGatewayId: null,
+  controlTransportMode: 'p2p-first',
   trustPolicy: {
     explicitAllowlist: [],
     requireFollowedByMe: true,
@@ -104,6 +105,13 @@ function normalizeSettings(raw = {}) {
   if (typeof raw.activeGatewayId === 'string') {
     const value = raw.activeGatewayId.trim();
     normalized.activeGatewayId = value || null;
+  }
+
+  if (typeof raw.controlTransportMode === 'string') {
+    const value = raw.controlTransportMode.trim().toLowerCase();
+    if (value === 'http-required' || value === 'http-only' || value === 'p2p-first' || value === 'p2p-only') {
+      normalized.controlTransportMode = value;
+    }
   }
 
   if (raw.preferredGatewayIds != null) {
@@ -378,6 +386,9 @@ function withDefaults(raw = {}) {
 
   merged.federationId = sanitizeString(merged.federationId);
   merged.activeGatewayId = sanitizeString(merged.activeGatewayId);
+  if (!['http-required', 'http-only', 'p2p-first', 'p2p-only'].includes(merged.controlTransportMode)) {
+    merged.controlTransportMode = DEFAULT_SETTINGS.controlTransportMode;
+  }
 
   if (!merged.gateways || typeof merged.gateways !== 'object' || Array.isArray(merged.gateways)) {
     merged.gateways = {};

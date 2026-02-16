@@ -112,6 +112,7 @@ export default class BlindPeeringManager extends EventEmitter {
     this.started = false;
     this.handshakeMirrors = new Set();
     this.manualMirrors = new Set();
+    this.runtimeMirrors = new Set();
     this.trustedMirrors = new Set();
     this.mirrorTargets = new Map();
     this.blindPeering = null;
@@ -154,6 +155,8 @@ export default class BlindPeeringManager extends EventEmitter {
     const nextSettings = settings || this.settingsProvider();
     if (!nextSettings) {
       this.enabled = false;
+      this.handshakeMirrors.clear();
+      this.manualMirrors.clear();
       this.trustedMirrors.clear();
       return;
     }
@@ -169,12 +172,17 @@ export default class BlindPeeringManager extends EventEmitter {
     const sanitizedManual = manualKeys.map(sanitizeKey).filter(Boolean);
     this.handshakeMirrors = new Set(sanitizedHandshake);
     this.manualMirrors = new Set(sanitizedManual);
-    this.trustedMirrors = new Set([...this.handshakeMirrors, ...this.manualMirrors]);
+    this.trustedMirrors = new Set([
+      ...this.handshakeMirrors,
+      ...this.manualMirrors,
+      ...this.runtimeMirrors
+    ]);
 
     this.logger?.debug?.('[BlindPeering] Configuration updated', {
       enabled: this.enabled,
       handshakeKeys: this.handshakeMirrors.size,
       manualKeys: this.manualMirrors.size,
+      runtimeKeys: this.runtimeMirrors.size,
       keys: this.trustedMirrors.size
     });
 
@@ -276,8 +284,8 @@ export default class BlindPeeringManager extends EventEmitter {
     for (const key of peerKeys) {
       const sanitized = sanitizeKey(key);
       if (!sanitized) continue;
-      if (!this.handshakeMirrors.has(sanitized)) {
-        this.handshakeMirrors.add(sanitized);
+      if (!this.runtimeMirrors.has(sanitized)) {
+        this.runtimeMirrors.add(sanitized);
       }
       if (!this.trustedMirrors.has(sanitized)) {
         this.trustedMirrors.add(sanitized);
@@ -286,7 +294,8 @@ export default class BlindPeeringManager extends EventEmitter {
     }
     if (updated) {
       this.logger?.debug?.('[BlindPeering] Trusted mirrors updated', {
-        count: this.trustedMirrors.size
+        count: this.trustedMirrors.size,
+        runtimeKeys: this.runtimeMirrors.size
       });
       if (this.blindPeering?.setKeys) {
         this.blindPeering.setKeys(Array.from(this.trustedMirrors));
@@ -513,7 +522,95 @@ export default class BlindPeeringManager extends EventEmitter {
       }
     }
 
+    const availability = this.assessRelayCoreRefs({
+      relayKey,
+      publicIdentifier,
+      coreRefs: uniqueRefs,
+      corestore: targetStore,
+      requireRemoteForEmpty: true
+    });
+    summary.ready = availability.ready;
+    summary.unavailable = availability.unavailable;
+    summary.available = availability.available;
+    if (summary.failed > 0 || summary.unavailable.length > 0) {
+      summary.status = summary.ready > 0 ? 'partial' : 'error';
+    }
+
     this.logger?.info?.('[BlindPeering] Relay core prefetch complete', summary);
+    return summary;
+  }
+
+  assessRelayCoreRefs({
+    relayKey = null,
+    publicIdentifier = null,
+    coreRefs = [],
+    corestore = null,
+    requireRemoteForEmpty = true
+  } = {}) {
+    const targetStore = corestore || this.runtime?.corestore || null;
+    const uniqueRefs = Array.from(new Set(
+      (Array.isArray(coreRefs) ? coreRefs : [])
+        .map(normalizeCoreKey)
+        .filter(Boolean)
+    ));
+    const summary = {
+      status: 'ok',
+      relayKey: relayKey || null,
+      publicIdentifier: publicIdentifier || null,
+      total: uniqueRefs.length,
+      ready: 0,
+      available: [],
+      unavailable: []
+    };
+    if (!targetStore) {
+      summary.status = 'skipped';
+      summary.reason = 'no-corestore';
+      return summary;
+    }
+    for (const ref of uniqueRefs) {
+      const label = `assess:${ref.slice(0, 16)}`;
+      const core = this.#getMirrorCore(ref, label, targetStore);
+      if (!core) {
+        summary.unavailable.push({ ref, reason: 'core-unavailable', state: null });
+        continue;
+      }
+      const state = this.#describeCoreState(core);
+      const hasLocalData =
+        (Number.isFinite(state.length) && state.length > 0) ||
+        (Number.isFinite(state.contiguousLength) && state.contiguousLength > 0) ||
+        (Number.isFinite(state.byteLength) && state.byteLength > 0) ||
+        (Number.isFinite(state.downloaded) && state.downloaded > 0);
+      const hasRemoteSignal =
+        (Number.isFinite(state.remoteLength) && state.remoteLength > 0) ||
+        (Number.isFinite(state.peers) && state.peers > 0);
+      const isWritable = state.writable === true;
+      const ready = isWritable || hasLocalData || (!requireRemoteForEmpty ? true : hasRemoteSignal);
+      if (ready) {
+        summary.ready += 1;
+        summary.available.push({
+          ref,
+          writable: isWritable,
+          hasLocalData,
+          hasRemoteSignal
+        });
+      } else {
+        summary.unavailable.push({
+          ref,
+          reason: 'no-local-or-remote-signal',
+          state: {
+            length: state.length ?? null,
+            contiguousLength: state.contiguousLength ?? null,
+            remoteLength: state.remoteLength ?? null,
+            byteLength: state.byteLength ?? null,
+            downloaded: state.downloaded ?? null,
+            peers: state.peers ?? null
+          }
+        });
+      }
+    }
+    if (summary.unavailable.length > 0) {
+      summary.status = summary.ready > 0 ? 'partial' : 'error';
+    }
     return summary;
   }
 
@@ -1451,6 +1548,7 @@ export default class BlindPeeringManager extends EventEmitter {
       running: this.started,
       handshakeMirrors: this.handshakeMirrors.size,
       manualMirrors: this.manualMirrors.size,
+      runtimeMirrors: this.runtimeMirrors.size,
       trustedMirrors: this.trustedMirrors.size,
       targets: this.mirrorTargets.size,
       refreshBackoff: {

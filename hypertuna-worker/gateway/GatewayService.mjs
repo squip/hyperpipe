@@ -42,6 +42,8 @@ const PUBLIC_GATEWAY_RELAY_KEY = 'public-gateway:hyperbee';
 const PUBLIC_GATEWAY_RELAY_PATH = 'relay';
 const PUBLIC_GATEWAY_RELAY_PATH_ALIASES = ['public-gateway/hyperbee'];
 const CONTROL_SESSION_REQUIRED_METHODS = new Set([
+  CONTROL_METHODS.RELAY_AUTHORITY_UPSERT,
+  CONTROL_METHODS.BRIDGE_BUNDLE_PUSH,
   CONTROL_METHODS.RELAY_REGISTER,
   CONTROL_METHODS.OPEN_JOIN_POOL_SYNC,
   CONTROL_METHODS.OPEN_JOIN_LEASE_CLAIM,
@@ -296,6 +298,8 @@ export class GatewayService extends EventEmitter {
     this.discoveredGateways = [];
     this.discoveryDisabledReason = null;
     this.discoveryWarning = null;
+    this.gatewayTrustBootstrapMode = false;
+    this.gatewayTrustBootstrapNoticeEmitted = false;
     this.discoveryClient = null;
     this.discoveryClientReady = null;
     this._discoveryRefreshScheduled = false;
@@ -353,6 +357,12 @@ export class GatewayService extends EventEmitter {
     const selectionMode = ['default', 'discovered', 'manual'].includes(selectionRaw)
       ? selectionRaw
       : '';
+    const controlTransportModeRaw = typeof rawConfig?.controlTransportMode === 'string'
+      ? rawConfig.controlTransportMode.trim().toLowerCase()
+      : '';
+    const controlTransportMode = ['http-required', 'http-only', 'p2p-first', 'p2p-only'].includes(controlTransportModeRaw)
+      ? controlTransportModeRaw
+      : 'p2p-first';
 
     const normalizeGatewayMap = (gatewaysInput) => {
       if (!gatewaysInput || typeof gatewaysInput !== 'object' || Array.isArray(gatewaysInput)) {
@@ -398,6 +408,7 @@ export class GatewayService extends EventEmitter {
       federationId: typeof rawConfig?.federationId === 'string'
         ? rawConfig.federationId.trim() || null
         : null,
+      controlTransportMode,
       selectionMode,
       selectedGatewayId: typeof rawConfig?.selectedGatewayId === 'string'
         ? rawConfig.selectedGatewayId.trim() || null
@@ -613,6 +624,7 @@ export class GatewayService extends EventEmitter {
       : [];
     const hasExplicitAllowlist = explicitAllowlist.length > 0;
     const isGatewayAllowed = (gatewayId) => !hasExplicitAllowlist || explicitAllowlist.includes(gatewayId);
+    const isExplicitlyAllowed = (gatewayId) => hasExplicitAllowlist && explicitAllowlist.includes(gatewayId);
 
     const configured = config?.gateways && typeof config.gateways === 'object'
       ? config.gateways
@@ -620,7 +632,8 @@ export class GatewayService extends EventEmitter {
     for (const [gatewayId, source] of Object.entries(configured)) {
       const normalized = this.#normalizeGatewayCandidate(source, gatewayId);
       if (!normalized) continue;
-      if (normalized.trust === 'blocked' || normalized.health === 'offline') continue;
+      if (normalized.health === 'offline') continue;
+      if (normalized.trust === 'blocked' && !isExplicitlyAllowed(normalized.id)) continue;
       if (!isGatewayAllowed(normalized.id)) continue;
       candidates[normalized.id] = normalized;
     }
@@ -692,10 +705,19 @@ export class GatewayService extends EventEmitter {
       : new Set(Array.isArray(trustContext.followersOfMe) ? trustContext.followersOfMe : []);
     const attestations = Array.isArray(trustContext.attestations) ? trustContext.attestations : [];
     const hasSocialContext = followsByMe.size > 0 || followersOfMe.size > 0 || attestations.length > 0;
-    const requiresTrustEvidence = false;
     const allowBootstrapWithoutEvidence = !hasSocialContext && !hasExplicitAllowlist;
+    const enforceTrustPolicy = !skipTrustPolicy;
+    this.gatewayTrustBootstrapMode = enforceTrustPolicy && allowBootstrapWithoutEvidence;
 
-    if (!skipTrustPolicy && requiresTrustEvidence && !allowBootstrapWithoutEvidence) {
+    if (this.gatewayTrustBootstrapMode && !this.gatewayTrustBootstrapNoticeEmitted) {
+      this.gatewayTrustBootstrapNoticeEmitted = true;
+      this.log('info', '[PublicGateway] Trust bootstrap mode active (no social context / allowlist); temporarily allowing discovered candidates');
+    } else if (!this.gatewayTrustBootstrapMode && this.gatewayTrustBootstrapNoticeEmitted) {
+      this.gatewayTrustBootstrapNoticeEmitted = false;
+      this.log('info', '[PublicGateway] Trust bootstrap mode disabled; enforcing configured trust policy');
+    }
+
+    if (enforceTrustPolicy && !allowBootstrapWithoutEvidence) {
       for (const [gatewayId, candidate] of Object.entries(candidates)) {
         const evaluation = this.gatewayTrustPolicyEngine.evaluateGateway({
           gatewayPubkey: gatewayId,
@@ -742,9 +764,12 @@ export class GatewayService extends EventEmitter {
         gateways: {},
         preferredGatewayIds: [],
         connectionPool: this.connectionPool,
+        preferP2P: config?.controlTransportMode !== 'http-required' && config?.controlTransportMode !== 'http-only',
         logger: this.loggerBridge || console
       });
     }
+    this.gatewayControlClientPool.preferP2P = config?.controlTransportMode !== 'http-required'
+      && config?.controlTransportMode !== 'http-only';
     this.gatewayControlClientPool.logger = this.loggerBridge || console;
     this.gatewayControlClientPool.updateGateways({
       gateways: this.#buildGatewayControlCandidates(config, options),
@@ -866,7 +891,8 @@ export class GatewayService extends EventEmitter {
       ...options,
       gatewayId,
       onlyGateway: options?.onlyGateway === true,
-      hedged: options?.hedged
+      hedged: options?.hedged,
+      transportMode: options?.transportMode || this.publicGatewaySettings?.controlTransportMode || 'p2p-first'
     };
 
     try {
@@ -2741,6 +2767,7 @@ export class GatewayService extends EventEmitter {
       discoveredGateways: this.discoveredGateways || [],
       discoveryUnavailableReason: this.discoveryDisabledReason,
       discoveryWarning: this.discoveryWarning,
+      trustBootstrapMode: !!this.gatewayTrustBootstrapMode,
       disabledReason: enabled ? null : (config.disabledReason || this.discoveryDisabledReason || null)
     };
   }

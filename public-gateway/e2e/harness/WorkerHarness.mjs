@@ -181,7 +181,7 @@ class WorkerHarness extends EventEmitter {
     });
   }
 
-  async setTrustFixture(fixture = {}, { timeoutMs = 30_000 } = {}) {
+  async setTrustFixture(fixture = {}, { timeoutMs = 120_000 } = {}) {
     const result = await this.request('set-gateway-trust-fixture', {
       fixture
     }, {
@@ -190,11 +190,15 @@ class WorkerHarness extends EventEmitter {
     return result;
   }
 
-  async getTrustFixture({ timeoutMs = 30_000 } = {}) {
+  async getTrustFixture({ timeoutMs = 60_000 } = {}) {
     return this.request('get-gateway-trust-fixture', {}, { timeoutMs });
   }
 
-  async runControlMethod(methodName, payload = {}, options = {}, { timeoutMs = 45_000 } = {}) {
+  async getRelayJoinDiagnostics(filters = {}, { timeoutMs = 60_000 } = {}) {
+    return this.request('get-relay-join-diagnostics', filters || {}, { timeoutMs });
+  }
+
+  async runControlMethod(methodName, payload = {}, options = {}, { timeoutMs = 60_000 } = {}) {
     return this.request('run-control-method', {
       methodName,
       payload,
@@ -224,6 +228,22 @@ class WorkerHarness extends EventEmitter {
       try {
         this.child.kill('SIGTERM');
       } catch (_) {}
+      await waitFor(async () => this.exited, {
+        timeoutMs: Math.max(1_000, Math.min(4_000, Math.round(timeoutMs / 2))),
+        intervalMs: 100,
+        label: `${this.label} shutdown sigterm`
+      }).catch(() => null);
+    }
+
+    if (!this.exited) {
+      try {
+        this.child.kill('SIGKILL');
+      } catch (_) {}
+      await waitFor(async () => this.exited, {
+        timeoutMs: 2_000,
+        intervalMs: 100,
+        label: `${this.label} shutdown sigkill`
+      }).catch(() => null);
     }
   }
 

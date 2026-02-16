@@ -1,8 +1,14 @@
 import { EventEmitter } from 'node:events';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
+
+import { stableStringify } from '../../../shared/public-gateway/RelayAuthorityTypes.mjs';
 
 class FederatedEventLog extends EventEmitter {
-  constructor({ logger = console, maxInMemoryEvents = 20_000 } = {}) {
+  constructor({
+    logger = console,
+    maxInMemoryEvents = 20_000,
+    validateExternalEvent = null
+  } = {}) {
     super();
     this.logger = logger;
     this.maxInMemoryEvents = Number.isFinite(Number(maxInMemoryEvents)) && Number(maxInMemoryEvents) > 0
@@ -11,12 +17,26 @@ class FederatedEventLog extends EventEmitter {
     this.events = [];
     this.sequence = 0;
     this.eventIds = new Set();
+    this.latestBySource = new Map();
+    this.validateExternalEvent = typeof validateExternalEvent === 'function'
+      ? validateExternalEvent
+      : null;
   }
 
   #appendNormalized(event) {
     this.sequence = event.sequence;
     this.events.push(event);
     this.eventIds.add(event.id);
+    const sourceGatewayId = typeof event?.metadata?.sourceGatewayId === 'string'
+      ? event.metadata.sourceGatewayId
+      : null;
+    if (sourceGatewayId) {
+      this.latestBySource.set(sourceGatewayId, {
+        sequence: event.sequence,
+        eventId: event.id,
+        timestamp: event.timestamp
+      });
+    }
     if (this.events.length > this.maxInMemoryEvents) {
       const removed = this.events.splice(0, this.events.length - this.maxInMemoryEvents);
       for (const entry of removed) {
@@ -40,6 +60,12 @@ class FederatedEventLog extends EventEmitter {
       metadata: metadata || {},
       timestamp: Date.now()
     };
+    event.digest = createHash('sha256').update(stableStringify({
+      eventType: event.eventType,
+      payload: event.payload,
+      metadata: event.metadata,
+      timestamp: event.timestamp
+    })).digest('hex');
 
     return this.#appendNormalized(event);
   }
@@ -60,6 +86,17 @@ class FederatedEventLog extends EventEmitter {
       return null;
     }
 
+    if (this.validateExternalEvent) {
+      const result = this.validateExternalEvent(input);
+      if (result === false) {
+        this.logger?.debug?.('[FederatedEventLog] external event rejected by validator', {
+          eventId,
+          eventType: input?.eventType
+        });
+        return null;
+      }
+    }
+
     const event = {
       id: eventId,
       sequence: this.sequence + 1,
@@ -74,6 +111,14 @@ class FederatedEventLog extends EventEmitter {
         ? Math.round(Number(input.timestamp))
         : Date.now()
     };
+    event.digest = typeof input.digest === 'string' && input.digest.trim()
+      ? input.digest.trim()
+      : createHash('sha256').update(stableStringify({
+          eventType: event.eventType,
+          payload: event.payload,
+          metadata: event.metadata,
+          timestamp: event.timestamp
+        })).digest('hex');
 
     return this.#appendNormalized(event);
   }
@@ -96,7 +141,8 @@ class FederatedEventLog extends EventEmitter {
     return {
       sequence: latest?.sequence || 0,
       eventId: latest?.id || null,
-      timestamp: latest?.timestamp || null
+      timestamp: latest?.timestamp || null,
+      bySource: Object.fromEntries(this.latestBySource.entries())
     };
   }
 }

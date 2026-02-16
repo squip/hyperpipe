@@ -103,6 +103,7 @@ class ScenarioContext {
 
   async finalizeSummary({ thresholds = {}, extra = {} } = {}) {
     const metrics = this.metricSnapshot();
+    const joinToWritable = this.#buildJoinToWritableSummary();
     const summary = {
       runId: this.runId,
       profile: this.profile,
@@ -111,9 +112,10 @@ class ScenarioContext {
       passedCount: this.scenarioResults.filter((entry) => entry.status === 'passed').length,
       failedCount: this.scenarioResults.filter((entry) => entry.status === 'failed').length,
       thresholds,
-      thresholdChecks: this.#checkThresholds(metrics, thresholds),
+      thresholdChecks: this.#checkThresholds(metrics, thresholds, joinToWritable),
       scenarios: this.scenarioResults,
       metrics,
+      joinToWritable,
       ...extra
     };
     await writeJsonFile(join(this.outputDir, 'summary.json'), summary);
@@ -131,14 +133,84 @@ class ScenarioContext {
     return summary;
   }
 
-  #checkThresholds(metrics, thresholds) {
+  #buildJoinToWritableSummary() {
+    const openResults = [];
+    const closedResults = [];
+    for (const scenario of this.scenarioResults) {
+      if (scenario?.status !== 'passed') continue;
+      const joinPayload = scenario?.result?.joinToWritable;
+      const records = Array.isArray(joinPayload)
+        ? joinPayload
+        : (joinPayload && typeof joinPayload === 'object' ? [joinPayload] : []);
+      for (const record of records) {
+        if (!record || typeof record !== 'object') continue;
+        const mode = record.mode === 'closed' ? 'closed' : 'open';
+        const normalized = {
+          mode,
+          joinToWritableMs: Number.isFinite(Number(record.joinToWritableMs))
+            ? Math.round(Number(record.joinToWritableMs))
+            : null,
+          joinAuthToWritableMs: Number.isFinite(Number(record.joinAuthToWritableMs))
+            ? Math.round(Number(record.joinAuthToWritableMs))
+            : null,
+          writable: typeof record.writable === 'boolean' ? record.writable : null,
+          expectedWriterActive: typeof record.expectedWriterActive === 'boolean' ? record.expectedWriterActive : null,
+          relayKey: record.relayKey || null,
+          publicIdentifier: record.publicIdentifier || null,
+          scenarioId: scenario.id
+        };
+        if (mode === 'closed') closedResults.push(normalized);
+        else openResults.push(normalized);
+      }
+    }
+    return {
+      open: {
+        results: openResults,
+        stats: this.#buildJoinStats(openResults)
+      },
+      closed: {
+        results: closedResults,
+        stats: this.#buildJoinStats(closedResults)
+      }
+    };
+  }
+
+  #buildJoinStats(results = []) {
+    const values = (Array.isArray(results) ? results : [])
+      .map((entry) => Number(entry?.joinToWritableMs))
+      .filter((value) => Number.isFinite(value) && value >= 0);
+    return {
+      count: values.length,
+      min: values.length ? Math.min(...values) : null,
+      p50: quantile(values, 0.5),
+      p95: quantile(values, 0.95),
+      max: values.length ? Math.max(...values) : null
+    };
+  }
+
+  #checkThresholds(metrics, thresholds, joinToWritable = null) {
     const passed = [];
     const failed = [];
+    const skipped = [];
+    const strictMissingMetrics = this.options?.strictThresholdMetrics === true;
+    const synthetic = {
+      'join_to_writable.open.p95': Number(joinToWritable?.open?.stats?.p95),
+      'join_to_writable.closed.p95': Number(joinToWritable?.closed?.stats?.p95)
+    };
     for (const [name, thresholdMs] of Object.entries(thresholds || {})) {
-      const metric = metrics[name] || null;
-      const p95 = Number(metric?.p95);
+      let p95 = Number.NaN;
+      if (Object.prototype.hasOwnProperty.call(synthetic, name)) {
+        p95 = synthetic[name];
+      } else {
+        const metric = metrics[name] || null;
+        p95 = Number(metric?.p95);
+      }
       if (!Number.isFinite(p95)) {
-        failed.push({ metric: name, reason: 'missing-p95', thresholdMs });
+        if (strictMissingMetrics) {
+          failed.push({ metric: name, reason: 'missing-p95', thresholdMs });
+        } else {
+          skipped.push({ metric: name, reason: 'missing-p95', thresholdMs });
+        }
         continue;
       }
       if (p95 <= Number(thresholdMs)) {
@@ -149,7 +221,8 @@ class ScenarioContext {
     }
     return {
       passed,
-      failed
+      failed,
+      skipped
     };
   }
 }

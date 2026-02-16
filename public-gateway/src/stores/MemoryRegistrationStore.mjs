@@ -18,6 +18,9 @@ class MemoryRegistrationStore {
     this.mirrorMetadata = new Map();
     this.writerEnvelopes = new Map();
     this.leaseCertificates = new Map();
+    this.relayAuthorityPolicies = new Map();
+    this.bridgeJoinBundles = new Map();
+    this.bridgeReceipts = new Map();
     this.relayAliases = new Map();
     this.relayAliasIndex = new Map();
     this.openJoinAliases = new Map();
@@ -54,6 +57,9 @@ class MemoryRegistrationStore {
     this.closedJoinPools.delete(relayKey);
     this.writerEnvelopes.delete(relayKey);
     this.leaseCertificates.delete(relayKey);
+    this.relayAuthorityPolicies.delete(relayKey);
+    this.bridgeJoinBundles.delete(relayKey);
+    this.bridgeReceipts.delete(relayKey);
     this.removeRelayAliases(relayKey);
     this.clearOpenJoinAliases(relayKey);
   }
@@ -121,6 +127,38 @@ class MemoryRegistrationStore {
       if (envelopeMap.size === 0) {
         this.writerEnvelopes.delete(relayKey);
       }
+    }
+
+    for (const [relayKey, record] of this.relayAuthorityPolicies.entries()) {
+      if (record?.expiresAt && record.expiresAt <= now) {
+        this.relayAuthorityPolicies.delete(relayKey);
+      }
+    }
+
+    for (const [relayKey, perPurpose] of this.bridgeJoinBundles.entries()) {
+      if (!(perPurpose instanceof Map)) {
+        this.bridgeJoinBundles.delete(relayKey);
+        continue;
+      }
+      for (const [purpose, record] of perPurpose.entries()) {
+        if (record?.expiresAt && record.expiresAt <= now) {
+          perPurpose.delete(purpose);
+        }
+      }
+      if (!perPurpose.size) this.bridgeJoinBundles.delete(relayKey);
+    }
+
+    for (const [relayKey, perPurpose] of this.bridgeReceipts.entries()) {
+      if (!(perPurpose instanceof Map)) {
+        this.bridgeReceipts.delete(relayKey);
+        continue;
+      }
+      for (const [purpose, record] of perPurpose.entries()) {
+        if (record?.expiresAt && record.expiresAt <= now) {
+          perPurpose.delete(purpose);
+        }
+      }
+      if (!perPurpose.size) this.bridgeReceipts.delete(relayKey);
     }
 
     for (const [alias, record] of this.relayAliases.entries()) {
@@ -330,6 +368,82 @@ class MemoryRegistrationStore {
     const perRelay = this.leaseCertificates.get(relayKey);
     if (!(perRelay instanceof Map)) return null;
     return perRelay.get(slotKey) || null;
+  }
+
+  async storeRelayPolicy(relayKey, policy = {}) {
+    if (!relayKey || !policy || typeof policy !== 'object') return;
+    this.relayAuthorityPolicies.set(relayKey, {
+      ...policy,
+      relayKey,
+      storedAt: Date.now()
+    });
+  }
+
+  async getRelayPolicy(relayKey) {
+    if (!relayKey) return null;
+    const record = this.relayAuthorityPolicies.get(relayKey);
+    if (!record) return null;
+    if (record.expiresAt && record.expiresAt <= Date.now()) {
+      this.relayAuthorityPolicies.delete(relayKey);
+      return null;
+    }
+    return record;
+  }
+
+  async storeBridgeJoinBundle(relayKey, purpose, bundle = {}) {
+    if (!relayKey || !purpose || !bundle || typeof bundle !== 'object') return;
+    let perRelay = this.bridgeJoinBundles.get(relayKey);
+    if (!(perRelay instanceof Map)) {
+      perRelay = new Map();
+      this.bridgeJoinBundles.set(relayKey, perRelay);
+    }
+    perRelay.set(purpose, {
+      ...bundle,
+      relayKey,
+      purpose,
+      storedAt: Date.now()
+    });
+  }
+
+  async getBridgeJoinBundle(relayKey, purpose) {
+    if (!relayKey || !purpose) return null;
+    const perRelay = this.bridgeJoinBundles.get(relayKey);
+    if (!(perRelay instanceof Map)) return null;
+    const record = perRelay.get(purpose);
+    if (!record) return null;
+    if (record.expiresAt && record.expiresAt <= Date.now()) {
+      perRelay.delete(purpose);
+      return null;
+    }
+    return record;
+  }
+
+  async storeBridgeReceipt(relayKey, purpose, receipt = {}) {
+    if (!relayKey || !purpose || !receipt || typeof receipt !== 'object') return;
+    let perRelay = this.bridgeReceipts.get(relayKey);
+    if (!(perRelay instanceof Map)) {
+      perRelay = new Map();
+      this.bridgeReceipts.set(relayKey, perRelay);
+    }
+    perRelay.set(purpose, {
+      ...receipt,
+      relayKey,
+      purpose,
+      storedAt: Date.now()
+    });
+  }
+
+  async getBridgeReceipt(relayKey, purpose) {
+    if (!relayKey || !purpose) return null;
+    const perRelay = this.bridgeReceipts.get(relayKey);
+    if (!(perRelay instanceof Map)) return null;
+    const record = perRelay.get(purpose);
+    if (!record) return null;
+    if (record.expiresAt && record.expiresAt <= Date.now()) {
+      perRelay.delete(purpose);
+      return null;
+    }
+    return record;
   }
 
   async storeOpenJoinAliases(relayKey, aliases = []) {

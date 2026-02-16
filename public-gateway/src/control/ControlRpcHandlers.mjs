@@ -13,6 +13,10 @@ class ControlRpcHandlers {
     this.#register(protocol, CONTROL_METHODS.MESH_STATE_READ, 'meshStateReadRpc');
     this.#register(protocol, CONTROL_METHODS.MESH_STATE_APPEND, 'meshStateAppendRpc');
     this.#register(protocol, CONTROL_METHODS.MESH_LEASE_VOTE, 'meshLeaseVoteRpc');
+    this.#register(protocol, CONTROL_METHODS.RELAY_AUTHORITY_READ, 'relayAuthorityReadRpc');
+    this.#register(protocol, CONTROL_METHODS.RELAY_AUTHORITY_UPSERT, 'relayAuthorityUpsertRpc');
+    this.#register(protocol, CONTROL_METHODS.BRIDGE_BUNDLE_READ, 'bridgeBundleReadRpc');
+    this.#register(protocol, CONTROL_METHODS.BRIDGE_BUNDLE_PUSH, 'bridgeBundlePushRpc');
     this.#register(protocol, CONTROL_METHODS.RELAY_POLICY_READ, 'relayPolicyReadRpc');
     this.#register(protocol, CONTROL_METHODS.AUTH_CHALLENGE, 'authChallengeRpc');
     this.#register(protocol, CONTROL_METHODS.AUTH_SESSION, 'authSessionRpc');

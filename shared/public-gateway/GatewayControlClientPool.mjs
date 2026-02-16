@@ -38,11 +38,13 @@ class GatewayControlClientPool {
     connectionPool = null,
     fetchImpl = globalThis.fetch,
     logger = console,
-    hedgeDelayMs = DEFAULT_HEDGE_DELAY_MS
+    hedgeDelayMs = DEFAULT_HEDGE_DELAY_MS,
+    preferP2P = true
   } = {}) {
     this.connectionPool = connectionPool;
     this.fetch = fetchImpl;
     this.logger = logger;
+    this.preferP2P = preferP2P !== false;
     this.hedgeDelayMs = Number.isFinite(Number(hedgeDelayMs)) && Number(hedgeDelayMs) > 0
       ? Math.round(Number(hedgeDelayMs))
       : DEFAULT_HEDGE_DELAY_MS;
@@ -184,15 +186,55 @@ class GatewayControlClientPool {
   async #requestGateway(gateway, methodName, payload, options = {}) {
     const start = nowMs();
     try {
-      const client = this.#buildClient(gateway);
-      const response = await client.request(methodName, payload, options);
+      const clients = this.#buildClients(gateway, options);
+      if (!clients.length) {
+        throw new Error(`Gateway ${gateway.id} has no usable control transport`);
+      }
+
+      const requestOptions = {
+        ...(options || {})
+      };
+      if (!Number.isFinite(Number(requestOptions.timeoutMs)) || Number(requestOptions.timeoutMs) <= 0) {
+        requestOptions.timeoutMs = 60_000;
+      }
+
+      let response = null;
+      let responseTransport = null;
+      let lastError = null;
+      const hasHttpFallback = clients.some((client) => client.transport === 'http');
+      for (const client of clients) {
+        const perTransportOptions = {
+          ...requestOptions
+        };
+        if (client.transport === 'p2p' && hasHttpFallback) {
+          const p2pFallbackTimeoutMs = Number.isFinite(Number(options?.p2pFallbackTimeoutMs))
+            ? Math.max(500, Math.round(Number(options.p2pFallbackTimeoutMs)))
+            : 5_000;
+          perTransportOptions.timeoutMs = Math.min(
+            Number(perTransportOptions.timeoutMs),
+            p2pFallbackTimeoutMs
+          );
+        }
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          response = await client.request(methodName, payload, perTransportOptions);
+          responseTransport = client.transport || null;
+          break;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (response == null) {
+        throw lastError || new Error('Control request failed');
+      }
+
       this.#recordGatewayStat(gateway.id, {
         success: true,
         latencyMs: nowMs() - start
       });
       return {
         gatewayId: gateway.id,
-        transport: gateway.swarmPublicKey && this.connectionPool ? 'p2p' : 'http',
+        transport: responseTransport || clients[0]?.transport || (gateway.swarmPublicKey && this.connectionPool ? 'p2p' : 'http'),
         data: response
       };
     } catch (error) {
@@ -204,24 +246,93 @@ class GatewayControlClientPool {
     }
   }
 
-  #buildClient(gateway) {
-    if (gateway.baseUrl) {
-      return new HttpGatewayControlClient({
-        baseUrl: gateway.baseUrl,
-        fetchImpl: this.fetch,
-        logger: this.logger
+  #buildClients(gateway, options = {}) {
+    const clients = [];
+    const transportMode = typeof options?.transportMode === 'string'
+      ? options.transportMode.trim().toLowerCase()
+      : null;
+    const httpOnly = transportMode === 'http-required' || transportMode === 'http-only';
+    const p2pOnly = transportMode === 'p2p-only';
+    const canP2P = !!(gateway.swarmPublicKey && this.connectionPool);
+    const canHttp = !!gateway.baseUrl;
+
+    if (httpOnly) {
+      if (canHttp) {
+        clients.push({
+          transport: 'http',
+          request: (methodName, payload, requestOptions) => {
+            const client = new HttpGatewayControlClient({
+              baseUrl: gateway.baseUrl,
+              fetchImpl: this.fetch,
+              logger: this.logger
+            });
+            return client.request(methodName, payload, requestOptions);
+          }
+        });
+      }
+      return clients;
+    }
+
+    if (p2pOnly) {
+      if (canP2P) {
+        clients.push({
+          transport: 'p2p',
+          request: (methodName, payload, requestOptions) => {
+            const client = new P2PGatewayControlClient({
+              connectionPool: this.connectionPool,
+              peerPublicKey: gateway.swarmPublicKey,
+              logger: this.logger
+            });
+            return client.request(methodName, payload, requestOptions);
+          }
+        });
+      }
+      return clients;
+    }
+
+    if (this.preferP2P && canP2P) {
+      clients.push({
+        transport: 'p2p',
+        request: (methodName, payload, requestOptions) => {
+          const client = new P2PGatewayControlClient({
+            connectionPool: this.connectionPool,
+            peerPublicKey: gateway.swarmPublicKey,
+            logger: this.logger
+          });
+          return client.request(methodName, payload, requestOptions);
+        }
       });
     }
 
-    if (gateway.swarmPublicKey && this.connectionPool) {
-      return new P2PGatewayControlClient({
-        connectionPool: this.connectionPool,
-        peerPublicKey: gateway.swarmPublicKey,
-        logger: this.logger
+    if (canHttp) {
+      clients.push({
+        transport: 'http',
+        request: (methodName, payload, requestOptions) => {
+          const client = new HttpGatewayControlClient({
+            baseUrl: gateway.baseUrl,
+            fetchImpl: this.fetch,
+            logger: this.logger
+          });
+          return client.request(methodName, payload, requestOptions);
+        }
       });
     }
 
-    throw new Error(`Gateway ${gateway.id} has no usable control transport`);
+    if (!this.preferP2P && canP2P) {
+      clients.push({
+        transport: 'p2p',
+        request: (methodName, payload, requestOptions) => {
+          const client = new P2PGatewayControlClient({
+            connectionPool: this.connectionPool,
+            peerPublicKey: gateway.swarmPublicKey,
+            logger: this.logger
+          });
+          return client.request(methodName, payload, requestOptions);
+        }
+      });
+    }
+
+    return clients;
   }
 
   #recordGatewayStat(gatewayId, { success, latencyMs }) {

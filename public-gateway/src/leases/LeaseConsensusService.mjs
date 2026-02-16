@@ -1,6 +1,10 @@
 import { randomBytes } from 'node:crypto';
 
 import { signObjectEd25519, verifyObjectEd25519 } from '../../../shared/auth/PublicGatewayTokens.mjs';
+import {
+  resolvePolicyQuorumWeight,
+  resolvePolicyValidatorSet
+} from '../../../shared/public-gateway/RelayAuthorityTypes.mjs';
 
 function normalizePurpose(value) {
   return value === 'closed-join' ? 'closed-join' : 'open-join';
@@ -14,7 +18,8 @@ class LeaseConsensusService {
     gatewayId = null,
     gatewayPrivateKey = null,
     gatewayPublicKeys = {},
-    requestVote = null
+    requestVote = null,
+    relayAuthorityPolicyService = null
   } = {}) {
     this.manifestService = manifestService;
     this.eventLog = eventLog;
@@ -23,6 +28,7 @@ class LeaseConsensusService {
     this.gatewayPrivateKey = gatewayPrivateKey || null;
     this.gatewayPublicKeys = gatewayPublicKeys || {};
     this.requestVote = typeof requestVote === 'function' ? requestVote : null;
+    this.relayAuthorityPolicyService = relayAuthorityPolicyService || null;
     this.slotCertificates = new Map();
     this.voteLocks = new Map();
   }
@@ -111,12 +117,32 @@ class LeaseConsensusService {
       };
     }
 
-    const voters = (manifest.gateways || []).filter((gateway) => gateway.role !== 'observer');
-    const minQuorum = Number.isFinite(Number(manifest.minQuorum))
+    let voters = (manifest.gateways || []).filter((gateway) => gateway.role !== 'observer');
+    let voterWeights = new Map(voters.map((gateway) => [gateway.id, 1]));
+    let requiredQuorumWeight = Number.isFinite(Number(manifest.minQuorum))
       ? Math.max(1, Math.round(Number(manifest.minQuorum)))
       : 1;
+    let authorityPolicyHash = null;
 
-    if (voters.length < minQuorum) {
+    const authorityPolicy = this.relayAuthorityPolicyService
+      ? await this.relayAuthorityPolicyService.getPolicy(relayKey, { includeDefault: false }).catch(() => null)
+      : null;
+    if (authorityPolicy?.validators?.length) {
+      const scopedValidators = resolvePolicyValidatorSet(authorityPolicy, { capability: purpose })
+        .filter((entry) => typeof entry?.gatewayPubkey === 'string' && entry.gatewayPubkey.trim());
+      if (scopedValidators.length) {
+        voters = scopedValidators.map((entry) => ({
+          id: entry.gatewayPubkey,
+          role: 'voter',
+          weight: Number(entry.weight) || 1
+        }));
+        voterWeights = new Map(voters.map((entry) => [entry.id, Number(entry.weight) || 1]));
+        requiredQuorumWeight = resolvePolicyQuorumWeight(authorityPolicy, { capability: purpose });
+        authorityPolicyHash = authorityPolicy.policyHash || null;
+      }
+    }
+
+    if (voters.length < 1) {
       const error = new Error('insufficient-voters-for-quorum');
       error.statusCode = 503;
       throw error;
@@ -140,7 +166,9 @@ class LeaseConsensusService {
         ? Math.round(Number(request.ttlMs))
         : 300_000,
       proposerGatewayId: this.gatewayId || null,
-      proposerSig: null
+      proposerSig: null,
+      authorityPolicyHash: request.authorityPolicyHash || authorityPolicyHash || null,
+      materialDigest: request.materialDigest || null
     };
 
     if (this.gatewayPrivateKey && this.gatewayId) {
@@ -159,6 +187,7 @@ class LeaseConsensusService {
       return 0;
     });
     const votes = [];
+    let grantWeight = 0;
 
     for (const voter of selectedVoters) {
       let vote = null;
@@ -205,20 +234,23 @@ class LeaseConsensusService {
         };
       }
       votes.push(vote);
+      if (vote.decision === 'grant') {
+        grantWeight += Number(voterWeights.get(vote.voterGatewayId) || 1);
+      }
 
-      if (votes.filter((entry) => entry.decision === 'grant').length >= minQuorum) {
+      if (grantWeight >= requiredQuorumWeight) {
         break;
       }
     }
 
     const grants = votes.filter((vote) => vote.decision === 'grant');
-    if (grants.length < minQuorum) {
+    if (grantWeight < requiredQuorumWeight) {
       return {
         granted: false,
         reason: 'quorum-not-reached',
         proposal,
         votes,
-        requiredQuorum: minQuorum
+        requiredQuorum: requiredQuorumWeight
       };
     }
 
@@ -226,7 +258,9 @@ class LeaseConsensusService {
       leaseId,
       slotKey,
       epoch: proposal.epoch,
-      quorum: minQuorum,
+      quorum: grants.length,
+      quorumWeight: grantWeight,
+      requiredQuorumWeight,
       voterGatewayIds: grants.map((vote) => vote.voterGatewayId),
       voterSigs: grants.map((vote) => vote.voterSig),
       fencingToken: randomBytes(16).toString('hex'),
@@ -235,6 +269,8 @@ class LeaseConsensusService {
       writerCoreKey,
       requesterNostrPubkey,
       requesterEncryptPubkey,
+      authorityPolicyHash: proposal.authorityPolicyHash || null,
+      materialDigest: proposal.materialDigest || null,
       issuedAt: Date.now(),
       expiresAt: Date.now() + proposal.ttlMs
     };
@@ -292,15 +328,40 @@ class LeaseConsensusService {
     const distinct = new Set(voterIds);
     if (distinct.size < quorum) return false;
 
-    const voterSet = new Set(
+    let voterWeights = new Map(
       (activeManifest.gateways || [])
         .filter((gateway) => gateway.role !== 'observer')
-        .map((gateway) => gateway.id)
+        .map((gateway) => [gateway.id, 1])
     );
+    let requiredQuorumWeight = Number.isFinite(Number(certificate.requiredQuorumWeight))
+      ? Math.max(1, Math.round(Number(certificate.requiredQuorumWeight)))
+      : quorum;
 
-    for (const voterId of distinct) {
-      if (!voterSet.has(voterId)) return false;
+    if (this.relayAuthorityPolicyService && certificate?.relayKey) {
+      const policy = this.relayAuthorityPolicyService.inMemoryPolicies?.get(certificate.relayKey)
+        || null;
+      if (policy?.validators?.length) {
+        const scopedValidators = resolvePolicyValidatorSet(policy, {
+          capability: certificate?.purpose === 'closed-join' ? 'closed-join' : 'open-join'
+        });
+        if (scopedValidators.length) {
+          voterWeights = new Map(scopedValidators.map((entry) => [entry.gatewayPubkey, Number(entry.weight) || 1]));
+          requiredQuorumWeight = resolvePolicyQuorumWeight(policy, {
+            capability: certificate?.purpose === 'closed-join' ? 'closed-join' : 'open-join'
+          });
+          if (certificate?.authorityPolicyHash && policy?.policyHash && certificate.authorityPolicyHash !== policy.policyHash) {
+            return false;
+          }
+        }
+      }
     }
+
+    let observedWeight = 0;
+    for (const voterId of distinct) {
+      if (!voterWeights.has(voterId)) return false;
+      observedWeight += Number(voterWeights.get(voterId) || 1);
+    }
+    if (observedWeight < requiredQuorumWeight) return false;
 
     const slotKey = certificate.slotKey;
     const existing = this.slotCertificates.get(slotKey);
@@ -316,7 +377,11 @@ class LeaseConsensusService {
       const voterId = voterIds[i];
       const voterSig = voterSigs[i];
       const publicKey = this.gatewayPublicKeys[voterId];
-      if (!publicKey || !voterSig || String(voterSig).startsWith('synthetic-')) {
+      const hasVerifiablePublicKey = (
+        (publicKey && typeof publicKey === 'object')
+        || (typeof publicKey === 'string' && publicKey.includes('BEGIN'))
+      );
+      if (!hasVerifiablePublicKey || !voterSig || String(voterSig).startsWith('synthetic-')) {
         continue;
       }
       const vote = {

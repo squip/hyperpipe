@@ -314,9 +314,13 @@ class HyperswarmConnection {
     if (forceDestroy) {
       if (this.protocol) {
         try { this.protocol.removeAllListeners?.(); } catch (_) {}
+        try { this.protocol.on?.('error', () => {}); } catch (_) {}
         try { this.protocol.destroy(); } catch (_) {}
       }
       if (this.stream) {
+        // Secret-stream can emit ECONNRESET while being destroyed.
+        // Keep a no-op handler attached so teardown never crashes the process.
+        try { this.stream.on?.('error', () => {}); } catch (_) {}
         try { this.stream.destroy(error instanceof Error ? error : undefined); } catch (_) {}
       }
     }
@@ -526,6 +530,21 @@ class EnhancedHyperswarmPool {
 
     this.swarm.on('connection', (connection, peerInfo) => {
       const publicKey = peerInfo.publicKey.toString('hex');
+      // Secret-stream can emit ECONNRESET while being torn down; always attach
+      // a handler so transient resets never crash the worker process.
+      const onRawStreamError = (error) => {
+        this.logger?.debug?.('Inbound hyperswarm stream error', {
+          peer: publicKey,
+          error: error?.message || error
+        });
+      };
+      try { connection.on?.('error', onRawStreamError); } catch (_) {}
+      try {
+        connection.once?.('close', () => {
+          try { connection.removeListener?.('error', onRawStreamError); } catch (_) {}
+        });
+      } catch (_) {}
+
       const existing = this.connections.get(publicKey);
       if (existing) {
         if (existing.connecting && !existing.connected) {

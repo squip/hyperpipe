@@ -23,6 +23,13 @@ let replicationConnectionsTotal = 0
 const relayStores = new Map()
 let corestoreCounter = 0
 
+function isCorestoreClosed (target) {
+  if (!target) return true
+  if (target.closing === true || target.closed === true) return true
+  if (target._root && (target._root.closing === true || target._root.closed === true)) return true
+  return false
+}
+
 function ensureCorestoreId (target, prefix = 'corestore') {
   if (!target) return null
   if (!target.__ht_id) {
@@ -112,6 +119,14 @@ export function getRelayCorestore (relayKey, { storageBase = null } = {}) {
   }
   let entry = relayStores.get(normalized)
   const storagePath = join(base, 'relays', normalized)
+  if (entry?.store && isCorestoreClosed(entry.store)) {
+    relayStores.delete(normalized)
+    entry = null
+    console.warn('[Hyperdrive] Relay corestore entry was closed; recreating', {
+      relayKey: normalized,
+      storagePath
+    })
+  }
   if (!entry || entry.storagePath !== storagePath) {
     const relayStore = new Corestore(storagePath)
     attachCorestoreMetadata(relayStore, storagePath, normalized)

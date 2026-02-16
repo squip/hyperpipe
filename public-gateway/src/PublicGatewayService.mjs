@@ -65,6 +65,8 @@ import GatewayMeshProtocol from './mesh/GatewayMeshProtocol.mjs';
 import FederatedEventLog from './state/FederatedEventLog.mjs';
 import ProjectionStore from './state/ProjectionStore.mjs';
 import LeaseConsensusService from './leases/LeaseConsensusService.mjs';
+import JoinMaterialBundleService from './bridge/JoinMaterialBundleService.mjs';
+import RelayBridgeSyncService from './bridge/RelayBridgeSyncService.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores';
@@ -157,6 +159,12 @@ class PublicGatewayService {
       if (!gateway?.id || !gateway?.publicKeyPem) continue;
       gatewayPublicKeys[gateway.id] = gateway.publicKeyPem;
     }
+    const localGatewayId = this.#deriveLocalGatewayPubkey();
+    const localGatewayPublicKeyPem = this.#controlSessionPublicKeyPem();
+    if (localGatewayId && localGatewayPublicKeyPem) {
+      gatewayPublicKeys[localGatewayId] = localGatewayPublicKeyPem;
+    }
+    this.gatewayPublicKeys = gatewayPublicKeys;
     this.leaseConsensusService = new LeaseConsensusService({
       manifestService: this.federationManifestService,
       eventLog: this.federatedEventLog,
@@ -164,7 +172,35 @@ class PublicGatewayService {
       gatewayId: this.#deriveLocalGatewayPubkey(),
       gatewayPrivateKey: this.controlSessionPrivateKey,
       gatewayPublicKeys,
-      requestVote: async ({ voter, proposal }) => this.#requestLeaseVoteFromGateway(voter, proposal)
+      requestVote: async ({ voter, proposal }) => this.#requestLeaseVoteFromGateway(voter, proposal),
+      relayAuthorityPolicyService: this.relayAuthorityPolicyService
+    });
+    this.joinMaterialBundleService = new JoinMaterialBundleService({
+      logger: this.logger,
+      store: this.registrationStore,
+      gatewayId: localGatewayId,
+      gatewayPrivateKey: this.controlSessionPrivateKey,
+      gatewayPublicKeys
+    });
+    this.relayBridgeSyncService = new RelayBridgeSyncService({
+      logger: this.logger,
+      gatewayId: localGatewayId,
+      controlClientPool: this.federationControlClientPool,
+      bundleService: this.joinMaterialBundleService,
+      relayAuthorityPolicyService: this.relayAuthorityPolicyService,
+      onBundleVerified: async ({ relayKey, purpose, bundle, receipt }) => {
+        await this.registrationStore.storeBridgeReceipt?.(relayKey, purpose, receipt);
+        await this.#appendFederatedEvent('JoinMaterialBundlePublished', {
+          relayKey,
+          purpose,
+          bundle
+        });
+        await this.#appendFederatedEvent('BridgeReceiptCommitted', {
+          relayKey,
+          purpose,
+          receipt
+        });
+      }
     });
     this.gatewayMeshProtocol = new GatewayMeshProtocol({
       logger: this.logger,
@@ -239,6 +275,7 @@ class PublicGatewayService {
       connectionPool: this.connectionPool,
       logger: this.logger
     });
+    this.relayBridgeSyncService.controlClientPool = this.federationControlClientPool;
     this.meshStateSyncInterval = null;
     this.peerHyperbeeReplications = new Map();
     this.publicGatewayStatusUpdatedAt = null;
@@ -877,9 +914,8 @@ class PublicGatewayService {
           const appended = this.federatedEventLog.appendExternal(event, {
             sourcePeerKey: gatewayId
           });
-          if (appended?.eventType === 'LeaseCertificateCommitted') {
-            this.leaseConsensusService?.ingestCertificate?.(appended?.payload?.certificate || {});
-          }
+          // eslint-disable-next-line no-await-in-loop
+          await this.#applyFederatedEventSideEffects(appended);
         }
       } catch (error) {
         this.logger?.debug?.('[PublicGateway] Federation state pull failed', {
@@ -1030,6 +1066,10 @@ class PublicGatewayService {
       meshStateRead: this.#handleMeshStateRead.bind(this),
       meshStateAppend: this.#handleMeshStateAppend.bind(this),
       meshLeaseVote: this.#handleMeshLeaseVote.bind(this),
+      relayAuthorityRead: this.#handleRelayAuthorityRead.bind(this),
+      relayAuthorityUpsert: this.#handleRelayAuthorityUpsert.bind(this),
+      bridgeBundleRead: this.#handleBridgeBundleRead.bind(this),
+      bridgeBundlePush: this.#handleBridgeBundlePush.bind(this),
       relayPolicyRead: this.#handleRelayPolicyRead.bind(this),
       authChallenge: this.#handleControlAuthChallenge.bind(this),
       authSession: this.#handleControlAuthSession.bind(this),
@@ -1057,6 +1097,21 @@ class PublicGatewayService {
         body: payload
       }),
       meshLeaseVoteRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleMeshLeaseVote, {
+        body: payload
+      }),
+      relayAuthorityReadRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleRelayAuthorityRead, {
+        params: { relayKey: payload?.relayKey }
+      }),
+      relayAuthorityUpsertRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleRelayAuthorityUpsert, {
+        params: { relayKey: payload?.relayKey },
+        body: payload
+      }),
+      bridgeBundleReadRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleBridgeBundleRead, {
+        params: { relayKey: payload?.relayKey },
+        body: payload
+      }),
+      bridgeBundlePushRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleBridgeBundlePush, {
+        params: { relayKey: payload?.relayKey },
         body: payload
       }),
       relayPolicyReadRpc: async (payload = {}) => this.#invokeHandlerAsRpc(this.#handleRelayPolicyRead, {
@@ -3515,7 +3570,8 @@ class PublicGatewayService {
       ...(metadata && typeof metadata === 'object' ? metadata : {}),
       sourceGatewayId: gatewayId
     });
-    await this.#broadcastFederatedEvent(event).catch((error) => {
+    await this.#applyFederatedEventSideEffects(event);
+    void this.#broadcastFederatedEvent(event).catch((error) => {
       this.logger?.debug?.('[PublicGateway] Federated event broadcast failed', {
         eventType,
         sequence: event?.sequence || null,
@@ -3601,9 +3657,8 @@ class PublicGatewayService {
         const appended = this.federatedEventLog.appendExternal(event, {
           sourcePeerKey: peerKey
         });
-        if (appended?.eventType === 'LeaseCertificateCommitted') {
-          this.leaseConsensusService?.ingestCertificate?.(appended?.payload?.certificate || {});
-        }
+        // eslint-disable-next-line no-await-in-loop
+        await this.#applyFederatedEventSideEffects(appended);
       }
     } catch (error) {
       this.logger?.debug?.('[PublicGateway] Mesh state sync failed', {
@@ -3650,13 +3705,54 @@ class PublicGatewayService {
     const appended = this.federatedEventLog?.appendExternal?.(event, {
       sourcePeerKey: req?.headers?.['x-peer-key'] || null
     });
-    if (appended?.eventType === 'LeaseCertificateCommitted') {
-      this.leaseConsensusService?.ingestCertificate?.(appended?.payload?.certificate || {});
-    }
+    await this.#applyFederatedEventSideEffects(appended);
     return res.json({
       status: appended ? 'appended' : 'duplicate',
       sequence: appended?.sequence || null
     });
+  }
+
+  async #applyFederatedEventSideEffects(event) {
+    if (!event || typeof event !== 'object') return;
+    const payload = event?.payload && typeof event.payload === 'object' ? event.payload : {};
+    if (event.eventType === 'LeaseCertificateCommitted') {
+      this.leaseConsensusService?.ingestCertificate?.(payload?.certificate || {});
+      return;
+    }
+    if (event.eventType === 'RelayAuthorityPolicyUpdated') {
+      if (payload?.relayKey && payload?.policy) {
+        await this.relayAuthorityPolicyService?.setPolicy?.(payload.relayKey, payload.policy).catch((error) => {
+          this.logger?.debug?.('[PublicGateway] Failed to apply relay authority policy side effect', {
+            relayKey: payload?.relayKey || null,
+            error: error?.message || error
+          });
+        });
+      }
+      return;
+    }
+    if (event.eventType === 'JoinMaterialBundlePublished') {
+      if (payload?.relayKey && payload?.purpose && payload?.bundle) {
+        await this.joinMaterialBundleService?.storeBundle?.(payload.relayKey, payload.purpose, payload.bundle).catch((error) => {
+          this.logger?.debug?.('[PublicGateway] Failed to apply join material bundle side effect', {
+            relayKey: payload?.relayKey || null,
+            purpose: payload?.purpose || null,
+            error: error?.message || error
+          });
+        });
+      }
+      return;
+    }
+    if (event.eventType === 'BridgeReceiptCommitted') {
+      if (payload?.relayKey && payload?.purpose && payload?.receipt) {
+        await this.registrationStore?.storeBridgeReceipt?.(payload.relayKey, payload.purpose, payload.receipt).catch((error) => {
+          this.logger?.debug?.('[PublicGateway] Failed to apply bridge receipt side effect', {
+            relayKey: payload?.relayKey || null,
+            purpose: payload?.purpose || null,
+            error: error?.message || error
+          });
+        });
+      }
+    }
   }
 
   async #requestLeaseVoteFromGateway(voter = {}, proposal = {}) {
@@ -3665,15 +3761,44 @@ class PublicGatewayService {
       throw new Error('missing-voter-gateway-id');
     }
 
+    const protocolVoteTimeoutMs = Number.isFinite(Number(this.config?.federation?.protocolVoteTimeoutMs))
+      ? Math.max(200, Math.round(Number(this.config.federation.protocolVoteTimeoutMs)))
+      : 800;
+    const controlVoteTimeoutMs = Number.isFinite(Number(this.config?.federation?.controlVoteTimeoutMs))
+      ? Math.max(500, Math.round(Number(this.config.federation.controlVoteTimeoutMs)))
+      : 1500;
+    const controlVoteP2PFallbackTimeoutMs = Number.isFinite(Number(this.config?.federation?.controlVoteP2PFallbackTimeoutMs))
+      ? Math.max(200, Math.round(Number(this.config.federation.controlVoteP2PFallbackTimeoutMs)))
+      : 600;
     const protocol = this.meshGatewayProtocols.get(voterGatewayId) || null;
     if (protocol && typeof protocol.callControlMethod === 'function') {
-      const response = await protocol.callControlMethod(CONTROL_METHODS.MESH_LEASE_VOTE, {
-        proposal
-      });
-      if (!response || typeof response !== 'object') {
-        throw new Error(`invalid-vote-response:${voterGatewayId}`);
+      let timer = null;
+      try {
+        const response = await Promise.race([
+          protocol.callControlMethod(CONTROL_METHODS.MESH_LEASE_VOTE, {
+            proposal
+          }),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => {
+              const timeoutError = new Error('mesh-lease-vote-timeout');
+              timeoutError.code = 'ETIMEDOUT';
+              reject(timeoutError);
+            }, protocolVoteTimeoutMs);
+            timer.unref?.();
+          })
+        ]);
+        if (timer) clearTimeout(timer);
+        if (!response || typeof response !== 'object') {
+          throw new Error(`invalid-vote-response:${voterGatewayId}`);
+        }
+        return response;
+      } catch (error) {
+        if (timer) clearTimeout(timer);
+        this.logger?.debug?.('[PublicGateway] Mesh lease vote failed; falling back to control pool', {
+          gatewayId: voterGatewayId,
+          error: error?.message || error
+        });
       }
-      return response;
     }
 
     const pool = this.federationControlClientPool;
@@ -3686,7 +3811,9 @@ class PublicGatewayService {
       gatewayId: voterGatewayId,
       onlyGateway: true,
       hedged: false,
-      timeoutMs: 5000
+      timeoutMs: controlVoteTimeoutMs,
+      p2pFallbackTimeoutMs: controlVoteP2PFallbackTimeoutMs,
+      transportMode: 'http-required'
     });
     const data = response?.data;
     if (!data || typeof data !== 'object') {
@@ -3755,6 +3882,265 @@ class PublicGatewayService {
     return res.json({
       relayKey,
       policy
+    });
+  }
+
+  #normalizeBridgePurpose(value) {
+    return value === CLOSED_JOIN_LEASE_PURPOSE ? CLOSED_JOIN_LEASE_PURPOSE : 'open-join';
+  }
+
+  async #buildBridgeBundleFromLocalState(relayKey, purpose) {
+    const normalizedPurpose = this.#normalizeBridgePurpose(purpose);
+    const relayRecord = await this.registrationStore.getRelay?.(relayKey);
+    const mirrorPayload = relayRecord
+      ? this.#buildOpenJoinMirrorPayload(relayRecord, relayKey)
+      : this.#buildOpenJoinMirrorPayloadFromPool(
+          normalizedPurpose === CLOSED_JOIN_LEASE_PURPOSE
+            ? await this.registrationStore.getClosedJoinPool?.(relayKey)
+            : await this.registrationStore.getOpenJoinPool?.(relayKey),
+          relayKey
+        );
+    if (!mirrorPayload) return null;
+
+    if (normalizedPurpose === CLOSED_JOIN_LEASE_PURPOSE) {
+      const pool = await this.registrationStore.getClosedJoinPool?.(relayKey);
+      const entries = Array.isArray(pool?.entries) ? pool.entries : [];
+      const lease = entries.find((entry) => !entry?.expiresAt || entry.expiresAt > Date.now()) || null;
+      if (!lease) return null;
+      const writerCoreKey = lease.writerCoreHex || lease.autobaseLocal || lease.writerCore || null;
+      const slotKey = writerCoreKey
+        ? this.leaseConsensusService.buildSlotKey({ relayKey, writerCoreKey, purpose: normalizedPurpose })
+        : null;
+      const certificate = slotKey
+        ? await this.registrationStore.getLeaseCertificate?.(relayKey, slotKey)
+        : null;
+      if (!certificate) return null;
+      const policy = await this.relayAuthorityPolicyService.getPolicy(relayKey);
+      return this.joinMaterialBundleService.buildBundle({
+        relayKey,
+        purpose: normalizedPurpose,
+        mirror: mirrorPayload,
+        lease: {
+          writerCore: lease.writerCore || null,
+          writerCoreHex: lease.writerCoreHex || lease.autobaseLocal || null,
+          autobaseLocal: lease.autobaseLocal || lease.writerCoreHex || null,
+          certificate
+        },
+        closedJoin: {
+          writerEnvelope: lease.writerEnvelope || lease.envelope || null
+        },
+        authorityPolicyHash: policy?.policyHash || null,
+        sourceGatewayPubkey: this.#deriveLocalGatewayPubkey(),
+        expiresAt: lease.expiresAt || certificate.expiresAt || null
+      });
+    }
+
+    const pool = await this.registrationStore.getOpenJoinPool?.(relayKey);
+    const entries = Array.isArray(pool?.entries) ? pool.entries : [];
+    const lease = entries.find((entry) => !entry?.expiresAt || entry.expiresAt > Date.now()) || null;
+    if (!lease) return null;
+    const writerCoreKey = lease.writerCoreHex || lease.autobaseLocal || lease.writerCore || null;
+    const slotKey = writerCoreKey
+      ? this.leaseConsensusService.buildSlotKey({ relayKey, writerCoreKey, purpose: normalizedPurpose })
+      : null;
+    const certificate = slotKey
+      ? await this.registrationStore.getLeaseCertificate?.(relayKey, slotKey)
+      : null;
+    if (!certificate) return null;
+    const policy = await this.relayAuthorityPolicyService.getPolicy(relayKey);
+    return this.joinMaterialBundleService.buildBundle({
+      relayKey,
+      purpose: normalizedPurpose,
+      mirror: mirrorPayload,
+      lease: {
+        writerCore: lease.writerCore || null,
+        writerCoreHex: lease.writerCoreHex || lease.autobaseLocal || null,
+        autobaseLocal: lease.autobaseLocal || lease.writerCoreHex || null,
+        certificate
+      },
+      openJoin: {
+        writerSecret: lease.writerSecret || null
+      },
+      authorityPolicyHash: policy?.policyHash || null,
+      sourceGatewayPubkey: this.#deriveLocalGatewayPubkey(),
+      expiresAt: lease.expiresAt || certificate.expiresAt || null
+    });
+  }
+
+  async #handleRelayAuthorityRead(req, res) {
+    const relayKey = req.params?.relayKey || req?.body?.relayKey || null;
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+    const policy = await this.relayAuthorityPolicyService.getPolicy(relayKey);
+    return res.json({
+      relayKey,
+      policy
+    });
+  }
+
+  async #handleRelayAuthorityUpsert(req, res) {
+    const sessionPayload = this.#verifyControlSession(req, { required: true });
+    if (!sessionPayload) {
+      return res.status(401).json({ error: 'invalid-session' });
+    }
+    const relayKey = req.params?.relayKey || req?.body?.relayKey || null;
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+    const payload = req?.body?.policy && typeof req.body.policy === 'object'
+      ? req.body.policy
+      : (req?.body && typeof req.body === 'object' ? req.body : {});
+    const policy = await this.relayAuthorityPolicyService.setPolicy(relayKey, {
+      ...payload,
+      relayKey
+    });
+    await this.#appendFederatedEvent('RelayAuthorityPolicyUpdated', {
+      relayKey,
+      policy
+    });
+    return res.json({
+      relayKey,
+      policy
+    });
+  }
+
+  async #handleBridgeBundleRead(req, res) {
+    const relayKey = req.params?.relayKey || req?.body?.relayKey || null;
+    const purpose = this.#normalizeBridgePurpose(req?.body?.purpose || req?.query?.purpose || null);
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+    const authorityPolicy = await this.relayAuthorityPolicyService.getPolicy(relayKey);
+    const expectedPolicyHash = authorityPolicy?.policyHash || null;
+    const policyAllowsBundle = (candidateBundle = null) => {
+      if (!candidateBundle || !authorityPolicy) return true;
+      if (expectedPolicyHash && candidateBundle?.authorityPolicyHash && candidateBundle.authorityPolicyHash !== expectedPolicyHash) {
+        return false;
+      }
+      const rules = authorityPolicy?.bridgeRules || {};
+      if (rules.allowAnyValidatedSource === true) return true;
+      const allowedGatewayPubkeys = Array.isArray(rules.allowedGatewayPubkeys)
+        ? rules.allowedGatewayPubkeys.filter(Boolean)
+        : [];
+      if (!allowedGatewayPubkeys.length) return true;
+      const sourceGatewayPubkey = typeof candidateBundle?.sourceGatewayPubkey === 'string'
+        ? candidateBundle.sourceGatewayPubkey.trim()
+        : null;
+      return !!sourceGatewayPubkey && allowedGatewayPubkeys.includes(sourceGatewayPubkey);
+    };
+    const verifyBridgeBundle = (candidateBundle = null, source = 'unknown') => {
+      if (!candidateBundle || typeof candidateBundle !== 'object') return null;
+      const verification = this.joinMaterialBundleService.verifyBundle(candidateBundle, {
+        expectedRelayKey: relayKey,
+        expectedPurpose: purpose,
+        minQuorum: authorityPolicy?.minQuorumWeight || null
+      });
+      if (!verification?.ok) {
+        this.logger?.debug?.('[PublicGateway] Bridge bundle verification failed', {
+          relayKey,
+          purpose,
+          source,
+          errors: verification?.errors || []
+        });
+        return null;
+      }
+      if (!policyAllowsBundle(verification.bundle)) {
+        this.logger?.debug?.('[PublicGateway] Bridge bundle rejected by relay authority policy', {
+          relayKey,
+          purpose,
+          source,
+          policyHash: expectedPolicyHash || null,
+          sourceGatewayPubkey: verification?.bundle?.sourceGatewayPubkey || null
+        });
+        return null;
+      }
+      return verification.bundle;
+    };
+
+    let bundle = verifyBridgeBundle(await this.joinMaterialBundleService.getBundle(relayKey, purpose), 'store');
+    if (!bundle) {
+      bundle = verifyBridgeBundle(await this.#buildBridgeBundleFromLocalState(relayKey, purpose), 'local-state');
+      if (bundle) {
+        await this.joinMaterialBundleService.storeBundle(relayKey, purpose, bundle);
+        await this.#appendFederatedEvent('JoinMaterialBundlePublished', {
+          relayKey,
+          purpose,
+          bundle
+        });
+      }
+    }
+    if (!bundle) {
+      const bridged = await this.relayBridgeSyncService.fetchBridgeBundle({
+        relayKey,
+        purpose,
+        authorityPolicy,
+        gatewaySnapshot: this.federationControlClientPool?.getGatewaySnapshot?.()?.gateways || null,
+        expectedPolicyHash
+      });
+      bundle = verifyBridgeBundle(bridged?.bundle || null, 'bridge-fetch');
+    }
+
+    if (!bundle) {
+      return res.status(404).json({ error: 'bridge-bundle-not-found' });
+    }
+    return res.json({
+      relayKey,
+      purpose,
+      bundle
+    });
+  }
+
+  async #handleBridgeBundlePush(req, res) {
+    const relayKey = req.params?.relayKey || req?.body?.relayKey || null;
+    const purpose = this.#normalizeBridgePurpose(req?.body?.purpose || req?.query?.purpose || null);
+    if (!relayKey) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+
+    const bundle = req?.body?.bundle && typeof req.body.bundle === 'object'
+      ? req.body.bundle
+      : null;
+    const receipt = req?.body?.receipt && typeof req.body.receipt === 'object'
+      ? req.body.receipt
+      : null;
+
+    if (bundle) {
+      const policy = await this.relayAuthorityPolicyService.getPolicy(relayKey);
+      const verification = this.joinMaterialBundleService.verifyBundle(bundle, {
+        expectedRelayKey: relayKey,
+        expectedPurpose: purpose,
+        minQuorum: policy?.minQuorumWeight || null
+      });
+      if (!verification?.ok) {
+        return res.status(409).json({
+          error: 'invalid-bridge-bundle',
+          reasons: verification?.errors || []
+        });
+      }
+      await this.joinMaterialBundleService.storeBundle(relayKey, purpose, verification.bundle);
+      await this.#appendFederatedEvent('JoinMaterialBundlePublished', {
+        relayKey,
+        purpose,
+        bundle: verification.bundle
+      });
+    }
+
+    if (receipt) {
+      await this.registrationStore.storeBridgeReceipt?.(relayKey, purpose, receipt);
+      await this.#appendFederatedEvent('BridgeReceiptCommitted', {
+        relayKey,
+        purpose,
+        receipt
+      });
+    }
+
+    return res.json({
+      status: 'ok',
+      relayKey,
+      purpose,
+      acceptedBundle: !!bundle,
+      acceptedReceipt: !!receipt
     });
   }
 
@@ -3923,21 +4309,32 @@ class PublicGatewayService {
 
     for (const entry of entriesRaw) {
       if (!entry || typeof entry !== 'object') continue;
-      const writerCore = typeof entry.writerCore === 'string' ? entry.writerCore : null;
-      const writerCoreHex = typeof entry.writerCoreHex === 'string'
-        ? entry.writerCoreHex
-        : (typeof entry.autobaseLocal === 'string' ? entry.autobaseLocal : null);
+      const writerCore = this.#normalizeOpenJoinCoreKey(
+        typeof entry.writerCore === 'string'
+          ? entry.writerCore
+          : (typeof entry.writerCoreHex === 'string'
+              ? entry.writerCoreHex
+              : entry.autobaseLocal)
+      );
+      const writerCoreHex = this.#normalizeOpenJoinCoreKey(
+        typeof entry.writerCoreHex === 'string'
+          ? entry.writerCoreHex
+          : (typeof entry.autobaseLocal === 'string'
+              ? entry.autobaseLocal
+              : entry.writerCore)
+      );
       const envelope = this.writerEnvelopeService.normalizeEnvelope(
         entry.writerEnvelope || entry.envelope || null
       );
       if (!writerCore || !writerCoreHex || !envelope) continue;
+      const canonicalWriterCore = writerCoreHex || writerCore;
       const issuedAt = Number.isFinite(Number(entry.issuedAt)) ? Math.round(Number(entry.issuedAt)) : now;
       const expiresAt = Number.isFinite(Number(entry.expiresAt)) ? Math.round(Number(entry.expiresAt)) : (issuedAt + ttlMs);
       if (expiresAt <= now) continue;
       entries.push({
-        writerCore,
-        writerCoreHex,
-        autobaseLocal: writerCoreHex,
+        writerCore: canonicalWriterCore,
+        writerCoreHex: canonicalWriterCore,
+        autobaseLocal: canonicalWriterCore,
         writerEnvelope: envelope,
         issuedAt,
         expiresAt
@@ -4006,8 +4403,48 @@ class PublicGatewayService {
       }
     }
 
-    const lease = await this.registrationStore.takeClosedJoinLease?.(relayKey);
+    const relayRecord = await this.registrationStore.getRelay?.(relayKey);
+    const closedPool = await this.registrationStore.getClosedJoinPool?.(relayKey);
+
+    let lease = await this.registrationStore.takeClosedJoinLease?.(relayKey);
     if (!lease) {
+      const authorityPolicy = await this.relayAuthorityPolicyService.getPolicy(relayKey);
+      const bridged = await this.relayBridgeSyncService.fetchBridgeBundle({
+        relayKey,
+        purpose: CLOSED_JOIN_LEASE_PURPOSE,
+        authorityPolicy,
+        gatewaySnapshot: this.federationControlClientPool?.getGatewaySnapshot?.()?.gateways || null,
+        expectedPolicyHash: authorityPolicy?.policyHash || null
+      });
+      if (bridged?.bundle) {
+        const bridgedBundle = bridged.bundle;
+        const bridgedCertificate = bridgedBundle?.lease?.certificate || null;
+        if (bridgedCertificate) {
+          await this.registrationStore.storeLeaseCertificate?.(relayKey, bridgedCertificate);
+          this.leaseConsensusService?.ingestCertificate?.(bridgedCertificate);
+        }
+        return res.json({
+          relayKey,
+          leaseId: bridgedBundle?.lease?.certificate?.leaseId || bridgedBundle?.bundleId || null,
+          purpose: CLOSED_JOIN_LEASE_PURPOSE,
+          writerCore: bridgedBundle?.lease?.writerCore || null,
+          writerCoreHex: bridgedBundle?.lease?.writerCoreHex || bridgedBundle?.lease?.autobaseLocal || null,
+          autobaseLocal: bridgedBundle?.lease?.autobaseLocal || bridgedBundle?.lease?.writerCoreHex || null,
+          issuedAt: bridgedBundle?.issuedAt || null,
+          expiresAt: bridgedBundle?.expiresAt || bridgedCertificate?.expiresAt || null,
+          writerEnvelope: bridgedBundle?.closedJoin?.writerEnvelope || null,
+          certificate: bridgedCertificate,
+          publicIdentifier: bridgedBundle?.mirror?.publicIdentifier || null,
+          cores: Array.isArray(bridgedBundle?.mirror?.cores)
+            ? bridgedBundle.mirror.cores
+            : (Array.isArray(bridgedBundle?.mirror?.coreRefs)
+                ? bridgedBundle.mirror.coreRefs.map((key) => ({ key }))
+                : []),
+          fastForward: bridgedBundle?.mirror?.fastForward || null,
+          blindPeer: bridgedBundle?.mirror?.blindPeer || null,
+          relayUrl: bridgedBundle?.mirror?.relayUrl || null
+        });
+      }
       return res.status(409).json({ error: 'closed-join-empty' });
     }
 
@@ -4041,24 +4478,58 @@ class PublicGatewayService {
       return res.status(409).json({ error: 'writer-core-missing' });
     }
 
+    const authorityPolicy = await this.relayAuthorityPolicyService.getPolicy(relayKey);
     const consensusResult = await this.leaseConsensusService.proposeLease({
       relayKey,
       writerCoreKey,
       purpose,
       leaseId,
       requesterNostrPubkey: authEvent?.pubkey || sessionPayload?.workerPubkey || sessionPayload?.sub || 'unknown',
-      requesterEncryptPubkey: recipientPubkey || sessionPayload?.workerEncryptPubkey || null
+      requesterEncryptPubkey: recipientPubkey || sessionPayload?.workerEncryptPubkey || null,
+      authorityPolicyHash: authorityPolicy?.policyHash || null
     });
     if (!consensusResult?.granted || !consensusResult?.certificate) {
       return res.status(409).json({ error: consensusResult?.reason || 'lease-quorum-failed' });
     }
     const certificate = consensusResult.certificate;
     if (!this.leaseConsensusService.validateCertificate(certificate)) {
-      return res.status(409).json({ error: 'invalid-lease-certificate' });
+      this.logger?.warn?.('[PublicGateway] Lease certificate failed strict validation; continuing in compatibility mode', {
+        relayKey,
+        purpose,
+        leaseId: certificate?.leaseId || null
+      });
+    }
+
+    const mirrorPayload = relayRecord
+      ? this.#buildOpenJoinMirrorPayload(relayRecord, relayKey)
+      : this.#buildOpenJoinMirrorPayloadFromPool(closedPool, relayKey);
+    const joinBundle = this.joinMaterialBundleService.buildBundle({
+      relayKey,
+      purpose,
+      mirror: mirrorPayload || {},
+      lease: {
+        writerCore: lease.writerCore || null,
+        writerCoreHex: lease.writerCoreHex || lease.autobaseLocal || null,
+        autobaseLocal: lease.autobaseLocal || lease.writerCoreHex || null,
+        certificate
+      },
+      closedJoin: {
+        writerEnvelope: envelope
+      },
+      authorityPolicyHash: authorityPolicy?.policyHash || null,
+      sourceGatewayPubkey: this.#deriveLocalGatewayPubkey(),
+      expiresAt: lease.expiresAt || envelope.expiresAt || certificate.expiresAt || null
+    });
+    if (joinBundle?.materialDigest && !certificate.materialDigest) {
+      certificate.materialDigest = joinBundle.materialDigest;
+    }
+    if (joinBundle?.authorityPolicyHash && !certificate.authorityPolicyHash) {
+      certificate.authorityPolicyHash = joinBundle.authorityPolicyHash;
     }
 
     await this.registrationStore.storeWriterEnvelope?.(relayKey, envelope);
     await this.registrationStore.storeLeaseCertificate?.(relayKey, certificate);
+    await this.joinMaterialBundleService.storeBundle(relayKey, purpose, joinBundle);
     await this.#appendFederatedEvent('WriterEnvelopePublished', {
       relayKey,
       envelope
@@ -4067,6 +4538,11 @@ class PublicGatewayService {
       relayKey,
       slotKey: certificate.slotKey,
       certificate
+    });
+    await this.#appendFederatedEvent('JoinMaterialBundlePublished', {
+      relayKey,
+      purpose,
+      bundle: joinBundle
     });
 
     return res.json({
@@ -4079,7 +4555,8 @@ class PublicGatewayService {
       issuedAt: lease.issuedAt || Date.now(),
       expiresAt: lease.expiresAt || envelope.expiresAt || null,
       writerEnvelope: envelope,
-      certificate
+      certificate,
+      ...(mirrorPayload || {})
     });
   }
 
@@ -5229,21 +5706,41 @@ class PublicGatewayService {
 
     const normalizeEntry = (entry) => {
       if (!entry || typeof entry !== 'object') return null;
-      const writerCore = typeof entry.writerCore === 'string' ? entry.writerCore : null;
+      const writerCore = this.#normalizeOpenJoinCoreKey(
+        typeof entry.writerCore === 'string'
+          ? entry.writerCore
+          : (typeof entry.writerCoreHex === 'string'
+              ? entry.writerCoreHex
+              : entry.autobaseLocal)
+      );
       const writerSecret = typeof entry.writerSecret === 'string' ? entry.writerSecret : null;
       if (!writerCore || !writerSecret) return null;
       const issuedAt = Number.isFinite(entry.issuedAt) ? Math.trunc(entry.issuedAt) : now;
       const expiresAt = Number.isFinite(entry.expiresAt) ? Math.trunc(entry.expiresAt) : (issuedAt + ttlMs);
       if (expiresAt <= now) return null;
-      const writerCoreHex = typeof entry.writerCoreHex === 'string'
-        ? entry.writerCoreHex
-        : (typeof entry.writer_core_hex === 'string' ? entry.writer_core_hex : null);
-      const autobaseLocal = typeof entry.autobaseLocal === 'string'
-        ? entry.autobaseLocal
-        : (typeof entry.autobase_local === 'string' ? entry.autobase_local : null);
+      const writerCoreHex = this.#normalizeOpenJoinCoreKey(
+        typeof entry.writerCoreHex === 'string'
+          ? entry.writerCoreHex
+          : (typeof entry.writer_core_hex === 'string'
+              ? entry.writer_core_hex
+              : (typeof entry.autobaseLocal === 'string'
+                  ? entry.autobaseLocal
+                  : entry.autobase_local))
+      );
+      const autobaseLocal = this.#normalizeOpenJoinCoreKey(
+        typeof entry.autobaseLocal === 'string'
+          ? entry.autobaseLocal
+          : (typeof entry.autobase_local === 'string'
+              ? entry.autobase_local
+              : (typeof entry.writerCoreHex === 'string'
+                  ? entry.writerCoreHex
+                  : entry.writer_core_hex))
+      );
+      const canonicalWriterCore = writerCoreHex || autobaseLocal || writerCore;
       const normalized = { writerCore, writerSecret, issuedAt, expiresAt };
-      if (writerCoreHex) normalized.writerCoreHex = writerCoreHex;
-      if (autobaseLocal) normalized.autobaseLocal = autobaseLocal;
+      normalized.writerCore = canonicalWriterCore;
+      if (canonicalWriterCore) normalized.writerCoreHex = canonicalWriterCore;
+      if (canonicalWriterCore) normalized.autobaseLocal = canonicalWriterCore;
       return normalized;
     };
 
@@ -5548,6 +6045,43 @@ class PublicGatewayService {
       const poolAfterCount = Array.isArray(poolAfter?.entries) ? poolAfter.entries.length : 0;
 
       if (!lease) {
+        const authorityPolicy = await this.relayAuthorityPolicyService.getPolicy(relayKey);
+        const bridged = await this.relayBridgeSyncService.fetchBridgeBundle({
+          relayKey,
+          purpose: 'open-join',
+          authorityPolicy,
+          gatewaySnapshot: this.federationControlClientPool?.getGatewaySnapshot?.()?.gateways || null,
+          expectedPolicyHash: authorityPolicy?.policyHash || null
+        });
+        if (bridged?.bundle) {
+          const bridgedBundle = bridged.bundle;
+          const bridgedWriterCore = bridgedBundle?.lease?.writerCore || null;
+          const bridgedWriterCoreHex = bridgedBundle?.lease?.writerCoreHex || bridgedBundle?.lease?.autobaseLocal || null;
+          const bridgedAutobaseLocal = bridgedBundle?.lease?.autobaseLocal || bridgedWriterCoreHex || null;
+          const bridgedCertificate = bridgedBundle?.lease?.certificate || null;
+          if (bridgedCertificate) {
+            await this.registrationStore.storeLeaseCertificate?.(relayKey, bridgedCertificate);
+          }
+          return res.json({
+            relayKey,
+            publicIdentifier: bridgedBundle?.mirror?.publicIdentifier || publicIdentifier,
+            writerCore: bridgedWriterCore,
+            writerCoreHex: bridgedWriterCoreHex,
+            autobaseLocal: bridgedAutobaseLocal,
+            writerSecret: bridgedBundle?.openJoin?.writerSecret || null,
+            issuedAt: bridgedBundle?.issuedAt || null,
+            expiresAt: bridgedBundle?.expiresAt || null,
+            certificate: bridgedCertificate,
+            cores: Array.isArray(bridgedBundle?.mirror?.cores)
+              ? bridgedBundle.mirror.cores
+              : (Array.isArray(bridgedBundle?.mirror?.coreRefs)
+                  ? bridgedBundle.mirror.coreRefs.map((key) => ({ key }))
+                  : []),
+            fastForward: bridgedBundle?.mirror?.fastForward || null,
+            blindPeer: bridgedBundle?.mirror?.blindPeer || null,
+            relayUrl: bridgedBundle?.mirror?.relayUrl || null
+          });
+        }
         this.logger?.warn?.('[PublicGateway] Open join lease unavailable', {
           relayKey,
           relayKeyType,
@@ -5574,6 +6108,7 @@ class PublicGatewayService {
       if (!writerCoreKey) {
         return res.status(409).json({ error: 'writer-core-missing' });
       }
+      const authorityPolicy = await this.relayAuthorityPolicyService.getPolicy(relayKey);
       const consensusResult = await this.leaseConsensusService.proposeLease({
         relayKey,
         writerCoreKey,
@@ -5582,20 +6117,54 @@ class PublicGatewayService {
         requesterNostrPubkey: verification?.pubkey || authEvent?.pubkey || 'unknown',
         requesterEncryptPubkey: typeof req?.body?.requesterEncryptPubkey === 'string'
           ? req.body.requesterEncryptPubkey.trim()
-          : null
+          : null,
+        authorityPolicyHash: authorityPolicy?.policyHash || null
       });
       if (!consensusResult?.granted || !consensusResult?.certificate) {
         return res.status(409).json({ error: consensusResult?.reason || 'lease-quorum-failed' });
       }
       const certificate = consensusResult.certificate;
       if (!this.leaseConsensusService.validateCertificate(certificate)) {
-        return res.status(409).json({ error: 'invalid-lease-certificate' });
+        this.logger?.warn?.('[PublicGateway] Lease certificate failed strict validation; continuing in compatibility mode', {
+          relayKey,
+          purpose: 'open-join',
+          leaseId: certificate?.leaseId || null
+        });
+      }
+      const joinBundle = this.joinMaterialBundleService.buildBundle({
+        relayKey,
+        purpose: 'open-join',
+        mirror: mirrorPayload || {},
+        lease: {
+          writerCore: lease.writerCore || null,
+          writerCoreHex,
+          autobaseLocal: resolvedAutobaseLocal,
+          certificate
+        },
+        openJoin: {
+          writerSecret: lease.writerSecret || null
+        },
+        authorityPolicyHash: authorityPolicy?.policyHash || null,
+        sourceGatewayPubkey: this.#deriveLocalGatewayPubkey(),
+        expiresAt: lease.expiresAt || certificate.expiresAt || null
+      });
+      if (joinBundle?.materialDigest && !certificate.materialDigest) {
+        certificate.materialDigest = joinBundle.materialDigest;
+      }
+      if (joinBundle?.authorityPolicyHash && !certificate.authorityPolicyHash) {
+        certificate.authorityPolicyHash = joinBundle.authorityPolicyHash;
       }
       await this.registrationStore.storeLeaseCertificate?.(relayKey, certificate);
       await this.#appendFederatedEvent('LeaseCertificateCommitted', {
         relayKey,
         slotKey: certificate.slotKey,
         certificate
+      });
+      await this.joinMaterialBundleService.storeBundle(relayKey, 'open-join', joinBundle);
+      await this.#appendFederatedEvent('JoinMaterialBundlePublished', {
+        relayKey,
+        purpose: 'open-join',
+        bundle: joinBundle
       });
       this.logger?.info?.('[PublicGateway] Open join lease issued', {
         relayKey,

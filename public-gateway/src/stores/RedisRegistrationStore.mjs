@@ -28,6 +28,9 @@ class RedisRegistrationStore {
     this.mirrorPrefix = `${this.prefix}mirrors:`;
     this.writerEnvelopePrefix = `${this.prefix}writer-envelope:`;
     this.leaseCertificatePrefix = `${this.prefix}lease-cert:`;
+    this.relayPolicyPrefix = `${this.prefix}relay-policy:`;
+    this.bridgeBundlePrefix = `${this.prefix}bridge-bundle:`;
+    this.bridgeReceiptPrefix = `${this.prefix}bridge-receipt:`;
     this.aliasPrefix = `${this.prefix}aliases:`;
     this.logger = logger || console;
     this.client = createClient({ url: this.url });
@@ -84,6 +87,18 @@ class RedisRegistrationStore {
     return `${this.leaseCertificatePrefix}${relayKey}:${slotKey}`;
   }
 
+  #relayPolicyKey(relayKey) {
+    return `${this.relayPolicyPrefix}${relayKey}`;
+  }
+
+  #bridgeBundleKey(relayKey, purpose) {
+    return `${this.bridgeBundlePrefix}${relayKey}:${purpose}`;
+  }
+
+  #bridgeReceiptKey(relayKey, purpose) {
+    return `${this.bridgeReceiptPrefix}${relayKey}:${purpose}`;
+  }
+
   #aliasKey(identifier) {
     return `${this.aliasPrefix}${identifier}`;
   }
@@ -136,6 +151,9 @@ class RedisRegistrationStore {
     await this.clearClosedJoinPool(relayKey);
     await this.#deleteByPrefix(this.#writerEnvelopeKey(relayKey, ''));
     await this.#deleteByPrefix(this.#leaseCertificateKey(relayKey, ''));
+    await this.client.del(this.#relayPolicyKey(relayKey));
+    await this.#deleteByPrefix(this.#bridgeBundleKey(relayKey, ''));
+    await this.#deleteByPrefix(this.#bridgeReceiptKey(relayKey, ''));
   }
 
   pruneExpired() {
@@ -382,6 +400,114 @@ class RedisRegistrationStore {
     }
   }
 
+  async storeRelayPolicy(relayKey, policy = {}) {
+    if (!relayKey) return;
+    await this.#ensureConnected();
+    const payload = JSON.stringify({
+      ...policy,
+      relayKey,
+      storedAt: Date.now()
+    });
+    const ttlMs = Number(policy?.expiresAt) - Date.now();
+    const ttlSeconds = Number.isFinite(ttlMs) && ttlMs > 0
+      ? Math.max(1, Math.ceil(ttlMs / 1000))
+      : null;
+    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+      await this.client.set(this.#relayPolicyKey(relayKey), payload, { EX: ttlSeconds });
+    } else {
+      await this.client.set(this.#relayPolicyKey(relayKey), payload);
+    }
+  }
+
+  async getRelayPolicy(relayKey) {
+    if (!relayKey) return null;
+    await this.#ensureConnected();
+    const value = await this.client.get(this.#relayPolicyKey(relayKey));
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse relay policy payload', { relayKey, error: error.message });
+      return null;
+    }
+  }
+
+  async storeBridgeJoinBundle(relayKey, purpose, bundle = {}) {
+    if (!relayKey || !purpose || !bundle || typeof bundle !== 'object') return;
+    await this.#ensureConnected();
+    const payload = JSON.stringify({
+      ...bundle,
+      relayKey,
+      purpose,
+      storedAt: Date.now()
+    });
+    const ttlMs = Number(bundle?.expiresAt) - Date.now();
+    const ttlSeconds = Number.isFinite(ttlMs) && ttlMs > 0
+      ? Math.max(1, Math.ceil(ttlMs / 1000))
+      : null;
+    const key = this.#bridgeBundleKey(relayKey, purpose);
+    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+      await this.client.set(key, payload, { EX: ttlSeconds });
+    } else {
+      await this.client.set(key, payload);
+    }
+  }
+
+  async getBridgeJoinBundle(relayKey, purpose) {
+    if (!relayKey || !purpose) return null;
+    await this.#ensureConnected();
+    const value = await this.client.get(this.#bridgeBundleKey(relayKey, purpose));
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse bridge join bundle payload', {
+        relayKey,
+        purpose,
+        error: error.message
+      });
+      return null;
+    }
+  }
+
+  async storeBridgeReceipt(relayKey, purpose, receipt = {}) {
+    if (!relayKey || !purpose || !receipt || typeof receipt !== 'object') return;
+    await this.#ensureConnected();
+    const payload = JSON.stringify({
+      ...receipt,
+      relayKey,
+      purpose,
+      storedAt: Date.now()
+    });
+    const ttlMs = Number(receipt?.expiresAt) - Date.now();
+    const ttlSeconds = Number.isFinite(ttlMs) && ttlMs > 0
+      ? Math.max(1, Math.ceil(ttlMs / 1000))
+      : null;
+    const key = this.#bridgeReceiptKey(relayKey, purpose);
+    if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+      await this.client.set(key, payload, { EX: ttlSeconds });
+    } else {
+      await this.client.set(key, payload);
+    }
+  }
+
+  async getBridgeReceipt(relayKey, purpose) {
+    if (!relayKey || !purpose) return null;
+    await this.#ensureConnected();
+    const value = await this.client.get(this.#bridgeReceiptKey(relayKey, purpose));
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse bridge receipt payload', {
+        relayKey,
+        purpose,
+        error: error.message
+      });
+      return null;
+    }
+  }
+
   async storeOpenJoinAliases(relayKey, aliases = []) {
     if (!relayKey) return;
     await this.#ensureConnected();
@@ -512,6 +638,9 @@ class RedisRegistrationStore {
       this.mirrorPrefix,
       this.writerEnvelopePrefix,
       this.leaseCertificatePrefix,
+      this.relayPolicyPrefix,
+      this.bridgeBundlePrefix,
+      this.bridgeReceiptPrefix,
       this.aliasPrefix
     ];
     let cursor = '0';
