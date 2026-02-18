@@ -255,6 +255,239 @@ function mergeCoreRefLists(...lists) {
     return merged;
 }
 
+function normalizeGatewayOrigin(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+        const parsed = new URL(trimmed);
+        if (parsed.protocol === 'ws:') parsed.protocol = 'http:';
+        if (parsed.protocol === 'wss:') parsed.protocol = 'https:';
+        if (!/^https?:$/i.test(parsed.protocol)) return null;
+        return parsed.origin;
+    } catch (_) {
+        return null;
+    }
+}
+
+function normalizeGatewayOriginList(values = []) {
+    const seen = new Set();
+    for (const value of Array.isArray(values) ? values : []) {
+        const origin = normalizeGatewayOrigin(value);
+        if (origin) seen.add(origin);
+    }
+    return Array.from(seen);
+}
+
+function resolveProfileGatewayOrigins(profile) {
+    if (!profile || typeof profile !== 'object') return [];
+    return normalizeGatewayOriginList([
+        ...(Array.isArray(profile.gateway_origins) ? profile.gateway_origins : []),
+        ...(Array.isArray(profile.gatewayOrigins) ? profile.gatewayOrigins : [])
+    ]);
+}
+
+function resolveRelayGatewayOriginsForAutoConnect(profile, relayKey, publicIdentifier) {
+    const fromProfile = resolveProfileGatewayOrigins(profile);
+    if (fromProfile.length) return fromProfile;
+    if (typeof global.resolveRelayGatewayOrigins === 'function') {
+        try {
+            const fromResolver = global.resolveRelayGatewayOrigins({
+                relayKey,
+                publicIdentifier,
+                profile
+            });
+            const normalized = normalizeGatewayOriginList(fromResolver);
+            if (normalized.length) return normalized;
+        } catch (error) {
+            console.warn('[RelayAdapter] Failed resolving relay-scoped gateways from worker resolver', {
+                relayKey,
+                publicIdentifier,
+                error: error?.message || error
+            });
+        }
+    }
+    return [];
+}
+
+function emitAutoConnectTelemetry(eventType, payload = {}) {
+    if (typeof global.emitAutoConnectTelemetryEvent !== 'function') return;
+    try {
+        global.emitAutoConnectTelemetryEvent(eventType, payload);
+    } catch (error) {
+        console.warn('[RelayAdapter] Failed emitting autoconnect telemetry event', {
+            eventType,
+            error: error?.message || error
+        });
+    }
+}
+
+function startAutoConnectTelemetrySession(payload = {}) {
+    if (typeof global.startAutoConnectTelemetrySession !== 'function') return null;
+    try {
+        return global.startAutoConnectTelemetrySession(payload);
+    } catch (error) {
+        console.warn('[RelayAdapter] Failed starting autoconnect telemetry session', {
+            relayKey: payload?.relayKey || null,
+            publicIdentifier: payload?.publicIdentifier || null,
+            error: error?.message || error
+        });
+        return null;
+    }
+}
+
+function markAutoConnectWriterMaterialApplied(session, meta = null) {
+    if (!session || typeof global.markAutoConnectWriterMaterialApplied !== 'function') return;
+    try {
+        global.markAutoConnectWriterMaterialApplied(session, meta);
+    } catch (error) {
+        console.warn('[RelayAdapter] Failed marking autoconnect writer material applied', {
+            relayKey: session?.relayKey || null,
+            error: error?.message || error
+        });
+    }
+}
+
+function markAutoConnectFastForwardApplied(session, meta = null) {
+    if (!session || typeof global.markAutoConnectFastForwardApplied !== 'function') return;
+    try {
+        global.markAutoConnectFastForwardApplied(session, meta);
+    } catch (error) {
+        console.warn('[RelayAdapter] Failed marking autoconnect fast-forward applied', {
+            relayKey: session?.relayKey || null,
+            error: error?.message || error
+        });
+    }
+}
+
+function markAutoConnectWritableEvent(session, writable, meta = null) {
+    if (!session || typeof global.markAutoConnectWritableEvent !== 'function') return;
+    try {
+        global.markAutoConnectWritableEvent(session, writable, meta);
+    } catch (error) {
+        console.warn('[RelayAdapter] Failed marking autoconnect writable event', {
+            relayKey: session?.relayKey || null,
+            writable: writable === true,
+            error: error?.message || error
+        });
+    }
+}
+
+function confirmAutoConnectWritable(session, meta = null) {
+    if (!session || typeof global.confirmAutoConnectWritable !== 'function') return;
+    try {
+        global.confirmAutoConnectWritable(session, meta);
+    } catch (error) {
+        console.warn('[RelayAdapter] Failed confirming autoconnect writable', {
+            relayKey: session?.relayKey || null,
+            error: error?.message || error
+        });
+    }
+}
+
+function emitAutoConnectFailFast(session, reasonCode, meta = null) {
+    if (!session || typeof global.emitAutoConnectFailFast !== 'function') return;
+    try {
+        global.emitAutoConnectFailFast(session, reasonCode, meta);
+    } catch (error) {
+        console.warn('[RelayAdapter] Failed emitting autoconnect fail-fast', {
+            relayKey: session?.relayKey || null,
+            reasonCode: reasonCode || null,
+            error: error?.message || error
+        });
+    }
+}
+
+async function waitForAutoConnectWritable({
+    relayKey,
+    expectedViewLength = null,
+    timeoutMs = 120000,
+    pollMs = 400
+} = {}) {
+    if (!relayKey) {
+        return { ok: false, reason: 'missing-relay-key' };
+    }
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+        const manager = activeRelays.get(relayKey);
+        const relay = manager?.relay || null;
+        if (relay) {
+            const preUpdateWritable = relay.writable === true;
+            const preUpdateViewLength = Number.isFinite(relay?.view?.length) ? Number(relay.view.length) : null;
+            const preUpdateLocalLength = Number.isFinite(relay?.local?.length) ? Number(relay.local.length) : null;
+            const preUpdateExpectedViewLength = Number.isFinite(expectedViewLength)
+                ? Number(expectedViewLength)
+                : (Number.isFinite(preUpdateViewLength) ? preUpdateViewLength : preUpdateLocalLength);
+            const preUpdateViewLengthMatch =
+                Number.isFinite(preUpdateViewLength) && Number.isFinite(preUpdateExpectedViewLength)
+                    ? preUpdateViewLength === preUpdateExpectedViewLength
+                    : null;
+            if (preUpdateWritable) {
+                return {
+                    ok: true,
+                    writable: true,
+                    elapsedMs: Date.now() - startedAt,
+                    viewLength: preUpdateViewLength,
+                    expectedViewLength: preUpdateExpectedViewLength,
+                    localLength: preUpdateLocalLength,
+                    viewLengthMatch: preUpdateViewLengthMatch
+                };
+            }
+
+            if (typeof relay.update === 'function') {
+                try {
+                    await relay.update();
+                } catch (_) {
+                    // ignore update errors during polling; writable can still flip from replication progress.
+                }
+            }
+
+            const writable = relay.writable === true;
+            const viewLength = Number.isFinite(relay?.view?.length) ? Number(relay.view.length) : null;
+            const localLength = Number.isFinite(relay?.local?.length) ? Number(relay.local.length) : null;
+            const resolvedExpectedViewLength = Number.isFinite(expectedViewLength)
+                ? Number(expectedViewLength)
+                : (Number.isFinite(viewLength) ? viewLength : localLength);
+            const viewLengthMatch = Number.isFinite(viewLength) && Number.isFinite(resolvedExpectedViewLength)
+                ? viewLength === resolvedExpectedViewLength
+                : null;
+            if (writable) {
+                return {
+                    ok: true,
+                    writable: true,
+                    elapsedMs: Date.now() - startedAt,
+                    viewLength,
+                    expectedViewLength: resolvedExpectedViewLength,
+                    localLength,
+                    viewLengthMatch
+                };
+            }
+        }
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+
+    const manager = activeRelays.get(relayKey);
+    const relay = manager?.relay || null;
+    const viewLength = Number.isFinite(relay?.view?.length) ? Number(relay.view.length) : null;
+    const localLength = Number.isFinite(relay?.local?.length) ? Number(relay.local.length) : null;
+    const resolvedExpectedViewLength = Number.isFinite(expectedViewLength)
+        ? Number(expectedViewLength)
+        : (Number.isFinite(viewLength) ? viewLength : localLength);
+    const viewLengthMatch = Number.isFinite(viewLength) && Number.isFinite(resolvedExpectedViewLength)
+        ? viewLength === resolvedExpectedViewLength
+        : null;
+    return {
+        ok: false,
+        writable: relay?.writable === true,
+        elapsedMs: Date.now() - startedAt,
+        reason: 'autoconnect-writable-timeout',
+        viewLength,
+        expectedViewLength: resolvedExpectedViewLength,
+        localLength,
+        viewLengthMatch
+    };
+}
+
 let localCorestoreCounter = 0;
 
 function ensureLocalCorestoreId(store) {
@@ -529,7 +762,8 @@ function applyJoinMetadata(profile, {
     expectedWriterKey = null,
     relayManager = null,
     blindPeer = null,
-    coreRefs = null
+    coreRefs = null,
+    gatewayOrigins = null
 } = {}) {
     const updated = { ...profile };
     const localKeyHex = relayManager?.relay?.local?.key
@@ -543,6 +777,9 @@ function applyJoinMetadata(profile, {
     const normalizedRefs = normalizeCoreRefs(coreRefs);
     const existingRefs = normalizeCoreRefs(profile.core_refs || profile.coreRefs);
     const mergedRefs = mergeCoreRefLists(existingRefs, normalizedRefs);
+    const normalizedGatewayOrigins = normalizeGatewayOriginList(gatewayOrigins);
+    const existingGatewayOrigins = resolveProfileGatewayOrigins(profile);
+    const mergedGatewayOrigins = mergeCoreRefLists(existingGatewayOrigins, normalizedGatewayOrigins);
     const blindPeerMeta = sanitizeBlindPeerMeta(blindPeer);
 
     const existingExpectedKey = decodeWriterKey(
@@ -570,13 +807,15 @@ function applyJoinMetadata(profile, {
     if (resolvedCoreKeyHex && shouldUpdateWriterMaterial) updated.autobase_local = resolvedCoreKeyHex;
     if (blindPeerMeta) updated.blind_peer = blindPeerMeta;
     if (mergedRefs.length) updated.core_refs = mergedRefs;
+    if (mergedGatewayOrigins.length) updated.gateway_origins = mergedGatewayOrigins;
 
     if (
         (writerSecret && shouldUpdateWriterMaterial) ||
         (writerCore && shouldUpdateWriterMaterial) ||
         (resolvedCoreKeyHex && shouldUpdateWriterMaterial) ||
         blindPeerMeta ||
-        mergedRefs.length
+        mergedRefs.length ||
+        mergedGatewayOrigins.length
     ) {
         updated.updated_at = new Date().toISOString();
     }
@@ -976,7 +1215,15 @@ async function ensureProfilesInitialized(userKey = null) {
  * @returns {Promise<Object>} - Result object with relay information
  */
 export async function createRelay(options = {}) {
-    const { name, description, isPublic = false, isOpen = false, storageDir, config } = options;
+    const {
+        name,
+        description,
+        isPublic = false,
+        isOpen = false,
+        storageDir,
+        config,
+        gatewayOrigins = []
+    } = options;
     
     // Store config and user key globally if provided
     if (config) {
@@ -1017,6 +1264,8 @@ export async function createRelay(options = {}) {
         
         const publicIdentifier = npub && name ? 
             generatePublicIdentifier(npub, name) : null;
+
+        const normalizedGatewayOrigins = normalizeGatewayOriginList(gatewayOrigins);
         
         // Auth token will be generated and added in pear-relay-server.mjs
         // to ensure a single, consistent token source.
@@ -1041,6 +1290,7 @@ export async function createRelay(options = {}) {
             is_active: true,
             isPublic,
             isOpen,
+            gateway_origins: normalizedGatewayOrigins,
             auth_config: {
                 requiresAuth: true,
                 tokenProtected: true,
@@ -1257,6 +1507,7 @@ export async function joinRelay(options = {}) {
         fastForward = null,
         blindPeer = null,
         coreRefs = null,
+        gatewayOrigins = null,
         suppressInitMessage = false,
         useSharedCorestore = false,
         corestore = null
@@ -1618,7 +1869,8 @@ export async function joinRelay(options = {}) {
                 expectedWriterKey,
                 relayManager,
                 blindPeer,
-                coreRefs
+                coreRefs,
+                gatewayOrigins
             });
             console.log('[RelayAdapter] Stored join metadata for new relay profile', {
                 relayKey,
@@ -1653,7 +1905,8 @@ export async function joinRelay(options = {}) {
                 expectedWriterKey,
                 relayManager,
                 blindPeer,
-                coreRefs
+                coreRefs,
+                gatewayOrigins
             });
             console.log('[RelayAdapter] Stored join metadata for existing relay profile', {
                 relayKey,
@@ -1994,6 +2247,20 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
     const publicIdentifier = profile.public_identifier || null;
     const displayName = profile.name || `Relay ${relayKey.substring(0, 8)}`;
     const isAlreadyActive = activeRelays.has(relayKey);
+    const initialGatewayOrigins = resolveRelayGatewayOriginsForAutoConnect(
+        profile,
+        relayKey,
+        publicIdentifier
+    );
+    let rankedGatewayOrigins = [...initialGatewayOrigins];
+    let selectedGatewayOrigin = rankedGatewayOrigins[0] || null;
+    let expectedLatestViewLength = null;
+    const profileFastForward = profile?.fast_forward || profile?.fastForward || null;
+    const hasStoredWriterMaterial = !!(
+        (profile?.writer_secret || profile?.writerSecret)
+        && (profile?.writer_core || profile?.writerCore || profile?.writer_core_hex || profile?.autobase_local)
+    );
+    let autoConnectSession = null;
 
     emitRelayLoadingEvent({
         relayKey,
@@ -2068,6 +2335,14 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
                 reason: 'auto-connect-disabled'
             };
         }
+
+        autoConnectSession = startAutoConnectTelemetrySession({
+            relayKey,
+            publicIdentifier,
+            gatewayOrigins: rankedGatewayOrigins,
+            hasFastForward: !!profileFastForward,
+            hasWriterMaterial: hasStoredWriterMaterial
+        });
 
         if (profile.auth_config && profile.auth_config.requiresAuth) {
             console.log(`[RelayAdapter] Loading auth configuration for relay ${relayKey}`);
@@ -2220,15 +2495,75 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
             }
         }
 
+        const relayIdentifierForProbe = relayKey || publicIdentifier || null;
+        if (
+            relayIdentifierForProbe
+            && rankedGatewayOrigins.length
+            && typeof global.probeGatewayRelayStatus === 'function'
+        ) {
+            try {
+                const probeSummary = await global.probeGatewayRelayStatus(
+                    relayIdentifierForProbe,
+                    rankedGatewayOrigins
+                );
+                emitAutoConnectTelemetry('AUTOCONNECT_GATEWAY_PROBE_RESULT', {
+                    relayKey,
+                    publicIdentifier,
+                    traceId: autoConnectSession?.traceId || null,
+                    probes: Array.isArray(probeSummary?.probes) ? probeSummary.probes : [],
+                    driftDetected: probeSummary?.driftDetected === true
+                });
+                if (Array.isArray(probeSummary?.rankedOrigins) && probeSummary.rankedOrigins.length) {
+                    rankedGatewayOrigins = normalizeGatewayOriginList(probeSummary.rankedOrigins);
+                }
+                if (autoConnectSession) {
+                    autoConnectSession.gatewayOrigins = rankedGatewayOrigins;
+                }
+                selectedGatewayOrigin = rankedGatewayOrigins[0] || selectedGatewayOrigin || null;
+                const probes = Array.isArray(probeSummary?.probes) ? probeSummary.probes : [];
+                const preferredProbe = probes.find((entry) =>
+                    entry?.result === 'ok' && entry?.origin === selectedGatewayOrigin
+                ) || probes.find((entry) => entry?.result === 'ok');
+                if (Number.isFinite(preferredProbe?.metrics?.latestViewLength)) {
+                    expectedLatestViewLength = Number(preferredProbe.metrics.latestViewLength);
+                }
+                emitAutoConnectTelemetry('AUTOCONNECT_GATEWAY_RANKING', {
+                    relayKey,
+                    publicIdentifier,
+                    traceId: autoConnectSession?.traceId || null,
+                    rankedOrigins: rankedGatewayOrigins,
+                    expectedLatestViewLength
+                });
+            } catch (error) {
+                console.warn('[RelayAdapter] Auto-connect: gateway probe failed', {
+                    relayKey,
+                    publicIdentifier,
+                    error: error?.message || error
+                });
+            }
+        }
+
+        if (storedWriterSecret && (storedWriterCore || storedExpectedWriter)) {
+            markAutoConnectWriterMaterialApplied(autoConnectSession, {
+                source: 'stored-profile'
+            });
+        }
+
         let mirrorFetchStatus = 'skipped';
+        let mirrorFetchOrigin = null;
         if (typeof global.fetchAndApplyRelayMirrorMetadata === 'function') {
             try {
                 const mirrorResult = await global.fetchAndApplyRelayMirrorMetadata({
                     relayKey,
                     publicIdentifier,
-                    reason: 'auto-connect'
+                    reason: 'auto-connect',
+                    origins: rankedGatewayOrigins.length ? rankedGatewayOrigins : null
                 });
                 mirrorFetchStatus = mirrorResult?.status || 'error';
+                mirrorFetchOrigin = normalizeGatewayOrigin(mirrorResult?.origin || null);
+                if (mirrorFetchOrigin) {
+                    selectedGatewayOrigin = mirrorFetchOrigin;
+                }
             } catch (error) {
                 mirrorFetchStatus = 'error';
                 console.warn('[RelayAdapter] Auto-connect: mirror metadata fetch failed', {
@@ -2248,6 +2583,11 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
 
         const storedCoreRefs = normalizeCoreRefs(profile.core_refs || profile.coreRefs);
         const storedFastForward = profile.fast_forward || profile.fastForward || null;
+        if (storedFastForward) {
+            markAutoConnectFastForwardApplied(autoConnectSession, {
+                source: 'profile'
+            });
+        }
         let mergedCoreRefs = storedCoreRefs;
         if (typeof global.resolveRelayMirrorCoreRefs === 'function') {
             mergedCoreRefs = await global.resolveRelayMirrorCoreRefs(
@@ -2349,11 +2689,15 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
             coreRefs: mergedCoreRefs,
             fastForward: storedFastForward,
             useSharedCorestore: !prefersLocalCorestore && !!relayCorestore,
-            corestore: relayCorestore
+            corestore: relayCorestore,
+            gatewayOrigins: rankedGatewayOrigins
         });
 
         if (!joinResult.success) {
             console.error(`[RelayAdapter] Failed to connect to relay ${relayKey}: ${joinResult.error}`);
+            emitAutoConnectFailFast(autoConnectSession, 'autoconnect-join-failed', {
+                error: joinResult.error || null
+            });
             if (global.sendMessage) {
                 global.sendMessage({
                     type: 'relay-initialization-failed',
@@ -2370,8 +2714,73 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
             };
         }
 
-        profile.auto_connected = true;
-        profile.last_connected_at = new Date().toISOString();
+        const writableResult = await waitForAutoConnectWritable({
+            relayKey,
+            expectedViewLength: expectedLatestViewLength,
+            timeoutMs: 120000
+        });
+        markAutoConnectWritableEvent(autoConnectSession, writableResult?.writable === true, {
+            source: 'post-join-wait',
+            viewLength: writableResult?.viewLength ?? null,
+            expectedViewLength: writableResult?.expectedViewLength ?? null,
+            localLength: writableResult?.localLength ?? null,
+            viewLengthMatch: writableResult?.viewLengthMatch ?? null
+        });
+        if (!writableResult?.ok || writableResult?.writable !== true) {
+            emitAutoConnectFailFast(autoConnectSession, writableResult?.reason || 'autoconnect-writable-timeout', {
+                elapsedMs: writableResult?.elapsedMs ?? null,
+                viewLength: writableResult?.viewLength ?? null,
+                expectedViewLength: writableResult?.expectedViewLength ?? null,
+                localLength: writableResult?.localLength ?? null
+            });
+            throw new Error(writableResult?.reason || 'autoconnect-writable-timeout');
+        }
+        if (writableResult?.viewLengthMatch === false) {
+            emitAutoConnectFailFast(autoConnectSession, 'autoconnect-view-length-mismatch', {
+                viewLength: writableResult?.viewLength ?? null,
+                expectedViewLength: writableResult?.expectedViewLength ?? null,
+                localLength: writableResult?.localLength ?? null
+            });
+            throw new Error('autoconnect-view-length-mismatch');
+        }
+        confirmAutoConnectWritable(autoConnectSession, {
+            source: 'post-join-wait',
+            viewLength: writableResult?.viewLength ?? null,
+            expectedViewLength: writableResult?.expectedViewLength ?? null,
+            localLength: writableResult?.localLength ?? null,
+            viewLengthMatch: writableResult?.viewLengthMatch ?? null
+        });
+
+        if (typeof global.runAutoConnectMirrorFanout === 'function') {
+            try {
+                await global.runAutoConnectMirrorFanout(autoConnectSession, {
+                    relayKey,
+                    publicIdentifier,
+                    gatewayOrigins: rankedGatewayOrigins
+                });
+            } catch (error) {
+                console.warn('[RelayAdapter] Auto-connect mirror fanout failed', {
+                    relayKey,
+                    publicIdentifier,
+                    error: error?.message || error
+                });
+            }
+        }
+
+        const mergedGatewayOrigins = mergeCoreRefLists(
+            resolveProfileGatewayOrigins(profile),
+            rankedGatewayOrigins
+        );
+        profile = {
+            ...profile,
+            auto_connected: true,
+            last_connected_at: new Date().toISOString(),
+            last_success_gateway_origin: normalizeGatewayOrigin(selectedGatewayOrigin),
+            last_autoconnect_success_at: Date.now(),
+            gateway_origins: mergedGatewayOrigins.length
+                ? mergedGatewayOrigins
+                : resolveProfileGatewayOrigins(profile)
+        };
         await saveRelayProfile(profile);
 
         let userAuthToken = null;
@@ -2407,6 +2816,9 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
         return { success: true, relayKey };
     } catch (error) {
         console.error(`[RelayAdapter] Error auto-connecting to ${relayKey}:`, error);
+        emitAutoConnectFailFast(autoConnectSession, 'autoconnect-error', {
+            error: error?.message || error
+        });
         if (global.sendMessage) {
             global.sendMessage({
                 type: 'relay-initialization-failed',
@@ -2597,6 +3009,8 @@ export async function getActiveRelays() {
             ? Number(manager.relay.local.length)
             : null;
         const expectedViewLength = Number.isFinite(viewLength) ? viewLength : localLength;
+        const gatewayOrigins = resolveProfileGatewayOrigins(profile);
+        const lastSuccessGatewayOrigin = normalizeGatewayOrigin(profile?.last_success_gateway_origin || null);
 
         activeRelayList.push({
             relayKey: key,
@@ -2614,7 +3028,9 @@ export async function getActiveRelays() {
             isJoined: !!profile?.joined_at && !profile?.created_at,
             viewLength,
             localLength,
-            expectedViewLength
+            expectedViewLength,
+            gatewayOrigins,
+            lastSuccessGatewayOrigin
         });
     }
 
@@ -2628,6 +3044,8 @@ export async function getActiveRelays() {
         const identifierPath = profile?.public_identifier
             ? profile.public_identifier.replace(':', '/')
             : relayKey;
+        const gatewayOrigins = resolveProfileGatewayOrigins(profile);
+        const lastSuccessGatewayOrigin = normalizeGatewayOrigin(profile?.last_success_gateway_origin || null);
 
         activeRelayList.push({
             relayKey,
@@ -2645,7 +3063,9 @@ export async function getActiveRelays() {
             isJoined: !!profile?.joined_at && !profile?.created_at,
             viewLength: null,
             localLength: null,
-            expectedViewLength: null
+            expectedViewLength: null,
+            gatewayOrigins,
+            lastSuccessGatewayOrigin
         });
     }
     

@@ -100,6 +100,8 @@ const accountScopedUiStateSchema = z.object({
   dismissedGroupInviteIds: z.array(z.string()).default([]),
   acceptedGroupInviteIds: z.array(z.string()).default([]),
   acceptedGroupInviteGroupIds: z.array(z.string()).default([]),
+  dismissedGatewayInviteIds: z.array(z.string()).default([]),
+  acceptedGatewayInviteIds: z.array(z.string()).default([]),
   dismissedChatInviteIds: z.array(z.string()).default([]),
   acceptedChatInviteIds: z.array(z.string()).default([]),
   acceptedChatInviteConversationIds: z.array(z.string()).default([]),

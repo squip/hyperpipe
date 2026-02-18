@@ -13,8 +13,9 @@ import { useFetchProfile } from '@/hooks'
 import { useGroups } from '@/providers/GroupsProvider'
 import { useNostr } from '@/providers/NostrProvider'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
-import { TGroupInvite } from '@/types/groups'
+import { TGatewayInvite, TGroupInvite } from '@/types/groups'
 import { TPageRef } from '@/types'
+import { invalidateGatewayBearerToken, requestGatewayBearerToken } from '@/lib/gateway-auth'
 import dayjs from 'dayjs'
 import { ArrowDown, ArrowUp, ArrowUpDown, Link2, Loader2, Users, X } from 'lucide-react'
 import { type PointerEvent as ReactPointerEvent, forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
@@ -194,6 +195,8 @@ const GroupsPage = forwardRef<
   const {
     discoveryGroups,
     invites,
+    gatewayInvites,
+    gatewayJoinRequests,
     pendingInviteCount,
     myGroupList,
     getProvisionalGroupMetadata,
@@ -211,13 +214,14 @@ const GroupsPage = forwardRef<
     groupMemberPreviewVersion
   } = useGroups()
   const { startJoinFlow, sendToWorker, getRelayPeerCount } = useWorkerBridge()
-  const { pubkey } = useNostr()
+  const { pubkey, signEvent } = useNostr()
   const { current: currentPrimaryPage, display: primaryDisplay } = usePrimaryPage()
   const isGroupsPageActive = currentPrimaryPage === 'groups' && primaryDisplay
   const [tab, setTab] = useState<TTab>(initialTab || 'discover')
   const [search, setSearch] = useState('')
   const [showCreate, setShowCreate] = useState(false)
   const [joiningInviteId, setJoiningInviteId] = useState<string | null>(null)
+  const [redeemingGatewayInviteId, setRedeemingGatewayInviteId] = useState<string | null>(null)
   const [discoverSort, setDiscoverSort] = useState<GroupSortState>({ key: 'members', direction: 'desc' })
   const [mySort, setMySort] = useState<GroupSortState>({ key: 'createdAt', direction: 'desc' })
   const [inviteSort, setInviteSort] = useState<InviteSortState>({ key: 'inviteDate', direction: 'desc' })
@@ -731,6 +735,7 @@ const GroupsPage = forwardRef<
         writerCoreHex: inv.writerCoreHex,
         autobaseLocal: inv.autobaseLocal,
         writerSecret: inv.writerSecret,
+        gatewayOrigins: Array.isArray(inv.gatewayOrigins) ? inv.gatewayOrigins : undefined,
         fastForward: inv.fastForward || undefined
       })
 
@@ -747,6 +752,67 @@ const GroupsPage = forwardRef<
   const handleDismissInvite = (inv: TGroupInvite) => {
     if (!inv?.event?.id) return
     dismissInvite(inv.event.id)
+  }
+
+  const handleRedeemGatewayInvite = async (invite: TGatewayInvite) => {
+    const inviteId = String(invite?.event?.id || '').trim()
+    if (!inviteId || !pubkey) return
+    if (redeemingGatewayInviteId) return
+    setRedeemingGatewayInviteId(inviteId)
+    try {
+      const authContext = {
+        origin: invite.origin,
+        pubkey,
+        scope: 'gateway:invite-redeem'
+      }
+      const redeemInvite = async (token: string) => fetch(`${invite.origin}/api/gateway/invites/redeem`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          inviteToken: invite.inviteToken
+        })
+      })
+
+      const bearerToken = await requestGatewayBearerToken({
+        ...authContext,
+        signEvent
+      })
+      let response = await redeemInvite(bearerToken)
+
+      if (response.status === 401 || response.status === 403) {
+        invalidateGatewayBearerToken(authContext)
+        const refreshedToken = await requestGatewayBearerToken({
+          ...authContext,
+          signEvent,
+          forceRefresh: true
+        })
+        response = await redeemInvite(refreshedToken)
+      }
+
+      if (!response.ok) {
+        throw new Error(`Redeem failed (${response.status})`)
+      }
+      markInviteAccepted(inviteId)
+      toast.success(t('Gateway invite accepted'))
+      refreshDiscovery().catch(() => {})
+    } catch (error) {
+      toast.error(
+        `${t('Failed to accept gateway invite')}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    } finally {
+      setRedeemingGatewayInviteId(null)
+    }
+  }
+
+  const handleDismissGatewayInvite = (invite: TGatewayInvite) => {
+    const inviteId = String(invite?.event?.id || '').trim()
+    if (!inviteId) return
+    dismissInvite(inviteId)
   }
 
   const toggleGroupSort = (key: GroupSortKey, current: GroupSortState, setter: (next: GroupSortState) => void) => {
@@ -1012,7 +1078,8 @@ const GroupsPage = forwardRef<
   }
 
   const renderInvites = () => {
-    if (!sortedInviteRows.length) {
+    const hasGatewayEvents = gatewayInvites.length > 0 || gatewayJoinRequests.length > 0
+    if (!sortedInviteRows.length && !hasGatewayEvents) {
       return (
         <div className="space-y-3">
           <div className="flex items-center justify-between">
@@ -1037,6 +1104,75 @@ const GroupsPage = forwardRef<
           </Button>
         </div>
         {invitesError ? <div className="text-sm text-red-500">{invitesError}</div> : null}
+
+        {gatewayInvites.length > 0 ? (
+          <div className="rounded-lg border">
+            <div className="border-b px-3 py-2 text-xs font-medium text-muted-foreground">
+              {t('Gateway invites')}
+            </div>
+            <div className="divide-y">
+              {gatewayInvites.map((invite) => (
+                <div
+                  key={invite.event.id}
+                  className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-xs"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-medium">{invite.origin}</div>
+                    <div className="truncate text-muted-foreground">
+                      {t('Operator')}: {invite.operatorPubkey || '-'} •{' '}
+                      <FormattedTimestamp timestamp={invite.event.created_at} />
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleDismissGatewayInvite(invite)}
+                    >
+                      <X className="w-4 h-4 mr-1" />
+                      {t('Dismiss')}
+                    </Button>
+                    <Button
+                      size="sm"
+                      disabled={redeemingGatewayInviteId === invite.event.id}
+                      onClick={() => void handleRedeemGatewayInvite(invite)}
+                    >
+                      {redeemingGatewayInviteId === invite.event.id
+                        ? t('Accepting…')
+                        : t('Accept gateway')}
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        {gatewayJoinRequests.length > 0 ? (
+          <div className="rounded-lg border">
+            <div className="border-b px-3 py-2 text-xs font-medium text-muted-foreground">
+              {t('Gateway join requests')}
+            </div>
+            <div className="divide-y">
+              {gatewayJoinRequests.map((request) => (
+                <div
+                  key={request.event.id}
+                  className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-xs"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-medium">{request.origin}</div>
+                    <div className="truncate text-muted-foreground">
+                      {request.content || t('No message')}
+                    </div>
+                  </div>
+                  <div className="text-muted-foreground">
+                    <FormattedTimestamp timestamp={request.event.created_at} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
 
         <div
           className="overflow-x-auto scrollbar-hide rounded-lg border cursor-grab active:cursor-grabbing"

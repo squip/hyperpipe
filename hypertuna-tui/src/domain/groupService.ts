@@ -1,5 +1,8 @@
 import type { Event, EventTemplate } from 'nostr-tools'
 import type {
+  GatewayInviteEvent,
+  GatewayJoinRequestEvent,
+  GatewayMetadataEvent,
   GroupJoinRequest,
   GroupInvite,
   GroupListEntry,
@@ -7,7 +10,12 @@ import type {
   GroupSummary
 } from './types.js'
 import { NostrClient } from './nostrClient.js'
-import { parseGroupListEvent } from '../lib/groups.js'
+import {
+  parseGatewayInviteEvent,
+  parseGatewayJoinRequestEvent,
+  parseGatewayMetadataEvent,
+  parseGroupListEvent
+} from '../lib/groups.js'
 import { eventNow, signDraftEvent } from '../lib/nostr.js'
 import type { WorkerHost } from '../runtime/workerHost.js'
 import {
@@ -55,6 +63,28 @@ export class GroupService implements IGroupService {
       metadataEvents,
       relayEvents
     })
+  }
+
+  async discoverGatewayMetadata(relays: string[], limit = 300): Promise<GatewayMetadataEvent[]> {
+    const events = await this.client.query(
+      relays,
+      {
+        kinds: [30078],
+        '#h': ['hypertuna_gateway:metadata'],
+        limit
+      },
+      5_000
+    )
+    const latestByOrigin = new Map<string, GatewayMetadataEvent>()
+    for (const event of events) {
+      const parsed = parseGatewayMetadataEvent(event)
+      if (!parsed) continue
+      const existing = latestByOrigin.get(parsed.origin)
+      if (!existing || parsed.createdAt >= existing.createdAt) {
+        latestByOrigin.set(parsed.origin, parsed)
+      }
+    }
+    return Array.from(latestByOrigin.values()).sort((left, right) => right.createdAt - left.createdAt)
   }
 
   async discoverInvites(
@@ -111,6 +141,42 @@ export class GroupService implements IGroupService {
 
     invites.sort((left, right) => right.event.created_at - left.event.created_at)
     return invites
+  }
+
+  async discoverGatewayInvites(relays: string[], pubkey: string): Promise<GatewayInviteEvent[]> {
+    const events = await this.client.query(
+      relays,
+      {
+        kinds: [30078],
+        '#h': ['hypertuna_gateway:invite'],
+        '#p': [pubkey],
+        limit: 200
+      },
+      5_000
+    )
+    const invites = events
+      .map((event) => parseGatewayInviteEvent(event))
+      .filter((event): event is GatewayInviteEvent => !!event)
+    invites.sort((left, right) => right.createdAt - left.createdAt)
+    return invites
+  }
+
+  async discoverGatewayJoinRequests(relays: string[], pubkey: string): Promise<GatewayJoinRequestEvent[]> {
+    const events = await this.client.query(
+      relays,
+      {
+        kinds: [30078],
+        '#h': ['hypertuna_gateway:join_request'],
+        '#p': [pubkey],
+        limit: 200
+      },
+      5_000
+    )
+    const requests = events
+      .map((event) => parseGatewayJoinRequestEvent(event))
+      .filter((event): event is GatewayJoinRequestEvent => !!event)
+    requests.sort((left, right) => right.createdAt - left.createdAt)
+    return requests
   }
 
   async loadMyGroupList(relays: string[], pubkey: string): Promise<GroupListEntry[]> {

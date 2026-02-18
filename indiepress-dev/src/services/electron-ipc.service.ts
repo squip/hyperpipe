@@ -30,6 +30,8 @@ export type RelayEntry = {
   registrationError?: string
   isActive?: boolean
   gatewayPath?: string
+  gatewayOrigins?: string[]
+  lastSuccessGatewayOrigin?: string | null
 }
 
 export type GatewayLogEntry = {

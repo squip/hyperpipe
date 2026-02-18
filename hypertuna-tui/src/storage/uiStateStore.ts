@@ -46,6 +46,8 @@ const defaultAccountScopedUiState = (): AccountScopedUiState => ({
   dismissedGroupInviteIds: [],
   acceptedGroupInviteIds: [],
   acceptedGroupInviteGroupIds: [],
+  dismissedGatewayInviteIds: [],
+  acceptedGatewayInviteIds: [],
   dismissedChatInviteIds: [],
   acceptedChatInviteIds: [],
   acceptedChatInviteConversationIds: [],

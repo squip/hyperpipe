@@ -1132,7 +1132,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             about: data.about ?? prev.metadata.about,
             picture: data.picture ?? prev.metadata.picture,
             isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : prev.metadata.isOpen,
-            isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : prev.metadata.isPublic
+            isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : prev.metadata.isPublic,
+            gateways: Array.isArray(data.gateways) ? data.gateways : prev.metadata.gateways
           }
         }
       })
@@ -2304,7 +2305,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
               about: detail?.metadata?.about,
               picture: detail?.metadata?.picture,
               isOpen: detail?.metadata?.isOpen,
-              isPublic: detail?.metadata?.isPublic
+              isPublic: detail?.metadata?.isPublic,
+              gateways: detail?.metadata?.gateways || []
             }}
             isOpen={isMetadataDialogOpen}
             onSave={handleSaveMetadata}

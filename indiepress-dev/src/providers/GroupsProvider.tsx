@@ -3,6 +3,9 @@ import {
   buildPrivateGroupLeaveShadowRef,
   deriveMembershipStatus,
   parseGroupAdminsEvent,
+  parseGatewayInviteEvent,
+  parseGatewayJoinRequestEvent,
+  parseGatewayMetadataEvent,
   parseGroupIdentifier,
   parseGroupInviteEvent,
   parseGroupJoinRequestEvent,
@@ -27,6 +30,9 @@ import { TDraftEvent } from '@/types'
 import {
   TGroupAdmin,
   TGatewayDescriptor,
+  TGatewayInvite,
+  TGatewayJoinRequest,
+  TGatewayMetadata,
   TGroupInvite,
   TGroupListEntry,
   TGroupMembershipStatus,
@@ -119,6 +125,9 @@ export type LeaveGroupResult = {
 type TGroupsContext = {
   discoveryGroups: TGroupMetadata[]
   invites: TGroupInvite[]
+  gatewayMetadata: TGatewayMetadata[]
+  gatewayInvites: TGatewayInvite[]
+  gatewayJoinRequests: TGatewayJoinRequest[]
   pendingInviteCount: number
   joinRequests: Record<string, TJoinRequest[]>
   favoriteGroups: string[]
@@ -210,6 +219,7 @@ type TGroupsContext = {
       picture: string
       isPublic: boolean
       isOpen: boolean
+      gateways: TGatewayDescriptor[]
     }>,
     relay?: string
   ) => Promise<void>
@@ -258,6 +268,9 @@ export const useGroups = () => {
     return {
       discoveryGroups: [],
       invites: [],
+      gatewayMetadata: [],
+      gatewayInvites: [],
+      gatewayJoinRequests: [],
       pendingInviteCount: 0,
       joinRequests: {},
       favoriteGroups: [],
@@ -352,12 +365,15 @@ const createProvisionalGroupMetadata = (args: {
   const name = typeof args.name === 'string' ? args.name.trim() : ''
   const about = typeof args.about === 'string' ? args.about.trim() : ''
   const picture = typeof args.picture === 'string' ? args.picture.trim() : ''
+  const hasGatewayInput = Array.isArray(args.gateways)
+  const normalizedGateways = hasGatewayInput ? normalizeGatewayTags(buildGatewayTags(args.gateways)) : []
   const hasAnyMetadata =
     !!name ||
     !!about ||
     !!picture ||
     typeof args.isPublic === 'boolean' ||
-    typeof args.isOpen === 'boolean'
+    typeof args.isOpen === 'boolean' ||
+    hasGatewayInput
   if (!hasAnyMetadata) return null
   const createdAt =
     Number.isFinite(args.createdAt) && (args.createdAt as number) > 0
@@ -373,7 +389,7 @@ const createProvisionalGroupMetadata = (args: {
   if (picture) tags.push(['picture', picture])
   if (typeof args.isPublic === 'boolean') tags.push([args.isPublic ? 'public' : 'private'])
   if (typeof args.isOpen === 'boolean') tags.push([args.isOpen ? 'open' : 'closed'])
-  tags.push(...buildGatewayTags(args.gateways || []))
+  tags.push(...buildGatewayTags(normalizedGateways))
   const event = {
     id: `provisional:${groupId}:${createdAt}`,
     pubkey: '',
@@ -392,7 +408,7 @@ const createProvisionalGroupMetadata = (args: {
     isPublic: typeof args.isPublic === 'boolean' ? args.isPublic : undefined,
     isOpen: typeof args.isOpen === 'boolean' ? args.isOpen : undefined,
     tags: [],
-    gateways: normalizeGatewayTags(tags),
+    gateways: normalizedGateways,
     event
   }
 }
@@ -424,6 +440,21 @@ const normalizePubkeyList = (values?: string[] | null) =>
     )
   )
 
+const normalizeGatewayOriginsFromDescriptors = (
+  gateways?: Array<{ origin?: string | null } | string> | null
+) =>
+  Array.from(
+    new Set(
+      (Array.isArray(gateways) ? gateways : [])
+        .map((entry) => {
+          if (typeof entry === 'string') return entry
+          return entry?.origin || null
+        })
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    )
+  )
+
 const areSameMemberLists = (left: string[], right: string[]) =>
   left.length === right.length && left.every((value, idx) => value === right[idx])
 
@@ -444,6 +475,7 @@ const buildInvitePayload = (args: {
   token: string
   relayUrl: string | null
   relayKey?: string | null
+  gatewayOrigins?: string[]
   meta?: TGroupMetadata | null
   groupName?: string
   groupPicture?: string
@@ -465,6 +497,7 @@ const buildInvitePayload = (args: {
   relayUrl: args.relayUrl,
   token: args.token,
   relayKey: args.relayKey ?? null,
+  gatewayOrigins: normalizeGatewayOriginsFromDescriptors(args.gatewayOrigins || args.meta?.gateways),
   isPublic: args.meta?.isPublic !== false,
   groupName: args.groupName || args.meta?.name,
   groupPicture: args.groupPicture || args.meta?.picture || null,
@@ -484,12 +517,14 @@ const buildInvitePayload = (args: {
 const buildOpenInvitePayload = (args: {
   relayUrl: string | null
   relayKey?: string | null
+  gatewayOrigins?: string[]
   groupName?: string
   groupPicture?: string
   authorizedMemberPubkeys?: string[]
 }) => ({
   relayUrl: args.relayUrl,
   relayKey: args.relayKey ?? null,
+  gatewayOrigins: normalizeGatewayOriginsFromDescriptors(args.gatewayOrigins),
   groupName: args.groupName || null,
   groupPicture: args.groupPicture || null,
   authorizedMemberPubkeys: normalizePubkeyList(args.authorizedMemberPubkeys)
@@ -553,6 +588,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const { relays: workerRelays, joinFlows, createRelay, sendToWorker } = useWorkerBridge()
   const [discoveryGroups, setDiscoveryGroups] = useState<TGroupMetadata[]>([])
   const [invites, setInvites] = useState<TGroupInvite[]>([])
+  const [gatewayMetadata, setGatewayMetadata] = useState<TGatewayMetadata[]>([])
+  const [gatewayInvites, setGatewayInvites] = useState<TGatewayInvite[]>([])
+  const [gatewayJoinRequests, setGatewayJoinRequests] = useState<TGatewayJoinRequest[]>([])
   const [joinRequests, setJoinRequests] = useState<Record<string, TJoinRequest[]>>({})
   const [favoriteGroups, setFavoriteGroups] = useState<string[]>([])
   const [myGroupList, setMyGroupList] = useState<TGroupListEntry[]>([])
@@ -681,6 +719,54 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     },
     [workerRelayUrlMap]
   )
+
+  useEffect(() => {
+    if (!isElectron() || !sendToWorker) return
+    const groupGatewaySync = new Map<
+      string,
+      {
+        groupId: string
+        gatewayOrigins: string[]
+        sourceEventId?: string
+        updatedAt?: number
+      }
+    >()
+
+    const upsertGroup = (group: { id?: string; gateways?: TGatewayDescriptor[]; event?: any } | null) => {
+      if (!group?.id) return
+      const groupId = String(group.id || '').trim()
+      if (!groupId) return
+      const gatewayOrigins = normalizeGatewayOriginsFromDescriptors(group.gateways)
+      if (!gatewayOrigins.length) return
+      const sourceEventId =
+        typeof group.event?.id === 'string' && group.event.id.trim() ? group.event.id.trim() : undefined
+      const updatedAt =
+        Number.isFinite(group.event?.created_at) && group.event.created_at > 0
+          ? Math.trunc(group.event.created_at * 1000)
+          : Date.now()
+      const existing = groupGatewaySync.get(groupId)
+      if (!existing || (existing.updatedAt || 0) <= updatedAt) {
+        groupGatewaySync.set(groupId, {
+          groupId,
+          gatewayOrigins,
+          sourceEventId,
+          updatedAt
+        })
+      }
+    }
+
+    discoveryGroups.forEach((group) => upsertGroup(group))
+    Object.values(provisionalGroupMetadataByKey).forEach((entry) => upsertGroup(entry?.metadata || null))
+
+    const entries = Array.from(groupGatewaySync.values())
+    if (!entries.length) return
+    sendToWorker({
+      type: 'sync-group-gateway-origins',
+      data: entries
+    }).catch((error) => {
+      console.warn('[GroupsProvider] Failed to sync group gateway origins to worker', error)
+    })
+  }, [discoveryGroups, provisionalGroupMetadataByKey, sendToWorker])
 
   const upsertProvisionalGroupMetadata = useCallback(
     (args: {
@@ -973,6 +1059,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     // Clear per-account volatile state on account switch
     setJoinRequests({})
+    setGatewayInvites([])
+    setGatewayJoinRequests([])
     setHandledJoinRequests({})
   }, [pubkey])
 
@@ -993,7 +1081,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     setIsLoadingDiscovery(true)
     setDiscoveryError(null)
     try {
-      const [metadataEvents, relayEvents] = await Promise.all([
+      const [metadataEvents, relayEvents, gatewayMetadataEvents] = await Promise.all([
         client.fetchEvents(discoveryRelays, {
           kinds: [ExtendedKind.GROUP_METADATA],
           '#i': [HYPERTUNA_IDENTIFIER_TAG],
@@ -1004,6 +1092,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           kinds: [KIND_HYPERTUNA_RELAY],
           '#i': [HYPERTUNA_IDENTIFIER_TAG],
           limit: 300
+        }),
+        client.fetchEvents(discoveryRelays, {
+          kinds: [30078],
+          '#h': ['hypertuna_gateway:metadata'],
+          limit: 400
         })
       ])
 
@@ -1034,6 +1127,24 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         return true
       })
       setDiscoveryGroups(deduped)
+
+      const gatewayByOrigin = new Map<string, TGatewayMetadata>()
+      gatewayMetadataEvents
+        .map((evt) => parseGatewayMetadataEvent(evt))
+        .filter((entry): entry is TGatewayMetadata => !!entry)
+        .forEach((entry) => {
+          const current = gatewayByOrigin.get(entry.origin)
+          const currentTs = current?.event?.created_at || 0
+          const nextTs = entry?.event?.created_at || 0
+          if (!current || nextTs >= currentTs) {
+            gatewayByOrigin.set(entry.origin, entry)
+          }
+        })
+      setGatewayMetadata(
+        Array.from(gatewayByOrigin.values()).sort(
+          (left, right) => (right.event?.created_at || 0) - (left.event?.created_at || 0)
+        )
+      )
     } catch (error) {
       console.warn('Failed to refresh discovery groups', error)
       setDiscoveryError((error as Error).message)
@@ -1052,6 +1163,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       return next
     })
     setInvites((prev) => prev.filter((invite) => invite.event?.id !== normalizedInviteId))
+    setGatewayInvites((prev) => prev.filter((invite) => invite.event?.id !== normalizedInviteId))
   }, [])
 
   const markInviteAccepted = useCallback(
@@ -1099,6 +1211,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           return true
         })
       })
+      if (normalizedInviteId) {
+        setGatewayInvites((prev) => prev.filter((invite) => invite.event?.id !== normalizedInviteId))
+      }
     },
     [upsertProvisionalGroupMetadata]
   )
@@ -1112,19 +1227,36 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [invites]
   )
 
-  const pendingInviteCount = invites.length
+  const pendingInviteCount = invites.length + gatewayInvites.length
 
   const refreshInvites = useCallback(async () => {
     if (!pubkey) {
       setInvites([])
+      setGatewayInvites([])
+      setGatewayJoinRequests([])
       return
     }
+    setInvitesError(null)
     try {
-      const events = await client.fetchEvents(discoveryRelays, {
-        kinds: [9009],
-        '#p': [pubkey],
-        limit: 200
-      })
+      const [events, gatewayInviteEvents, gatewayJoinRequestEvents] = await Promise.all([
+        client.fetchEvents(discoveryRelays, {
+          kinds: [9009],
+          '#p': [pubkey],
+          limit: 200
+        }),
+        client.fetchEvents(discoveryRelays, {
+          kinds: [30078],
+          '#h': ['hypertuna_gateway:invite'],
+          '#p': [pubkey],
+          limit: 200
+        }),
+        client.fetchEvents(discoveryRelays, {
+          kinds: [30078],
+          '#h': ['hypertuna_gateway:join_request'],
+          '#p': [pubkey],
+          limit: 200
+        })
+      ])
       const parsed = await Promise.all(
         events.map(async (evt) => {
           const invite = parseGroupInviteEvent(evt)
@@ -1145,6 +1277,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let writerCoreHex: string | null | undefined
             let autobaseLocal: string | null | undefined
             let writerSecret: string | null | undefined
+            let gatewayOrigins: string[] | undefined
             let fastForward:
               | {
                   key?: string | null
@@ -1201,6 +1334,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 }
                 if (typeof payload.writerSecret === 'string') {
                   writerSecret = payload.writerSecret
+                }
+                if (Array.isArray((payload as any).gatewayOrigins)) {
+                  gatewayOrigins = normalizeGatewayOriginsFromDescriptors(
+                    (payload as any).gatewayOrigins
+                  )
                 }
                 const fastForwardPayload =
                   payload.fastForward && typeof payload.fastForward === 'object'
@@ -1272,6 +1410,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               writerCoreHex,
               autobaseLocal,
               writerSecret,
+              gatewayOrigins,
               fastForward
             }
           } catch (_err) {
@@ -1316,6 +1455,37 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         return true
       })
       setInvites(filtered)
+
+      const parsedGatewayInvites = gatewayInviteEvents
+        .map((event) => parseGatewayInviteEvent(event))
+        .filter((event): event is TGatewayInvite => !!event)
+      const gatewayById = new Map<string, TGatewayInvite>()
+      parsedGatewayInvites.forEach((invite) => {
+        const id = String(invite.event?.id || '').trim()
+        if (!id) return
+        const existing = gatewayById.get(id)
+        const existingTs = existing?.event?.created_at || 0
+        const nextTs = invite?.event?.created_at || 0
+        if (!existing || nextTs >= existingTs) {
+          gatewayById.set(id, invite)
+        }
+      })
+      const filteredGatewayInvites = Array.from(gatewayById.values())
+        .filter((invite) => {
+          const inviteId = String(invite.event?.id || '').trim()
+          if (!inviteId) return false
+          if (dismissedInviteIdsRef.current.has(inviteId)) return false
+          if (acceptedInviteIdsRef.current.has(inviteId)) return false
+          return true
+        })
+        .sort((left, right) => (right.event?.created_at || 0) - (left.event?.created_at || 0))
+      setGatewayInvites(filteredGatewayInvites)
+
+      const parsedGatewayJoinRequests = gatewayJoinRequestEvents
+        .map((event) => parseGatewayJoinRequestEvent(event))
+        .filter((event): event is TGatewayJoinRequest => !!event)
+        .sort((left, right) => (right.event?.created_at || 0) - (left.event?.created_at || 0))
+      setGatewayJoinRequests(parsedGatewayJoinRequests)
     } catch (error) {
       console.warn('Failed to refresh group invites', error)
       setInvitesError((error as Error).message)
@@ -3328,7 +3498,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         isPublic,
         isOpen,
         fileSharing,
-        picture
+        picture,
+        gateways
       })
       if (!result?.success) throw new Error(result?.error || 'Failed to create relay')
 
@@ -3629,17 +3800,19 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           const inviteMirrorMetadata = buildInviteMirrorMetadata(writerInfo)
           const token = isOpenGroup ? null : randomString(24)
           const payload = isOpenGroup
-            ? buildOpenInvitePayload({
-                relayUrl: inviteRelayUrl,
-                relayKey: inviteRelayKey,
-                groupName: inviteName,
-                groupPicture: invitePicture,
-                authorizedMemberPubkeys: baseAuthorizedMemberPubkeys
-              })
-            : buildInvitePayload({
+              ? buildOpenInvitePayload({
+                  relayUrl: inviteRelayUrl,
+                  relayKey: inviteRelayKey,
+                  gatewayOrigins: normalizeGatewayOriginsFromDescriptors(meta?.gateways),
+                  groupName: inviteName,
+                  groupPicture: invitePicture,
+                  authorizedMemberPubkeys: baseAuthorizedMemberPubkeys
+                })
+              : buildInvitePayload({
                 token: token as string,
                 relayUrl: inviteRelayUrl,
                 relayKey: inviteRelayKey,
+                gatewayOrigins: normalizeGatewayOriginsFromDescriptors(meta?.gateways),
                 meta,
                 groupName: inviteName,
                 groupPicture: invitePicture,
@@ -3872,6 +4045,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         picture: string
         isPublic: boolean
         isOpen: boolean
+        gateways: TGatewayDescriptor[]
       }>,
       relay?: string
     ) => {
@@ -3891,11 +4065,26 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const existingMetadataTags = Array.isArray(cachedMetadata?.event?.tags)
         ? (cachedMetadata?.event?.tags as string[][]).filter((tag) => Array.isArray(tag) && tag[0])
         : []
+      const existingGatewayTags = normalizeGatewayTags(existingMetadataTags)
       const preservedMetadataTags = existingMetadataTags.filter((tag) => {
         const key = tag[0]
-        return !['h', 'd', 'name', 'about', 'picture', 'public', 'private', 'open', 'closed'].includes(key)
+        return ![
+          'h',
+          'd',
+          'name',
+          'about',
+          'picture',
+          'public',
+          'private',
+          'open',
+          'closed',
+          'gateway'
+        ].includes(key)
       })
-      const preservedGatewayTags = normalizeGatewayTags(preservedMetadataTags)
+      const shouldUpdateGateways = Array.isArray(data.gateways)
+      const nextGatewayTags = shouldUpdateGateways
+        ? normalizeGatewayTags(buildGatewayTags(data.gateways))
+        : existingGatewayTags
 
       const commandTags: string[][] = [['h', groupId]]
       const name = baseTagValue(data.name)
@@ -3908,6 +4097,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       if (typeof data.isPublic === 'boolean')
         commandTags.push([data.isPublic ? 'public' : 'private'])
       if (typeof data.isOpen === 'boolean') commandTags.push([data.isOpen ? 'open' : 'closed'])
+      if (shouldUpdateGateways) commandTags.push(...buildGatewayTags(nextGatewayTags))
 
       if (commandTags.length > 1) {
         const draftEvent: TDraftEvent = {
@@ -3938,8 +4128,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         metadataTags.push(['i', HYPERTUNA_IDENTIFIER_TAG])
       }
 
-      if (metadataTags.length > 2) {
+      const shouldPublishMetadataSnapshot = metadataTags.length > 2 || shouldUpdateGateways
+      if (shouldPublishMetadataSnapshot) {
         metadataTags.push(...preservedMetadataTags)
+        metadataTags.push(...buildGatewayTags(nextGatewayTags))
         const metadataEvent: TDraftEvent = {
           kind: ExtendedKind.GROUP_METADATA,
           created_at: Math.floor(Date.now() / 1000),
@@ -3962,7 +4154,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           picture,
           isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : cachedMetadata?.isPublic,
           isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : cachedMetadata?.isOpen,
-          gateways: preservedGatewayTags,
+          gateways: nextGatewayTags,
           source: 'update'
         })
 
@@ -3982,7 +4174,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               picture: picture ?? g.picture,
               isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : g.isPublic,
               isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : g.isOpen,
-              gateways: preservedGatewayTags.length ? preservedGatewayTags : g.gateways
+              gateways: shouldUpdateGateways
+                ? nextGatewayTags
+                : (nextGatewayTags.length ? nextGatewayTags : g.gateways)
             }
           })
         )
@@ -4137,6 +4331,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     () => ({
       discoveryGroups,
       invites,
+      gatewayMetadata,
+      gatewayInvites,
+      gatewayJoinRequests,
       pendingInviteCount,
       joinRequests,
       favoriteGroups,
@@ -4282,6 +4479,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       discoveryGroups,
       favoriteGroups,
       invites,
+      gatewayMetadata,
+      gatewayInvites,
+      gatewayJoinRequests,
       pendingInviteCount,
       joinRequests,
       myGroupList,
@@ -4331,6 +4531,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!pubkey) {
       setInvites([])
+      setGatewayInvites([])
+      setGatewayJoinRequests([])
       inviteRefreshInFlightRef.current = false
       return
     }

@@ -199,6 +199,8 @@ const RELAY_SUBSCRIPTION_REFRESH_MAX_TRACKED = 512
 const relaySubscriptionRefreshRecent = new Map()
 const relaySubscriptionRefreshInFlight = new Map()
 const joinTelemetrySessions = new Map()
+const autoConnectTelemetrySessions = new Map()
+const relayGatewayOriginsCache = new Map()
 
 function resolveClosedJoinPoolEntryTtlMs(config) {
   const fromConfig =
@@ -895,6 +897,168 @@ function normalizeGatewayOriginList(values = []) {
   return Array.from(origins)
 }
 
+function normalizeGatewayCacheKey(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  return trimmed.toLowerCase()
+}
+
+function buildGatewayCacheKeys(value) {
+  const trimmed = typeof value === 'string' ? value.trim() : ''
+  if (!trimmed) return []
+  const normalized = normalizeGatewayCacheKey(trimmed)
+  if (!normalized) return []
+  const keys = new Set([normalized])
+  if (normalized.includes(':')) {
+    keys.add(normalized.replace(':', '/'))
+  }
+  if (normalized.includes('/')) {
+    keys.add(normalized.replace('/', ':'))
+  }
+  return Array.from(keys)
+}
+
+function collectRelayGatewayCacheKeys({ relayKey = null, publicIdentifier = null, profile = null } = {}) {
+  const keys = new Set()
+  const addValue = (value) => {
+    for (const key of buildGatewayCacheKeys(value)) keys.add(key)
+  }
+  addValue(relayKey)
+  addValue(publicIdentifier)
+  addValue(profile?.public_identifier || profile?.publicIdentifier || null)
+  addValue(profile?.group_id || profile?.groupId || null)
+  return Array.from(keys)
+}
+
+function getCachedRelayGatewayOrigins({ relayKey = null, publicIdentifier = null, profile = null } = {}) {
+  const keys = collectRelayGatewayCacheKeys({ relayKey, publicIdentifier, profile })
+  if (!keys.length) return []
+  let bestEntry = null
+  for (const key of keys) {
+    const entry = relayGatewayOriginsCache.get(key)
+    if (!entry || !Array.isArray(entry.gatewayOrigins) || !entry.gatewayOrigins.length) continue
+    if (!bestEntry) {
+      bestEntry = entry
+      continue
+    }
+    const bestTs = Number.isFinite(bestEntry.updatedAt) ? Number(bestEntry.updatedAt) : 0
+    const nextTs = Number.isFinite(entry.updatedAt) ? Number(entry.updatedAt) : 0
+    if (nextTs >= bestTs) {
+      bestEntry = entry
+    }
+  }
+  return normalizeGatewayOriginList(bestEntry?.gatewayOrigins || [])
+}
+
+function resolveRelayGatewayOrigins({ relayKey = null, publicIdentifier = null, profile = null } = {}) {
+  const profileOrigins = normalizeGatewayOriginList([
+    ...(Array.isArray(profile?.gateway_origins) ? profile.gateway_origins : []),
+    ...(Array.isArray(profile?.gatewayOrigins) ? profile.gatewayOrigins : [])
+  ])
+  if (profileOrigins.length) return profileOrigins
+  const cachedOrigins = getCachedRelayGatewayOrigins({ relayKey, publicIdentifier, profile })
+  if (cachedOrigins.length) return cachedOrigins
+  return collectPublicGatewayOrigins()
+}
+
+function normalizeSyncGatewayOriginsPayload(payload) {
+  const entries = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.entries)
+      ? payload.entries
+      : []
+  const normalized = []
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') continue
+    const groupId = typeof entry.groupId === 'string' ? entry.groupId.trim() : ''
+    if (!groupId) continue
+    const gatewayOrigins = normalizeGatewayOriginList(entry.gatewayOrigins)
+    const sourceEventId =
+      typeof entry.sourceEventId === 'string' && entry.sourceEventId.trim()
+        ? entry.sourceEventId.trim()
+        : null
+    const updatedAt = Number.isFinite(entry.updatedAt) ? Number(entry.updatedAt) : Date.now()
+    normalized.push({
+      groupId,
+      gatewayOrigins,
+      sourceEventId,
+      updatedAt
+    })
+  }
+  return normalized
+}
+
+async function syncRelayGatewayOriginsToProfiles(entries = []) {
+  if (!Array.isArray(entries) || !entries.length) {
+    return { updatedProfiles: 0, cachedEntries: 0 }
+  }
+
+  const normalized = normalizeSyncGatewayOriginsPayload(entries)
+  for (const entry of normalized) {
+    const cacheKeys = buildGatewayCacheKeys(entry.groupId)
+    for (const key of cacheKeys) {
+      relayGatewayOriginsCache.set(key, {
+        gatewayOrigins: entry.gatewayOrigins,
+        sourceEventId: entry.sourceEventId || null,
+        updatedAt: entry.updatedAt
+      })
+    }
+  }
+
+  const profiles = await getAllRelayProfiles(global.userConfig?.userKey)
+  let updatedProfiles = 0
+  for (const profile of Array.isArray(profiles) ? profiles : []) {
+    if (!profile || typeof profile !== 'object') continue
+    const keys = collectRelayGatewayCacheKeys({
+      relayKey: profile?.relay_key || profile?.relayKey || null,
+      publicIdentifier: profile?.public_identifier || profile?.publicIdentifier || null,
+      profile
+    })
+    if (!keys.length) continue
+
+    let matchedEntry = null
+    for (const key of keys) {
+      const entry = relayGatewayOriginsCache.get(key)
+      if (!entry || !Array.isArray(entry.gatewayOrigins) || !entry.gatewayOrigins.length) continue
+      if (!matchedEntry) {
+        matchedEntry = entry
+        continue
+      }
+      const prevTs = Number.isFinite(matchedEntry.updatedAt) ? Number(matchedEntry.updatedAt) : 0
+      const nextTs = Number.isFinite(entry.updatedAt) ? Number(entry.updatedAt) : 0
+      if (nextTs >= prevTs) matchedEntry = entry
+    }
+    if (!matchedEntry) continue
+
+    const currentOrigins = normalizeGatewayOriginList([
+      ...(Array.isArray(profile.gateway_origins) ? profile.gateway_origins : []),
+      ...(Array.isArray(profile.gatewayOrigins) ? profile.gatewayOrigins : [])
+    ])
+    const mergedOrigins = normalizeGatewayOriginList([
+      ...currentOrigins,
+      ...matchedEntry.gatewayOrigins
+    ])
+    if (!mergedOrigins.length) continue
+    const unchanged =
+      mergedOrigins.length === currentOrigins.length
+      && mergedOrigins.every((origin, index) => origin === currentOrigins[index])
+    if (unchanged) continue
+
+    await saveRelayProfile({
+      ...profile,
+      gateway_origins: mergedOrigins,
+      updated_at: new Date().toISOString()
+    })
+    updatedProfiles += 1
+  }
+
+  return {
+    updatedProfiles,
+    cachedEntries: normalized.length
+  }
+}
+
 function normalizeSharedSecretCandidate(value) {
   if (typeof value !== 'string') return null
   const trimmed = value.trim()
@@ -1513,6 +1677,345 @@ function startJoinTelemetrySession({
   }
 
   return session
+}
+
+function createAutoConnectTraceId() {
+  return `autoconnect-${Date.now().toString(16)}-${nodeCrypto.randomBytes(4).toString('hex')}`
+}
+
+function makeAutoConnectTelemetrySessionKey({ relayKey = null, publicIdentifier = null } = {}) {
+  const relayPart = normalizeRelayKeyHex(relayKey) || (typeof relayKey === 'string' ? relayKey.trim() : '') || ''
+  const publicPart = typeof publicIdentifier === 'string' ? publicIdentifier.trim() : ''
+  if (relayPart) return `relay:${relayPart}`
+  if (publicPart) return `public:${publicPart}`
+  return null
+}
+
+function clearAutoConnectTelemetryTimers(session) {
+  if (!session?.timers || typeof session.timers !== 'object') return
+  for (const timer of Object.values(session.timers)) {
+    if (timer) clearTimeout(timer)
+  }
+  session.timers = {}
+}
+
+function emitAutoConnectTelemetryEvent(eventType, {
+  publicIdentifier = null,
+  relayKey = null,
+  traceId = null,
+  elapsedMs = null,
+  reasonCode = null,
+  writable = null,
+  gatewayOrigins = null,
+  meta = null
+} = {}) {
+  const payload = {
+    eventType,
+    traceId: traceId || null,
+    publicIdentifier: publicIdentifier || null,
+    relayKey: relayKey || null,
+    elapsedMs: Number.isFinite(elapsedMs) ? Math.trunc(elapsedMs) : null,
+    writable: typeof writable === 'boolean' ? writable : null,
+    reasonCode: reasonCode || null,
+    gatewayOrigins: Array.isArray(gatewayOrigins) ? gatewayOrigins : undefined,
+    meta: meta && typeof meta === 'object' ? meta : undefined,
+    timestamp: Date.now()
+  }
+
+  if (MULTI_GATEWAY_DEBUG) {
+    try {
+      console.log('[Worker][AutoConnectTelemetry]', JSON.stringify(payload))
+    } catch (_) {}
+  }
+  if (typeof sendMessage === 'function') {
+    sendMessage({
+      type: 'autoconnect-telemetry',
+      data: payload
+    })
+  }
+}
+
+function emitAutoConnectFailFast(session, reasonCode, meta = null) {
+  if (!session || session.failFastEmitted) return
+  session.failFastEmitted = true
+  emitAutoConnectTelemetryEvent('AUTOCONNECT_FAIL_FAST_ABORT', {
+    publicIdentifier: session.publicIdentifier,
+    relayKey: session.relayKey,
+    traceId: session.traceId,
+    elapsedMs: Date.now() - session.startedAt,
+    reasonCode,
+    gatewayOrigins: session.gatewayOrigins,
+    meta
+  })
+}
+
+function markAutoConnectWriterMaterialApplied(session, meta = null) {
+  if (!session || session.writerMaterialApplied) return
+  session.writerMaterialApplied = true
+  if (session.timers?.writerMaterial) {
+    clearTimeout(session.timers.writerMaterial)
+    delete session.timers.writerMaterial
+  }
+  emitAutoConnectTelemetryEvent('AUTOCONNECT_WRITER_MATERIAL_APPLIED', {
+    publicIdentifier: session.publicIdentifier,
+    relayKey: session.relayKey,
+    traceId: session.traceId,
+    elapsedMs: Date.now() - session.startedAt,
+    gatewayOrigins: session.gatewayOrigins,
+    meta
+  })
+}
+
+function markAutoConnectFastForwardApplied(session, meta = null) {
+  if (!session || session.fastForwardApplied) return
+  session.fastForwardApplied = true
+  if (session.timers?.fastForward) {
+    clearTimeout(session.timers.fastForward)
+    delete session.timers.fastForward
+  }
+  emitAutoConnectTelemetryEvent('AUTOCONNECT_FAST_FORWARD_APPLIED', {
+    publicIdentifier: session.publicIdentifier,
+    relayKey: session.relayKey,
+    traceId: session.traceId,
+    elapsedMs: Date.now() - session.startedAt,
+    gatewayOrigins: session.gatewayOrigins,
+    meta
+  })
+}
+
+function markAutoConnectWritableEvent(session, writable, meta = null) {
+  if (!session) return
+  emitAutoConnectTelemetryEvent('AUTOCONNECT_WRITABLE_EVENT', {
+    publicIdentifier: session.publicIdentifier,
+    relayKey: session.relayKey,
+    traceId: session.traceId,
+    elapsedMs: Date.now() - session.startedAt,
+    writable: writable === true,
+    gatewayOrigins: session.gatewayOrigins,
+    meta
+  })
+}
+
+function confirmAutoConnectWritable(session, meta = null) {
+  if (!session || session.writableConfirmed) return
+  session.writableConfirmed = true
+  const elapsedMs = Date.now() - session.startedAt
+  clearAutoConnectTelemetryTimers(session)
+  emitAutoConnectTelemetryEvent('AUTOCONNECT_WRITABLE_CONFIRMED', {
+    publicIdentifier: session.publicIdentifier,
+    relayKey: session.relayKey,
+    traceId: session.traceId,
+    elapsedMs,
+    writable: true,
+    gatewayOrigins: session.gatewayOrigins,
+    meta: {
+      ...(meta && typeof meta === 'object' ? meta : {}),
+      warning: elapsedMs > JOIN_WRITABLE_WARN_TIMEOUT_MS ? 'autoconnect-writable-over-60s' : null
+    }
+  })
+  if (session.key) {
+    autoConnectTelemetrySessions.delete(session.key)
+  }
+}
+
+function startAutoConnectTelemetrySession({
+  relayKey = null,
+  publicIdentifier = null,
+  gatewayOrigins = [],
+  hasFastForward = false,
+  hasWriterMaterial = false
+} = {}) {
+  const sessionKey = makeAutoConnectTelemetrySessionKey({ relayKey, publicIdentifier })
+  if (!sessionKey) return null
+  const previous = autoConnectTelemetrySessions.get(sessionKey)
+  if (previous) {
+    clearAutoConnectTelemetryTimers(previous)
+  }
+
+  const startedAt = Date.now()
+  const session = {
+    key: sessionKey,
+    publicIdentifier: typeof publicIdentifier === 'string' ? publicIdentifier.trim() : null,
+    relayKey: normalizeRelayKeyHex(relayKey) || relayKey || null,
+    traceId: createAutoConnectTraceId(),
+    startedAt,
+    gatewayOrigins: normalizeGatewayOriginList(gatewayOrigins),
+    writerMaterialApplied: false,
+    fastForwardApplied: hasFastForward ? false : true,
+    writableConfirmed: false,
+    failFastEmitted: false,
+    fanoutInFlight: false,
+    fanoutStarted: false,
+    timers: {}
+  }
+  autoConnectTelemetrySessions.set(sessionKey, session)
+
+  emitAutoConnectTelemetryEvent('AUTOCONNECT_START', {
+    publicIdentifier: session.publicIdentifier,
+    relayKey: session.relayKey,
+    traceId: session.traceId,
+    elapsedMs: 0,
+    gatewayOrigins: session.gatewayOrigins,
+    meta: {
+      hasFastForward,
+      hasWriterMaterial
+    }
+  })
+
+  session.timers.writerMaterial = setTimeout(() => {
+    if (!session.writerMaterialApplied && !session.writableConfirmed) {
+      emitAutoConnectFailFast(session, 'writer-material-timeout', {
+        thresholdMs: JOIN_WRITER_MATERIAL_TIMEOUT_MS
+      })
+    }
+  }, JOIN_WRITER_MATERIAL_TIMEOUT_MS)
+  session.timers.writerMaterial?.unref?.()
+
+  if (hasFastForward) {
+    session.timers.fastForward = setTimeout(() => {
+      if (!session.fastForwardApplied && !session.writableConfirmed) {
+        emitAutoConnectFailFast(session, 'fast-forward-timeout', {
+          thresholdMs: JOIN_FAST_FORWARD_TIMEOUT_MS
+        })
+      }
+    }, JOIN_FAST_FORWARD_TIMEOUT_MS)
+    session.timers.fastForward?.unref?.()
+  }
+
+  session.timers.warn = setTimeout(() => {
+    if (!session.writableConfirmed) {
+      emitAutoConnectTelemetryEvent('AUTOCONNECT_WRITABLE_EVENT', {
+        publicIdentifier: session.publicIdentifier,
+        relayKey: session.relayKey,
+        traceId: session.traceId,
+        elapsedMs: Date.now() - session.startedAt,
+        writable: false,
+        gatewayOrigins: session.gatewayOrigins,
+        meta: {
+          warning: 'autoconnect-writable-over-60s'
+        }
+      })
+    }
+  }, JOIN_WRITABLE_WARN_TIMEOUT_MS)
+  session.timers.warn?.unref?.()
+
+  session.timers.hard = setTimeout(() => {
+    if (!session.writableConfirmed) {
+      emitAutoConnectFailFast(session, 'autoconnect-writable-timeout', {
+        thresholdMs: JOIN_WRITABLE_HARD_TIMEOUT_MS
+      })
+    }
+  }, JOIN_WRITABLE_HARD_TIMEOUT_MS)
+  session.timers.hard?.unref?.()
+
+  if (hasWriterMaterial) {
+    markAutoConnectWriterMaterialApplied(session, { source: 'auto-connect-start' })
+  }
+  if (!hasFastForward) {
+    markAutoConnectFastForwardApplied(session, { source: 'no-fast-forward' })
+  }
+
+  return session
+}
+
+async function runAutoConnectMirrorFanout(session, {
+  relayKey = null,
+  publicIdentifier = null,
+  gatewayOrigins = []
+} = {}) {
+  if (!session) return { status: 'skipped', reason: 'missing-session', successCount: 0, results: [] }
+  if (session.fanoutInFlight) return { status: 'skipped', reason: 'fanout-in-flight', successCount: 0, results: [] }
+  const targetRelayKey = normalizeRelayKeyHex(relayKey || session.relayKey) || relayKey || null
+  const targetIdentifier = publicIdentifier || session.publicIdentifier || null
+  if (!targetRelayKey && !targetIdentifier) {
+    return { status: 'skipped', reason: 'missing-relay-identifier', successCount: 0, results: [] }
+  }
+  const origins = normalizeGatewayOriginList(
+    (Array.isArray(gatewayOrigins) && gatewayOrigins.length ? gatewayOrigins : session.gatewayOrigins) || []
+  )
+  if (!origins.length) {
+    return { status: 'skipped', reason: 'missing-gateway-origins', successCount: 0, results: [] }
+  }
+
+  session.fanoutInFlight = true
+  const startedAt = Date.now()
+  try {
+    const results = await Promise.all(
+      origins.map(async (origin) => {
+        const bootstrapResult = await bootstrapGatewayMirrorAvailability({
+          origin,
+          relayKey: targetRelayKey,
+          publicIdentifier: targetIdentifier,
+          relayManager: targetRelayKey ? activeRelays.get(targetRelayKey) : null,
+          reason: 'autoconnect-fanout'
+        })
+        const appendResult = await appendOpenJoinMirrorCores({
+          relayKey: targetRelayKey || targetIdentifier,
+          publicIdentifier: targetIdentifier,
+          origins: [origin],
+          reason: 'autoconnect-fanout'
+        })
+        const mirrorResult = await fetchRelayMirrorMetadata(targetRelayKey || targetIdentifier, {
+          origins: [origin],
+          reason: 'autoconnect-fanout-verify'
+        })
+        const success = appendResult?.status === 'ok' || mirrorResult?.status === 'ok'
+        return {
+          origin,
+          status: success ? 'ok' : 'error',
+          bootstrapStatus: bootstrapResult?.status || null,
+          bootstrapReason: bootstrapResult?.reason || null,
+          appendStatus: appendResult?.status || null,
+          appendReason: appendResult?.reason || null,
+          appendError: appendResult?.error || null,
+          mirrorStatus: mirrorResult?.status || null,
+          mirrorReason: mirrorResult?.reason || null,
+          mirrorError: mirrorResult?.error || null
+        }
+      })
+    )
+    const fanoutEvaluation = evaluateFanoutResults(results, { minimumSuccess: 1 })
+    const summary = {
+      publicIdentifier: targetIdentifier,
+      relayKey: targetRelayKey,
+      traceId: session.traceId,
+      total: fanoutEvaluation.total,
+      successCount: fanoutEvaluation.successCount,
+      failedCount: fanoutEvaluation.failedCount,
+      minimumSuccess: fanoutEvaluation.minimumSuccess,
+      elapsedMs: Date.now() - startedAt,
+      results
+    }
+    console.log('[Worker] Autoconnect mirror fanout summary', summary)
+    sendMessage({
+      type: 'autoconnect-fanout-summary',
+      data: summary
+    })
+    emitAutoConnectTelemetryEvent('AUTOCONNECT_FANOUT_SUMMARY', {
+      publicIdentifier: targetIdentifier,
+      relayKey: targetRelayKey,
+      traceId: session.traceId,
+      elapsedMs: summary.elapsedMs,
+      gatewayOrigins: origins,
+      meta: {
+        total: summary.total,
+        successCount: summary.successCount,
+        failedCount: summary.failedCount,
+        minimumSuccess: summary.minimumSuccess,
+        results
+      }
+    })
+    if (!fanoutEvaluation.passesThreshold) {
+      emitAutoConnectFailFast(session, 'fanout-no-success', summary)
+    }
+    return {
+      status: fanoutEvaluation.passesThreshold ? 'ok' : 'error',
+      successCount: fanoutEvaluation.successCount,
+      results
+    }
+  } finally {
+    session.fanoutInFlight = false
+  }
 }
 
 async function runJoinMirrorFanout(session, { relayKey = null, publicIdentifier = null } = {}) {
@@ -3059,7 +3562,7 @@ async function fetchAndApplyRelayMirrorMetadata({
     origin: mirrorResult.origin,
     reason
   })
-  return { status: 'ok', applyResult }
+  return { status: 'ok', origin: mirrorResult.origin || null, applyResult }
 }
 
 async function applyMirrorMetadataToProfile({
@@ -5474,10 +5977,20 @@ function startHealthLogger(intervalMs = 60000) {
 global.workerPipe = workerPipe
 global.sendMessage = sendMessage
 global.fetchAndApplyRelayMirrorMetadata = fetchAndApplyRelayMirrorMetadata
+global.probeGatewayRelayStatus = probeGatewayRelayStatus
+global.resolveRelayGatewayOrigins = resolveRelayGatewayOrigins
 global.resolveRelayMirrorCoreRefs = resolveRelayMirrorCoreRefs
 global.getRelayMirrorCoreRefsCache = getRelayMirrorCoreRefsCache
 global.syncActiveRelayCoreRefs = syncActiveRelayCoreRefs
 global.appendOpenJoinMirrorCores = appendOpenJoinMirrorCores
+global.emitAutoConnectTelemetryEvent = emitAutoConnectTelemetryEvent
+global.startAutoConnectTelemetrySession = startAutoConnectTelemetrySession
+global.markAutoConnectWriterMaterialApplied = markAutoConnectWriterMaterialApplied
+global.markAutoConnectFastForwardApplied = markAutoConnectFastForwardApplied
+global.markAutoConnectWritableEvent = markAutoConnectWritableEvent
+global.confirmAutoConnectWritable = confirmAutoConnectWritable
+global.emitAutoConnectFailFast = emitAutoConnectFailFast
+global.runAutoConnectMirrorFanout = runAutoConnectMirrorFanout
 global.recoverRelayDriveFile = recoverRelayDriveFile
 global.recoverConversationDriveFile = recoverConversationDriveFile
 global.requestRelaySubscriptionRefresh = async (relayKey = null, { reason = 'manual' } = {}) => {
@@ -7356,6 +7869,41 @@ async function handleMessageObject(message) {
         }
       }
       break
+
+    case 'sync-group-gateway-origins':
+    case 'syncGroupGatewayOrigins': {
+      const requestId = extractMessageRequestId(message)
+      try {
+        const payload = (message && typeof message === 'object' ? message.data : null) || []
+        const entries = normalizeSyncGatewayOriginsPayload(payload)
+        const summary = await syncRelayGatewayOriginsToProfiles(entries)
+        sendWorkerResponse(requestId, {
+          success: true,
+          data: {
+            ...summary,
+            count: entries.length
+          }
+        })
+        sendMessage({
+          type: 'group-gateway-origins-synced',
+          data: {
+            ...summary,
+            count: entries.length
+          }
+        })
+      } catch (error) {
+        const errorMessage = error?.message || String(error)
+        sendWorkerResponse(requestId, {
+          success: false,
+          error: errorMessage
+        })
+        sendMessage({
+          type: 'error',
+          message: `Failed to sync group gateway origins: ${errorMessage}`
+        })
+      }
+      break
+    }
 
     case 'get-relays':
       console.log('[Worker] Get relays requested')

@@ -71,7 +71,12 @@ function firstEvent(events, eventType) {
   return events.find((entry) => entry?.eventType === eventType) || null
 }
 
-function evaluateJoinPerformanceTelemetry(events = [], limits = {}) {
+function resolveTelemetryEventType(prefix, suffix) {
+  if (typeof prefix !== 'string' || !prefix.trim()) return suffix
+  return `${prefix.trim().toUpperCase()}_${suffix}`
+}
+
+function evaluatePerformanceTelemetry(events = [], limits = {}, { prefix = 'JOIN' } = {}) {
   const configured = {
     writableHardMs: Number.isFinite(limits?.writableHardMs)
       ? Math.trunc(limits.writableHardMs)
@@ -87,28 +92,33 @@ function evaluateJoinPerformanceTelemetry(events = [], limits = {}) {
       : DEFAULT_JOIN_PERFORMANCE_LIMITS.fastForwardMs
   }
 
-  const start = firstEvent(events, 'JOIN_START')
-  const writerMaterial = firstEvent(events, 'JOIN_WRITER_MATERIAL_APPLIED')
-  const fastForward = firstEvent(events, 'JOIN_FAST_FORWARD_APPLIED')
-  const writableConfirmed = firstEvent(events, 'JOIN_WRITABLE_CONFIRMED')
-  const failFast = firstEvent(events, 'JOIN_FAIL_FAST_ABORT')
+  const start = firstEvent(events, resolveTelemetryEventType(prefix, 'START'))
+  const writerMaterial = firstEvent(events, resolveTelemetryEventType(prefix, 'WRITER_MATERIAL_APPLIED'))
+  const fastForward = firstEvent(events, resolveTelemetryEventType(prefix, 'FAST_FORWARD_APPLIED'))
+  const writableConfirmed = firstEvent(events, resolveTelemetryEventType(prefix, 'WRITABLE_CONFIRMED'))
+  const failFast = firstEvent(events, resolveTelemetryEventType(prefix, 'FAIL_FAST_ABORT'))
 
   const writerMaterialElapsedMs = toSafeNumber(writerMaterial?.elapsedMs, null)
   const fastForwardElapsedMs = toSafeNumber(fastForward?.elapsedMs, null)
   const writableElapsedMs = toSafeNumber(writableConfirmed?.elapsedMs, null)
+  const hasFastForward =
+    start?.meta?.hasFastForward === true
+    || fastForward !== null
 
   const hardPass = Number.isFinite(writableElapsedMs) && writableElapsedMs <= configured.writableHardMs
   const warnPass = Number.isFinite(writableElapsedMs) && writableElapsedMs <= configured.writableWarnMs
   const writerMaterialPass = Number.isFinite(writerMaterialElapsedMs)
     && writerMaterialElapsedMs <= configured.writerMaterialMs
-  const fastForwardPass = Number.isFinite(fastForwardElapsedMs)
-    && fastForwardElapsedMs <= configured.fastForwardMs
+  const fastForwardPass = hasFastForward
+    ? (Number.isFinite(fastForwardElapsedMs) && fastForwardElapsedMs <= configured.fastForwardMs)
+    : true
 
   const failures = []
-  if (!start) failures.push('missing-join-start')
+  const label = typeof prefix === 'string' && prefix.trim() ? prefix.trim().toLowerCase() : 'join'
+  if (!start) failures.push(`missing-${label}-start`)
   if (!writerMaterialPass) failures.push('writer-material-sla-failed')
-  if (!fastForwardPass) failures.push('fast-forward-sla-failed')
-  if (!hardPass) failures.push('join-writable-hard-sla-failed')
+  if (hasFastForward && !fastForwardPass) failures.push('fast-forward-sla-failed')
+  if (!hardPass) failures.push(`${label}-writable-hard-sla-failed`)
   if (failFast?.reasonCode) failures.push(`fail-fast:${failFast.reasonCode}`)
 
   return {
@@ -118,6 +128,7 @@ function evaluateJoinPerformanceTelemetry(events = [], limits = {}) {
     writableElapsedMs,
     writerMaterialPass,
     fastForwardPass,
+    fastForwardRequired: hasFastForward,
     writableHardPass: hardPass,
     writableWarnPass: warnPass,
     failFastReason: failFast?.reasonCode || null,
@@ -126,10 +137,17 @@ function evaluateJoinPerformanceTelemetry(events = [], limits = {}) {
   }
 }
 
+function evaluateJoinPerformanceTelemetry(events = [], limits = {}, options = {}) {
+  return evaluatePerformanceTelemetry(events, limits, {
+    prefix: options?.prefix || 'JOIN'
+  })
+}
+
 export {
   DEFAULT_JOIN_PERFORMANCE_LIMITS,
   compareGatewayStatusResults,
   rankGatewayStatusProbes,
   evaluateFanoutResults,
-  evaluateJoinPerformanceTelemetry
+  evaluateJoinPerformanceTelemetry,
+  evaluatePerformanceTelemetry
 }

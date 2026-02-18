@@ -19,6 +19,7 @@ import {
 } from '@/services/electron-ipc.service'
 import { isElectron } from '@/lib/platform'
 import { useNostr } from '@/providers/NostrProvider'
+import { TGatewayDescriptor } from '@/types/groups'
 
 type WorkerStatusPhase =
   | 'starting'
@@ -137,6 +138,7 @@ type RelayCreateRequest = {
   isOpen?: boolean
   fileSharing?: boolean
   picture?: string
+  gateways?: TGatewayDescriptor[]
 }
 
 type RelayBootstrapPublishStatus = {
@@ -345,6 +347,7 @@ const RELAY_COMPARE_FIELDS: Array<keyof RelayEntry> = [
   'registrationError',
   'isActive',
   'gatewayPath',
+  'lastSuccessGatewayOrigin',
   'name',
   'description',
   'createdAt'
@@ -357,6 +360,10 @@ function normalizeRelayForCompare(relay: RelayEntry) {
   }
   const members = Array.isArray(relay.members) ? [...relay.members].sort() : null
   normalized.members = members
+  const gatewayOrigins = Array.isArray((relay as any).gatewayOrigins)
+    ? [...((relay as any).gatewayOrigins as string[])].map((entry) => String(entry || '').trim()).filter(Boolean).sort()
+    : null
+  normalized.gatewayOrigins = gatewayOrigins
   return normalized
 }
 

@@ -7,6 +7,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import Uploader from '@/components/PostEditor/Uploader'
 import { Upload, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { TGatewayDescriptor } from '@/types/groups'
+import { parseGatewayDescriptorInput, serializeGatewayDescriptorInput } from '@/lib/gateway-tags'
 
 export type TGroupMetadataForm = {
   name: string
@@ -14,6 +16,7 @@ export type TGroupMetadataForm = {
   picture: string
   isPublic: boolean
   isOpen: boolean
+  gateways: TGatewayDescriptor[]
 }
 
 export default function GroupMetadataEditor({
@@ -34,8 +37,12 @@ export default function GroupMetadataEditor({
     about: initial?.about ?? '',
     picture: initial?.picture ?? '',
     isPublic: initial?.isPublic ?? true,
-    isOpen: initial?.isOpen ?? true
+    isOpen: initial?.isOpen ?? true,
+    gateways: Array.isArray(initial?.gateways) ? initial.gateways : []
   })
+  const [gatewayInput, setGatewayInput] = useState(
+    serializeGatewayDescriptorInput(Array.isArray(initial?.gateways) ? initial.gateways : [])
+  )
   const [hasInteracted, setHasInteracted] = useState(false)
 
   const nextFormFromInitial = () => ({
@@ -43,20 +50,26 @@ export default function GroupMetadataEditor({
       about: initial?.about ?? '',
       picture: initial?.picture ?? '',
       isPublic: initial?.isPublic ?? true,
-      isOpen: initial?.isOpen ?? true
+      isOpen: initial?.isOpen ?? true,
+      gateways: Array.isArray(initial?.gateways) ? initial.gateways : []
     })
 
   useEffect(() => {
     if (!isOpen) return
     if (hasInteracted) return
     setForm(nextFormFromInitial())
+    setGatewayInput(
+      serializeGatewayDescriptorInput(Array.isArray(initial?.gateways) ? initial.gateways : [])
+    )
   }, [initial, isOpen, hasInteracted])
 
   useEffect(() => {
     if (!isOpen) return
     setHasInteracted(false)
     setForm(nextFormFromInitial())
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    setGatewayInput(
+      serializeGatewayDescriptorInput(Array.isArray(initial?.gateways) ? initial.gateways : [])
+    )
   }, [isOpen])
 
   return (
@@ -163,6 +176,23 @@ export default function GroupMetadataEditor({
             setForm((f) => ({ ...f, isOpen: val }))
           }}
         />
+      </div>
+      <div className="space-y-2">
+        <Label>Gateways</Label>
+        <Textarea
+          value={gatewayInput}
+          onChange={(e) => {
+            setHasInteracted(true)
+            const value = e.target.value
+            setGatewayInput(value)
+            setForm((current) => ({ ...current, gateways: parseGatewayDescriptorInput(value) }))
+          }}
+          placeholder="https://gateway.example,<operator-pubkey>,OPEN"
+          rows={4}
+        />
+        <div className="text-xs text-muted-foreground">
+          One per line: origin,operator-pubkey,OPEN|CLOSED
+        </div>
       </div>
       <div className="flex gap-2 justify-end">
         <Button variant="secondary" onClick={onCancel}>

@@ -12,6 +12,34 @@ export type TGatewayDescriptor = {
   policy: 'OPEN' | 'CLOSED'
 }
 
+export type TGatewayMetadata = {
+  origin: string
+  operatorPubkey: string
+  policy: 'OPEN' | 'CLOSED'
+  allowList: string[]
+  discoveryRelays: string[]
+  content: string
+  createdAt?: number | null
+  event: Event
+}
+
+export type TGatewayInvite = {
+  origin: string
+  inviteePubkey: string
+  inviteToken: string
+  operatorPubkey?: string | null
+  createdAt?: number | null
+  event: Event
+}
+
+export type TGatewayJoinRequest = {
+  origin: string
+  requesterPubkey: string
+  content?: string
+  createdAt?: number | null
+  event: Event
+}
+
 export type TGroupMetadata = {
   id: string
   relay?: string
@@ -54,6 +82,7 @@ export type TGroupInvite = {
   isPublic?: boolean
   relayUrl?: string | null
   relayKey?: string | null
+  gatewayOrigins?: string[]
   writerCore?: string | null
   writerCoreHex?: string | null
   autobaseLocal?: string | null

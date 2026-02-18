@@ -40,7 +40,14 @@ type SelectedChatInviteRef = {
   conversationId?: string | null
 }
 
-type SelectedInviteRef = SelectedGroupInviteRef | SelectedChatInviteRef
+type SelectedGatewayInviteRef = {
+  kind: 'gateway'
+  id: string
+  origin: string
+  inviteToken?: string | null
+}
+
+type SelectedInviteRef = SelectedGroupInviteRef | SelectedChatInviteRef | SelectedGatewayInviteRef
 
 type SelectedRelayRef = {
   relayKey: string
@@ -103,6 +110,11 @@ export interface CommandController {
     isOpen?: boolean
     fileSharing?: boolean
     picture?: string
+    gateways?: Array<{
+      origin: string
+      operatorPubkey: string
+      policy: 'OPEN' | 'CLOSED'
+    }>
   }): Promise<Record<string, unknown>>
   joinRelay(input: {
     relayKey?: string
@@ -182,6 +194,8 @@ export interface CommandController {
   }): Promise<void>
   acceptGroupInvite(inviteId: string): Promise<void>
   dismissGroupInvite(inviteId: string): Promise<void>
+  acceptGatewayInvite(inviteId: string): Promise<void>
+  dismissGatewayInvite(inviteId: string): Promise<void>
   setGroupViewTab(tab: 'discover' | 'my'): Promise<void>
   refreshJoinRequests(groupId: string, relay?: string): Promise<void>
   approveJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void>
@@ -309,6 +323,60 @@ function looksLikeGroupIdentifier(value: string): boolean {
   if (normalized.includes(':')) return true
   if (normalized.startsWith('npub')) return true
   return isHex64(normalized)
+}
+
+function collectOptionValues(args: string[], optionName: string): string[] {
+  const values: string[] = []
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== optionName) continue
+    const value = args[index + 1]
+    if (!value || value.startsWith('--')) continue
+    values.push(value)
+  }
+  return values
+}
+
+function collectOptionValue(args: string[], optionName: string): string | undefined {
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== optionName) continue
+    const parts: string[] = []
+    for (let valueIndex = index + 1; valueIndex < args.length; valueIndex += 1) {
+      const candidate = args[valueIndex]
+      if (!candidate || candidate.startsWith('--')) break
+      parts.push(candidate)
+    }
+    if (parts.length) return parts.join(' ')
+  }
+  return undefined
+}
+
+function normalizeGatewayOrigin(value: string): string | null {
+  const trimmed = String(value || '').trim()
+  if (!trimmed) return null
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol === 'wss:') parsed.protocol = 'https:'
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:'
+    if (parsed.protocol === 'http:') parsed.protocol = 'https:'
+    if (parsed.protocol !== 'https:') return null
+    return parsed.origin
+  } catch {
+    return null
+  }
+}
+
+function parseGatewayDescriptorSpec(spec: string) {
+  const [originRaw, operatorRaw, policyRaw] = String(spec || '')
+    .split(',')
+    .map((entry) => entry?.trim() || '')
+  const origin = normalizeGatewayOrigin(originRaw)
+  const operatorPubkey = isHex64(operatorRaw) ? operatorRaw.toLowerCase() : null
+  if (!origin || !operatorPubkey) return null
+  return {
+    origin,
+    operatorPubkey,
+    policy: String(policyRaw || '').toUpperCase() === 'CLOSED' ? ('CLOSED' as const) : ('OPEN' as const)
+  }
 }
 
 const NAV_ALIASES: Record<string, NavNodeId> = {
@@ -828,14 +896,20 @@ export async function executeCommand(
       const isPublic = args.includes('--public') || !args.includes('--private')
       const isOpen = args.includes('--open') || !args.includes('--closed')
       const fileSharing = args.includes('--file-sharing') ? true : args.includes('--no-file-sharing') ? false : true
+      const gatewaySpecs = collectOptionValues(args, '--gateway')
+      const parsedGateways = gatewaySpecs
+        .map((spec) => parseGatewayDescriptorSpec(spec))
+        .filter((entry): entry is { origin: string; operatorPubkey: string; policy: 'OPEN' | 'CLOSED' } => !!entry)
+      if (gatewaySpecs.length && parsedGateways.length !== gatewaySpecs.length) {
+        throw new Error('Invalid --gateway value. Expected "origin,operator-pubkey,OPEN|CLOSED".')
+      }
       await controller.createRelay({
         name,
         isPublic,
         isOpen,
         fileSharing,
-        description: args.includes('--desc')
-          ? args.slice(args.indexOf('--desc') + 1).join(' ')
-          : undefined
+        description: collectOptionValue(args, '--desc'),
+        gateways: parsedGateways.length ? parsedGateways : undefined
       })
       return { message: `Relay created: ${name}`, gotoNode: 'relays' }
     }
@@ -891,10 +965,14 @@ export async function executeCommand(
         }
       }
       publicIdentifier = requireArg(publicIdentifier, 'publicIdentifier')
+      const gatewayOrigins = collectOptionValues(args, '--gateway')
+        .map((entry) => normalizeGatewayOrigin(entry))
+        .filter((entry): entry is string => !!entry)
       await controller.startJoinFlow({
         publicIdentifier,
         token,
-        openJoin: args.includes('--open')
+        openJoin: args.includes('--open'),
+        gatewayOrigins: gatewayOrigins.length ? Array.from(new Set(gatewayOrigins)) : undefined
       })
       return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }
@@ -1030,11 +1108,15 @@ export async function executeCommand(
       }
 
       publicIdentifier = requireArg(publicIdentifier, 'publicIdentifier')
+      const gatewayOrigins = collectOptionValues(args, '--gateway')
+        .map((entry) => normalizeGatewayOrigin(entry))
+        .filter((entry): entry is string => !!entry)
 
       await controller.startJoinFlow({
         publicIdentifier,
         token,
-        openJoin: args.includes('--open')
+        openJoin: args.includes('--open'),
+        gatewayOrigins: gatewayOrigins.length ? Array.from(new Set(gatewayOrigins)) : undefined
       })
       return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }

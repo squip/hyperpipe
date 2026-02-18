@@ -203,6 +203,8 @@ class WorkerClient {
     this.pending = new Map()
     this.stdoutBuffer = ''
     this.stderrBuffer = ''
+    this.messageBacklog = []
+    this.maxMessageBacklog = 4096
     this.stopped = false
   }
 
@@ -267,8 +269,11 @@ class WorkerClient {
 
     await this.waitForMessage((message) => {
       if (!message || typeof message !== 'object') return false
+      if (message.type === 'relay-server-ready') return true
+      if (message.type === 'heartbeat' && message.status === 'running') return true
       if (message.type !== 'status') return false
-      return message.phase === 'ready' || message.initialized === true
+      if (message.initialized === true) return true
+      return message.phase === 'ready' || message.phase === 'gateway-ready'
     }, Math.min(this.scenarioTimeoutMs, 180000), `${this.name}:ready`)
   }
 
@@ -327,6 +332,20 @@ class WorkerClient {
   async waitForMessage(predicate, timeoutMs = 60000, label = 'worker-message') {
     const timeout = Math.max(1000, Math.trunc(timeoutMs))
     return await new Promise((resolve, reject) => {
+      for (let index = this.messageBacklog.length - 1; index >= 0; index -= 1) {
+        const cached = this.messageBacklog[index]
+        let cachedMatch = false
+        try {
+          cachedMatch = predicate(cached)
+        } catch {
+          cachedMatch = false
+        }
+        if (cachedMatch) {
+          resolve(cached)
+          return
+        }
+      }
+
       let settled = false
       const onMessage = (message) => {
         if (settled) return
@@ -397,6 +416,10 @@ class WorkerClient {
 
   #handleMessage(message) {
     if (!message || typeof message !== 'object') return
+    this.messageBacklog.push(message)
+    if (this.messageBacklog.length > this.maxMessageBacklog) {
+      this.messageBacklog.splice(0, this.messageBacklog.length - this.maxMessageBacklog)
+    }
     try {
       this.#appendLog(JSON.stringify(message))
     } catch {
@@ -726,6 +749,79 @@ async function waitForJoinFanout(worker, traceId, timeoutMs = 45000) {
   }
 }
 
+async function waitForAutoConnectWritable(worker, {
+  relayKey,
+  publicIdentifier,
+  timeoutMs
+}) {
+  const hardTimeout = Math.max(1000, timeoutMs)
+  const startedAt = nowTs()
+  const message = await worker.waitForMessage((entry) => {
+    if (!entry || typeof entry !== 'object') return false
+    if (entry.type !== 'autoconnect-telemetry') return false
+    const data = entry.data && typeof entry.data === 'object' ? entry.data : null
+    if (!data) return false
+    if (!matchRelayIdentifier(data, relayKey, publicIdentifier)) return false
+    return (
+      data.eventType === 'AUTOCONNECT_FAIL_FAST_ABORT'
+      || (data.eventType === 'AUTOCONNECT_WRITABLE_CONFIRMED' && data.writable === true)
+    )
+  }, hardTimeout, 'autoconnect-writable')
+
+  const data = message?.data && typeof message.data === 'object' ? message.data : null
+  if (!data) {
+    throw new Error(`autoconnect-writable-timeout:${hardTimeout}`)
+  }
+  process.stdout.write(`${JSON.stringify({ type: 'autoconnect-telemetry', data })}\n`)
+  if (data.eventType === 'AUTOCONNECT_FAIL_FAST_ABORT') {
+    throw new Error(data.reasonCode || 'autoconnect-fail-fast-abort')
+  }
+  return {
+    event: data,
+    elapsedMs: nowTs() - startedAt
+  }
+}
+
+async function waitForAutoConnectFanout(worker, traceId, timeoutMs = 45000) {
+  try {
+    const message = await worker.waitForMessage((entry) => {
+      if (!entry || typeof entry !== 'object') return false
+      if (entry.type !== 'autoconnect-fanout-summary') return false
+      if (!traceId) return true
+      return entry?.data?.traceId === traceId
+    }, timeoutMs, 'autoconnect-fanout-summary')
+    if (message?.type === 'autoconnect-fanout-summary') {
+      process.stdout.write(`${JSON.stringify(message)}\n`)
+    }
+    return message
+  } catch {
+    return null
+  }
+}
+
+async function collectRelayViewLengths(worker, relayKey, publicIdentifier) {
+  try {
+    const relays = await worker.getRelays(45000)
+    const joinedRelay = relays.find((entry) => (
+      (typeof entry?.relayKey === 'string' && entry.relayKey.toLowerCase() === relayKey.toLowerCase())
+      || (typeof entry?.publicIdentifier === 'string' && entry.publicIdentifier === publicIdentifier)
+    ))
+    if (!joinedRelay || typeof joinedRelay !== 'object') return null
+    const viewLength = Number.isFinite(joinedRelay?.viewLength) ? Number(joinedRelay.viewLength) : null
+    const expectedViewLength = Number.isFinite(joinedRelay?.expectedViewLength)
+      ? Number(joinedRelay.expectedViewLength)
+      : null
+    const localLength = Number.isFinite(joinedRelay?.localLength) ? Number(joinedRelay.localLength) : null
+    return {
+      viewLength,
+      expectedViewLength,
+      localLength
+    }
+  } catch (_) {
+    return null
+  }
+}
+
 async function setupScenarioPreconditions(scenario) {
   if (scenario?.id === 'S17') {
     await ensureInviteAllowList({
@@ -752,6 +848,7 @@ async function runScenario() {
   const workerBStorage = path.join(SCENARIO_DIR, 'workerB-data')
   const workerALog = path.join(SCENARIO_DIR, 'workerA.log')
   const workerBLog = path.join(SCENARIO_DIR, 'workerB.log')
+  const workerBRestartLog = path.join(SCENARIO_DIR, 'workerB-restart.log')
 
   await writeGatewaySettings(workerAStorage, createGateway.baseUrl)
   await writeGatewaySettings(workerBStorage, createGateway.baseUrl)
@@ -779,10 +876,14 @@ async function runScenario() {
 
   const summary = {
     scenarioId: SCENARIO_ID,
-    workerLogs: [workerALog, workerBLog],
+    workerLogs: [workerALog, workerBLog, workerBRestartLog],
     observedViewLength: null,
-    expectedViewLength: null
+    expectedViewLength: null,
+    autoConnectObservedViewLength: null,
+    autoConnectExpectedViewLength: null
   }
+
+  let workerBRestart = null
 
   try {
     await workerA.start()
@@ -863,34 +964,79 @@ async function runScenario() {
     const traceId = typeof joinResult?.event?.traceId === 'string' ? joinResult.event.traceId : null
     await waitForJoinFanout(workerB, traceId, 60000)
 
-    try {
-      const relays = await workerB.getRelays(45000)
-      const joinedRelay = relays.find((entry) => (
-        (typeof entry?.relayKey === 'string' && entry.relayKey.toLowerCase() === relayKey.toLowerCase())
-        || (typeof entry?.publicIdentifier === 'string' && entry.publicIdentifier === publicIdentifier)
-      ))
-      if (joinedRelay && summary.observedViewLength == null && Number.isFinite(joinedRelay?.viewLength)) {
-        summary.observedViewLength = Number(joinedRelay.viewLength)
+    const joinedRelayLens = await collectRelayViewLengths(workerB, relayKey, publicIdentifier)
+    if (joinedRelayLens) {
+      if (summary.observedViewLength == null && joinedRelayLens.viewLength != null) {
+        summary.observedViewLength = joinedRelayLens.viewLength
       }
-      if (joinedRelay && summary.observedViewLength == null && Number.isFinite(joinedRelay?.localLength)) {
-        summary.observedViewLength = Number(joinedRelay.localLength)
+      if (summary.observedViewLength == null && joinedRelayLens.localLength != null) {
+        summary.observedViewLength = joinedRelayLens.localLength
       }
-      if (joinedRelay && summary.expectedViewLength == null && Number.isFinite(joinedRelay?.expectedViewLength)) {
-        summary.expectedViewLength = Number(joinedRelay.expectedViewLength)
+      if (summary.expectedViewLength == null && joinedRelayLens.expectedViewLength != null) {
+        summary.expectedViewLength = joinedRelayLens.expectedViewLength
       }
-      if (joinedRelay && summary.expectedViewLength == null && Number.isFinite(joinedRelay?.viewLength)) {
-        summary.expectedViewLength = Number(joinedRelay.viewLength)
+      if (summary.expectedViewLength == null && joinedRelayLens.viewLength != null) {
+        summary.expectedViewLength = joinedRelayLens.viewLength
       }
-      if (joinedRelay && summary.expectedViewLength == null && Number.isFinite(joinedRelay?.localLength)) {
-        summary.expectedViewLength = Number(joinedRelay.localLength)
+      if (summary.expectedViewLength == null && joinedRelayLens.localLength != null) {
+        summary.expectedViewLength = joinedRelayLens.localLength
       }
-    } catch (_) {}
+    }
+
+    await workerB.stop()
+
+    workerBRestart = new WorkerClient({
+      name: 'workerB-restart',
+      workerRoot: WORKER_ROOT,
+      storageDir: workerBStorage,
+      userKey: 'e2e-worker-b',
+      pubkeyHex: WORKER_B_PUBKEY,
+      nsecHex: WORKER_B_PRIVKEY,
+      logFile: workerBRestartLog,
+      scenarioTimeoutMs: SCENARIO_TIMEOUT_MS
+    })
+    await workerBRestart.start()
+
+    const autoConnectResult = await waitForAutoConnectWritable(workerBRestart, {
+      relayKey,
+      publicIdentifier,
+      timeoutMs: GATES.joinToWritableMs + 5000
+    })
+    const autoConnectMetrics = extractWritableMetricsFromTelemetry(autoConnectResult?.event)
+    summary.autoConnectObservedViewLength = autoConnectMetrics.observedViewLength
+    summary.autoConnectExpectedViewLength = autoConnectMetrics.expectedViewLength
+
+    const autoConnectTraceId =
+      typeof autoConnectResult?.event?.traceId === 'string'
+        ? autoConnectResult.event.traceId
+        : null
+    await waitForAutoConnectFanout(workerBRestart, autoConnectTraceId, 60000)
+
+    const autoConnectRelayLens = await collectRelayViewLengths(workerBRestart, relayKey, publicIdentifier)
+    if (autoConnectRelayLens) {
+      if (summary.autoConnectObservedViewLength == null && autoConnectRelayLens.viewLength != null) {
+        summary.autoConnectObservedViewLength = autoConnectRelayLens.viewLength
+      }
+      if (summary.autoConnectObservedViewLength == null && autoConnectRelayLens.localLength != null) {
+        summary.autoConnectObservedViewLength = autoConnectRelayLens.localLength
+      }
+      if (summary.autoConnectExpectedViewLength == null && autoConnectRelayLens.expectedViewLength != null) {
+        summary.autoConnectExpectedViewLength = autoConnectRelayLens.expectedViewLength
+      }
+      if (summary.autoConnectExpectedViewLength == null && autoConnectRelayLens.viewLength != null) {
+        summary.autoConnectExpectedViewLength = autoConnectRelayLens.viewLength
+      }
+      if (summary.autoConnectExpectedViewLength == null && autoConnectRelayLens.localLength != null) {
+        summary.autoConnectExpectedViewLength = autoConnectRelayLens.localLength
+      }
+    }
 
     return summary
   } finally {
     await Promise.allSettled([
       workerA.stop(),
-      workerB.stop()
+      workerB.stop(),
+      workerBRestart?.stop()
     ])
   }
 }
@@ -903,7 +1049,9 @@ async function main() {
       path.join(SCENARIO_DIR, 'workerB.log')
     ],
     observedViewLength: null,
-    expectedViewLength: null
+    expectedViewLength: null,
+    autoConnectObservedViewLength: null,
+    autoConnectExpectedViewLength: null
   }
 
   let failed = false

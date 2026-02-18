@@ -1,5 +1,13 @@
 import type { Event } from 'nostr-tools'
-import type { ChatInvite, GroupInvite, GroupJoinRequest, GroupListEntry, GroupSummary, InvitesInboxItem } from '../types.js'
+import type {
+  ChatInvite,
+  GatewayInviteEvent,
+  GroupInvite,
+  GroupJoinRequest,
+  GroupListEntry,
+  GroupSummary,
+  InvitesInboxItem
+} from '../types.js'
 import { parseGroupIdentifier, parseGroupInviteEvent, parseGroupMetadataEvent } from '../../lib/groups.js'
 import {
   getBaseRelayUrl,
@@ -149,6 +157,15 @@ export function parseGroupInviteWithPayload(args: {
       : typeof payload.relay_key === 'string'
         ? payload.relay_key
         : null
+  const gatewayOrigins = Array.isArray((payload as Record<string, unknown>).gatewayOrigins)
+    ? Array.from(
+      new Set(
+        ((payload as Record<string, unknown>).gatewayOrigins as unknown[])
+          .map((entry) => String(entry || '').trim())
+          .filter(Boolean)
+      )
+    )
+    : undefined
   const token = typeof payload.token === 'string' ? payload.token : undefined
   const fileSharing = typeof payload.fileSharing === 'boolean' ? payload.fileSharing : parsed.fileSharing
   const isPublic = typeof payload.isPublic === 'boolean' ? payload.isPublic : parsed.isPublic
@@ -251,6 +268,7 @@ export function parseGroupInviteWithPayload(args: {
     relay,
     relayUrl: relayUrl || null,
     relayKey,
+    gatewayOrigins,
     groupName,
     groupPicture,
     name: groupName,
@@ -301,6 +319,7 @@ export function filterActionableGroupInvites(args: {
 
 export function buildInvitesInbox(args: {
   groupInvites: GroupInvite[]
+  gatewayInvites?: GatewayInviteEvent[]
   chatInvites: ChatInvite[]
 }): InvitesInboxItem[] {
   const rows: InvitesInboxItem[] = []
@@ -326,6 +345,17 @@ export function buildInvitesInbox(args: {
       title: invite.title || invite.id,
       senderPubkey: invite.senderPubkey,
       status: invite.status
+    })
+  }
+
+  for (const invite of Array.isArray(args.gatewayInvites) ? args.gatewayInvites : []) {
+    rows.push({
+      type: 'gateway',
+      id: invite.id,
+      createdAt: invite.createdAt || 0,
+      origin: invite.origin,
+      operatorPubkey: invite.operatorPubkey || null,
+      inviteToken: invite.inviteToken
     })
   }
 

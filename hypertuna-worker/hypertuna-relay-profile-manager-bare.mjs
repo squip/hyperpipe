@@ -26,6 +26,30 @@ async function withProfileLock(fn) {
 
 const DEFAULT_STORAGE_BASE = process.env.STORAGE_DIR || join(process.cwd(), 'data');
 
+function normalizeGatewayOrigin(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+        const parsed = new URL(trimmed);
+        if (parsed.protocol === 'ws:') parsed.protocol = 'http:';
+        if (parsed.protocol === 'wss:') parsed.protocol = 'https:';
+        if (!/^https?:$/i.test(parsed.protocol)) return null;
+        return parsed.origin;
+    } catch (_) {
+        return null;
+    }
+}
+
+function normalizeGatewayOriginList(values = []) {
+    const set = new Set();
+    for (const value of Array.isArray(values) ? values : []) {
+        const origin = normalizeGatewayOrigin(value);
+        if (origin) set.add(origin);
+    }
+    return Array.from(set);
+}
+
 // Get storage directory from runtime config or use default
 function getStorageDir(userKey = null) {
     const baseDir = global.userConfig?.storage || DEFAULT_STORAGE_BASE;
@@ -107,6 +131,25 @@ function ensureProfileSchema(profile) {
     if (profile.isOpen === undefined) {
         profile.isOpen = false;
     }
+
+    const legacyGatewayOrigins = Array.isArray(profile.gatewayOrigins) ? profile.gatewayOrigins : [];
+    const currentGatewayOrigins = Array.isArray(profile.gateway_origins) ? profile.gateway_origins : [];
+    const normalizedGatewayOrigins = normalizeGatewayOriginList([
+        ...currentGatewayOrigins,
+        ...legacyGatewayOrigins
+    ]);
+    profile.gateway_origins = normalizedGatewayOrigins;
+    if (profile.gatewayOrigins !== undefined) {
+        delete profile.gatewayOrigins;
+    }
+
+    const lastSuccessGatewayOrigin = normalizeGatewayOrigin(profile.last_success_gateway_origin);
+    profile.last_success_gateway_origin = lastSuccessGatewayOrigin;
+
+    const autoconnectSuccessAt = Number(profile.last_autoconnect_success_at);
+    profile.last_autoconnect_success_at = Number.isFinite(autoconnectSuccessAt) && autoconnectSuccessAt > 0
+        ? Math.trunc(autoconnectSuccessAt)
+        : null;
 
     return profile;
 }

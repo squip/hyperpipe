@@ -74,6 +74,11 @@ export class RelayService implements IRelayService {
     isOpen?: boolean
     fileSharing?: boolean
     picture?: string
+    gateways?: Array<{
+      origin: string
+      operatorPubkey: string
+      policy: 'OPEN' | 'CLOSED'
+    }>
   }): Promise<Record<string, unknown>> {
     let event: Record<string, unknown>
     try {

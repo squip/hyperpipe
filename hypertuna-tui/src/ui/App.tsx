@@ -80,6 +80,7 @@ type CenterRow = {
     | 'relay'
     | 'group'
     | 'group-invite'
+    | 'gateway-invite'
     | 'chat-invite'
     | 'chat-conversation'
     | 'form-field'
@@ -313,6 +314,9 @@ function fileFamilyForMime(mime?: string | null): FileFamily {
 
 function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRow[] {
   const rows: NavRow[] = []
+  const gatewayInvites = Array.isArray((state as { gatewayInvites?: unknown[] }).gatewayInvites)
+    ? state.gatewayInvites
+    : []
   for (const root of ROOT_NAV_ORDER) {
     let rootLabel = ROOT_NAV_LABELS[root]
     if (root === 'groups') rootLabel = 'Groups'
@@ -380,6 +384,14 @@ function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRo
         expanded: false
       })
       rows.push({
+        id: 'invites:gateway',
+        label: `Gateway Invites (${gatewayInvites.length})`,
+        depth: 1,
+        parent: 'invites',
+        isParent: false,
+        expanded: false
+      })
+      rows.push({
         id: 'invites:chat',
         label: `Chat Invites (${state.chatInvites.length})`,
         depth: 1,
@@ -415,6 +427,9 @@ function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRo
 }
 
 function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[] {
+  const gatewayInvites = Array.isArray((state as { gatewayInvites?: unknown[] }).gatewayInvites)
+    ? state.gatewayInvites
+    : []
   if (node === 'dashboard') {
     return [
       {
@@ -619,6 +634,12 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
         data: null
       },
       {
+        key: 'invites:gateway',
+        label: `Gateway Invites (${gatewayInvites.length})`,
+        kind: 'summary',
+        data: null
+      },
+      {
         key: 'invites:chat',
         label: `Chat Invites (${state.chatInvites.length})`,
         kind: 'summary',
@@ -638,6 +659,15 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
       key: invite.id,
       label: `${shortText(invite.groupName || invite.groupId, 24)} · members:${invite.event?.tags?.filter((tag) => tag[0] === 'p').length || 0} · by:${shortId(invite.event.pubkey, 8)}`,
       kind: 'group-invite',
+      data: invite
+    }))
+  }
+
+  if (node === 'invites:gateway') {
+    return gatewayInvites.map((invite) => ({
+      key: invite.id,
+      label: `${shortText(invite.origin, 30)} · by:${shortId(invite.operatorPubkey || '', 8)} · ${new Date(invite.createdAt * 1000).toLocaleDateString()}`,
+      kind: 'gateway-invite',
       data: invite
     }))
   }
@@ -710,6 +740,7 @@ function splitNode(node: NavNodeId): boolean {
     || node === 'groups:create'
     || node === 'chats:create'
     || node === 'invites:group'
+    || node === 'invites:gateway'
     || node === 'invites:chat'
     || node === 'invites:send'
     || node === 'files'
@@ -800,6 +831,13 @@ function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: C
       'Group details',
       'Admin details',
       `Members (${members})`,
+      'Accept invite',
+      'Dismiss invite'
+    ]
+  }
+  if (node === 'invites:gateway') {
+    return [
+      'Gateway details',
       'Accept invite',
       'Dismiss invite'
     ]
@@ -914,6 +952,9 @@ function splitBottomRows(
   selectedAction: string,
   paneActionMessage: string | null
 ): string[] {
+  const gatewayJoinRequests = Array.isArray((state as { gatewayJoinRequests?: unknown[] }).gatewayJoinRequests)
+    ? state.gatewayJoinRequests
+    : []
   if (node === 'groups:browse') {
     const group = selectedRow?.data as any
     if (!group) return ['No group selected']
@@ -1029,6 +1070,26 @@ function splitBottomRows(
     }
   }
 
+  if (node === 'invites:gateway') {
+    const invite = selectedRow?.data as any
+    if (!invite) return ['No gateway invite selected']
+    if (selectedAction.startsWith('Gateway details')) {
+      const requests = gatewayJoinRequests
+        .filter((entry) => entry.origin === invite.origin)
+        .slice(0, 5)
+      return [
+        `origin: ${invite.origin}`,
+        `operator: ${invite.operatorPubkey || '-'}`,
+        `created: ${invite.createdAt ? new Date(invite.createdAt * 1000).toLocaleString() : '-'}`,
+        `join requests tracked: ${gatewayJoinRequests.filter((entry) => entry.origin === invite.origin).length}`,
+        ...requests.map((entry) => `request · ${new Date((entry.createdAt || 0) * 1000).toLocaleString()} · ${shortId(entry.requesterPubkey, 10)}`)
+      ]
+    }
+    if (selectedAction.startsWith('Accept invite') || selectedAction.startsWith('Dismiss invite')) {
+      return [paneActionMessage || 'Press Enter to execute this action']
+    }
+  }
+
   if (node === 'invites:chat') {
     const invite = selectedRow?.data as any
     if (!invite) return ['No invite selected']
@@ -1129,6 +1190,7 @@ async function refreshNode(controller: AppController, node: NavNodeId, selectedR
       break
     case 'invites':
     case 'invites:group':
+    case 'invites:gateway':
     case 'invites:chat':
       await Promise.all([controller.refreshInvites(), controller.refreshChats()])
       break
@@ -1716,6 +1778,15 @@ export function App({
             conversationId: invite.conversationId || null
           }
         }
+        if (row.kind === 'gateway-invite') {
+          const invite = row.data as any
+          return {
+            kind: 'gateway',
+            id: invite.id,
+            origin: invite.origin,
+            inviteToken: invite.inviteToken || null
+          }
+        }
         return null
       },
       resolveSelectedRelay: () => {
@@ -2101,6 +2172,24 @@ export function App({
           setPaneActionMessage('Dismissing invite…')
           await controller.dismissGroupInvite(invite.id)
           setPaneActionMessage('Invite dismissed')
+          await controller.refreshInvites()
+          return
+        }
+      }
+
+      if (selectedNode === 'invites:gateway' && selectedCenterRow.kind === 'gateway-invite') {
+        const invite = selectedCenterRow.data as any
+        if (selectedRightTopAction.startsWith('Accept invite')) {
+          setPaneActionMessage('Accepting gateway invite…')
+          await controller.acceptGatewayInvite(invite.id)
+          setPaneActionMessage('Gateway invite accepted')
+          await controller.refreshInvites()
+          return
+        }
+        if (selectedRightTopAction.startsWith('Dismiss invite')) {
+          setPaneActionMessage('Dismissing gateway invite…')
+          await controller.dismissGatewayInvite(invite.id)
+          setPaneActionMessage('Gateway invite dismissed')
           await controller.refreshInvites()
           return
         }

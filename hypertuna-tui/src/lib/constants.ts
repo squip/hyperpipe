@@ -38,7 +38,7 @@ export type ParentNavId = (typeof PARENT_NAV_IDS)[number]
 
 export const GROUP_CHILD_NAV_IDS = ['groups:browse', 'groups:my', 'groups:create'] as const
 export const CHAT_CHILD_NAV_IDS = ['chats:create'] as const
-export const INVITE_CHILD_NAV_IDS = ['invites:group', 'invites:chat', 'invites:send'] as const
+export const INVITE_CHILD_NAV_IDS = ['invites:group', 'invites:gateway', 'invites:chat', 'invites:send'] as const
 
 export const FILE_CHILD_NAV_IDS = FILE_FAMILY_ORDER.map((family) => `files:type:${family}`) as readonly `files:type:${FileFamily}`[]
 

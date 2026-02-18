@@ -19,6 +19,9 @@ import type {
   FileControls,
   FileFamilyCounts,
   FileSortKey,
+  GatewayInviteEvent,
+  GatewayJoinRequestEvent,
+  GatewayMetadataEvent,
   GroupNoteRecord,
   GroupComposeDraft,
   GroupControls,
@@ -145,8 +148,11 @@ export type ControllerState = {
   searchQuery: string
   myGroupList: GroupListEntry[]
   groupDiscover: GroupSummary[]
+  gatewayMetadata: GatewayMetadataEvent[]
   myGroups: GroupSummary[]
   groupInvites: GroupInvite[]
+  gatewayInvites: GatewayInviteEvent[]
+  gatewayJoinRequests: GatewayJoinRequestEvent[]
   groupJoinRequests: Record<string, GroupJoinRequest[]>
   invitesInbox: InvitesInboxItem[]
   chatUnreadTotal: number
@@ -191,6 +197,8 @@ export type ControllerState = {
   dismissedGroupInviteIds: string[]
   acceptedGroupInviteIds: string[]
   acceptedGroupInviteGroupIds: string[]
+  dismissedGatewayInviteIds: string[]
+  acceptedGatewayInviteIds: string[]
   dismissedChatInviteIds: string[]
   acceptedChatInviteIds: string[]
   acceptedChatInviteConversationIds: string[]
@@ -407,6 +415,8 @@ const GROUP_METADATA_TIMEOUT_MS = 2_500
 const LOCAL_PROFILE_CACHE_TTL_MS = 5_000
 const CREATE_RELAY_RECONCILE_TIMEOUT_MS = 90_000
 const CREATE_RELAY_RECONCILE_POLL_MS = 1_500
+const GATEWAY_AUTH_REFRESH_SKEW_MS = 30_000
+const GATEWAY_AUTH_DEFAULT_TTL_SEC = 120
 
 type LocalRelayProfileSnapshot = {
   relayKey: string
@@ -459,6 +469,7 @@ export class TuiController {
   private profileNameCache = new Map<string, string>()
   private localProfileCache: { loadedAt: number; entries: LocalRelayProfileSnapshot[] } | null = null
   private gatewayPeerRelayMap: Record<string, string[]> = {}
+  private gatewayAuthTokenCache = new Map<string, { token: string; expiresAtMs: number }>()
 
   private state: ControllerState = {
     initialized: false,
@@ -495,8 +506,11 @@ export class TuiController {
     searchQuery: '',
     myGroupList: [],
     groupDiscover: [],
+    gatewayMetadata: [],
     myGroups: [],
     groupInvites: [],
+    gatewayInvites: [],
+    gatewayJoinRequests: [],
     groupJoinRequests: {},
     invitesInbox: [],
     chatUnreadTotal: 0,
@@ -537,6 +551,8 @@ export class TuiController {
     dismissedGroupInviteIds: [],
     acceptedGroupInviteIds: [],
     acceptedGroupInviteGroupIds: [],
+    dismissedGatewayInviteIds: [],
+    acceptedGatewayInviteIds: [],
     dismissedChatInviteIds: [],
     acceptedChatInviteIds: [],
     acceptedChatInviteConversationIds: [],
@@ -614,8 +630,11 @@ export class TuiController {
       searchResults: this.state.searchResults.map((result) => ({ ...result })),
       myGroupList: this.state.myGroupList.map((entry) => ({ ...entry })),
       groupDiscover: this.state.groupDiscover.map((group) => ({ ...group })),
+      gatewayMetadata: this.state.gatewayMetadata.map((entry) => ({ ...entry })),
       myGroups: this.state.myGroups.map((group) => ({ ...group })),
       groupInvites: this.state.groupInvites.map((invite) => ({ ...invite })),
+      gatewayInvites: this.state.gatewayInvites.map((invite) => ({ ...invite })),
+      gatewayJoinRequests: this.state.gatewayJoinRequests.map((entry) => ({ ...entry })),
       groupJoinRequests: Object.fromEntries(
         Object.entries(this.state.groupJoinRequests).map(([key, value]) => [key, value.map((row) => ({ ...row }))])
       ),
@@ -657,6 +676,8 @@ export class TuiController {
       dismissedGroupInviteIds: [...this.state.dismissedGroupInviteIds],
       acceptedGroupInviteIds: [...this.state.acceptedGroupInviteIds],
       acceptedGroupInviteGroupIds: [...this.state.acceptedGroupInviteGroupIds],
+      dismissedGatewayInviteIds: [...this.state.dismissedGatewayInviteIds],
+      acceptedGatewayInviteIds: [...this.state.acceptedGatewayInviteIds],
       dismissedChatInviteIds: [...this.state.dismissedChatInviteIds],
       acceptedChatInviteIds: [...this.state.acceptedChatInviteIds],
       acceptedChatInviteConversationIds: [...this.state.acceptedChatInviteConversationIds],
@@ -674,9 +695,11 @@ export class TuiController {
     const refreshTriggers = [
       'files',
       'groupInvites',
+      'gatewayInvites',
       'invites',
       'myGroupList',
       'groupDiscover',
+      'gatewayMetadata',
       'groups',
       'conversations',
       'chatInvites'
@@ -856,6 +879,7 @@ export class TuiController {
 
     const invitesInbox = buildInvitesInbox({
       groupInvites: this.state.groupInvites,
+      gatewayInvites: this.state.gatewayInvites,
       chatInvites: this.state.chatInvites
     })
 
@@ -872,7 +896,180 @@ export class TuiController {
     }
     this.state.chatUnreadTotal = selectChatUnreadTotal(this.state.conversations)
     this.state.chatPendingInviteCount = selectChatPendingInviteCount(this.state.chatInvites)
-    this.state.invitesCount = selectInvitesCount(this.state.groupInvites, this.state.chatInvites)
+    this.state.invitesCount = selectInvitesCount(
+      this.state.groupInvites,
+      this.state.gatewayInvites,
+      this.state.chatInvites
+    )
+  }
+
+  private async readJsonResponse(response: Response): Promise<any> {
+    const text = await response.text().catch(() => '')
+    if (!text) return null
+    try {
+      return JSON.parse(text)
+    } catch {
+      return null
+    }
+  }
+
+  private parseGatewayAuthError(payload: any, fallback: string): string {
+    if (payload && typeof payload === 'object') {
+      const error = typeof payload.error === 'string' ? payload.error.trim() : ''
+      if (error) return error
+      const reason = typeof payload.reason === 'string' ? payload.reason.trim() : ''
+      if (reason) return reason
+    }
+    return fallback
+  }
+
+  private normalizeGatewayOrigin(value: string): string {
+    const origin = String(value || '').trim()
+    if (!origin) return ''
+    try {
+      return new URL(origin).origin
+    } catch {
+      return origin.replace(/\/+$/, '')
+    }
+  }
+
+  private buildGatewayAuthCacheKey(args: {
+    origin: string
+    pubkey: string
+    scope: string
+    relayKey?: string | null
+  }): string {
+    const origin = this.normalizeGatewayOrigin(args.origin).toLowerCase()
+    const pubkey = String(args.pubkey || '').trim().toLowerCase()
+    const scope = String(args.scope || '').trim()
+    const relayKey = String(args.relayKey || '').trim().toLowerCase()
+    return `${origin}|${pubkey}|${scope}|${relayKey}`
+  }
+
+  private pruneGatewayAuthTokenCache(nowMs = Date.now()): void {
+    for (const [key, entry] of this.gatewayAuthTokenCache.entries()) {
+      if (!entry.token || entry.expiresAtMs <= nowMs) {
+        this.gatewayAuthTokenCache.delete(key)
+      }
+    }
+  }
+
+  private invalidateGatewayAuthToken(args: {
+    origin: string
+    pubkey: string
+    scope: string
+    relayKey?: string | null
+  }): void {
+    const cacheKey = this.buildGatewayAuthCacheKey(args)
+    if (cacheKey) {
+      this.gatewayAuthTokenCache.delete(cacheKey)
+    }
+  }
+
+  private async issueGatewayBearerToken(args: {
+    origin: string
+    pubkey: string
+    nsecHex: string
+    scope: string
+    relayKey?: string | null
+    forceRefresh?: boolean
+  }): Promise<string> {
+    const origin = this.normalizeGatewayOrigin(args.origin)
+    const pubkey = String(args.pubkey || '').trim().toLowerCase()
+    const scope = String(args.scope || '').trim()
+    if (!origin) throw new Error('gateway origin is required')
+    if (!pubkey) throw new Error('pubkey is required')
+    if (!scope) throw new Error('scope is required')
+
+    const cacheKey = this.buildGatewayAuthCacheKey({
+      origin,
+      pubkey,
+      scope,
+      relayKey: args.relayKey
+    })
+    const now = Date.now()
+    this.pruneGatewayAuthTokenCache(now)
+    if (!args.forceRefresh) {
+      const cached = this.gatewayAuthTokenCache.get(cacheKey)
+      if (cached && cached.expiresAtMs - GATEWAY_AUTH_REFRESH_SKEW_MS > now) {
+        return cached.token
+      }
+    }
+
+    const challengeResponse = await fetch(`${origin}/api/auth/challenge`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        pubkey,
+        scope,
+        relayKey: args.relayKey || null
+      })
+    })
+    const challengePayload = await this.readJsonResponse(challengeResponse)
+    if (!challengeResponse.ok) {
+      throw new Error(
+        this.parseGatewayAuthError(
+          challengePayload,
+          `challenge failed (${challengeResponse.status})`
+        )
+      )
+    }
+
+    const challengeId = String(challengePayload?.challengeId || challengePayload?.challenge_id || '').trim()
+    const nonce = String(challengePayload?.nonce || '').trim()
+    if (!challengeId || !nonce) {
+      throw new Error('challenge response missing challengeId/nonce')
+    }
+
+    const tags: string[][] = [
+      ['challenge', nonce],
+      ['scope', scope]
+    ]
+    if (args.relayKey) {
+      tags.push(['relay', String(args.relayKey)])
+    }
+
+    const authEvent = signDraftEvent(args.nsecHex, {
+      kind: 22242,
+      created_at: eventNow(),
+      tags,
+      content: ''
+    })
+
+    const verifyResponse = await fetch(`${origin}/api/auth/verify`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        challengeId,
+        authEvent
+      })
+    })
+    const verifyPayload = await this.readJsonResponse(verifyResponse)
+    if (!verifyResponse.ok) {
+      throw new Error(
+        this.parseGatewayAuthError(
+          verifyPayload,
+          `auth verify failed (${verifyResponse.status})`
+        )
+      )
+    }
+    const token = String(verifyPayload?.token || '').trim()
+    if (!token) {
+      throw new Error('auth verify response missing token')
+    }
+    const expiresInSec = Number(verifyPayload?.expiresIn ?? verifyPayload?.expires_in)
+    const ttlSec = Number.isFinite(expiresInSec) && expiresInSec > 0
+      ? Math.floor(expiresInSec)
+      : GATEWAY_AUTH_DEFAULT_TTL_SEC
+    this.gatewayAuthTokenCache.set(cacheKey, {
+      token,
+      expiresAtMs: Date.now() + ttlSec * 1000
+    })
+    return token
   }
 
   private requireSession(): AccountSession {
@@ -915,6 +1112,8 @@ export class TuiController {
       dismissedGroupInviteIds: scoped.dismissedGroupInviteIds,
       acceptedGroupInviteIds: scoped.acceptedGroupInviteIds,
       acceptedGroupInviteGroupIds: scoped.acceptedGroupInviteGroupIds,
+      dismissedGatewayInviteIds: scoped.dismissedGatewayInviteIds || [],
+      acceptedGatewayInviteIds: scoped.acceptedGatewayInviteIds || [],
       dismissedChatInviteIds: scoped.dismissedChatInviteIds,
       acceptedChatInviteIds: scoped.acceptedChatInviteIds,
       acceptedChatInviteConversationIds: scoped.acceptedChatInviteConversationIds,
@@ -952,6 +1151,8 @@ export class TuiController {
     dismissedGroupInviteIds?: string[]
     acceptedGroupInviteIds?: string[]
     acceptedGroupInviteGroupIds?: string[]
+    dismissedGatewayInviteIds?: string[]
+    acceptedGatewayInviteIds?: string[]
     dismissedChatInviteIds?: string[]
     acceptedChatInviteIds?: string[]
     acceptedChatInviteConversationIds?: string[]
@@ -2978,6 +3179,11 @@ export class TuiController {
     isOpen?: boolean
     fileSharing?: boolean
     picture?: string
+    gateways?: Array<{
+      origin: string
+      operatorPubkey: string
+      policy: 'OPEN' | 'CLOSED'
+    }>
   }): Promise<Record<string, unknown>> {
     return await this.runTask('Create relay', async () => {
       await this.ensureWorkerReadyForOperation('create relay')
@@ -3042,6 +3248,7 @@ export class TuiController {
           picture: input.picture || undefined,
           isPublic: typeof input.isPublic === 'boolean' ? input.isPublic : true,
           isOpen: typeof input.isOpen === 'boolean' ? input.isOpen : true,
+          gateways: Array.isArray(input.gateways) ? input.gateways : undefined,
           adminPubkey: session?.pubkey || null,
           adminName: null,
           members: session?.pubkey ? [session.pubkey] : [],
@@ -3616,12 +3823,13 @@ export class TuiController {
     await this.runTask('Refresh groups', async () => {
       const discoveryRelays = this.searchableRelayUrls(18)
       const myListRelays = this.searchableRelayUrls(14)
-      const [groups, loadedMyGroupList, localGroups] = await Promise.all([
+      const [groups, loadedMyGroupList, localGroups, gatewayMetadata] = await Promise.all([
         this.groupService.discoverGroups(discoveryRelays, 220),
         this.state.session
           ? this.groupService.loadMyGroupList(myListRelays, this.state.session.pubkey)
           : Promise.resolve(this.state.myGroupList),
-        this.loadLocalDiscoveryGroups().catch(() => [])
+        this.loadLocalDiscoveryGroups().catch(() => []),
+        this.groupService.discoverGatewayMetadata(discoveryRelays, 320).catch(() => [])
       ])
       const relayBackfillEntries = this.deriveMyGroupListFromConnectedRelays()
       const myGroupList = this.mergeMyGroupList(loadedMyGroupList, relayBackfillEntries)
@@ -3651,7 +3859,10 @@ export class TuiController {
       const mergedGroups = Array.from(groupMap.values())
       const enrichedGroups = await this.enrichGroupMetadata(mergedGroups)
       this.rawGroupDiscover = enrichedGroups.map((group) => ({ ...group }))
-      this.patchState({ myGroupList })
+      this.patchState({
+        myGroupList,
+        gatewayMetadata
+      })
 
       const loadedKeys = new Set(loadedMyGroupList.map((entry) => groupListEntryKey(entry)))
       const mergedKeys = new Set(myGroupList.map((entry) => groupListEntryKey(entry)))
@@ -3672,8 +3883,52 @@ export class TuiController {
           .map((group) => group.adminPubkey || group.event?.pubkey || '')
           .filter(Boolean)
       )
+      await this.syncGroupGatewayOriginsToWorker(enrichedGroups).catch((error) => {
+        this.log('warn', `Failed syncing group gateway origins to worker: ${error instanceof Error ? error.message : String(error)}`)
+      })
       this.syncGroupView()
     }, { dedupeKey: 'refresh:groups', retries: 0 })
+  }
+
+  private async syncGroupGatewayOriginsToWorker(groups: GroupSummary[]): Promise<void> {
+    const entries = (Array.isArray(groups) ? groups : [])
+      .map((group) => {
+        const groupId = String(group?.id || '').trim()
+        if (!groupId) return null
+        const gatewayOrigins = Array.from(
+          new Set(
+            (Array.isArray(group?.gateways) ? group.gateways : [])
+              .map((entry) => String(entry?.origin || '').trim())
+              .filter(Boolean)
+          )
+        )
+        if (!gatewayOrigins.length) return null
+        const updatedAt =
+          Number.isFinite(group?.event?.created_at) && Number(group.event.created_at) > 0
+            ? Math.trunc(Number(group.event.created_at) * 1000)
+            : Date.now()
+        return {
+          groupId,
+          gatewayOrigins,
+          sourceEventId: typeof group?.event?.id === 'string' ? group.event.id : undefined,
+          updatedAt
+        }
+      })
+      .filter((entry): entry is {
+        groupId: string
+        gatewayOrigins: string[]
+        sourceEventId?: string
+        updatedAt?: number
+      } => !!entry)
+
+    if (!entries.length) return
+    const sent = await this.workerHost.send({
+      type: 'sync-group-gateway-origins',
+      data: entries
+    })
+    if (!sent.success) {
+      this.log('warn', `Worker rejected gateway origin sync: ${sent.error || 'unknown error'}`)
+    }
   }
 
   async refreshInvites(): Promise<void> {
@@ -3686,12 +3941,16 @@ export class TuiController {
 
     await this.runTask('Refresh invites', async () => {
       const session = this.requireSession()
-      const invites = await this.withTimeout(
-        this.groupService.discoverInvites(
-          this.searchableRelayUrls(),
-          session.pubkey,
-          async (pubkey, ciphertext) => nip04Decrypt(session.nsecHex, pubkey, ciphertext)
-        ),
+      const [invites, gatewayInvitesRaw, gatewayJoinRequests] = await this.withTimeout(
+        Promise.all([
+          this.groupService.discoverInvites(
+            this.searchableRelayUrls(),
+            session.pubkey,
+            async (pubkey, ciphertext) => nip04Decrypt(session.nsecHex, pubkey, ciphertext)
+          ),
+          this.groupService.discoverGatewayInvites(this.searchableRelayUrls(), session.pubkey),
+          this.groupService.discoverGatewayJoinRequests(this.searchableRelayUrls(), session.pubkey)
+        ]),
         12_000,
         'Invite refresh'
       )
@@ -3708,12 +3967,37 @@ export class TuiController {
         acceptedInviteIds: new Set(this.state.acceptedGroupInviteIds),
         acceptedInviteGroupIds: new Set(this.state.acceptedGroupInviteGroupIds)
       })
+      const dedupedGatewayById = new Map<string, GatewayInviteEvent>()
+      for (const invite of gatewayInvitesRaw) {
+        const inviteId = String(invite.id || '').trim()
+        if (!inviteId) continue
+        const existing = dedupedGatewayById.get(inviteId)
+        if (!existing || invite.createdAt >= existing.createdAt) {
+          dedupedGatewayById.set(inviteId, invite)
+        }
+      }
+      const dismissedGateway = new Set(this.state.dismissedGatewayInviteIds)
+      const acceptedGateway = new Set(this.state.acceptedGatewayInviteIds)
+      const gatewayInvites = Array.from(dedupedGatewayById.values())
+        .filter((invite) => {
+          const inviteId = String(invite.id || '').trim()
+          if (!inviteId) return false
+          if (dismissedGateway.has(inviteId)) return false
+          if (acceptedGateway.has(inviteId)) return false
+          return true
+        })
+        .sort((left, right) => right.createdAt - left.createdAt)
       this.patchState({
         invites: filtered,
-        groupInvites: filtered
+        groupInvites: filtered,
+        gatewayInvites,
+        gatewayJoinRequests
       })
       await this.ensureAdminProfiles(
-        filtered.map((invite) => invite.event?.pubkey || '').filter(Boolean)
+        [
+          ...filtered.map((invite) => invite.event?.pubkey || ''),
+          ...gatewayInvites.map((invite) => invite.operatorPubkey || '')
+        ].filter(Boolean)
       )
     }, { dedupeKey: 'refresh:group-invites', retries: 0 })
   }
@@ -3738,6 +4022,7 @@ export class TuiController {
         writerCoreHex: target.writerCoreHex || undefined,
         autobaseLocal: target.autobaseLocal || undefined,
         writerSecret: target.writerSecret || undefined,
+        gatewayOrigins: Array.isArray(target.gatewayOrigins) ? target.gatewayOrigins : undefined,
         fastForward: target.fastForward || undefined
       })
 
@@ -3775,6 +4060,78 @@ export class TuiController {
       })
       await this.persistAccountScopedUiState({
         dismissedGroupInviteIds: this.state.dismissedGroupInviteIds
+      })
+    })
+  }
+
+  async acceptGatewayInvite(inviteId: string): Promise<void> {
+    await this.runTask('Accept gateway invite', async () => {
+      const session = this.requireSession()
+      const target = this.state.gatewayInvites.find((invite) => invite.id === inviteId)
+      if (!target) {
+        throw new Error(`Gateway invite not found: ${inviteId}`)
+      }
+
+      const authContext = {
+        origin: target.origin,
+        pubkey: session.pubkey,
+        scope: 'gateway:invite-redeem'
+      }
+
+      const redeemInvite = async (token: string) => fetch(`${target.origin}/api/gateway/invites/redeem`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          inviteToken: target.inviteToken
+        })
+      })
+
+      const bearerToken = await this.issueGatewayBearerToken({
+        ...authContext,
+        nsecHex: session.nsecHex,
+        forceRefresh: false
+      })
+      let response = await redeemInvite(bearerToken)
+      if (response.status === 401 || response.status === 403) {
+        this.invalidateGatewayAuthToken(authContext)
+        const refreshedToken = await this.issueGatewayBearerToken({
+          ...authContext,
+          nsecHex: session.nsecHex,
+          forceRefresh: true
+        })
+        response = await redeemInvite(refreshedToken)
+      }
+      if (!response.ok) {
+        throw new Error(`Gateway invite redeem failed (${response.status})`)
+      }
+
+      const nextAccepted = new Set(this.state.acceptedGatewayInviteIds)
+      nextAccepted.add(inviteId)
+      const nextInvites = this.state.gatewayInvites.filter((invite) => invite.id !== inviteId)
+      this.patchState({
+        gatewayInvites: nextInvites,
+        acceptedGatewayInviteIds: Array.from(nextAccepted)
+      })
+      await this.persistAccountScopedUiState({
+        acceptedGatewayInviteIds: this.state.acceptedGatewayInviteIds
+      })
+    })
+  }
+
+  async dismissGatewayInvite(inviteId: string): Promise<void> {
+    await this.runTask('Dismiss gateway invite', async () => {
+      const nextDismissed = new Set(this.state.dismissedGatewayInviteIds)
+      nextDismissed.add(inviteId)
+      const nextInvites = this.state.gatewayInvites.filter((invite) => invite.id !== inviteId)
+      this.patchState({
+        gatewayInvites: nextInvites,
+        dismissedGatewayInviteIds: Array.from(nextDismissed)
+      })
+      await this.persistAccountScopedUiState({
+        dismissedGatewayInviteIds: this.state.dismissedGatewayInviteIds
       })
     })
   }
@@ -3831,9 +4188,17 @@ export class TuiController {
       const groupMembers = Array.isArray(selectedGroup?.members)
         ? selectedGroup.members.filter((member) => /^[a-f0-9]{64}$/i.test(String(member || '').trim()))
         : []
+      const gatewayOrigins = Array.from(
+        new Set(
+          (Array.isArray(selectedGroup?.gateways) ? selectedGroup.gateways : [])
+            .map((entry) => String(entry?.origin || '').trim())
+            .filter(Boolean)
+        )
+      )
       const payload: Record<string, unknown> = {
         relayUrl,
         relayKey: relayKey || null,
+        gatewayOrigins,
         groupName: selectedGroup?.name || normalizedGroupId,
         groupPicture: selectedGroup?.picture || null,
         name: selectedGroup?.name || normalizedGroupId,
@@ -4038,6 +4403,13 @@ export class TuiController {
         ...payloadInput,
         relayUrl: resolvedRelayUrl,
         relayKey: resolvedRelayKey || payloadInput.relayKey || null,
+        gatewayOrigins: Array.from(
+          new Set(
+            (Array.isArray(payloadInput.gatewayOrigins) ? payloadInput.gatewayOrigins : [])
+              .map((entry) => String(entry || '').trim())
+              .filter(Boolean)
+          )
+        ),
         token: inviteToken || null,
         writerCore: writerCore || payloadInput.writerCore || null,
         writerCoreHex: writerCoreHex || payloadInput.writerCoreHex || payloadInput.writer_core_hex || null,

@@ -2829,6 +2829,47 @@ async function publishMemberAddEvent(identifier, pubkey, token, subnetHashes = [
   }
 }
 
+function normalizeGatewayOriginForTag(candidate) {
+  if (typeof candidate !== 'string') return null;
+  const trimmed = candidate.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'wss:') parsed.protocol = 'https:';
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:';
+    if (parsed.protocol === 'http:') parsed.protocol = 'https:';
+    if (parsed.protocol !== 'https:') return null;
+    return parsed.origin;
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeGatewayOperatorPubkey(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/i.test(trimmed)) return null;
+  return trimmed;
+}
+
+function normalizeGatewayPolicyTag(value) {
+  const upper = typeof value === 'string' ? value.trim().toUpperCase() : '';
+  return upper === 'CLOSED' ? 'CLOSED' : 'OPEN';
+}
+
+function buildGatewayTagsForBootstrap(gateways = []) {
+  const tags = [];
+  const seen = new Set();
+  for (const gateway of Array.isArray(gateways) ? gateways : []) {
+    const origin = normalizeGatewayOriginForTag(gateway?.origin);
+    const operatorPubkey = normalizeGatewayOperatorPubkey(gateway?.operatorPubkey);
+    if (!origin || !operatorPubkey || seen.has(origin)) continue;
+    seen.add(origin);
+    tags.push(['gateway', origin, operatorPubkey, normalizeGatewayPolicyTag(gateway?.policy)]);
+  }
+  return tags;
+}
+
 function buildCreateRelayBootstrapDraftEvents({
   publicIdentifier,
   adminPubkey,
@@ -2838,7 +2879,8 @@ function buildCreateRelayBootstrapDraftEvents({
   isOpen,
   fileSharing,
   relayWsUrl,
-  picture
+  picture,
+  gateways
 }) {
   const canonicalIdentifier = normalizeRelayIdentifier(publicIdentifier);
   const now = Math.floor(Date.now() / 1000);
@@ -2846,6 +2888,7 @@ function buildCreateRelayBootstrapDraftEvents({
   const about = description ? String(description) : '';
   const fileSharingEnabled = fileSharing !== false;
   const pictureTag = typeof picture === 'string' && picture.trim() ? picture.trim() : null;
+  const gatewayTags = buildGatewayTagsForBootstrap(gateways);
 
   const groupTags = [
     ['h', canonicalIdentifier],
@@ -2858,6 +2901,7 @@ function buildCreateRelayBootstrapDraftEvents({
     [fileSharingEnabled ? 'file-sharing-on' : 'file-sharing-off']
   ];
   if (pictureTag) groupTags.push(['picture', pictureTag, 'hypertuna:drive:pfp']);
+  groupTags.push(...gatewayTags);
 
   const metadataTags = [
     ['d', canonicalIdentifier],
@@ -2871,6 +2915,7 @@ function buildCreateRelayBootstrapDraftEvents({
     [fileSharingEnabled ? 'file-sharing-on' : 'file-sharing-off']
   ];
   if (pictureTag) metadataTags.push(['picture', pictureTag, 'hypertuna:drive:pfp']);
+  metadataTags.push(...gatewayTags);
 
   const adminTags = [
     ['h', canonicalIdentifier],
@@ -3001,7 +3046,8 @@ async function publishCreateRelayBootstrapEvents({
   isPublic,
   isOpen,
   fileSharing,
-  picture
+  picture,
+  gateways
 }) {
   const canonicalIdentifier = normalizeRelayIdentifier(publicIdentifier || relayKey || '');
   if (!canonicalIdentifier) {
@@ -3031,7 +3077,8 @@ async function publishCreateRelayBootstrapEvents({
     isOpen,
     fileSharing,
     relayWsUrl,
-    picture
+    picture,
+    gateways
   });
 
   let lastError = null;
@@ -4605,15 +4652,28 @@ export async function createRelay(options) {
     isPublic = false,
     isOpen = false,
     fileSharing = true,
-    picture
+    picture,
+    gateways = []
   } = options;
+  const gatewayOrigins = Array.from(
+    new Set(
+      (Array.isArray(gateways) ? gateways : [])
+        .map((entry) => {
+          if (typeof entry === 'string') return toHttpOrigin(entry);
+          return toHttpOrigin(entry?.origin || null);
+        })
+        .filter(Boolean)
+    )
+  );
   console.log('[RelayServer] Creating relay via adapter:', {
     name,
     description,
     isPublic,
     isOpen,
     fileSharing,
-    hasPicture: typeof picture === 'string' && !!picture.trim()
+    hasPicture: typeof picture === 'string' && !!picture.trim(),
+    gatewayCount: Array.isArray(gateways) ? gateways.length : 0,
+    gatewayOrigins
   });
 
   const result = await createRelayManager({
@@ -4622,7 +4682,8 @@ export async function createRelay(options) {
     isPublic,
     isOpen,
     fileSharing,
-    config
+    config,
+    gatewayOrigins
   });
   
   if (result.success) {
@@ -4769,7 +4830,8 @@ export async function createRelay(options) {
         isPublic,
         isOpen,
         fileSharing,
-        picture
+        picture,
+        gateways
       });
       bootstrapPublish.status = bootstrapResult.ok ? 'success' : 'failed';
       bootstrapPublish.attempt = bootstrapResult.attempt || 0;
@@ -4857,9 +4919,18 @@ async function preseedJoinMetadata({
   userPubkey,
   authToken,
   storageDir,
-  reason
+  reason,
+  gatewayOrigins = []
 }) {
   if (!relayKey || !userPubkey || !authToken) return null;
+
+  const normalizedGatewayOrigins = Array.from(
+    new Set(
+      (Array.isArray(gatewayOrigins) ? gatewayOrigins : [])
+        .map((entry) => toHttpOrigin(typeof entry === 'string' ? entry : entry?.origin || null))
+        .filter(Boolean)
+    )
+  );
 
   const resolvedStorageDir =
     storageDir || join(config.storage || './data', 'relays', relayKey);
@@ -4884,7 +4955,8 @@ async function preseedJoinMetadata({
       member_adds: config.nostr_pubkey_hex
         ? [{ pubkey: config.nostr_pubkey_hex, ts: Date.now() }]
         : [],
-      member_removes: []
+      member_removes: [],
+      gateway_origins: normalizedGatewayOrigins
     };
     await saveRelayProfile(profile);
   } else {
@@ -4896,6 +4968,28 @@ async function preseedJoinMetadata({
     if (resolvedStorageDir && !profile.relay_storage) {
       profile.relay_storage = resolvedStorageDir;
       changed = true;
+    }
+    if (normalizedGatewayOrigins.length) {
+      const currentGatewayOrigins = Array.from(
+        new Set(
+          [
+            ...(Array.isArray(profile.gateway_origins) ? profile.gateway_origins : []),
+            ...(Array.isArray(profile.gatewayOrigins) ? profile.gatewayOrigins : [])
+          ]
+            .map((entry) => toHttpOrigin(entry))
+            .filter(Boolean)
+        )
+      );
+      const mergedGatewayOrigins = Array.from(
+        new Set([...currentGatewayOrigins, ...normalizedGatewayOrigins])
+      );
+      const unchanged =
+        mergedGatewayOrigins.length === currentGatewayOrigins.length
+        && mergedGatewayOrigins.every((entry, index) => entry === currentGatewayOrigins[index]);
+      if (!unchanged) {
+        profile.gateway_origins = mergedGatewayOrigins;
+        changed = true;
+      }
     }
     if (changed) {
       await saveRelayProfile(profile);
@@ -4934,8 +5028,16 @@ export async function startJoinAuthentication(options) {
     autobaseLocal = null,
     coreRefs = [],
     writerCoreRefs = [],
-    fastForward = null
+    fastForward = null,
+    gatewayOrigins = []
   } = options;
+  const normalizedGatewayOrigins = Array.from(
+    new Set(
+      (Array.isArray(gatewayOrigins) ? gatewayOrigins : [])
+        .map((entry) => toHttpOrigin(typeof entry === 'string' ? entry : entry?.origin || null))
+        .filter(Boolean)
+    )
+  );
   const expectedWriter = resolveExpectedWriterKey({ writerCoreHex, autobaseLocal, writerCore });
   const expectedWriterKey = expectedWriter.expectedWriterKey;
   const expectedWriterSource = expectedWriter.source;
@@ -5033,7 +5135,8 @@ export async function startJoinAuthentication(options) {
     openJoin,
     resolvedCoreRefsSource,
     resolvedCoreRefsCount: coreRefsForJoin.length,
-    checkpointInJoinRefs
+    checkpointInJoinRefs,
+    gatewayOrigins: normalizedGatewayOrigins
   });
   console.log('[RelayServer][WriterMaterial] Join auth writer material', {
     publicIdentifier,
@@ -5209,7 +5312,8 @@ export async function startJoinAuthentication(options) {
           userPubkey,
           authToken: inviteToken,
           storageDir: join(config.storage || './data', 'relays', fallbackRelayKey),
-          reason: 'blind-peer-fallback'
+          reason: 'blind-peer-fallback',
+          gatewayOrigins: normalizedGatewayOrigins
         });
 
         await joinRelayManager({
@@ -5228,7 +5332,8 @@ export async function startJoinAuthentication(options) {
           fastForward,
           expectedWriterKey,
           suppressInitMessage: true,
-          useSharedCorestore: true
+          useSharedCorestore: true,
+          gatewayOrigins: normalizedGatewayOrigins
         });
         await applyPendingAuthUpdates(updateRelayAuthToken, fallbackRelayKey, publicIdentifier);
 
@@ -5579,7 +5684,8 @@ export async function startJoinAuthentication(options) {
           userPubkey,
           authToken: provisionalToken,
           storageDir: join(config.storage || './data', 'relays', fallbackRelayKey),
-          reason: 'open-offline'
+          reason: 'open-offline',
+          gatewayOrigins: normalizedGatewayOrigins
         });
 
         await joinRelayManager({
@@ -5598,7 +5704,8 @@ export async function startJoinAuthentication(options) {
           fastForward,
           expectedWriterKey,
           suppressInitMessage: true,
-          useSharedCorestore: true
+          useSharedCorestore: true,
+          gatewayOrigins: normalizedGatewayOrigins
         });
         await applyPendingAuthUpdates(updateRelayAuthToken, fallbackRelayKey, publicIdentifier);
 
@@ -5841,7 +5948,8 @@ export async function startJoinAuthentication(options) {
       userPubkey,
       authToken,
       storageDir: join(config.storage || './data', 'relays', relayKey),
-      reason: 'direct-join'
+      reason: 'direct-join',
+      gatewayOrigins: normalizedGatewayOrigins
     });
 
     // Join the relay locally so we have a profile and key mapping
@@ -5857,7 +5965,8 @@ export async function startJoinAuthentication(options) {
       blindPeer,
       coreRefs: directCoreRefs,
       fastForward,
-      expectedWriterKey: finalExpectedWriterKey
+      expectedWriterKey: finalExpectedWriterKey,
+      gatewayOrigins: normalizedGatewayOrigins
     });
     await applyPendingAuthUpdates(updateRelayAuthToken, relayKey, finalIdentifier);
 

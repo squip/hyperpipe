@@ -242,8 +242,10 @@ function parseJsonFromLine(line) {
 }
 
 function parseWorkerLogContent(content) {
-  const telemetry = []
-  const fanout = []
+  const joinTelemetry = []
+  const autoconnectTelemetry = []
+  const joinFanout = []
+  const autoconnectFanout = []
   const failFastSignals = []
 
   for (const line of content.split(/\r?\n/)) {
@@ -255,6 +257,12 @@ function parseWorkerLogContent(content) {
         reason: 'JOIN_FAIL_FAST_ABORT'
       })
     }
+    if (line.includes('AUTOCONNECT_FAIL_FAST_ABORT')) {
+      failFastSignals.push({
+        line,
+        reason: 'AUTOCONNECT_FAIL_FAST_ABORT'
+      })
+    }
 
     const parsed = parseJsonFromLine(line)
     if (!parsed || typeof parsed !== 'object') {
@@ -262,7 +270,7 @@ function parseWorkerLogContent(content) {
     }
 
     if (parsed?.type === 'join-telemetry' && parsed?.data && typeof parsed.data === 'object') {
-      telemetry.push(parsed.data)
+      joinTelemetry.push(parsed.data)
       if (parsed.data.eventType === 'JOIN_FAIL_FAST_ABORT') {
         failFastSignals.push({
           reason: parsed.data.reasonCode || 'join-fail-fast',
@@ -273,11 +281,27 @@ function parseWorkerLogContent(content) {
       continue
     }
 
-    if (parsed?.eventType && typeof parsed.eventType === 'string') {
-      telemetry.push(parsed)
-      if (parsed.eventType === 'JOIN_FAIL_FAST_ABORT') {
+    if (parsed?.type === 'autoconnect-telemetry' && parsed?.data && typeof parsed.data === 'object') {
+      autoconnectTelemetry.push(parsed.data)
+      if (parsed.data.eventType === 'AUTOCONNECT_FAIL_FAST_ABORT') {
         failFastSignals.push({
-          reason: parsed.reasonCode || 'join-fail-fast',
+          reason: parsed.data.reasonCode || 'autoconnect-fail-fast',
+          traceId: parsed.data.traceId || null,
+          payload: parsed.data
+        })
+      }
+      continue
+    }
+
+    if (parsed?.eventType && typeof parsed.eventType === 'string') {
+      if (parsed.eventType.startsWith('AUTOCONNECT_')) {
+        autoconnectTelemetry.push(parsed)
+      } else {
+        joinTelemetry.push(parsed)
+      }
+      if (parsed.eventType === 'JOIN_FAIL_FAST_ABORT' || parsed.eventType === 'AUTOCONNECT_FAIL_FAST_ABORT') {
+        failFastSignals.push({
+          reason: parsed.reasonCode || 'telemetry-fail-fast',
           traceId: parsed.traceId || null,
           payload: parsed
         })
@@ -286,26 +310,40 @@ function parseWorkerLogContent(content) {
     }
 
     if (parsed?.type === 'join-fanout-summary' && parsed?.data && typeof parsed.data === 'object') {
-      fanout.push(parsed.data)
+      joinFanout.push(parsed.data)
+      continue
+    }
+
+    if (parsed?.type === 'autoconnect-fanout-summary' && parsed?.data && typeof parsed.data === 'object') {
+      autoconnectFanout.push(parsed.data)
       continue
     }
 
     if (parsed?.traceId && parsed?.results && Array.isArray(parsed.results) && Number.isFinite(parsed.successCount)) {
-      fanout.push(parsed)
+      const trace = typeof parsed.traceId === 'string' ? parsed.traceId : ''
+      if (trace.startsWith('autoconnect-')) {
+        autoconnectFanout.push(parsed)
+      } else {
+        joinFanout.push(parsed)
+      }
     }
   }
 
   return {
-    telemetry,
-    fanout,
+    joinTelemetry,
+    autoconnectTelemetry,
+    joinFanout,
+    autoconnectFanout,
     failFastSignals
   }
 }
 
 async function parseWorkerLogs(files = []) {
   const combined = {
-    telemetry: [],
-    fanout: [],
+    joinTelemetry: [],
+    autoconnectTelemetry: [],
+    joinFanout: [],
+    autoconnectFanout: [],
     failFastSignals: []
   }
 
@@ -313,8 +351,10 @@ async function parseWorkerLogs(files = []) {
     try {
       const content = await fs.readFile(filePath, 'utf8')
       const parsed = parseWorkerLogContent(content)
-      combined.telemetry.push(...parsed.telemetry)
-      combined.fanout.push(...parsed.fanout)
+      combined.joinTelemetry.push(...parsed.joinTelemetry)
+      combined.autoconnectTelemetry.push(...parsed.autoconnectTelemetry)
+      combined.joinFanout.push(...parsed.joinFanout)
+      combined.autoconnectFanout.push(...parsed.autoconnectFanout)
       combined.failFastSignals.push(...parsed.failFastSignals)
     } catch (_) {}
   }
@@ -322,7 +362,7 @@ async function parseWorkerLogs(files = []) {
   return combined
 }
 
-function selectPrimaryTrace(telemetry = []) {
+function selectPrimaryTrace(telemetry = [], prefix = 'JOIN') {
   const traces = new Map()
   for (const event of telemetry) {
     const traceId = typeof event?.traceId === 'string' && event.traceId.trim()
@@ -336,8 +376,8 @@ function selectPrimaryTrace(telemetry = []) {
   let bestTraceId = null
   let bestScore = -1
   for (const [traceId, events] of traces.entries()) {
-    const hasConfirmed = events.some((event) => event?.eventType === 'JOIN_WRITABLE_CONFIRMED')
-    const hasStart = events.some((event) => event?.eventType === 'JOIN_START')
+    const hasConfirmed = events.some((event) => event?.eventType === `${prefix}_WRITABLE_CONFIRMED`)
+    const hasStart = events.some((event) => event?.eventType === `${prefix}_START`)
     const score = (hasConfirmed ? 1000 : 0) + (hasStart ? 100 : 0) + events.length
     if (score > bestScore) {
       bestScore = score
@@ -352,8 +392,8 @@ function selectPrimaryTrace(telemetry = []) {
   }
 }
 
-function findWritableViewLength(primaryEvents = []) {
-  const confirmed = primaryEvents.find((entry) => entry?.eventType === 'JOIN_WRITABLE_CONFIRMED') || null
+function findWritableViewLength(primaryEvents = [], prefix = 'JOIN') {
+  const confirmed = primaryEvents.find((entry) => entry?.eventType === `${prefix}_WRITABLE_CONFIRMED`) || null
   const viewLength = Number.isFinite(confirmed?.meta?.viewLength) ? Number(confirmed.meta.viewLength) : null
   const expectedViewLength = Number.isFinite(confirmed?.meta?.expectedViewLength)
     ? Number(confirmed.meta.expectedViewLength)
@@ -380,6 +420,14 @@ function selectFanoutSummary(fanout = [], traceId = null) {
     if (match) return match
   }
   return fanout[fanout.length - 1]
+}
+
+function normalizeExpectedViewLength(observedViewLength, expectedViewLength) {
+  const observed = Number.isFinite(observedViewLength) ? Number(observedViewLength) : null
+  const expected = Number.isFinite(expectedViewLength) ? Number(expectedViewLength) : null
+  if (expected !== null && expected > 0) return expected
+  if (observed !== null) return observed
+  return expected
 }
 
 function getEnvGatewayDefinitions() {
@@ -562,6 +610,24 @@ function detectFailFastLine(line) {
       reason: 'JOIN_FAIL_FAST_ABORT'
     }
   }
+  if (line.includes('AUTOCONNECT_FAIL_FAST_ABORT')) {
+    return {
+      failFast: true,
+      reason: 'AUTOCONNECT_FAIL_FAST_ABORT'
+    }
+  }
+  if (line.includes('autoconnect-writer-material-timeout')) {
+    return {
+      failFast: true,
+      reason: 'autoconnect-writer-material-timeout'
+    }
+  }
+  if (line.includes('autoconnect-writable-timeout')) {
+    return {
+      failFast: true,
+      reason: 'autoconnect-writable-timeout'
+    }
+  }
   if (line.includes('writer-material-timeout')) {
     return {
       failFast: true,
@@ -622,11 +688,50 @@ async function runScenarioExecutor(scenario, scenarioDir) {
   }
 
   const watchdog = {
-    joinStartedAtMs: null,
-    writerMaterialApplied: false,
-    fastForwardApplied: false,
-    fastForwardExpected: false,
-    writableConfirmed: false
+    join: {
+      startedAtMs: null,
+      writerMaterialApplied: false,
+      fastForwardApplied: false,
+      fastForwardExpected: false,
+      writableConfirmed: false
+    },
+    autoconnect: {
+      startedAtMs: null,
+      writerMaterialApplied: false,
+      fastForwardApplied: false,
+      fastForwardExpected: false,
+      writableConfirmed: false
+    }
+  }
+
+  const checkWatchdogStage = (stage, label) => {
+    if (!stage.startedAtMs || stage.writableConfirmed) return null
+    const elapsed = Date.now() - stage.startedAtMs
+    if (elapsed > HARD_GATES.joinToWritableMs) {
+      return {
+        failFast: true,
+        reason: label === 'autoconnect'
+          ? 'autoconnect-writable-timeout'
+          : 'join-writable-timeout'
+      }
+    }
+    if (!stage.writerMaterialApplied && elapsed > HARD_GATES.writerMaterialMs) {
+      return {
+        failFast: true,
+        reason: label === 'autoconnect'
+          ? 'autoconnect-writer-material-timeout'
+          : 'writer-material-timeout'
+      }
+    }
+    if (stage.fastForwardExpected && !stage.fastForwardApplied && elapsed > HARD_GATES.fastForwardMs) {
+      return {
+        failFast: true,
+        reason: label === 'autoconnect'
+          ? 'autoconnect-fast-forward-timeout'
+          : 'fast-forward-timeout'
+      }
+    }
+    return null
   }
 
   const onExecutorLine = (line) => {
@@ -636,20 +741,27 @@ async function runScenarioExecutor(scenario, scenarioDir) {
     const parsed = parseJsonFromLine(line)
     const telemetry = parsed?.type === 'join-telemetry'
       ? parsed?.data
-      : (parsed?.eventType ? parsed : null)
+      : (parsed?.type === 'autoconnect-telemetry'
+        ? parsed?.data
+        : (parsed?.eventType ? parsed : null))
     if (telemetry && typeof telemetry === 'object') {
-      if (telemetry.eventType === 'JOIN_START') {
-        watchdog.joinStartedAtMs = Date.now()
-        watchdog.fastForwardExpected = telemetry?.meta?.hasFastForward === true
+      const eventType = typeof telemetry.eventType === 'string' ? telemetry.eventType : ''
+      const stage = eventType.startsWith('AUTOCONNECT_')
+        ? watchdog.autoconnect
+        : watchdog.join
+
+      if (eventType.endsWith('_START')) {
+        stage.startedAtMs = Date.now()
+        stage.fastForwardExpected = telemetry?.meta?.hasFastForward === true
       }
-      if (telemetry.eventType === 'JOIN_WRITER_MATERIAL_APPLIED') {
-        watchdog.writerMaterialApplied = true
+      if (eventType.endsWith('_WRITER_MATERIAL_APPLIED')) {
+        stage.writerMaterialApplied = true
       }
-      if (telemetry.eventType === 'JOIN_FAST_FORWARD_APPLIED') {
-        watchdog.fastForwardApplied = true
+      if (eventType.endsWith('_FAST_FORWARD_APPLIED')) {
+        stage.fastForwardApplied = true
       }
-      if (telemetry.eventType === 'JOIN_WRITABLE_CONFIRMED') {
-        watchdog.writableConfirmed = true
+      if (eventType.endsWith('_WRITABLE_CONFIRMED')) {
+        stage.writableConfirmed = true
       }
       if (telemetry.eventType === 'JOIN_FAIL_FAST_ABORT') {
         return {
@@ -657,29 +769,17 @@ async function runScenarioExecutor(scenario, scenarioDir) {
           reason: telemetry.reasonCode || 'join-fail-fast'
         }
       }
+      if (telemetry.eventType === 'AUTOCONNECT_FAIL_FAST_ABORT') {
+        return {
+          failFast: true,
+          reason: telemetry.reasonCode || 'autoconnect-fail-fast'
+        }
+      }
     }
 
-    if (!watchdog.joinStartedAtMs || watchdog.writableConfirmed) return null
-    const elapsed = Date.now() - watchdog.joinStartedAtMs
-    if (elapsed > HARD_GATES.joinToWritableMs) {
-      return {
-        failFast: true,
-        reason: 'join-writable-timeout'
-      }
-    }
-    if (!watchdog.writerMaterialApplied && elapsed > HARD_GATES.writerMaterialMs) {
-      return {
-        failFast: true,
-        reason: 'writer-material-timeout'
-      }
-    }
-    if (watchdog.fastForwardExpected && !watchdog.fastForwardApplied && elapsed > HARD_GATES.fastForwardMs) {
-      return {
-        failFast: true,
-        reason: 'fast-forward-timeout'
-      }
-    }
-    return null
+    return checkWatchdogStage(watchdog.join, 'join')
+      || checkWatchdogStage(watchdog.autoconnect, 'autoconnect')
+      || null
   }
 
   const run = await runCommand('zsh', ['-lc', executor], {
@@ -740,26 +840,54 @@ async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
     : fallbackWorkerLogs
 
   const parsedWorker = await parseWorkerLogs(workerLogs)
-  const primaryTrace = selectPrimaryTrace(parsedWorker.telemetry)
-  const joinPerf = evaluateJoinPerformanceTelemetry(primaryTrace.events, {
+  const joinTrace = selectPrimaryTrace(parsedWorker.joinTelemetry, 'JOIN')
+  const autoconnectTrace = selectPrimaryTrace(parsedWorker.autoconnectTelemetry, 'AUTOCONNECT')
+
+  const joinPerf = evaluateJoinPerformanceTelemetry(joinTrace.events, {
     writableHardMs: HARD_GATES.joinToWritableMs,
     writableWarnMs: HARD_GATES.joinToWritableWarnMs,
     writerMaterialMs: HARD_GATES.writerMaterialMs,
     fastForwardMs: HARD_GATES.fastForwardMs
+  }, {
+    prefix: 'JOIN'
+  })
+  const autoconnectPerf = evaluateJoinPerformanceTelemetry(autoconnectTrace.events, {
+    writableHardMs: HARD_GATES.joinToWritableMs,
+    writableWarnMs: HARD_GATES.joinToWritableWarnMs,
+    writerMaterialMs: HARD_GATES.writerMaterialMs,
+    fastForwardMs: HARD_GATES.fastForwardMs
+  }, {
+    prefix: 'AUTOCONNECT'
   })
 
-  const fanoutSummary = selectFanoutSummary(parsedWorker.fanout, primaryTrace.traceId)
-  const fanout = evaluateFanoutResults(fanoutSummary?.results || [], {
+  const joinFanoutSummary = selectFanoutSummary(parsedWorker.joinFanout, joinTrace.traceId)
+  const joinFanout = evaluateFanoutResults(joinFanoutSummary?.results || [], {
+    minimumSuccess: HARD_GATES.minimumFanoutSuccess
+  })
+  const autoconnectFanoutSummary = selectFanoutSummary(parsedWorker.autoconnectFanout, autoconnectTrace.traceId)
+  const autoconnectFanout = evaluateFanoutResults(autoconnectFanoutSummary?.results || [], {
     minimumSuccess: HARD_GATES.minimumFanoutSuccess
   })
 
-  const writableView = findWritableViewLength(primaryTrace.events)
+  const joinWritableView = findWritableViewLength(joinTrace.events, 'JOIN')
+  const autoconnectWritableView = findWritableViewLength(autoconnectTrace.events, 'AUTOCONNECT')
   const observedViewLength = Number.isFinite(summary?.observedViewLength)
     ? Number(summary.observedViewLength)
-    : writableView.viewLength
+    : joinWritableView.viewLength
   const expectedViewLength = Number.isFinite(summary?.expectedViewLength)
     ? Number(summary.expectedViewLength)
-    : writableView.expectedViewLength
+    : joinWritableView.expectedViewLength
+  const autoconnectObservedViewLength = Number.isFinite(summary?.autoConnectObservedViewLength)
+    ? Number(summary.autoConnectObservedViewLength)
+    : autoconnectWritableView.viewLength
+  const autoconnectExpectedViewLength = Number.isFinite(summary?.autoConnectExpectedViewLength)
+    ? Number(summary.autoConnectExpectedViewLength)
+    : autoconnectWritableView.expectedViewLength
+  const normalizedExpectedViewLength = normalizeExpectedViewLength(observedViewLength, expectedViewLength)
+  const normalizedAutoconnectExpectedViewLength = normalizeExpectedViewLength(
+    autoconnectObservedViewLength,
+    autoconnectExpectedViewLength
+  )
 
   const checks = []
   checks.push({
@@ -776,30 +904,73 @@ async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
     severity: 'warning'
   })
   checks.push({
-    name: 'writer_material_stage',
+    name: 'join_writer_material_stage',
     pass: joinPerf.writerMaterialPass,
     observedMs: joinPerf.writerMaterialElapsedMs,
     thresholdMs: HARD_GATES.writerMaterialMs
   })
   checks.push({
-    name: 'fast_forward_stage',
+    name: 'join_fast_forward_stage',
     pass: joinPerf.fastForwardPass,
     observedMs: joinPerf.fastForwardElapsedMs,
     thresholdMs: HARD_GATES.fastForwardMs
   })
   checks.push({
-    name: 'fanout_success_threshold',
-    pass: fanout.passesThreshold,
-    successCount: fanout.successCount,
-    minimumSuccess: fanout.minimumSuccess
+    name: 'join_fanout_success_threshold',
+    pass: joinFanout.passesThreshold,
+    successCount: joinFanout.successCount,
+    minimumSuccess: joinFanout.minimumSuccess
   })
 
   const hasViewEvidence = Number.isFinite(observedViewLength) && Number.isFinite(expectedViewLength)
   checks.push({
-    name: 'view_length_match',
-    pass: hasViewEvidence ? observedViewLength === expectedViewLength : false,
+    name: 'join_view_length_match',
+    pass: hasViewEvidence ? observedViewLength === normalizedExpectedViewLength : false,
     observedViewLength,
-    expectedViewLength
+    expectedViewLength: normalizedExpectedViewLength
+  })
+
+  checks.push({
+    name: 'autoconnect_to_writable_hard',
+    pass: autoconnectPerf.writableHardPass,
+    observedMs: autoconnectPerf.writableElapsedMs,
+    thresholdMs: HARD_GATES.joinToWritableMs
+  })
+  checks.push({
+    name: 'autoconnect_to_writable_warn',
+    pass: autoconnectPerf.writableWarnPass,
+    observedMs: autoconnectPerf.writableElapsedMs,
+    thresholdMs: HARD_GATES.joinToWritableWarnMs,
+    severity: 'warning'
+  })
+  checks.push({
+    name: 'autoconnect_writer_material_stage',
+    pass: autoconnectPerf.writerMaterialPass,
+    observedMs: autoconnectPerf.writerMaterialElapsedMs,
+    thresholdMs: HARD_GATES.writerMaterialMs
+  })
+  checks.push({
+    name: 'autoconnect_fast_forward_stage',
+    pass: autoconnectPerf.fastForwardPass,
+    observedMs: autoconnectPerf.fastForwardElapsedMs,
+    thresholdMs: HARD_GATES.fastForwardMs
+  })
+  checks.push({
+    name: 'autoconnect_fanout_success_threshold',
+    pass: autoconnectFanout.passesThreshold,
+    successCount: autoconnectFanout.successCount,
+    minimumSuccess: autoconnectFanout.minimumSuccess
+  })
+
+  const hasAutoConnectViewEvidence =
+    Number.isFinite(autoconnectObservedViewLength) && Number.isFinite(autoconnectExpectedViewLength)
+  checks.push({
+    name: 'autoconnect_view_length_match',
+    pass: hasAutoConnectViewEvidence
+      ? autoconnectObservedViewLength === normalizedAutoconnectExpectedViewLength
+      : false,
+    observedViewLength: autoconnectObservedViewLength,
+    expectedViewLength: normalizedAutoconnectExpectedViewLength
   })
 
   if (parsedWorker.failFastSignals.length > 0) {
@@ -815,14 +986,20 @@ async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
 
   return {
     scenario: scenario.id,
-    traceId: primaryTrace.traceId,
+    traceId: joinTrace.traceId,
+    autoconnectTraceId: autoconnectTrace.traceId,
     status: hardFailures.length === 0 ? 'PASS' : 'FAIL',
     hardFailures,
     warnings,
     checks,
-    telemetryEvents: primaryTrace.events,
-    fanoutSummary: fanoutSummary || null,
+    telemetryEvents: joinTrace.events,
+    joinTelemetryEvents: joinTrace.events,
+    autoconnectTelemetryEvents: autoconnectTrace.events,
+    fanoutSummary: joinFanoutSummary || null,
+    joinFanoutSummary: joinFanoutSummary || null,
+    autoconnectFanoutSummary: autoconnectFanoutSummary || null,
     joinPerformance: joinPerf,
+    autoconnectPerformance: autoconnectPerf,
     failFastSignals: parsedWorker.failFastSignals,
     workerLogs,
     summary

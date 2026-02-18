@@ -40,12 +40,45 @@ export type RelayEntry = {
   registrationError?: string
   isActive?: boolean
   gatewayPath?: string
+  gatewayOrigins?: string[]
+  lastSuccessGatewayOrigin?: string | null
 }
 
 export type GatewayDescriptor = {
   origin: string
   operatorPubkey: string
   policy: 'OPEN' | 'CLOSED'
+}
+
+export type GatewayMetadataEvent = {
+  id: string
+  origin: string
+  operatorPubkey: string
+  policy: 'OPEN' | 'CLOSED'
+  allowList: string[]
+  discoveryRelays: string[]
+  content: string
+  createdAt: number
+  event: Event
+}
+
+export type GatewayInviteEvent = {
+  id: string
+  origin: string
+  inviteePubkey: string
+  inviteToken: string
+  operatorPubkey: string | null
+  createdAt: number
+  event: Event
+}
+
+export type GatewayJoinRequestEvent = {
+  id: string
+  origin: string
+  requesterPubkey: string
+  content?: string
+  createdAt: number
+  event: Event
 }
 
 export type FeedItem = Event
@@ -88,6 +121,7 @@ export type GroupInvite = {
   relay?: string
   relayUrl?: string | null
   relayKey?: string | null
+  gatewayOrigins?: string[]
   groupName?: string
   groupPicture?: string
   name?: string
@@ -243,6 +277,14 @@ export type InvitesInboxItem =
       senderPubkey: string
       status: ChatInvite['status']
     }
+  | {
+      type: 'gateway'
+      id: string
+      createdAt: number
+      origin: string
+      operatorPubkey?: string | null
+      inviteToken?: string
+    }
 
 export type PaneViewportEntry = {
   cursor: number
@@ -389,6 +431,7 @@ export interface RelayService {
     isOpen?: boolean
     fileSharing?: boolean
     picture?: string
+    gateways?: GatewayDescriptor[]
   }): Promise<Record<string, unknown>>
   joinRelay(input: {
     relayKey?: string
@@ -420,6 +463,7 @@ export interface RelayService {
     writerCoreHex?: string | null
     autobaseLocal?: string | null
     writerSecret?: string | null
+    gatewayOrigins?: string[]
     fastForward?: {
       key?: string | null
       length?: number | null
@@ -448,7 +492,10 @@ export interface PostService {
 
 export interface GroupService {
   discoverGroups(relays: string[], limit?: number): Promise<GroupSummary[]>
+  discoverGatewayMetadata(relays: string[], limit?: number): Promise<GatewayMetadataEvent[]>
   discoverInvites(relays: string[], pubkey: string, decrypt: (pubkey: string, ciphertext: string) => Promise<string>): Promise<GroupInvite[]>
+  discoverGatewayInvites(relays: string[], pubkey: string): Promise<GatewayInviteEvent[]>
+  discoverGatewayJoinRequests(relays: string[], pubkey: string): Promise<GatewayJoinRequestEvent[]>
   loadMyGroupList(relays: string[], pubkey: string): Promise<GroupListEntry[]>
   saveMyGroupList(relays: string[], pubkey: string, nsecHex: string, entries: GroupListEntry[]): Promise<void>
   dismissInvite(inviteIds: Set<string>, inviteId: string): Set<string>
