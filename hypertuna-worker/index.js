@@ -101,6 +101,10 @@ import {
   setRelayWriterPool,
   pruneWriterPoolEntries
 } from './relay-writer-pool-store.mjs'
+import {
+  rankGatewayStatusProbes,
+  evaluateFanoutResults
+} from './gateway/MultiGatewayJoinUtils.mjs'
 import MarmotService from './marmot-service.mjs'
 import ConversationFileIndex from './conversation-file-index.mjs'
 import MediaServiceManager from './media/MediaServiceManager.mjs'
@@ -145,9 +149,15 @@ const BLIND_PEER_JOIN_REHYDRATION_RETRIES = 1
 const BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS = 7000
 const BLIND_PEER_MIRROR_METADATA_REFRESH_MS = 1 * 60 * 1000
 const BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS = 8000
+const GATEWAY_STATUS_TIMEOUT_MS = 8000
 const OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores'
+const JOIN_WRITER_MATERIAL_TIMEOUT_MS = 45000
+const JOIN_FAST_FORWARD_TIMEOUT_MS = 30000
+const JOIN_WRITABLE_WARN_TIMEOUT_MS = 60000
+const JOIN_WRITABLE_HARD_TIMEOUT_MS = 120000
+const MULTI_GATEWAY_DEBUG = process.env.HT_DEBUG_MULTI_GATEWAY === '1'
 
 global.userConfig = {
   storage: defaultStorageDir,
@@ -185,6 +195,7 @@ const RELAY_SUBSCRIPTION_REFRESH_CACHE_TTL_MS = 60 * 1000
 const RELAY_SUBSCRIPTION_REFRESH_MAX_TRACKED = 512
 const relaySubscriptionRefreshRecent = new Map()
 const relaySubscriptionRefreshInFlight = new Map()
+const joinTelemetrySessions = new Map()
 
 function resolveClosedJoinPoolEntryTtlMs(config) {
   const fromConfig =
@@ -870,6 +881,322 @@ function collectPublicGatewayOrigins() {
   }
 
   return Array.from(origins)
+}
+
+function normalizeGatewayOriginList(values = []) {
+  const origins = new Set()
+  for (const value of Array.isArray(values) ? values : []) {
+    const origin = normalizeHttpOrigin(value)
+    if (origin) origins.add(origin)
+  }
+  return Array.from(origins)
+}
+
+function createJoinTraceId() {
+  return `join-${Date.now().toString(16)}-${nodeCrypto.randomBytes(4).toString('hex')}`
+}
+
+function findJoinTelemetrySession({ publicIdentifier = null, relayKey = null } = {}) {
+  const identifier = typeof publicIdentifier === 'string' ? publicIdentifier.trim() : ''
+  if (identifier && joinTelemetrySessions.has(identifier)) {
+    return joinTelemetrySessions.get(identifier)
+  }
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey)
+  if (!normalizedRelayKey) return null
+  for (const session of joinTelemetrySessions.values()) {
+    if (session?.relayKey && normalizeRelayKeyHex(session.relayKey) === normalizedRelayKey) {
+      return session
+    }
+  }
+  return null
+}
+
+function clearJoinTelemetryTimers(session) {
+  if (!session?.timers || typeof session.timers !== 'object') return
+  for (const timer of Object.values(session.timers)) {
+    if (timer) clearTimeout(timer)
+  }
+  session.timers = {}
+}
+
+function emitJoinTelemetryEvent(eventType, {
+  publicIdentifier = null,
+  relayKey = null,
+  traceId = null,
+  elapsedMs = null,
+  reasonCode = null,
+  writable = null,
+  gatewayOrigins = null,
+  meta = null
+} = {}) {
+  const payload = {
+    eventType,
+    traceId: traceId || null,
+    publicIdentifier: publicIdentifier || null,
+    relayKey: relayKey || null,
+    elapsedMs: Number.isFinite(elapsedMs) ? Math.trunc(elapsedMs) : null,
+    writable: typeof writable === 'boolean' ? writable : null,
+    reasonCode: reasonCode || null,
+    gatewayOrigins: Array.isArray(gatewayOrigins) ? gatewayOrigins : undefined,
+    meta: meta && typeof meta === 'object' ? meta : undefined,
+    timestamp: Date.now()
+  }
+
+  if (MULTI_GATEWAY_DEBUG) {
+    try {
+      console.log('[Worker][JoinTelemetry]', JSON.stringify(payload))
+    } catch (_) {}
+  }
+  if (typeof sendMessage === 'function') {
+    sendMessage({
+      type: 'join-telemetry',
+      data: payload
+    })
+  }
+}
+
+function markJoinWriterMaterialApplied(session, meta = null) {
+  if (!session || session.writerMaterialApplied) return
+  session.writerMaterialApplied = true
+  if (session.timers?.writerMaterial) {
+    clearTimeout(session.timers.writerMaterial)
+    delete session.timers.writerMaterial
+  }
+  emitJoinTelemetryEvent('JOIN_WRITER_MATERIAL_APPLIED', {
+    publicIdentifier: session.publicIdentifier,
+    relayKey: session.relayKey,
+    traceId: session.traceId,
+    elapsedMs: Date.now() - session.startedAt,
+    gatewayOrigins: session.gatewayOrigins,
+    meta
+  })
+}
+
+function markJoinFastForwardApplied(session, meta = null) {
+  if (!session || session.fastForwardApplied) return
+  session.fastForwardApplied = true
+  if (session.timers?.fastForward) {
+    clearTimeout(session.timers.fastForward)
+    delete session.timers.fastForward
+  }
+  emitJoinTelemetryEvent('JOIN_FAST_FORWARD_APPLIED', {
+    publicIdentifier: session.publicIdentifier,
+    relayKey: session.relayKey,
+    traceId: session.traceId,
+    elapsedMs: Date.now() - session.startedAt,
+    gatewayOrigins: session.gatewayOrigins,
+    meta
+  })
+}
+
+function emitJoinFailFast(session, reasonCode, meta = null) {
+  if (!session || session.failFastEmitted) return
+  session.failFastEmitted = true
+  emitJoinTelemetryEvent('JOIN_FAIL_FAST_ABORT', {
+    publicIdentifier: session.publicIdentifier,
+    relayKey: session.relayKey,
+    traceId: session.traceId,
+    elapsedMs: Date.now() - session.startedAt,
+    reasonCode,
+    gatewayOrigins: session.gatewayOrigins,
+    meta
+  })
+}
+
+function markJoinWritableEvent(session, writable, meta = null) {
+  if (!session) return
+  emitJoinTelemetryEvent('JOIN_WRITABLE_EVENT', {
+    publicIdentifier: session.publicIdentifier,
+    relayKey: session.relayKey,
+    traceId: session.traceId,
+    elapsedMs: Date.now() - session.startedAt,
+    writable: writable === true,
+    gatewayOrigins: session.gatewayOrigins,
+    meta
+  })
+}
+
+function confirmJoinWritable(session, meta = null) {
+  if (!session || session.writableConfirmed) return
+  session.writableConfirmed = true
+  const elapsedMs = Date.now() - session.startedAt
+  clearJoinTelemetryTimers(session)
+  emitJoinTelemetryEvent('JOIN_WRITABLE_CONFIRMED', {
+    publicIdentifier: session.publicIdentifier,
+    relayKey: session.relayKey,
+    traceId: session.traceId,
+    elapsedMs,
+    writable: true,
+    gatewayOrigins: session.gatewayOrigins,
+    meta: {
+      ...(meta && typeof meta === 'object' ? meta : {}),
+      warning: elapsedMs > JOIN_WRITABLE_WARN_TIMEOUT_MS ? 'join-writable-over-60s' : null
+    }
+  })
+  joinTelemetrySessions.delete(session.publicIdentifier)
+}
+
+function startJoinTelemetrySession({
+  publicIdentifier,
+  relayKey = null,
+  gatewayOrigins = [],
+  hasFastForward = false,
+  hasWriterMaterial = false
+} = {}) {
+  const identifier = typeof publicIdentifier === 'string' ? publicIdentifier.trim() : ''
+  if (!identifier) return null
+  const startedAt = Date.now()
+  const session = {
+    publicIdentifier: identifier,
+    relayKey: normalizeRelayKeyHex(relayKey) || relayKey || null,
+    traceId: createJoinTraceId(),
+    startedAt,
+    gatewayOrigins: normalizeGatewayOriginList(gatewayOrigins),
+    writerMaterialApplied: false,
+    fastForwardApplied: hasFastForward ? false : true,
+    writableConfirmed: false,
+    failFastEmitted: false,
+    timers: {}
+  }
+  joinTelemetrySessions.set(identifier, session)
+
+  emitJoinTelemetryEvent('JOIN_START', {
+    publicIdentifier: session.publicIdentifier,
+    relayKey: session.relayKey,
+    traceId: session.traceId,
+    elapsedMs: 0,
+    gatewayOrigins: session.gatewayOrigins,
+    meta: {
+      hasFastForward,
+      hasWriterMaterial
+    }
+  })
+
+  session.timers.writerMaterial = setTimeout(() => {
+    if (!session.writerMaterialApplied && !session.writableConfirmed) {
+      emitJoinFailFast(session, 'writer-material-timeout', {
+        thresholdMs: JOIN_WRITER_MATERIAL_TIMEOUT_MS
+      })
+    }
+  }, JOIN_WRITER_MATERIAL_TIMEOUT_MS)
+  session.timers.writerMaterial?.unref?.()
+
+  if (hasFastForward) {
+    session.timers.fastForward = setTimeout(() => {
+      if (!session.fastForwardApplied && !session.writableConfirmed) {
+        emitJoinFailFast(session, 'fast-forward-timeout', {
+          thresholdMs: JOIN_FAST_FORWARD_TIMEOUT_MS
+        })
+      }
+    }, JOIN_FAST_FORWARD_TIMEOUT_MS)
+    session.timers.fastForward?.unref?.()
+  }
+
+  session.timers.warn = setTimeout(() => {
+    if (!session.writableConfirmed) {
+      emitJoinTelemetryEvent('JOIN_WRITABLE_EVENT', {
+        publicIdentifier: session.publicIdentifier,
+        relayKey: session.relayKey,
+        traceId: session.traceId,
+        elapsedMs: Date.now() - session.startedAt,
+        writable: false,
+        gatewayOrigins: session.gatewayOrigins,
+        meta: {
+          warning: 'join-writable-over-60s'
+        }
+      })
+    }
+  }, JOIN_WRITABLE_WARN_TIMEOUT_MS)
+  session.timers.warn?.unref?.()
+
+  session.timers.hard = setTimeout(() => {
+    if (!session.writableConfirmed) {
+      emitJoinFailFast(session, 'join-writable-timeout', {
+        thresholdMs: JOIN_WRITABLE_HARD_TIMEOUT_MS
+      })
+    }
+  }, JOIN_WRITABLE_HARD_TIMEOUT_MS)
+  session.timers.hard?.unref?.()
+
+  if (hasWriterMaterial) {
+    markJoinWriterMaterialApplied(session, { source: 'start-join-flow' })
+  }
+  if (!hasFastForward) {
+    markJoinFastForwardApplied(session, { source: 'no-fast-forward' })
+  }
+
+  return session
+}
+
+async function runJoinMirrorFanout(session, { relayKey = null, publicIdentifier = null } = {}) {
+  if (!session) return { status: 'skipped', reason: 'missing-session', successCount: 0, results: [] }
+  if (session.fanoutInFlight) return { status: 'skipped', reason: 'fanout-in-flight', successCount: 0, results: [] }
+  const targetRelayKey = normalizeRelayKeyHex(relayKey || session.relayKey) || relayKey || null
+  const targetIdentifier = publicIdentifier || session.publicIdentifier || null
+  if (!targetRelayKey && !targetIdentifier) {
+    return { status: 'skipped', reason: 'missing-relay-identifier', successCount: 0, results: [] }
+  }
+  const origins = normalizeGatewayOriginList(session.gatewayOrigins || [])
+  if (!origins.length) {
+    return { status: 'skipped', reason: 'missing-gateway-origins', successCount: 0, results: [] }
+  }
+
+  session.fanoutInFlight = true
+  const startedAt = Date.now()
+  try {
+    const results = await Promise.all(
+      origins.map(async (origin) => {
+        const appendResult = await appendOpenJoinMirrorCores({
+          relayKey: targetRelayKey || targetIdentifier,
+          publicIdentifier: targetIdentifier,
+          origins: [origin],
+          reason: 'join-fanout'
+        })
+        const mirrorResult = await fetchRelayMirrorMetadata(targetRelayKey || targetIdentifier, {
+          origins: [origin],
+          reason: 'join-fanout-verify'
+        })
+        const success = appendResult?.status === 'ok' || mirrorResult?.status === 'ok'
+        return {
+          origin,
+          status: success ? 'ok' : 'error',
+          appendStatus: appendResult?.status || null,
+          appendReason: appendResult?.reason || null,
+          appendError: appendResult?.error || null,
+          mirrorStatus: mirrorResult?.status || null,
+          mirrorReason: mirrorResult?.reason || null,
+          mirrorError: mirrorResult?.error || null
+        }
+      })
+    )
+    const fanoutEvaluation = evaluateFanoutResults(results, { minimumSuccess: 1 })
+    const summary = {
+      publicIdentifier: targetIdentifier,
+      relayKey: targetRelayKey,
+      traceId: session.traceId,
+      total: fanoutEvaluation.total,
+      successCount: fanoutEvaluation.successCount,
+      failedCount: fanoutEvaluation.failedCount,
+      minimumSuccess: fanoutEvaluation.minimumSuccess,
+      elapsedMs: Date.now() - startedAt,
+      results
+    }
+    console.log('[Worker] Join mirror fanout summary', summary)
+    sendMessage({
+      type: 'join-fanout-summary',
+      data: summary
+    })
+    if (!fanoutEvaluation.passesThreshold) {
+      emitJoinFailFast(session, 'fanout-no-success', summary)
+    }
+    return {
+      status: fanoutEvaluation.passesThreshold ? 'ok' : 'error',
+      successCount: fanoutEvaluation.successCount,
+      results
+    }
+  } finally {
+    session.fanoutInFlight = false
+  }
 }
 
 async function ensureConversationFileIndex(storageRoot = null) {
@@ -1681,6 +2008,120 @@ async function refreshGatewayRelayRegistry(reason = 'gateway-refresh', options =
   }
 }
 
+async function fetchGatewayRelayStatus(relayIdentifier, origin) {
+  const normalizedOrigin = normalizeHttpOrigin(origin)
+  if (!relayIdentifier || !normalizedOrigin) {
+    return {
+      result: 'error',
+      origin: normalizedOrigin || origin || null,
+      reason: 'missing-relay-identifier-or-origin'
+    }
+  }
+  const fetchImpl = globalThis.fetch
+  if (typeof fetchImpl !== 'function') {
+    return {
+      result: 'error',
+      origin: normalizedOrigin,
+      reason: 'fetch-unavailable'
+    }
+  }
+
+  const encodedRelay = encodeURIComponent(relayIdentifier)
+  const url = `${normalizedOrigin.replace(/\/$/, '')}/api/relays/${encodedRelay}/status`
+  const startedAt = Date.now()
+  const controller = typeof AbortController === 'function' ? new AbortController() : null
+  const timer = controller ? setTimeout(() => controller.abort(), GATEWAY_STATUS_TIMEOUT_MS) : null
+
+  try {
+    const response = await fetchImpl(url, {
+      signal: controller?.signal
+    })
+    const latencyMs = Date.now() - startedAt
+    if (!response.ok) {
+      return {
+        result: 'error',
+        origin: normalizedOrigin,
+        latencyMs,
+        reason: `status-${response.status}`
+      }
+    }
+    const payload = await response.json().catch(() => null)
+    if (!payload || typeof payload !== 'object') {
+      return {
+        result: 'error',
+        origin: normalizedOrigin,
+        latencyMs,
+        reason: 'invalid-payload'
+      }
+    }
+    return {
+      result: 'ok',
+      origin: normalizedOrigin,
+      latencyMs,
+      statusCode: response.status,
+      statusPayload: payload,
+      metrics: {
+        latestViewLength: Number(payload?.latestViewLength || 0),
+        maxCoreLength: Number(payload?.maxCoreLength || 0),
+        writerCount: Number(payload?.writerCount || 0),
+        updatedAt: Number(payload?.updatedAt || 0),
+        coreRefsHash: typeof payload?.coreRefsHash === 'string' ? payload.coreRefsHash : null,
+        fastForwardSignedLength: Number(payload?.fastForwardSignedLength || 0),
+        writerMaterialUpdatedAt: Number(payload?.writerMaterialUpdatedAt || 0),
+        mirrorVersion: Number(payload?.mirrorVersion || 0)
+      }
+    }
+  } catch (error) {
+    return {
+      result: 'error',
+      origin: normalizedOrigin,
+      latencyMs: Date.now() - startedAt,
+      reason: error?.name === 'AbortError' ? 'timeout' : (error?.message || 'request-failed')
+    }
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function probeGatewayRelayStatus(relayIdentifier, origins = []) {
+  const originList = normalizeGatewayOriginList(origins)
+  if (!relayIdentifier || !originList.length) {
+    return {
+      status: 'skipped',
+      reason: 'missing-relay-origins',
+      rankedOrigins: originList,
+      probes: []
+    }
+  }
+  const probes = await Promise.all(originList.map((origin) => fetchGatewayRelayStatus(relayIdentifier, origin)))
+  const ranking = rankGatewayStatusProbes(probes, originList)
+  const rankedOrigins = Array.isArray(ranking?.rankedOrigins) && ranking.rankedOrigins.length
+    ? ranking.rankedOrigins
+    : originList
+  const driftDetected = ranking?.driftDetected === true
+  if (driftDetected) {
+    console.warn('[Worker] Gateway status probe detected coreRefsHash drift', {
+      relayIdentifier,
+      coreRefsHashes: ranking?.coreRefsHashes || []
+    })
+  }
+  if (MULTI_GATEWAY_DEBUG) {
+    console.log('[Worker] Gateway status probe summary', {
+      relayIdentifier,
+      total: probes.length,
+      healthy: Array.isArray(ranking?.healthy) ? ranking.healthy.length : 0,
+      rankedOrigins,
+      driftDetected
+    })
+  }
+  return {
+    status: Array.isArray(ranking?.healthy) && ranking.healthy.length ? 'ok' : 'error',
+    rankedOrigins,
+    probes,
+    driftDetected
+  }
+}
+
 async function fetchOpenJoinChallenge(relayIdentifier, { origin, purpose = null } = {}) {
   if (!relayIdentifier) {
     return { status: 'skipped', reason: 'missing-relay-identifier' }
@@ -1900,6 +2341,7 @@ async function appendOpenJoinMirrorCores({
   relayKey,
   publicIdentifier = null,
   relayManager = null,
+  origins = null,
   reason = 'open-join-append'
 } = {}) {
   const relayIdentifier = relayKey || publicIdentifier
@@ -1925,6 +2367,7 @@ async function appendOpenJoinMirrorCores({
   return submitOpenJoinAppendCores(relayIdentifier, {
     publicIdentifier: publicIdentifier || manager?.publicIdentifier || null,
     cores: coreEntries,
+    origins,
     reason
   })
 }
@@ -3383,6 +3826,108 @@ function trackOpenJoinReauthState(message) {
   }
 }
 
+function trackJoinTelemetryState(message) {
+  if (!message || typeof message !== 'object') return
+  const data = message?.data && typeof message.data === 'object' ? message.data : {}
+  const publicIdentifier =
+    typeof data?.publicIdentifier === 'string' && data.publicIdentifier.trim()
+      ? data.publicIdentifier.trim()
+      : null
+  const relayKey = normalizeRelayKeyHex(data?.relayKey) || normalizeRelayKeyHex(message?.relayKey) || null
+  const session = findJoinTelemetrySession({ publicIdentifier, relayKey })
+
+  if (message.type === 'join-auth-progress' && session) {
+    const status = typeof data?.status === 'string' ? data.status : null
+    if (status === 'verify' || status === 'complete') {
+      markJoinWriterMaterialApplied(session, {
+        source: `join-auth-progress:${status}`
+      })
+      if (!session.fastForwardApplied) {
+        markJoinFastForwardApplied(session, {
+          source: `join-auth-progress:${status}`
+        })
+      }
+    }
+    return
+  }
+
+  if (message.type === 'join-auth-success' && session) {
+    if (relayKey && !session.relayKey) {
+      session.relayKey = relayKey
+    }
+    markJoinWriterMaterialApplied(session, {
+      source: 'join-auth-success'
+    })
+    if (!session.fastForwardApplied) {
+      markJoinFastForwardApplied(session, {
+        source: 'join-auth-success'
+      })
+    }
+    return
+  }
+
+  if (message.type === 'join-auth-error' && session) {
+    emitJoinFailFast(session, 'join-auth-error', {
+      error: data?.error || message?.error || null
+    })
+    clearJoinTelemetryTimers(session)
+    joinTelemetrySessions.delete(session.publicIdentifier)
+    return
+  }
+
+  if (message.type === 'relay-writable' && session) {
+    const writable = data?.writable === true
+    if (relayKey && !session.relayKey) session.relayKey = relayKey
+    const viewLength = Number.isFinite(data?.viewLength) ? Number(data.viewLength) : null
+    const expectedViewLength = Number.isFinite(data?.expectedViewLength)
+      ? Number(data.expectedViewLength)
+      : null
+    const localLength = Number.isFinite(data?.localLength) ? Number(data.localLength) : null
+    const viewLengthMatch = Number.isFinite(viewLength) && Number.isFinite(expectedViewLength)
+      ? viewLength === expectedViewLength
+      : null
+    markJoinWritableEvent(session, writable, {
+      mode: data?.mode || null,
+      expectedWriterActive: data?.expectedWriterActive ?? null,
+      viewLength,
+      expectedViewLength,
+      localLength,
+      viewLengthMatch
+    })
+    if (!writable) return
+    if (viewLengthMatch === false) {
+      emitJoinFailFast(session, 'view-length-mismatch', {
+        mode: data?.mode || null,
+        viewLength,
+        expectedViewLength,
+        localLength
+      })
+      return
+    }
+    confirmJoinWritable(session, {
+      mode: data?.mode || null,
+      expectedWriterActive: data?.expectedWriterActive ?? null,
+      viewLength,
+      expectedViewLength,
+      localLength,
+      viewLengthMatch
+    })
+    if (!session.fanoutStarted) {
+      session.fanoutStarted = true
+      runJoinMirrorFanout(session, {
+        relayKey: relayKey || session.relayKey || null,
+        publicIdentifier: publicIdentifier || session.publicIdentifier || null
+      }).catch((error) => {
+        console.warn('[Worker] Join mirror fanout failed', {
+          publicIdentifier: session.publicIdentifier,
+          relayKey: session.relayKey,
+          error: error?.message || error
+        })
+      })
+    }
+  }
+}
+
 async function maybeReauthOpenJoins(status) {
   if (!relayServer || !pendingOpenJoinReauth.size) return
   if (!status?.peerRelayMap) return
@@ -3418,6 +3963,7 @@ const sendMessage = (message) => {
 
   trackRegistrationStatus(message)
   trackOpenJoinReauthState(message)
+  trackJoinTelemetryState(message)
 
   if (workerPipe) {
     const messageStr = JSON.stringify(message) + '\n'
@@ -5774,8 +6320,13 @@ async function handleMessageObject(message) {
         const inviteToken = typeof data.token === 'string' ? data.token.trim() : null
         let joinBlindPeeringManager = null
         let joinRelayIdentifierForTracking = null
+        let joinTelemetrySession = null
         try {
           let hostPeers = Array.isArray(data.hostPeers) ? data.hostPeers : []
+          const requestedGatewayOrigins = normalizeGatewayOriginList(data.gatewayOrigins)
+          let rankedGatewayOrigins = requestedGatewayOrigins.length
+            ? requestedGatewayOrigins
+            : collectPublicGatewayOrigins()
           let coreRefs = Array.isArray(data.cores) ? normalizeCoreRefList(data.cores) : []
           let writerCoreRefs = Array.isArray(data.cores) ? normalizeMirrorWriterCoreRefs(data.cores) : []
           let blindPeer = sanitizeBlindPeerMeta(data.blindPeer)
@@ -5801,6 +6352,38 @@ async function handleMessageObject(message) {
             .map((key) => String(key || '').trim().toLowerCase())
             .filter(Boolean)
 
+          joinTelemetrySession = startJoinTelemetrySession({
+            publicIdentifier,
+            relayKey: joinRelayKey,
+            gatewayOrigins: rankedGatewayOrigins,
+            hasFastForward: !!fastForward,
+            hasWriterMaterial: !!(writerSecret && (writerCore || writerCoreHex || autobaseLocal))
+          })
+
+          const relayIdentifierForProbe = joinRelayKey || publicIdentifier
+          if (relayIdentifierForProbe && rankedGatewayOrigins.length) {
+            try {
+              const probeSummary = await probeGatewayRelayStatus(relayIdentifierForProbe, rankedGatewayOrigins)
+              if (Array.isArray(probeSummary?.rankedOrigins) && probeSummary.rankedOrigins.length) {
+                rankedGatewayOrigins = probeSummary.rankedOrigins
+                if (joinTelemetrySession) {
+                  joinTelemetrySession.gatewayOrigins = normalizeGatewayOriginList(rankedGatewayOrigins)
+                }
+              }
+              if (probeSummary?.driftDetected) {
+                console.warn('[Worker] Join-flow gateway probe detected mirror drift', {
+                  relayIdentifier: relayIdentifierForProbe,
+                  rankedGatewayOrigins
+                })
+              }
+            } catch (error) {
+              console.warn('[Worker] Join-flow gateway status probe failed', {
+                relayIdentifier: relayIdentifierForProbe,
+                error: error?.message || error
+              })
+            }
+          }
+
           console.info('[Worker] Start join flow input', {
             publicIdentifier,
             openJoin,
@@ -5816,7 +6399,9 @@ async function handleMessageObject(message) {
             writerCorePrefix: previewValue(writerCore, 16),
             writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
             writerSecretLen: writerSecret ? String(writerSecret).length : 0,
-            hasFastForward: !!fastForward
+            hasFastForward: !!fastForward,
+            requestedGatewayOrigins,
+            rankedGatewayOrigins
           })
 
           if (openJoin && publicIdentifier) {
@@ -5833,7 +6418,10 @@ async function handleMessageObject(message) {
             if (relayIdentifier) {
               try {
                 await ensurePublicGatewaySettingsLoaded()
-                const bootstrapResult = await fetchOpenJoinBootstrap(relayIdentifier, { reason: 'open-join' })
+                const bootstrapResult = await fetchOpenJoinBootstrap(relayIdentifier, {
+                  reason: 'open-join',
+                  origins: rankedGatewayOrigins
+                })
                 if (bootstrapResult?.status === 'ok' && bootstrapResult.data) {
                   const bootstrapData = bootstrapResult.data
                   const bootstrapBlindPeer = sanitizeBlindPeerMeta(bootstrapData.blindPeer)
@@ -5888,6 +6476,12 @@ async function handleMessageObject(message) {
                     blindPeerKey: previewValue(blindPeer?.publicKey, 16),
                     blindPeerHasEncryptionKey: !!blindPeer?.encryptionKey
                   })
+                  if (joinTelemetrySession && writerSecret && (writerCore || writerCoreHex || autobaseLocal)) {
+                    markJoinWriterMaterialApplied(joinTelemetrySession, {
+                      source: 'open-join-bootstrap',
+                      origin: bootstrapResult?.origin || null
+                    })
+                  }
                 } else {
                   console.warn('[Worker] Open join bootstrap unavailable', {
                     relayIdentifier,
@@ -5915,7 +6509,10 @@ async function handleMessageObject(message) {
                   isOpen
                 })
                 await ensurePublicGatewaySettingsLoaded()
-                const mirrorResult = await fetchRelayMirrorMetadata(relayIdentifier, { reason: 'join-flow' })
+                const mirrorResult = await fetchRelayMirrorMetadata(relayIdentifier, {
+                  reason: 'join-flow',
+                  origins: rankedGatewayOrigins
+                })
                 if (mirrorResult?.status === 'ok' && mirrorResult.data) {
                   const mirrorData = mirrorResult.data
                   const mirrorBlindPeer = sanitizeBlindPeerMeta(mirrorData.blindPeer)
@@ -5938,6 +6535,9 @@ async function handleMessageObject(message) {
                     autobaseLocal = String(mirrorData.autobaseLocal || mirrorData.autobase_local)
                   }
                   if (!writerSecret && mirrorData.writerSecret) writerSecret = String(mirrorData.writerSecret)
+                  if (!fastForward && (mirrorData.fastForward || mirrorData.fast_forward)) {
+                    fastForward = mirrorData.fastForward || mirrorData.fast_forward
+                  }
                   if (openJoin && publicIdentifier) {
                     recordOpenJoinContext({
                       publicIdentifier,
@@ -5961,6 +6561,18 @@ async function handleMessageObject(message) {
                     blindPeerKey: previewValue(blindPeer?.publicKey, 16),
                     blindPeerHasEncryptionKey: !!blindPeer?.encryptionKey
                   })
+                  if (joinTelemetrySession && writerSecret && (writerCore || writerCoreHex || autobaseLocal)) {
+                    markJoinWriterMaterialApplied(joinTelemetrySession, {
+                      source: 'mirror-metadata',
+                      origin: mirrorResult?.origin || null
+                    })
+                  }
+                  if (joinTelemetrySession && fastForward) {
+                    markJoinFastForwardApplied(joinTelemetrySession, {
+                      source: 'mirror-metadata',
+                      origin: mirrorResult?.origin || null
+                    })
+                  }
                 }
               } catch (err) {
                 console.warn('[Worker] Failed to fetch mirror metadata for join flow', err?.message || err)
@@ -6095,6 +6707,20 @@ async function handleMessageObject(message) {
             hasFastForward: !!fastForward
           })
 
+          if (joinTelemetrySession && joinRelayKey && !joinTelemetrySession.relayKey) {
+            joinTelemetrySession.relayKey = joinRelayKey
+          }
+          if (joinTelemetrySession && writerSecret && (writerCore || writerCoreHex || autobaseLocal)) {
+            markJoinWriterMaterialApplied(joinTelemetrySession, {
+              source: 'join-flow-resolved'
+            })
+          }
+          if (joinTelemetrySession && fastForward) {
+            markJoinFastForwardApplied(joinTelemetrySession, {
+              source: 'join-flow-resolved'
+            })
+          }
+
           await relayServer.startJoinAuthentication({
             ...data,
             publicIdentifier,
@@ -6111,7 +6737,8 @@ async function handleMessageObject(message) {
             writerCoreHex,
             autobaseLocal,
             writerSecret,
-            fastForward
+            fastForward,
+            gatewayOrigins: rankedGatewayOrigins
           })
           if (joinBlindPeeringManager && joinRelayIdentifierForTracking && typeof joinBlindPeeringManager.markJoinEnd === 'function') {
             joinBlindPeeringManager.markJoinEnd({
@@ -6133,6 +6760,13 @@ async function handleMessageObject(message) {
             })
             joinBlindPeeringManager = null
             joinRelayIdentifierForTracking = null
+          }
+          if (joinTelemetrySession) {
+            emitJoinFailFast(joinTelemetrySession, 'start-join-flow-error', {
+              error: err?.message || String(err)
+            })
+            clearJoinTelemetryTimers(joinTelemetrySession)
+            joinTelemetrySessions.delete(joinTelemetrySession.publicIdentifier)
           }
           sendMessage({
             type: 'join-auth-error',

@@ -85,6 +85,20 @@ const DEFAULT_CONFIG = {
     challengeTtlMs: Number(process.env.GATEWAY_OPEN_JOIN_CHALLENGE_TTL_MS) || (2 * 60 * 1000),
     authWindowSeconds: Number(process.env.GATEWAY_OPEN_JOIN_AUTH_WINDOW || 300),
     maxPoolSize: Number(process.env.GATEWAY_OPEN_JOIN_MAX_POOL || 100)
+  },
+  gateway: {
+    enableMulti: process.env.GATEWAY_ENABLE_MULTI === 'true',
+    operatorNsecHex: process.env.GATEWAY_OPERATOR_NSEC_HEX || null,
+    operatorPubkey: process.env.GATEWAY_OPERATOR_PUBKEY_HEX || null,
+    policy: process.env.GATEWAY_POLICY || 'OPEN',
+    allowList: parseCsvValues(process.env.GATEWAY_ALLOW_LIST),
+    banList: parseCsvValues(process.env.GATEWAY_BAN_LIST),
+    discoveryRelays: parseCsvValues(process.env.GATEWAY_DISCOVERY_RELAYS),
+    inviteOnly: process.env.GATEWAY_INVITE_ONLY === 'true',
+    authJwtSecret: process.env.GATEWAY_AUTH_JWT_SECRET || null,
+    authTokenTtlSec: Number(process.env.GATEWAY_AUTH_TOKEN_TTL_SEC || 3600),
+    authChallengeTtlMs: Number(process.env.GATEWAY_AUTH_CHALLENGE_TTL_MS || (2 * 60 * 1000)),
+    authWindowSec: Number(process.env.GATEWAY_AUTH_WINDOW_SEC || 300)
   }
 };
 
@@ -145,6 +159,10 @@ function loadConfig(overrides = {}) {
     openJoin: {
       ...DEFAULT_CONFIG.openJoin,
       ...(overrides.openJoin || {})
+    },
+    gateway: {
+      ...DEFAULT_CONFIG.gateway,
+      ...(overrides.gateway || {})
     }
   };
 
@@ -176,7 +194,10 @@ function loadConfig(overrides = {}) {
     merged.registration.aliasTtlSeconds = 0;
   }
 
-  if (Number.isFinite(merged.registration?.relayGcAfterMs)
+  const relayGcExplicitlyConfigured = typeof process.env.GATEWAY_RELAY_GC_AFTER_MS !== 'undefined'
+    || Number.isFinite(overrides?.registration?.relayGcAfterMs);
+  if (relayGcExplicitlyConfigured
+    && Number.isFinite(merged.registration?.relayGcAfterMs)
     && merged.registration.relayGcAfterMs > 0
     && Number.isFinite(merged.blindPeer?.staleCoreTtlMs)
     && merged.blindPeer.staleCoreTtlMs < merged.registration.relayGcAfterMs) {
@@ -189,6 +210,17 @@ function loadConfig(overrides = {}) {
 function parseRelayAliasPaths(input) {
   if (!input) return null;
   if (Array.isArray(input)) return input.map((value) => (typeof value === 'string' ? value.trim() : value)).filter((value) => typeof value === 'string' && value.length);
+  return String(input)
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length);
+}
+
+function parseCsvValues(input) {
+  if (!input) return [];
+  if (Array.isArray(input)) {
+    return input.map((value) => String(value || '').trim()).filter((value) => value.length);
+  }
   return String(input)
     .split(',')
     .map((value) => value.trim())

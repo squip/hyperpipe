@@ -2590,6 +2590,13 @@ export async function getActiveRelays() {
         const identifierPath = profile?.public_identifier
             ? profile.public_identifier.replace(':', '/')
             : key;
+        const viewLength = Number.isFinite(manager?.relay?.view?.length)
+            ? Number(manager.relay.view.length)
+            : null;
+        const localLength = Number.isFinite(manager?.relay?.local?.length)
+            ? Number(manager.relay.local.length)
+            : null;
+        const expectedViewLength = Number.isFinite(viewLength) ? viewLength : localLength;
 
         activeRelayList.push({
             relayKey: key,
@@ -2604,7 +2611,10 @@ export async function getActiveRelays() {
             isOpen: profile?.isOpen === true,
             isPublic: profile?.isPublic === true,
             isHosted: !!profile?.created_at,
-            isJoined: !!profile?.joined_at && !profile?.created_at
+            isJoined: !!profile?.joined_at && !profile?.created_at,
+            viewLength,
+            localLength,
+            expectedViewLength
         });
     }
 
@@ -2632,7 +2642,10 @@ export async function getActiveRelays() {
             isOpen: profile?.isOpen === true,
             isPublic: profile?.isPublic === true,
             isHosted: !!profile?.created_at,
-            isJoined: !!profile?.joined_at && !profile?.created_at
+            isJoined: !!profile?.joined_at && !profile?.created_at,
+            viewLength: null,
+            localLength: null,
+            expectedViewLength: null
         });
     }
     

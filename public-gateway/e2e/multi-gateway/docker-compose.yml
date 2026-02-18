@@ -1,0 +1,38 @@
+name: hypertuna-multi-gateway-e2e
+
+services:
+  redis1:
+    image: redis:7-alpine
+    container_name: hypertuna-e2e-redis1
+    ports:
+      - '6380:6379'
+
+  redis2:
+    image: redis:7-alpine
+    container_name: hypertuna-e2e-redis2
+    ports:
+      - '6381:6379'
+
+  gateway1:
+    build:
+      context: ../../../
+      dockerfile: public-gateway/Dockerfile
+    container_name: hypertuna-e2e-gateway1
+    env_file:
+      - ./env/gateway1.env
+    ports:
+      - '4541:4430'
+    depends_on:
+      - redis1
+
+  gateway2:
+    build:
+      context: ../../../
+      dockerfile: public-gateway/Dockerfile
+    container_name: hypertuna-e2e-gateway2
+    env_file:
+      - ./env/gateway2.env
+    ports:
+      - '4542:4430'
+    depends_on:
+      - redis2

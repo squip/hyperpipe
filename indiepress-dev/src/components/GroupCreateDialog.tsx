@@ -26,6 +26,7 @@ export default function GroupCreateDialog({
   const [picture, setPicture] = useState('')
   const [isPublic, setIsPublic] = useState(true)
   const [isOpen, setIsOpen] = useState(true)
+  const [gatewayInput, setGatewayInput] = useState('')
   const [isSaving, setIsSaving] = useState(false)
 
   const handleSave = async () => {
@@ -35,19 +36,50 @@ export default function GroupCreateDialog({
     }
     setIsSaving(true)
     try {
+      const gateways = gatewayInput
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          const [originRaw, operatorRaw, policyRaw] = line.split(',').map((entry) => entry?.trim() || '')
+          let origin: string | null = null
+          try {
+            const parsed = new URL(originRaw)
+            if (parsed.protocol === 'http:') parsed.protocol = 'https:'
+            if (parsed.protocol === 'ws:') parsed.protocol = 'https:'
+            if (parsed.protocol === 'wss:') parsed.protocol = 'https:'
+            if (parsed.protocol === 'https:') {
+              origin = parsed.origin
+            }
+          } catch (_err) {
+            origin = null
+          }
+          const operatorPubkey = /^[a-f0-9]{64}$/i.test(operatorRaw || '')
+            ? operatorRaw.toLowerCase()
+            : null
+          if (!origin || !operatorPubkey) return null
+          return {
+            origin,
+            operatorPubkey,
+            policy: String(policyRaw || '').toUpperCase() === 'CLOSED' ? ('CLOSED' as const) : ('OPEN' as const)
+          }
+        })
+        .filter((entry): entry is { origin: string; operatorPubkey: string; policy: 'OPEN' | 'CLOSED' } => !!entry)
       await createHypertunaRelayGroup({
         name: name.trim(),
         about: about.trim(),
         isPublic,
         isOpen,
         picture: picture.trim() || undefined,
-        fileSharing: true
+        fileSharing: true,
+        gateways
       })
       toast.success(t('Group created'), { duration: 2000 })
       onOpenChange(false)
       setName('')
       setAbout('')
       setPicture('')
+      setGatewayInput('')
     } catch (err) {
       toast.error(t('Failed to create group'))
       console.error(err)
@@ -146,6 +178,18 @@ export default function GroupCreateDialog({
               </div>
             </div>
             <Switch checked={isOpen} onCheckedChange={setIsOpen} />
+          </div>
+          <div className="space-y-2">
+            <Label>{t('Gateways')} ({t('optional')})</Label>
+            <Textarea
+              value={gatewayInput}
+              onChange={(e) => setGatewayInput(e.target.value)}
+              placeholder={'https://gateway.example,<operator-pubkey>,OPEN'}
+              rows={3}
+            />
+            <div className="text-xs text-muted-foreground">
+              {t('One per line: origin,operator-pubkey,OPEN|CLOSED')}
+            </div>
           </div>
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={() => onOpenChange(false)}>

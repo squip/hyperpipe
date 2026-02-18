@@ -237,6 +237,7 @@ type WorkerBridgeContextValue = {
       autobaseLocal?: string | null
       writerSecret?: string | null
       openJoin?: boolean
+      gatewayOrigins?: string[]
       fastForward?: {
         key?: string | null
         length?: number | null
@@ -636,6 +637,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         autobaseLocal?: string | null
         writerSecret?: string | null
         openJoin?: boolean
+        gatewayOrigins?: string[]
         fastForward?: {
           key?: string | null
           length?: number | null
@@ -703,6 +705,10 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         writerCoreHex: opts?.writerCoreHex,
         autobaseLocal: opts?.autobaseLocal,
         writerSecret: opts?.writerSecret,
+        gatewayOrigins:
+          Array.isArray(opts?.gatewayOrigins) && opts?.gatewayOrigins.length
+            ? opts.gatewayOrigins.map((entry) => String(entry || '').trim()).filter(Boolean)
+            : undefined,
         fastForward: opts?.fastForward || undefined
       }
       if (hostPeers && hostPeers.length) data.hostPeers = hostPeers

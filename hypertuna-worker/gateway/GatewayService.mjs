@@ -661,6 +661,34 @@ export class GatewayService extends EventEmitter {
     return null;
   }
 
+  #normalizePubkeyHex(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/i.test(trimmed)) return null;
+    return trimmed;
+  }
+
+  #getRegistrationAdminPubkey() {
+    return this.#normalizePubkeyHex(this.getCurrentPubkey?.());
+  }
+
+  #ensureRelayAdminMetadata(metadata = {}, { adminPubkey = null } = {}) {
+    if (!metadata || typeof metadata !== 'object') return metadata;
+    const normalizedAdmin = this.#normalizePubkeyHex(adminPubkey) || this.#getRegistrationAdminPubkey();
+    if (!normalizedAdmin) return metadata;
+
+    if (!this.#normalizePubkeyHex(metadata.nostrPubkeyHex)) {
+      metadata.nostrPubkeyHex = normalizedAdmin;
+    }
+    if (!this.#normalizePubkeyHex(metadata.ownerPubkey) && !this.#normalizePubkeyHex(metadata.owner_pubkey)) {
+      metadata.ownerPubkey = normalizedAdmin;
+    }
+    if (!this.#normalizePubkeyHex(metadata.creatorPubkey) && !this.#normalizePubkeyHex(metadata.creator_pubkey)) {
+      metadata.creatorPubkey = normalizedAdmin;
+    }
+    return metadata;
+  }
+
   #resolveConnectionAuthToken(connData, identifier) {
     if (!connData) return null;
     const relayKey = identifier || connData.relayKey;
@@ -1126,6 +1154,10 @@ export class GatewayService extends EventEmitter {
     const peers = Array.from(relayData.peers || []);
     const metadata = relayData.metadata || {};
     const metadataCopy = metadata ? { ...metadata } : {};
+    const registrationAdminPubkey = this.#getRegistrationAdminPubkey();
+    this.#ensureRelayAdminMetadata(metadataCopy, {
+      adminPubkey: registrationAdminPubkey
+    });
 
     if (this.#isPublicGatewayRelayKey(relayKey)) {
       metadataCopy.identifier = metadataCopy.identifier || relayKey;
@@ -1181,6 +1213,13 @@ export class GatewayService extends EventEmitter {
           peers,
           metadata: metadataCopy
         };
+        const relayAdminPubkey = this.#normalizePubkeyHex(metadataCopy.ownerPubkey)
+          || this.#normalizePubkeyHex(metadataCopy.nostrPubkeyHex)
+          || registrationAdminPubkey;
+        if (relayAdminPubkey) {
+          payload.ownerPubkey = relayAdminPubkey;
+          payload.nostrPubkeyHex = relayAdminPubkey;
+        }
         if (relayCores?.length) {
           payload.relayCores = relayCores;
           payload.relayCoresMode = 'merge';
@@ -1272,6 +1311,13 @@ export class GatewayService extends EventEmitter {
       peers,
       metadata: metadataCopy
     };
+    const relayAdminPubkey = this.#normalizePubkeyHex(metadataCopy.ownerPubkey)
+      || this.#normalizePubkeyHex(metadataCopy.nostrPubkeyHex)
+      || registrationAdminPubkey;
+    if (relayAdminPubkey) {
+      payload.ownerPubkey = relayAdminPubkey;
+      payload.nostrPubkeyHex = relayAdminPubkey;
+    }
     if (relayCores?.length) {
       payload.relayCores = relayCores;
       payload.relayCoresMode = 'merge';
@@ -2964,6 +3010,9 @@ export class GatewayService extends EventEmitter {
         if (!nextMetadata.identifier) {
           nextMetadata.identifier = normalizedIdentifier;
         }
+        this.#ensureRelayAdminMetadata(nextMetadata, {
+          adminPubkey: peer.nostrPubkeyHex || null
+        });
 
         const gatewayPath = this._normalizeGatewayPath(normalizedIdentifier, relayObj.gatewayPath, relayObj.connectionUrl);
         if (gatewayPath) {
@@ -3275,6 +3324,7 @@ export class GatewayService extends EventEmitter {
     }
 
     const metadata = { ...(relayData.metadata || {}) };
+    this.#ensureRelayAdminMetadata(metadata);
     metadata.identifier = metadata.identifier || relayKey;
     if (!metadata.name) {
       metadata.name = this.publicGatewaySettings?.resolvedDisplayName || 'Public Gateway Relay';

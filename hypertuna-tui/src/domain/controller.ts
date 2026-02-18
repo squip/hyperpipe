@@ -3186,6 +3186,7 @@ export class TuiController {
     writerCoreHex?: string | null
     autobaseLocal?: string | null
     writerSecret?: string | null
+    gatewayOrigins?: string[]
     fastForward?: {
       key?: string | null
       length?: number | null
@@ -3219,11 +3220,25 @@ export class TuiController {
           relayUrl: relayUrl || null
         })
       ]))
+      const discoveredGatewayOrigins = Array.from(
+        new Set(
+          [...this.state.groupDiscover, ...this.state.myGroups, ...this.state.groups]
+            .filter((group) => group.id === normalizedIdentifier)
+            .flatMap((group) => Array.isArray(group.gateways) ? group.gateways : [])
+            .map((gateway) => String(gateway?.origin || '').trim())
+            .filter(Boolean)
+        )
+      )
+      const gatewayOrigins =
+        Array.isArray(input.gatewayOrigins) && input.gatewayOrigins.length
+          ? Array.from(new Set(input.gatewayOrigins.map((entry) => String(entry || '').trim()).filter(Boolean)))
+          : (discoveredGatewayOrigins.length ? discoveredGatewayOrigins : undefined)
 
       await this.relayService.startJoinFlow({
         ...input,
         relayKey,
         relayUrl,
+        gatewayOrigins,
         hostPeers: hostPeers.length ? hostPeers : undefined
       })
       this.localProfileCache = null

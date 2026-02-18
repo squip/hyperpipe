@@ -154,6 +154,7 @@ export class RelayService implements IRelayService {
     writerCoreHex?: string | null
     autobaseLocal?: string | null
     writerSecret?: string | null
+    gatewayOrigins?: string[]
     fastForward?: {
       key?: string | null
       length?: number | null

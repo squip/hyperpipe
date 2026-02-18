@@ -14,16 +14,19 @@ import {
 } from '@/lib/groups'
 import {
   buildHypertunaAdminBootstrapDraftEvents,
+  buildGatewayTags,
   buildHypertunaDiscoveryDraftEvents,
   getBaseRelayUrl,
   HYPERTUNA_IDENTIFIER_TAG,
   isHypertunaTaggedEvent,
   KIND_HYPERTUNA_RELAY,
+  normalizeGatewayTags,
   parseHypertunaRelayEvent30166
 } from '@/lib/hypertuna-group-events'
 import { TDraftEvent } from '@/types'
 import {
   TGroupAdmin,
+  TGatewayDescriptor,
   TGroupInvite,
   TGroupListEntry,
   TGroupMembershipStatus,
@@ -242,6 +245,7 @@ type TGroupsContext = {
     isOpen: boolean
     picture?: string
     fileSharing?: boolean
+    gateways?: TGatewayDescriptor[]
   }) => Promise<{ groupId: string; relay: string }>
 }
 
@@ -340,6 +344,7 @@ const createProvisionalGroupMetadata = (args: {
   picture?: string | null
   isPublic?: boolean
   isOpen?: boolean
+  gateways?: TGatewayDescriptor[]
   createdAt?: number
 }): TGroupMetadata | null => {
   const groupId = String(args.groupId || '').trim()
@@ -368,6 +373,7 @@ const createProvisionalGroupMetadata = (args: {
   if (picture) tags.push(['picture', picture])
   if (typeof args.isPublic === 'boolean') tags.push([args.isPublic ? 'public' : 'private'])
   if (typeof args.isOpen === 'boolean') tags.push([args.isOpen ? 'open' : 'closed'])
+  tags.push(...buildGatewayTags(args.gateways || []))
   const event = {
     id: `provisional:${groupId}:${createdAt}`,
     pubkey: '',
@@ -386,6 +392,7 @@ const createProvisionalGroupMetadata = (args: {
     isPublic: typeof args.isPublic === 'boolean' ? args.isPublic : undefined,
     isOpen: typeof args.isOpen === 'boolean' ? args.isOpen : undefined,
     tags: [],
+    gateways: normalizeGatewayTags(tags),
     event
   }
 }
@@ -684,6 +691,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       picture?: string | null
       isPublic?: boolean
       isOpen?: boolean
+      gateways?: TGatewayDescriptor[]
       createdAt?: number
       source: ProvisionalGroupMetadataEntry['source']
     }) => {
@@ -702,6 +710,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         picture: args.picture,
         isPublic: args.isPublic,
         isOpen: args.isOpen,
+        gateways: args.gateways,
         createdAt: args.createdAt
       })
       if (!metadata) return
@@ -727,7 +736,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             (current.metadata.about || '') === (metadata.about || '') &&
             (current.metadata.picture || '') === (metadata.picture || '') &&
             current.metadata.isPublic === metadata.isPublic &&
-            current.metadata.isOpen === metadata.isOpen
+            current.metadata.isOpen === metadata.isOpen &&
+            JSON.stringify(current.metadata.gateways || []) === JSON.stringify(metadata.gateways || [])
           ) {
             return
           }
@@ -3300,7 +3310,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       isPublic,
       isOpen,
       picture,
-      fileSharing
+      fileSharing,
+      gateways
     }: {
       name: string
       about?: string
@@ -3308,6 +3319,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       isOpen: boolean
       picture?: string
       fileSharing?: boolean
+      gateways?: TGatewayDescriptor[]
     }) => {
       if (!pubkey) throw new Error('Not logged in')
       const result = await createRelay({
@@ -3336,6 +3348,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         picture,
         isPublic,
         isOpen,
+        gateways,
         source: 'create'
       })
 
@@ -3348,7 +3361,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           isOpen,
           fileSharing,
           relayWsUrl,
-          pictureTagUrl: picture
+          pictureTagUrl: picture,
+          gateways
         })
       const { adminListEvent, memberListEvent } = buildHypertunaAdminBootstrapDraftEvents({
         publicIdentifier,
@@ -3874,6 +3888,14 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           return getBaseRelayUrl(g.relay) === getBaseRelayUrl(relay)
         }) ||
         null
+      const existingMetadataTags = Array.isArray(cachedMetadata?.event?.tags)
+        ? (cachedMetadata?.event?.tags as string[][]).filter((tag) => Array.isArray(tag) && tag[0])
+        : []
+      const preservedMetadataTags = existingMetadataTags.filter((tag) => {
+        const key = tag[0]
+        return !['h', 'd', 'name', 'about', 'picture', 'public', 'private', 'open', 'closed'].includes(key)
+      })
+      const preservedGatewayTags = normalizeGatewayTags(preservedMetadataTags)
 
       const commandTags: string[][] = [['h', groupId]]
       const name = baseTagValue(data.name)
@@ -3917,6 +3939,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       }
 
       if (metadataTags.length > 2) {
+        metadataTags.push(...preservedMetadataTags)
         const metadataEvent: TDraftEvent = {
           kind: ExtendedKind.GROUP_METADATA,
           created_at: Math.floor(Date.now() / 1000),
@@ -3939,6 +3962,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           picture,
           isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : cachedMetadata?.isPublic,
           isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : cachedMetadata?.isOpen,
+          gateways: preservedGatewayTags,
           source: 'update'
         })
 
@@ -3957,7 +3981,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               about: about ?? g.about,
               picture: picture ?? g.picture,
               isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : g.isPublic,
-              isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : g.isOpen
+              isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : g.isOpen,
+              gateways: preservedGatewayTags.length ? preservedGatewayTags : g.gateways
             }
           })
         )

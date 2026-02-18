@@ -59,5 +59,7 @@ test('memory registration store captures token metadata', async () => {
   assert.ok(metadata);
   assert.equal(metadata.pubkey, 'pubkey123');
   assert.equal(metadata.scope, 'relay-access');
-  assert.equal(metadata.expiresAt, expiresAt);
+  // Store computes ttl-based expiry on write; ensure it is near the requested window.
+  assert.ok(metadata.expiresAt >= expiresAt - 25);
+  assert.ok(metadata.expiresAt <= expiresAt + 250);
 });

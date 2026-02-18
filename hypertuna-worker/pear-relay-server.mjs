@@ -3908,10 +3908,14 @@ async function waitForRelayWriterActivation(options = {}) {
   }
 
   const snapshot = (context) => {
+    const relayStats = collectRelayUpdateStats(relay);
     const localKey = relay?.local?.key ? b4a.toString(relay.local.key, 'hex') : null;
     const expectedActive = expectedKey && relay?.activeWriters?.has
       ? relay.activeWriters.has(expectedKey)
       : null;
+    const viewLength = Number.isFinite(relayStats?.viewLength) ? relayStats.viewLength : null;
+    const localLength = Number.isFinite(relayStats?.localLength) ? relayStats.localLength : null;
+    const expectedViewLength = Number.isFinite(viewLength) ? viewLength : localLength;
     return {
       relayKey,
       reason,
@@ -3922,6 +3926,9 @@ async function waitForRelayWriterActivation(options = {}) {
       localKey: localKey ? localKey.slice(0, 16) : null,
       expectedWriter: expectedHex,
       expectedWriterActive: expectedActive,
+      viewLength,
+      localLength,
+      expectedViewLength,
       elapsedMs: Date.now() - start
     };
   };
@@ -4007,6 +4014,20 @@ async function waitForRelayWriterActivation(options = {}) {
   });
 }
 
+function relayWritableMetricsFromResult(result = null) {
+  const localLength = Number.isFinite(result?.localLength) ? result.localLength : null;
+  const viewLength = Number.isFinite(result?.viewLength)
+    ? result.viewLength
+    : localLength;
+  return {
+    viewLength,
+    localLength,
+    expectedViewLength: Number.isFinite(result?.expectedViewLength)
+      ? result.expectedViewLength
+      : viewLength
+  };
+}
+
 function scheduleLateWriterRecovery(options = {}) {
   const {
     relayKey,
@@ -4063,7 +4084,8 @@ function scheduleLateWriterRecovery(options = {}) {
           authToken,
           mode,
           writable: true,
-          expectedWriterActive: result?.expectedWriterActive ?? null
+          expectedWriterActive: result?.expectedWriterActive ?? null,
+          ...relayWritableMetricsFromResult(result)
         };
         global.sendMessage({
           type: 'relay-writable',
@@ -4685,7 +4707,8 @@ export async function createRelay(options) {
           authToken: result.authToken || null,
           mode: 'create-relay',
           writable: relayWaitResult?.writable ?? null,
-          expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
+          expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
+          ...relayWritableMetricsFromResult(relayWaitResult)
         };
         global.sendMessage({
           type: 'relay-writable',
@@ -5322,6 +5345,11 @@ export async function startJoinAuthentication(options) {
         let relayWaitResult = null;
         const canBypassWait = Boolean(writerSecret && (expectedWriterKey || writerCore || writerCoreHex));
         if (canBypassWait) {
+          const relayStats = collectRelayUpdateStats(relayManager?.relay);
+          const viewLength = Number.isFinite(relayStats?.viewLength)
+            ? relayStats.viewLength
+            : (Number.isFinite(relayStats?.localLength) ? relayStats.localLength : null);
+          const localLength = Number.isFinite(relayStats?.localLength) ? relayStats.localLength : null;
           let expectedWriterActive = null;
           try {
             const activeWriters = relayManager?.relay?.activeWriters;
@@ -5336,7 +5364,10 @@ export async function startJoinAuthentication(options) {
             writable: relayManager?.relay?.writable ?? false,
             expectedWriterActive,
             elapsedMs: 0,
-            bypassed: true
+            bypassed: true,
+            viewLength,
+            localLength,
+            expectedViewLength: Number.isFinite(viewLength) ? viewLength : localLength
           };
           console.log('[RelayServer] Bypassing relay-writable wait (writer secret present)', {
             relayKey: fallbackRelayKey,
@@ -5382,7 +5413,8 @@ export async function startJoinAuthentication(options) {
             authToken: inviteToken,
             mode: 'blind-peer-offline',
             writable: relayWaitResult?.writable ?? null,
-            expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
+            expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
+            ...relayWritableMetricsFromResult(relayWaitResult)
           };
 
           global.sendMessage({
@@ -5614,7 +5646,8 @@ export async function startJoinAuthentication(options) {
             authToken: provisionalToken,
             mode: 'open-offline',
             writable: relayWaitResult?.writable ?? null,
-            expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
+            expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
+            ...relayWritableMetricsFromResult(relayWaitResult)
           };
 
           global.sendMessage({
@@ -5867,7 +5900,8 @@ export async function startJoinAuthentication(options) {
         authToken,
         mode: 'direct-join',
         writable: directWaitResult?.writable ?? null,
-        expectedWriterActive: directWaitResult?.expectedWriterActive ?? null
+        expectedWriterActive: directWaitResult?.expectedWriterActive ?? null,
+        ...relayWritableMetricsFromResult(directWaitResult)
       };
 
       global.sendMessage({

@@ -9,6 +9,12 @@ export const KIND_GROUP_ADMIN_LIST = 39001
 export const KIND_GROUP_MEMBER_LIST = 39002
 export const KIND_HYPERTUNA_RELAY = 30166
 
+export type HypertunaGatewayTag = {
+  origin: string
+  operatorPubkey: string
+  policy: 'OPEN' | 'CLOSED'
+}
+
 export function getBaseRelayUrl(url: string): string {
   try {
     const u = new URL(url)
@@ -45,6 +51,61 @@ export function parseHypertunaRelayEvent30166(
   return { publicIdentifier, wsUrl }
 }
 
+export function normalizeGatewayOrigin(url: string | null | undefined): string | null {
+  if (!url) return null
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol === 'wss:') parsed.protocol = 'https:'
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:'
+    if (parsed.protocol === 'http:') parsed.protocol = 'https:'
+    if (parsed.protocol !== 'https:') return null
+    return parsed.origin
+  } catch (_err) {
+    return null
+  }
+}
+
+export function normalizeGatewayPolicy(value: string | null | undefined): 'OPEN' | 'CLOSED' {
+  const upper = typeof value === 'string' ? value.trim().toUpperCase() : ''
+  return upper === 'CLOSED' ? 'CLOSED' : 'OPEN'
+}
+
+export function normalizeGatewayPubkey(value: string | null | undefined): string | null {
+  if (!value) return null
+  const trimmed = value.trim().toLowerCase()
+  if (!/^[a-f0-9]{64}$/i.test(trimmed)) return null
+  return trimmed
+}
+
+export function normalizeGatewayTags(tags: string[][] | null | undefined): HypertunaGatewayTag[] {
+  const gateways: HypertunaGatewayTag[] = []
+  const seen = new Set<string>()
+  for (const tag of Array.isArray(tags) ? tags : []) {
+    if (!Array.isArray(tag) || tag[0] !== 'gateway') continue
+    const origin = normalizeGatewayOrigin(tag[1])
+    const operatorPubkey = normalizeGatewayPubkey(tag[2])
+    if (!origin || !operatorPubkey || seen.has(origin)) continue
+    seen.add(origin)
+    gateways.push({
+      origin,
+      operatorPubkey,
+      policy: normalizeGatewayPolicy(tag[3])
+    })
+  }
+  return gateways
+}
+
+export function buildGatewayTags(gateways: HypertunaGatewayTag[] | undefined): string[][] {
+  const tags: string[][] = []
+  for (const gateway of Array.isArray(gateways) ? gateways : []) {
+    const origin = normalizeGatewayOrigin(gateway?.origin)
+    const operatorPubkey = normalizeGatewayPubkey(gateway?.operatorPubkey)
+    if (!origin || !operatorPubkey) continue
+    tags.push(['gateway', origin, operatorPubkey, normalizeGatewayPolicy(gateway?.policy)])
+  }
+  return tags
+}
+
 export function buildHypertunaDiscoveryDraftEvents(args: {
   publicIdentifier: string
   name: string
@@ -54,6 +115,7 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   fileSharing?: boolean
   relayWsUrl: string
   pictureTagUrl?: string
+  gateways?: HypertunaGatewayTag[]
 }): { groupCreateEvent: TDraftEvent; metadataEvent: TDraftEvent; hypertunaEvent: TDraftEvent } {
   const now = Math.floor(Date.now() / 1000)
   const fileSharingEnabled = args.fileSharing !== false
@@ -72,6 +134,7 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   if (args.pictureTagUrl) {
     groupTags.push(['picture', args.pictureTagUrl, 'hypertuna:drive:pfp'])
   }
+  groupTags.push(...buildGatewayTags(args.gateways))
 
   const groupCreateEvent: TDraftEvent = {
     kind: KIND_GROUP_CREATE,
@@ -95,6 +158,7 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   if (args.pictureTagUrl) {
     metadataTags.push(['picture', args.pictureTagUrl, 'hypertuna:drive:pfp'])
   }
+  metadataTags.push(...buildGatewayTags(args.gateways))
 
   const metadataEvent: TDraftEvent = {
     kind: KIND_GROUP_METADATA,

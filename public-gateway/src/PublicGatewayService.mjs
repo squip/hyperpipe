@@ -50,9 +50,14 @@ import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGate
 import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hyperbeeReplicationChannel.mjs';
 import BlindPeerService from './blind-peer/BlindPeerService.mjs';
 import BlindPeerReplicaManager from './blind-peer/BlindPeerReplicaManager.mjs';
+import GatewayPolicyService from './GatewayPolicyService.mjs';
+import GatewayAuthService from './GatewayAuthService.mjs';
+import GatewayEventPublisher from './GatewayEventPublisher.mjs';
+import GatewayInviteService from './GatewayInviteService.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores';
+const MULTI_GATEWAY_DEBUG = process.env.PG_DEBUG_MULTI_GATEWAY === '1';
 
 function safeString(value) {
   if (typeof value === 'string') return value;
@@ -197,6 +202,38 @@ class PublicGatewayService {
         }
       }
     };
+    this.gatewayOrigin = this.#resolveGatewayOrigin(this.config?.publicBaseUrl);
+    this.multiGatewayEnabled = this.config?.gateway?.enableMulti === true;
+    this.gatewayPolicyService = new GatewayPolicyService({
+      logger: this.logger,
+      config: {
+        operatorPubkey: this.config?.gateway?.operatorPubkey || null,
+        operatorNsecHex: this.config?.gateway?.operatorNsecHex || null,
+        policy: this.config?.gateway?.policy || 'OPEN',
+        allowList: this.config?.gateway?.allowList || [],
+        banList: this.config?.gateway?.banList || [],
+        discoveryRelays: this.config?.gateway?.discoveryRelays || [],
+        inviteOnly: this.config?.gateway?.inviteOnly === true
+      }
+    });
+    this.gatewayAuthService = new GatewayAuthService({
+      logger: this.logger,
+      config: {
+        jwtSecret: this.config?.gateway?.authJwtSecret || null,
+        tokenTtlSec: this.config?.gateway?.authTokenTtlSec || 3600,
+        challengeTtlMs: this.config?.gateway?.authChallengeTtlMs || (2 * 60 * 1000),
+        authWindowSec: this.config?.gateway?.authWindowSec || 300,
+        issuer: `hypertuna-public-gateway:${this.gatewayOrigin || 'unknown'}`
+      }
+    });
+    this.gatewayInviteService = new GatewayInviteService({
+      logger: this.logger
+    });
+    this.gatewayEventPublisher = new GatewayEventPublisher({
+      logger: this.logger,
+      gatewayOrigin: this.gatewayOrigin,
+      policyService: this.gatewayPolicyService
+    });
 
     if (this.dispatcher) {
       const assignmentListener = (event) => this.#handleDispatcherAssignment(event);
@@ -257,6 +294,9 @@ class PublicGatewayService {
       });
       await this.blindPeerService.initialize();
       await this.#initializeBlindPeerReplicaManager();
+    }
+    if (this.multiGatewayEnabled) {
+      this.gatewayEventPublisher.publishGatewayMetadata({ reason: 'startup' });
     }
     this.logger.info('PublicGatewayService initialized');
   }
@@ -416,6 +456,23 @@ class PublicGatewayService {
     app.get('/api/blind-peer/replicas', (req, res) => this.#handleBlindPeerReplicas(req, res));
     app.post('/api/blind-peer/gc', (req, res) => this.#handleBlindPeerGc(req, res));
     app.delete('/api/blind-peer/mirrors/:key', (req, res) => this.#handleBlindPeerDelete(req, res));
+    app.get('/api/relays/:relayKey/status', (req, res) => this.#handleRelayStatus(req, res));
+    app.post('/api/auth/challenge', (req, res) => this.#handleGatewayAuthChallenge(req, res));
+    app.post('/api/auth/verify', (req, res) => this.#handleGatewayAuthVerify(req, res));
+    app.get('/api/gateway/policy', (req, res) => this.#handleGatewayPolicyStatus(req, res));
+    app.post('/api/gateway/policy', (req, res) => this.#handleGatewayPolicyUpdate(req, res));
+    app.post('/api/gateway/join-requests', (req, res) => this.#handleGatewayJoinRequestCreate(req, res));
+    app.get('/api/gateway/join-requests', (req, res) => this.#handleGatewayJoinRequestList(req, res));
+    app.post('/api/gateway/join-requests/:id/approve', (req, res) => this.#handleGatewayJoinRequestApprove(req, res));
+    app.post('/api/gateway/join-requests/:id/reject', (req, res) => this.#handleGatewayJoinRequestReject(req, res));
+    app.post('/api/gateway/invites', (req, res) => this.#handleGatewayInviteCreate(req, res));
+    app.post('/api/gateway/invites/redeem', (req, res) => this.#handleGatewayInviteRedeem(req, res));
+    app.get('/api/gateway/allow-list', (req, res) => this.#handleGatewayAllowList(req, res));
+    app.post('/api/gateway/allow-list', (req, res) => this.#handleGatewayAllowAdd(req, res));
+    app.delete('/api/gateway/allow-list/:pubkey', (req, res) => this.#handleGatewayAllowRemove(req, res));
+    app.get('/api/gateway/ban-list', (req, res) => this.#handleGatewayBanList(req, res));
+    app.post('/api/gateway/ban-list', (req, res) => this.#handleGatewayBanAdd(req, res));
+    app.delete('/api/gateway/ban-list/:pubkey', (req, res) => this.#handleGatewayBanRemove(req, res));
 
     app.get('/health', (_req, res) => {
       res.json({ status: 'ok' });
@@ -583,6 +640,62 @@ class PublicGatewayService {
       maxAppendCores: Number.isFinite(maxAppendCores) && maxAppendCores > 0 ? Math.trunc(maxAppendCores) : 64,
       maxRelayCores: Number.isFinite(maxRelayCores) && maxRelayCores > 0 ? Math.trunc(maxRelayCores) : 1024
     };
+  }
+
+  #resolveGatewayOrigin(value) {
+    if (!value || typeof value !== 'string') return null;
+    try {
+      const parsed = new URL(value);
+      if (parsed.protocol === 'wss:') parsed.protocol = 'https:';
+      if (parsed.protocol === 'ws:') parsed.protocol = 'http:';
+      if (parsed.protocol === 'http:') parsed.protocol = 'https:';
+      if (parsed.protocol !== 'https:') return null;
+      return parsed.origin;
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  #extractRelayAdminPubkey(registration = {}) {
+    const candidates = [
+      registration?.metadata?.ownerPubkey,
+      registration?.metadata?.owner_pubkey,
+      registration?.metadata?.creatorPubkey,
+      registration?.metadata?.creator_pubkey,
+      registration?.metadata?.nostrPubkeyHex,
+      registration?.metadata?.nostr_pubkey_hex,
+      registration?.ownerPubkey,
+      registration?.owner_pubkey,
+      registration?.nostrPubkeyHex,
+      registration?.nostr_pubkey_hex
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate !== 'string') continue;
+      const trimmed = candidate.trim().toLowerCase();
+      if (/^[a-f0-9]{64}$/i.test(trimmed)) return trimmed;
+    }
+    return null;
+  }
+
+  #verifyGatewayBearer(req, { requiredScopes = [], relayKey = null, pubkey = null } = {}) {
+    const authHeader = req?.headers?.authorization || req?.headers?.Authorization || null;
+    return this.gatewayAuthService.verifyBearer(authHeader, {
+      requiredScopes,
+      relayKey,
+      pubkey
+    });
+  }
+
+  #emitMultiGatewayDebug(eventType, payload = {}) {
+    if (!MULTI_GATEWAY_DEBUG) return;
+    try {
+      const line = {
+        ts: new Date().toISOString(),
+        eventType,
+        ...(payload && typeof payload === 'object' ? payload : {})
+      };
+      console.log('[PublicGateway][MultiGateway]', JSON.stringify(line));
+    } catch (_) {}
   }
 
   #resolveRelayPeerCount(record) {
@@ -3069,6 +3182,407 @@ class PublicGatewayService {
     }
   }
 
+  async #handleRelayStatus(req, res) {
+    const identifier = req.params?.relayKey;
+    if (!identifier) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+    try {
+      const resolvedRegistration = await this.#resolveOpenJoinRegistration(identifier);
+      const resolvedPool = await this.#resolveOpenJoinPool(identifier);
+      const relayKey = resolvedRegistration?.relayKey || resolvedPool?.relayKey || identifier;
+      const record = resolvedRegistration?.record || null;
+      const pool = resolvedPool?.pool || null;
+      const source = record ? 'registration' : (pool ? 'open-join-pool' : 'unknown');
+      const relayCores = Array.isArray(record?.relayCores)
+        ? record.relayCores
+        : (Array.isArray(pool?.relayCores) ? pool.relayCores : []);
+      const maxCoreLength = relayCores.reduce((max, entry) => {
+        const candidate = Number(entry?.length || entry?.signedLength || 0);
+        return Number.isFinite(candidate) && candidate > max ? candidate : max;
+      }, 0);
+      const writerCount = relayCores.reduce((count, entry) => {
+        const role = typeof entry?.role === 'string' ? entry.role.toLowerCase() : '';
+        if (role === 'writer' || role === 'local' || role === 'member-writer') {
+          return count + 1;
+        }
+        return count;
+      }, 0);
+      const latestViewLength = Number(
+        record?.metadata?.latestViewLength
+        || record?.metadata?.viewLength
+        || record?.metadata?.autobaseLength
+        || pool?.metadata?.latestViewLength
+        || maxCoreLength
+        || 0
+      );
+      const updatedAt = Number(
+        record?.updatedAt
+        || record?.metadata?.metadataUpdatedAt
+        || pool?.updatedAt
+        || Date.now()
+      );
+      const fastForward = record?.metadata?.fastForward || record?.metadata?.fast_forward || pool?.metadata?.fastForward || pool?.metadata?.fast_forward || null;
+      const fastForwardSignedLength = Number(
+        fastForward?.signedLength
+        || fastForward?.signed_length
+        || fastForward?.length
+        || 0
+      );
+      const writerMaterialUpdatedAt = Number(
+        record?.metadata?.writerMaterialUpdatedAt
+        || pool?.metadata?.writerMaterialUpdatedAt
+        || updatedAt
+      );
+      const mirrorVersion = Number(
+        record?.gatewayReplica?.version
+        || record?.metadata?.mirrorVersion
+        || pool?.metadata?.mirrorVersion
+        || 1
+      );
+      const coreRefsHash = relayCores.length
+        ? createHash('sha256')
+            .update(
+              relayCores
+                .map((entry) => String(entry?.key || '').trim())
+                .filter((value) => value.length)
+                .sort()
+                .join('|')
+            )
+            .digest('hex')
+        : null;
+      const responsePayload = {
+        relayKey,
+        source,
+        latestViewLength: Number.isFinite(latestViewLength) ? latestViewLength : 0,
+        maxCoreLength,
+        writerCount,
+        updatedAt,
+        coreRefsHash,
+        fastForwardSignedLength: Number.isFinite(fastForwardSignedLength) ? fastForwardSignedLength : 0,
+        writerMaterialUpdatedAt: Number.isFinite(writerMaterialUpdatedAt) ? writerMaterialUpdatedAt : updatedAt,
+        mirrorVersion: Number.isFinite(mirrorVersion) ? mirrorVersion : 1,
+        policy: this.gatewayPolicyService.getSnapshot().policy
+      };
+      this.#emitMultiGatewayDebug('relay-status', {
+        relayKey,
+        source,
+        latestViewLength: responsePayload.latestViewLength,
+        writerCount: responsePayload.writerCount,
+        fastForwardSignedLength: responsePayload.fastForwardSignedLength,
+        mirrorVersion: responsePayload.mirrorVersion,
+        coreRefsHash: responsePayload.coreRefsHash
+      });
+      return res.json(responsePayload);
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Failed to resolve relay status', {
+        identifier,
+        error: error?.message || error
+      });
+      this.#emitMultiGatewayDebug('relay-status-error', {
+        identifier,
+        error: error?.message || String(error)
+      });
+      return res.status(500).json({ error: 'relay-status-unavailable' });
+    }
+  }
+
+  #requireGatewayScope(req, res, requiredScopes = [], { relayKey = null, pubkey = null } = {}) {
+    const verification = this.#verifyGatewayBearer(req, {
+      requiredScopes,
+      relayKey,
+      pubkey
+    });
+    if (!verification?.ok) {
+      res.status(401).json({ error: verification?.reason || 'unauthorized' });
+      return null;
+    }
+    return verification.payload || null;
+  }
+
+  async #handleGatewayAuthChallenge(req, res) {
+    try {
+      const pubkey = req.body?.pubkey;
+      const scope = req.body?.scope;
+      const relayKey = req.body?.relayKey || null;
+      const challenge = this.gatewayAuthService.issueChallenge({ pubkey, scope, relayKey });
+      this.#emitMultiGatewayDebug('auth-challenge-issued', {
+        pubkey: typeof pubkey === 'string' ? pubkey.slice(0, 12) : null,
+        scope,
+        relayKey: relayKey || null,
+        challengeId: challenge.challengeId
+      });
+      return res.json({
+        challengeId: challenge.challengeId,
+        nonce: challenge.nonce,
+        expiresAt: challenge.expiresAt,
+        scope: challenge.scope,
+        relayKey: challenge.relayKey
+      });
+    } catch (error) {
+      this.#emitMultiGatewayDebug('auth-challenge-failed', {
+        error: error?.message || String(error)
+      });
+      return res.status(400).json({ error: error?.message || 'challenge-issue-failed' });
+    }
+  }
+
+  async #handleGatewayAuthVerify(req, res) {
+    const challengeId = req.body?.challengeId || req.body?.challenge_id;
+    const authEvent = req.body?.authEvent || req.body?.auth_event || req.body?.event || null;
+    const result = await this.gatewayAuthService.verifyChallenge({ challengeId, authEvent });
+    if (!result?.ok) {
+      this.#emitMultiGatewayDebug('auth-verify-failed', {
+        challengeId: challengeId || null,
+        reason: result?.reason || 'auth-verify-failed'
+      });
+      return res.status(401).json({ error: result?.reason || 'auth-verify-failed' });
+    }
+    this.#emitMultiGatewayDebug('auth-verify-success', {
+      challengeId: challengeId || null,
+      scope: result.scope,
+      relayKey: result.relayKey || null,
+      pubkey: typeof result.pubkey === 'string' ? result.pubkey.slice(0, 12) : null
+    });
+    return res.json({
+      tokenType: result.tokenType,
+      token: result.token,
+      expiresIn: result.expiresIn,
+      scope: result.scope,
+      relayKey: result.relayKey,
+      pubkey: result.pubkey
+    });
+  }
+
+  async #handleGatewayPolicyStatus(_req, res) {
+    const snapshot = this.gatewayPolicyService.getSnapshot();
+    return res.json({
+      gatewayOrigin: this.gatewayOrigin,
+      policy: snapshot.policy,
+      operatorPubkey: snapshot.operatorPubkey,
+      allowList: snapshot.allowList,
+      inviteOnly: snapshot.inviteOnly,
+      discoveryRelays: snapshot.discoveryRelays,
+      banCount: snapshot.banList.length
+    });
+  }
+
+  async #handleGatewayPolicyUpdate(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+
+    const policy = req.body?.policy;
+    const inviteOnly = req.body?.inviteOnly;
+    const discoveryRelays = req.body?.discoveryRelays;
+    if (policy !== undefined) {
+      this.gatewayPolicyService.setPolicy(policy);
+    }
+    if (typeof inviteOnly === 'boolean') {
+      this.gatewayPolicyService.setInviteOnly(inviteOnly);
+    }
+    if (Array.isArray(discoveryRelays)) {
+      this.gatewayPolicyService.setDiscoveryRelays(discoveryRelays);
+    }
+
+    const snapshot = this.gatewayPolicyService.getSnapshot();
+    this.gatewayEventPublisher.publishGatewayMetadata({ reason: 'policy-update' });
+    this.#emitMultiGatewayDebug('policy-updated', {
+      policy: snapshot.policy,
+      inviteOnly: snapshot.inviteOnly,
+      discoveryRelayCount: snapshot.discoveryRelays.length
+    });
+    return res.json({
+      status: 'ok',
+      policy: snapshot.policy,
+      inviteOnly: snapshot.inviteOnly,
+      discoveryRelays: snapshot.discoveryRelays
+    });
+  }
+
+  async #handleGatewayJoinRequestCreate(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:join-request', 'gateway:join_request']);
+    if (!auth) return;
+    if (this.gatewayPolicyService.getSnapshot().inviteOnly) {
+      return res.status(403).json({ error: 'invite-only-gateway' });
+    }
+    const pubkey = auth?.pubkey || auth?.sub || null;
+    try {
+      const created = this.gatewayInviteService.submitJoinRequest({
+        pubkey,
+        content: req.body?.content || req.body?.note || '',
+        metadata: {
+          origin: this.gatewayOrigin
+        }
+      });
+      return res.json({ status: 'ok', request: created });
+    } catch (error) {
+      return res.status(400).json({ error: error?.message || 'join-request-create-failed' });
+    }
+  }
+
+  async #handleGatewayJoinRequestList(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    const status = typeof req.query?.status === 'string' ? req.query.status : null;
+    const requests = this.gatewayInviteService.listJoinRequests({ status });
+    return res.json({ status: 'ok', requests });
+  }
+
+  async #handleGatewayJoinRequestApprove(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    try {
+      const requestId = req.params?.id;
+      const approved = this.gatewayInviteService.approveJoinRequest({ requestId });
+      const invitee = approved?.invite?.pubkey || null;
+      const inviteToken = approved?.invite?.inviteToken || null;
+      if (invitee && inviteToken) {
+        this.gatewayEventPublisher.publishInviteEvent({
+          inviteePubkey: invitee,
+          inviteToken
+        });
+      }
+      return res.json({ status: 'ok', ...approved });
+    } catch (error) {
+      return res.status(400).json({ error: error?.message || 'join-request-approve-failed' });
+    }
+  }
+
+  async #handleGatewayJoinRequestReject(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    try {
+      const requestId = req.params?.id;
+      const rejected = this.gatewayInviteService.rejectJoinRequest({ requestId });
+      return res.json({ status: 'ok', request: rejected });
+    } catch (error) {
+      return res.status(400).json({ error: error?.message || 'join-request-reject-failed' });
+    }
+  }
+
+  async #handleGatewayInviteCreate(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    try {
+      const pubkey = req.body?.pubkey;
+      const invite = this.gatewayInviteService.createInvite({
+        pubkey,
+        metadata: { origin: this.gatewayOrigin }
+      });
+      this.gatewayEventPublisher.publishInviteEvent({
+        inviteePubkey: invite.pubkey,
+        inviteToken: invite.inviteToken
+      });
+      return res.json({ status: 'ok', invite });
+    } catch (error) {
+      return res.status(400).json({ error: error?.message || 'invite-create-failed' });
+    }
+  }
+
+  async #handleGatewayInviteRedeem(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:invite-redeem', 'gateway:invite_redeem']);
+    if (!auth) return;
+    const pubkey = auth?.pubkey || auth?.sub || null;
+    try {
+      const inviteToken = req.body?.inviteToken || req.body?.invite_token || req.body?.token;
+      const redeemed = this.gatewayInviteService.redeemInvite({
+        inviteToken,
+        pubkey
+      });
+      this.gatewayPolicyService.addAllow(pubkey);
+      this.gatewayEventPublisher.publishGatewayMetadata({ reason: 'invite-redeem' });
+      return res.json({
+        status: 'ok',
+        invite: redeemed,
+        allowListed: true
+      });
+    } catch (error) {
+      return res.status(400).json({ error: error?.message || 'invite-redeem-failed' });
+    }
+  }
+
+  async #handleGatewayAllowList(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    const snapshot = this.gatewayPolicyService.getSnapshot();
+    return res.json({
+      status: 'ok',
+      allowList: snapshot.allowList,
+      count: snapshot.allowList.length
+    });
+  }
+
+  async #handleGatewayAllowAdd(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    const result = this.gatewayPolicyService.addAllow(req.body?.pubkey);
+    if (!result?.ok) {
+      return res.status(400).json({ error: result?.reason || 'allow-add-failed' });
+    }
+    this.gatewayEventPublisher.publishGatewayMetadata({ reason: 'allow-list-add' });
+    return res.json({
+      status: 'ok',
+      pubkey: result.pubkey,
+      allowList: this.gatewayPolicyService.getSnapshot().allowList
+    });
+  }
+
+  async #handleGatewayAllowRemove(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    const result = this.gatewayPolicyService.removeAllow(req.params?.pubkey);
+    if (!result?.ok) {
+      return res.status(400).json({ error: result?.reason || 'allow-remove-failed' });
+    }
+    this.gatewayEventPublisher.publishGatewayMetadata({ reason: 'allow-list-remove' });
+    return res.json({
+      status: 'ok',
+      pubkey: result.pubkey,
+      allowList: this.gatewayPolicyService.getSnapshot().allowList
+    });
+  }
+
+  async #handleGatewayBanList(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    const snapshot = this.gatewayPolicyService.getSnapshot();
+    return res.json({
+      status: 'ok',
+      banList: snapshot.banList,
+      count: snapshot.banList.length
+    });
+  }
+
+  async #handleGatewayBanAdd(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    const result = this.gatewayPolicyService.addBan(req.body?.pubkey);
+    if (!result?.ok) {
+      return res.status(400).json({ error: result?.reason || 'ban-add-failed' });
+    }
+    this.gatewayEventPublisher.publishGatewayMetadata({ reason: 'ban-list-add' });
+    return res.json({
+      status: 'ok',
+      pubkey: result.pubkey,
+      banCount: this.gatewayPolicyService.getSnapshot().banList.length
+    });
+  }
+
+  async #handleGatewayBanRemove(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    const result = this.gatewayPolicyService.removeBan(req.params?.pubkey);
+    if (!result?.ok) {
+      return res.status(400).json({ error: result?.reason || 'ban-remove-failed' });
+    }
+    this.gatewayEventPublisher.publishGatewayMetadata({ reason: 'ban-list-remove' });
+    return res.json({
+      status: 'ok',
+      pubkey: result.pubkey,
+      banCount: this.gatewayPolicyService.getSnapshot().banList.length
+    });
+  }
+
   #verifySignedPayload(payload, signature) {
     if (!this.sharedSecret) return false;
     if (!payload || typeof payload !== 'object' || !signature) return false;
@@ -3645,6 +4159,26 @@ class PublicGatewayService {
             role: typeof entry.role === 'string' ? entry.role : null
           }))
       : null;
+    const relayAdminPubkey = this.#extractRelayAdminPubkey(registration);
+    if (this.multiGatewayEnabled) {
+      const policyDecision = this.gatewayPolicyService.canRegisterRelay({
+        adminPubkey: relayAdminPubkey
+      });
+      this.#emitMultiGatewayDebug('policy-register-check', {
+        relayKey: registration.relayKey,
+        relayAdminPubkey: relayAdminPubkey ? relayAdminPubkey.slice(0, 12) : null,
+        allowed: policyDecision.allowed,
+        reason: policyDecision.reason
+      });
+      if (!policyDecision.allowed) {
+        this.logger?.warn?.('[PublicGateway] Relay registration rejected by policy', {
+          relayKey: registration.relayKey,
+          relayAdminPubkey: relayAdminPubkey ? relayAdminPubkey.slice(0, 12) : null,
+          reason: policyDecision.reason
+        });
+        return res.status(403).json({ error: 'policy-denied', reason: policyDecision.reason });
+      }
+    }
 
     const valid = verifySignature(registration, signature, this.sharedSecret);
     if (!valid) {
@@ -4217,6 +4751,23 @@ class PublicGatewayService {
       if (!verification.ok) {
         return res.status(401).json({ error: verification.error || 'auth-invalid' });
       }
+      if (this.multiGatewayEnabled) {
+        const relayAdminPubkey = this.#extractRelayAdminPubkey(record || { metadata: pool?.metadata || null });
+        const accessDecision = this.gatewayPolicyService.canAccessRelay({
+          pubkey: verification.pubkey,
+          relayAdminPubkey
+        });
+        this.#emitMultiGatewayDebug('policy-open-join-access', {
+          relayKey,
+          requesterPubkey: verification.pubkey ? verification.pubkey.slice(0, 12) : null,
+          relayAdminPubkey: relayAdminPubkey ? relayAdminPubkey.slice(0, 12) : null,
+          allowed: accessDecision.allowed,
+          reason: accessDecision.reason
+        });
+        if (!accessDecision.allowed) {
+          return res.status(403).json({ error: 'policy-denied', reason: accessDecision.reason });
+        }
+      }
 
       let poolBefore = null;
       try {
@@ -4371,6 +4922,23 @@ class PublicGatewayService {
       });
       if (!verification.ok) {
         return res.status(401).json({ error: verification.error || 'auth-invalid' });
+      }
+      if (this.multiGatewayEnabled) {
+        const relayAdminPubkey = this.#extractRelayAdminPubkey(record || { metadata: pool?.metadata || null });
+        const accessDecision = this.gatewayPolicyService.canAccessRelay({
+          pubkey: verification.pubkey,
+          relayAdminPubkey
+        });
+        this.#emitMultiGatewayDebug('policy-append-access', {
+          relayKey,
+          requesterPubkey: verification.pubkey ? verification.pubkey.slice(0, 12) : null,
+          relayAdminPubkey: relayAdminPubkey ? relayAdminPubkey.slice(0, 12) : null,
+          allowed: accessDecision.allowed,
+          reason: accessDecision.reason
+        });
+        if (!accessDecision.allowed) {
+          return res.status(403).json({ error: 'policy-denied', reason: accessDecision.reason });
+        }
       }
 
       const poolRecord = pool || await this.registrationStore.getOpenJoinPool?.(relayKey);

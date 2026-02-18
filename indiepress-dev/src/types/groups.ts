@@ -6,6 +6,12 @@ export type TGroupIdentifier = {
   relay?: string
 }
 
+export type TGatewayDescriptor = {
+  origin: string
+  operatorPubkey: string
+  policy: 'OPEN' | 'CLOSED'
+}
+
 export type TGroupMetadata = {
   id: string
   relay?: string
@@ -15,6 +21,7 @@ export type TGroupMetadata = {
   isPublic?: boolean
   isOpen?: boolean
   tags: string[]
+  gateways?: TGatewayDescriptor[]
   event: Event
 }
 

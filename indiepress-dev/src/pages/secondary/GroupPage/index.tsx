@@ -1054,6 +1054,13 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       const relayUrlForJoin = resolvedGroupRelay || effectiveGroupRelay || null
       const inviteRelayKey = inviteData?.relayKey || null
       const relayKey = relayKeyForGroup || inviteRelayKey || null
+      const gatewayOrigins = Array.from(
+        new Set(
+          ((effectiveDetail?.metadata?.gateways || fallbackMeta?.gateways || []) as Array<{ origin?: string }>)
+            .map((gateway) => String(gateway?.origin || '').trim())
+            .filter(Boolean)
+        )
+      )
       const shouldUseWorkerJoin =
         isElectron() &&
         (isHypertunaGroup || hasInviteJoinData || !!relayKeyForGroup || !!groupId?.includes(':'))
@@ -1089,6 +1096,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           token: inviteToken,
           relayKey,
           relayUrl: relayUrlForJoin,
+          gatewayOrigins,
           blindPeer: inviteData?.blindPeer,
           cores: inviteData?.cores,
           writerCore: inviteData?.writerCore,

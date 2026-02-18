@@ -28,6 +28,50 @@ export function buildGroupIdForCreation(creatorNpub: string, name: string): stri
   return `${creatorNpub}-${sanitizedName}`
 }
 
+function normalizeGatewayOrigin(candidate: string | undefined): string | null {
+  if (!candidate) return null
+  try {
+    const parsed = new URL(candidate)
+    if (parsed.protocol === 'wss:') parsed.protocol = 'https:'
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:'
+    if (parsed.protocol === 'http:') parsed.protocol = 'https:'
+    if (parsed.protocol !== 'https:') return null
+    return parsed.origin
+  } catch (_err) {
+    return null
+  }
+}
+
+function normalizePubkey(value: string | undefined): string | null {
+  if (!value) return null
+  const trimmed = value.trim().toLowerCase()
+  if (!/^[a-f0-9]{64}$/i.test(trimmed)) return null
+  return trimmed
+}
+
+function normalizeGatewayPolicy(value: string | undefined): 'OPEN' | 'CLOSED' {
+  const upper = typeof value === 'string' ? value.trim().toUpperCase() : ''
+  return upper === 'CLOSED' ? 'CLOSED' : 'OPEN'
+}
+
+function parseGatewayTags(tags: string[][]) {
+  const gateways: Array<{ origin: string; operatorPubkey: string; policy: 'OPEN' | 'CLOSED' }> = []
+  const seen = new Set<string>()
+  for (const tag of tags) {
+    if (!Array.isArray(tag) || tag[0] !== 'gateway') continue
+    const origin = normalizeGatewayOrigin(tag[1])
+    const operatorPubkey = normalizePubkey(tag[2])
+    if (!origin || !operatorPubkey || seen.has(origin)) continue
+    seen.add(origin)
+    gateways.push({
+      origin,
+      operatorPubkey,
+      policy: normalizeGatewayPolicy(tag[3])
+    })
+  }
+  return gateways
+}
+
 export function parseGroupMetadataEvent(event: Event, relay?: string) {
   const d = event.tags.find((tag) => tag[0] === 'd')?.[1] ?? ''
   const name = event.tags.find((tag) => tag[0] === 'name')?.[1] ?? (d || 'Untitled Group')
@@ -35,6 +79,7 @@ export function parseGroupMetadataEvent(event: Event, relay?: string) {
   const picture = event.tags.find((tag) => tag[0] === 'picture')?.[1]
   const isPublic = event.tags.some((tag) => tag[0] === 'public')
   const isOpen = event.tags.some((tag) => tag[0] === 'open')
+  const gateways = parseGatewayTags(event.tags)
 
   return {
     id: d,
@@ -44,6 +89,7 @@ export function parseGroupMetadataEvent(event: Event, relay?: string) {
     picture,
     isPublic,
     isOpen,
+    gateways,
     event
   }
 }

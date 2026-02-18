@@ -42,6 +42,12 @@ export type RelayEntry = {
   gatewayPath?: string
 }
 
+export type GatewayDescriptor = {
+  origin: string
+  operatorPubkey: string
+  policy: 'OPEN' | 'CLOSED'
+}
+
 export type FeedItem = Event
 
 export type FeedSourceMode = 'relays' | 'relay' | 'following' | 'group'
@@ -66,6 +72,7 @@ export type GroupSummary = {
   picture?: string
   isPublic?: boolean
   isOpen?: boolean
+  gateways?: GatewayDescriptor[]
   adminPubkey?: string | null
   adminName?: string | null
   members?: string[]
