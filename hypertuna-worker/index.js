@@ -105,6 +105,7 @@ import {
   rankGatewayStatusProbes,
   evaluateFanoutResults
 } from './gateway/MultiGatewayJoinUtils.mjs'
+import PublicGatewayRegistrar from './gateway/PublicGatewayRegistrar.mjs'
 import MarmotService from './marmot-service.mjs'
 import ConversationFileIndex from './conversation-file-index.mjs'
 import MediaServiceManager from './media/MediaServiceManager.mjs'
@@ -150,6 +151,7 @@ const BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS = 7000
 const BLIND_PEER_MIRROR_METADATA_REFRESH_MS = 1 * 60 * 1000
 const BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS = 8000
 const GATEWAY_STATUS_TIMEOUT_MS = 8000
+const GATEWAY_SHARED_SECRET_TIMEOUT_MS = 5000
 const OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores'
@@ -177,6 +179,7 @@ let pendingRelayRegistryRefresh = false
 let gatewayWasRunning = false
 let lastMirrorMetadataRefreshAt = 0
 let mirrorMetadataRefreshInFlight = null
+const gatewaySharedSecretCache = new Map()
 const openJoinContexts = new Map()
 const pendingOpenJoinReauth = new Map()
 const OPEN_JOIN_REAUTH_MIN_INTERVAL_MS = 30000
@@ -892,6 +895,390 @@ function normalizeGatewayOriginList(values = []) {
   return Array.from(origins)
 }
 
+function normalizeSharedSecretCandidate(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  return trimmed
+}
+
+function normalizePubkeyHex(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim().toLowerCase()
+  if (!/^[a-f0-9]{64}$/i.test(trimmed)) return null
+  return trimmed
+}
+
+function decodeNpubToHex(npubValue) {
+  if (typeof npubValue !== 'string') return null
+  const normalized = npubValue.trim().toLowerCase()
+  if (!normalized.startsWith('npub1')) return null
+  const separatorIndex = normalized.lastIndexOf('1')
+  if (separatorIndex <= 0) return null
+  const hrp = normalized.slice(0, separatorIndex)
+  if (hrp !== 'npub') return null
+  const dataPart = normalized.slice(separatorIndex + 1)
+  if (!dataPart || dataPart.length < 6) return null
+
+  const charset = NostrUtils.bech32Charset()
+  const values = []
+  for (const char of dataPart) {
+    const idx = charset.indexOf(char)
+    if (idx < 0) return null
+    values.push(idx)
+  }
+
+  const checksumValues = NostrUtils.bech32HrpExpand(hrp).concat(values)
+  if (NostrUtils.bech32Polymod(checksumValues) !== 1) return null
+
+  const payload = values.slice(0, -6)
+  const bytes = NostrUtils.convertBits(payload, 5, 8, false)
+  if (!bytes || bytes.length !== 32) return null
+  return normalizePubkeyHex(NostrUtils.bytesToHex(Uint8Array.from(bytes)))
+}
+
+function extractAdminPubkeyFromPublicIdentifier(publicIdentifier) {
+  if (typeof publicIdentifier !== 'string') return null
+  const trimmed = publicIdentifier.trim()
+  if (!trimmed) return null
+  const npubCandidate = trimmed.split(':')[0]?.trim()
+  if (!npubCandidate) return null
+  return decodeNpubToHex(npubCandidate)
+}
+
+function getConfiguredSharedSecret() {
+  const direct = normalizeSharedSecretCandidate(publicGatewaySettings?.sharedSecret)
+  if (direct) return direct
+  const cached = getCachedPublicGatewaySettings?.()
+  return normalizeSharedSecretCandidate(cached?.sharedSecret)
+}
+
+async function fetchGatewaySharedSecret(origin, { timeoutMs = GATEWAY_SHARED_SECRET_TIMEOUT_MS } = {}) {
+  const fetchImpl = globalThis.fetch
+  if (!origin || typeof fetchImpl !== 'function') return null
+  const secretPath = '/.well-known/hypertuna-gateway-secret'
+  const controller = typeof AbortController === 'function' ? new AbortController() : null
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+  try {
+    const response = await fetchImpl(`${origin.replace(/\/$/, '')}${secretPath}`, {
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      signal: controller?.signal
+    })
+    if (!response.ok) {
+      return null
+    }
+    const payload = await response.json().catch(() => null)
+    const sharedSecret = normalizeSharedSecretCandidate(payload?.sharedSecret)
+    return sharedSecret
+  } catch (_) {
+    return null
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function resolveGatewaySharedSecretForOrigin(origin, { forceRefresh = false } = {}) {
+  const normalizedOrigin = normalizeHttpOrigin(origin)
+  if (!normalizedOrigin) return null
+
+  if (!forceRefresh) {
+    const cached = gatewaySharedSecretCache.get(normalizedOrigin)
+    if (cached?.sharedSecret) {
+      return cached.sharedSecret
+    }
+  } else {
+    gatewaySharedSecretCache.delete(normalizedOrigin)
+  }
+
+  const configuredSharedSecret = getConfiguredSharedSecret()
+  const configuredOrigins = normalizeGatewayOriginList([
+    publicGatewaySettings?.preferredBaseUrl,
+    publicGatewaySettings?.baseUrl,
+    publicGatewaySettings?.resolvedWsUrl,
+    publicGatewayStatusCache?.wsBase
+  ])
+  if (configuredSharedSecret && configuredOrigins.includes(normalizedOrigin)) {
+    gatewaySharedSecretCache.set(normalizedOrigin, {
+      sharedSecret: configuredSharedSecret,
+      source: 'configured',
+      fetchedAt: Date.now()
+    })
+    return configuredSharedSecret
+  }
+
+  const discoveredSecret = await fetchGatewaySharedSecret(normalizedOrigin)
+  if (discoveredSecret) {
+    gatewaySharedSecretCache.set(normalizedOrigin, {
+      sharedSecret: discoveredSecret,
+      source: 'discovery-endpoint',
+      fetchedAt: Date.now()
+    })
+    return discoveredSecret
+  }
+
+  if (configuredSharedSecret) {
+    gatewaySharedSecretCache.set(normalizedOrigin, {
+      sharedSecret: configuredSharedSecret,
+      source: 'configured-fallback',
+      fetchedAt: Date.now()
+    })
+    return configuredSharedSecret
+  }
+
+  return null
+}
+
+function isGatewayStatusReadyForFanout(probe) {
+  if (!probe || probe.result !== 'ok') return false
+  const source =
+    typeof probe?.statusPayload?.source === 'string'
+      ? probe.statusPayload.source.trim().toLowerCase()
+      : ''
+  if (!source || source === 'unknown') return false
+  return true
+}
+
+async function probeOpenJoinChallengeReadiness(relayIdentifier, origin) {
+  if (!relayIdentifier || !origin) {
+    return { ready: false, reason: 'missing-relay-or-origin' }
+  }
+  const challenge = await fetchOpenJoinChallenge(relayIdentifier, {
+    origin,
+    purpose: OPEN_JOIN_APPEND_CORES_PURPOSE
+  })
+  if (challenge?.status === 'ok') {
+    return { ready: true, reason: 'challenge-ready' }
+  }
+  return {
+    ready: false,
+    reason: challenge?.reason || 'challenge-unavailable'
+  }
+}
+
+async function resolveRelayBootstrapState({
+  relayKey = null,
+  publicIdentifier = null,
+  relayManager = null
+} = {}) {
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey)
+  const normalizedPublicIdentifier =
+    typeof publicIdentifier === 'string' && publicIdentifier.trim()
+      ? publicIdentifier.trim()
+      : null
+
+  let profile = null
+  if (normalizedRelayKey) {
+    profile = await getRelayProfileByKey(normalizedRelayKey)
+  }
+  if (!profile && normalizedPublicIdentifier) {
+    profile = await getRelayProfileByPublicIdentifier(normalizedPublicIdentifier)
+  }
+
+  const canonicalRelayKey =
+    normalizeRelayKeyHex(profile?.relay_key || profile?.relayKey || null)
+    || normalizedRelayKey
+    || null
+  const canonicalPublicIdentifier =
+    profile?.public_identifier
+    || profile?.publicIdentifier
+    || normalizedPublicIdentifier
+    || (canonicalRelayKey ? keyToPublic.get(canonicalRelayKey) || null : null)
+    || null
+  const adminFromIdentifier = extractAdminPubkeyFromPublicIdentifier(canonicalPublicIdentifier)
+
+  const manager = relayManager
+    || (canonicalRelayKey ? activeRelays.get(canonicalRelayKey) : null)
+    || null
+  const relayCoreEntries = collectRelayCoreEntriesForAppend(manager)
+  const relayPath = normalizeGatewayPathFragment(
+    resolveRelayIdentifierPath(canonicalPublicIdentifier || canonicalRelayKey || '')
+  )
+  const ownerPubkey =
+    adminFromIdentifier
+    || normalizePubkeyHex(profile?.admin_pubkey)
+    || normalizePubkeyHex(profile?.adminPubkey)
+    || normalizePubkeyHex(profile?.owner_pubkey)
+    || normalizePubkeyHex(profile?.ownerPubkey)
+    || normalizePubkeyHex(profile?.creator_pubkey)
+    || normalizePubkeyHex(profile?.creatorPubkey)
+    || normalizePubkeyHex(config?.nostr_pubkey_hex)
+    || null
+
+  const metadata = {
+    identifier: canonicalPublicIdentifier || canonicalRelayKey || relayKey || null,
+    name: profile?.name || (canonicalRelayKey ? `Relay ${canonicalRelayKey.slice(0, 8)}` : 'Relay'),
+    description: profile?.description || '',
+    gatewayPath: relayPath || null,
+    connectionUrl: relayPath ? `${buildGatewayWebsocketBase(config)}/${relayPath}` : null,
+    isPublic: profile?.isPublic !== false,
+    isOpen: profile?.isOpen === true,
+    isHosted: profile?.isHosted === true || !!profile?.created_at,
+    isJoined: profile?.isJoined === true || (!!profile?.joined_at && !profile?.created_at),
+    metadataUpdatedAt: profile?.updated_at ? Date.parse(profile.updated_at) || null : null
+  }
+
+  if (ownerPubkey) {
+    metadata.nostrPubkeyHex = ownerPubkey
+    metadata.ownerPubkey = ownerPubkey
+    metadata.creatorPubkey = ownerPubkey
+  }
+
+  const aliases = new Set()
+  if (canonicalPublicIdentifier) aliases.add(canonicalPublicIdentifier)
+  if (relayPath) aliases.add(relayPath)
+  if (canonicalRelayKey) aliases.add(canonicalRelayKey)
+
+  return {
+    relayKey: canonicalRelayKey || relayKey || null,
+    publicIdentifier: canonicalPublicIdentifier || publicIdentifier || null,
+    metadata,
+    aliases: Array.from(aliases),
+    relayCores: relayCoreEntries
+  }
+}
+
+async function bootstrapGatewayMirrorAvailability({
+  origin,
+  relayKey = null,
+  publicIdentifier = null,
+  relayManager = null,
+  reason = 'join-fanout',
+  forceRebootstrap = false
+} = {}) {
+  const normalizedOrigin = normalizeHttpOrigin(origin)
+  if (!normalizedOrigin) {
+    return { status: 'skipped', reason: 'invalid-origin' }
+  }
+
+  const relayIdentifier = relayKey || publicIdentifier
+  if (!relayIdentifier) {
+    return { status: 'skipped', reason: 'missing-relay-identifier' }
+  }
+
+  const bootstrap = await resolveRelayBootstrapState({
+    relayKey,
+    publicIdentifier,
+    relayManager
+  })
+  const targetRelayKey = bootstrap?.relayKey || relayKey || publicIdentifier
+  if (!targetRelayKey) {
+    return { status: 'skipped', reason: 'missing-bootstrap-relay-key' }
+  }
+  const requiresOpenJoinChallenge = bootstrap?.metadata?.isOpen === true
+  const statusProbeIdentifier = targetRelayKey || bootstrap?.publicIdentifier || relayIdentifier
+
+  const probe = forceRebootstrap
+    ? null
+    : await fetchGatewayRelayStatus(statusProbeIdentifier, normalizedOrigin)
+  if (!forceRebootstrap && isGatewayStatusReadyForFanout(probe)) {
+    if (requiresOpenJoinChallenge) {
+      const challengeProbe = await probeOpenJoinChallengeReadiness(statusProbeIdentifier, normalizedOrigin)
+      if (challengeProbe.ready) {
+        return { status: 'ok', reason: 'status-and-challenge-ready' }
+      }
+    } else {
+      return { status: 'ok', reason: 'status-ready' }
+    }
+  }
+
+  await ensurePublicGatewaySettingsLoaded()
+  let sharedSecret = await resolveGatewaySharedSecretForOrigin(normalizedOrigin)
+  if (!sharedSecret) {
+    return { status: 'skipped', reason: 'missing-shared-secret' }
+  }
+
+  const registrarForSecret = (secret) => new PublicGatewayRegistrar({
+    baseUrl: normalizedOrigin,
+    sharedSecret: secret,
+    logger: console,
+    fetchImpl: globalThis.fetch
+  })
+
+  let registrar = registrarForSecret(sharedSecret)
+  let registration = await registrar.registerRelay(targetRelayKey, {
+    peers: [],
+    metadata: bootstrap.metadata,
+    ownerPubkey: bootstrap.metadata?.ownerPubkey || null,
+    nostrPubkeyHex: bootstrap.metadata?.nostrPubkeyHex || null,
+    relayCores: bootstrap.relayCores,
+    relayCoresMode: 'merge'
+  })
+
+  if (!registration?.success && registration?.status === 401) {
+    const refreshedSecret = await resolveGatewaySharedSecretForOrigin(normalizedOrigin, { forceRefresh: true })
+    if (refreshedSecret && refreshedSecret !== sharedSecret) {
+      sharedSecret = refreshedSecret
+      registrar = registrarForSecret(sharedSecret)
+      registration = await registrar.registerRelay(targetRelayKey, {
+        peers: [],
+        metadata: bootstrap.metadata,
+        ownerPubkey: bootstrap.metadata?.ownerPubkey || null,
+        nostrPubkeyHex: bootstrap.metadata?.nostrPubkeyHex || null,
+        relayCores: bootstrap.relayCores,
+        relayCoresMode: 'merge'
+      })
+    }
+  }
+
+  if (!registration?.success) {
+    return {
+      status: 'error',
+      reason: `registration-status-${registration?.status || 'unknown'}`,
+      details: {
+        origin: normalizedOrigin,
+        relayIdentifier: targetRelayKey,
+        reason
+      }
+    }
+  }
+
+  let poolResult = null
+  if (bootstrap.metadata?.isOpen === true) {
+    try {
+      poolResult = await registrar.updateOpenJoinPool(targetRelayKey, [], {
+        updatedAt: Date.now(),
+        targetSize: OPEN_JOIN_POOL_TARGET_SIZE,
+        publicIdentifier: bootstrap.publicIdentifier || null,
+        relayCores: bootstrap.relayCores,
+        metadata: bootstrap.metadata,
+        aliases: bootstrap.aliases
+      })
+    } catch (error) {
+      poolResult = { error: error?.message || String(error) }
+    }
+  }
+
+  const postProbe = await fetchGatewayRelayStatus(targetRelayKey, normalizedOrigin)
+  const statusReady = isGatewayStatusReadyForFanout(postProbe)
+  let challengeReady = !requiresOpenJoinChallenge
+  let challengeReason = null
+  if (requiresOpenJoinChallenge) {
+    const challengeProbe = await probeOpenJoinChallengeReadiness(targetRelayKey, normalizedOrigin)
+    challengeReady = challengeProbe.ready
+    challengeReason = challengeProbe.reason
+  }
+  const bootstrappedReady = statusReady && challengeReady
+  return {
+    status: bootstrappedReady ? 'ok' : 'error',
+    reason: bootstrappedReady
+      ? 'bootstrapped'
+      : !statusReady
+        ? `status-${postProbe?.reason || 'unready'}`
+        : `challenge-${challengeReason || 'unready'}`,
+    details: {
+      relayIdentifier: targetRelayKey,
+      poolStatus: poolResult?.status || null,
+      statusSource:
+        typeof postProbe?.statusPayload?.source === 'string'
+          ? postProbe.statusPayload.source
+          : null,
+      challengeReady,
+      challengeReason
+    }
+  }
+}
+
 function createJoinTraceId() {
   return `join-${Date.now().toString(16)}-${nodeCrypto.randomBytes(4).toString('hex')}`
 }
@@ -1146,6 +1533,13 @@ async function runJoinMirrorFanout(session, { relayKey = null, publicIdentifier 
   try {
     const results = await Promise.all(
       origins.map(async (origin) => {
+        const bootstrapResult = await bootstrapGatewayMirrorAvailability({
+          origin,
+          relayKey: targetRelayKey,
+          publicIdentifier: targetIdentifier,
+          relayManager: targetRelayKey ? activeRelays.get(targetRelayKey) : null,
+          reason: 'join-fanout'
+        })
         const appendResult = await appendOpenJoinMirrorCores({
           relayKey: targetRelayKey || targetIdentifier,
           publicIdentifier: targetIdentifier,
@@ -1160,6 +1554,8 @@ async function runJoinMirrorFanout(session, { relayKey = null, publicIdentifier 
         return {
           origin,
           status: success ? 'ok' : 'error',
+          bootstrapStatus: bootstrapResult?.status || null,
+          bootstrapReason: bootstrapResult?.reason || null,
           appendStatus: appendResult?.status || null,
           appendReason: appendResult?.reason || null,
           appendError: appendResult?.error || null,
