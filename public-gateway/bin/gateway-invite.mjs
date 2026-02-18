@@ -1,25 +1,11 @@
 #!/usr/bin/env node
-import { readCliGatewayConfig, gatewayRequest } from './_gateway-client.mjs';
+import { spawnSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-async function main() {
-  const [, , action, pubkey] = process.argv;
-  if (action !== 'create') {
-    throw new Error('Usage: gateway-invite create <pubkey>');
-  }
-  if (!/^[a-f0-9]{64}$/i.test(pubkey || '')) {
-    throw new Error('pubkey must be a 64-char hex value');
-  }
-  const cfg = readCliGatewayConfig();
-  const result = await gatewayRequest({
-    ...cfg,
-    path: '/api/gateway/invites',
-    method: 'POST',
-    body: { pubkey: pubkey.toLowerCase() }
-  });
-  console.log(JSON.stringify(result, null, 2));
-}
-
-main().catch((error) => {
-  console.error(error?.message || error);
-  process.exitCode = 1;
-});
+const binDir = dirname(fileURLToPath(import.meta.url));
+const gatewayAdmin = resolve(binDir, 'gateway-admin.mjs');
+const [, , action, pubkey] = process.argv;
+const args = ['operator', 'invite', action, pubkey].filter(Boolean);
+const result = spawnSync(process.execPath, [gatewayAdmin, ...args], { stdio: 'inherit' });
+process.exitCode = result.status || 0;

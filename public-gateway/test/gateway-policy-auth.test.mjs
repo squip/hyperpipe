@@ -133,6 +133,51 @@ test('GatewayAuthService rejects expired challenges', async () => {
   assert.equal(result.reason, 'challenge-not-found')
 })
 
+test('GatewayAuthService refresh and revoke token lifecycle', async () => {
+  const kp = createKeypair()
+  const authService = new GatewayAuthService({
+    config: {
+      jwtSecret: 'refresh-revoke-secret',
+      tokenTtlSec: 120,
+      challengeTtlMs: 120000,
+      authWindowSec: 60
+    }
+  })
+
+  const challenge = authService.issueChallenge({
+    pubkey: kp.publicKeyHex,
+    scope: 'gateway:operator'
+  })
+  const authEvent = await signGatewayAuthEvent({
+    privateKeyHex: kp.privateKeyHex,
+    pubkey: kp.publicKeyHex,
+    nonce: challenge.nonce,
+    scope: 'gateway:operator'
+  })
+
+  const verified = await authService.verifyChallenge({
+    challengeId: challenge.challengeId,
+    authEvent
+  })
+  assert.equal(verified.ok, true)
+  assert.ok(verified.token)
+
+  const refreshed = authService.refreshToken(verified.token, {
+    requiredScopes: ['gateway:operator']
+  })
+  assert.equal(refreshed.ok, true)
+  assert.ok(refreshed.token)
+
+  const revoke = authService.revokeToken(refreshed.token)
+  assert.equal(revoke.ok, true)
+
+  const revokedCheck = authService.verifyToken(refreshed.token, {
+    requiredScopes: ['gateway:operator']
+  })
+  assert.equal(revokedCheck.ok, false)
+  assert.equal(revokedCheck.reason, 'token-revoked')
+})
+
 test('GatewayEventPublisher includes metadata + invite tags', () => {
   const policy = new GatewayPolicyService({
     config: {

@@ -3,7 +3,7 @@ import { config as loadEnv } from 'dotenv';
 import { loadConfig, loadTlsOptions } from './config.mjs';
 import { createLogger } from './logger.mjs';
 import PublicGatewayService from './PublicGatewayService.mjs';
-import { createRegistrationStore } from './stores/index.mjs';
+import { createRegistrationStore, createGatewayAdminStateStore } from './stores/index.mjs';
 import { installStdoutLogRotation } from './utils/stdout-log-rotator.mjs';
 
 async function main() {
@@ -22,12 +22,18 @@ async function main() {
     const config = loadConfig();
     const tlsOptions = await loadTlsOptions(config.tls);
     const registrationStore = await createRegistrationStore(config.registration, logger);
+    const adminStateStore = await createGatewayAdminStateStore({
+      redisUrl: config.registration?.redisUrl,
+      adminStateRedisPrefix: config.gateway?.adminStateRedisPrefix,
+      adminActivityRetention: config.gateway?.adminActivityRetention
+    }, logger);
 
     const service = new PublicGatewayService({
       config,
       logger,
       tlsOptions,
-      registrationStore
+      registrationStore,
+      adminStateStore
     });
 
     await service.init();

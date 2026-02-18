@@ -66,6 +66,7 @@ hyperbeam-documentation/
 test-logs/
 jspm_packages/
 deploy/.env
+public-gateway/deploy/runtime/
 
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/

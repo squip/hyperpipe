@@ -23,8 +23,9 @@ function normalizePubkeyList(values) {
 }
 
 class GatewayPolicyService {
-  constructor({ config = {}, logger = console } = {}) {
+  constructor({ config = {}, logger = console, adminStateStore = null } = {}) {
     this.logger = logger;
+    this.adminStateStore = adminStateStore;
     this.operatorPubkey = normalizePubkey(config?.operatorPubkey) || null;
     this.operatorNsecHex = typeof config?.operatorNsecHex === 'string'
       ? config.operatorNsecHex.trim()
@@ -36,6 +37,28 @@ class GatewayPolicyService {
       ? config.discoveryRelays.map((value) => String(value || '').trim()).filter(Boolean)
       : [];
     this.inviteOnly = config?.inviteOnly === true;
+  }
+
+  async hydrateFromStore() {
+    if (!this.adminStateStore?.getPolicySnapshot) return this.getSnapshot();
+    try {
+      const snapshot = await this.adminStateStore.getPolicySnapshot();
+      if (!snapshot || typeof snapshot !== 'object') {
+        return this.getSnapshot();
+      }
+      this.policy = normalizePolicy(snapshot.policy);
+      this.allowList = new Set(normalizePubkeyList(snapshot.allowList));
+      this.banList = new Set(normalizePubkeyList(snapshot.banList));
+      this.discoveryRelays = Array.isArray(snapshot.discoveryRelays)
+        ? snapshot.discoveryRelays.map((value) => String(value || '').trim()).filter(Boolean)
+        : this.discoveryRelays;
+      this.inviteOnly = snapshot.inviteOnly === true;
+    } catch (error) {
+      this.logger?.warn?.('[GatewayPolicy] Failed to hydrate policy snapshot', {
+        error: error?.message || error
+      });
+    }
+    return this.getSnapshot();
   }
 
   getSnapshot() {
@@ -100,58 +123,76 @@ class GatewayPolicyService {
     return { allowed: false, reason: 'closed-policy-denied' };
   }
 
-  setPolicy(policy) {
+  async setPolicy(policy) {
     this.policy = normalizePolicy(policy);
+    await this.#persistState();
     return this.policy;
   }
 
-  setInviteOnly(inviteOnly) {
+  async setInviteOnly(inviteOnly) {
     this.inviteOnly = inviteOnly === true;
+    await this.#persistState();
     return this.inviteOnly;
   }
 
-  setDiscoveryRelays(relays = []) {
+  async setDiscoveryRelays(relays = []) {
     const values = Array.isArray(relays)
       ? relays.map((value) => String(value || '').trim()).filter(Boolean)
       : [];
     this.discoveryRelays = Array.from(new Set(values));
+    await this.#persistState();
     return [...this.discoveryRelays];
   }
 
-  addAllow(pubkey) {
+  async addAllow(pubkey) {
     const normalized = normalizePubkey(pubkey);
     if (!normalized) {
       return { ok: false, reason: 'invalid-pubkey' };
     }
     this.allowList.add(normalized);
+    await this.#persistState();
     return { ok: true, pubkey: normalized };
   }
 
-  removeAllow(pubkey) {
+  async removeAllow(pubkey) {
     const normalized = normalizePubkey(pubkey);
     if (!normalized) {
       return { ok: false, reason: 'invalid-pubkey' };
     }
     this.allowList.delete(normalized);
+    await this.#persistState();
     return { ok: true, pubkey: normalized };
   }
 
-  addBan(pubkey) {
+  async addBan(pubkey) {
     const normalized = normalizePubkey(pubkey);
     if (!normalized) {
       return { ok: false, reason: 'invalid-pubkey' };
     }
     this.banList.add(normalized);
+    await this.#persistState();
     return { ok: true, pubkey: normalized };
   }
 
-  removeBan(pubkey) {
+  async removeBan(pubkey) {
     const normalized = normalizePubkey(pubkey);
     if (!normalized) {
       return { ok: false, reason: 'invalid-pubkey' };
     }
     this.banList.delete(normalized);
+    await this.#persistState();
     return { ok: true, pubkey: normalized };
+  }
+
+  async #persistState() {
+    if (!this.adminStateStore?.setPolicySnapshot) return;
+    try {
+      await this.adminStateStore.setPolicySnapshot(this.getSnapshot());
+    } catch (error) {
+      this.logger?.warn?.('[GatewayPolicy] Failed to persist policy snapshot', {
+        error: error?.message || error
+      });
+    }
   }
 }
 

@@ -21,6 +21,7 @@ import {
   verifyClientToken
 } from '../../shared/auth/PublicGatewayTokens.mjs';
 import {
+  register,
   metricsMiddleware,
   sessionGauge,
   peerGauge,
@@ -51,7 +52,7 @@ import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hype
 import BlindPeerService from './blind-peer/BlindPeerService.mjs';
 import BlindPeerReplicaManager from './blind-peer/BlindPeerReplicaManager.mjs';
 import GatewayPolicyService from './GatewayPolicyService.mjs';
-import GatewayAuthService from './GatewayAuthService.mjs';
+import GatewayAuthService, { parseBearerToken } from './GatewayAuthService.mjs';
 import GatewayEventPublisher from './GatewayEventPublisher.mjs';
 import GatewayInviteService from './GatewayInviteService.mjs';
 
@@ -82,11 +83,12 @@ function hexToBytes(hex) {
 }
 
 class PublicGatewayService {
-  constructor({ config, logger, tlsOptions = null, registrationStore }) {
+  constructor({ config, logger, tlsOptions = null, registrationStore, adminStateStore = null }) {
     this.config = config;
     this.logger = logger;
     this.tlsOptions = tlsOptions;
     this.registrationStore = registrationStore || new MemoryRegistrationStore(config.registration?.cacheTtlSeconds);
+    this.adminStateStore = adminStateStore || null;
     this.sharedSecret = config.registration?.sharedSecret || null;
     this.openJoinConfig = this.#normalizeOpenJoinConfig(config?.openJoin);
     this.openJoinChallenges = new Map();
@@ -204,8 +206,19 @@ class PublicGatewayService {
     };
     this.gatewayOrigin = this.#resolveGatewayOrigin(this.config?.publicBaseUrl);
     this.multiGatewayEnabled = this.config?.gateway?.enableMulti === true;
+    this.adminUiEnabled = this.config?.gateway?.adminUiEnabled !== false;
+    this.adminUiPath = this.#normalizeAdminUiPath(this.config?.gateway?.adminUiPath);
+    this.adminSessionCookieName = this.config?.gateway?.adminSessionCookieName || 'ht_gateway_admin';
+    this.adminSessionTtlSec = Number.isFinite(this.config?.gateway?.adminSessionTtlSec)
+      ? Math.max(60, Math.trunc(this.config.gateway.adminSessionTtlSec))
+      : 3600;
+    this.adminActivityRetention = Number.isFinite(this.config?.gateway?.adminActivityRetention)
+      ? Math.max(100, Math.trunc(this.config.gateway.adminActivityRetention))
+      : 5000;
+    this.startedAt = Date.now();
     this.gatewayPolicyService = new GatewayPolicyService({
       logger: this.logger,
+      adminStateStore: this.adminStateStore,
       config: {
         operatorPubkey: this.config?.gateway?.operatorPubkey || null,
         operatorNsecHex: this.config?.gateway?.operatorNsecHex || null,
@@ -227,7 +240,8 @@ class PublicGatewayService {
       }
     });
     this.gatewayInviteService = new GatewayInviteService({
-      logger: this.logger
+      logger: this.logger,
+      adminStateStore: this.adminStateStore
     });
     this.gatewayEventPublisher = new GatewayEventPublisher({
       logger: this.logger,
@@ -251,6 +265,9 @@ class PublicGatewayService {
   async init() {
     this.#setupHttpServer();
     await this.connectionPool.initialize();
+    await this.adminStateStore?.connect?.();
+    await this.gatewayPolicyService.hydrateFromStore();
+    await this.gatewayInviteService.hydrateFromStore();
     if (Number.isFinite(this.config?.registration?.relayGcAfterMs) && this.config.registration.relayGcAfterMs > 0) {
       this.logger?.info?.('[PublicGateway] Relay GC policy enabled', {
         relayGcAfterMs: this.config.registration.relayGcAfterMs,
@@ -422,6 +439,9 @@ class PublicGatewayService {
 
     await this.connectionPool.destroy();
     await this.registrationStore?.disconnect?.();
+    if (this.adminStateStore && this.adminStateStore !== this.registrationStore) {
+      await this.adminStateStore?.disconnect?.();
+    }
   }
 
   #setupHttpServer() {
@@ -473,10 +493,52 @@ class PublicGatewayService {
     app.get('/api/gateway/ban-list', (req, res) => this.#handleGatewayBanList(req, res));
     app.post('/api/gateway/ban-list', (req, res) => this.#handleGatewayBanAdd(req, res));
     app.delete('/api/gateway/ban-list/:pubkey', (req, res) => this.#handleGatewayBanRemove(req, res));
+    app.get('/api/admin/overview', (req, res) => this.#handleAdminOverview(req, res));
+    app.get('/api/admin/metrics/summary', (req, res) => this.#handleAdminMetricsSummary(req, res));
+    app.get('/api/admin/activity', (req, res) => this.#handleAdminActivity(req, res));
+    app.get('/api/admin/invites', (req, res) => this.#handleAdminInvites(req, res));
+    app.post('/api/admin/actions/republish-metadata', (req, res) => this.#handleAdminRepublishMetadata(req, res));
+    app.post('/api/admin/actions/blind-peer-gc', (req, res) => this.#handleAdminBlindPeerGc(req, res));
+    app.post('/api/admin/auth/refresh', (req, res) => this.#handleAdminAuthRefresh(req, res));
+    app.post('/api/admin/auth/logout', (req, res) => this.#handleAdminAuthLogout(req, res));
 
     app.get('/health', (_req, res) => {
       res.json({ status: 'ok' });
     });
+
+    if (this.adminUiEnabled) {
+      const adminUiDir = resolve(process.cwd(), 'src/admin-ui');
+      const nobleCurvesDir = resolve(process.cwd(), 'node_modules/@noble/curves');
+      const nobleHashesDir = resolve(process.cwd(), 'node_modules/@noble/hashes');
+      const adminUiCsp = [
+        "default-src 'self'",
+        "base-uri 'self'",
+        "font-src 'self' https: data:",
+        "form-action 'self'",
+        "frame-ancestors 'self'",
+        "img-src 'self' data:",
+        "object-src 'none'",
+        "script-src 'self' 'unsafe-inline'",
+        "script-src-attr 'none'",
+        "style-src 'self' 'unsafe-inline'"
+      ].join('; ');
+      app.use(this.adminUiPath, (_req, res, next) => {
+        // Admin UI needs an inline import map to resolve local noble module paths.
+        res.setHeader('Content-Security-Policy', adminUiCsp);
+        next();
+      });
+      app.use('/admin/vendor/noble-curves', express.static(nobleCurvesDir, {
+        immutable: true,
+        maxAge: '1d'
+      }));
+      app.use('/admin/vendor/noble-hashes', express.static(nobleHashesDir, {
+        immutable: true,
+        maxAge: '1d'
+      }));
+      app.use(this.adminUiPath, express.static(adminUiDir, {
+        index: 'index.html'
+      }));
+    }
 
     if (this.#shouldExposeSecretEndpoint()) {
       app.get(this.secretEndpointPath, (req, res) => this.#handleSecretRequest(req, res));
@@ -642,6 +704,14 @@ class PublicGatewayService {
     };
   }
 
+  #normalizeAdminUiPath(value) {
+    if (!value || typeof value !== 'string') return '/admin';
+    const trimmed = value.trim();
+    if (!trimmed) return '/admin';
+    if (trimmed === '/') return '/admin';
+    return trimmed.startsWith('/') ? trimmed.replace(/\/+$/, '') || '/admin' : `/${trimmed.replace(/\/+$/, '')}`;
+  }
+
   #resolveGatewayOrigin(value) {
     if (!value || typeof value !== 'string') return null;
     try {
@@ -679,11 +749,123 @@ class PublicGatewayService {
 
   #verifyGatewayBearer(req, { requiredScopes = [], relayKey = null, pubkey = null } = {}) {
     const authHeader = req?.headers?.authorization || req?.headers?.Authorization || null;
-    return this.gatewayAuthService.verifyBearer(authHeader, {
-      requiredScopes,
-      relayKey,
-      pubkey
-    });
+    const cookieToken = this.#getAdminSessionToken(req);
+    if (authHeader) {
+      const fromBearer = this.gatewayAuthService.verifyBearer(authHeader, {
+        requiredScopes,
+        relayKey,
+        pubkey
+      });
+      if (fromBearer?.ok) return fromBearer;
+      if (!cookieToken) return fromBearer;
+    }
+    if (cookieToken) {
+      return this.gatewayAuthService.verifyToken(cookieToken, {
+        requiredScopes,
+        relayKey,
+        pubkey
+      });
+    }
+    return { ok: false, reason: 'missing-auth-token' };
+  }
+
+  #parseCookies(req) {
+    const header = req?.headers?.cookie;
+    if (!header || typeof header !== 'string') return {};
+    const out = {};
+    const pairs = header.split(';');
+    for (const pair of pairs) {
+      const idx = pair.indexOf('=');
+      if (idx <= 0) continue;
+      const key = pair.slice(0, idx).trim();
+      if (!key) continue;
+      const value = pair.slice(idx + 1).trim();
+      try {
+        out[key] = decodeURIComponent(value);
+      } catch (_) {
+        out[key] = value;
+      }
+    }
+    return out;
+  }
+
+  #getAdminSessionToken(req) {
+    const cookies = this.#parseCookies(req);
+    const token = cookies?.[this.adminSessionCookieName];
+    if (!token || typeof token !== 'string') return null;
+    return token.trim() || null;
+  }
+
+  #setAdminSessionCookie(res, token) {
+    if (!token || typeof token !== 'string') return;
+    const maxAge = Number.isFinite(this.adminSessionTtlSec) ? this.adminSessionTtlSec : 3600;
+    const cookieParts = [
+      `${this.adminSessionCookieName}=${encodeURIComponent(token)}`,
+      'HttpOnly',
+      'SameSite=Lax',
+      `Max-Age=${maxAge}`,
+      'Path=/'
+    ];
+    if (this.config?.tls?.enabled === true) {
+      cookieParts.push('Secure');
+    }
+    res.setHeader('Set-Cookie', cookieParts.join('; '));
+  }
+
+  #clearAdminSessionCookie(res) {
+    const cookieParts = [
+      `${this.adminSessionCookieName}=`,
+      'HttpOnly',
+      'SameSite=Lax',
+      'Max-Age=0',
+      'Path=/'
+    ];
+    if (this.config?.tls?.enabled === true) {
+      cookieParts.push('Secure');
+    }
+    res.setHeader('Set-Cookie', cookieParts.join('; '));
+  }
+
+  #isTrustedAdminOrigin(req) {
+    const originHeader = req?.headers?.origin;
+    if (!originHeader || typeof originHeader !== 'string') return true;
+    try {
+      const origin = new URL(originHeader).origin;
+      const hostHeader = req?.headers?.host ? String(req.headers.host) : null;
+      if (hostHeader) {
+        const reqProtocol = this.config?.tls?.enabled === true ? 'https:' : 'http:';
+        const requestOrigin = `${reqProtocol}//${hostHeader}`;
+        if (origin === requestOrigin) return true;
+      }
+      const publicOrigin = this.#resolveGatewayOrigin(this.config?.publicBaseUrl);
+      if (publicOrigin && origin === publicOrigin) return true;
+      if (this.gatewayOrigin && origin === this.gatewayOrigin) return true;
+    } catch (_) {
+      return false;
+    }
+    return false;
+  }
+
+  async #recordAdminActivity(type, {
+    actorPubkey = null,
+    relayKey = null,
+    details = null
+  } = {}) {
+    if (!this.adminStateStore?.appendActivity || !type) return;
+    try {
+      await this.adminStateStore.appendActivity({
+        type,
+        actorPubkey,
+        relayKey,
+        details,
+        createdAt: Date.now()
+      });
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Failed to append admin activity', {
+        type,
+        error: error?.message || error
+      });
+    }
   }
 
   #emitMultiGatewayDebug(eventType, payload = {}) {
@@ -3330,6 +3512,7 @@ class PublicGatewayService {
   async #handleGatewayAuthVerify(req, res) {
     const challengeId = req.body?.challengeId || req.body?.challenge_id;
     const authEvent = req.body?.authEvent || req.body?.auth_event || req.body?.event || null;
+    const wantsAdminSession = req.body?.adminSession === true || req.body?.admin_session === true;
     const result = await this.gatewayAuthService.verifyChallenge({ challengeId, authEvent });
     if (!result?.ok) {
       this.#emitMultiGatewayDebug('auth-verify-failed', {
@@ -3344,13 +3527,23 @@ class PublicGatewayService {
       relayKey: result.relayKey || null,
       pubkey: typeof result.pubkey === 'string' ? result.pubkey.slice(0, 12) : null
     });
+    if (wantsAdminSession) {
+      if (result.scope !== 'gateway:operator') {
+        return res.status(400).json({ error: 'admin-session-scope-not-allowed' });
+      }
+      if (!this.#isTrustedAdminOrigin(req)) {
+        return res.status(403).json({ error: 'untrusted-admin-origin' });
+      }
+      this.#setAdminSessionCookie(res, result.token);
+    }
     return res.json({
       tokenType: result.tokenType,
       token: result.token,
       expiresIn: result.expiresIn,
       scope: result.scope,
       relayKey: result.relayKey,
-      pubkey: result.pubkey
+      pubkey: result.pubkey,
+      adminSession: wantsAdminSession
     });
   }
 
@@ -3375,17 +3568,25 @@ class PublicGatewayService {
     const inviteOnly = req.body?.inviteOnly;
     const discoveryRelays = req.body?.discoveryRelays;
     if (policy !== undefined) {
-      this.gatewayPolicyService.setPolicy(policy);
+      await this.gatewayPolicyService.setPolicy(policy);
     }
     if (typeof inviteOnly === 'boolean') {
-      this.gatewayPolicyService.setInviteOnly(inviteOnly);
+      await this.gatewayPolicyService.setInviteOnly(inviteOnly);
     }
     if (Array.isArray(discoveryRelays)) {
-      this.gatewayPolicyService.setDiscoveryRelays(discoveryRelays);
+      await this.gatewayPolicyService.setDiscoveryRelays(discoveryRelays);
     }
 
     const snapshot = this.gatewayPolicyService.getSnapshot();
     this.gatewayEventPublisher.publishGatewayMetadata({ reason: 'policy-update' });
+    await this.#recordAdminActivity('policy-update', {
+      actorPubkey: auth?.pubkey || auth?.sub || null,
+      details: {
+        policy: snapshot.policy,
+        inviteOnly: snapshot.inviteOnly,
+        discoveryRelayCount: snapshot.discoveryRelays.length
+      }
+    });
     this.#emitMultiGatewayDebug('policy-updated', {
       policy: snapshot.policy,
       inviteOnly: snapshot.inviteOnly,
@@ -3407,11 +3608,17 @@ class PublicGatewayService {
     }
     const pubkey = auth?.pubkey || auth?.sub || null;
     try {
-      const created = this.gatewayInviteService.submitJoinRequest({
+      const created = await this.gatewayInviteService.submitJoinRequest({
         pubkey,
         content: req.body?.content || req.body?.note || '',
         metadata: {
           origin: this.gatewayOrigin
+        }
+      });
+      await this.#recordAdminActivity('join-request-create', {
+        actorPubkey: pubkey,
+        details: {
+          requestId: created?.id || null
         }
       });
       return res.json({ status: 'ok', request: created });
@@ -3433,7 +3640,7 @@ class PublicGatewayService {
     if (!auth) return;
     try {
       const requestId = req.params?.id;
-      const approved = this.gatewayInviteService.approveJoinRequest({ requestId });
+      const approved = await this.gatewayInviteService.approveJoinRequest({ requestId });
       const invitee = approved?.invite?.pubkey || null;
       const inviteToken = approved?.invite?.inviteToken || null;
       if (invitee && inviteToken) {
@@ -3442,6 +3649,13 @@ class PublicGatewayService {
           inviteToken
         });
       }
+      await this.#recordAdminActivity('join-request-approve', {
+        actorPubkey: auth?.pubkey || auth?.sub || null,
+        details: {
+          requestId,
+          inviteePubkey: invitee
+        }
+      });
       return res.json({ status: 'ok', ...approved });
     } catch (error) {
       return res.status(400).json({ error: error?.message || 'join-request-approve-failed' });
@@ -3453,7 +3667,13 @@ class PublicGatewayService {
     if (!auth) return;
     try {
       const requestId = req.params?.id;
-      const rejected = this.gatewayInviteService.rejectJoinRequest({ requestId });
+      const rejected = await this.gatewayInviteService.rejectJoinRequest({ requestId });
+      await this.#recordAdminActivity('join-request-reject', {
+        actorPubkey: auth?.pubkey || auth?.sub || null,
+        details: {
+          requestId
+        }
+      });
       return res.json({ status: 'ok', request: rejected });
     } catch (error) {
       return res.status(400).json({ error: error?.message || 'join-request-reject-failed' });
@@ -3465,13 +3685,19 @@ class PublicGatewayService {
     if (!auth) return;
     try {
       const pubkey = req.body?.pubkey;
-      const invite = this.gatewayInviteService.createInvite({
+      const invite = await this.gatewayInviteService.createInvite({
         pubkey,
         metadata: { origin: this.gatewayOrigin }
       });
       this.gatewayEventPublisher.publishInviteEvent({
         inviteePubkey: invite.pubkey,
         inviteToken: invite.inviteToken
+      });
+      await this.#recordAdminActivity('invite-create', {
+        actorPubkey: auth?.pubkey || auth?.sub || null,
+        details: {
+          inviteePubkey: invite.pubkey
+        }
       });
       return res.json({ status: 'ok', invite });
     } catch (error) {
@@ -3485,12 +3711,18 @@ class PublicGatewayService {
     const pubkey = auth?.pubkey || auth?.sub || null;
     try {
       const inviteToken = req.body?.inviteToken || req.body?.invite_token || req.body?.token;
-      const redeemed = this.gatewayInviteService.redeemInvite({
+      const redeemed = await this.gatewayInviteService.redeemInvite({
         inviteToken,
         pubkey
       });
-      this.gatewayPolicyService.addAllow(pubkey);
+      await this.gatewayPolicyService.addAllow(pubkey);
       this.gatewayEventPublisher.publishGatewayMetadata({ reason: 'invite-redeem' });
+      await this.#recordAdminActivity('invite-redeem', {
+        actorPubkey: pubkey,
+        details: {
+          inviteToken: inviteToken ? String(inviteToken).slice(0, 16) : null
+        }
+      });
       return res.json({
         status: 'ok',
         invite: redeemed,
@@ -3515,11 +3747,17 @@ class PublicGatewayService {
   async #handleGatewayAllowAdd(req, res) {
     const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
     if (!auth) return;
-    const result = this.gatewayPolicyService.addAllow(req.body?.pubkey);
+    const result = await this.gatewayPolicyService.addAllow(req.body?.pubkey);
     if (!result?.ok) {
       return res.status(400).json({ error: result?.reason || 'allow-add-failed' });
     }
     this.gatewayEventPublisher.publishGatewayMetadata({ reason: 'allow-list-add' });
+    await this.#recordAdminActivity('allow-list-add', {
+      actorPubkey: auth?.pubkey || auth?.sub || null,
+      details: {
+        pubkey: result.pubkey
+      }
+    });
     return res.json({
       status: 'ok',
       pubkey: result.pubkey,
@@ -3530,11 +3768,17 @@ class PublicGatewayService {
   async #handleGatewayAllowRemove(req, res) {
     const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
     if (!auth) return;
-    const result = this.gatewayPolicyService.removeAllow(req.params?.pubkey);
+    const result = await this.gatewayPolicyService.removeAllow(req.params?.pubkey);
     if (!result?.ok) {
       return res.status(400).json({ error: result?.reason || 'allow-remove-failed' });
     }
     this.gatewayEventPublisher.publishGatewayMetadata({ reason: 'allow-list-remove' });
+    await this.#recordAdminActivity('allow-list-remove', {
+      actorPubkey: auth?.pubkey || auth?.sub || null,
+      details: {
+        pubkey: result.pubkey
+      }
+    });
     return res.json({
       status: 'ok',
       pubkey: result.pubkey,
@@ -3556,11 +3800,17 @@ class PublicGatewayService {
   async #handleGatewayBanAdd(req, res) {
     const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
     if (!auth) return;
-    const result = this.gatewayPolicyService.addBan(req.body?.pubkey);
+    const result = await this.gatewayPolicyService.addBan(req.body?.pubkey);
     if (!result?.ok) {
       return res.status(400).json({ error: result?.reason || 'ban-add-failed' });
     }
     this.gatewayEventPublisher.publishGatewayMetadata({ reason: 'ban-list-add' });
+    await this.#recordAdminActivity('ban-list-add', {
+      actorPubkey: auth?.pubkey || auth?.sub || null,
+      details: {
+        pubkey: result.pubkey
+      }
+    });
     return res.json({
       status: 'ok',
       pubkey: result.pubkey,
@@ -3571,16 +3821,232 @@ class PublicGatewayService {
   async #handleGatewayBanRemove(req, res) {
     const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
     if (!auth) return;
-    const result = this.gatewayPolicyService.removeBan(req.params?.pubkey);
+    const result = await this.gatewayPolicyService.removeBan(req.params?.pubkey);
     if (!result?.ok) {
       return res.status(400).json({ error: result?.reason || 'ban-remove-failed' });
     }
     this.gatewayEventPublisher.publishGatewayMetadata({ reason: 'ban-list-remove' });
+    await this.#recordAdminActivity('ban-list-remove', {
+      actorPubkey: auth?.pubkey || auth?.sub || null,
+      details: {
+        pubkey: result.pubkey
+      }
+    });
     return res.json({
       status: 'ok',
       pubkey: result.pubkey,
       banCount: this.gatewayPolicyService.getSnapshot().banList.length
     });
+  }
+
+  async #handleAdminOverview(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    const policy = this.gatewayPolicyService.getSnapshot();
+    const joinRequests = this.gatewayInviteService.listJoinRequests({});
+    const pendingJoinRequests = joinRequests.filter((entry) => entry.status === 'pending').length;
+    const invites = Array.from(this.gatewayInviteService.invites?.values?.() || []);
+    let relayCount = null;
+    try {
+      const relays = await this.registrationStore?.listRelays?.();
+      relayCount = Array.isArray(relays) ? relays.length : null;
+    } catch (_) {}
+
+    const blindPeerStatus = this.blindPeerService?.getStatus?.({
+      ownerLimit: 0,
+      includeCores: false,
+      mirrorLimit: 5
+    }) || null;
+
+    return res.json({
+      status: 'ok',
+      gatewayOrigin: this.gatewayOrigin,
+      startedAt: this.startedAt,
+      uptimeMs: Math.max(0, Date.now() - this.startedAt),
+      policy: {
+        value: policy.policy,
+        inviteOnly: policy.inviteOnly,
+        allowCount: policy.allowList.length,
+        banCount: policy.banList.length,
+        discoveryRelayCount: policy.discoveryRelays.length
+      },
+      counts: {
+        activeSessions: this.sessions.size,
+        trackedPeers: this.peerMetadata.size,
+        relays: relayCount,
+        joinRequests: joinRequests.length,
+        pendingJoinRequests,
+        invites: invites.length,
+        pendingInvites: invites.filter((invite) => !invite?.redeemedAt).length
+      },
+      blindPeer: blindPeerStatus
+        ? {
+            enabled: blindPeerStatus.enabled,
+            running: blindPeerStatus.running,
+            trustedPeerCount: blindPeerStatus.trustedPeerCount,
+            trackedCores: blindPeerStatus?.metadata?.trackedCores ?? null
+          }
+        : { enabled: false },
+      features: {
+        multiGatewayEnabled: this.multiGatewayEnabled,
+        adminUiEnabled: this.adminUiEnabled
+      }
+    });
+  }
+
+  async #handleAdminMetricsSummary(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    const metrics = await register.getMetricsAsJSON();
+    const summary = {};
+    for (const metric of Array.isArray(metrics) ? metrics : []) {
+      const values = Array.isArray(metric?.values) ? metric.values : [];
+      if (values.length === 0) continue;
+      if (values.every((value) => !value.labels || Object.keys(value.labels).length === 0)) {
+        summary[metric.name] = values.reduce((total, value) => total + (Number(value.value) || 0), 0);
+      } else {
+        summary[metric.name] = values.map((value) => ({
+          labels: value.labels || {},
+          value: Number(value.value) || 0
+        }));
+      }
+    }
+
+    const blindPeerStatus = this.blindPeerService?.getStatus?.({
+      ownerLimit: 5,
+      includeCores: false,
+      mirrorLimit: 25
+    }) || null;
+
+    return res.json({
+      status: 'ok',
+      generatedAt: Date.now(),
+      runtime: {
+        uptimeMs: Math.max(0, Date.now() - this.startedAt),
+        activeSessions: this.sessions.size,
+        trackedPeers: this.peerMetadata.size
+      },
+      blindPeer: blindPeerStatus,
+      metrics: summary
+    });
+  }
+
+  async #handleAdminActivity(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    const limitRaw = Number(req.query?.limit);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0
+      ? Math.min(Math.trunc(limitRaw), 1000)
+      : 100;
+    const activity = await this.adminStateStore?.listActivity?.({ limit }) || [];
+    return res.json({
+      status: 'ok',
+      count: activity.length,
+      activity
+    });
+  }
+
+  async #handleAdminInvites(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    const invites = Array.from(this.gatewayInviteService.invites?.values?.() || [])
+      .sort((left, right) => (right.createdAt || 0) - (left.createdAt || 0));
+    return res.json({
+      status: 'ok',
+      count: invites.length,
+      invites
+    });
+  }
+
+  async #handleAdminRepublishMetadata(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    if (!this.multiGatewayEnabled) {
+      return res.status(400).json({ error: 'multi-gateway-disabled' });
+    }
+    const reason = typeof req.body?.reason === 'string' && req.body.reason.trim().length
+      ? req.body.reason.trim()
+      : 'admin-api';
+    const event = this.gatewayEventPublisher.publishGatewayMetadata({ reason });
+    await this.#recordAdminActivity('metadata-republish', {
+      actorPubkey: auth?.pubkey || auth?.sub || null,
+      details: { reason, hasEvent: !!event }
+    });
+    return res.json({
+      status: 'ok',
+      published: !!event
+    });
+  }
+
+  async #handleAdminBlindPeerGc(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    if (!this.blindPeerService) {
+      return res.status(503).json({ error: 'blind-peer-disabled' });
+    }
+    const reason = typeof req.body?.reason === 'string' && req.body.reason.trim().length
+      ? req.body.reason.trim()
+      : 'admin-api';
+    const result = await this.blindPeerService.runHygiene(reason);
+    await this.#recordAdminActivity('blind-peer-gc', {
+      actorPubkey: auth?.pubkey || auth?.sub || null,
+      details: { reason, result: result?.status || null }
+    });
+    return res.json({
+      status: 'ok',
+      result
+    });
+  }
+
+  async #handleAdminAuthRefresh(req, res) {
+    const authHeader = req?.headers?.authorization || req?.headers?.Authorization || null;
+    const bearerToken = parseBearerToken(authHeader);
+    const cookieToken = this.#getAdminSessionToken(req);
+    const sourceToken = bearerToken || cookieToken;
+    if (!sourceToken) {
+      return res.status(401).json({ error: 'missing-auth-token' });
+    }
+    const refreshed = this.gatewayAuthService.refreshToken(sourceToken, {
+      requiredScopes: ['gateway:operator']
+    });
+    if (!refreshed?.ok) {
+      return res.status(401).json({ error: refreshed?.reason || 'token-refresh-failed' });
+    }
+    const wantsSessionCookie = cookieToken || req.body?.adminSession === true;
+    if (wantsSessionCookie) {
+      if (!this.#isTrustedAdminOrigin(req)) {
+        return res.status(403).json({ error: 'untrusted-admin-origin' });
+      }
+      this.#setAdminSessionCookie(res, refreshed.token);
+    }
+    return res.json({
+      status: 'ok',
+      tokenType: refreshed.tokenType || 'Bearer',
+      token: refreshed.token,
+      expiresIn: refreshed.expiresIn
+    });
+  }
+
+  async #handleAdminAuthLogout(req, res) {
+    const authHeader = req?.headers?.authorization || req?.headers?.Authorization || null;
+    const bearerToken = parseBearerToken(authHeader);
+    const cookieToken = this.#getAdminSessionToken(req);
+    const sourceToken = bearerToken || cookieToken;
+    let actorPubkey = null;
+    if (sourceToken) {
+      const verified = this.gatewayAuthService.verifyToken(sourceToken, {
+        requiredScopes: ['gateway:operator']
+      });
+      if (verified?.ok) {
+        actorPubkey = verified?.payload?.pubkey || verified?.payload?.sub || null;
+      }
+      this.gatewayAuthService.revokeToken(sourceToken);
+    }
+    this.#clearAdminSessionCookie(res);
+    await this.#recordAdminActivity('admin-logout', {
+      actorPubkey
+    });
+    return res.json({ status: 'ok' });
   }
 
   #verifySignedPayload(payload, signature) {

@@ -346,7 +346,7 @@ class RedisRegistrationStore {
     let cursor = '0';
     do {
       const result = await this.client.scan(cursor, { MATCH: `${this.prefix}*`, COUNT: 100 });
-      cursor = result.cursor;
+      cursor = String(result?.cursor ?? '0');
       const keys = result.keys || [];
       const relayKeys = keys.filter((key) => !excludePrefixes.some((prefix) => key.startsWith(prefix)));
       if (relayKeys.length === 0) continue;

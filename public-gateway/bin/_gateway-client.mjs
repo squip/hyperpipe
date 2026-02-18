@@ -1,4 +1,7 @@
 import { createHash } from 'node:crypto';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
 import { schnorr } from '@noble/curves/secp256k1';
 
 function hexToBytes(hex) {
@@ -59,13 +62,58 @@ async function fetchJson(url, options = {}) {
   return data;
 }
 
+function getTokenCachePath() {
+  return process.env.GATEWAY_CLI_TOKEN_CACHE
+    || join(homedir(), '.hypertuna', 'gateway-cli-token-cache.json');
+}
+
+async function readTokenCache() {
+  const path = getTokenCachePath();
+  try {
+    const raw = await readFile(path, 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : { tokens: {} };
+  } catch (_) {
+    return { tokens: {} };
+  }
+}
+
+async function writeTokenCache(cache) {
+  const path = getTokenCachePath();
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(cache, null, 2), 'utf8');
+}
+
+function buildCacheKey({ baseUrl, pubkey, scope, relayKey = null }) {
+  return `${baseUrl}|${pubkey}|${scope}|${relayKey || ''}`;
+}
+
+function getCachedToken(cache, key) {
+  const entry = cache?.tokens?.[key];
+  if (!entry || typeof entry !== 'object') return null;
+  const expiresAt = Number(entry.expiresAt || 0);
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return null;
+  if (!entry.token || typeof entry.token !== 'string') return null;
+  return entry.token;
+}
+
 async function getScopedToken({
   baseUrl,
   pubkey,
   nsecHex,
   scope,
-  relayKey = null
+  relayKey = null,
+  useCache = true
 }) {
+  const cacheKey = buildCacheKey({ baseUrl, pubkey, scope, relayKey });
+  if (useCache) {
+    const cache = await readTokenCache();
+    const cachedToken = getCachedToken(cache, cacheKey);
+    if (cachedToken) {
+      return cachedToken;
+    }
+  }
+
   const challenge = await fetchJson(new URL('/api/auth/challenge', baseUrl), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -100,6 +148,24 @@ async function getScopedToken({
   if (!verified?.token) {
     throw new Error('token-verify-failed');
   }
+
+  if (useCache) {
+    const cache = await readTokenCache();
+    const expiresIn = Number(verified?.expiresIn || 0);
+    const refreshSlackMs = 15_000;
+    const ttlMs = Number.isFinite(expiresIn) && expiresIn > 0
+      ? Math.max((expiresIn * 1000) - refreshSlackMs, 30_000)
+      : 30 * 60 * 1000;
+    cache.tokens = cache.tokens || {};
+    cache.tokens[cacheKey] = {
+      token: verified.token,
+      expiresAt: Date.now() + ttlMs,
+      scope,
+      relayKey: relayKey || null
+    };
+    await writeTokenCache(cache);
+  }
+
   return verified.token;
 }
 
@@ -127,9 +193,19 @@ async function gatewayRequest({
   scope = 'gateway:operator',
   path,
   method = 'GET',
-  body = null
+  body = null,
+  relayKey = null,
+  useTokenCache = true
 }) {
-  const token = await getScopedToken({ baseUrl, pubkey, nsecHex, scope });
+  const token = await getScopedToken({
+    baseUrl,
+    pubkey,
+    nsecHex,
+    scope,
+    relayKey,
+    useCache: useTokenCache
+  });
+
   return await fetchJson(new URL(path, baseUrl), {
     method,
     headers: {
@@ -142,5 +218,9 @@ async function gatewayRequest({
 
 export {
   readCliGatewayConfig,
-  gatewayRequest
+  gatewayRequest,
+  getScopedToken,
+  readTokenCache,
+  writeTokenCache,
+  getTokenCachePath
 };

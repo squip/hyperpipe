@@ -98,7 +98,13 @@ const DEFAULT_CONFIG = {
     authJwtSecret: process.env.GATEWAY_AUTH_JWT_SECRET || null,
     authTokenTtlSec: Number(process.env.GATEWAY_AUTH_TOKEN_TTL_SEC || 3600),
     authChallengeTtlMs: Number(process.env.GATEWAY_AUTH_CHALLENGE_TTL_MS || (2 * 60 * 1000)),
-    authWindowSec: Number(process.env.GATEWAY_AUTH_WINDOW_SEC || 300)
+    authWindowSec: Number(process.env.GATEWAY_AUTH_WINDOW_SEC || 300),
+    adminUiEnabled: process.env.GATEWAY_ADMIN_UI_ENABLED !== 'false',
+    adminUiPath: process.env.GATEWAY_ADMIN_UI_PATH || '/admin',
+    adminSessionCookieName: process.env.GATEWAY_ADMIN_SESSION_COOKIE_NAME || 'ht_gateway_admin',
+    adminSessionTtlSec: Number(process.env.GATEWAY_ADMIN_SESSION_TTL_SEC || 3600),
+    adminActivityRetention: Number(process.env.GATEWAY_ADMIN_ACTIVITY_RETENTION || 5000),
+    adminStateRedisPrefix: process.env.GATEWAY_ADMIN_STATE_REDIS_PREFIX || 'gateway:admin:'
   }
 };
 

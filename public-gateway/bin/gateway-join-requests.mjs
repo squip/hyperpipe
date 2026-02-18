@@ -1,33 +1,11 @@
 #!/usr/bin/env node
-import { readCliGatewayConfig, gatewayRequest } from './_gateway-client.mjs';
+import { spawnSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-async function main() {
-  const [, , action, requestId] = process.argv;
-  if (!action || !['list', 'approve', 'reject'].includes(action)) {
-    throw new Error('Usage: gateway-join-requests <list|approve|reject> [requestId]');
-  }
-  const cfg = readCliGatewayConfig();
-  if (action === 'list') {
-    const result = await gatewayRequest({
-      ...cfg,
-      path: '/api/gateway/join-requests',
-      method: 'GET'
-    });
-    console.log(JSON.stringify(result, null, 2));
-    return;
-  }
-  if (!requestId) {
-    throw new Error('requestId is required');
-  }
-  const result = await gatewayRequest({
-    ...cfg,
-    path: `/api/gateway/join-requests/${encodeURIComponent(requestId)}/${action}`,
-    method: 'POST'
-  });
-  console.log(JSON.stringify(result, null, 2));
-}
-
-main().catch((error) => {
-  console.error(error?.message || error);
-  process.exitCode = 1;
-});
+const binDir = dirname(fileURLToPath(import.meta.url));
+const gatewayAdmin = resolve(binDir, 'gateway-admin.mjs');
+const [, , action, requestId] = process.argv;
+const args = ['operator', 'join-requests', action, requestId].filter(Boolean);
+const result = spawnSync(process.execPath, [gatewayAdmin, ...args], { stdio: 'inherit' });
+process.exitCode = result.status || 0;

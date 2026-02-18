@@ -75,6 +75,7 @@ class GatewayAuthService {
       ? config.issuer.trim()
       : 'hypertuna-public-gateway';
     this.challenges = new Map();
+    this.revokedTokenDigests = new Map();
   }
 
   issueChallenge({ pubkey, scope, relayKey = null } = {}) {
@@ -146,13 +147,16 @@ class GatewayAuthService {
     };
   }
 
-  issueToken(claims = {}) {
+  issueToken(claims = {}, { ttlSec = null } = {}) {
     const nowSec = Math.floor(Date.now() / 1000);
+    const resolvedTtl = Number.isFinite(ttlSec) && ttlSec > 0
+      ? Math.trunc(ttlSec)
+      : this.tokenTtlSec;
     const payload = {
       ...claims,
       iss: this.issuer,
       iat: nowSec,
-      exp: nowSec + this.tokenTtlSec
+      exp: nowSec + resolvedTtl
     };
     const header = { alg: 'HS256', typ: 'JWT' };
     const encodedHeader = base64url(stableJson(header));
@@ -163,8 +167,13 @@ class GatewayAuthService {
   }
 
   verifyToken(token, { requiredScopes = [], relayKey = null, pubkey = null } = {}) {
+    this.pruneRevokedTokens();
     if (typeof token !== 'string' || !token.trim()) {
       return { ok: false, reason: 'missing-token' };
+    }
+    const digest = this.#tokenDigest(token.trim());
+    if (digest && this.revokedTokenDigests.has(digest)) {
+      return { ok: false, reason: 'token-revoked' };
     }
     const [encodedHeader, encodedPayload, encodedSignature] = token.split('.');
     if (!encodedHeader || !encodedPayload || !encodedSignature) {
@@ -221,6 +230,50 @@ class GatewayAuthService {
     const token = parseBearerToken(authorizationHeader);
     if (!token) return { ok: false, reason: 'missing-bearer-token' };
     return this.verifyToken(token, options);
+  }
+
+  refreshToken(token, options = {}) {
+    const verified = this.verifyToken(token, options);
+    if (!verified?.ok) return verified;
+    const payload = verified.payload || {};
+    const nextClaims = { ...payload };
+    delete nextClaims.iat;
+    delete nextClaims.exp;
+    delete nextClaims.nbf;
+    const refreshed = this.issueToken(nextClaims);
+    return {
+      ok: true,
+      token: refreshed,
+      tokenType: 'Bearer',
+      expiresIn: this.tokenTtlSec,
+      payload: nextClaims
+    };
+  }
+
+  revokeToken(token) {
+    const verified = this.verifyToken(token);
+    if (!verified?.ok) return verified;
+    const digest = this.#tokenDigest(token);
+    if (digest) {
+      const exp = Number(verified?.payload?.exp);
+      this.revokedTokenDigests.set(digest, Number.isFinite(exp) ? exp : Math.floor(Date.now() / 1000) + this.tokenTtlSec);
+    }
+    return { ok: true };
+  }
+
+  pruneRevokedTokens() {
+    if (!this.revokedTokenDigests?.size) return;
+    const nowSec = Math.floor(Date.now() / 1000);
+    for (const [digest, exp] of this.revokedTokenDigests.entries()) {
+      if (!Number.isFinite(exp) || exp <= nowSec) {
+        this.revokedTokenDigests.delete(digest);
+      }
+    }
+  }
+
+  #tokenDigest(token) {
+    if (typeof token !== 'string' || !token.length) return null;
+    return createHash('sha256').update(token).digest('hex');
   }
 
   async #verifyAuthEvent(event, challengeEntry) {

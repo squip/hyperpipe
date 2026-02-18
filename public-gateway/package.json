@@ -14,6 +14,7 @@
     "gateway-ban": "node ./bin/gateway-ban.mjs",
     "gateway-invite": "node ./bin/gateway-invite.mjs",
     "gateway-join-requests": "node ./bin/gateway-join-requests.mjs",
+    "gateway-admin": "node ./bin/gateway-admin.mjs",
     "e2e:multi-gateway:dry": "node ./e2e/multi-gateway/run-matrix.mjs --dry-run",
     "e2e:multi-gateway:run": "node ./e2e/multi-gateway/run-matrix.mjs",
     "e2e:multi-gateway:stub": "node ./e2e/multi-gateway/run-matrix.mjs --skip-docker --executor \"node ./public-gateway/e2e/multi-gateway/executor-stub.mjs\"",

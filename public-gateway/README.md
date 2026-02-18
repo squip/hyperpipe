@@ -1,102 +1,108 @@
-# Public Gateway Revamp
+# Hypertuna Public Gateway
 
-This document captures the high-level goals and task breakdown for reviving a public Hyperswarm-backed gateway that reuses the existing relay protocol end-to-end.
+Public HTTPS gateway for Hypertuna relays with multi-gateway policy controls, blind-peer mirror services, and operator tooling.
 
-## Goals
-- Allow remote clients to reach user-hosted relays via a public HTTPS/WebSocket edge.
-- Preserve existing worker-side behaviour while proxying traffic over Hyperswarm using the shared `RelayProtocol`.
-- Support optional observability and security features so the gateway can operate in shared infrastructure.
+## What is included
 
-## Deliverables
-1. **Shared Hyperswarm Client Library**
-   - Extract/rewrite the legacy gateway client into an ES module that can be consumed by the public gateway.
-   - Responsibilities: connection pooling, health checks, forwarding of HTTP/WebSocket frames, event streaming.
+- Gateway service (`src/index.mjs`) with relay bridge + blind-peer mirror functionality.
+- Operator APIs for policy, allow-list, ban-list, join requests, invites, and status.
+- Nostr challenge/verify JWT auth (`/api/auth/challenge`, `/api/auth/verify`).
+- Embedded admin web UI at `/admin`.
+- Guided deployment/management CLI: `gateway-admin`.
 
-2. **Public Gateway Service**
-   - New Node.js service (Express + `ws`) that terminates HTTPS/WebSocket, validates tokens, and bridges messages to the shared client library.
-   - Provide configuration via env/config file for bind address, TLS, Redis, metrics, etc.
-
-3. **Registration and Auth Flow**
-   - Worker API endpoint to register a relay with the public gateway.
-   - Signed registration payloads and token generation/validation utilities shared between worker and gateway.
-
-4. **Session & Event Plumbing**
-   - Adapter that mirrors `handleWebSocket` semantics: connection bookkeeping, message queueing, event polling, error propagation.
-   - Health-check scheduling and failover matching the worker’s expectations.
-
-5. **Observability & Ops** (optional but planned)
-   - Structured logging hooks.
-   - Prometheus-style metrics exporter (sessions, peer health, throughput).
-   - Rate limiting and per-token usage accounting.
-
-6. **Documentation & Tooling**
-   - Deployment instructions (Dockerfile, env sample).
-   - Developer testing workflow for end-to-end relay access through the public gateway.
-
-## Task Breakdown
-- [x] Create shared client module under `shared/public-gateway/HyperswarmClient.mjs` reusing protocol logic.
-- [x] Implement connection pool with health tracking and peer selection.
-- [x] Build public gateway service entrypoint (`public-gateway/server.mjs`) with Express, `ws`, TLS support.
-- [x] Implement registration API in worker (`hypertuna-worker`) to produce signed payloads and manage relay listings.
-- [x] Add token issuing/validation helpers in `shared/auth/PublicGatewayTokens.mjs`.
-- [x] Wire worker to call public gateway registration endpoint when user enables remote access.
-- [x] Implement WebSocket session adapter bridging to `RelayProtocol` requests.
-- [x] Add metrics/logging middleware and expose `/metrics` endpoint.
-- [x] Provide Dockerfile + configuration examples for deployment.
-- [x] Document operational runbook in this folder.
-
-## Open Questions
-- Where to persist registration metadata for multi-node deployments (initial pass can use in-memory store with optional Redis adapter).
-- Desired token lifetime and renewal UX.
-
-This roadmap will be updated as implementation proceeds.
-
-## Running the Gateway
-
-### Local Development
+## Quick Start (Wizard + Docker)
 
 ```bash
 cd public-gateway
 npm install
-npm run dev # loads configuration from .env.local if present
+node ./bin/gateway-admin.mjs init
+node ./bin/gateway-admin.mjs deploy up
 ```
 
-By default the service listens on `4430` and expects signed registration payloads from the desktop worker. Use `GATEWAY_REGISTRATION_SECRET` to set the shared HMAC secret.
+This creates runtime deployment files in:
 
-### Docker
+- `public-gateway/deploy/runtime/docker-compose.yml`
+- `public-gateway/deploy/runtime/.env`
+- `public-gateway/deploy/runtime/config.json`
 
-The repository ships with a Dockerfile rooted at `public-gateway/Dockerfile`.
+After `deploy up`, open:
+
+- Admin UI: `${GATEWAY_PUBLIC_URL}/admin`
+- Health: `${GATEWAY_PUBLIC_URL}/health`
+- Metrics: `${GATEWAY_PUBLIC_URL}/metrics`
+
+## Admin UI Login
+
+The admin UI uses Nostr challenge auth:
+
+1. Enter operator pubkey hex + nsec hex.
+2. UI signs `kind:22242` auth event.
+3. Gateway issues JWT + optional HttpOnly admin session cookie.
+
+From the dashboard, operators can:
+
+- Update OPEN/CLOSED policy and invite-only mode.
+- Manage allow-list and ban-list entries.
+- Review and approve/reject join requests.
+- Create invites.
+- View overview/metrics/activity.
+- Trigger metadata republish and blind-peer GC actions.
+
+## `gateway-admin` CLI
 
 ```bash
-# build from the repository root
-docker build -f public-gateway/Dockerfile -t hypertuna/public-gateway .
-
-# run with TLS disabled and local Redis cache
-docker run -p 4430:4430 \
-  -e GATEWAY_PUBLIC_URL=https://hypertuna.com \
-  -e GATEWAY_REGISTRATION_SECRET=change-me \
-  -e GATEWAY_REGISTRATION_REDIS=redis://redis:6379 \
-  hypertuna/public-gateway
+gateway-admin init
+gateway-admin config show
+gateway-admin config edit
+gateway-admin deploy up
+gateway-admin deploy status
+gateway-admin deploy logs --service public-gateway
+gateway-admin deploy down --volumes
 ```
 
-For Compose deployments ensure the `shared/` directory remains mounted so the service can import the shared protocol modules.
-
-### Configuration Reference
-
-| Environment Variable | Description |
-| -------------------- | ----------- |
-| `GATEWAY_PUBLIC_URL` | External HTTPS base used when generating share links. |
-| `GATEWAY_REGISTRATION_SECRET` | Shared HMAC secret the worker uses to sign registration payloads and tokens. |
-| `GATEWAY_REGISTRATION_REDIS` | Optional Redis connection string for distributed registration state. Falls back to in-memory cache when omitted or unavailable. |
-| `GATEWAY_REGISTRATION_REDIS_PREFIX` | Namespace prefix for Redis keys. Defaults to `gateway:registrations:`. |
-| `GATEWAY_REGISTRATION_TTL` | Registration TTL in seconds. Defaults to `300`. |
-| `GATEWAY_DEFAULT_TOKEN_TTL` | Default token lifetime in seconds for link generation. Defaults to `3600`. |
-
-### Testing
+Operator commands:
 
 ```bash
-cd public-gateway
+gateway-admin operator allow list
+gateway-admin operator allow add <pubkey>
+gateway-admin operator ban add <pubkey>
+gateway-admin operator invite create <pubkey>
+gateway-admin operator join-requests list
+gateway-admin operator join-requests approve <requestId>
+gateway-admin operator policy show
+gateway-admin operator policy set --policy CLOSED --invite-only --discovery wss://relay.one,wss://relay.two
+```
+
+Legacy wrappers remain available and forward to `gateway-admin operator ...`:
+
+- `gateway-allow`
+- `gateway-ban`
+- `gateway-invite`
+- `gateway-join-requests`
+
+## Deployment Profiles
+
+Templates live in `public-gateway/deploy/templates/`:
+
+- `docker-compose.local.yml` (single host/local access)
+- `docker-compose.internet.yml` (Traefik + Let's Encrypt)
+
+Env templates:
+
+- `env.local.example`
+- `env.internet.example`
+
+## Development
+
+```bash
+npm run dev
 npm test
 ```
 
-This runs lightweight unit tests for token helpers and the in-memory registration store using Node's built-in test runner.
+## Configuration
+
+See `public-gateway/.env.example` for the complete env surface, including:
+
+- Gateway policy/auth (`GATEWAY_POLICY`, `GATEWAY_AUTH_*`)
+- Admin UI/session settings (`GATEWAY_ADMIN_*`)
+- Multi-gateway controls (`GATEWAY_ENABLE_MULTI`, allow/ban/discovery lists)

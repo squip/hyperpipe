@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hypertuna Gateway Admin</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Gateway Admin</h1>
+        <p>Operator controls for policy, requests, invites, and runtime health.</p>
+      </div>
+      <div class="topbar-actions">
+        <button id="btn-refresh-all" class="btn">Refresh</button>
+        <button id="btn-logout" class="btn btn-danger">Logout</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section id="login-panel" class="card">
+        <h2>Operator Login</h2>
+        <p class="muted">Sign a Nostr challenge to start an admin session.</p>
+        <label>Operator pubkey (hex)
+          <input id="login-pubkey" type="text" placeholder="64-char hex pubkey" />
+        </label>
+        <label>Operator nsec (hex)
+          <input id="login-nsec" type="password" placeholder="64-char hex private key" />
+        </label>
+        <div class="row">
+          <button id="btn-login" class="btn btn-primary">Sign In</button>
+          <span id="login-status" class="muted"></span>
+        </div>
+      </section>
+
+      <section id="dashboard" class="dashboard hidden">
+        <div class="grid two">
+          <article class="card">
+            <h3>Overview</h3>
+            <pre id="overview-json" class="code"></pre>
+          </article>
+
+          <article class="card">
+            <h3>Policy</h3>
+            <div class="row">
+              <select id="policy-value">
+                <option value="OPEN">OPEN</option>
+                <option value="CLOSED">CLOSED</option>
+              </select>
+              <label class="inline">
+                <input id="policy-invite-only" type="checkbox" /> Invite-only
+              </label>
+              <button id="btn-policy-save" class="btn btn-primary">Save</button>
+            </div>
+            <label>Discovery relays (comma separated)
+              <input id="policy-relays" type="text" placeholder="wss://relay.one,wss://relay.two" />
+            </label>
+          </article>
+        </div>
+
+        <div class="grid two">
+          <article class="card">
+            <h3>Allow-List</h3>
+            <div class="row">
+              <input id="allow-input" type="text" placeholder="pubkey hex" />
+              <button id="btn-allow-add" class="btn btn-primary">Add</button>
+            </div>
+            <ul id="allow-list" class="list"></ul>
+          </article>
+
+          <article class="card">
+            <h3>Ban-List</h3>
+            <div class="row">
+              <input id="ban-input" type="text" placeholder="pubkey hex" />
+              <button id="btn-ban-add" class="btn btn-primary">Add</button>
+            </div>
+            <ul id="ban-list" class="list"></ul>
+          </article>
+        </div>
+
+        <div class="grid two">
+          <article class="card">
+            <h3>Join Requests</h3>
+            <ul id="join-requests" class="list"></ul>
+          </article>
+
+          <article class="card">
+            <h3>Invites</h3>
+            <div class="row">
+              <input id="invite-input" type="text" placeholder="invitee pubkey hex" />
+              <button id="btn-invite-create" class="btn btn-primary">Create Invite</button>
+            </div>
+            <ul id="invites" class="list"></ul>
+          </article>
+        </div>
+
+        <div class="grid two">
+          <article class="card">
+            <h3>Metrics Summary</h3>
+            <pre id="metrics-json" class="code"></pre>
+          </article>
+
+          <article class="card">
+            <h3>Runtime Actions</h3>
+            <div class="row">
+              <button id="btn-republish" class="btn">Republish Metadata</button>
+              <button id="btn-gc" class="btn">Run Blind-Peer GC</button>
+            </div>
+            <h4>Recent Activity</h4>
+            <ul id="activity" class="list"></ul>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <section id="toast" class="toast hidden"></section>
+    <script type="importmap">
+      {
+        "imports": {
+          "@noble/curves/": "/admin/vendor/noble-curves/esm/",
+          "@noble/hashes/": "/admin/vendor/noble-hashes/esm/",
+          "@noble/hashes/utils": "/admin/vendor/noble-hashes/esm/utils.js",
+          "@noble/hashes/crypto": "/admin/vendor/noble-hashes/esm/crypto.js"
+        }
+      }
+    </script>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
