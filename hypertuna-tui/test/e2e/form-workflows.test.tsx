@@ -102,4 +102,33 @@ describe.sequential('TUI e2e in-pane form workflows', () => {
       instance.unmount()
     }
   })
+
+  it('shows gateway discovery rows in create-group form', async () => {
+    const controller = MockController.withSeedData(BASE_OPTIONS)
+    await controller.setSelectedNode('groups:create')
+    await controller.setFocusPane('center')
+    const instance = render(
+      <App
+        options={BASE_OPTIONS}
+        controllerFactory={() => controller}
+      />
+    )
+
+    try {
+      await waitFor(() => lastFrame(instance).includes('groups:create'))
+      await waitFor(() => lastFrame(instance).includes('gateway search:'))
+      await waitFor(() => lastFrame(instance).includes('https://gateway.seed.example'))
+
+      instance.stdin.write('\r')
+      await waitFor(() => lastFrame(instance).includes('Group name:'))
+      await typeText(instance, 'gateway-form-group')
+      instance.stdin.write('\r')
+      await waitFor(() => !lastFrame(instance).includes('Group name:'))
+
+      await waitFor(() => lastFrame(instance).includes('gateway search:'))
+      expect(lastFrame(instance)).toContain('https://gateway.seed.example')
+    } finally {
+      instance.unmount()
+    }
+  })
 })

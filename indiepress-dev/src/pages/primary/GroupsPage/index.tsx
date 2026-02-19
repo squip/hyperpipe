@@ -195,6 +195,7 @@ const GroupsPage = forwardRef<
   const {
     discoveryGroups,
     invites,
+    gatewayMetadata,
     gatewayInvites,
     gatewayJoinRequests,
     pendingInviteCount,
@@ -703,6 +704,20 @@ const GroupsPage = forwardRef<
     })
   }, [filteredInviteRows, inviteSort, resolvePeerCount, resolveRowAdmin, resolveRowMembers])
 
+  const gatewayMetadataByOrigin = useMemo(() => {
+    const map = new Map<string, { operatorPubkey: string; policy: 'OPEN' | 'CLOSED' }>()
+    gatewayMetadata.forEach((entry) => {
+      const origin = String(entry?.origin || '').trim()
+      const operatorPubkey = String(entry?.operatorPubkey || '').trim()
+      if (!origin || !operatorPubkey) return
+      map.set(origin, {
+        operatorPubkey,
+        policy: String(entry?.policy || '').toUpperCase() === 'CLOSED' ? 'CLOSED' : 'OPEN'
+      })
+    })
+    return map
+  }, [gatewayMetadata])
+
   const handleUseInvite = async (inv: TGroupInvite) => {
     if (!inv) return
     if (joiningInviteId) return
@@ -1111,15 +1126,30 @@ const GroupsPage = forwardRef<
               {t('Gateway invites')}
             </div>
             <div className="divide-y">
-              {gatewayInvites.map((invite) => (
+              {gatewayInvites.map((invite) => {
+                const metadata = gatewayMetadataByOrigin.get(invite.origin)
+                const operatorPubkey = String(invite.operatorPubkey || metadata?.operatorPubkey || '').trim()
+                const policy = metadata?.policy || 'OPEN'
+                return (
                 <div
                   key={invite.event.id}
                   className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-xs"
                 >
                   <div className="min-w-0 flex-1">
-                    <div className="truncate font-medium">{invite.origin}</div>
-                    <div className="truncate text-muted-foreground">
-                      {t('Operator')}: {invite.operatorPubkey || '-'} •{' '}
+                    <div className="truncate font-medium">
+                      {invite.origin} • {policy}
+                    </div>
+                    <div className="mt-1 flex items-center gap-2 min-w-0">
+                      {operatorPubkey ? (
+                        <>
+                          <SimpleUserAvatar userId={operatorPubkey} size="small" className="h-5 w-5 rounded-full" />
+                          <Username userId={operatorPubkey} className="truncate text-xs" withoutSkeleton />
+                        </>
+                      ) : (
+                        <span className="text-muted-foreground">{t('Operator')}: -</span>
+                      )}
+                    </div>
+                    <div className="truncate text-muted-foreground mt-1">
                       <FormattedTimestamp timestamp={invite.event.created_at} />
                     </div>
                   </div>
@@ -1143,7 +1173,8 @@ const GroupsPage = forwardRef<
                     </Button>
                   </div>
                 </div>
-              ))}
+                )
+              })}
             </div>
           </div>
         ) : null}
@@ -1161,6 +1192,10 @@ const GroupsPage = forwardRef<
                 >
                   <div className="min-w-0 flex-1">
                     <div className="truncate font-medium">{request.origin}</div>
+                    <div className="mt-1 flex items-center gap-2 min-w-0">
+                      <SimpleUserAvatar userId={request.requesterPubkey} size="small" className="h-5 w-5 rounded-full" />
+                      <Username userId={request.requesterPubkey} className="truncate text-xs" withoutSkeleton />
+                    </div>
                     <div className="truncate text-muted-foreground">
                       {request.content || t('No message')}
                     </div>

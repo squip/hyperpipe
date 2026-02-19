@@ -149,6 +149,7 @@ export type ControllerState = {
   myGroupList: GroupListEntry[]
   groupDiscover: GroupSummary[]
   gatewayMetadata: GatewayMetadataEvent[]
+  followedPubkeys: string[]
   myGroups: GroupSummary[]
   groupInvites: GroupInvite[]
   gatewayInvites: GatewayInviteEvent[]
@@ -507,6 +508,7 @@ export class TuiController {
     myGroupList: [],
     groupDiscover: [],
     gatewayMetadata: [],
+    followedPubkeys: [],
     myGroups: [],
     groupInvites: [],
     gatewayInvites: [],
@@ -631,6 +633,7 @@ export class TuiController {
       myGroupList: this.state.myGroupList.map((entry) => ({ ...entry })),
       groupDiscover: this.state.groupDiscover.map((group) => ({ ...group })),
       gatewayMetadata: this.state.gatewayMetadata.map((entry) => ({ ...entry })),
+      followedPubkeys: [...this.state.followedPubkeys],
       myGroups: this.state.myGroups.map((group) => ({ ...group })),
       groupInvites: this.state.groupInvites.map((invite) => ({ ...invite })),
       gatewayInvites: this.state.gatewayInvites.map((invite) => ({ ...invite })),
@@ -3823,13 +3826,16 @@ export class TuiController {
     await this.runTask('Refresh groups', async () => {
       const discoveryRelays = this.searchableRelayUrls(18)
       const myListRelays = this.searchableRelayUrls(14)
-      const [groups, loadedMyGroupList, localGroups, gatewayMetadata] = await Promise.all([
+      const [groups, loadedMyGroupList, localGroups, gatewayMetadata, followedPubkeys] = await Promise.all([
         this.groupService.discoverGroups(discoveryRelays, 220),
         this.state.session
           ? this.groupService.loadMyGroupList(myListRelays, this.state.session.pubkey)
           : Promise.resolve(this.state.myGroupList),
         this.loadLocalDiscoveryGroups().catch(() => []),
-        this.groupService.discoverGatewayMetadata(discoveryRelays, 320).catch(() => [])
+        this.groupService.discoverGatewayMetadata(discoveryRelays, 320).catch(() => []),
+        this.state.session
+          ? this.loadFollowListPubkeys().catch(() => [])
+          : Promise.resolve([])
       ])
       const relayBackfillEntries = this.deriveMyGroupListFromConnectedRelays()
       const myGroupList = this.mergeMyGroupList(loadedMyGroupList, relayBackfillEntries)
@@ -3861,7 +3867,8 @@ export class TuiController {
       this.rawGroupDiscover = enrichedGroups.map((group) => ({ ...group }))
       this.patchState({
         myGroupList,
-        gatewayMetadata
+        gatewayMetadata,
+        followedPubkeys
       })
 
       const loadedKeys = new Set(loadedMyGroupList.map((entry) => groupListEntryKey(entry)))
@@ -3879,9 +3886,10 @@ export class TuiController {
       }
 
       await this.ensureAdminProfiles(
-        enrichedGroups
-          .map((group) => group.adminPubkey || group.event?.pubkey || '')
-          .filter(Boolean)
+        [
+          ...enrichedGroups.map((group) => group.adminPubkey || group.event?.pubkey || ''),
+          ...gatewayMetadata.map((entry) => entry.operatorPubkey || '')
+        ].filter(Boolean)
       )
       await this.syncGroupGatewayOriginsToWorker(enrichedGroups).catch((error) => {
         this.log('warn', `Failed syncing group gateway origins to worker: ${error instanceof Error ? error.message : String(error)}`)

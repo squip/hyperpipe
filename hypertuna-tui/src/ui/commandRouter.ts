@@ -83,6 +83,13 @@ export type CommandContext = {
   resolveSelectedFile?: () => SelectedFileRef | null
   resolveSelectedConversation?: () => SelectedConversationRef | null
   resolveSelectedNote?: () => SelectedNoteRef | null
+  resolveGatewayMetadata?: () => Array<{
+    origin: string
+    operatorPubkey: string
+    policy: 'OPEN' | 'CLOSED'
+    allowList?: string[]
+  }>
+  resolveCurrentPubkey?: () => string | null
   copy?: (text: string) => Promise<ClipboardCopyResult>
   unsafeCopySecrets?: boolean
 }
@@ -376,6 +383,32 @@ function parseGatewayDescriptorSpec(spec: string) {
     origin,
     operatorPubkey,
     policy: String(policyRaw || '').toUpperCase() === 'CLOSED' ? ('CLOSED' as const) : ('OPEN' as const)
+  }
+}
+
+function normalizePubkey(value: string | null | undefined): string | null {
+  const trimmed = String(value || '').trim().toLowerCase()
+  return isHex64(trimmed) ? trimmed : null
+}
+
+function resolveGatewayDescriptorByOrigin(
+  context: CommandContext | undefined,
+  originInput: string
+): { origin: string; operatorPubkey: string; policy: 'OPEN' | 'CLOSED'; allowList: string[] } | null {
+  const origin = normalizeGatewayOrigin(originInput)
+  if (!origin) return null
+  const metadata = context?.resolveGatewayMetadata?.() || []
+  const match = metadata.find((entry) => normalizeGatewayOrigin(entry?.origin || '') === origin)
+  if (!match) return null
+  const operatorPubkey = normalizePubkey(match.operatorPubkey)
+  if (!operatorPubkey) return null
+  return {
+    origin,
+    operatorPubkey,
+    policy: String(match.policy || '').toUpperCase() === 'CLOSED' ? 'CLOSED' : 'OPEN',
+    allowList: (Array.isArray(match.allowList) ? match.allowList : [])
+      .map((value) => normalizePubkey(String(value || '')))
+      .filter((value): value is string => !!value)
   }
 }
 
@@ -903,13 +936,42 @@ export async function executeCommand(
       if (gatewaySpecs.length && parsedGateways.length !== gatewaySpecs.length) {
         throw new Error('Invalid --gateway value. Expected "origin,operator-pubkey,OPEN|CLOSED".')
       }
+      const gatewayOriginValues = collectOptionValues(args, '--gateway-origin')
+      const gatewayOriginDescriptors = gatewayOriginValues.map((originValue) => {
+        const resolved = resolveGatewayDescriptorByOrigin(context, originValue)
+        if (!resolved) {
+          const normalized = normalizeGatewayOrigin(originValue) || originValue
+          throw new Error(
+            `Unknown --gateway-origin: ${normalized}. Refresh discovery metadata or use --gateway origin,pubkey,policy.`
+          )
+        }
+        const currentPubkey = normalizePubkey(context?.resolveCurrentPubkey?.())
+        if (resolved.policy === 'CLOSED') {
+          if (!currentPubkey || !resolved.allowList.includes(currentPubkey)) {
+            throw new Error(
+              `Gateway ${resolved.origin} is CLOSED and current account is not allow-listed.`
+            )
+          }
+        }
+        return {
+          origin: resolved.origin,
+          operatorPubkey: resolved.operatorPubkey,
+          policy: resolved.policy
+        }
+      })
+      const mergedGateways = Array.from(
+        new Map(
+          [...parsedGateways, ...gatewayOriginDescriptors]
+            .map((entry) => [entry.origin, entry])
+        ).values()
+      )
       await controller.createRelay({
         name,
         isPublic,
         isOpen,
         fileSharing,
         description: collectOptionValue(args, '--desc'),
-        gateways: parsedGateways.length ? parsedGateways : undefined
+        gateways: mergedGateways.length ? mergedGateways : undefined
       })
       return { message: `Relay created: ${name}`, gotoNode: 'relays' }
     }

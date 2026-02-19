@@ -14,6 +14,7 @@ import type {
   FeedSourceState,
   FileControls,
   FileSortKey,
+  GatewayMetadataEvent,
   GroupNoteRecord,
   GroupComposeDraft,
   GroupControls,
@@ -209,8 +210,12 @@ function emptyState(): ControllerState {
     searchQuery: '',
     myGroupList: [],
     groupDiscover: [],
+    gatewayMetadata: [],
+    followedPubkeys: [],
     myGroups: [],
     groupInvites: [],
+    gatewayInvites: [],
+    gatewayJoinRequests: [],
     groupJoinRequests: {},
     invitesInbox: [],
     chatUnreadTotal: 0,
@@ -258,6 +263,8 @@ function emptyState(): ControllerState {
     dismissedGroupInviteIds: [],
     acceptedGroupInviteIds: [],
     acceptedGroupInviteGroupIds: [],
+    dismissedGatewayInviteIds: [],
+    acceptedGatewayInviteIds: [],
     dismissedChatInviteIds: [],
     acceptedChatInviteIds: [],
     acceptedChatInviteConversationIds: [],
@@ -304,8 +311,16 @@ function cloneState(state: ControllerState): ControllerState {
     searchResults: state.searchResults.map((entry) => ({ ...entry })),
     myGroupList: state.myGroupList.map((entry) => ({ ...entry })),
     groupDiscover: state.groupDiscover.map((entry) => ({ ...entry })),
+    gatewayMetadata: (state.gatewayMetadata || []).map((entry: any) => ({ ...entry })),
+    followedPubkeys: [
+      ...(Array.isArray((state as any).followedPubkeys)
+        ? (state as any).followedPubkeys
+        : [])
+    ],
     myGroups: state.myGroups.map((entry) => ({ ...entry })),
     groupInvites: state.groupInvites.map((entry) => ({ ...entry })),
+    gatewayInvites: (state.gatewayInvites || []).map((entry: any) => ({ ...entry })),
+    gatewayJoinRequests: (state.gatewayJoinRequests || []).map((entry: any) => ({ ...entry })),
     groupJoinRequests: Object.fromEntries(
       Object.entries(state.groupJoinRequests).map(([key, value]) => [key, value.map((entry) => ({ ...entry }))])
     ),
@@ -351,6 +366,8 @@ function cloneState(state: ControllerState): ControllerState {
     dismissedGroupInviteIds: [...state.dismissedGroupInviteIds],
     acceptedGroupInviteIds: [...state.acceptedGroupInviteIds],
     acceptedGroupInviteGroupIds: [...state.acceptedGroupInviteGroupIds],
+    dismissedGatewayInviteIds: [...(state.dismissedGatewayInviteIds || [])],
+    acceptedGatewayInviteIds: [...(state.acceptedGatewayInviteIds || [])],
     dismissedChatInviteIds: [...state.dismissedChatInviteIds],
     acceptedChatInviteIds: [...state.acceptedChatInviteIds],
     acceptedChatInviteConversationIds: [...state.acceptedChatInviteConversationIds]
@@ -455,6 +472,33 @@ export class MockController implements AppController {
       makeEvent({ idSeed: 'feed-1', pubkey, kind: 1, content: 'hello from feed 1' }),
       makeEvent({ idSeed: 'feed-2', pubkey: shortPubkeySeed('peer'), kind: 1, content: 'hello from peer' })
     ]
+    const gatewayOperatorPubkey = shortPubkeySeed('gateway-operator')
+    const gatewayOrigin = 'https://gateway.seed.example'
+    const gatewayMetadata: GatewayMetadataEvent[] = [
+      {
+        id: 'gateway-meta-seed',
+        origin: gatewayOrigin,
+        operatorPubkey: gatewayOperatorPubkey,
+        policy: 'OPEN',
+        allowList: [],
+        discoveryRelays: ['wss://relay.damus.io/'],
+        content: '',
+        createdAt: nowSec(),
+        event: makeEvent({
+          idSeed: 'gateway-meta',
+          pubkey: gatewayOperatorPubkey,
+          kind: 30078,
+          tags: [
+            ['d', `hypertuna_gateway:${gatewayOrigin}`],
+            ['h', 'hypertuna_gateway:metadata'],
+            ['operator', gatewayOperatorPubkey],
+            ['policy', 'OPEN'],
+            ['r', 'wss://relay.damus.io/']
+          ],
+          content: ''
+        })
+      }
+    ]
 
     const groups: GroupSummary[] = [
       {
@@ -466,6 +510,13 @@ export class MockController implements AppController {
         isOpen: true,
         adminPubkey: pubkey,
         adminName: 'seed-admin',
+        gateways: [
+          {
+            origin: gatewayOrigin,
+            operatorPubkey: gatewayOperatorPubkey,
+            policy: 'OPEN'
+          }
+        ],
         members: [pubkey, shortPubkeySeed('peer-group')],
         membersCount: 2,
         peersOnline: 1,
@@ -553,6 +604,8 @@ export class MockController implements AppController {
       relays,
       feed,
       groups,
+      gatewayMetadata,
+      followedPubkeys: [gatewayOperatorPubkey],
       myGroupList: [{ groupId: groups[0].id, relay: groups[0].relay }],
       invites,
       files,
@@ -1148,6 +1201,11 @@ export class MockController implements AppController {
     isOpen?: boolean
     fileSharing?: boolean
     picture?: string
+    gateways?: Array<{
+      origin: string
+      operatorPubkey: string
+      policy: 'OPEN' | 'CLOSED'
+    }>
   }): Promise<Record<string, unknown>> {
     const relayKey = this.nextRelayKey(input.name)
     const publicIdentifier = `${shortPubkeySeed(input.name).slice(0, 8)}:${input.name}`
@@ -1170,6 +1228,7 @@ export class MockController implements AppController {
       isOpen: input.isOpen,
       adminPubkey: this.state.session?.pubkey || null,
       adminName: 'me',
+      gateways: Array.isArray(input.gateways) ? input.gateways : [],
       members: this.state.session ? [this.state.session.pubkey] : [],
       membersCount: this.state.session ? 1 : 0,
       peersOnline: 0,

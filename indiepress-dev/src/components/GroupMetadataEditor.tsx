@@ -6,9 +6,12 @@ import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import Uploader from '@/components/PostEditor/Uploader'
 import { Upload, X } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { TGatewayDescriptor } from '@/types/groups'
-import { parseGatewayDescriptorInput, serializeGatewayDescriptorInput } from '@/lib/gateway-tags'
+import { useGroups } from '@/providers/GroupsProvider'
+import { useNostr } from '@/providers/NostrProvider'
+import GatewaySelector from '@/components/groups/GatewaySelector'
+import { toast } from 'sonner'
 
 export type TGroupMetadataForm = {
   name: string
@@ -32,6 +35,8 @@ export default function GroupMetadataEditor({
   saving?: boolean
   isOpen?: boolean
 }) {
+  const { gatewayDirectory, gatewayMetadata } = useGroups()
+  const { pubkey } = useNostr()
   const [form, setForm] = useState<TGroupMetadataForm>({
     name: initial?.name ?? '',
     about: initial?.about ?? '',
@@ -40,9 +45,6 @@ export default function GroupMetadataEditor({
     isOpen: initial?.isOpen ?? true,
     gateways: Array.isArray(initial?.gateways) ? initial.gateways : []
   })
-  const [gatewayInput, setGatewayInput] = useState(
-    serializeGatewayDescriptorInput(Array.isArray(initial?.gateways) ? initial.gateways : [])
-  )
   const [hasInteracted, setHasInteracted] = useState(false)
 
   const nextFormFromInitial = () => ({
@@ -58,19 +60,30 @@ export default function GroupMetadataEditor({
     if (!isOpen) return
     if (hasInteracted) return
     setForm(nextFormFromInitial())
-    setGatewayInput(
-      serializeGatewayDescriptorInput(Array.isArray(initial?.gateways) ? initial.gateways : [])
-    )
   }, [initial, isOpen, hasInteracted])
 
   useEffect(() => {
     if (!isOpen) return
     setHasInteracted(false)
     setForm(nextFormFromInitial())
-    setGatewayInput(
-      serializeGatewayDescriptorInput(Array.isArray(initial?.gateways) ? initial.gateways : [])
-    )
   }, [isOpen])
+
+  const gatewayMetadataByOrigin = useMemo(() => {
+    const map = new Map<string, { policy: 'OPEN' | 'CLOSED'; allowList: Set<string> }>()
+    gatewayMetadata.forEach((entry) => {
+      const origin = String(entry?.origin || '').trim()
+      if (!origin) return
+      map.set(origin, {
+        policy: String(entry?.policy || '').toUpperCase() === 'CLOSED' ? 'CLOSED' : 'OPEN',
+        allowList: new Set(
+          (Array.isArray(entry?.allowList) ? entry.allowList : [])
+            .map((value) => String(value || '').trim().toLowerCase())
+            .filter(Boolean)
+        )
+      })
+    })
+    return map
+  }, [gatewayMetadata])
 
   return (
     <div className="space-y-4">
@@ -179,26 +192,47 @@ export default function GroupMetadataEditor({
       </div>
       <div className="space-y-2">
         <Label>Gateways</Label>
-        <Textarea
-          value={gatewayInput}
-          onChange={(e) => {
+        <GatewaySelector
+          value={form.gateways}
+          onChange={(nextGateways) => {
             setHasInteracted(true)
-            const value = e.target.value
-            setGatewayInput(value)
-            setForm((current) => ({ ...current, gateways: parseGatewayDescriptorInput(value) }))
+            setForm((current) => ({ ...current, gateways: nextGateways }))
           }}
-          placeholder="https://gateway.example,<operator-pubkey>,OPEN"
-          rows={4}
+          directory={gatewayDirectory}
         />
         <div className="text-xs text-muted-foreground">
-          One per line: origin,operator-pubkey,OPEN|CLOSED
+          CLOSED gateways are shown only when your pubkey is allow-listed in gateway metadata.
         </div>
       </div>
       <div className="flex gap-2 justify-end">
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
-        <Button onClick={() => onSave(form)} disabled={saving}>
+        <Button
+          onClick={() => {
+            const currentPubkey = String(pubkey || '').trim().toLowerCase()
+            const deniedClosedGateways: string[] = []
+            const gateways = (Array.isArray(form.gateways) ? form.gateways : []).filter((gateway) => {
+              const metadata = gatewayMetadataByOrigin.get(gateway.origin)
+              const policy = metadata?.policy || gateway.policy
+              if (policy !== 'CLOSED') return true
+              const allowList = metadata?.allowList
+              if (allowList && currentPubkey && allowList.has(currentPubkey)) return true
+              deniedClosedGateways.push(gateway.origin)
+              return false
+            })
+            if (deniedClosedGateways.length) {
+              toast.warning(
+                `Skipped CLOSED gateways without allow-list access: ${deniedClosedGateways.join(', ')}`
+              )
+            }
+            onSave({
+              ...form,
+              gateways
+            })
+          }}
+          disabled={saving}
+        >
           {saving ? 'Saving...' : 'Save'}
         </Button>
       </div>

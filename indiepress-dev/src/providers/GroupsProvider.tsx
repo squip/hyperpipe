@@ -29,6 +29,7 @@ import {
 import { TDraftEvent } from '@/types'
 import {
   TGroupAdmin,
+  TGatewayDirectoryEntry,
   TGatewayDescriptor,
   TGatewayInvite,
   TGatewayJoinRequest,
@@ -39,6 +40,7 @@ import {
   TGroupMetadata,
   TJoinRequest
 } from '@/types/groups'
+import { buildGatewayDirectory } from '@/lib/gateway-directory'
 import client from '@/services/client.service'
 import localStorageService, {
   ArchivedGroupFilesEntry,
@@ -126,6 +128,7 @@ type TGroupsContext = {
   discoveryGroups: TGroupMetadata[]
   invites: TGroupInvite[]
   gatewayMetadata: TGatewayMetadata[]
+  gatewayDirectory: TGatewayDirectoryEntry[]
   gatewayInvites: TGatewayInvite[]
   gatewayJoinRequests: TGatewayJoinRequest[]
   pendingInviteCount: number
@@ -137,6 +140,7 @@ type TGroupsContext = {
   invitesError: string | null
   joinRequestsError: string | null
   refreshDiscovery: () => Promise<void>
+  refreshGatewayDirectory: () => Promise<void>
   refreshInvites: () => Promise<void>
   dismissInvite: (inviteId: string) => void
   markInviteAccepted: (inviteId: string, groupId?: string) => void
@@ -269,6 +273,7 @@ export const useGroups = () => {
       discoveryGroups: [],
       invites: [],
       gatewayMetadata: [],
+      gatewayDirectory: [],
       gatewayInvites: [],
       gatewayJoinRequests: [],
       pendingInviteCount: 0,
@@ -280,6 +285,7 @@ export const useGroups = () => {
       invitesError: null,
       joinRequestsError: null,
       refreshDiscovery: async () => {},
+      refreshGatewayDirectory: async () => {},
       refreshInvites: async () => {},
       dismissInvite: () => {},
       markInviteAccepted: () => {},
@@ -584,11 +590,12 @@ const mergeMembershipEvents = <T extends { id?: string | null }>(primary: T[], s
 }
 
 export function GroupsProvider({ children }: { children: ReactNode }) {
-  const { pubkey, publish, relayList, nip04Decrypt, nip04Encrypt } = useNostr()
+  const { pubkey, publish, relayList, nip04Decrypt, nip04Encrypt, followList } = useNostr()
   const { relays: workerRelays, joinFlows, createRelay, sendToWorker } = useWorkerBridge()
   const [discoveryGroups, setDiscoveryGroups] = useState<TGroupMetadata[]>([])
   const [invites, setInvites] = useState<TGroupInvite[]>([])
   const [gatewayMetadata, setGatewayMetadata] = useState<TGatewayMetadata[]>([])
+  const [gatewayDirectory, setGatewayDirectory] = useState<TGatewayDirectoryEntry[]>([])
   const [gatewayInvites, setGatewayInvites] = useState<TGatewayInvite[]>([])
   const [gatewayJoinRequests, setGatewayJoinRequests] = useState<TGatewayJoinRequest[]>([])
   const [joinRequests, setJoinRequests] = useState<Record<string, TJoinRequest[]>>({})
@@ -632,6 +639,16 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const dismissedInviteIdsRef = useRef<Set<string>>(new Set())
   const acceptedInviteIdsRef = useRef<Set<string>>(new Set())
   const acceptedInviteGroupIdsRef = useRef<Set<string>>(new Set())
+  const gatewayOperatorProfilesRef = useRef<
+    Record<
+      string,
+      {
+        name?: string | null
+        nip05?: string | null
+        picture?: string | null
+      }
+    >
+  >({})
   const groupMemberPreviewByKeyRef = useRef<Record<string, GroupMemberPreviewEntry>>({})
   const groupMemberPreviewInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map())
   const inviteRefreshInFlightRef = useRef(false)
@@ -1152,6 +1169,70 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       setIsLoadingDiscovery(false)
     }
   }, [discoveryRelays])
+
+  const refreshGatewayDirectory = useCallback(async () => {
+    const operatorPubkeys = new Set<string>()
+    gatewayMetadata.forEach((entry) => {
+      const normalized = String(entry?.operatorPubkey || '').trim().toLowerCase()
+      if (/^[a-f0-9]{64}$/i.test(normalized)) operatorPubkeys.add(normalized)
+    })
+    discoveryGroups.forEach((group) => {
+      ;(Array.isArray(group?.gateways) ? group.gateways : []).forEach((gateway) => {
+        const normalized = String(gateway?.operatorPubkey || '').trim().toLowerCase()
+        if (/^[a-f0-9]{64}$/i.test(normalized)) operatorPubkeys.add(normalized)
+      })
+    })
+
+    const nextProfiles = { ...gatewayOperatorProfilesRef.current }
+    const missing = Array.from(operatorPubkeys).filter((pubkeyValue) => !nextProfiles[pubkeyValue])
+    if (missing.length) {
+      await Promise.allSettled(
+        missing.slice(0, 160).map(async (operatorPubkey) => {
+          try {
+            const profile = await client.fetchProfile(operatorPubkey)
+            const metadata = profile?.metadata || {}
+            nextProfiles[operatorPubkey] = {
+              name:
+                typeof metadata.display_name === 'string' && metadata.display_name.trim()
+                  ? metadata.display_name.trim()
+                  : typeof metadata.name === 'string' && metadata.name.trim()
+                    ? metadata.name.trim()
+                    : null,
+              nip05:
+                typeof metadata.nip05 === 'string' && metadata.nip05.trim()
+                  ? metadata.nip05.trim()
+                  : null,
+              picture:
+                typeof metadata.picture === 'string' && metadata.picture.trim()
+                  ? metadata.picture.trim()
+                  : null
+            }
+          } catch (_err) {
+            nextProfiles[operatorPubkey] = {
+              name: null,
+              nip05: null,
+              picture: null
+            }
+          }
+        })
+      )
+      gatewayOperatorProfilesRef.current = nextProfiles
+    }
+
+    const followedPubkeys = (Array.isArray(followList) ? followList : [])
+      .map((entry) => String(entry || '').trim().toLowerCase())
+      .filter(Boolean)
+
+    setGatewayDirectory(
+      buildGatewayDirectory({
+        discoveryGroups,
+        gatewayMetadata,
+        currentPubkey: pubkey || undefined,
+        followedPubkeys,
+        operatorProfiles: gatewayOperatorProfilesRef.current
+      })
+    )
+  }, [discoveryGroups, followList, gatewayMetadata, pubkey])
 
   const dismissInvite = useCallback((inviteId: string) => {
     const normalizedInviteId = String(inviteId || '').trim()
@@ -4332,6 +4413,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       discoveryGroups,
       invites,
       gatewayMetadata,
+      gatewayDirectory,
       gatewayInvites,
       gatewayJoinRequests,
       pendingInviteCount,
@@ -4343,6 +4425,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       invitesError,
       joinRequestsError,
       refreshDiscovery,
+      refreshGatewayDirectory,
       refreshInvites,
       dismissInvite,
       markInviteAccepted,
@@ -4480,6 +4563,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       favoriteGroups,
       invites,
       gatewayMetadata,
+      gatewayDirectory,
       gatewayInvites,
       gatewayJoinRequests,
       pendingInviteCount,
@@ -4490,6 +4574,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       invitesError,
       joinRequestsError,
       refreshDiscovery,
+      refreshGatewayDirectory,
       refreshInvites,
       dismissInvite,
       markInviteAccepted,
@@ -4527,6 +4612,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     refreshDiscovery()
   }, [refreshDiscovery])
+
+  useEffect(() => {
+    void refreshGatewayDirectory()
+  }, [refreshGatewayDirectory])
 
   useEffect(() => {
     if (!pubkey) {

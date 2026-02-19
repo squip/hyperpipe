@@ -23,6 +23,18 @@ export type TGatewayMetadata = {
   event: Event
 }
 
+export type TGatewayDirectoryEntry = {
+  origin: string
+  operatorPubkey: string
+  policy: 'OPEN' | 'CLOSED'
+  allowListed: boolean
+  popularityCount: number
+  followedOperator: boolean
+  operatorName?: string | null
+  operatorNip05?: string | null
+  operatorPicture?: string | null
+}
+
 export type TGatewayInvite = {
   origin: string
   inviteePubkey: string

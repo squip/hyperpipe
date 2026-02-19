@@ -97,6 +97,12 @@ type GroupCreateDraft = {
   about: string
   membership: 'open' | 'closed'
   visibility: 'public' | 'private'
+  gateways: Array<{
+    origin: string
+    operatorPubkey: string
+    policy: 'OPEN' | 'CLOSED'
+  }>
+  gatewayQuery: string
 }
 
 type ChatCreateDraft = {
@@ -129,6 +135,25 @@ function clamp(value: number, min: number, max: number): number {
 
 function isHex64(value: string | null | undefined): boolean {
   return /^[a-f0-9]{64}$/i.test(String(value || '').trim())
+}
+
+function normalizeGatewayOrigin(value: string | null | undefined): string | null {
+  const trimmed = String(value || '').trim()
+  if (!trimmed) return null
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol === 'wss:') parsed.protocol = 'https:'
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:'
+    if (parsed.protocol === 'http:') parsed.protocol = 'https:'
+    if (parsed.protocol !== 'https:') return null
+    return parsed.origin
+  } catch {
+    return null
+  }
+}
+
+function normalizeGatewayPolicy(value: string | null | undefined): 'OPEN' | 'CLOSED' {
+  return String(value || '').trim().toUpperCase() === 'CLOSED' ? 'CLOSED' : 'OPEN'
 }
 
 function shortText(value: string | null | undefined, max = 80): string {
@@ -761,6 +786,18 @@ function groupKey(groupId: string, relay?: string | null): string {
 function groupDetailsRows(group: any): string[] {
   if (!group) return ['No group selected']
   const members = Number(group.membersCount || group.members?.length || 0)
+  const gateways = Array.isArray(group.gateways) ? group.gateways : []
+  const gatewayLines = gateways
+    .slice(0, 3)
+    .map((gateway: any, index: number) => {
+      const origin = String(gateway?.origin || '').trim()
+      const policy = normalizeGatewayPolicy(gateway?.policy)
+      const operator = String(gateway?.operatorPubkey || '').trim()
+      return `gateway ${index + 1}: ${origin || '-'} · ${policy}${operator ? ` · op:${shortId(operator, 12)}` : ''}`
+    })
+  if (gateways.length > gatewayLines.length) {
+    gatewayLines.push(`gateway: +${gateways.length - gatewayLines.length} more`)
+  }
   return [
     `id: ${group.id}`,
     `name: ${group.name || '-'}`,
@@ -770,8 +807,148 @@ function groupDetailsRows(group: any): string[] {
     `membership: ${group.isOpen === false ? 'closed' : 'open'}`,
     `admin: ${group.adminName || group.adminPubkey || '-'}`,
     `members: ${members}`,
-    `peers online: ${group.peersOnline || 0}`
+    `peers online: ${group.peersOnline || 0}`,
+    ...(gatewayLines.length ? gatewayLines : ['gateway: -'])
   ]
+}
+
+function buildCreateGatewaySuggestions(state: ControllerState, draft: GroupCreateDraft): Array<{
+  origin: string
+  operatorPubkey: string
+  policy: 'OPEN' | 'CLOSED'
+  selected: boolean
+  popularity: number
+  followed: boolean
+  operatorName: string | null
+}> {
+  const metadata = Array.isArray((state as { gatewayMetadata?: unknown[] }).gatewayMetadata)
+    ? (state as { gatewayMetadata: any[] }).gatewayMetadata
+    : []
+  const groups = Array.isArray(state.groupDiscover) ? state.groupDiscover : []
+  const currentPubkey = String(state.session?.pubkey || '').trim().toLowerCase()
+  const followedSet = new Set(
+    (Array.isArray((state as { followedPubkeys?: unknown[] }).followedPubkeys)
+      ? (state as { followedPubkeys?: unknown[] }).followedPubkeys
+      : []
+    )
+      .map((entry) => String(entry || '').trim().toLowerCase())
+      .filter((entry) => isHex64(entry))
+  )
+  const metadataByOrigin = new Map<
+    string,
+    {
+      operatorPubkey: string
+      policy: 'OPEN' | 'CLOSED'
+      allowList: Set<string>
+      createdAt: number
+    }
+  >()
+  for (const entry of metadata) {
+    const origin = normalizeGatewayOrigin(entry?.origin)
+    const operatorPubkey = isHex64(String(entry?.operatorPubkey || ''))
+      ? String(entry.operatorPubkey).trim().toLowerCase()
+      : ''
+    if (!origin || !operatorPubkey) continue
+    const createdAt = Number(entry?.createdAt || entry?.event?.created_at || 0)
+    const existing = metadataByOrigin.get(origin)
+    if (existing && existing.createdAt > createdAt) continue
+    metadataByOrigin.set(origin, {
+      operatorPubkey,
+      policy: normalizeGatewayPolicy(entry?.policy),
+      allowList: new Set(
+        (Array.isArray(entry?.allowList) ? entry.allowList : [])
+          .map((value) => String(value || '').trim().toLowerCase())
+          .filter((value) => isHex64(value))
+      ),
+      createdAt
+    })
+  }
+
+  const popularityByOrigin = new Map<string, number>()
+  const fallbackByOrigin = new Map<string, { operatorPubkey: string; policy: 'OPEN' | 'CLOSED' }>()
+  for (const group of groups) {
+    for (const gateway of Array.isArray(group?.gateways) ? group.gateways : []) {
+      const origin = normalizeGatewayOrigin(gateway?.origin)
+      const operatorPubkey = isHex64(String(gateway?.operatorPubkey || ''))
+        ? String(gateway.operatorPubkey).trim().toLowerCase()
+        : ''
+      if (!origin || !operatorPubkey) continue
+      popularityByOrigin.set(origin, Number(popularityByOrigin.get(origin) || 0) + 1)
+      const existing = fallbackByOrigin.get(origin)
+      if (!existing) {
+        fallbackByOrigin.set(origin, {
+          operatorPubkey,
+          policy: normalizeGatewayPolicy(gateway?.policy)
+        })
+      } else if (normalizeGatewayPolicy(gateway?.policy) === 'CLOSED') {
+        fallbackByOrigin.set(origin, {
+          ...existing,
+          policy: 'CLOSED'
+        })
+      }
+    }
+  }
+
+  const selectedOrigins = new Set(
+    (Array.isArray(draft.gateways) ? draft.gateways : [])
+      .map((entry) => normalizeGatewayOrigin(entry.origin))
+      .filter((entry): entry is string => !!entry)
+  )
+
+  const query = String(draft.gatewayQuery || '').trim().toLowerCase()
+  const origins = new Set<string>([
+    ...Array.from(metadataByOrigin.keys()),
+    ...Array.from(fallbackByOrigin.keys())
+  ])
+  const suggestions: Array<{
+    origin: string
+    operatorPubkey: string
+    policy: 'OPEN' | 'CLOSED'
+    selected: boolean
+    popularity: number
+    followed: boolean
+    operatorName: string | null
+  }> = []
+
+  for (const origin of origins) {
+    const fromMetadata = metadataByOrigin.get(origin)
+    const fromGroup = fallbackByOrigin.get(origin)
+    const operatorPubkey = fromMetadata?.operatorPubkey || fromGroup?.operatorPubkey || ''
+    if (!operatorPubkey || !isHex64(operatorPubkey)) continue
+    const policy = fromMetadata?.policy || fromGroup?.policy || 'OPEN'
+    if (policy === 'CLOSED') {
+      const allowList = fromMetadata?.allowList
+      if (!allowList?.size || !currentPubkey || !allowList.has(currentPubkey)) continue
+    }
+    const operatorName = state.adminProfileByPubkey[operatorPubkey]?.name || null
+    const searchable = [
+      origin,
+      operatorPubkey,
+      policy,
+      operatorName || ''
+    ]
+      .join(' ')
+      .toLowerCase()
+    if (query && !searchable.includes(query)) continue
+    suggestions.push({
+      origin,
+      operatorPubkey,
+      policy,
+      selected: selectedOrigins.has(origin),
+      popularity: Number(popularityByOrigin.get(origin) || 0),
+      followed: followedSet.has(operatorPubkey),
+      operatorName
+    })
+  }
+
+  return suggestions
+    .sort((left, right) => {
+      if (left.followed !== right.followed) return left.followed ? -1 : 1
+      if (left.popularity !== right.popularity) return right.popularity - left.popularity
+      if (left.policy !== right.policy) return left.policy === 'OPEN' ? -1 : 1
+      return left.origin.localeCompare(right.origin)
+    })
+    .slice(0, 12)
 }
 
 function fileRowsForGroup(state: ControllerState, group: any): any[] {
@@ -1238,7 +1415,9 @@ export function App({
     name: '',
     about: '',
     membership: 'open',
-    visibility: 'public'
+    visibility: 'public',
+    gateways: [],
+    gatewayQuery: ''
   })
   const [chatCreateDraft, setChatCreateDraft] = useState<ChatCreateDraft>({
     name: '',
@@ -1360,7 +1539,9 @@ export function App({
       name: '',
       about: '',
       membership: 'open',
-      visibility: 'public'
+      visibility: 'public',
+      gateways: [],
+      gatewayQuery: ''
     })
     setChatCreateDraft({
       name: '',
@@ -1410,12 +1591,18 @@ export function App({
 
   const centerVisibleRows = Math.max(1, frameRows.mainRows - 2)
   const rightVisibleRows = Math.max(1, frameRows.mainRows - 2)
+  const createGatewaySuggestions = useMemo(
+    () => (state && selectedNode === 'groups:create'
+      ? buildCreateGatewaySuggestions(state, groupCreateDraft)
+      : []),
+    [state, selectedNode, groupCreateDraft]
+  )
 
   const centerRows = useMemo(() => {
     if (!state) return []
     const base = centerRowsForNode(state, selectedNode)
     if (selectedNode === 'groups:create') {
-      return base.map((row) => {
+      const normalizedRows = base.map((row) => {
         if (row.key === 'groups:create:name') {
           return {
             ...row,
@@ -1466,6 +1653,43 @@ export function App({
         }
         return row
       })
+
+      const gatewayRows: CenterRow[] = [
+        {
+          key: 'groups:create:gateways',
+          label: `gateways: ${groupCreateDraft.gateways.length}`,
+          kind: 'form-field',
+          data: { form: 'group-create', field: 'gateways' }
+        },
+        {
+          key: 'groups:create:gateway-query',
+          label: `gateway search: ${groupCreateDraft.gatewayQuery || '-'}`,
+          kind: 'form-field',
+          data: { form: 'group-create', field: 'gateway-query' }
+        },
+        ...createGatewaySuggestions.map((entry) => ({
+          key: `groups:create:gateway:${entry.origin}`,
+          label: `  ${entry.selected ? '[x]' : '[ ]'} ${entry.origin} · ${entry.policy} · ${entry.operatorName || shortId(entry.operatorPubkey, 10)}${entry.followed ? ' · followed' : ''} · used:${entry.popularity}`,
+          kind: 'form-option' as const,
+          data: {
+            form: 'group-create',
+            field: 'gateway',
+            origin: entry.origin,
+            operatorPubkey: entry.operatorPubkey,
+            policy: entry.policy
+          }
+        }))
+      ]
+
+      const submitIndex = normalizedRows.findIndex((row) => row.key === 'groups:create:submit')
+      if (submitIndex < 0) {
+        return [...normalizedRows, ...gatewayRows]
+      }
+      return [
+        ...normalizedRows.slice(0, submitIndex),
+        ...gatewayRows,
+        ...normalizedRows.slice(submitIndex)
+      ]
     }
     if (selectedNode === 'chats:create') {
       return base.map((row) => {
@@ -1506,7 +1730,7 @@ export function App({
       })
     }
     return base
-  }, [state, selectedNode, groupCreateDraft, chatCreateDraft])
+  }, [state, selectedNode, groupCreateDraft, chatCreateDraft, createGatewaySuggestions])
 
   const selectedNodeViewport = useMemo(() => {
     const current = nodeViewport[selectedNode] || { cursor: 0, offset: 0 }
@@ -1540,7 +1764,9 @@ export function App({
         `name: ${groupCreateDraft.name || '-'}`,
         `description: ${groupCreateDraft.about || '-'}`,
         `membership: ${groupCreateDraft.membership}`,
-        `visibility: ${groupCreateDraft.visibility}`
+        `visibility: ${groupCreateDraft.visibility}`,
+        `gateways: ${groupCreateDraft.gateways.length}`,
+        `gateway search: ${groupCreateDraft.gatewayQuery || '-'}`
       ]
     }
     if (selectedNode === 'chats:create') {
@@ -1673,6 +1899,24 @@ export function App({
 
   const splitBottomRawRows = useMemo(() => {
     if (!state) return ['No data']
+    if (selectedNode === 'groups:create') {
+      const lines = [
+        paneActionMessage || 'Use center pane to edit fields and run create.',
+        'Press Enter on gateway rows to toggle selection.',
+        'CLOSED gateways are shown only when allow-listed.',
+        `gateway search: ${groupCreateDraft.gatewayQuery || '-'}`,
+        `selected gateways: ${groupCreateDraft.gateways.length}`
+      ]
+      ;(Array.isArray(groupCreateDraft.gateways) ? groupCreateDraft.gateways : [])
+        .slice(0, 4)
+        .forEach((entry, index) => {
+          lines.push(`gateway ${index + 1}: ${entry.origin} · ${entry.policy}`)
+        })
+      if (groupCreateDraft.gateways.length > 4) {
+        lines.push(`gateway: +${groupCreateDraft.gateways.length - 4} more`)
+      }
+      return lines
+    }
     if (selectedNode === 'invites:send') {
       const lines = [
         `mode: ${inviteSendMode === 'group' ? 'Group Invite' : 'Chat Invite'}`,
@@ -1703,7 +1947,8 @@ export function App({
     inviteSendSuggestions,
     inviteSendSuggestionIndex,
     inviteSendBusy,
-    inviteSendStatus
+    inviteSendStatus,
+    groupCreateDraft
   ])
 
   const singleRightRawRows = useMemo(() => {
@@ -1840,6 +2085,12 @@ export function App({
         await controllerRef.current?.setLastCopied(text, result.method)
         return result
       },
+      resolveGatewayMetadata: () =>
+        (Array.isArray((snapshot as { gatewayMetadata?: unknown[] }).gatewayMetadata)
+          ? (snapshot as { gatewayMetadata: Array<any> }).gatewayMetadata
+          : []
+        ).map((entry) => ({ ...entry })),
+      resolveCurrentPubkey: () => snapshot.session?.pubkey || null,
       unsafeCopySecrets: process.env.HYPERTUNA_TUI_ALLOW_UNSAFE_COPY === '1'
     }
   }
@@ -1877,6 +2128,8 @@ export function App({
         setGroupCreateDraft((previous) => ({ ...previous, name: value.trim() }))
       } else if (context.field === 'about') {
         setGroupCreateDraft((previous) => ({ ...previous, about: value.trim() }))
+      } else if (context.field === 'gateway-query') {
+        setGroupCreateDraft((previous) => ({ ...previous, gatewayQuery: value.trim() }))
       }
       return
     }
@@ -1923,6 +2176,39 @@ export function App({
     })
   }
 
+  const toggleGroupGatewayDraft = (gateway: {
+    origin: string
+    operatorPubkey: string
+    policy: 'OPEN' | 'CLOSED'
+  }): void => {
+    const origin = normalizeGatewayOrigin(gateway.origin)
+    const operatorPubkey = String(gateway.operatorPubkey || '').trim().toLowerCase()
+    if (!origin || !isHex64(operatorPubkey)) return
+    const policy = normalizeGatewayPolicy(gateway.policy)
+    setGroupCreateDraft((previous) => {
+      const existing = (Array.isArray(previous.gateways) ? previous.gateways : []).find(
+        (entry) => entry.origin === origin
+      )
+      if (existing) {
+        return {
+          ...previous,
+          gateways: previous.gateways.filter((entry) => entry.origin !== origin)
+        }
+      }
+      return {
+        ...previous,
+        gateways: [
+          ...previous.gateways,
+          {
+            origin,
+            operatorPubkey,
+            policy
+          }
+        ]
+      }
+    })
+  }
+
   const runCreateGroup = async (): Promise<void> => {
     const controller = controllerRef.current
     if (!controller) return
@@ -1933,12 +2219,19 @@ export function App({
     }
     try {
       setPaneActionMessage('Creating group…')
+      const normalizedGateways = Array.from(
+        new Map(
+          (Array.isArray(groupCreateDraft.gateways) ? groupCreateDraft.gateways : [])
+            .map((entry) => [entry.origin, entry])
+        ).values()
+      )
       const result = await controller.createRelay({
         name,
         description: String(groupCreateDraft.about || '').trim() || undefined,
         isOpen: groupCreateDraft.membership === 'open',
         isPublic: groupCreateDraft.visibility === 'public',
-        fileSharing: true
+        fileSharing: true,
+        gateways: normalizedGateways.length ? normalizedGateways : undefined
       })
       await Promise.all([
         controller.refreshGroups(),
@@ -1950,7 +2243,9 @@ export function App({
         name: '',
         about: '',
         membership: 'open',
-        visibility: 'public'
+        visibility: 'public',
+        gateways: [],
+        gatewayQuery: ''
       })
     } catch (error) {
       setPaneActionMessage(error instanceof Error ? error.message : String(error))
@@ -2025,6 +2320,35 @@ export function App({
       }
       if (selectedCenterRow.key === 'groups:create:visibility:private') {
         setGroupCreateDraft((previous) => ({ ...previous, visibility: 'private' }))
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:gateway-query') {
+        openFieldInput('groups:create', 'gateway-query', 'Gateway search', groupCreateDraft.gatewayQuery)
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:gateways') {
+        setGroupCreateDraft((previous) => ({
+          ...previous,
+          gateways: []
+        }))
+        return
+      }
+      if (selectedCenterRow.key.startsWith('groups:create:gateway:')) {
+        const data = selectedCenterRow.data as {
+          origin?: string
+          operatorPubkey?: string
+          policy?: 'OPEN' | 'CLOSED'
+        }
+        const origin = String(data?.origin || '').trim()
+        const operatorPubkey = String(data?.operatorPubkey || '').trim().toLowerCase()
+        const policy = normalizeGatewayPolicy(data?.policy)
+        if (origin && operatorPubkey) {
+          toggleGroupGatewayDraft({
+            origin,
+            operatorPubkey,
+            policy
+          })
+        }
         return
       }
       if (selectedCenterRow.key === 'groups:create:submit') {

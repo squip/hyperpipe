@@ -36,6 +36,21 @@ function groupContext(controller: MockController, copyImpl?: CommandContext['cop
   }
 }
 
+function gatewayCreateContext(args: {
+  gatewayMetadata: Array<{
+    origin: string
+    operatorPubkey: string
+    policy: 'OPEN' | 'CLOSED'
+    allowList?: string[]
+  }>
+  currentPubkey?: string
+}): CommandContext {
+  return {
+    resolveGatewayMetadata: () => args.gatewayMetadata,
+    resolveCurrentPubkey: () => args.currentPubkey || null
+  }
+}
+
 describe('command router context-first workflows', () => {
   it('supports goto aliases for new tree workflow nodes', async () => {
     const controller = createController()
@@ -172,5 +187,65 @@ describe('command router context-first workflows', () => {
     await expect(executeCommand(controller, 'copy token', context)).rejects.toThrow(
       /sensitive fields/i
     )
+  })
+
+  it('supports relay create --gateway-origin resolution from metadata', async () => {
+    const controller = createController()
+    const gateway = {
+      origin: 'https://gateway-open.example',
+      operatorPubkey: 'e'.repeat(64),
+      policy: 'OPEN' as const,
+      allowList: []
+    }
+    const context = gatewayCreateContext({
+      gatewayMetadata: [gateway],
+      currentPubkey: 'f'.repeat(64)
+    })
+
+    const result = await executeCommand(
+      controller,
+      'relay create gateway-origin-ok --gateway-origin https://gateway-open.example',
+      context
+    )
+    expect(result.message).toContain('Relay created')
+  })
+
+  it('fails relay create --gateway-origin when origin is unknown', async () => {
+    const controller = createController()
+    const context = gatewayCreateContext({
+      gatewayMetadata: [],
+      currentPubkey: 'f'.repeat(64)
+    })
+
+    await expect(
+      executeCommand(
+        controller,
+        'relay create gateway-origin-missing --gateway-origin https://missing-gateway.example',
+        context
+      )
+    ).rejects.toThrow(/Unknown --gateway-origin/)
+  })
+
+  it('fails relay create --gateway-origin for CLOSED gateway when user is not allow-listed', async () => {
+    const controller = createController()
+    const context = gatewayCreateContext({
+      gatewayMetadata: [
+        {
+          origin: 'https://gateway-closed.example',
+          operatorPubkey: 'a'.repeat(64),
+          policy: 'CLOSED',
+          allowList: ['b'.repeat(64)]
+        }
+      ],
+      currentPubkey: 'c'.repeat(64)
+    })
+
+    await expect(
+      executeCommand(
+        controller,
+        'relay create gateway-origin-closed --gateway-origin https://gateway-closed.example',
+        context
+      )
+    ).rejects.toThrow(/not allow-listed/)
   })
 })
