@@ -62,7 +62,29 @@ export type TGroupMetadata = {
   isOpen?: boolean
   tags: string[]
   gateways?: TGatewayDescriptor[]
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
   event: Event
+}
+
+export type WriterLeaseEnvelope = {
+  version: number
+  leaseId: string
+  relayKey: string
+  publicIdentifier?: string | null
+  scope: string
+  inviteePubkey: string
+  tokenHash: string
+  writerCore?: string | null
+  writerCoreHex?: string | null
+  autobaseLocal?: string | null
+  writerSecret: string
+  issuedAt: number
+  expiresAt: number
+  issuerPubkey: string
+  issuerPeerKey?: string | null
+  signature: string
 }
 
 export type TGroupAdmin = {
@@ -95,10 +117,15 @@ export type TGroupInvite = {
   relayUrl?: string | null
   relayKey?: string | null
   gatewayOrigins?: string[]
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  memberPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
   writerCore?: string | null
   writerCoreHex?: string | null
   autobaseLocal?: string | null
   writerSecret?: string | null
+  writerLease?: WriterLeaseEnvelope | null
   fastForward?: {
     key?: string | null
     length?: number | null

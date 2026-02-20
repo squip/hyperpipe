@@ -116,9 +116,27 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   relayWsUrl: string
   pictureTagUrl?: string
   gateways?: HypertunaGatewayTag[]
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
 }): { groupCreateEvent: TDraftEvent; metadataEvent: TDraftEvent; hypertunaEvent: TDraftEvent } {
   const now = Math.floor(Date.now() / 1000)
   const fileSharingEnabled = args.fileSharing !== false
+  const discoveryTopic =
+    typeof args.discoveryTopic === 'string' && /^[a-f0-9]{64}$/i.test(args.discoveryTopic.trim())
+      ? args.discoveryTopic.trim().toLowerCase()
+      : null
+  const hostPeerKeys = Array.from(
+    new Set(
+      (Array.isArray(args.hostPeerKeys) ? args.hostPeerKeys : [])
+        .map((entry) => String(entry || '').trim().toLowerCase())
+        .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+    )
+  )
+  const writerIssuerPubkey =
+    typeof args.writerIssuerPubkey === 'string' && /^[a-f0-9]{64}$/i.test(args.writerIssuerPubkey.trim())
+      ? args.writerIssuerPubkey.trim().toLowerCase()
+      : null
 
   const groupTags: string[][] = [
     ['h', args.publicIdentifier],
@@ -134,6 +152,9 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   if (args.pictureTagUrl) {
     groupTags.push(['picture', args.pictureTagUrl, 'hypertuna:drive:pfp'])
   }
+  if (discoveryTopic) groupTags.push(['swarm-topic', discoveryTopic])
+  hostPeerKeys.forEach((peerKey) => groupTags.push(['host-peer', peerKey]))
+  if (writerIssuerPubkey) groupTags.push(['writer-issuer', writerIssuerPubkey])
   groupTags.push(...buildGatewayTags(args.gateways))
 
   const groupCreateEvent: TDraftEvent = {
@@ -158,6 +179,9 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   if (args.pictureTagUrl) {
     metadataTags.push(['picture', args.pictureTagUrl, 'hypertuna:drive:pfp'])
   }
+  if (discoveryTopic) metadataTags.push(['swarm-topic', discoveryTopic])
+  hostPeerKeys.forEach((peerKey) => metadataTags.push(['host-peer', peerKey]))
+  if (writerIssuerPubkey) metadataTags.push(['writer-issuer', writerIssuerPubkey])
   metadataTags.push(...buildGatewayTags(args.gateways))
 
   const metadataEvent: TDraftEvent = {

@@ -1103,6 +1103,18 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           writerCoreHex: inviteData?.writerCoreHex,
           autobaseLocal: inviteData?.autobaseLocal,
           writerSecret: inviteData?.writerSecret,
+          discoveryTopic: inviteData?.discoveryTopic || detail?.metadata?.discoveryTopic || undefined,
+          hostPeerKeys:
+            Array.isArray(inviteData?.hostPeerKeys)
+              ? inviteData.hostPeerKeys
+              : Array.isArray(detail?.metadata?.hostPeerKeys)
+                ? detail?.metadata?.hostPeerKeys
+                : undefined,
+          memberPeerKeys: Array.isArray(inviteData?.memberPeerKeys) ? inviteData.memberPeerKeys : undefined,
+          writerIssuerPubkey:
+            inviteData?.writerIssuerPubkey
+            || detail?.metadata?.writerIssuerPubkey
+            || undefined,
           fastForward: inviteData?.fastForward || undefined
         })
         return

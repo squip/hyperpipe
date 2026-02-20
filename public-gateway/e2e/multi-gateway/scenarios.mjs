@@ -142,6 +142,38 @@ const SCENARIOS = [
     gateway2: 'OPEN',
     specialSetup: 'join-request approval flow',
     expected: 'allow-list updated, subsequent create/join pass'
+  },
+  {
+    id: 'S19',
+    groupType: 'OPEN',
+    gateway1: 'OPEN',
+    gateway2: 'OPEN',
+    specialSetup: 'no gateways configured, host offline, member online',
+    expected: 'direct peer local-provision path succeeds without gateway preseed'
+  },
+  {
+    id: 'S20',
+    groupType: 'CLOSED',
+    gateway1: 'OPEN',
+    gateway2: 'OPEN',
+    specialSetup: 'host offline, member has replicated invite-lease',
+    expected: 'direct peer invite-lease claim succeeds and relay is writable'
+  },
+  {
+    id: 'S21',
+    groupType: 'CLOSED',
+    gateway1: 'OPEN',
+    gateway2: 'OPEN',
+    specialSetup: 'host offline, no invite-lease available',
+    expected: 'join fails fast with writer-material-unavailable signal'
+  },
+  {
+    id: 'S22',
+    groupType: 'CLOSED',
+    gateway1: 'OPEN',
+    gateway2: 'OPEN',
+    specialSetup: 'gateway down, peers up',
+    expected: 'smart-select chooses peer path and join remains writable'
   }
 ]
 

@@ -166,6 +166,34 @@ export function parseGroupInviteWithPayload(args: {
       )
     )
     : undefined
+  const discoveryTopic =
+    typeof (payload as Record<string, unknown>).discoveryTopic === 'string'
+      && /^[a-f0-9]{64}$/i.test(String((payload as Record<string, unknown>).discoveryTopic).trim())
+      ? String((payload as Record<string, unknown>).discoveryTopic).trim().toLowerCase()
+      : null
+  const hostPeerKeys = Array.isArray((payload as Record<string, unknown>).hostPeerKeys)
+    ? Array.from(
+      new Set(
+        ((payload as Record<string, unknown>).hostPeerKeys as unknown[])
+          .map((entry) => String(entry || '').trim().toLowerCase())
+          .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+      )
+    )
+    : undefined
+  const memberPeerKeys = Array.isArray((payload as Record<string, unknown>).memberPeerKeys)
+    ? Array.from(
+      new Set(
+        ((payload as Record<string, unknown>).memberPeerKeys as unknown[])
+          .map((entry) => String(entry || '').trim().toLowerCase())
+          .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+      )
+    )
+    : undefined
+  const writerIssuerPubkey =
+    typeof (payload as Record<string, unknown>).writerIssuerPubkey === 'string'
+      && /^[a-f0-9]{64}$/i.test(String((payload as Record<string, unknown>).writerIssuerPubkey).trim())
+      ? String((payload as Record<string, unknown>).writerIssuerPubkey).trim().toLowerCase()
+      : null
   const token = typeof payload.token === 'string' ? payload.token : undefined
   const fileSharing = typeof payload.fileSharing === 'boolean' ? payload.fileSharing : parsed.fileSharing
   const isPublic = typeof payload.isPublic === 'boolean' ? payload.isPublic : parsed.isPublic
@@ -241,6 +269,10 @@ export function parseGroupInviteWithPayload(args: {
   if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
   if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
   const writerSecret = typeof payload.writerSecret === 'string' ? payload.writerSecret : null
+  const writerLease =
+    payload.writerLease && typeof payload.writerLease === 'object'
+      ? payload.writerLease as GroupInvite['writerLease']
+      : null
 
   const fastForwardPayload =
     payload.fastForward && typeof payload.fastForward === 'object'
@@ -269,6 +301,10 @@ export function parseGroupInviteWithPayload(args: {
     relayUrl: relayUrl || null,
     relayKey,
     gatewayOrigins,
+    discoveryTopic,
+    hostPeerKeys,
+    memberPeerKeys,
+    writerIssuerPubkey,
     groupName,
     groupPicture,
     name: groupName,
@@ -282,6 +318,7 @@ export function parseGroupInviteWithPayload(args: {
     writerCoreHex,
     autobaseLocal,
     writerSecret,
+    writerLease,
     fastForward,
     token
   }

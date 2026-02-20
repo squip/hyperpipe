@@ -37,6 +37,18 @@ function normalizeEntry(entry) {
   const writerSecret = typeof entry.writerSecret === 'string' ? entry.writerSecret : null;
   const issuedAt = Number.isFinite(entry.issuedAt) ? entry.issuedAt : null;
   const expiresAt = Number.isFinite(entry.expiresAt) ? entry.expiresAt : null;
+  const leaseVersion = Number.isFinite(entry.leaseVersion) ? Math.trunc(entry.leaseVersion) : null;
+  const leaseId = typeof entry.leaseId === 'string' ? entry.leaseId.trim().toLowerCase() : null;
+  const leaseScope = typeof entry.leaseScope === 'string' ? entry.leaseScope.trim().toLowerCase() : null;
+  const inviteePubkey = typeof entry.inviteePubkey === 'string' ? entry.inviteePubkey.trim().toLowerCase() : null;
+  const tokenHash = typeof entry.tokenHash === 'string' ? entry.tokenHash.trim().toLowerCase() : null;
+  const issuerPubkey = typeof entry.issuerPubkey === 'string' ? entry.issuerPubkey.trim().toLowerCase() : null;
+  const issuerPeerKey = typeof entry.issuerPeerKey === 'string' ? entry.issuerPeerKey.trim().toLowerCase() : null;
+  const signature = typeof entry.signature === 'string' ? entry.signature.trim().toLowerCase() : null;
+  const relayKey = typeof entry.relayKey === 'string' ? entry.relayKey.trim().toLowerCase() : null;
+  const publicIdentifier = typeof entry.publicIdentifier === 'string' ? entry.publicIdentifier.trim() : null;
+  const source = typeof entry.source === 'string' ? entry.source.trim() : null;
+  const lastClaimedAt = Number.isFinite(entry.lastClaimedAt) ? Math.trunc(entry.lastClaimedAt) : null;
   if (!writerCore && !writerCoreHex && !autobaseLocal) return null;
   if (!writerSecret) return null;
   return {
@@ -45,17 +57,43 @@ function normalizeEntry(entry) {
     autobaseLocal,
     writerSecret,
     issuedAt,
-    expiresAt
+    expiresAt,
+    leaseVersion,
+    leaseId,
+    leaseScope,
+    inviteePubkey,
+    tokenHash,
+    issuerPubkey,
+    issuerPeerKey,
+    signature,
+    relayKey,
+    publicIdentifier,
+    source,
+    lastClaimedAt
   };
+}
+
+function makeEntryDedupKey(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  if (entry.leaseId) return `lease:${entry.leaseId}`;
+  const writerKey = entry.writerCoreHex || entry.autobaseLocal || entry.writerCore || null;
+  if (!writerKey) return null;
+  const invitee = entry.inviteePubkey || '';
+  const tokenHash = entry.tokenHash || '';
+  return `writer:${writerKey}:${invitee}:${tokenHash}`;
 }
 
 export function pruneWriterPoolEntries(entries = [], now = Date.now()) {
   if (!Array.isArray(entries)) return [];
+  const seen = new Set();
   const result = [];
   for (const entry of entries) {
     const normalized = normalizeEntry(entry);
     if (!normalized) continue;
     if (Number.isFinite(normalized.expiresAt) && normalized.expiresAt <= now) continue;
+    const dedupKey = makeEntryDedupKey(normalized);
+    if (dedupKey && seen.has(dedupKey)) continue;
+    if (dedupKey) seen.add(dedupKey);
     result.push(normalized);
   }
   return result;

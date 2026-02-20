@@ -316,15 +316,27 @@ class HyperswarmConnection {
         try { this.protocol.removeAllListeners?.(); } catch (_) {}
         try { this.protocol.destroy(); } catch (_) {}
       }
-      if (this.stream) {
-        try { this.stream.destroy(error instanceof Error ? error : undefined); } catch (_) {}
-      }
+      this._safeDestroyStream(error);
     }
 
     if (firstClosure || forceDestroy) {
       this.protocol = null;
       this.stream = null;
     }
+  }
+
+  _safeDestroyStream(error = null) {
+    if (!this.stream) return;
+    const stream = this.stream;
+    try {
+      stream.once?.('error', (destroyError) => {
+        this.logger?.debug?.('Ignored stream error during forced destroy', {
+          peer: this.publicKey,
+          error: destroyError?.message || destroyError
+        });
+      });
+      stream.destroy(error instanceof Error ? error : undefined);
+    } catch (_) {}
   }
   
   _waitForOrCreateConnection(targetPublicKey) {
@@ -523,9 +535,20 @@ class EnhancedHyperswarmPool {
     this.swarmKeyPair = crypto.keyPair(seed);
     this.swarm = new Hyperswarm({ keyPair: this.swarmKeyPair });
     this.logger?.info?.('Hyperswarm pool initialized with new swarm keypair');
+    this.swarm.on('error', (error) => {
+      this.logger?.warn?.('Hyperswarm emitted error', {
+        error: error?.message || error
+      });
+    });
 
     this.swarm.on('connection', (connection, peerInfo) => {
       const publicKey = peerInfo.publicKey.toString('hex');
+      connection.on?.('error', (error) => {
+        this.logger?.debug?.('Hyperswarm raw stream error', {
+          peer: publicKey,
+          error: error?.message || error
+        });
+      });
       const existing = this.connections.get(publicKey);
       if (existing) {
         if (existing.connecting && !existing.connected) {
@@ -544,6 +567,12 @@ class EnhancedHyperswarmPool {
             peer: publicKey
           });
           try {
+            connection.once?.('error', (error) => {
+              this.logger?.debug?.('Ignored duplicate inbound stream error during destroy', {
+                peer: publicKey,
+                error: error?.message || error
+              });
+            });
             connection.destroy();
           } catch (_) {}
           return;

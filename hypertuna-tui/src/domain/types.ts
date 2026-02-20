@@ -106,6 +106,9 @@ export type GroupSummary = {
   isPublic?: boolean
   isOpen?: boolean
   gateways?: GatewayDescriptor[]
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
   adminPubkey?: string | null
   adminName?: string | null
   members?: string[]
@@ -115,6 +118,25 @@ export type GroupSummary = {
   event?: Event
 }
 
+export type WriterLeaseEnvelope = {
+  version: number
+  leaseId: string
+  relayKey: string
+  publicIdentifier?: string | null
+  scope: string
+  inviteePubkey: string
+  tokenHash: string
+  writerCore?: string | null
+  writerCoreHex?: string | null
+  autobaseLocal?: string | null
+  writerSecret: string
+  issuedAt: number
+  expiresAt: number
+  issuerPubkey: string
+  issuerPeerKey?: string | null
+  signature: string
+}
+
 export type GroupInvite = {
   id: string
   groupId: string
@@ -122,6 +144,10 @@ export type GroupInvite = {
   relayUrl?: string | null
   relayKey?: string | null
   gatewayOrigins?: string[]
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  memberPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
   groupName?: string
   groupPicture?: string
   name?: string
@@ -143,6 +169,7 @@ export type GroupInvite = {
   writerCoreHex?: string | null
   autobaseLocal?: string | null
   writerSecret?: string | null
+  writerLease?: WriterLeaseEnvelope | null
   fastForward?: {
     key?: string | null
     length?: number | null
@@ -464,6 +491,10 @@ export interface RelayService {
     autobaseLocal?: string | null
     writerSecret?: string | null
     gatewayOrigins?: string[]
+    discoveryTopic?: string | null
+    hostPeerKeys?: string[]
+    memberPeerKeys?: string[]
+    writerIssuerPubkey?: string | null
     fastForward?: {
       key?: string | null
       length?: number | null

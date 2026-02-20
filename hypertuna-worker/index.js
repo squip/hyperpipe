@@ -102,6 +102,16 @@ import {
   pruneWriterPoolEntries
 } from './relay-writer-pool-store.mjs'
 import {
+  configureRelayPeerDiscoveryStore,
+  getRelayPeerDiscovery,
+  setRelayPeerDiscovery,
+  recordRelayPeerCapability,
+  listRelayPeerCapabilities
+} from './relay-peer-discovery-store.mjs'
+import {
+  computeWriterLeaseTokenHash
+} from './writer-lease-envelope.mjs'
+import {
   rankGatewayStatusProbes,
   evaluateFanoutResults
 } from './gateway/MultiGatewayJoinUtils.mjs'
@@ -168,6 +178,7 @@ global.userConfig = {
 
 configureRelayCoreRefsStore({ storageBase: defaultStorageDir, logger: console })
 configureRelayWriterPoolStore({ storageBase: defaultStorageDir, logger: console })
+configureRelayPeerDiscoveryStore({ storageBase: defaultStorageDir, logger: console })
 
 const relayMirrorSubscriptions = new Map()
 const relayMirrorSyncState = new Map()
@@ -330,6 +341,80 @@ function resolveHostPeersFromGatewayStatus(status, identifier) {
     if (normalized.length) return normalized
   }
   return []
+}
+
+function normalizePeerKeyHint(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim().toLowerCase()
+  if (!trimmed || !isHex64(trimmed)) return null
+  return trimmed
+}
+
+function normalizePeerKeyHintList(values = []) {
+  return Array.from(new Set(
+    (Array.isArray(values) ? values : [])
+      .map((value) => normalizePeerKeyHint(String(value || '')))
+      .filter(Boolean)
+  ))
+}
+
+function getWriterGuaranteeRank(writerGuarantee = null) {
+  const key = typeof writerGuarantee === 'string' ? writerGuarantee.trim() : ''
+  switch (key) {
+    case 'invite-payload':
+      return 0
+    case 'peer-local-provision':
+      return 1
+    case 'peer-invite-lease':
+      return 2
+    case 'host-direct':
+      return 3
+    case 'gateway-open-join':
+      return 4
+    case 'gateway-mirror':
+      return 5
+    case 'mirror-only':
+      return 6
+    default:
+      return 99
+  }
+}
+
+function rankJoinPeerCandidates(candidates = [], {
+  hostPeerSet = new Set()
+} = {}) {
+  const rows = Array.isArray(candidates) ? candidates.slice() : []
+  rows.sort((left, right) => {
+    const leftRank = getWriterGuaranteeRank(left?.writerGuarantee || null)
+    const rightRank = getWriterGuaranteeRank(right?.writerGuarantee || null)
+    if (leftRank !== rightRank) return leftRank - rightRank
+
+    const leftHosted = left?.isHosted === true || hostPeerSet.has(left?.peerKey || '')
+    const rightHosted = right?.isHosted === true || hostPeerSet.has(right?.peerKey || '')
+    if (leftHosted !== rightHosted) return leftHosted ? -1 : 1
+
+    const leftRtt = Number.isFinite(left?.rttMs) ? Math.trunc(left.rttMs) : Number.POSITIVE_INFINITY
+    const rightRtt = Number.isFinite(right?.rttMs) ? Math.trunc(right.rttMs) : Number.POSITIVE_INFINITY
+    if (leftRtt !== rightRtt) return leftRtt - rightRtt
+
+    return String(left?.peerKey || '').localeCompare(String(right?.peerKey || ''))
+  })
+  return rows
+}
+
+function deriveRelayDiscoveryTopic({ relayKey = null, publicIdentifier = null } = {}) {
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey)
+  const normalizedPublicIdentifier =
+    typeof publicIdentifier === 'string' && publicIdentifier.trim()
+      ? publicIdentifier.trim()
+      : null
+  const seed = normalizedRelayKey || normalizedPublicIdentifier
+  if (!seed) return null
+  try {
+    return nodeCrypto.createHash('sha256').update(`hypertuna:relay-discovery:v1:${seed}`).digest('hex')
+  } catch (_) {
+    return null
+  }
 }
 
 function normalizeOpenJoinCoreEntry(entry) {
@@ -4754,6 +4839,32 @@ function trackJoinTelemetryState(message) {
     if (relayKey && !session.relayKey) {
       session.relayKey = relayKey
     }
+    const discoveredHostPeer = normalizePeerKeyHint(data?.hostPeer || null)
+    if (discoveredHostPeer || publicIdentifier || relayKey) {
+      setRelayPeerDiscovery(relayKey, publicIdentifier, {
+        hostPeerKeys: discoveredHostPeer ? [discoveredHostPeer] : []
+      }).catch((error) => {
+        console.warn('[Worker] Failed to persist join host peer discovery hint', {
+          publicIdentifier,
+          relayKey,
+          error: error?.message || error
+        })
+      })
+    }
+    if (typeof data?.writerSource === 'string' && data.writerSource.trim()) {
+      emitJoinTelemetryEvent('JOIN_WRITER_SOURCE', {
+        publicIdentifier: session.publicIdentifier,
+        relayKey: session.relayKey,
+        traceId: session.traceId,
+        elapsedMs: Date.now() - session.startedAt,
+        gatewayOrigins: session.gatewayOrigins,
+        meta: {
+          source: data.writerSource,
+          mode: data?.mode || null,
+          hostPeer: data?.hostPeer || null
+        }
+      })
+    }
     markJoinWriterMaterialApplied(session, {
       source: 'join-auth-success'
     })
@@ -4794,6 +4905,13 @@ function trackJoinTelemetryState(message) {
       viewLengthMatch
     })
     if (!writable) return
+    if (!session.writerMaterialApplied) {
+      markJoinWriterMaterialApplied(session, {
+        source: 'relay-writable',
+        mode: data?.mode || null,
+        expectedWriterActive: data?.expectedWriterActive ?? null
+      })
+    }
     if (viewLengthMatch === false) {
       emitJoinFailFast(session, 'view-length-mismatch', {
         mode: data?.mode || null,
@@ -7227,11 +7345,20 @@ async function handleMessageObject(message) {
               ? true
               : undefined
         const inviteToken = typeof data.token === 'string' ? data.token.trim() : null
+        const inviteTokenHash = inviteToken ? computeWriterLeaseTokenHash(inviteToken) : null
         let joinBlindPeeringManager = null
         let joinRelayIdentifierForTracking = null
         let joinTelemetrySession = null
         try {
           let hostPeers = Array.isArray(data.hostPeers) ? data.hostPeers : []
+          const hostPeerKeysHint = normalizePeerKeyHintList(data.hostPeerKeys)
+          const memberPeerKeysHint = normalizePeerKeyHintList(data.memberPeerKeys)
+          let discoveryTopic =
+            typeof data.discoveryTopic === 'string' && data.discoveryTopic.trim()
+              ? data.discoveryTopic.trim()
+              : null
+          const writerIssuerPubkey =
+            normalizePubkeyHex(data.writerIssuerPubkey || data.writer_issuer_pubkey || null) || null
           const requestedGatewayOrigins = normalizeGatewayOriginList(data.gatewayOrigins)
           let rankedGatewayOrigins = requestedGatewayOrigins.length
             ? requestedGatewayOrigins
@@ -7240,6 +7367,12 @@ async function handleMessageObject(message) {
           let writerCoreRefs = Array.isArray(data.cores) ? normalizeMirrorWriterCoreRefs(data.cores) : []
           let blindPeer = sanitizeBlindPeerMeta(data.blindPeer)
           let joinRelayKey = normalizeRelayKeyHex(data.relayKey)
+          if (!discoveryTopic) {
+            discoveryTopic = deriveRelayDiscoveryTopic({
+              relayKey: joinRelayKey,
+              publicIdentifier
+            })
+          }
           let joinRelayUrl = data.relayUrl || null
           let writerCore = data.writerCore || null
           let writerSecret = data.writerSecret || null
@@ -7257,9 +7390,11 @@ async function handleMessageObject(message) {
           if (writerCoreKey) {
             writerCoreRefs = mergeCoreRefLists(writerCoreRefs, [writerCoreKey])
           }
-          hostPeers = hostPeers
-            .map((key) => String(key || '').trim().toLowerCase())
-            .filter(Boolean)
+          hostPeers = normalizePeerKeyHintList(hostPeers)
+          const hadWriterMaterialAtStart = !!(
+            writerSecret
+            && (writerCore || writerCoreHex || autobaseLocal)
+          )
 
           joinTelemetrySession = startJoinTelemetrySession({
             publicIdentifier,
@@ -7301,6 +7436,10 @@ async function handleMessageObject(message) {
             relayKey: previewValue(joinRelayKey, 16),
             relayUrl: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
             hostPeersCount: hostPeers.length,
+            hostPeerHintsCount: hostPeerKeysHint.length,
+            memberPeerHintsCount: memberPeerKeysHint.length,
+            discoveryTopic: previewValue(discoveryTopic, 16),
+            writerIssuerPubkey: previewValue(writerIssuerPubkey, 16),
             hasBlindPeer: !!blindPeer?.publicKey,
             coreRefsCount: coreRefs.length,
             coreRefsPreview: summarizeCoreRefs(coreRefs),
@@ -7308,10 +7447,26 @@ async function handleMessageObject(message) {
             writerCorePrefix: previewValue(writerCore, 16),
             writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
             writerSecretLen: writerSecret ? String(writerSecret).length : 0,
+            hasInviteTokenHash: !!inviteTokenHash,
             hasFastForward: !!fastForward,
             requestedGatewayOrigins,
             rankedGatewayOrigins
           })
+
+          let cachedPeerDiscovery = await getRelayPeerDiscovery(joinRelayKey, publicIdentifier)
+          if (
+            discoveryTopic
+            || hostPeerKeysHint.length
+            || memberPeerKeysHint.length
+            || writerIssuerPubkey
+          ) {
+            cachedPeerDiscovery = await setRelayPeerDiscovery(joinRelayKey, publicIdentifier, {
+              discoveryTopic,
+              hostPeerKeys: hostPeerKeysHint,
+              memberPeerKeys: memberPeerKeysHint,
+              writerIssuerPubkey
+            })
+          }
 
           if (openJoin && publicIdentifier) {
             recordOpenJoinContext({
@@ -7591,8 +7746,257 @@ async function handleMessageObject(message) {
             }
           }
 
-          if (!hostPeers.length) {
-            hostPeers = resolveHostPeersFromGatewayStatus(getGatewayStatus(), publicIdentifier)
+          const hasExplicitPeerDiscoveryHints = !!(
+            hostPeerKeysHint.length
+            || memberPeerKeysHint.length
+            || (typeof data.discoveryTopic === 'string' && data.discoveryTopic.trim())
+          )
+          const skipPeerSmartSelect = hadWriterMaterialAtStart && !hasExplicitPeerDiscoveryHints
+
+          if (skipPeerSmartSelect) {
+            hostPeers = normalizePeerKeyHintList(hostPeers)
+            console.log('[Worker] Join flow skipping peer smart-select (preseeded writer material available)', {
+              publicIdentifier,
+              relayKey: previewValue(joinRelayKey, 16),
+              hasInviteToken: !!inviteToken,
+              openJoin,
+              hostPeersCount: hostPeers.length
+            })
+          } else {
+            if (!discoveryTopic) {
+              discoveryTopic = deriveRelayDiscoveryTopic({
+                relayKey: joinRelayKey,
+                publicIdentifier
+              })
+            }
+
+            const cachedHostPeers = normalizePeerKeyHintList(cachedPeerDiscovery?.hostPeerKeys || [])
+            const cachedMemberPeerKeys = normalizePeerKeyHintList(cachedPeerDiscovery?.memberPeerKeys || [])
+            const gatewayStatusPeers = resolveHostPeersFromGatewayStatus(getGatewayStatus(), publicIdentifier)
+            const cachedCapabilityPeers = Array.from(
+              new Set(
+                (await listRelayPeerCapabilities(joinRelayKey, publicIdentifier))
+                  .map((entry) => normalizePeerKeyHint(entry?.peerKey || null))
+                  .filter(Boolean)
+              )
+            )
+            const localPeerKey =
+              normalizePeerKeyHint(config?.swarmPublicKey || null)
+              || normalizePeerKeyHint(deriveSwarmPublicKey(config) || null)
+              || null
+
+            let candidatePeers = normalizePeerKeyHintList([
+              ...hostPeers,
+              ...hostPeerKeysHint,
+              ...memberPeerKeysHint,
+              ...cachedHostPeers,
+              ...cachedMemberPeerKeys,
+              ...cachedCapabilityPeers,
+              ...gatewayStatusPeers
+            ]).filter((peerKey) => !localPeerKey || peerKey !== localPeerKey)
+
+            if (blindPeer?.publicKey) {
+              candidatePeers = normalizePeerKeyHintList([
+                blindPeer.publicKey,
+                ...candidatePeers
+              ]).filter((peerKey) => !localPeerKey || peerKey !== localPeerKey)
+            }
+
+            if (discoveryTopic && relayServer?.discoverPeersByTopic) {
+              try {
+                const discoveryResult = await relayServer.discoverPeersByTopic(discoveryTopic, {
+                  timeoutMs: 5000
+                })
+                const topicPeers = normalizePeerKeyHintList(discoveryResult?.peers || [])
+                if (topicPeers.length) {
+                  candidatePeers = normalizePeerKeyHintList([
+                    ...candidatePeers,
+                    ...topicPeers
+                  ]).filter((peerKey) => !localPeerKey || peerKey !== localPeerKey)
+                }
+                if (discoveryResult?.status === 'ok') {
+                  cachedPeerDiscovery = await setRelayPeerDiscovery(joinRelayKey, publicIdentifier, {
+                    discoveryTopic: discoveryResult?.topic || discoveryTopic,
+                    hostPeerKeys: cachedHostPeers,
+                    memberPeerKeys: normalizePeerKeyHintList([
+                      ...memberPeerKeysHint,
+                      ...cachedMemberPeerKeys,
+                      ...topicPeers
+                    ]),
+                    writerIssuerPubkey
+                  })
+                }
+              } catch (error) {
+                console.warn('[Worker] Discovery topic probe failed', {
+                  publicIdentifier,
+                  relayKey: previewValue(joinRelayKey, 16),
+                  topic: previewValue(discoveryTopic, 16),
+                  error: error?.message || error
+                })
+              }
+            }
+
+            const capabilityRows = []
+            const probeShortCircuitRank =
+              openJoin && !inviteToken
+                ? getWriterGuaranteeRank('peer-local-provision')
+                : (!openJoin && inviteToken
+                  ? getWriterGuaranteeRank('peer-invite-lease')
+                  : null)
+            if (relayServer?.probePeerJoinCapabilities && candidatePeers.length) {
+              for (const peerKey of candidatePeers) {
+                const probeStartedAt = Date.now()
+                const probe = await relayServer.probePeerJoinCapabilities({
+                  peerKey,
+                  identifier: publicIdentifier || joinRelayKey,
+                  relayKey: joinRelayKey,
+                  requesterPubkey: config?.nostr_pubkey_hex || null,
+                  hasInviteToken: !!inviteToken,
+                  tokenHash: inviteTokenHash || null,
+                  writerIssuerPubkey,
+                  timeoutMs: 12000
+                })
+                const capability = probe?.capability && typeof probe.capability === 'object'
+                  ? probe.capability
+                  : {}
+                const row = {
+                  peerKey,
+                  writerGuarantee: probe?.ok
+                    ? String(capability?.writerGuarantee || 'none')
+                    : 'none',
+                  supports: Array.isArray(capability?.supports)
+                    ? capability.supports.map((entry) => String(entry || '').trim()).filter(Boolean)
+                    : [],
+                  isHosted: capability?.isHosted === true,
+                  isOpen: capability?.isOpen === true,
+                  writable: capability?.writable === true,
+                  rttMs: Number.isFinite(probe?.rttMs)
+                    ? Math.trunc(probe.rttMs)
+                    : (Date.now() - probeStartedAt),
+                  probeOk: probe?.ok === true,
+                  probeReason: probe?.reason || null
+                }
+                capabilityRows.push(row)
+                if (probe?.ok) {
+                  await recordRelayPeerCapability(joinRelayKey, publicIdentifier, peerKey, row)
+                }
+                if (joinTelemetrySession) {
+                  emitJoinTelemetryEvent('JOIN_PEER_CAPABILITY_PROBE', {
+                    publicIdentifier,
+                    relayKey: joinRelayKey,
+                    traceId: joinTelemetrySession.traceId,
+                    elapsedMs: Date.now() - joinTelemetrySession.startedAt,
+                    gatewayOrigins: joinTelemetrySession.gatewayOrigins,
+                    meta: {
+                      peerKey,
+                      probeOk: row.probeOk,
+                      probeReason: row.probeReason,
+                      writerGuarantee: row.writerGuarantee,
+                      isHosted: row.isHosted,
+                      writable: row.writable,
+                      rttMs: row.rttMs
+                    }
+                  })
+                }
+                if (row.probeOk && Number.isFinite(probeShortCircuitRank)) {
+                  const rowRank = getWriterGuaranteeRank(row.writerGuarantee)
+                  if (rowRank <= probeShortCircuitRank) {
+                    console.log('[Worker] Join peer capability probe short-circuit', {
+                      publicIdentifier,
+                      relayKey: previewValue(joinRelayKey, 16),
+                      peerKey,
+                      writerGuarantee: row.writerGuarantee,
+                      rowRank
+                    })
+                    break
+                  }
+                }
+              }
+            } else {
+              for (const peerKey of candidatePeers) {
+                capabilityRows.push({
+                  peerKey,
+                  writerGuarantee: 'none',
+                  supports: [],
+                  isHosted: hostPeerKeysHint.includes(peerKey) || cachedHostPeers.includes(peerKey),
+                  isOpen: openJoin,
+                  writable: false,
+                  rttMs: null,
+                  probeOk: false,
+                  probeReason: 'probe-unavailable'
+                })
+              }
+            }
+
+            const rankedPeerRows = rankJoinPeerCandidates(capabilityRows, {
+              hostPeerSet: new Set([
+                ...hostPeers,
+                ...hostPeerKeysHint,
+                ...cachedHostPeers
+              ])
+            })
+            hostPeers = rankedPeerRows.map((entry) => entry.peerKey)
+
+            if (!hostPeers.length) {
+              hostPeers = normalizePeerKeyHintList(gatewayStatusPeers)
+            }
+
+            cachedPeerDiscovery = await setRelayPeerDiscovery(joinRelayKey, publicIdentifier, {
+              discoveryTopic: discoveryTopic || cachedPeerDiscovery?.discoveryTopic || null,
+              hostPeerKeys: normalizePeerKeyHintList([
+                ...hostPeers,
+                ...hostPeerKeysHint,
+                ...cachedHostPeers
+              ]),
+              memberPeerKeys: normalizePeerKeyHintList([
+                ...memberPeerKeysHint,
+                ...cachedMemberPeerKeys
+              ]),
+              writerIssuerPubkey: writerIssuerPubkey || cachedPeerDiscovery?.writerIssuerPubkey || null
+            })
+
+            const selectedPeer = rankedPeerRows[0] || null
+            if (joinTelemetrySession) {
+              emitJoinTelemetryEvent('JOIN_PATH_SELECTED', {
+                publicIdentifier,
+                relayKey: joinRelayKey,
+                traceId: joinTelemetrySession.traceId,
+                elapsedMs: Date.now() - joinTelemetrySession.startedAt,
+                gatewayOrigins: joinTelemetrySession.gatewayOrigins,
+                meta: {
+                  selectedPeer: selectedPeer?.peerKey || null,
+                  selectedWriterGuarantee: selectedPeer?.writerGuarantee || null,
+                  selectedPeerHosted: selectedPeer?.isHosted === true,
+                  selectedRttMs: Number.isFinite(selectedPeer?.rttMs) ? selectedPeer.rttMs : null,
+                  candidateCount: candidatePeers.length,
+                  probeCount: capabilityRows.length
+                }
+              })
+              const joinWriterSource =
+                (
+                  selectedPeer?.writerGuarantee
+                  && selectedPeer.writerGuarantee !== 'none'
+                )
+                  ? selectedPeer.writerGuarantee
+                  : (
+                    writerSecret && (writerCore || writerCoreHex || autobaseLocal)
+                      ? (inviteToken ? 'invite-payload' : 'gateway-open-join')
+                      : null
+                  )
+              if (joinWriterSource) {
+                emitJoinTelemetryEvent('JOIN_WRITER_SOURCE', {
+                  publicIdentifier,
+                  relayKey: joinRelayKey,
+                  traceId: joinTelemetrySession.traceId,
+                  elapsedMs: Date.now() - joinTelemetrySession.startedAt,
+                  gatewayOrigins: joinTelemetrySession.gatewayOrigins,
+                  meta: {
+                    source: joinWriterSource,
+                    selectedPeer: selectedPeer?.peerKey || null
+                  }
+                })
+              }
+            }
           }
 
           if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
@@ -7606,6 +8010,10 @@ async function handleMessageObject(message) {
             relayKey: previewValue(joinRelayKey, 16),
             relayUrl: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
             hostPeersCount: hostPeers.length,
+            hostPeerHintsCount: hostPeerKeysHint.length,
+            memberPeerHintsCount: memberPeerKeysHint.length,
+            discoveryTopic: previewValue(discoveryTopic || cachedPeerDiscovery?.discoveryTopic || null, 16),
+            writerIssuerPubkey: previewValue(writerIssuerPubkey || cachedPeerDiscovery?.writerIssuerPubkey || null, 16),
             hasBlindPeer: !!blindPeer?.publicKey,
             coreRefsCount: coreRefs.length,
             coreRefsPreview: summarizeCoreRefs(coreRefs),
@@ -7647,7 +8055,17 @@ async function handleMessageObject(message) {
             autobaseLocal,
             writerSecret,
             fastForward,
-            gatewayOrigins: rankedGatewayOrigins
+            gatewayOrigins: rankedGatewayOrigins,
+            discoveryTopic: discoveryTopic || cachedPeerDiscovery?.discoveryTopic || null,
+            hostPeerKeys: normalizePeerKeyHintList([
+              ...hostPeers,
+              ...hostPeerKeysHint
+            ]),
+            memberPeerKeys: normalizePeerKeyHintList([
+              ...memberPeerKeysHint,
+              ...(cachedPeerDiscovery?.memberPeerKeys || [])
+            ]),
+            writerIssuerPubkey: writerIssuerPubkey || cachedPeerDiscovery?.writerIssuerPubkey || null
           })
           if (joinBlindPeeringManager && joinRelayIdentifierForTracking && typeof joinBlindPeeringManager.markJoinEnd === 'function') {
             joinBlindPeeringManager.markJoinEnd({
@@ -7708,9 +8126,15 @@ async function handleMessageObject(message) {
         const requestId = message?.requestId
         if (!relayServer?.provisionWriterForInvitee) throw new Error('Relay server unavailable')
         const relayKey = normalizeRelayKeyHex(requestData.relayKey) || requestData.relayKey || null
+        const normalizedInviteToken =
+          typeof requestData.inviteToken === 'string' && requestData.inviteToken.trim()
+            ? requestData.inviteToken.trim()
+            : null
+        const normalizedInviteePubkey = normalizePubkeyHex(requestData.inviteePubkey || null)
+        const requiresTokenBoundLease = !!(normalizedInviteToken && normalizedInviteePubkey)
         let poolResult = null
         let result = null
-        if (requestData.useWriterPool !== false) {
+        if (requestData.useWriterPool !== false && !requiresTokenBoundLease) {
           poolResult = await claimClosedJoinWriterPoolEntry({
             relayKey,
             publicIdentifier: requestData.publicIdentifier || null,
@@ -7727,6 +8151,8 @@ async function handleMessageObject(message) {
           result = await relayServer.provisionWriterForInvitee({
             ...(message.data || {}),
             relayKey,
+            inviteToken: normalizedInviteToken || null,
+            inviteePubkey: normalizedInviteePubkey || null,
             reason: requestData.useWriterPool === false ? 'invite-direct' : 'invite-fallback'
           })
         }
@@ -7743,6 +8169,60 @@ async function handleMessageObject(message) {
           poolAvailable: poolResult?.pool?.available ?? null,
           poolKey: poolResult?.pool?.poolKey ? previewValue(poolResult.pool.poolKey, 16) : null,
           fastForward
+        }
+
+        if (result?.writerLease && relayServer?.replicateWriterLeaseEnvelope) {
+          const cachedPeerDiscovery = await getRelayPeerDiscovery(
+            resolvedRelayKey,
+            requestData.publicIdentifier || null
+          )
+          const replicationPeers = normalizePeerKeyHintList([
+            ...(Array.isArray(requestData.memberPeerKeys) ? requestData.memberPeerKeys : []),
+            ...(Array.isArray(requestData.hostPeerKeys) ? requestData.hostPeerKeys : []),
+            ...(Array.isArray(cachedPeerDiscovery?.memberPeerKeys) ? cachedPeerDiscovery.memberPeerKeys : []),
+            ...(Array.isArray(cachedPeerDiscovery?.hostPeerKeys) ? cachedPeerDiscovery.hostPeerKeys : [])
+          ])
+          responsePayload.writerLeaseReplication = {
+            status: 'pending',
+            reason: 'async-replication',
+            attempted: 0,
+            replicated: 0
+          }
+          const replicationInput = {
+            relayKey: resolvedRelayKey,
+            publicIdentifier: requestData.publicIdentifier || cachedPeerDiscovery?.publicIdentifier || null,
+            leaseEnvelope: result.writerLease,
+            peerKeys: replicationPeers,
+            writerIssuerPubkey:
+              requestData.writerIssuerPubkey
+              || cachedPeerDiscovery?.writerIssuerPubkey
+              || result?.writerLease?.issuerPubkey
+              || null,
+            replicationFactor:
+              Number.isFinite(requestData.replicationFactor) && requestData.replicationFactor > 0
+                ? Math.trunc(requestData.replicationFactor)
+                : 3,
+            timeoutMs:
+              Number.isFinite(requestData.replicationTimeoutMs) && requestData.replicationTimeoutMs > 0
+                ? Math.trunc(requestData.replicationTimeoutMs)
+                : 6000
+          }
+          Promise.resolve()
+            .then(() => relayServer.replicateWriterLeaseEnvelope(replicationInput))
+            .then((replicationSummary) => {
+              console.log('[Worker] Writer lease replication completed', {
+                relayKey: previewValue(resolvedRelayKey, 16),
+                status: replicationSummary?.status || null,
+                replicated: replicationSummary?.replicated ?? null,
+                attempted: replicationSummary?.attempted ?? null
+              })
+            })
+            .catch((error) => {
+              console.warn('[Worker] Writer lease replication failed', {
+                relayKey: previewValue(resolvedRelayKey, 16),
+                error: error?.message || String(error)
+              })
+            })
         }
 
         sendMessage({ type: 'provision-writer-for-invitee:result', requestId, data: responsePayload })

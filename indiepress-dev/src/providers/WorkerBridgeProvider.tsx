@@ -240,6 +240,10 @@ type WorkerBridgeContextValue = {
       writerSecret?: string | null
       openJoin?: boolean
       gatewayOrigins?: string[]
+      discoveryTopic?: string | null
+      hostPeerKeys?: string[]
+      memberPeerKeys?: string[]
+      writerIssuerPubkey?: string | null
       fastForward?: {
         key?: string | null
         length?: number | null
@@ -645,6 +649,10 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         writerSecret?: string | null
         openJoin?: boolean
         gatewayOrigins?: string[]
+        discoveryTopic?: string | null
+        hostPeerKeys?: string[]
+        memberPeerKeys?: string[]
+        writerIssuerPubkey?: string | null
         fastForward?: {
           key?: string | null
           length?: number | null
@@ -674,13 +682,10 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         await startWorkerInternal({ resetRestartAttempts: false })
       }
 
-      // The gateway is the source of truth for relay host peers. Ensure it's running.
-      if (!gatewayStatus?.running) {
-        await electronIpc.sendToWorker({ type: 'start-gateway', options: {} }).catch(() => {})
+      // Gateway status is optional for direct-join. Refresh opportunistically only when running.
+      if (gatewayStatus?.running) {
+        await electronIpc.sendToWorker({ type: 'get-gateway-status' }).catch(() => {})
       }
-
-      // Refresh gateway status so peerRelayMap is as current as possible.
-      await electronIpc.sendToWorker({ type: 'get-gateway-status' }).catch(() => {})
 
       const fileSharing = opts?.fileSharing !== false
 
@@ -715,6 +720,22 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         gatewayOrigins:
           Array.isArray(opts?.gatewayOrigins) && opts?.gatewayOrigins.length
             ? opts.gatewayOrigins.map((entry) => String(entry || '').trim()).filter(Boolean)
+            : undefined,
+        discoveryTopic:
+          typeof opts?.discoveryTopic === 'string' && opts.discoveryTopic.trim()
+            ? opts.discoveryTopic.trim()
+            : undefined,
+        hostPeerKeys:
+          Array.isArray(opts?.hostPeerKeys) && opts.hostPeerKeys.length
+            ? opts.hostPeerKeys.map((entry) => String(entry || '').trim()).filter(Boolean)
+            : undefined,
+        memberPeerKeys:
+          Array.isArray(opts?.memberPeerKeys) && opts.memberPeerKeys.length
+            ? opts.memberPeerKeys.map((entry) => String(entry || '').trim()).filter(Boolean)
+            : undefined,
+        writerIssuerPubkey:
+          typeof opts?.writerIssuerPubkey === 'string' && opts.writerIssuerPubkey.trim()
+            ? opts.writerIssuerPubkey.trim().toLowerCase()
             : undefined,
         fastForward: opts?.fastForward || undefined
       }

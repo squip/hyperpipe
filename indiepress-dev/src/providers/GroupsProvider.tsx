@@ -38,7 +38,8 @@ import {
   TGroupListEntry,
   TGroupMembershipStatus,
   TGroupMetadata,
-  TJoinRequest
+  TJoinRequest,
+  WriterLeaseEnvelope
 } from '@/types/groups'
 import { buildGatewayDirectory } from '@/lib/gateway-directory'
 import client from '@/services/client.service'
@@ -461,6 +462,71 @@ const normalizeGatewayOriginsFromDescriptors = (
     )
   )
 
+const normalizeWriterLeaseEnvelope = (value: unknown): WriterLeaseEnvelope | null => {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const version = Number.isFinite(raw.version) ? Number(raw.version) : null
+  const issuedAt = Number.isFinite(raw.issuedAt) ? Number(raw.issuedAt) : null
+  const expiresAt = Number.isFinite(raw.expiresAt) ? Number(raw.expiresAt) : null
+
+  const leaseId = typeof raw.leaseId === 'string' ? raw.leaseId.trim() : ''
+  const relayKey = typeof raw.relayKey === 'string' ? raw.relayKey.trim() : ''
+  const scope = typeof raw.scope === 'string' ? raw.scope.trim() : ''
+  const inviteePubkey = typeof raw.inviteePubkey === 'string' ? raw.inviteePubkey.trim() : ''
+  const tokenHash = typeof raw.tokenHash === 'string' ? raw.tokenHash.trim() : ''
+  const writerSecret = typeof raw.writerSecret === 'string' ? raw.writerSecret.trim() : ''
+  const issuerPubkey = typeof raw.issuerPubkey === 'string' ? raw.issuerPubkey.trim() : ''
+  const signature = typeof raw.signature === 'string' ? raw.signature.trim() : ''
+
+  if (
+    version == null
+    || !leaseId
+    || !relayKey
+    || !scope
+    || !inviteePubkey
+    || !tokenHash
+    || !writerSecret
+    || issuedAt == null
+    || expiresAt == null
+    || !issuerPubkey
+    || !signature
+  ) {
+    return null
+  }
+
+  return {
+    version,
+    leaseId,
+    relayKey,
+    publicIdentifier:
+      typeof raw.publicIdentifier === 'string' && raw.publicIdentifier.trim()
+        ? raw.publicIdentifier.trim()
+        : null,
+    scope,
+    inviteePubkey,
+    tokenHash,
+    writerCore:
+      typeof raw.writerCore === 'string' && raw.writerCore.trim() ? raw.writerCore.trim() : null,
+    writerCoreHex:
+      typeof raw.writerCoreHex === 'string' && raw.writerCoreHex.trim()
+        ? raw.writerCoreHex.trim()
+        : null,
+    autobaseLocal:
+      typeof raw.autobaseLocal === 'string' && raw.autobaseLocal.trim()
+        ? raw.autobaseLocal.trim()
+        : null,
+    writerSecret,
+    issuedAt,
+    expiresAt,
+    issuerPubkey,
+    issuerPeerKey:
+      typeof raw.issuerPeerKey === 'string' && raw.issuerPeerKey.trim()
+        ? raw.issuerPeerKey.trim()
+        : null,
+    signature
+  }
+}
+
 const areSameMemberLists = (left: string[], right: string[]) =>
   left.length === right.length && left.every((value, idx) => value === right[idx])
 
@@ -487,6 +553,9 @@ const buildInvitePayload = (args: {
   groupPicture?: string
   authorizedMemberPubkeys?: string[]
   mirrorMetadata?: InviteMirrorMetadata
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  memberPeerKeys?: string[]
   fastForward?: {
     key?: string | null
     length?: number | null
@@ -498,12 +567,20 @@ const buildInvitePayload = (args: {
     writerCoreHex?: string
     autobaseLocal?: string
     writerSecret?: string
+    writerLease?: WriterLeaseEnvelope | null
   } | null
 }) => ({
   relayUrl: args.relayUrl,
   token: args.token,
   relayKey: args.relayKey ?? null,
   gatewayOrigins: normalizeGatewayOriginsFromDescriptors(args.gatewayOrigins || args.meta?.gateways),
+  discoveryTopic: args.discoveryTopic || args.meta?.discoveryTopic || null,
+  hostPeerKeys: normalizePubkeyList(args.hostPeerKeys || args.meta?.hostPeerKeys),
+  memberPeerKeys: normalizePubkeyList(args.memberPeerKeys),
+  writerIssuerPubkey:
+    args.writerInfo?.writerLease?.issuerPubkey
+    || args.meta?.writerIssuerPubkey
+    || null,
   isPublic: args.meta?.isPublic !== false,
   groupName: args.groupName || args.meta?.name,
   groupPicture: args.groupPicture || args.meta?.picture || null,
@@ -517,13 +594,18 @@ const buildInvitePayload = (args: {
   writerCore: args.writerInfo?.writerCore || null,
   writerCoreHex: args.writerInfo?.writerCoreHex || args.writerInfo?.autobaseLocal || null,
   autobaseLocal: args.writerInfo?.autobaseLocal || args.writerInfo?.writerCoreHex || null,
-  writerSecret: args.writerInfo?.writerSecret || null
+  writerSecret: args.writerInfo?.writerSecret || null,
+  writerLease: args.writerInfo?.writerLease || null
 })
 
 const buildOpenInvitePayload = (args: {
   relayUrl: string | null
   relayKey?: string | null
   gatewayOrigins?: string[]
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  memberPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
   groupName?: string
   groupPicture?: string
   authorizedMemberPubkeys?: string[]
@@ -531,6 +613,10 @@ const buildOpenInvitePayload = (args: {
   relayUrl: args.relayUrl,
   relayKey: args.relayKey ?? null,
   gatewayOrigins: normalizeGatewayOriginsFromDescriptors(args.gatewayOrigins),
+  discoveryTopic: args.discoveryTopic || null,
+  hostPeerKeys: normalizePubkeyList(args.hostPeerKeys),
+  memberPeerKeys: normalizePubkeyList(args.memberPeerKeys),
+  writerIssuerPubkey: args.writerIssuerPubkey || null,
   groupName: args.groupName || null,
   groupPicture: args.groupPicture || null,
   authorizedMemberPubkeys: normalizePubkeyList(args.authorizedMemberPubkeys)
@@ -1359,6 +1445,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let autobaseLocal: string | null | undefined
             let writerSecret: string | null | undefined
             let gatewayOrigins: string[] | undefined
+            let discoveryTopic: string | null | undefined
+            let hostPeerKeys: string[] | undefined
+            let memberPeerKeys: string[] | undefined
+            let writerIssuerPubkey: string | null | undefined
+            let writerLease: WriterLeaseEnvelope | null | undefined
             let fastForward:
               | {
                   key?: string | null
@@ -1420,6 +1511,27 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                   gatewayOrigins = normalizeGatewayOriginsFromDescriptors(
                     (payload as any).gatewayOrigins
                   )
+                }
+                if (typeof (payload as any).discoveryTopic === 'string') {
+                  const topic = String((payload as any).discoveryTopic).trim().toLowerCase()
+                  if (/^[a-f0-9]{64}$/i.test(topic)) {
+                    discoveryTopic = topic
+                  }
+                }
+                if (Array.isArray((payload as any).hostPeerKeys)) {
+                  hostPeerKeys = normalizePubkeyList((payload as any).hostPeerKeys as string[])
+                }
+                if (Array.isArray((payload as any).memberPeerKeys)) {
+                  memberPeerKeys = normalizePubkeyList((payload as any).memberPeerKeys as string[])
+                }
+                if (typeof (payload as any).writerIssuerPubkey === 'string') {
+                  const issuer = String((payload as any).writerIssuerPubkey).trim().toLowerCase()
+                  if (/^[a-f0-9]{64}$/i.test(issuer)) {
+                    writerIssuerPubkey = issuer
+                  }
+                }
+                if ((payload as any).writerLease && typeof (payload as any).writerLease === 'object') {
+                  writerLease = normalizeWriterLeaseEnvelope((payload as any).writerLease)
                 }
                 const fastForwardPayload =
                   payload.fastForward && typeof payload.fastForward === 'object'
@@ -1491,6 +1603,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               writerCoreHex,
               autobaseLocal,
               writerSecret,
+              writerLease,
+              discoveryTopic,
+              hostPeerKeys,
+              memberPeerKeys,
+              writerIssuerPubkey,
               gatewayOrigins,
               fastForward
             }
@@ -3614,7 +3731,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           fileSharing,
           relayWsUrl,
           pictureTagUrl: picture,
-          gateways
+          gateways,
+          writerIssuerPubkey: pubkey
         })
       const { adminListEvent, memberListEvent } = buildHypertunaAdminBootstrapDraftEvents({
         publicIdentifier,
@@ -3794,7 +3912,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         })
       }
 
-      const provisionWriterInfo = async (invitee: string) => {
+      const provisionWriterInfo = async (invitee: string, inviteToken?: string | null) => {
         if (isOpenGroup) return null
         if (!sendToWorker || !relayEntry?.relayKey) return null
         try {
@@ -3804,7 +3922,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               relayKey: relayEntry.relayKey,
               publicIdentifier: groupId,
               inviteePubkey: invitee,
-              useWriterPool: true
+              inviteToken: inviteToken || null,
+              useWriterPool: inviteToken ? false : true,
+              discoveryTopic: meta?.discoveryTopic || null,
+              hostPeerKeys: normalizePubkeyList(meta?.hostPeerKeys),
+              memberPeerKeys: normalizePubkeyList([
+                ...baseAuthorizedMemberPubkeys,
+                invitee
+              ]),
+              writerIssuerPubkey: meta?.writerIssuerPubkey || pubkey
             }
           })
           if (res && typeof res === 'object') {
@@ -3813,6 +3939,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               writerCoreHex: (res as any).writerCoreHex,
               autobaseLocal: (res as any).autobaseLocal,
               writerSecret: (res as any).writerSecret,
+              writerLease: normalizeWriterLeaseEnvelope((res as any).writerLease),
               poolCoreRefs: Array.isArray((res as any).poolCoreRefs)
                 ? (res as any).poolCoreRefs
                 : undefined,
@@ -3826,6 +3953,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               hasWriterCoreHex: !!writerInfo?.writerCoreHex,
               hasAutobaseLocal: !!writerInfo?.autobaseLocal,
               hasWriterSecret: !!writerInfo?.writerSecret,
+              hasWriterLease: !!writerInfo?.writerLease,
               hasPoolCoreRefs:
                 Array.isArray(writerInfo?.poolCoreRefs) && writerInfo.poolCoreRefs.length > 0,
               hasFastForward: !!writerInfo?.fastForward
@@ -3877,14 +4005,21 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       await Promise.all(
         invitees.map(async (invitee) => {
-          const writerInfo = await provisionWriterInfo(invitee)
-          const inviteMirrorMetadata = buildInviteMirrorMetadata(writerInfo)
           const token = isOpenGroup ? null : randomString(24)
+          const writerInfo = await provisionWriterInfo(invitee, token)
+          const inviteMirrorMetadata = buildInviteMirrorMetadata(writerInfo)
           const payload = isOpenGroup
               ? buildOpenInvitePayload({
                   relayUrl: inviteRelayUrl,
                   relayKey: inviteRelayKey,
                   gatewayOrigins: normalizeGatewayOriginsFromDescriptors(meta?.gateways),
+                  discoveryTopic: meta?.discoveryTopic || null,
+                  hostPeerKeys: normalizePubkeyList(meta?.hostPeerKeys),
+                  memberPeerKeys: normalizePubkeyList([
+                    ...baseAuthorizedMemberPubkeys,
+                    invitee
+                  ]),
+                  writerIssuerPubkey: meta?.writerIssuerPubkey || pubkey,
                   groupName: inviteName,
                   groupPicture: invitePicture,
                   authorizedMemberPubkeys: baseAuthorizedMemberPubkeys
@@ -3894,6 +4029,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 relayUrl: inviteRelayUrl,
                 relayKey: inviteRelayKey,
                 gatewayOrigins: normalizeGatewayOriginsFromDescriptors(meta?.gateways),
+                discoveryTopic: meta?.discoveryTopic || null,
+                hostPeerKeys: normalizePubkeyList(meta?.hostPeerKeys),
+                memberPeerKeys: normalizePubkeyList([
+                  ...baseAuthorizedMemberPubkeys,
+                  invitee
+                ]),
                 meta,
                 groupName: inviteName,
                 groupPicture: invitePicture,

@@ -3397,6 +3397,10 @@ export class TuiController {
     autobaseLocal?: string | null
     writerSecret?: string | null
     gatewayOrigins?: string[]
+    discoveryTopic?: string | null
+    hostPeerKeys?: string[]
+    memberPeerKeys?: string[]
+    writerIssuerPubkey?: string | null
     fastForward?: {
       key?: string | null
       length?: number | null
@@ -3430,6 +3434,17 @@ export class TuiController {
           relayUrl: relayUrl || null
         })
       ]))
+      const hostPeerKeys = Array.from(new Set([
+        ...hostPeers,
+        ...(Array.isArray(input.hostPeerKeys) ? input.hostPeerKeys : [])
+          .map((entry) => String(entry || '').trim().toLowerCase())
+          .filter(Boolean)
+      ]))
+      const memberPeerKeys = Array.from(new Set(
+        (Array.isArray(input.memberPeerKeys) ? input.memberPeerKeys : [])
+          .map((entry) => String(entry || '').trim().toLowerCase())
+          .filter(Boolean)
+      ))
       const discoveredGatewayOrigins = Array.from(
         new Set(
           [...this.state.groupDiscover, ...this.state.myGroups, ...this.state.groups]
@@ -3448,6 +3463,16 @@ export class TuiController {
         ...input,
         relayKey,
         relayUrl,
+        discoveryTopic:
+          typeof input.discoveryTopic === 'string' && input.discoveryTopic.trim()
+            ? input.discoveryTopic.trim().toLowerCase()
+            : undefined,
+        hostPeerKeys: hostPeerKeys.length ? hostPeerKeys : undefined,
+        memberPeerKeys: memberPeerKeys.length ? memberPeerKeys : undefined,
+        writerIssuerPubkey:
+          typeof input.writerIssuerPubkey === 'string' && input.writerIssuerPubkey.trim()
+            ? input.writerIssuerPubkey.trim().toLowerCase()
+            : undefined,
         gatewayOrigins,
         hostPeers: hostPeers.length ? hostPeers : undefined
       })
@@ -4030,6 +4055,10 @@ export class TuiController {
         writerCoreHex: target.writerCoreHex || undefined,
         autobaseLocal: target.autobaseLocal || undefined,
         writerSecret: target.writerSecret || undefined,
+        discoveryTopic: target.discoveryTopic || undefined,
+        hostPeerKeys: Array.isArray(target.hostPeerKeys) ? target.hostPeerKeys : undefined,
+        memberPeerKeys: Array.isArray(target.memberPeerKeys) ? target.memberPeerKeys : undefined,
+        writerIssuerPubkey: target.writerIssuerPubkey || undefined,
         gatewayOrigins: Array.isArray(target.gatewayOrigins) ? target.gatewayOrigins : undefined,
         fastForward: target.fastForward || undefined
       })
@@ -4313,6 +4342,24 @@ export class TuiController {
       }
 
       const payloadInput = input.payload as Record<string, unknown>
+      const payloadDiscoveryTopic =
+        typeof payloadInput.discoveryTopic === 'string' && /^[a-f0-9]{64}$/i.test(payloadInput.discoveryTopic.trim())
+          ? payloadInput.discoveryTopic.trim().toLowerCase()
+          : null
+      const payloadHostPeerKeys = Array.from(new Set(
+        (Array.isArray(payloadInput.hostPeerKeys) ? payloadInput.hostPeerKeys : [])
+          .map((entry) => String(entry || '').trim().toLowerCase())
+          .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+      ))
+      const payloadMemberPeerKeys = Array.from(new Set(
+        (Array.isArray(payloadInput.memberPeerKeys) ? payloadInput.memberPeerKeys : [])
+          .map((entry) => String(entry || '').trim().toLowerCase())
+          .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+      ))
+      const payloadWriterIssuerPubkey =
+        typeof payloadInput.writerIssuerPubkey === 'string' && /^[a-f0-9]{64}$/i.test(payloadInput.writerIssuerPubkey.trim())
+          ? payloadInput.writerIssuerPubkey.trim().toLowerCase()
+          : session.pubkey
       const isOpenGroup = input.token
         ? false
         : (typeof payloadInput.fileSharing === 'boolean' ? payloadInput.fileSharing : true)
@@ -4356,7 +4403,15 @@ export class TuiController {
                 relayKey: resolvedRelayKey,
                 publicIdentifier: normalizedGroupId,
                 inviteePubkey: normalizedInvitee,
-                useWriterPool: true
+                inviteToken: inviteToken || null,
+                useWriterPool: inviteToken ? false : true,
+                discoveryTopic: payloadDiscoveryTopic,
+                hostPeerKeys: payloadHostPeerKeys,
+                memberPeerKeys: Array.from(new Set([
+                  ...payloadMemberPeerKeys,
+                  normalizedInvitee
+                ])),
+                writerIssuerPubkey: payloadWriterIssuerPubkey
               }
             },
             90_000
@@ -4373,6 +4428,10 @@ export class TuiController {
       if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
       if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
       const writerSecret = typeof writerProvision?.writerSecret === 'string' ? writerProvision.writerSecret : null
+      const writerLease =
+        writerProvision?.writerLease && typeof writerProvision.writerLease === 'object'
+          ? writerProvision.writerLease
+          : null
       const fastForward = writerProvision?.fastForward && typeof writerProvision.fastForward === 'object'
         ? writerProvision.fastForward
         : null
@@ -4418,11 +4477,19 @@ export class TuiController {
               .filter(Boolean)
           )
         ),
+        discoveryTopic: payloadDiscoveryTopic,
+        hostPeerKeys: payloadHostPeerKeys,
+        memberPeerKeys: Array.from(new Set([
+          ...payloadMemberPeerKeys,
+          normalizedInvitee
+        ])),
+        writerIssuerPubkey: payloadWriterIssuerPubkey,
         token: inviteToken || null,
         writerCore: writerCore || payloadInput.writerCore || null,
         writerCoreHex: writerCoreHex || payloadInput.writerCoreHex || payloadInput.writer_core_hex || null,
         autobaseLocal: autobaseLocal || payloadInput.autobaseLocal || payloadInput.autobase_local || null,
         writerSecret: writerSecret || payloadInput.writerSecret || null,
+        writerLease: writerLease || payloadInput.writerLease || null,
         fastForward: fastForward || payloadInput.fastForward || payloadInput.fast_forward || null,
         authorizedMemberPubkeys: Array.from(new Set(
           [

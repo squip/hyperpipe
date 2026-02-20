@@ -111,6 +111,31 @@ function parseGatewayDiscoveryRelays(tags: string[][]): string[] {
   return relays
 }
 
+function parseSwarmTopicTag(tags: string[][]): string | null {
+  const tag = tags.find((entry) => entry[0] === 'swarm-topic' && entry[1])
+  if (!tag?.[1]) return null
+  const value = String(tag[1]).trim().toLowerCase()
+  if (!/^[a-f0-9]{64}$/i.test(value)) return null
+  return value
+}
+
+function parseHostPeerTags(tags: string[][]): string[] {
+  const peers = new Set<string>()
+  for (const tag of tags) {
+    if (!Array.isArray(tag) || tag[0] !== 'host-peer' || !tag[1]) continue
+    const normalized = normalizePubkey(String(tag[1]))
+    if (!normalized) continue
+    peers.add(normalized)
+  }
+  return Array.from(peers)
+}
+
+function parseWriterIssuerTag(tags: string[][]): string | null {
+  const tag = tags.find((entry) => entry[0] === 'writer-issuer' && entry[1])
+  if (!tag?.[1]) return null
+  return normalizePubkey(String(tag[1]))
+}
+
 export function parseGroupMetadataEvent(event: Event, relay?: string) {
   const d = event.tags.find((tag) => tag[0] === 'd')?.[1] ?? ''
   const name = event.tags.find((tag) => tag[0] === 'name')?.[1] ?? (d || 'Untitled Group')
@@ -119,6 +144,9 @@ export function parseGroupMetadataEvent(event: Event, relay?: string) {
   const isPublic = event.tags.some((tag) => tag[0] === 'public')
   const isOpen = event.tags.some((tag) => tag[0] === 'open')
   const gateways = parseGatewayTags(event.tags)
+  const discoveryTopic = parseSwarmTopicTag(event.tags)
+  const hostPeerKeys = parseHostPeerTags(event.tags)
+  const writerIssuerPubkey = parseWriterIssuerTag(event.tags)
 
   return {
     id: d,
@@ -129,6 +157,9 @@ export function parseGroupMetadataEvent(event: Event, relay?: string) {
     isPublic,
     isOpen,
     gateways,
+    discoveryTopic,
+    hostPeerKeys,
+    writerIssuerPubkey,
     event
   }
 }

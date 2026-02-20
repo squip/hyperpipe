@@ -101,6 +101,13 @@ function selectScenarios() {
   return SCENARIOS.filter((scenario) => wanted.has(scenario.id))
 }
 
+function scenarioExpectsFailFast(scenario) {
+  if (!scenario || typeof scenario !== 'object') return false
+  if (String(scenario.id || '').toUpperCase() === 'S21') return true
+  const expected = typeof scenario.expected === 'string' ? scenario.expected : ''
+  return /fails?\s+fast/i.test(expected)
+}
+
 function hexToBytes(hex) {
   if (typeof hex !== 'string' || !hex.length || hex.length % 2 !== 0 || /[^a-f0-9]/i.test(hex)) return null
   const out = new Uint8Array(hex.length / 2)
@@ -802,6 +809,14 @@ async function runScenarioExecutor(scenario, scenarioDir) {
     }
   }
   if (run.killedByFailFast) {
+    if (scenarioExpectsFailFast(scenario)) {
+      return {
+        status: 'OK',
+        reason: run.failFastReason || 'expected-fail-fast',
+        summary,
+        run
+      }
+    }
     return {
       status: 'FAIL',
       reason: run.failFastReason || 'executor-fail-fast',
@@ -889,6 +904,42 @@ async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
     autoconnectExpectedViewLength
   )
 
+  if (scenario?.id === 'S21') {
+    const failFastSignals = Array.isArray(parsedWorker.failFastSignals) ? parsedWorker.failFastSignals : []
+    const failFastObserved = failFastSignals.length > 0
+      || joinPerf?.failFastReason
+      || autoconnectPerf?.failFastReason
+    const checks = [
+      {
+        name: 'expected_closed_join_without_lease_fail_fast',
+        pass: !!failFastObserved,
+        signals: failFastSignals,
+        joinFailFastReason: joinPerf?.failFastReason || null,
+        autoconnectFailFastReason: autoconnectPerf?.failFastReason || null
+      }
+    ]
+    return {
+      scenario: scenario.id,
+      traceId: joinTrace.traceId,
+      autoconnectTraceId: autoconnectTrace.traceId,
+      status: failFastObserved ? 'PASS' : 'FAIL',
+      hardFailures: failFastObserved ? [] : checks,
+      warnings: [],
+      checks,
+      telemetryEvents: joinTrace.events,
+      joinTelemetryEvents: joinTrace.events,
+      autoconnectTelemetryEvents: autoconnectTrace.events,
+      fanoutSummary: joinFanoutSummary || null,
+      joinFanoutSummary: joinFanoutSummary || null,
+      autoconnectFanoutSummary: autoconnectFanoutSummary || null,
+      joinPerformance: joinPerf,
+      autoconnectPerformance: autoconnectPerf,
+      failFastSignals,
+      workerLogs,
+      summary
+    }
+  }
+
   const checks = []
   checks.push({
     name: 'join_to_writable_hard',
@@ -972,6 +1023,60 @@ async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
     observedViewLength: autoconnectObservedViewLength,
     expectedViewLength: normalizedAutoconnectExpectedViewLength
   })
+
+  const joinPathSelectedEvent = [...(Array.isArray(joinTrace.events) ? joinTrace.events : [])]
+    .reverse()
+    .find((event) => event?.eventType === 'JOIN_PATH_SELECTED') || null
+  const joinWriterSourceEvent = [...(Array.isArray(joinTrace.events) ? joinTrace.events : [])]
+    .reverse()
+    .find((event) => event?.eventType === 'JOIN_WRITER_SOURCE') || null
+  const selectedWriterGuarantee =
+    typeof joinPathSelectedEvent?.meta?.selectedWriterGuarantee === 'string'
+      ? joinPathSelectedEvent.meta.selectedWriterGuarantee
+      : null
+  const selectedWriterSource =
+    typeof joinWriterSourceEvent?.meta?.source === 'string'
+      ? joinWriterSourceEvent.meta.source
+      : null
+
+  if (['S19', 'S20', 'S22'].includes(scenario?.id)) {
+    checks.push({
+      name: 'join_path_selected_telemetry',
+      pass: !!joinPathSelectedEvent,
+      selectedWriterGuarantee,
+      selectedWriterSource
+    })
+    checks.push({
+      name: 'join_writer_source_telemetry',
+      pass: !!joinWriterSourceEvent,
+      selectedWriterGuarantee,
+      selectedWriterSource
+    })
+  }
+  if (scenario?.id === 'S19') {
+    checks.push({
+      name: 's19_peer_local_provision_source',
+      pass: selectedWriterSource === 'peer-local-provision' || selectedWriterGuarantee === 'peer-local-provision',
+      selectedWriterGuarantee,
+      selectedWriterSource
+    })
+  }
+  if (scenario?.id === 'S20') {
+    checks.push({
+      name: 's20_peer_invite_lease_source',
+      pass: selectedWriterSource === 'peer-invite-lease' || selectedWriterGuarantee === 'peer-invite-lease',
+      selectedWriterGuarantee,
+      selectedWriterSource
+    })
+  }
+  if (scenario?.id === 'S22') {
+    checks.push({
+      name: 's22_peer_path_preferred',
+      pass: typeof selectedWriterGuarantee === 'string' && selectedWriterGuarantee.startsWith('peer-'),
+      selectedWriterGuarantee,
+      selectedWriterSource
+    })
+  }
 
   if (parsedWorker.failFastSignals.length > 0) {
     checks.push({

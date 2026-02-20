@@ -160,6 +160,10 @@ export class RelayService implements IRelayService {
     autobaseLocal?: string | null
     writerSecret?: string | null
     gatewayOrigins?: string[]
+    discoveryTopic?: string | null
+    hostPeerKeys?: string[]
+    memberPeerKeys?: string[]
+    writerIssuerPubkey?: string | null
     fastForward?: {
       key?: string | null
       length?: number | null

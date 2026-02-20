@@ -732,6 +732,29 @@ async function waitForJoinWritable(worker, {
   })
 }
 
+async function waitForJoinFailFast(worker, {
+  relayKey,
+  publicIdentifier,
+  timeoutMs
+}) {
+  const hardTimeout = Math.max(1000, timeoutMs)
+  const message = await worker.waitForMessage((entry) => {
+    if (!entry || typeof entry !== 'object') return false
+    if (entry.type !== 'join-telemetry') return false
+    const data = entry.data && typeof entry.data === 'object' ? entry.data : null
+    if (!data) return false
+    if (!matchRelayIdentifier(data, relayKey, publicIdentifier)) return false
+    return data.eventType === 'JOIN_FAIL_FAST_ABORT'
+  }, hardTimeout, 'join-fail-fast')
+
+  const data = message?.data && typeof message.data === 'object' ? message.data : null
+  if (!data) {
+    throw new Error(`join-fail-fast-timeout:${hardTimeout}`)
+  }
+  process.stdout.write(`${JSON.stringify({ type: 'join-telemetry', data })}\n`)
+  return data
+}
+
 async function waitForJoinFanout(worker, traceId, timeoutMs = 45000) {
   try {
     const message = await worker.waitForMessage((entry) => {
@@ -842,7 +865,10 @@ async function runScenario() {
   const scenarioName = baseNameForScenario(SCENARIO_ID)
   const createGatewayName = chooseCreateGatewayName(SCENARIO)
   const createGateway = GATEWAYS[createGatewayName]
-  const joinOrigins = gatewayOrderForJoin()
+  const joinOrigins = SCENARIO?.id === 'S19' ? [] : gatewayOrderForJoin()
+  const shouldPreseedWriterMaterial = !['S19', 'S20', 'S21', 'S22'].includes(SCENARIO?.id)
+  const requiresLeaseProvision = ['S20', 'S22'].includes(SCENARIO?.id)
+  const expectJoinFailure = SCENARIO?.id === 'S21'
 
   const workerAStorage = path.join(SCENARIO_DIR, 'workerA-data')
   const workerBStorage = path.join(SCENARIO_DIR, 'workerB-data')
@@ -880,7 +906,9 @@ async function runScenario() {
     observedViewLength: null,
     expectedViewLength: null,
     autoConnectObservedViewLength: null,
-    autoConnectExpectedViewLength: null
+    autoConnectExpectedViewLength: null,
+    joinExpectedFailure: expectJoinFailure,
+    joinFailFastReason: null
   }
 
   let workerBRestart = null
@@ -909,24 +937,39 @@ async function runScenario() {
       throw new Error('create-relay-missing-identifiers')
     }
 
-    const provisionResult = await workerA.request('provision-writer-for-invitee', {
-      relayKey,
-      publicIdentifier,
-      inviteePubkey: WORKER_B_PUBKEY,
-      useWriterPool: true
-    }, 180000)
-
     const inviteToken = `invite-${SCENARIO_ID.toLowerCase()}-${randomBytes(16).toString('hex')}`
-    workerA.send({
-      type: 'update-auth-data',
-      data: {
+    if (SCENARIO?.groupType !== 'OPEN') {
+      workerA.send({
+        type: 'update-auth-data',
+        data: {
+          relayKey,
+          publicIdentifier,
+          pubkey: WORKER_B_PUBKEY,
+          token: inviteToken
+        }
+      })
+      await sleep(1200)
+    }
+
+    let provisionResult = null
+    if (SCENARIO?.groupType === 'OPEN') {
+      if (shouldPreseedWriterMaterial) {
+        provisionResult = await workerA.request('provision-writer-for-invitee', {
+          relayKey,
+          publicIdentifier,
+          inviteePubkey: WORKER_B_PUBKEY,
+          useWriterPool: true
+        }, 180000)
+      }
+    } else if (requiresLeaseProvision || shouldPreseedWriterMaterial) {
+      provisionResult = await workerA.request('provision-writer-for-invitee', {
         relayKey,
         publicIdentifier,
-        pubkey: WORKER_B_PUBKEY,
-        token: inviteToken
-      }
-    })
-    await sleep(1200)
+        inviteePubkey: WORKER_B_PUBKEY,
+        inviteToken,
+        useWriterPool: shouldPreseedWriterMaterial
+      }, 180000)
+    }
 
     const joinPayload = {
       publicIdentifier,
@@ -935,11 +978,11 @@ async function runScenario() {
       isOpen: SCENARIO?.groupType === 'OPEN',
       openJoin: SCENARIO?.groupType === 'OPEN',
       gatewayOrigins: joinOrigins,
-      writerCore: provisionResult?.writerCore || null,
-      writerCoreHex: provisionResult?.writerCoreHex || null,
-      autobaseLocal: provisionResult?.autobaseLocal || null,
-      writerSecret: provisionResult?.writerSecret || null,
-      fastForward: provisionResult?.fastForward || null
+      writerCore: shouldPreseedWriterMaterial ? (provisionResult?.writerCore || null) : null,
+      writerCoreHex: shouldPreseedWriterMaterial ? (provisionResult?.writerCoreHex || null) : null,
+      autobaseLocal: shouldPreseedWriterMaterial ? (provisionResult?.autobaseLocal || null) : null,
+      writerSecret: shouldPreseedWriterMaterial ? (provisionResult?.writerSecret || null) : null,
+      fastForward: shouldPreseedWriterMaterial ? (provisionResult?.fastForward || null) : null
     }
 
     if (SCENARIO?.groupType !== 'OPEN') {
@@ -950,6 +993,23 @@ async function runScenario() {
       type: 'start-join-flow',
       data: joinPayload
     })
+
+    if (expectJoinFailure) {
+      const failFastEvent = await waitForJoinFailFast(workerB, {
+        relayKey,
+        publicIdentifier,
+        timeoutMs: GATES.joinToWritableMs + 5000
+      })
+      summary.joinFailFastReason = typeof failFastEvent?.reasonCode === 'string'
+        ? failFastEvent.reasonCode
+        : 'join-fail-fast-abort'
+      const failTraceId =
+        typeof failFastEvent?.traceId === 'string' && failFastEvent.traceId.trim()
+          ? failFastEvent.traceId.trim()
+          : null
+      await waitForJoinFanout(workerB, failTraceId, 15000)
+      return summary
+    }
 
     const joinResult = await waitForJoinWritable(workerB, {
       relayKey,

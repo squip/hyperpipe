@@ -750,6 +750,10 @@ const GroupsPage = forwardRef<
         writerCoreHex: inv.writerCoreHex,
         autobaseLocal: inv.autobaseLocal,
         writerSecret: inv.writerSecret,
+        discoveryTopic: inv.discoveryTopic || undefined,
+        hostPeerKeys: Array.isArray(inv.hostPeerKeys) ? inv.hostPeerKeys : undefined,
+        memberPeerKeys: Array.isArray(inv.memberPeerKeys) ? inv.memberPeerKeys : undefined,
+        writerIssuerPubkey: inv.writerIssuerPubkey || undefined,
         gatewayOrigins: Array.isArray(inv.gatewayOrigins) ? inv.gatewayOrigins : undefined,
         fastForward: inv.fastForward || undefined
       })
