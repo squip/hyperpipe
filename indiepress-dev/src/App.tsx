@@ -27,6 +27,8 @@ import { UserTrustProvider } from '@/providers/UserTrustProvider'
 import { ZapProvider } from '@/providers/ZapProvider'
 import { MessengerProvider } from '@/providers/MessengerProvider'
 import { NotepadProvider } from '@/providers/NotepadProvider'
+import MatrixE2EBridge from '@/devtools/matrixE2EBridge'
+import { isElectron } from '@/lib/platform'
 import { PluginRegistryProvider } from '@/providers/PluginRegistryProvider'
 import { PageManager } from './PageManager'
 import { GroupFilesProvider } from './providers/GroupFilesProvider'
@@ -34,6 +36,14 @@ import { GroupsProvider } from './providers/GroupsProvider'
 import { WorkerBridgeProvider } from './providers/WorkerBridgeProvider'
 
 export default function App(): JSX.Element {
+  const enableMatrixE2EBridge =
+    isElectron()
+    && typeof window !== 'undefined'
+    && (() => {
+      const params = new URLSearchParams(window.location.search)
+      return params.get('htMatrixE2E') === '1' || params.get('ht_matrix_e2e') === '1'
+    })()
+
   return (
     <ScreenSizeProvider>
       <UserPreferencesProvider>
@@ -64,6 +74,9 @@ export default function App(): JSX.Element {
                                                         <GroupFilesProvider>
                                                           <PluginRegistryProvider>
                                                             <PageManager />
+                                                            {enableMatrixE2EBridge ? (
+                                                              <MatrixE2EBridge enabled />
+                                                            ) : null}
                                                           </PluginRegistryProvider>
                                                         </GroupFilesProvider>
                                                       </GroupsProvider>

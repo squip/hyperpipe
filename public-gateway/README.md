@@ -25,6 +25,12 @@ This creates runtime deployment files in:
 - `public-gateway/deploy/runtime/.env`
 - `public-gateway/deploy/runtime/config.json`
 
+Wizard notes:
+
+- `GATEWAY_OPERATOR_PUBKEY_HEX` is auto-derived from `GATEWAY_OPERATOR_NSEC_HEX`.
+- Relay host admin keypair (`GATEWAY_RELAY_ADMIN_*`) is auto-derived from the relay seed.
+- Runtime `.env` now includes relay namespace/topic and stdout log rotation settings.
+
 After `deploy up`, open:
 
 - Admin UI: `${GATEWAY_PUBLIC_URL}/admin`

@@ -61,6 +61,39 @@ function normalizePubkey(value) {
   return trimmed
 }
 
+function normalizeGatewayMode(value) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === 'remote' || normalized === 'disabled') return normalized
+  return 'local'
+}
+
+const gatewayTopology = {
+  gateway1: {
+    mode: normalizeGatewayMode(process.env.HT_GW1_MODE || 'local'),
+    remoteLogCommand:
+      typeof process.env.HT_GW1_REMOTE_LOG_CMD === 'string' && process.env.HT_GW1_REMOTE_LOG_CMD.trim()
+        ? process.env.HT_GW1_REMOTE_LOG_CMD.trim()
+        : null
+  },
+  gateway2: {
+    mode: normalizeGatewayMode(process.env.HT_GW2_MODE || 'local'),
+    remoteLogCommand:
+      typeof process.env.HT_GW2_REMOTE_LOG_CMD === 'string' && process.env.HT_GW2_REMOTE_LOG_CMD.trim()
+        ? process.env.HT_GW2_REMOTE_LOG_CMD.trim()
+        : null
+  }
+}
+
+function isGatewayEnabled(name) {
+  const topology = gatewayTopology[name]
+  return !!topology && topology.mode !== 'disabled'
+}
+
+function isGatewayLocal(name) {
+  const topology = gatewayTopology[name]
+  return !!topology && topology.mode === 'local'
+}
+
 function dedupePubkeys(values = []) {
   const unique = new Set()
   for (const value of values) {
@@ -254,9 +287,36 @@ function parseWorkerLogContent(content) {
   const joinFanout = []
   const autoconnectFanout = []
   const failFastSignals = []
+  const joinHintSignals = {
+    joinStartSeen: false,
+    joinStartCount: 0,
+    maxHostPeerHintsCount: 0,
+    sawDiscoveryTopicHint: false,
+    sawWriterIssuerHint: false,
+    sawHostPeerHintsZero: false
+  }
 
   for (const line of content.split(/\r?\n/)) {
     if (!line.trim()) continue
+
+    if (line.includes('[Worker] Start join flow input')) {
+      joinHintSignals.joinStartSeen = true
+      joinHintSignals.joinStartCount += 1
+    }
+    const hostHintMatch = line.match(/\bhostPeerHintsCount:\s*([0-9]+)/)
+    if (hostHintMatch) {
+      const value = Number.parseInt(hostHintMatch[1], 10)
+      if (Number.isFinite(value)) {
+        joinHintSignals.maxHostPeerHintsCount = Math.max(joinHintSignals.maxHostPeerHintsCount, value)
+        if (value === 0) joinHintSignals.sawHostPeerHintsZero = true
+      }
+    }
+    if (/\bdiscoveryTopic:\s*'?[a-f0-9]{16,}'?/i.test(line)) {
+      joinHintSignals.sawDiscoveryTopicHint = true
+    }
+    if (/\bwriterIssuerPubkey:\s*'?[a-f0-9]{16,}'?/i.test(line)) {
+      joinHintSignals.sawWriterIssuerHint = true
+    }
 
     if (line.includes('JOIN_FAIL_FAST_ABORT')) {
       failFastSignals.push({
@@ -341,7 +401,8 @@ function parseWorkerLogContent(content) {
     autoconnectTelemetry,
     joinFanout,
     autoconnectFanout,
-    failFastSignals
+    failFastSignals,
+    joinHintSignals
   }
 }
 
@@ -351,7 +412,15 @@ async function parseWorkerLogs(files = []) {
     autoconnectTelemetry: [],
     joinFanout: [],
     autoconnectFanout: [],
-    failFastSignals: []
+    failFastSignals: [],
+    joinHintSignals: {
+      joinStartSeen: false,
+      joinStartCount: 0,
+      maxHostPeerHintsCount: 0,
+      sawDiscoveryTopicHint: false,
+      sawWriterIssuerHint: false,
+      sawHostPeerHintsZero: false
+    }
   }
 
   for (const filePath of files) {
@@ -363,6 +432,19 @@ async function parseWorkerLogs(files = []) {
       combined.joinFanout.push(...parsed.joinFanout)
       combined.autoconnectFanout.push(...parsed.autoconnectFanout)
       combined.failFastSignals.push(...parsed.failFastSignals)
+      combined.joinHintSignals.joinStartSeen =
+        combined.joinHintSignals.joinStartSeen || parsed.joinHintSignals.joinStartSeen
+      combined.joinHintSignals.joinStartCount += parsed.joinHintSignals.joinStartCount || 0
+      combined.joinHintSignals.maxHostPeerHintsCount = Math.max(
+        combined.joinHintSignals.maxHostPeerHintsCount,
+        parsed.joinHintSignals.maxHostPeerHintsCount || 0
+      )
+      combined.joinHintSignals.sawDiscoveryTopicHint =
+        combined.joinHintSignals.sawDiscoveryTopicHint || parsed.joinHintSignals.sawDiscoveryTopicHint
+      combined.joinHintSignals.sawWriterIssuerHint =
+        combined.joinHintSignals.sawWriterIssuerHint || parsed.joinHintSignals.sawWriterIssuerHint
+      combined.joinHintSignals.sawHostPeerHintsZero =
+        combined.joinHintSignals.sawHostPeerHintsZero || parsed.joinHintSignals.sawHostPeerHintsZero
     } catch (_) {}
   }
 
@@ -440,11 +522,13 @@ function normalizeExpectedViewLength(observedViewLength, expectedViewLength) {
 function getEnvGatewayDefinitions() {
   return {
     gateway1: {
+      mode: gatewayTopology.gateway1.mode,
       baseUrl: process.env.HT_GW1_BASE_URL || 'http://127.0.0.1:4541',
       operatorPrivkey: process.env.HT_GW1_OPERATOR_PRIVKEY || '1111111111111111111111111111111111111111111111111111111111111111',
       operatorPubkey: process.env.HT_GW1_OPERATOR_PUBKEY || '4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa'
     },
     gateway2: {
+      mode: gatewayTopology.gateway2.mode,
       baseUrl: process.env.HT_GW2_BASE_URL || 'http://127.0.0.1:4542',
       operatorPrivkey: process.env.HT_GW2_OPERATOR_PRIVKEY || '2222222222222222222222222222222222222222222222222222222222222222',
       operatorPubkey: process.env.HT_GW2_OPERATOR_PUBKEY || '466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27'
@@ -551,22 +635,19 @@ async function resetGatewayLists(gateway, token) {
 
 async function configureScenarioPolicies(scenario) {
   const gateways = getEnvGatewayDefinitions()
-  const g1Token = await issueOperatorToken(gateways.gateway1)
-  const g2Token = await issueOperatorToken(gateways.gateway2)
-
-  await gatewayRequest(gateways.gateway1, g1Token, 'POST', '/api/gateway/policy', {
-    policy: scenario.gateway1,
-    inviteOnly: scenario.id === 'S17',
-    discoveryRelays: ['wss://relay.damus.io', 'wss://nos.lol']
-  })
-  await gatewayRequest(gateways.gateway2, g2Token, 'POST', '/api/gateway/policy', {
-    policy: scenario.gateway2,
-    inviteOnly: false,
-    discoveryRelays: ['wss://relay.damus.io', 'wss://nos.lol']
-  })
-
-  await resetGatewayLists(gateways.gateway1, g1Token)
-  await resetGatewayLists(gateways.gateway2, g2Token)
+  const gatewayTokens = {}
+  for (const gatewayName of ['gateway1', 'gateway2']) {
+    if (!isGatewayEnabled(gatewayName)) continue
+    const gateway = gateways[gatewayName]
+    const token = await issueOperatorToken(gateway)
+    gatewayTokens[gatewayName] = token
+    await gatewayRequest(gateway, token, 'POST', '/api/gateway/policy', {
+      policy: scenario[gatewayName] === 'CLOSED' ? 'CLOSED' : 'OPEN',
+      inviteOnly: gatewayName === 'gateway1' && scenario.id === 'S17',
+      discoveryRelays: ['wss://relay.damus.io', 'wss://nos.lol']
+    })
+    await resetGatewayLists(gateway, token)
+  }
 
   const derivedAdminPubkey = derivePubkeyFromPrivkey(
     process.env.HT_MULTI_GATEWAY_WORKER_A_PRIVKEY || DEFAULT_WORKER_A_PRIVKEY
@@ -577,34 +658,42 @@ async function configureScenarioPolicies(scenario) {
   const adminPubkeys = dedupePubkeys([options.adminPubkey, derivedAdminPubkey])
   const workerBPubkeys = dedupePubkeys([options.workerBPubkey, derivedWorkerBPubkey])
 
-  const addAllow = async (gateway, token, pubkey) => {
+  const addAllow = async (gatewayName, pubkey) => {
     if (!pubkey) return
+    if (!isGatewayEnabled(gatewayName)) return
+    const gateway = gateways[gatewayName]
+    const token = gatewayTokens[gatewayName]
+    if (!gateway || !token) return
     await gatewayRequest(gateway, token, 'POST', '/api/gateway/allow-list', { pubkey })
   }
-  const addBan = async (gateway, token, pubkey) => {
+  const addBan = async (gatewayName, pubkey) => {
     if (!pubkey) return
+    if (!isGatewayEnabled(gatewayName)) return
+    const gateway = gateways[gatewayName]
+    const token = gatewayTokens[gatewayName]
+    if (!gateway || !token) return
     await gatewayRequest(gateway, token, 'POST', '/api/gateway/ban-list', { pubkey })
   }
 
   if (['S02', 'S06'].includes(scenario.id)) {
     for (const pubkey of adminPubkeys) {
-      await addAllow(gateways.gateway2, g2Token, pubkey)
+      await addAllow('gateway2', pubkey)
     }
   }
   if (['S03', 'S07'].includes(scenario.id)) {
     for (const pubkey of adminPubkeys) {
-      await addAllow(gateways.gateway1, g1Token, pubkey)
+      await addAllow('gateway1', pubkey)
     }
   }
   if (['S04', 'S08'].includes(scenario.id)) {
     for (const pubkey of adminPubkeys) {
-      await addAllow(gateways.gateway1, g1Token, pubkey)
-      await addAllow(gateways.gateway2, g2Token, pubkey)
+      await addAllow('gateway1', pubkey)
+      await addAllow('gateway2', pubkey)
     }
   }
   if (['S11', 'S12'].includes(scenario.id)) {
     for (const pubkey of workerBPubkeys) {
-      await addBan(gateways.gateway1, g1Token, pubkey)
+      await addBan('gateway1', pubkey)
     }
   }
 }
@@ -691,7 +780,9 @@ async function runScenarioExecutor(scenario, scenarioDir) {
     HT_SCENARIO_DIR: scenarioDir,
     HT_SCENARIO_TIMEOUT_MS: String(options.timeoutMs),
     HT_SCENARIO_BASELINE_DIR: options.baselineDir,
-    HT_MULTI_GATEWAY_GATES: JSON.stringify(HARD_GATES)
+    HT_MULTI_GATEWAY_GATES: JSON.stringify(HARD_GATES),
+    HT_GW1_MODE: gatewayTopology.gateway1.mode,
+    HT_GW2_MODE: gatewayTopology.gateway2.mode
   }
 
   const watchdog = {
@@ -841,6 +932,28 @@ async function runScenarioExecutor(scenario, scenarioDir) {
   }
 }
 
+async function captureGatewayLogSnapshot(gatewayName, scenarioDir) {
+  const topology = gatewayTopology[gatewayName]
+  if (!topology || !topology.remoteLogCommand) return null
+  const stdoutFile = path.join(scenarioDir, `${gatewayName}.snapshot.stdout.log`)
+  const stderrFile = path.join(scenarioDir, `${gatewayName}.snapshot.stderr.log`)
+  const run = await runCommand('zsh', ['-lc', topology.remoteLogCommand], {
+    cwd: ROOT_DIR,
+    timeoutMs: 120000,
+    stdoutFile,
+    stderrFile
+  })
+  return {
+    gateway: gatewayName,
+    mode: topology.mode,
+    command: topology.remoteLogCommand,
+    code: run.code,
+    timedOut: run.timedOut,
+    stdoutFile,
+    stderrFile
+  }
+}
+
 async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
   const summary = executorResult.summary && typeof executorResult.summary === 'object'
     ? executorResult.summary
@@ -909,6 +1022,14 @@ async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
     const failFastObserved = failFastSignals.length > 0
       || joinPerf?.failFastReason
       || autoconnectPerf?.failFastReason
+    const joinHintSignals = parsedWorker.joinHintSignals || {
+      joinStartSeen: false,
+      joinStartCount: 0,
+      maxHostPeerHintsCount: 0,
+      sawDiscoveryTopicHint: false,
+      sawWriterIssuerHint: false,
+      sawHostPeerHintsZero: false
+    }
     const checks = [
       {
         name: 'expected_closed_join_without_lease_fail_fast',
@@ -916,6 +1037,13 @@ async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
         signals: failFastSignals,
         joinFailFastReason: joinPerf?.failFastReason || null,
         autoconnectFailFastReason: autoconnectPerf?.failFastReason || null
+      },
+      {
+        name: 'join_dispatch_hint_evidence',
+        pass:
+          joinHintSignals.joinStartSeen
+          && (joinHintSignals.maxHostPeerHintsCount > 0 || joinHintSignals.sawDiscoveryTopicHint),
+        joinHintSignals
       }
     ]
     return {
@@ -1078,6 +1206,36 @@ async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
     })
   }
 
+  const joinHintSignals = parsedWorker.joinHintSignals || {
+    joinStartSeen: false,
+    joinStartCount: 0,
+    maxHostPeerHintsCount: 0,
+    sawDiscoveryTopicHint: false,
+    sawWriterIssuerHint: false,
+    sawHostPeerHintsZero: false
+  }
+  const metadataHintContinuityPass =
+    !joinHintSignals.joinStartSeen
+    || (
+      joinHintSignals.sawDiscoveryTopicHint
+      && (
+        joinHintSignals.maxHostPeerHintsCount > 0
+        || scenario?.id === 'S19'
+      )
+    )
+  checks.push({
+    name: 'join_dispatch_hint_evidence',
+    pass:
+      joinHintSignals.joinStartSeen
+      && (joinHintSignals.maxHostPeerHintsCount > 0 || joinHintSignals.sawDiscoveryTopicHint),
+    joinHintSignals
+  })
+  checks.push({
+    name: 'metadata_hint_continuity',
+    pass: metadataHintContinuityPass,
+    joinHintSignals
+  })
+
   if (parsedWorker.failFastSignals.length > 0) {
     checks.push({
       name: 'fail_fast_signals',
@@ -1124,22 +1282,40 @@ async function main() {
   logLine('[multi-gateway] artifacts directory', { runDir })
   logLine('[multi-gateway] baseline calibration reference', { baselineDir: options.baselineDir })
   logLine('[multi-gateway] scenario executor', { executor: options.executor })
+  logLine('[multi-gateway] gateway topology', {
+    gateway1: gatewayTopology.gateway1.mode,
+    gateway2: gatewayTopology.gateway2.mode
+  })
 
   let dockerStarted = false
   if (!options.skipDocker && !options.dryRun) {
-    logLine('[multi-gateway] starting docker stack')
-    const up = await dockerCompose(['up', '-d', '--build'])
-    if (up.code !== 0) {
-      throw new Error(`docker compose up failed: ${up.code}`)
-    }
-    dockerStarted = true
+    const localServices = []
+    if (isGatewayLocal('gateway1')) localServices.push('redis1', 'gateway1')
+    if (isGatewayLocal('gateway2')) localServices.push('redis2', 'gateway2')
 
-    const health1 = await waitForGatewayHealth(process.env.HT_GW1_BASE_URL || 'http://127.0.0.1:4541')
-    const health2 = await waitForGatewayHealth(process.env.HT_GW2_BASE_URL || 'http://127.0.0.1:4542')
-    if (!health1 || !health2) {
-      throw new Error('gateway health checks failed after docker startup')
+    if (localServices.length > 0) {
+      logLine('[multi-gateway] starting local docker gateways', { services: localServices })
+      const up = await dockerCompose(['up', '-d', '--build', ...localServices])
+      if (up.code !== 0) {
+        throw new Error(`docker compose up failed: ${up.code}`)
+      }
+      dockerStarted = true
+    } else {
+      logLine('[multi-gateway] no local gateways selected; skipping docker startup')
     }
-    logLine('[multi-gateway] docker stack healthy')
+  }
+
+  if (!options.dryRun) {
+    const gateways = getEnvGatewayDefinitions()
+    for (const gatewayName of ['gateway1', 'gateway2']) {
+      if (!isGatewayEnabled(gatewayName)) continue
+      const gateway = gateways[gatewayName]
+      const healthy = await waitForGatewayHealth(gateway.baseUrl)
+      if (!healthy) {
+        throw new Error(`gateway health check failed: ${gatewayName} (${gateway.baseUrl})`)
+      }
+    }
+    logLine('[multi-gateway] gateway health checks passed')
   }
 
   const results = []
@@ -1163,7 +1339,7 @@ async function main() {
         continue
       }
 
-      if (!options.skipDocker) {
+      if (isGatewayEnabled('gateway1') || isGatewayEnabled('gateway2')) {
         try {
           await configureScenarioPolicies(scenario)
         } catch (error) {
@@ -1185,17 +1361,43 @@ async function main() {
       })
 
       const executorResult = await runScenarioExecutor(scenario, scenarioDir)
+      const gatewaySnapshots = []
+      for (const gatewayName of ['gateway1', 'gateway2']) {
+        if (!gatewayTopology[gatewayName]?.remoteLogCommand) continue
+        try {
+          const snapshot = await captureGatewayLogSnapshot(gatewayName, scenarioDir)
+          if (snapshot) gatewaySnapshots.push(snapshot)
+        } catch (error) {
+          gatewaySnapshots.push({
+            gateway: gatewayName,
+            mode: gatewayTopology[gatewayName]?.mode || null,
+            command: gatewayTopology[gatewayName]?.remoteLogCommand || null,
+            error: error?.message || String(error)
+          })
+        }
+      }
+      if (gatewaySnapshots.length > 0) {
+        await fs.writeFile(
+          path.join(scenarioDir, 'gateway-snapshots.json'),
+          JSON.stringify(gatewaySnapshots, null, 2),
+          'utf8'
+        )
+      }
       if (executorResult.status !== 'OK') {
         results.push({
           scenario: scenario.id,
           status: executorResult.status,
           reason: executorResult.reason,
-          checks: []
+          checks: [],
+          gatewaySnapshots
         })
         continue
       }
 
       const evaluated = await evaluateScenarioResult(scenario, scenarioDir, executorResult)
+      if (gatewaySnapshots.length > 0) {
+        evaluated.gatewaySnapshots = gatewaySnapshots
+      }
       results.push(evaluated)
 
       await fs.writeFile(
@@ -1225,6 +1427,10 @@ async function main() {
     runDir,
     gates: HARD_GATES,
     baselineDir: options.baselineDir,
+    topology: {
+      gateway1: gatewayTopology.gateway1.mode,
+      gateway2: gatewayTopology.gateway2.mode
+    },
     total: results.length,
     passed: results.filter((entry) => entry.status === 'PASS').length,
     failed: results.filter((entry) => entry.status === 'FAIL').length,
@@ -1241,6 +1447,7 @@ async function main() {
     `- Generated: ${summary.generatedAt}`,
     `- Run Dir: ${summary.runDir}`,
     `- Baseline Reference: ${summary.baselineDir}`,
+    `- Topology: gateway1=${summary.topology.gateway1} gateway2=${summary.topology.gateway2}`,
     `- Totals: pass=${summary.passed} fail=${summary.failed} blocked=${summary.blocked} skip=${summary.skipped}`,
     '',
     '| Scenario | Status | Hard Failures |',

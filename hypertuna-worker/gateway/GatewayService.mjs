@@ -37,6 +37,7 @@ const DEFAULT_PORT = 8443;
 const PUBLIC_GATEWAY_RELAY_KEY = 'public-gateway:hyperbee';
 const PUBLIC_GATEWAY_RELAY_PATH = 'relay';
 const PUBLIC_GATEWAY_RELAY_PATH_ALIASES = ['public-gateway/hyperbee'];
+const EVENT_FORWARD_ACK_TIMEOUT_MS = 1500;
 
 function guessContentType(fileName = '') {
   const lower = typeof fileName === 'string' ? fileName.toLowerCase() : '';
@@ -1030,16 +1031,10 @@ export class GatewayService extends EventEmitter {
   }
 
   #logExternal(level, message, meta) {
-    const parts = ['[PublicGateway]'];
-    if (message) parts.push(message);
-    if (meta && Object.keys(meta).length) {
-      try {
-        parts.push(JSON.stringify(meta));
-      } catch (_) {
-        parts.push(String(meta));
-      }
-    }
-    this.log(level, parts.join(' '));
+    const prefix = '[PublicGateway]';
+    const text = message ? `${prefix} ${message}` : prefix;
+    const metadata = (meta && typeof meta === 'object' && Object.keys(meta).length) ? meta : null;
+    this.log(level, text, metadata);
   }
 
   #computePublicGatewayWsBase(baseUrl) {
@@ -1730,16 +1725,29 @@ export class GatewayService extends EventEmitter {
     });
   }
 
-  log(level, message) {
+  log(level, message, metadata = null) {
+    const normalizedLevel = typeof level === 'string' ? level.toLowerCase() : 'info';
+    const normalizedMessage = typeof message === 'string' ? message : String(message);
     const entry = {
       id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-      level,
-      message,
+      level: normalizedLevel,
+      message: normalizedMessage,
       timestamp: new Date().toISOString()
     };
+    if (metadata && typeof metadata === 'object' && Object.keys(metadata).length) {
+      entry.metadata = metadata;
+    }
     this.logs.push(entry);
     if (this.logs.length > MAX_LOG_ENTRIES) {
       this.logs.shift();
+    }
+    if (normalizedLevel === 'warn' || normalizedLevel === 'error') {
+      const outputFn = normalizedLevel === 'error' ? console.error : console.warn;
+      if (entry.metadata) {
+        outputFn(entry.message, entry.metadata);
+      } else {
+        outputFn(entry.message);
+      }
     }
     this.emit('log', entry);
   }
@@ -3529,12 +3537,22 @@ export class GatewayService extends EventEmitter {
 
         let frameType = null;
         let frameSubscriptionId = null;
+        let frameEventId = null;
         if (typeof msg === 'string' || msg instanceof Buffer) {
           try {
             const parsed = JSON.parse(typeof msg === 'string' ? msg : msg.toString());
             if (Array.isArray(parsed)) {
               frameType = parsed[0];
-              frameSubscriptionId = parsed[1];
+              frameSubscriptionId =
+                (frameType === 'REQ' || frameType === 'CLOSE') && typeof parsed[1] === 'string'
+                  ? parsed[1]
+                  : null;
+              if (frameType === 'EVENT') {
+                const eventCandidate = parsed[1] || parsed[2] || null;
+                if (eventCandidate && typeof eventCandidate.id === 'string') {
+                  frameEventId = eventCandidate.id;
+                }
+              }
             }
           } catch (_) {}
         }
@@ -3625,7 +3643,10 @@ export class GatewayService extends EventEmitter {
           connData.shouldPollPeers = true;
         }
 
-        const healthyPeer = await this.findHealthyPeerForRelay(identifier, wantsDelegation);
+        // EVENT writes need the same retry behavior as delegated REQs;
+        // otherwise stale health can cause publish timeouts with no forward attempt.
+        const requiresRetryingPeerLookup = wantsDelegation || frameType === 'EVENT';
+        const healthyPeer = await this.findHealthyPeerForRelay(identifier, requiresRetryingPeerLookup);
         if (!healthyPeer) {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify(['NOTICE', 'No healthy peers available for this relay']));
@@ -3645,7 +3666,7 @@ export class GatewayService extends EventEmitter {
 
         let forwardSucceeded = false;
         try {
-          const responses = await this.#forwardMessageToPeer({
+          const forwardPromise = this.#forwardMessageToPeer({
             connData,
             healthyPeer,
             identifier,
@@ -3653,19 +3674,61 @@ export class GatewayService extends EventEmitter {
             subscriptionId,
             isRetry: false
           });
-
-          for (const response of responses) {
-            if (!response) continue;
-            if (response[0] === 'OK' && response[2] === false) {
-              const errorMsg = response[3] || '';
-              if (errorMsg.includes('Authentication') && ws.readyState === WebSocket.OPEN) {
-                ws.close(4403, 'Authentication failed');
-                return;
+          const flushForwardResponses = (responses = []) => {
+            if (!Array.isArray(responses)) {
+              return 0;
+            }
+            let sentCount = 0;
+            for (const response of responses) {
+              if (!response) continue;
+              if (response[0] === 'OK' && response[2] === false) {
+                const errorMsg = response[3] || '';
+                if (errorMsg.includes('Authentication') && ws.readyState === WebSocket.OPEN) {
+                  ws.close(4403, 'Authentication failed');
+                  return sentCount;
+                }
+              }
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(response));
+                sentCount += 1;
               }
             }
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify(response));
+            return sentCount;
+          };
+
+          let responses = null;
+          let eventAckSent = false;
+          if (frameType === 'EVENT') {
+            responses = await Promise.race([
+              forwardPromise,
+              new Promise((resolve) => setTimeout(() => resolve(null), EVENT_FORWARD_ACK_TIMEOUT_MS))
+            ]);
+            if (responses === null) {
+              if (frameEventId && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(['OK', frameEventId, true, 'accepted: pending']));
+                eventAckSent = true;
+              }
+              forwardPromise
+                .then((lateResponses) => {
+                  flushForwardResponses(lateResponses);
+                })
+                .catch((error) => {
+                  this.log('warn', '[PublicGateway] Late EVENT forward failed after provisional ack', {
+                    connectionKey,
+                    relayKey: identifier,
+                    peer: healthyPeer.publicKey?.slice(0, 12) || 'unknown',
+                    error: error?.message || String(error)
+                  });
+                });
+              responses = [];
             }
+          } else {
+            responses = await forwardPromise;
+          }
+
+          const sentCount = flushForwardResponses(responses);
+          if (frameType === 'EVENT' && sentCount === 0 && !eventAckSent && frameEventId && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(['OK', frameEventId, true, '']));
           }
 
           forwardSucceeded = true;
@@ -3703,7 +3766,12 @@ export class GatewayService extends EventEmitter {
         }
 
         if (shouldTriggerImmediatePoll && forwardSucceeded) {
-          await this.#pollDelegatedSubscriptions(connectionKey, { reason: 'immediate', allowRetry: true });
+          // Do not block the ws message queue on delegated poll work.
+          // Blocking here can starve subsequent EVENT frames and cause publish timeouts.
+          this.#pollDelegatedSubscriptions(connectionKey, { reason: 'immediate', allowRetry: true })
+            .catch((error) => {
+              this.log('warn', `[PublicGateway] Immediate delegated poll failed: ${error.message}`);
+            });
         }
       });
     });
@@ -4255,7 +4323,15 @@ export class GatewayService extends EventEmitter {
     const peerKeys = Array.from(relay.peers);
     if (!peerKeys.length) return null;
 
-    for (const publicKey of peerKeys) {
+    const ownPeerKey = this.ownPeerPublicKey || this.connectionPool?.getPublicKey?.() || null;
+    const orderedPeerKeys = ownPeerKey
+      ? [
+          ...peerKeys.filter((key) => key && key !== ownPeerKey),
+          ...peerKeys.filter((key) => key && key === ownPeerKey)
+        ]
+      : peerKeys;
+
+    for (const publicKey of orderedPeerKeys) {
       const peer = this.activePeers.find(p => p.publicKey === publicKey);
       if (!peer) continue;
       const healthy = this.peerHealthManager.isPeerHealthy(publicKey);
@@ -4265,7 +4341,7 @@ export class GatewayService extends EventEmitter {
     }
 
     if (allowRetry) {
-      for (const publicKey of peerKeys) {
+      for (const publicKey of orderedPeerKeys) {
         const peer = this.activePeers.find(p => p.publicKey === publicKey);
         if (!peer) continue;
         const healthy = await this.peerHealthManager.checkPeerHealth(peer, this.connectionPool);

@@ -1,68 +1,100 @@
 # Multi-Gateway Live Matrix Harness
 
-This harness drives S01-S18 multi-gateway scenarios with:
-- 2 dockerized public gateways (`gateway1`, `gateway2`)
-- 2 isolated Redis instances (`redis1`, `redis2`)
-- fail-fast detection from worker join telemetry
-- hard performance gates and fanout threshold checks
+This harness validates S01-S22 across:
+- worker-direct executor (`executor-real.mjs`)
+- renderer/Electron executor (`executor-renderer.mjs`)
+- local/remote/disabled gateway topology mixes
 
 ## Files
-- `scenarios.mjs`: canonical S01-S18 scenario definitions + hard gate constants.
-- `docker-compose.yml`: local stack for gateways and Redis.
-- `env/gateway1.env`, `env/gateway2.env`: default gateway configs.
-- `run-matrix.mjs`: orchestrator + evaluator + artifacts writer.
+- `scenarios.mjs`: canonical S01-S22 scenario definitions + hard gate constants.
+- `executor-real.mjs`: worker-direct scenario driver.
+- `executor-renderer.mjs`: Playwright-driven Electron renderer scenario driver.
+- `run-matrix.mjs`: orchestrator, policy setup, health checks, evaluation, artifact generation.
+- `docker-compose.yml`: local gateway stack (`gateway1`,`gateway2`,`redis1`,`redis2`).
 
-## Required Inputs
-The matrix runner can execute the built-in real executor (`executor-real.mjs`) by default.
-You can still override with:
-- `--executor "<command>"`
-- `HT_MULTI_GATEWAY_SCENARIO_EXECUTOR="<command>"`
+Renderer executor prerequisites:
+- `indiepress-dev/node_modules/playwright` installed
+- `hypertuna-desktop/node_modules/electron` installed
 
-The command is executed with scenario context env vars:
+## Executor Contract
+The selected executor receives:
 - `HT_SCENARIO_ID`
 - `HT_SCENARIO_JSON`
 - `HT_SCENARIO_DIR`
 - `HT_SCENARIO_TIMEOUT_MS`
 - `HT_SCENARIO_BASELINE_DIR`
 - `HT_MULTI_GATEWAY_GATES`
+- `HT_GW1_MODE`
+- `HT_GW2_MODE`
 
-The executor should write:
-- worker logs to `${HT_SCENARIO_DIR}/workerA.log` and `${HT_SCENARIO_DIR}/workerB.log`
-  OR return explicit paths in summary JSON.
-- optional structured summary line:
-  - `HT_SCENARIO_SUMMARY={...json...}`
+Executors should emit:
+- worker logs (at minimum `workerA.log`, `workerB.log`) under `${HT_SCENARIO_DIR}`
+- `HT_SCENARIO_SUMMARY={...json...}` with optional:
+  - `workerLogs: string[]`
+  - `observedViewLength: number`
+  - `expectedViewLength: number`
+  - `autoConnectObservedViewLength: number`
+  - `autoConnectExpectedViewLength: number`
 
-Summary fields recognized by the harness:
-- `workerLogs: string[]`
-- `observedViewLength: number`
-- `expectedViewLength: number`
+## Gateway Topology Controls
+`run-matrix.mjs` supports per-gateway modes:
+- `HT_GW1_MODE=local|remote|disabled`
+- `HT_GW2_MODE=local|remote|disabled`
 
-## Join / Reliability Gates
-Hard-fail gates per scenario:
+Behavior:
+- local: docker service is started/stopped by the runner.
+- remote: no docker for that gateway; health/policy APIs are still exercised.
+- disabled: gateway is skipped for docker, health, and policy.
+
+Optional remote log snapshots per scenario:
+- `HT_GW1_REMOTE_LOG_CMD="<shell command>"`
+- `HT_GW2_REMOTE_LOG_CMD="<shell command>"`
+
+Snapshot outputs are written into each scenario artifact directory.
+
+## Reliability Gates
+Hard-fail:
 - join-to-writable <= 120000ms
 - writer-material stage <= 45000ms
 - fast-forward stage <= 30000ms
-- fanout success count >= 1
-- writable view length equals expected view length
+- fanout success >= 1
+- writable view length parity
 
-Warning-only gate:
-- join-to-writable <= 60000ms (warning when exceeded)
+Warning:
+- join-to-writable <= 60000ms
+
+Additional regression checks:
+- `join_dispatch_hint_evidence`
+- `metadata_hint_continuity`
+- required telemetry/source checks for S19-S22 (`JOIN_PATH_SELECTED`, `JOIN_WRITER_SOURCE`)
 
 ## Commands
-Run full matrix (with docker stack):
+Default matrix (worker-direct executor):
 ```bash
-node /Users/essorensen/hypertuna-electron/public-gateway/e2e/multi-gateway/run-matrix.mjs \
-  --executor "<your-scenario-driver>"
+node /Users/essorensen/hypertuna-electron/public-gateway/e2e/multi-gateway/run-matrix.mjs
 ```
 
-Run one scenario:
+Renderer executor matrix:
 ```bash
 node /Users/essorensen/hypertuna-electron/public-gateway/e2e/multi-gateway/run-matrix.mjs \
-  --scenario S11 \
-  --executor "<your-scenario-driver>"
+  --executor "node ./public-gateway/e2e/multi-gateway/executor-renderer.mjs"
 ```
 
-Dry run (no docker, no execution):
+Mixed topology (`GW1=remote`, `GW2=local`) with renderer executor:
+```bash
+HT_GW1_MODE=remote HT_GW2_MODE=local \
+node /Users/essorensen/hypertuna-electron/public-gateway/e2e/multi-gateway/run-matrix.mjs \
+  --executor "node ./public-gateway/e2e/multi-gateway/executor-renderer.mjs"
+```
+
+One scenario:
+```bash
+node /Users/essorensen/hypertuna-electron/public-gateway/e2e/multi-gateway/run-matrix.mjs \
+  --scenario S22 \
+  --executor "node ./public-gateway/e2e/multi-gateway/executor-renderer.mjs"
+```
+
+Dry run:
 ```bash
 node /Users/essorensen/hypertuna-electron/public-gateway/e2e/multi-gateway/run-matrix.mjs --dry-run
 ```
@@ -74,4 +106,4 @@ Outputs are written under:
 Per run:
 - `matrix-summary.json`
 - `matrix-summary.md`
-- per-scenario folder with `scenario.json`, executor logs, `result.json`.
+- per-scenario directory with `scenario.json`, executor logs, `result.json`, optional `gateway-snapshots.json`.

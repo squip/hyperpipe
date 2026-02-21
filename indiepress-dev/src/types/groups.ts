@@ -64,6 +64,7 @@ export type TGroupMetadata = {
   gateways?: TGatewayDescriptor[]
   discoveryTopic?: string | null
   hostPeerKeys?: string[]
+  memberPeerKeys?: string[]
   writerIssuerPubkey?: string | null
   event: Event
 }

@@ -87,6 +87,18 @@ function emitRendererEvent(channel, payload) {
   }
 }
 
+const userDataOverride = typeof process.env.HYPERTUNA_USER_DATA_DIR === 'string'
+  ? process.env.HYPERTUNA_USER_DATA_DIR.trim()
+  : '';
+if (userDataOverride) {
+  try {
+    app.setPath('userData', path.resolve(userDataOverride));
+    console.log('[Main] Using overridden userData path', app.getPath('userData'));
+  } catch (error) {
+    console.warn('[Main] Failed to apply HYPERTUNA_USER_DATA_DIR override:', error?.message || error);
+  }
+}
+
 const userDataPath = app.getPath('userData');
 const storagePath = path.join(userDataPath, 'hypertuna-data');
 const logFilePath = path.join(storagePath, 'desktop-console.log');
@@ -446,6 +458,26 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function applyUrlQuery(baseUrl, queryString) {
+  const rawUrl = typeof baseUrl === 'string' ? baseUrl.trim() : '';
+  if (!rawUrl) return rawUrl;
+  const normalizedQuery = typeof queryString === 'string'
+    ? queryString.trim().replace(/^\?/, '')
+    : '';
+  if (!normalizedQuery) return rawUrl;
+  try {
+    const parsed = new URL(rawUrl);
+    const incoming = new URLSearchParams(normalizedQuery);
+    incoming.forEach((value, key) => {
+      parsed.searchParams.set(key, value);
+    });
+    return parsed.toString();
+  } catch (_error) {
+    const separator = rawUrl.includes('?') ? '&' : '?';
+    return `${rawUrl}${separator}${normalizedQuery}`;
+  }
+}
+
 async function appendLogLineWithBackoff(line) {
   const payload = typeof line === 'string' ? line : String(line ?? '');
   if (!payload) return;
@@ -496,7 +528,14 @@ function createWindow() {
   });
 
   const devUrl = process.env.RENDERER_URL;
+  const rendererQueryRaw = typeof process.env.HYPERTUNA_RENDERER_QUERY === 'string'
+    ? process.env.HYPERTUNA_RENDERER_QUERY.trim()
+    : '';
+  const rendererSearch = rendererQueryRaw
+    ? (rendererQueryRaw.startsWith('?') ? rendererQueryRaw : `?${rendererQueryRaw}`)
+    : '';
   if (devUrl) {
+    const targetDevUrl = applyUrlQuery(devUrl, rendererQueryRaw);
     const loadDev = (url) => {
       if (!mainWindow || mainWindow.isDestroyed()) return;
       mainWindow.loadURL(url).catch((err) => {
@@ -505,12 +544,16 @@ function createWindow() {
     };
     mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
       console.warn(`[Main] Renderer load failed (${errorCode}): ${errorDescription} ${validatedURL ? `(${validatedURL})` : ''}. Retrying...`);
-      setTimeout(() => loadDev(devUrl), 750);
+      setTimeout(() => loadDev(targetDevUrl), 750);
     });
-    loadDev(devUrl);
+    loadDev(targetDevUrl);
   } else {
     const rendererPath = path.join(__dirname, '..', 'indiepress-dev', 'dist', 'index.html');
-    mainWindow.loadFile(rendererPath);
+    if (rendererSearch) {
+      mainWindow.loadFile(rendererPath, { search: rendererSearch });
+    } else {
+      mainWindow.loadFile(rendererPath);
+    }
   }
 }
 

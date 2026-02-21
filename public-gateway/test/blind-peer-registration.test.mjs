@@ -122,3 +122,86 @@ test('PublicGatewayService forwards raw peer keys to blind peer service', async 
   const postCleanupStatus = blindPeerService.getStatus();
   assert.equal(postCleanupStatus.trustedPeerCount, 1);
 });
+
+test('PublicGatewayService returns partial status when hyperswarm relay merges fail', async () => {
+  const rawPeerKey = randomBytes(32);
+  const peerHex = rawPeerKey.toString('hex');
+  const goodRelayKey = randomBytes(32).toString('hex');
+  const badRelayKey = 'bad-relay-key';
+
+  const registrationStore = {
+    getRelay: async () => null,
+    upsertRelay: async (relayKey) => {
+      if (relayKey === badRelayKey) {
+        throw new Error('merge-failed');
+      }
+    },
+    items: new Map()
+  };
+
+  const noop = () => {};
+  const logger = {
+    info: noop,
+    warn: noop,
+    error: noop,
+    debug: noop,
+    child: () => logger
+  };
+
+  const service = new PublicGatewayService({
+    config: {
+      host: '127.0.0.1',
+      port: 0,
+      publicBaseUrl: 'https://example.com',
+      metrics: { enabled: false, path: '/metrics' },
+      registration: { sharedSecret: null, cacheTtlSeconds: 60 },
+      discovery: { enabled: false, openAccess: false },
+      relay: {},
+      features: {},
+      dispatcher: {},
+      blindPeer: { enabled: false }
+    },
+    logger,
+    registrationStore
+  });
+
+  const onProtocol = service.connectionPool.options.onProtocol;
+  let registrationHandler = null;
+  const protocol = {
+    handle: (path, handler) => {
+      if (path === '/gateway/register') {
+        registrationHandler = handler;
+      }
+    },
+    once: () => {}
+  };
+
+  onProtocol({
+    publicKey: peerHex,
+    protocol,
+    context: {
+      peerInfo: { publicKey: rawPeerKey }
+    }
+  });
+
+  assert.equal(typeof registrationHandler, 'function');
+
+  const response = await registrationHandler({
+    method: 'POST',
+    body: Buffer.from(JSON.stringify({
+      publicKey: peerHex,
+      relays: [
+        { identifier: 'good:relay', relayKey: goodRelayKey },
+        { identifier: 'bad:relay', relayKey: badRelayKey }
+      ]
+    }))
+  });
+
+  assert.equal(response.statusCode, 207);
+  const parsed = JSON.parse(response.body.toString());
+  assert.equal(parsed.status, 'partial');
+  assert.equal(parsed.mergedRelayCount, 1);
+  assert.equal(parsed.failedRelayCount, 1);
+  assert.equal(Array.isArray(parsed.failures), true);
+  assert.equal(parsed.failures.length, 1);
+});

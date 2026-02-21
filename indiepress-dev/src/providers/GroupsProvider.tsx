@@ -75,6 +75,7 @@ const JOIN_REQUESTS_HANDLED_STORAGE_KEY = 'hypertuna_join_requests_handled_v1'
 const GROUP_MEMBER_PREVIEW_TTL_MS = 2 * 60 * 1000
 const LEAVE_PUBLISH_RETRY_BASE_DELAY_MS = 5000
 const LEAVE_PUBLISH_RETRY_MAX_DELAY_MS = 60 * 60 * 1000
+const GROUP_GATEWAY_SYNC_THROTTLE_MS = 1500
 
 type GroupMemberPreviewEntry = {
   members: string[]
@@ -365,6 +366,10 @@ const createProvisionalGroupMetadata = (args: {
   isPublic?: boolean
   isOpen?: boolean
   gateways?: TGatewayDescriptor[]
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  memberPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
   createdAt?: number
 }): TGroupMetadata | null => {
   const groupId = String(args.groupId || '').trim()
@@ -372,15 +377,31 @@ const createProvisionalGroupMetadata = (args: {
   const name = typeof args.name === 'string' ? args.name.trim() : ''
   const about = typeof args.about === 'string' ? args.about.trim() : ''
   const picture = typeof args.picture === 'string' ? args.picture.trim() : ''
+  const discoveryTopic =
+    typeof args.discoveryTopic === 'string' && /^[a-f0-9]{64}$/i.test(args.discoveryTopic.trim())
+      ? args.discoveryTopic.trim().toLowerCase()
+      : null
+  const hostPeerKeys = normalizePubkeyList(args.hostPeerKeys || [])
+  const memberPeerKeys = normalizePubkeyList(args.memberPeerKeys || [])
+  const writerIssuerPubkey =
+    typeof args.writerIssuerPubkey === 'string' && /^[a-f0-9]{64}$/i.test(args.writerIssuerPubkey.trim())
+      ? args.writerIssuerPubkey.trim().toLowerCase()
+      : null
   const hasGatewayInput = Array.isArray(args.gateways)
   const normalizedGateways = hasGatewayInput ? normalizeGatewayTags(buildGatewayTags(args.gateways)) : []
+  const hasHintMetadata =
+    !!discoveryTopic
+    || hostPeerKeys.length > 0
+    || memberPeerKeys.length > 0
+    || !!writerIssuerPubkey
   const hasAnyMetadata =
     !!name ||
     !!about ||
     !!picture ||
     typeof args.isPublic === 'boolean' ||
     typeof args.isOpen === 'boolean' ||
-    hasGatewayInput
+    hasGatewayInput ||
+    hasHintMetadata
   if (!hasAnyMetadata) return null
   const createdAt =
     Number.isFinite(args.createdAt) && (args.createdAt as number) > 0
@@ -396,6 +417,10 @@ const createProvisionalGroupMetadata = (args: {
   if (picture) tags.push(['picture', picture])
   if (typeof args.isPublic === 'boolean') tags.push([args.isPublic ? 'public' : 'private'])
   if (typeof args.isOpen === 'boolean') tags.push([args.isOpen ? 'open' : 'closed'])
+  if (discoveryTopic) tags.push(['swarm-topic', discoveryTopic])
+  hostPeerKeys.forEach((peerKey) => tags.push(['host-peer', peerKey]))
+  memberPeerKeys.forEach((peerKey) => tags.push(['member-peer', peerKey]))
+  if (writerIssuerPubkey) tags.push(['writer-issuer', writerIssuerPubkey])
   tags.push(...buildGatewayTags(normalizedGateways))
   const event = {
     id: `provisional:${groupId}:${createdAt}`,
@@ -416,6 +441,10 @@ const createProvisionalGroupMetadata = (args: {
     isOpen: typeof args.isOpen === 'boolean' ? args.isOpen : undefined,
     tags: [],
     gateways: normalizedGateways,
+    discoveryTopic,
+    hostPeerKeys,
+    memberPeerKeys,
+    writerIssuerPubkey,
     event
   }
 }
@@ -438,14 +467,15 @@ type SendInviteOptions = {
   authorizedMemberPubkeys?: string[]
 }
 
-const normalizePubkeyList = (values?: string[] | null) =>
-  Array.from(
+function normalizePubkeyList(values?: string[] | null) {
+  return Array.from(
     new Set(
       (Array.isArray(values) ? values : [])
         .map((value) => String(value || '').trim())
         .filter(Boolean)
     )
   )
+}
 
 const normalizeGatewayOriginsFromDescriptors = (
   gateways?: Array<{ origin?: string | null } | string> | null
@@ -461,6 +491,9 @@ const normalizeGatewayOriginsFromDescriptors = (
         .filter(Boolean)
     )
   )
+
+const isLikelyRelayUrl = (value: unknown): value is string =>
+  typeof value === 'string' && /^(wss?|https?):\/\//i.test(value.trim())
 
 const normalizeWriterLeaseEnvelope = (value: unknown): WriterLeaseEnvelope | null => {
   if (!value || typeof value !== 'object') return null
@@ -677,7 +710,7 @@ const mergeMembershipEvents = <T extends { id?: string | null }>(primary: T[], s
 
 export function GroupsProvider({ children }: { children: ReactNode }) {
   const { pubkey, publish, relayList, nip04Decrypt, nip04Encrypt, followList } = useNostr()
-  const { relays: workerRelays, joinFlows, createRelay, sendToWorker } = useWorkerBridge()
+  const { relays: workerRelays, gatewayStatus, joinFlows, createRelay, sendToWorker } = useWorkerBridge()
   const [discoveryGroups, setDiscoveryGroups] = useState<TGroupMetadata[]>([])
   const [invites, setInvites] = useState<TGroupInvite[]>([])
   const [gatewayMetadata, setGatewayMetadata] = useState<TGatewayMetadata[]>([])
@@ -738,6 +771,22 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const groupMemberPreviewByKeyRef = useRef<Record<string, GroupMemberPreviewEntry>>({})
   const groupMemberPreviewInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map())
   const inviteRefreshInFlightRef = useRef(false)
+  const groupGatewaySyncSenderRef = useRef(sendToWorker)
+  const groupGatewaySyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const groupGatewaySyncPendingRef = useRef<
+    | {
+        signature: string
+        entries: Array<{
+          groupId: string
+          gatewayOrigins: string[]
+          sourceEventId?: string
+          updatedAt?: number
+        }>
+      }
+    | null
+  >(null)
+  const groupGatewaySyncLastSignatureRef = useRef<string | null>(null)
+  const groupGatewaySyncLastSentAtRef = useRef(0)
 
   const workerRelayUrlMap = useMemo(() => {
     const map = new Map<string, string>()
@@ -824,7 +873,35 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   )
 
   useEffect(() => {
-    if (!isElectron() || !sendToWorker) return
+    groupGatewaySyncSenderRef.current = sendToWorker
+  }, [sendToWorker])
+
+  useEffect(() => {
+    return () => {
+      if (groupGatewaySyncTimerRef.current) {
+        clearTimeout(groupGatewaySyncTimerRef.current)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isElectron()) return
+
+    const flushGroupGatewaySync = () => {
+      const pending = groupGatewaySyncPendingRef.current
+      const sender = groupGatewaySyncSenderRef.current
+      if (!pending || !sender) return
+      groupGatewaySyncPendingRef.current = null
+      groupGatewaySyncLastSignatureRef.current = pending.signature
+      groupGatewaySyncLastSentAtRef.current = Date.now()
+      sender({
+        type: 'sync-group-gateway-origins',
+        data: pending.entries
+      }).catch((error) => {
+        console.warn('[GroupsProvider] Failed to sync group gateway origins to worker', error)
+      })
+    }
+
     const groupGatewaySync = new Map<
       string,
       {
@@ -846,7 +923,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const updatedAt =
         Number.isFinite(group.event?.created_at) && group.event.created_at > 0
           ? Math.trunc(group.event.created_at * 1000)
-          : Date.now()
+          : Number.isFinite((group as any)?.updatedAt) && (group as any).updatedAt > 0
+            ? Math.trunc((group as any).updatedAt)
+            : 0
       const existing = groupGatewaySync.get(groupId)
       if (!existing || (existing.updatedAt || 0) <= updatedAt) {
         groupGatewaySync.set(groupId, {
@@ -862,14 +941,49 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     Object.values(provisionalGroupMetadataByKey).forEach((entry) => upsertGroup(entry?.metadata || null))
 
     const entries = Array.from(groupGatewaySync.values())
-    if (!entries.length) return
-    sendToWorker({
-      type: 'sync-group-gateway-origins',
-      data: entries
-    }).catch((error) => {
-      console.warn('[GroupsProvider] Failed to sync group gateway origins to worker', error)
-    })
-  }, [discoveryGroups, provisionalGroupMetadataByKey, sendToWorker])
+      .map((entry) => ({
+        ...entry,
+        gatewayOrigins: [...entry.gatewayOrigins].sort()
+      }))
+      .sort((a, b) => a.groupId.localeCompare(b.groupId))
+    if (!entries.length) {
+      groupGatewaySyncPendingRef.current = null
+      if (groupGatewaySyncTimerRef.current) {
+        clearTimeout(groupGatewaySyncTimerRef.current)
+        groupGatewaySyncTimerRef.current = null
+      }
+      return
+    }
+    const signature = JSON.stringify(
+      entries.map((entry) => [
+        entry.groupId,
+        entry.sourceEventId || '',
+        entry.updatedAt || 0,
+        entry.gatewayOrigins
+      ])
+    )
+
+    if (signature === groupGatewaySyncLastSignatureRef.current) {
+      return
+    }
+
+    groupGatewaySyncPendingRef.current = { signature, entries }
+    if (groupGatewaySyncTimerRef.current) {
+      return
+    }
+
+    const elapsedMs = Date.now() - groupGatewaySyncLastSentAtRef.current
+    const delayMs = Math.max(0, GROUP_GATEWAY_SYNC_THROTTLE_MS - elapsedMs)
+    if (delayMs === 0) {
+      flushGroupGatewaySync()
+      return
+    }
+
+    groupGatewaySyncTimerRef.current = setTimeout(() => {
+      groupGatewaySyncTimerRef.current = null
+      flushGroupGatewaySync()
+    }, delayMs)
+  }, [discoveryGroups, provisionalGroupMetadataByKey])
 
   const upsertProvisionalGroupMetadata = useCallback(
     (args: {
@@ -881,6 +995,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       isPublic?: boolean
       isOpen?: boolean
       gateways?: TGatewayDescriptor[]
+      discoveryTopic?: string | null
+      hostPeerKeys?: string[]
+      memberPeerKeys?: string[]
+      writerIssuerPubkey?: string | null
       createdAt?: number
       source: ProvisionalGroupMetadataEntry['source']
     }) => {
@@ -900,6 +1018,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         isPublic: args.isPublic,
         isOpen: args.isOpen,
         gateways: args.gateways,
+        discoveryTopic: args.discoveryTopic,
+        hostPeerKeys: args.hostPeerKeys,
+        memberPeerKeys: args.memberPeerKeys,
+        writerIssuerPubkey: args.writerIssuerPubkey,
         createdAt: args.createdAt
       })
       if (!metadata) return
@@ -926,6 +1048,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             (current.metadata.picture || '') === (metadata.picture || '') &&
             current.metadata.isPublic === metadata.isPublic &&
             current.metadata.isOpen === metadata.isOpen &&
+            (current.metadata.discoveryTopic || '') === (metadata.discoveryTopic || '') &&
+            JSON.stringify(current.metadata.hostPeerKeys || []) ===
+              JSON.stringify(metadata.hostPeerKeys || []) &&
+            JSON.stringify(current.metadata.memberPeerKeys || []) ===
+              JSON.stringify(metadata.memberPeerKeys || []) &&
+            (current.metadata.writerIssuerPubkey || '') === (metadata.writerIssuerPubkey || '') &&
             JSON.stringify(current.metadata.gateways || []) === JSON.stringify(metadata.gateways || [])
           ) {
             return
@@ -1368,6 +1496,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             picture: matchedInvite.groupPicture,
             isPublic: matchedInvite.isPublic,
             isOpen: matchedInvite.fileSharing,
+            discoveryTopic: matchedInvite.discoveryTopic || null,
+            hostPeerKeys: matchedInvite.hostPeerKeys,
+            memberPeerKeys: matchedInvite.memberPeerKeys,
+            writerIssuerPubkey: matchedInvite.writerIssuerPubkey || null,
             createdAt: matchedInvite.event?.created_at,
             source: 'invite'
           })
@@ -1639,6 +1771,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           picture: invite.groupPicture,
           isPublic: invite.isPublic,
           isOpen: invite.fileSharing,
+          discoveryTopic: invite.discoveryTopic || null,
+          hostPeerKeys: invite.hostPeerKeys,
+          memberPeerKeys: invite.memberPeerKeys,
+          writerIssuerPubkey: invite.writerIssuerPubkey || null,
           createdAt: invite.event?.created_at,
           source: 'invite'
         })
@@ -2304,6 +2440,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           picture: metadata.picture,
           isPublic: metadata.isPublic,
           isOpen: metadata.isOpen,
+          discoveryTopic: metadata.discoveryTopic || null,
+          hostPeerKeys: metadata.hostPeerKeys,
+          memberPeerKeys: metadata.memberPeerKeys,
+          writerIssuerPubkey: metadata.writerIssuerPubkey || null,
           createdAt: metadata.event?.created_at,
           source: 'update'
         })
@@ -3372,6 +3512,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             picture: metadata.picture,
             isPublic: metadata.isPublic,
             isOpen: metadata.isOpen,
+            discoveryTopic: metadata.discoveryTopic || null,
+            hostPeerKeys: metadata.hostPeerKeys,
+            memberPeerKeys: metadata.memberPeerKeys,
+            writerIssuerPubkey: metadata.writerIssuerPubkey || null,
             createdAt: metadata.event?.created_at,
             source: 'update'
           })
@@ -3702,8 +3846,30 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       if (!result?.success) throw new Error(result?.error || 'Failed to create relay')
 
       const publicIdentifier = result.publicIdentifier
-      const authenticatedRelayUrl = result.relayUrl
+      const authenticatedRelayUrl = (() => {
+        const rawRelayUrl = typeof result.relayUrl === 'string' ? result.relayUrl.trim() : ''
+        const authToken = typeof result.authToken === 'string' ? result.authToken.trim() : ''
+        if (!rawRelayUrl || !authToken) return rawRelayUrl
+        try {
+          const parsed = new URL(rawRelayUrl)
+          if (!parsed.searchParams.has('token')) {
+            parsed.searchParams.set('token', authToken)
+          }
+          return parsed.toString()
+        } catch (_err) {
+          return rawRelayUrl
+        }
+      })()
       const relayKey = result.relayKey || null
+      const discoveryTopic =
+        typeof result.discoveryTopic === 'string' && result.discoveryTopic.trim()
+          ? result.discoveryTopic.trim().toLowerCase()
+          : null
+      const hostPeerKeys = normalizePubkeyList(result.hostPeerKeys || [])
+      const writerIssuerPubkey =
+        typeof result.writerIssuerPubkey === 'string' && /^[a-f0-9]{64}$/i.test(result.writerIssuerPubkey.trim())
+          ? result.writerIssuerPubkey.trim().toLowerCase()
+          : (pubkey || null)
       if (!publicIdentifier || !authenticatedRelayUrl) {
         throw new Error('Worker did not return a publicIdentifier/relayUrl')
       }
@@ -3718,6 +3884,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         isPublic,
         isOpen,
         gateways,
+        discoveryTopic,
+        hostPeerKeys,
+        writerIssuerPubkey,
         source: 'create'
       })
 
@@ -3732,7 +3901,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           relayWsUrl,
           pictureTagUrl: picture,
           gateways,
-          writerIssuerPubkey: pubkey
+          discoveryTopic,
+          hostPeerKeys,
+          writerIssuerPubkey
         })
       const { adminListEvent, memberListEvent } = buildHypertunaAdminBootstrapDraftEvents({
         publicIdentifier,
@@ -3759,8 +3930,14 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       const workerBootstrap = result?.bootstrapPublish
       const workerBootstrapRelayUrl =
-        resolveRelayUrl(workerBootstrap?.relayWsUrl || authenticatedRelayUrl) ||
-        authenticatedRelayUrl
+        [
+          resolveRelayUrl(authenticatedRelayUrl),
+          authenticatedRelayUrl,
+          publicIdentifier ? resolveRelayUrl(publicIdentifier) : null,
+          relayKey ? resolveRelayUrl(relayKey) : null,
+          resolveRelayUrl(workerBootstrap?.relayWsUrl || ''),
+          workerBootstrap?.relayWsUrl || null
+        ].find(isLikelyRelayUrl) || authenticatedRelayUrl
       console.info('[GroupsProvider] create bootstrap worker status', {
         groupId: publicIdentifier,
         relayKey,
@@ -3777,6 +3954,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       })
 
       let bootstrapRelayUrl = workerBootstrapRelayUrl
+      let bootstrapSource: 'worker' | 'worker-trusted' | 'renderer-fallback' = 'worker'
       const workerVerification = await verifyGroupRelayBootstrapState({
         groupId: publicIdentifier,
         relayUrl: workerBootstrapRelayUrl,
@@ -3785,45 +3963,73 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       })
 
       if (!workerVerification.ok) {
-        console.warn(
-          '[GroupsProvider] create bootstrap worker verification failed, using renderer fallback',
-          {
+        if (workerBootstrap?.status === 'success') {
+          // Worker already published bootstrap events; renderer relay access can be unavailable.
+          // Trust worker success here and avoid blocking the create flow on renderer websocket reachability.
+          console.warn(
+            '[GroupsProvider] create bootstrap worker verification failed; trusting worker bootstrap result',
+            {
+              groupId: publicIdentifier,
+              relayKey,
+              status: workerBootstrap?.status || 'unknown',
+              workerError: workerBootstrap?.error || null,
+              verifyAttempt: workerVerification.attempt,
+              metadataFound: workerVerification.metadataFound,
+              membersFound: workerVerification.membersFound,
+              verifyError: workerVerification.error
+            }
+          )
+          bootstrapSource = 'worker-trusted'
+        } else {
+          console.warn(
+            '[GroupsProvider] create bootstrap worker verification failed, using renderer fallback',
+            {
+              groupId: publicIdentifier,
+              relayKey,
+              status: workerBootstrap?.status || 'unknown',
+              workerError: workerBootstrap?.error || null,
+              verifyAttempt: workerVerification.attempt,
+              metadataFound: workerVerification.metadataFound,
+              membersFound: workerVerification.membersFound,
+              verifyError: workerVerification.error
+            }
+          )
+          bootstrapRelayUrl = await publishBootstrapEventsToGroupRelay({
             groupId: publicIdentifier,
             relayKey,
-            status: workerBootstrap?.status || 'unknown',
-            workerError: workerBootstrap?.error || null,
-            verifyAttempt: workerVerification.attempt,
-            metadataFound: workerVerification.metadataFound,
-            membersFound: workerVerification.membersFound,
-            verifyError: workerVerification.error
-          }
-        )
-        bootstrapRelayUrl = await publishBootstrapEventsToGroupRelay({
-          groupId: publicIdentifier,
-          relayKey,
-          fallbackRelayUrl: workerBootstrapRelayUrl,
-          events: [groupCreateEvent, metadataEvent, hypertunaEvent, adminListEvent, memberListEvent]
-        })
+            fallbackRelayUrl: workerBootstrapRelayUrl,
+            events: [groupCreateEvent, metadataEvent, hypertunaEvent, adminListEvent, memberListEvent]
+          })
+          bootstrapSource = 'renderer-fallback'
+        }
       }
 
       console.info('[GroupsProvider] create bootstrap verify complete', {
         groupId: publicIdentifier,
         relayKey,
         relayUrl: bootstrapRelayUrl,
-        source: workerVerification.ok ? 'worker' : 'renderer-fallback',
+        source: bootstrapSource,
         metadataFound: workerVerification.metadataFound,
         membersFound: workerVerification.membersFound,
         adminsFound: workerVerification.adminsFound
       })
 
       // Bootstrap admin/member snapshots on the group relay.
-      const membershipSnapshotTargets = isPublic
-        ? Array.from(new Set([bootstrapRelayUrl, ...BIG_RELAY_URLS]))
-        : [bootstrapRelayUrl]
-      await Promise.all([
-        publish(adminListEvent, { specifiedRelayUrls: membershipSnapshotTargets }),
-        publish(memberListEvent, { specifiedRelayUrls: membershipSnapshotTargets })
-      ])
+      const membershipSnapshotTargets = !workerVerification.ok && workerBootstrap?.status === 'success'
+        ? (isPublic ? Array.from(new Set(BIG_RELAY_URLS)) : [])
+        : (isPublic ? Array.from(new Set([bootstrapRelayUrl, ...BIG_RELAY_URLS])) : [bootstrapRelayUrl])
+      if (membershipSnapshotTargets.length > 0) {
+        await Promise.all([
+          publish(adminListEvent, { specifiedRelayUrls: membershipSnapshotTargets }),
+          publish(memberListEvent, { specifiedRelayUrls: membershipSnapshotTargets })
+        ])
+      } else {
+        console.info('[GroupsProvider] create bootstrap membership snapshot skipped (worker trusted)', {
+          groupId: publicIdentifier,
+          relayKey,
+          isPublic
+        })
+      }
 
       return { groupId: publicIdentifier, relay: relayWsUrl }
     },
@@ -3900,6 +4106,28 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const inviteName = options?.name ?? meta?.name
       const inviteAbout = options?.about ?? meta?.about
       const invitePicture = options?.picture ?? meta?.picture
+      let inviteHostPeerKeys = normalizePubkeyList([
+        ...(Array.isArray(meta?.hostPeerKeys) ? meta.hostPeerKeys : []),
+        typeof gatewayStatus?.ownPeerPublicKey === 'string' ? gatewayStatus.ownPeerPublicKey : ''
+      ])
+      if (!inviteHostPeerKeys.length && sendToWorker) {
+        try {
+          const status = (await sendToWorker({ type: 'get-gateway-status' })) as
+            | { ownPeerPublicKey?: string; data?: { ownPeerPublicKey?: string } }
+            | null
+          const ownPeerKey =
+            typeof status?.ownPeerPublicKey === 'string'
+              ? status.ownPeerPublicKey
+              : typeof status?.data?.ownPeerPublicKey === 'string'
+                ? status.data.ownPeerPublicKey
+                : null
+          if (ownPeerKey) {
+            inviteHostPeerKeys = normalizePubkeyList([ownPeerKey])
+          }
+        } catch (_err) {
+          // best effort fallback
+        }
+      }
       const baseAuthorizedMemberPubkeys = normalizePubkeyList(options?.authorizedMemberPubkeys)
       const membershipRelayUrls = buildMembershipPublishTargets(resolved, isPublicGroup)
 
@@ -3925,7 +4153,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               inviteToken: inviteToken || null,
               useWriterPool: inviteToken ? false : true,
               discoveryTopic: meta?.discoveryTopic || null,
-              hostPeerKeys: normalizePubkeyList(meta?.hostPeerKeys),
+              hostPeerKeys: inviteHostPeerKeys,
               memberPeerKeys: normalizePubkeyList([
                 ...baseAuthorizedMemberPubkeys,
                 invitee
@@ -4014,7 +4242,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                   relayKey: inviteRelayKey,
                   gatewayOrigins: normalizeGatewayOriginsFromDescriptors(meta?.gateways),
                   discoveryTopic: meta?.discoveryTopic || null,
-                  hostPeerKeys: normalizePubkeyList(meta?.hostPeerKeys),
+                  hostPeerKeys: inviteHostPeerKeys,
                   memberPeerKeys: normalizePubkeyList([
                     ...baseAuthorizedMemberPubkeys,
                     invitee
@@ -4030,7 +4258,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 relayKey: inviteRelayKey,
                 gatewayOrigins: normalizeGatewayOriginsFromDescriptors(meta?.gateways),
                 discoveryTopic: meta?.discoveryTopic || null,
-                hostPeerKeys: normalizePubkeyList(meta?.hostPeerKeys),
+                hostPeerKeys: inviteHostPeerKeys,
                 memberPeerKeys: normalizePubkeyList([
                   ...baseAuthorizedMemberPubkeys,
                   invitee
@@ -4140,6 +4368,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       discoveryGroups,
       fetchGroupDetail,
       fetchInviteMirrorMetadata,
+      gatewayStatus,
       getProvisionalGroupMetadata,
       getRelayEntryForGroup,
       nip04Encrypt,
@@ -4377,6 +4606,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : cachedMetadata?.isPublic,
           isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : cachedMetadata?.isOpen,
           gateways: nextGatewayTags,
+          discoveryTopic: cachedMetadata?.discoveryTopic || null,
+          hostPeerKeys: cachedMetadata?.hostPeerKeys || [],
+          memberPeerKeys: cachedMetadata?.memberPeerKeys || [],
+          writerIssuerPubkey: cachedMetadata?.writerIssuerPubkey || null,
           source: 'update'
         })
 

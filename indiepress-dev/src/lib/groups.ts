@@ -131,6 +131,17 @@ function parseHostPeerTags(tags: string[][]): string[] {
   return Array.from(peers)
 }
 
+function parseMemberPeerTags(tags: string[][]): string[] {
+  const peers = new Set<string>()
+  for (const tag of tags) {
+    if (!Array.isArray(tag) || tag[0] !== 'member-peer' || !tag[1]) continue
+    const normalized = normalizePubkey(String(tag[1]))
+    if (!normalized) continue
+    peers.add(normalized)
+  }
+  return Array.from(peers)
+}
+
 function parseWriterIssuerTag(tags: string[][]): string | null {
   const tag = tags.find((entry) => entry[0] === 'writer-issuer' && entry[1])
   if (!tag?.[1]) return null
@@ -148,6 +159,7 @@ export function parseGroupMetadataEvent(event: Event, relay?: string): TGroupMet
   const gateways = parseGatewayTags(event.tags)
   const discoveryTopic = parseSwarmTopicTag(event.tags)
   const hostPeerKeys = parseHostPeerTags(event.tags)
+  const memberPeerKeys = parseMemberPeerTags(event.tags)
   const writerIssuerPubkey = parseWriterIssuerTag(event.tags)
 
   return {
@@ -162,6 +174,7 @@ export function parseGroupMetadataEvent(event: Event, relay?: string): TGroupMet
     gateways,
     discoveryTopic,
     hostPeerKeys,
+    memberPeerKeys,
     writerIssuerPubkey,
     event
   }

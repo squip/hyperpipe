@@ -243,6 +243,23 @@ function buildGatewayWebsocketBase(config) {
   return `${protocol}://${host}`
 }
 
+function buildLocalGatewayWebsocketBase() {
+  try {
+    const status = getGatewayStatus()
+    const hostname = typeof status?.urls?.hostname === 'string' ? status.urls.hostname.trim() : ''
+    if (hostname) {
+      return hostname.replace(/\/+$/, '')
+    }
+    const port = status?.port || gatewayOptions?.port || config?.port || 8443
+    const host = gatewayOptions?.hostname || '127.0.0.1'
+    return `ws://${host}:${port}`
+  } catch (_) {
+    const port = gatewayOptions?.port || config?.port || 8443
+    const host = gatewayOptions?.hostname || '127.0.0.1'
+    return `ws://${host}:${port}`
+  }
+}
+
 function deriveGatewayHostFromStatus(status) {
   try {
     const hostnameUrl = status?.urls?.hostname ? new URL(status.urls.hostname) : null
@@ -319,28 +336,110 @@ function pruneRelaySubscriptionRefreshState(now = Date.now()) {
   }
 }
 
-function resolveHostPeersFromGatewayStatus(status, identifier) {
+function resolveHostPeersFromGatewayStatus(status, identifier, options = {}) {
   if (!status || !identifier) return []
   const peerRelayMap = status?.peerRelayMap
-  if (!peerRelayMap || typeof peerRelayMap !== 'object') return []
   const localPeerKeyRaw = status?.ownPeerPublicKey || config?.swarmPublicKey || deriveSwarmPublicKey(config)
   const localPeerKey = typeof localPeerKeyRaw === 'string' ? localPeerKeyRaw.trim().toLowerCase() : null
+  const relayKeyHint = normalizeRelayKeyHex(options?.relayKey || null)
+  const includePeerDetailsFallback = options?.includePeerDetailsFallback === true
   const candidates = [identifier]
   if (typeof identifier === 'string' && identifier.includes(':')) {
     candidates.push(identifier.replace(':', '/'))
   }
-  for (const candidate of candidates) {
-    if (!candidate) continue
-    const entry = peerRelayMap?.[candidate]
-    const peers = Array.isArray(entry?.peers) ? entry.peers : []
-    if (!peers.length) continue
-    const normalized = peers
+  if (relayKeyHint) {
+    candidates.push(relayKeyHint)
+  }
+  const candidateSet = new Set(
+    candidates
+      .map((entry) => String(entry || '').trim())
+      .filter(Boolean)
+  )
+  const candidateSetLower = new Set(Array.from(candidateSet).map((entry) => entry.toLowerCase()))
+
+  const normalizePeers = (peers = []) =>
+    peers
       .map((key) => String(key || '').trim().toLowerCase())
       .filter(Boolean)
       .filter((key) => !localPeerKey || key !== localPeerKey)
-    if (normalized.length) return normalized
+
+  if (peerRelayMap && typeof peerRelayMap === 'object') {
+    for (const candidate of candidateSet) {
+      const entry =
+        peerRelayMap?.[candidate]
+        || peerRelayMap?.[candidate.toLowerCase()]
+        || null
+      const normalized = normalizePeers(entry?.peers || [])
+      if (normalized.length) {
+        return Array.from(new Set(normalized))
+      }
+    }
   }
+
+  const peerDetails = status?.peerDetails
+  if (peerDetails && typeof peerDetails === 'object') {
+    const matched = []
+    const fallback = []
+    for (const [peerKey, detail] of Object.entries(peerDetails)) {
+      const normalizedPeer = String(peerKey || '').trim().toLowerCase()
+      if (!normalizedPeer) continue
+      if (localPeerKey && normalizedPeer === localPeerKey) continue
+      fallback.push(normalizedPeer)
+
+      const relays = Array.isArray(detail?.relays)
+        ? detail.relays
+          .map((entry) => String(entry || '').trim())
+          .filter(Boolean)
+        : []
+      if (!relays.length) continue
+      const relaySetLower = new Set(relays.map((entry) => entry.toLowerCase()))
+      const hasMatch = Array.from(candidateSetLower).some((candidate) => relaySetLower.has(candidate))
+      if (hasMatch) {
+        matched.push(normalizedPeer)
+      }
+    }
+    if (matched.length) return Array.from(new Set(matched))
+    if (includePeerDetailsFallback && fallback.length) {
+      return Array.from(new Set(fallback))
+    }
+  }
+
   return []
+}
+
+function collectGatewayPeerHintsFromStatus(status = null) {
+  if (!status || typeof status !== 'object') return []
+  const hints = new Set()
+  const addPeer = (value) => {
+    const normalized = normalizePeerKeyHint(value)
+    if (normalized) hints.add(normalized)
+  }
+
+  addPeer(status?.publicGateway?.resolvedGatewayId || null)
+  addPeer(status?.publicGateway?.selectedGatewayId || null)
+  addPeer(config?.gatewayPublicKey || null)
+
+  const peerDetails = status?.peerDetails && typeof status.peerDetails === 'object'
+    ? status.peerDetails
+    : null
+  if (peerDetails) {
+    for (const [peerKey, detail] of Object.entries(peerDetails)) {
+      const role = String(detail?.role || detail?.peerRole || '').trim().toLowerCase()
+      const mode = String(detail?.mode || '').trim().toLowerCase()
+      const isGatewayLike =
+        detail?.isGateway === true
+        || detail?.gatewayReplica === true
+        || (detail?.gatewayReplica && typeof detail.gatewayReplica === 'object')
+        || role === 'gateway'
+        || role === 'gateway-replica'
+        || mode === 'gateway'
+        || mode === 'gateway-replica'
+        || mode === 'target-only'
+      if (isGatewayLike) addPeer(peerKey)
+    }
+  }
+
+  return Array.from(hints)
 }
 
 function normalizePeerKeyHint(value) {
@@ -356,6 +455,101 @@ function normalizePeerKeyHintList(values = []) {
       .map((value) => normalizePeerKeyHint(String(value || '')))
       .filter(Boolean)
   ))
+}
+
+async function seedGatewayRelayPeerHints({
+  relayKey = null,
+  publicIdentifier = null,
+  peerKeys = [],
+  reason = 'join-flow-peer-hints'
+} = {}) {
+  if (!gatewayService?.registerPeerMetadata) {
+    return { status: 'skipped', reason: 'gateway-unavailable', applied: 0 }
+  }
+
+  const normalizedPublicIdentifier =
+    typeof publicIdentifier === 'string' && publicIdentifier.trim()
+      ? publicIdentifier.trim()
+      : null
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey)
+  const relayIdentifiers = []
+  if (normalizedPublicIdentifier) relayIdentifiers.push(normalizedPublicIdentifier)
+  if (normalizedRelayKey && !relayIdentifiers.includes(normalizedRelayKey)) {
+    relayIdentifiers.push(normalizedRelayKey)
+  }
+  if (!relayIdentifiers.length) {
+    return { status: 'skipped', reason: 'missing-relay-identifiers', applied: 0 }
+  }
+
+  const normalizedPeers = normalizePeerKeyHintList(peerKeys)
+  if (!normalizedPeers.length) {
+    return { status: 'skipped', reason: 'no-peer-hints', applied: 0 }
+  }
+
+  const statusSnapshot = gatewayService.getStatus?.() || null
+  const localPeerKey = normalizePeerKeyHint(
+    statusSnapshot?.ownPeerPublicKey
+      || config?.swarmPublicKey
+      || deriveSwarmPublicKey(config)
+      || null
+  )
+  const peerDetails = statusSnapshot?.peerDetails && typeof statusSnapshot.peerDetails === 'object'
+    ? statusSnapshot.peerDetails
+    : {}
+
+  let applied = 0
+  for (const peerKey of normalizedPeers) {
+    if (localPeerKey && peerKey === localPeerKey) continue
+    const existingPeer =
+      peerDetails?.[peerKey]
+      || peerDetails?.[peerKey.toLowerCase()]
+      || null
+    const existingRelays = Array.isArray(existingPeer?.relays)
+      ? existingPeer.relays
+        .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
+        .filter(Boolean)
+      : []
+    const relaySet = new Set([...existingRelays, ...relayIdentifiers])
+    if (!relaySet.size) continue
+
+    try {
+      await gatewayService.registerPeerMetadata({
+        publicKey: peerKey,
+        relays: Array.from(relaySet).map((identifier) => ({ identifier })),
+        mode: existingPeer?.mode || 'hyperswarm',
+        address: existingPeer?.address || null,
+        nostrPubkeyHex: existingPeer?.nostrPubkeyHex || null
+      }, {
+        source: reason,
+        skipConnect: true
+      })
+      applied += 1
+    } catch (error) {
+      console.warn('[Worker] Failed to seed gateway relay peer hint', {
+        peerKey: typeof peerKey === 'string' ? peerKey.slice(0, 12) : null,
+        relayKey: normalizedRelayKey ? normalizedRelayKey.slice(0, 16) : null,
+        publicIdentifier: normalizedPublicIdentifier || null,
+        reason,
+        error: error?.message || error
+      })
+    }
+  }
+
+  if (applied > 0) {
+    console.log('[Worker] Seeded gateway relay peer hints', {
+      relayKey: normalizedRelayKey ? normalizedRelayKey.slice(0, 16) : null,
+      publicIdentifier: normalizedPublicIdentifier || null,
+      candidateCount: normalizedPeers.length,
+      applied,
+      reason
+    })
+  }
+
+  return {
+    status: applied > 0 ? 'ok' : 'skipped',
+    reason: applied > 0 ? null : 'no-hints-applied',
+    applied
+  }
 }
 
 function getWriterGuaranteeRank(writerGuarantee = null) {
@@ -1837,6 +2031,7 @@ function emitAutoConnectFailFast(session, reasonCode, meta = null) {
 function markAutoConnectWriterMaterialApplied(session, meta = null) {
   if (!session || session.writerMaterialApplied) return
   session.writerMaterialApplied = true
+  session.writerMaterialElapsedMs = Date.now() - session.startedAt
   if (session.timers?.writerMaterial) {
     clearTimeout(session.timers.writerMaterial)
     delete session.timers.writerMaterial
@@ -1854,6 +2049,7 @@ function markAutoConnectWriterMaterialApplied(session, meta = null) {
 function markAutoConnectFastForwardApplied(session, meta = null) {
   if (!session || session.fastForwardApplied) return
   session.fastForwardApplied = true
+  session.fastForwardElapsedMs = Date.now() - session.startedAt
   if (session.timers?.fastForward) {
     clearTimeout(session.timers.fastForward)
     delete session.timers.fastForward
@@ -1868,8 +2064,60 @@ function markAutoConnectFastForwardApplied(session, meta = null) {
   })
 }
 
+function backfillAutoConnectTelemetryOnWritable(session) {
+  if (!session || session.writableBackfillEmitted) return
+  session.writableBackfillEmitted = true
+  const elapsedMs = Date.now() - session.startedAt
+
+  emitAutoConnectTelemetryEvent('AUTOCONNECT_START', {
+    publicIdentifier: session.publicIdentifier,
+    relayKey: session.relayKey,
+    traceId: session.traceId,
+    elapsedMs: 0,
+    gatewayOrigins: session.gatewayOrigins,
+    meta: {
+      hasFastForward: session.hasFastForward === true,
+      hasWriterMaterial: session.hasWriterMaterial === true,
+      source: 'writable-backfill'
+    }
+  })
+
+  if (session.writerMaterialApplied || session.hasWriterMaterial) {
+    emitAutoConnectTelemetryEvent('AUTOCONNECT_WRITER_MATERIAL_APPLIED', {
+      publicIdentifier: session.publicIdentifier,
+      relayKey: session.relayKey,
+      traceId: session.traceId,
+      elapsedMs: Number.isFinite(session.writerMaterialElapsedMs)
+        ? Math.trunc(session.writerMaterialElapsedMs)
+        : elapsedMs,
+      gatewayOrigins: session.gatewayOrigins,
+      meta: {
+        source: 'writable-backfill'
+      }
+    })
+  }
+
+  if (session.fastForwardApplied || !session.hasFastForward) {
+    emitAutoConnectTelemetryEvent('AUTOCONNECT_FAST_FORWARD_APPLIED', {
+      publicIdentifier: session.publicIdentifier,
+      relayKey: session.relayKey,
+      traceId: session.traceId,
+      elapsedMs: Number.isFinite(session.fastForwardElapsedMs)
+        ? Math.trunc(session.fastForwardElapsedMs)
+        : elapsedMs,
+      gatewayOrigins: session.gatewayOrigins,
+      meta: {
+        source: 'writable-backfill'
+      }
+    })
+  }
+}
+
 function markAutoConnectWritableEvent(session, writable, meta = null) {
   if (!session) return
+  if (writable === true) {
+    backfillAutoConnectTelemetryOnWritable(session)
+  }
   emitAutoConnectTelemetryEvent('AUTOCONNECT_WRITABLE_EVENT', {
     publicIdentifier: session.publicIdentifier,
     relayKey: session.relayKey,
@@ -1925,9 +2173,14 @@ function startAutoConnectTelemetrySession({
     traceId: createAutoConnectTraceId(),
     startedAt,
     gatewayOrigins: normalizeGatewayOriginList(gatewayOrigins),
+    hasFastForward: hasFastForward === true,
+    hasWriterMaterial: hasWriterMaterial === true,
     writerMaterialApplied: false,
+    writerMaterialElapsedMs: null,
     fastForwardApplied: hasFastForward ? false : true,
+    fastForwardElapsedMs: hasFastForward ? null : 0,
     writableConfirmed: false,
+    writableBackfillEmitted: false,
     failFastEmitted: false,
     fanoutInFlight: false,
     fanoutStarted: false,
@@ -2907,7 +3160,7 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
 }
 
 async function syncGatewayPeerMetadata(reason = 'unspecified', options = {}) {
-  if (!config?.nostr_pubkey_hex || !config?.swarmPublicKey || !config?.pfpDriveKey) {
+  if (!config?.nostr_pubkey_hex || !config?.swarmPublicKey) {
     pendingGatewayMetadataSync = true
     return
   }
@@ -2923,7 +3176,7 @@ async function syncGatewayPeerMetadata(reason = 'unspecified', options = {}) {
     await gatewayService.registerPeerMetadata({
       publicKey: config.swarmPublicKey,
       nostrPubkeyHex: config.nostr_pubkey_hex,
-      pfpDriveKey: config.pfpDriveKey,
+      pfpDriveKey: config.pfpDriveKey || null,
       mode: 'hyperswarm',
       address: config.proxy_server_address || `${gatewayOptions.hostname || '127.0.0.1'}:${gatewayOptions.port || 8443}`,
       relays: entries
@@ -2932,7 +3185,7 @@ async function syncGatewayPeerMetadata(reason = 'unspecified', options = {}) {
     console.log('[Worker] Synced gateway peer metadata', {
       reason,
       owner: config.nostr_pubkey_hex.slice(0, 8),
-      pfpDriveKey: config.pfpDriveKey.slice(0, 8),
+      pfpDriveKey: config.pfpDriveKey ? config.pfpDriveKey.slice(0, 8) : null,
       relayCount,
       aliasEntries: Math.max(entries.length - relayCount, 0)
     })
@@ -4758,14 +5011,45 @@ function trackRegistrationStatus(message) {
   }
 }
 
-function recordOpenJoinContext({ publicIdentifier, fileSharing, relayKey, relayUrl } = {}) {
+function recordOpenJoinContext({
+  publicIdentifier,
+  fileSharing,
+  relayKey,
+  relayUrl,
+  isOpen,
+  discoveryTopic,
+  hostPeerKeys,
+  memberPeerKeys,
+  writerIssuerPubkey,
+  gatewayOrigins
+} = {}) {
   if (!publicIdentifier) return
   const current = openJoinContexts.get(publicIdentifier) || { publicIdentifier }
+  const nextDiscoveryTopic =
+    typeof discoveryTopic === 'string' && discoveryTopic.trim()
+      ? discoveryTopic.trim()
+      : current.discoveryTopic ?? null
+  const nextHostPeerKeys = Array.isArray(hostPeerKeys)
+    ? normalizePeerKeyHintList(hostPeerKeys)
+    : normalizePeerKeyHintList(current.hostPeerKeys || [])
+  const nextMemberPeerKeys = Array.isArray(memberPeerKeys)
+    ? normalizePeerKeyHintList(memberPeerKeys)
+    : normalizePeerKeyHintList(current.memberPeerKeys || [])
+  const normalizedWriterIssuerPubkey = normalizePubkeyHex(writerIssuerPubkey || null)
+  const nextGatewayOrigins = Array.isArray(gatewayOrigins)
+    ? normalizeGatewayOriginList(gatewayOrigins)
+    : normalizeGatewayOriginList(current.gatewayOrigins || [])
   openJoinContexts.set(publicIdentifier, {
     ...current,
     fileSharing: typeof fileSharing === 'boolean' ? fileSharing : current.fileSharing,
     relayKey: relayKey ?? current.relayKey ?? null,
-    relayUrl: relayUrl ?? current.relayUrl ?? null
+    relayUrl: relayUrl ?? current.relayUrl ?? null,
+    isOpen: typeof isOpen === 'boolean' ? isOpen : (typeof current.isOpen === 'boolean' ? current.isOpen : true),
+    discoveryTopic: nextDiscoveryTopic,
+    hostPeerKeys: nextHostPeerKeys,
+    memberPeerKeys: nextMemberPeerKeys,
+    writerIssuerPubkey: normalizedWriterIssuerPubkey || current.writerIssuerPubkey || null,
+    gatewayOrigins: nextGatewayOrigins
   })
 }
 
@@ -4778,7 +5062,16 @@ function trackOpenJoinReauthState(message) {
     recordOpenJoinContext({
       publicIdentifier: identifier,
       relayKey: data.relayKey || null,
-      relayUrl: data.relayUrl || null
+      relayUrl: data.relayUrl || null,
+      isOpen: data?.mode === 'open-offline' ? true : undefined,
+      discoveryTopic: data?.discoveryTopic || null,
+      hostPeerKeys: normalizePeerKeyHintList([
+        data?.hostPeer || null,
+        ...(Array.isArray(data?.hostPeerKeys) ? data.hostPeerKeys : [])
+      ]),
+      memberPeerKeys: normalizePeerKeyHintList(data?.memberPeerKeys || []),
+      writerIssuerPubkey: data?.writerIssuerPubkey || null,
+      gatewayOrigins: normalizeGatewayOriginList(data?.gatewayOrigins || [])
     })
     if (data.provisional) {
       const context = openJoinContexts.get(identifier) || { publicIdentifier: identifier }
@@ -4948,16 +5241,35 @@ function trackJoinTelemetryState(message) {
 async function maybeReauthOpenJoins(status) {
   if (!relayServer || !pendingOpenJoinReauth.size) return
   if (!status?.peerRelayMap) return
+  const relayGatewayPeerHints =
+    typeof relayServer?.listGatewayPeerKeys === 'function'
+      ? normalizePeerKeyHintList(relayServer.listGatewayPeerKeys())
+      : []
+  const gatewayPeerHints = new Set([
+    ...collectGatewayPeerHintsFromStatus(status),
+    ...relayGatewayPeerHints
+  ])
   const now = Date.now()
   for (const [identifier, entry] of pendingOpenJoinReauth.entries()) {
     if (!identifier || entry?.inFlight) continue
     if (entry?.lastAttempt && now - entry.lastAttempt < OPEN_JOIN_REAUTH_MIN_INTERVAL_MS) continue
-    const hostPeers = resolveHostPeersFromGatewayStatus(status, identifier)
+    const hostPeers = normalizePeerKeyHintList([
+      ...(Array.isArray(entry?.hostPeerKeys) ? entry.hostPeerKeys : []),
+      ...resolveHostPeersFromGatewayStatus(status, identifier, {
+        relayKey: entry?.relayKey || null
+      })
+    ]).filter((peerKey) => !gatewayPeerHints.has(peerKey))
     if (!hostPeers.length) continue
+    const gatewayOrigins = normalizeGatewayOriginList(
+      Array.isArray(entry?.gatewayOrigins) && entry.gatewayOrigins.length
+        ? entry.gatewayOrigins
+        : collectPublicGatewayOrigins()
+    )
     pendingOpenJoinReauth.set(identifier, { ...entry, inFlight: true, lastAttempt: now })
     console.log('[Worker] Reauthing open join with host peers', {
       publicIdentifier: identifier,
-      hostPeersCount: hostPeers.length
+      hostPeersCount: hostPeers.length,
+      gatewayOriginsCount: gatewayOrigins.length
     })
     try {
       await relayServer.startJoinAuthentication({
@@ -4966,7 +5278,13 @@ async function maybeReauthOpenJoins(status) {
         relayKey: entry?.relayKey || undefined,
         relayUrl: entry?.relayUrl || undefined,
         hostPeers,
-        openJoin: false
+        openJoin: true,
+        isOpen: entry?.isOpen === false ? false : true,
+        gatewayOrigins,
+        discoveryTopic: entry?.discoveryTopic || null,
+        hostPeerKeys: hostPeers,
+        memberPeerKeys: normalizePeerKeyHintList(entry?.memberPeerKeys || []),
+        writerIssuerPubkey: normalizePubkeyHex(entry?.writerIssuerPubkey || null) || null
       })
     } catch (err) {
       console.warn('[Worker] Open join reauth attempt failed', err?.message || err)
@@ -5440,8 +5758,11 @@ async function addAuthInfoToRelays(relays) {
         ? profile.public_identifier.replace(':', '/')
         : r.relayKey
 
-      const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`
-      const connectionUrl = token ? `${baseUrl}?token=${token}` : baseUrl
+      const gatewayBaseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`
+      const localBaseUrl = `${buildLocalGatewayWebsocketBase()}/${identifierPath}`
+      const gatewayConnectionUrl = token ? `${gatewayBaseUrl}?token=${token}` : gatewayBaseUrl
+      const localConnectionUrl = token ? `${localBaseUrl}?token=${token}` : localBaseUrl
+      const connectionUrl = localConnectionUrl || gatewayConnectionUrl
       const requiresAuth = profile.auth_config?.requiresAuth || false
       const writable = r?.writable === true
       let tokenPresent = !!token
@@ -5465,6 +5786,8 @@ async function addAuthInfoToRelays(relays) {
         fromLegacyToken: !!(profile.auth_tokens && profile.auth_tokens[config.nostr_pubkey_hex]),
         fromStoreToken: !!tokenFromStore,
         tokenApplied: !!token,
+        gatewayConnectionUrl,
+        localConnectionUrl,
         connectionUrl,
         userAuthToken: token
       })
@@ -5477,6 +5800,8 @@ async function addAuthInfoToRelays(relays) {
         ...r,
         publicIdentifier: profile.public_identifier || null,
         connectionUrl,
+        localConnectionUrl,
+        gatewayConnectionUrl,
         userAuthToken: token,
         requiresAuth,
         writable,
@@ -6495,6 +6820,7 @@ async function handleMessageObject(message) {
     }
 
     case 'get-worker-identity': {
+      const requestId = extractMessageRequestId(message)
       const pubkeyHex =
         typeof config?.nostr_pubkey_hex === 'string'
           ? config.nostr_pubkey_hex
@@ -6509,6 +6835,13 @@ async function handleMessageObject(message) {
             : null
       sendMessage({
         type: 'worker-identity',
+        data: {
+          pubkeyHex: pubkeyHex ? String(pubkeyHex) : null,
+          userKey: userKey || null
+        }
+      })
+      sendWorkerResponse(requestId, {
+        success: true,
         data: {
           pubkeyHex: pubkeyHex ? String(pubkeyHex) : null,
           userKey: userKey || null
@@ -7473,7 +7806,16 @@ async function handleMessageObject(message) {
               publicIdentifier,
               fileSharing: fileSharing !== false,
               relayKey: joinRelayKey,
-              relayUrl: joinRelayUrl
+              relayUrl: joinRelayUrl,
+              isOpen,
+              discoveryTopic,
+              hostPeerKeys: normalizePeerKeyHintList([
+                ...hostPeers,
+                ...hostPeerKeysHint
+              ]),
+              memberPeerKeys: memberPeerKeysHint,
+              writerIssuerPubkey,
+              gatewayOrigins: rankedGatewayOrigins
             })
           }
 
@@ -7514,7 +7856,16 @@ async function handleMessageObject(message) {
                       publicIdentifier,
                       fileSharing: fileSharing !== false,
                       relayKey: joinRelayKey,
-                      relayUrl: joinRelayUrl
+                      relayUrl: joinRelayUrl,
+                      isOpen,
+                      discoveryTopic,
+                      hostPeerKeys: normalizePeerKeyHintList([
+                        ...hostPeers,
+                        ...hostPeerKeysHint
+                      ]),
+                      memberPeerKeys: memberPeerKeysHint,
+                      writerIssuerPubkey,
+                      gatewayOrigins: rankedGatewayOrigins
                     })
                   }
                   console.log('[Worker] Open join bootstrap fetched', {
@@ -7607,7 +7958,16 @@ async function handleMessageObject(message) {
                       publicIdentifier,
                       fileSharing: fileSharing !== false,
                       relayKey: joinRelayKey,
-                      relayUrl: joinRelayUrl
+                      relayUrl: joinRelayUrl,
+                      isOpen,
+                      discoveryTopic,
+                      hostPeerKeys: normalizePeerKeyHintList([
+                        ...hostPeers,
+                        ...hostPeerKeysHint
+                      ]),
+                      memberPeerKeys: memberPeerKeysHint,
+                      writerIssuerPubkey,
+                      gatewayOrigins: rankedGatewayOrigins
                     })
                   }
                   console.log('[Worker] Mirror metadata fetched for join flow', {
@@ -7752,9 +8112,27 @@ async function handleMessageObject(message) {
             || (typeof data.discoveryTopic === 'string' && data.discoveryTopic.trim())
           )
           const skipPeerSmartSelect = hadWriterMaterialAtStart && !hasExplicitPeerDiscoveryHints
+          const gatewayStatusSnapshot = getGatewayStatus()
+          const relayGatewayPeerHints =
+            typeof relayServer?.listGatewayPeerKeys === 'function'
+              ? normalizePeerKeyHintList(relayServer.listGatewayPeerKeys())
+              : []
+          const gatewayPeerHints = new Set([
+            ...collectGatewayPeerHintsFromStatus(gatewayStatusSnapshot),
+            ...relayGatewayPeerHints
+          ])
+          const localPeerKey =
+            normalizePeerKeyHint(config?.swarmPublicKey || null)
+            || normalizePeerKeyHint(deriveSwarmPublicKey(config) || null)
+            || null
+          const filterJoinCandidates = (values = []) => normalizePeerKeyHintList(values).filter((peerKey) => {
+            if (localPeerKey && peerKey === localPeerKey) return false
+            if (gatewayPeerHints.has(peerKey)) return false
+            return true
+          })
 
           if (skipPeerSmartSelect) {
-            hostPeers = normalizePeerKeyHintList(hostPeers)
+            hostPeers = filterJoinCandidates(hostPeers)
             console.log('[Worker] Join flow skipping peer smart-select (preseeded writer material available)', {
               publicIdentifier,
               relayKey: previewValue(joinRelayKey, 16),
@@ -7770,9 +8148,12 @@ async function handleMessageObject(message) {
               })
             }
 
-            const cachedHostPeers = normalizePeerKeyHintList(cachedPeerDiscovery?.hostPeerKeys || [])
+            const cachedHostPeers = filterJoinCandidates(cachedPeerDiscovery?.hostPeerKeys || [])
             const cachedMemberPeerKeys = normalizePeerKeyHintList(cachedPeerDiscovery?.memberPeerKeys || [])
-            const gatewayStatusPeers = resolveHostPeersFromGatewayStatus(getGatewayStatus(), publicIdentifier)
+            const gatewayStatusPeers = resolveHostPeersFromGatewayStatus(gatewayStatusSnapshot, publicIdentifier, {
+              relayKey: joinRelayKey,
+              includePeerDetailsFallback: true
+            })
             const cachedCapabilityPeers = Array.from(
               new Set(
                 (await listRelayPeerCapabilities(joinRelayKey, publicIdentifier))
@@ -7780,26 +8161,22 @@ async function handleMessageObject(message) {
                   .filter(Boolean)
               )
             )
-            const localPeerKey =
-              normalizePeerKeyHint(config?.swarmPublicKey || null)
-              || normalizePeerKeyHint(deriveSwarmPublicKey(config) || null)
-              || null
 
-            let candidatePeers = normalizePeerKeyHintList([
+            let candidatePeers = filterJoinCandidates([
               ...hostPeers,
               ...hostPeerKeysHint,
               ...memberPeerKeysHint,
+              ...gatewayStatusPeers,
               ...cachedHostPeers,
               ...cachedMemberPeerKeys,
               ...cachedCapabilityPeers,
-              ...gatewayStatusPeers
-            ]).filter((peerKey) => !localPeerKey || peerKey !== localPeerKey)
+            ])
 
             if (blindPeer?.publicKey) {
-              candidatePeers = normalizePeerKeyHintList([
+              candidatePeers = filterJoinCandidates([
                 blindPeer.publicKey,
                 ...candidatePeers
-              ]).filter((peerKey) => !localPeerKey || peerKey !== localPeerKey)
+              ])
             }
 
             if (discoveryTopic && relayServer?.discoverPeersByTopic) {
@@ -7809,10 +8186,10 @@ async function handleMessageObject(message) {
                 })
                 const topicPeers = normalizePeerKeyHintList(discoveryResult?.peers || [])
                 if (topicPeers.length) {
-                  candidatePeers = normalizePeerKeyHintList([
+                  candidatePeers = filterJoinCandidates([
                     ...candidatePeers,
                     ...topicPeers
-                  ]).filter((peerKey) => !localPeerKey || peerKey !== localPeerKey)
+                  ])
                 }
                 if (discoveryResult?.status === 'ok') {
                   cachedPeerDiscovery = await setRelayPeerDiscovery(joinRelayKey, publicIdentifier, {
@@ -7837,6 +8214,9 @@ async function handleMessageObject(message) {
             }
 
             const capabilityRows = []
+            const capabilityProbeTimeoutMs = 8000
+            const capabilityProbeHardTimeoutMs = 9000
+            const maxCapabilityProbeCount = 6
             const probeShortCircuitRank =
               openJoin && !inviteToken
                 ? getWriterGuaranteeRank('peer-local-provision')
@@ -7844,9 +8224,10 @@ async function handleMessageObject(message) {
                   ? getWriterGuaranteeRank('peer-invite-lease')
                   : null)
             if (relayServer?.probePeerJoinCapabilities && candidatePeers.length) {
-              for (const peerKey of candidatePeers) {
+              const probeCandidates = candidatePeers.slice(0, maxCapabilityProbeCount)
+              for (const peerKey of probeCandidates) {
                 const probeStartedAt = Date.now()
-                const probe = await relayServer.probePeerJoinCapabilities({
+                const probePromise = relayServer.probePeerJoinCapabilities({
                   peerKey,
                   identifier: publicIdentifier || joinRelayKey,
                   relayKey: joinRelayKey,
@@ -7854,7 +8235,23 @@ async function handleMessageObject(message) {
                   hasInviteToken: !!inviteToken,
                   tokenHash: inviteTokenHash || null,
                   writerIssuerPubkey,
-                  timeoutMs: 12000
+                  timeoutMs: capabilityProbeTimeoutMs
+                })
+                let hardTimeout = null
+                const probe = await Promise.race([
+                  probePromise,
+                  new Promise((resolve) => {
+                    hardTimeout = setTimeout(() => {
+                      resolve({
+                        ok: false,
+                        reason: 'probe-timeout-hard',
+                        peerKey,
+                        rttMs: Date.now() - probeStartedAt
+                      })
+                    }, capabilityProbeHardTimeoutMs)
+                  })
+                ]).finally(() => {
+                  if (hardTimeout) clearTimeout(hardTimeout)
                 })
                 const capability = probe?.capability && typeof probe.capability === 'object'
                   ? probe.capability
@@ -7938,7 +8335,7 @@ async function handleMessageObject(message) {
             hostPeers = rankedPeerRows.map((entry) => entry.peerKey)
 
             if (!hostPeers.length) {
-              hostPeers = normalizePeerKeyHintList(gatewayStatusPeers)
+              hostPeers = filterJoinCandidates(gatewayStatusPeers)
             }
 
             cachedPeerDiscovery = await setRelayPeerDiscovery(joinRelayKey, publicIdentifier, {
@@ -8001,6 +8398,43 @@ async function handleMessageObject(message) {
 
           if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
           if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
+          const resolvedHostPeerHints = filterJoinCandidates([
+            ...hostPeerKeysHint,
+            ...(Array.isArray(cachedPeerDiscovery?.hostPeerKeys) ? cachedPeerDiscovery.hostPeerKeys : []),
+            ...hostPeers
+          ])
+          const resolvedMemberPeerHints = filterJoinCandidates([
+            ...memberPeerKeysHint,
+            ...(Array.isArray(cachedPeerDiscovery?.memberPeerKeys) ? cachedPeerDiscovery.memberPeerKeys : [])
+          ])
+          const routingHintPeers = normalizePeerKeyHintList([
+            ...resolvedHostPeerHints,
+            ...resolvedMemberPeerHints
+          ])
+
+          if (routingHintPeers.length) {
+            await seedGatewayRelayPeerHints({
+              relayKey: joinRelayKey || null,
+              publicIdentifier,
+              peerKeys: routingHintPeers,
+              reason: 'join-flow-routing-hints'
+            })
+          }
+
+          if (openJoin && publicIdentifier) {
+            recordOpenJoinContext({
+              publicIdentifier,
+              fileSharing: fileSharing !== false,
+              relayKey: joinRelayKey,
+              relayUrl: joinRelayUrl,
+              isOpen,
+              discoveryTopic: discoveryTopic || cachedPeerDiscovery?.discoveryTopic || null,
+              hostPeerKeys: resolvedHostPeerHints,
+              memberPeerKeys: resolvedMemberPeerHints,
+              writerIssuerPubkey: writerIssuerPubkey || cachedPeerDiscovery?.writerIssuerPubkey || null,
+              gatewayOrigins: rankedGatewayOrigins
+            })
+          }
 
           console.info('[Worker] Start join flow resolved', {
             publicIdentifier,
@@ -8010,8 +8444,8 @@ async function handleMessageObject(message) {
             relayKey: previewValue(joinRelayKey, 16),
             relayUrl: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
             hostPeersCount: hostPeers.length,
-            hostPeerHintsCount: hostPeerKeysHint.length,
-            memberPeerHintsCount: memberPeerKeysHint.length,
+            hostPeerHintsCount: resolvedHostPeerHints.length,
+            memberPeerHintsCount: resolvedMemberPeerHints.length,
             discoveryTopic: previewValue(discoveryTopic || cachedPeerDiscovery?.discoveryTopic || null, 16),
             writerIssuerPubkey: previewValue(writerIssuerPubkey || cachedPeerDiscovery?.writerIssuerPubkey || null, 16),
             hasBlindPeer: !!blindPeer?.publicKey,
@@ -8057,14 +8491,8 @@ async function handleMessageObject(message) {
             fastForward,
             gatewayOrigins: rankedGatewayOrigins,
             discoveryTopic: discoveryTopic || cachedPeerDiscovery?.discoveryTopic || null,
-            hostPeerKeys: normalizePeerKeyHintList([
-              ...hostPeers,
-              ...hostPeerKeysHint
-            ]),
-            memberPeerKeys: normalizePeerKeyHintList([
-              ...memberPeerKeysHint,
-              ...(cachedPeerDiscovery?.memberPeerKeys || [])
-            ]),
+            hostPeerKeys: resolvedHostPeerHints,
+            memberPeerKeys: resolvedMemberPeerHints,
             writerIssuerPubkey: writerIssuerPubkey || cachedPeerDiscovery?.writerIssuerPubkey || null
           })
           if (joinBlindPeeringManager && joinRelayIdentifierForTracking && typeof joinBlindPeeringManager.markJoinEnd === 'function') {

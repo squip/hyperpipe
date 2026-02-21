@@ -943,6 +943,13 @@ class PublicGatewayService {
     return typeof value === 'string' && /^[0-9a-fA-F]{64}$/.test(value);
   }
 
+  #normalizeRelayRegistrationKey(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    return this.#isHexRelayKey(trimmed) ? trimmed.toLowerCase() : trimmed;
+  }
+
   async #resolveRelayAlias(identifier) {
     if (!identifier || typeof this.registrationStore?.resolveRelayAlias !== 'function') return null;
     const candidates = new Set();
@@ -1073,33 +1080,41 @@ class PublicGatewayService {
   }
 
   async #resolveOpenJoinRegistration(identifier) {
-    if (!identifier) return null;
-    const aliasRelayKey = this.#resolveRelayKeyFromPath(identifier);
+    const normalizedIdentifier = this.#normalizeRelayRegistrationKey(identifier);
+    if (!normalizedIdentifier) return null;
+
+    const aliasRelayKey = this.#resolveRelayKeyFromPath(normalizedIdentifier);
     if (aliasRelayKey) {
       const record = await this.registrationStore.getRelay(aliasRelayKey);
       if (record) return { relayKey: aliasRelayKey, record };
     }
 
-    const mappedRelayKey = await this.#resolveRelayAlias(identifier);
-    if (mappedRelayKey && this.#isHexRelayKey(mappedRelayKey)) {
+    const mappedRelayKey = this.#normalizeRelayRegistrationKey(
+      await this.#resolveRelayAlias(normalizedIdentifier)
+    );
+    if (mappedRelayKey) {
       const record = await this.registrationStore.getRelay(mappedRelayKey);
       if (record) return { relayKey: mappedRelayKey, record };
-      return null;
     }
 
-    const target = await this.#resolveRelayTarget(identifier);
-    if (target?.relayKey && this.#isHexRelayKey(target.relayKey)) {
-      const record = await this.registrationStore.getRelay(target.relayKey);
-      if (record) return { relayKey: target.relayKey, record };
+    const target = await this.#resolveRelayTarget(normalizedIdentifier);
+    const targetRelayKey = this.#normalizeRelayRegistrationKey(target?.relayKey);
+    if (targetRelayKey) {
+      const record = await this.registrationStore.getRelay(targetRelayKey);
+      if (record) return { relayKey: targetRelayKey, record };
     }
 
-    if (!this.#isHexRelayKey(identifier)) {
-      return null;
-    }
-
-    const direct = await this.registrationStore.getRelay(identifier);
+    const direct = await this.registrationStore.getRelay(normalizedIdentifier);
     if (direct) {
-      return { relayKey: identifier, record: direct };
+      return { relayKey: normalizedIdentifier, record: direct };
+    }
+
+    // Legacy fallback: if normalization changed the key, try the original literal once.
+    if (normalizedIdentifier !== identifier) {
+      const legacy = await this.registrationStore.getRelay(identifier);
+      if (legacy) {
+        return { relayKey: identifier, record: legacy };
+      }
     }
 
     return null;
@@ -1110,19 +1125,19 @@ class PublicGatewayService {
     const trimmed = typeof identifier === 'string' ? identifier.trim() : null;
     if (!trimmed) return null;
     const normalized = this.#normalizePathValue(trimmed) || trimmed;
-    const directCandidate = this.#isHexRelayKey(trimmed)
-      ? trimmed
-      : (this.#isHexRelayKey(normalized) ? normalized : null);
-    const directRelayKey = directCandidate ? directCandidate.toLowerCase() : null;
-    if (directRelayKey) {
+    const directRelayCandidates = new Set();
+    const directCandidate = this.#normalizeRelayRegistrationKey(trimmed);
+    const normalizedCandidate = this.#normalizeRelayRegistrationKey(normalized);
+    if (directCandidate) directRelayCandidates.add(directCandidate);
+    if (normalizedCandidate) directRelayCandidates.add(normalizedCandidate);
+    for (const directRelayKey of directRelayCandidates) {
+      // eslint-disable-next-line no-await-in-loop
       const pool = await this.registrationStore.getOpenJoinPool(directRelayKey);
       if (pool) return { relayKey: directRelayKey, pool };
     }
     if (typeof this.registrationStore?.resolveOpenJoinAlias === 'function') {
       const resolvedKey = await this.registrationStore.resolveOpenJoinAlias(normalized);
-      const aliasRelayKey = resolvedKey && this.#isHexRelayKey(resolvedKey)
-        ? resolvedKey.toLowerCase()
-        : null;
+      const aliasRelayKey = this.#normalizeRelayRegistrationKey(resolvedKey);
       if (aliasRelayKey) {
         const pool = await this.registrationStore.getOpenJoinPool(aliasRelayKey);
         if (pool) return { relayKey: aliasRelayKey, pool };
@@ -4238,26 +4253,55 @@ class PublicGatewayService {
 
     const now = Date.now();
     const relays = Array.isArray(payload.relays) ? payload.relays : [];
+    let mergedRelayCount = 0;
+    const mergeFailures = [];
 
     for (const entry of relays) {
       let relayKey = null;
       let relayPayload = entry;
       if (typeof entry === 'string') {
-        relayKey = entry;
-        relayPayload = { identifier: entry };
+        relayKey = this.#normalizeRelayRegistrationKey(entry);
+        relayPayload = { identifier: entry, relayKey };
       } else if (entry && typeof entry === 'object') {
-        relayKey = entry.identifier || entry.relayKey || null;
+        relayPayload = { ...entry };
+        const identifier = this.#normalizeRelayRegistrationKey(entry.identifier);
+        const explicitRelayKey = this.#normalizeRelayRegistrationKey(entry.relayKey);
+        relayKey = explicitRelayKey || identifier || null;
+        if (!explicitRelayKey && identifier) {
+          // eslint-disable-next-line no-await-in-loop
+          const mappedRelayKey = await this.#resolveRelayAlias(identifier);
+          relayKey = this.#normalizeRelayRegistrationKey(mappedRelayKey) || relayKey;
+        }
+        if (identifier || relayKey) {
+          relayPayload.identifier = identifier || relayKey;
+        }
+        if (relayKey) {
+          relayPayload.relayKey = relayKey;
+        }
       }
-      if (!relayKey) continue;
+      if (!relayKey) {
+        mergeFailures.push({
+          relayKey: null,
+          identifier: typeof relayPayload?.identifier === 'string' ? relayPayload.identifier : null,
+          error: 'missing-relay-key'
+        });
+        continue;
+      }
 
       try {
         await this.#mergeRelayRegistration(relayKey, peerKey, relayPayload, payload.gatewayReplica, now);
+        mergedRelayCount += 1;
       } catch (error) {
         this.logger.error?.({
           relayKey,
           peer: peerKey,
           error: error?.message || error
         }, 'Failed to merge relay registration from peer');
+        mergeFailures.push({
+          relayKey,
+          identifier: typeof relayPayload?.identifier === 'string' ? relayPayload.identifier : null,
+          error: error?.message || String(error)
+        });
       }
     }
 
@@ -4315,11 +4359,31 @@ class PublicGatewayService {
     this.#emitPublicGatewayStatus();
 
     const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
+    const failedRelayCount = mergeFailures.length;
+    const statusCode = failedRelayCount
+      ? (mergedRelayCount > 0 ? 207 : 500)
+      : 200;
+    const status = failedRelayCount
+      ? (mergedRelayCount > 0 ? 'partial' : 'error')
+      : 'ok';
+    if (failedRelayCount) {
+      this.logger?.warn?.('[PublicGateway] Hyperswarm registration merge completed with failures', {
+        peer: peerKey,
+        relayCount: relays.length,
+        mergedRelayCount,
+        failedRelayCount
+      });
+    }
     return {
-      statusCode: 200,
+      statusCode,
       headers: { 'content-type': 'application/json' },
       body: Buffer.from(JSON.stringify({
-        status: 'ok',
+        status,
+        error: status === 'error' ? 'registration-merge-failed' : null,
+        relayCount: relays.length,
+        mergedRelayCount,
+        failedRelayCount,
+        failures: mergeFailures.slice(0, 10),
         hyperbee: this.#getRelayHostInfo(),
         blindPeer: blindPeerInfo && blindPeerInfo.enabled ? blindPeerInfo : { enabled: false }
       }))
@@ -4333,10 +4397,14 @@ class PublicGatewayService {
     const peers = new Set(Array.isArray(existing?.peers) ? existing.peers : []);
     peers.add(peerKey);
 
-    const metadata = { ...(existing?.metadata || {}) };
-    metadata.identifier = metadata.identifier || relayKey;
-
     const maybeString = (value) => (typeof value === 'string' && value.trim().length ? value.trim() : null);
+
+    const metadata = { ...(existing?.metadata || {}) };
+    const registrationIdentifier =
+      maybeString(relayPayload?.identifier) ||
+      maybeString(relayPayload?.publicIdentifier) ||
+      null;
+    metadata.identifier = registrationIdentifier || metadata.identifier || relayKey;
 
     const name = maybeString(relayPayload?.name);
     if (name) metadata.name = name;

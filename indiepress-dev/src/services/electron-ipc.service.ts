@@ -46,6 +46,7 @@ export type GatewayStatus = {
   host?: string
   port?: number
   wsBase?: string
+  ownPeerPublicKey?: string | null
   urls?: Record<string, string>
   startedAt?: number
   relays?: RelayEntry[]

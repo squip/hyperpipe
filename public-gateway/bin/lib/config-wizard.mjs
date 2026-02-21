@@ -2,12 +2,27 @@ import { randomBytes } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { schnorr } from '@noble/curves/secp256k1';
+import { keyPair as deriveHypercoreKeyPair } from 'hypercore-crypto';
 
-function normalizeHex64(value) {
+const DEFAULT_RELAY_NAMESPACE = 'public-gateway-relay';
+const DEFAULT_LOG_DIR = '/app/public-gateway/logs';
+const DEFAULT_LOG_PREFIX = 'public-gateway';
+const DEFAULT_LOG_ROTATE_MS = '1800000';
+const DEFAULT_LOG_RETENTION_MS = '18000000';
+
+function normalizeHex(value, expectedLength) {
   if (typeof value !== 'string') return null;
   const normalized = value.trim().toLowerCase();
-  if (!/^[a-f0-9]{64}$/i.test(normalized)) return null;
+  if (!new RegExp(`^[a-f0-9]{${expectedLength}}$`, 'i').test(normalized)) return null;
   return normalized;
+}
+
+function normalizeHex64(value) {
+  return normalizeHex(value, 64);
+}
+
+function normalizeHex128(value) {
+  return normalizeHex(value, 128);
 }
 
 function toHex(bytes) {
@@ -28,6 +43,26 @@ async function promptWithDefault(rl, label, defaultValue) {
   const value = await rl.question(`${label}${suffix}: `);
   const trimmed = value.trim();
   return trimmed.length ? trimmed : (defaultValue ?? '');
+}
+
+function deriveOperatorPubkeyHex(operatorNsecHex) {
+  const normalized = normalizeHex64(operatorNsecHex);
+  if (!normalized) {
+    throw new Error('operator nsec must be a 64-char hex value');
+  }
+  return toHex(schnorr.getPublicKey(normalized));
+}
+
+function deriveRelayAdminKeyPair(seedHex) {
+  const normalizedSeed = normalizeHex64(seedHex);
+  if (!normalizedSeed) {
+    throw new Error('relay seed must be a 64-char hex value');
+  }
+  const keypair = deriveHypercoreKeyPair(Buffer.from(normalizedSeed, 'hex'));
+  return {
+    relayAdminPublicKeyHex: toHex(keypair.publicKey),
+    relayAdminSecretKeyHex: toHex(keypair.secretKey)
+  };
 }
 
 async function runConfigWizard({ existing = {}, mode = 'init' } = {}) {
@@ -69,15 +104,38 @@ async function runConfigWizard({ existing = {}, mode = 'init' } = {}) {
       throw new Error('operator nsec must be a 64-char hex value');
     }
 
-    const derivedOperatorPubkey = toHex(schnorr.getPublicKey(operatorNsecHex));
-    const operatorPubkeyHex = normalizeHex64(await promptWithDefault(
-      rl,
-      'Operator pubkey hex',
-      existing.operatorPubkeyHex || derivedOperatorPubkey
-    ));
+    const operatorPubkeyHex = normalizeHex64(deriveOperatorPubkeyHex(operatorNsecHex));
     if (!operatorPubkeyHex) {
-      throw new Error('operator pubkey must be a 64-char hex value');
+      throw new Error('failed to derive operator pubkey from operator nsec');
     }
+    output.write(`Derived operator pubkey hex: ${operatorPubkeyHex}\n`);
+
+    const relaySeedHex = normalizeHex64(await promptWithDefault(
+      rl,
+      'Relay admin seed hex',
+      existing.relaySeedHex || randomBytes(32).toString('hex')
+    ));
+    if (!relaySeedHex) {
+      throw new Error('relay admin seed must be a 64-char hex value');
+    }
+
+    const relayNamespace = await promptWithDefault(
+      rl,
+      'Relay namespace',
+      existing.relayNamespace || DEFAULT_RELAY_NAMESPACE
+    );
+
+    const relayReplicationTopic = await promptWithDefault(
+      rl,
+      'Relay replication topic',
+      existing.relayReplicationTopic || relayNamespace
+    );
+
+    const gatewayHostLogPath = await promptWithDefault(
+      rl,
+      'Gateway host log path',
+      existing.gatewayHostLogPath || `${process.env.HOME || '.'}/public-gateway-logs`
+    );
 
     const policyRaw = await promptWithDefault(rl, 'Gateway policy (OPEN|CLOSED)', existing.policy || 'OPEN');
     const policy = String(policyRaw || '').trim().toUpperCase() === 'CLOSED' ? 'CLOSED' : 'OPEN';
@@ -115,6 +173,10 @@ async function runConfigWizard({ existing = {}, mode = 'init' } = {}) {
       registrationSecret,
       operatorNsecHex,
       operatorPubkeyHex,
+      relaySeedHex,
+      relayNamespace,
+      relayReplicationTopic,
+      gatewayHostLogPath,
       policy,
       inviteOnly,
       allowList,
@@ -133,6 +195,32 @@ function buildEnvMap(config = {}) {
   const redisPrefix = profile === 'internet'
     ? `public-gateway:${config.gatewayHost}:`
     : 'public-gateway:local:';
+
+  const operatorNsecHex = normalizeHex64(config.operatorNsecHex);
+  if (!operatorNsecHex) {
+    throw new Error('operator nsec must be a 64-char hex value');
+  }
+  const operatorPubkeyHex = deriveOperatorPubkeyHex(operatorNsecHex);
+
+  const relaySeedHex = normalizeHex64(
+    config.relaySeedHex
+    || config.relaySeed
+    || config.operatorNsecHex
+    || randomBytes(32).toString('hex')
+  );
+  if (!relaySeedHex) {
+    throw new Error('relay admin seed must be a 64-char hex value');
+  }
+  const relayAdminKeys = deriveRelayAdminKeyPair(relaySeedHex);
+  const relayAdminPublicKeyHex = normalizeHex64(config.relayAdminPublicKeyHex || relayAdminKeys.relayAdminPublicKeyHex);
+  const relayAdminSecretKeyHex = normalizeHex128(config.relayAdminSecretKeyHex || relayAdminKeys.relayAdminSecretKeyHex);
+  if (!relayAdminPublicKeyHex || !relayAdminSecretKeyHex) {
+    throw new Error('failed to derive relay admin keypair');
+  }
+
+  const relayNamespace = String(config.relayNamespace || DEFAULT_RELAY_NAMESPACE).trim() || DEFAULT_RELAY_NAMESPACE;
+  const relayReplicationTopic = String(config.relayReplicationTopic || relayNamespace).trim() || relayNamespace;
+
   const env = {
     GATEWAY_PROFILE: profile,
     GATEWAY_PUBLIC_URL: config.gatewayPublicUrl,
@@ -152,11 +240,21 @@ function buildEnvMap(config = {}) {
     GATEWAY_FEATURE_RELAY_DISPATCHER: 'true',
     GATEWAY_FEATURE_RELAY_TOKEN_ENFORCEMENT: 'true',
     GATEWAY_RELAY_STORAGE: '/data/gateway-relay',
+    GATEWAY_RELAY_NAMESPACE: relayNamespace,
+    GATEWAY_RELAY_REPLICATION_TOPIC: relayReplicationTopic,
+    GATEWAY_RELAY_SEED: relaySeedHex,
+    GATEWAY_RELAY_ADMIN_PUBLIC_KEY: relayAdminPublicKeyHex,
+    GATEWAY_RELAY_ADMIN_SECRET_KEY: relayAdminSecretKeyHex,
     GATEWAY_BLINDPEER_ENABLED: 'true',
     GATEWAY_BLINDPEER_STORAGE: '/data/blind-peer',
+    GATEWAY_LOG_DIR: DEFAULT_LOG_DIR,
+    GATEWAY_LOG_PREFIX: DEFAULT_LOG_PREFIX,
+    GATEWAY_LOG_ROTATE_MS: DEFAULT_LOG_ROTATE_MS,
+    GATEWAY_LOG_RETENTION_MS: DEFAULT_LOG_RETENTION_MS,
+    GATEWAY_HOST_LOG_PATH: String(config.gatewayHostLogPath || `${process.env.HOME || '.'}/public-gateway-logs`),
     GATEWAY_ENABLE_MULTI: 'true',
-    GATEWAY_OPERATOR_NSEC_HEX: config.operatorNsecHex,
-    GATEWAY_OPERATOR_PUBKEY_HEX: config.operatorPubkeyHex,
+    GATEWAY_OPERATOR_NSEC_HEX: operatorNsecHex,
+    GATEWAY_OPERATOR_PUBKEY_HEX: operatorPubkeyHex,
     GATEWAY_POLICY: config.policy,
     GATEWAY_ALLOW_LIST: (config.allowList || []).join(','),
     GATEWAY_BAN_LIST: (config.banList || []).join(','),
@@ -190,6 +288,8 @@ function buildEnvMap(config = {}) {
 export {
   runConfigWizard,
   buildEnvMap,
+  deriveOperatorPubkeyHex,
+  deriveRelayAdminKeyPair,
   normalizeHex64,
   parseCsv
 };

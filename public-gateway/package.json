@@ -17,6 +17,8 @@
     "gateway-admin": "node ./bin/gateway-admin.mjs",
     "e2e:multi-gateway:dry": "node ./e2e/multi-gateway/run-matrix.mjs --dry-run",
     "e2e:multi-gateway:run": "node ./e2e/multi-gateway/run-matrix.mjs",
+    "e2e:multi-gateway:renderer": "node ./e2e/multi-gateway/run-matrix.mjs --executor \"node ./public-gateway/e2e/multi-gateway/executor-renderer.mjs\"",
+    "e2e:multi-gateway:mixed": "HT_GW1_MODE=remote HT_GW2_MODE=local node ./e2e/multi-gateway/run-matrix.mjs --executor \"node ./public-gateway/e2e/multi-gateway/executor-renderer.mjs\"",
     "e2e:multi-gateway:stub": "node ./e2e/multi-gateway/run-matrix.mjs --skip-docker --executor \"node ./public-gateway/e2e/multi-gateway/executor-stub.mjs\"",
     "e2e:multi-gateway:up": "docker compose -f ./e2e/multi-gateway/docker-compose.yml up -d --build",
     "e2e:multi-gateway:down": "docker compose -f ./e2e/multi-gateway/docker-compose.yml down -v"

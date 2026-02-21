@@ -96,6 +96,43 @@ async function verifyEventSignature(event) {
 }
 
 const WAKEUP_CAPABILITY_FILENAME = 'wakeup-capability.json';
+const SWARM_DISCOVERY_FLUSH_TIMEOUT_MS = 10000;
+const RELAY_INIT_EVENT_TIMEOUT_MS = 5000;
+
+async function awaitDiscoveryFlushed(discovery, { timeoutMs = SWARM_DISCOVERY_FLUSH_TIMEOUT_MS } = {}) {
+  if (!discovery || typeof discovery.flushed !== 'function') {
+    return { status: 'skipped', elapsedMs: 0, timeoutMs };
+  }
+
+  const startedAt = Date.now();
+  let timeoutId = null;
+  try {
+    await Promise.race([
+      discovery.flushed(),
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(`discovery-flush-timeout-${timeoutMs}`));
+        }, timeoutMs);
+        timeoutId?.unref?.();
+      })
+    ]);
+    return {
+      status: 'ok',
+      elapsedMs: Date.now() - startedAt,
+      timeoutMs
+    };
+  } catch (error) {
+    const message = error?.message || String(error);
+    return {
+      status: message.startsWith('discovery-flush-timeout-') ? 'timeout' : 'error',
+      elapsedMs: Date.now() - startedAt,
+      timeoutMs,
+      error: message
+    };
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
 
 function serializeEvent(event) {
   return JSON.stringify([0, event.pubkey, event.created_at, event.kind, event.tags, event.content]);
@@ -297,16 +334,41 @@ export class RelayManager {
 
         console.log('Joining swarm with discovery key:', b4a.toString(this.relay.discoveryKey, 'hex'));
         const discovery = this.swarm.join(this.relay.discoveryKey);
-        await discovery.flushed();
+        const flushResult = await awaitDiscoveryFlushed(discovery, {
+          timeoutMs: SWARM_DISCOVERY_FLUSH_TIMEOUT_MS
+        });
+        if (flushResult.status === 'ok') {
+          console.log('[RelayManager] Swarm discovery flush complete', {
+            relayKey: this.bootstrap,
+            elapsedMs: flushResult.elapsedMs
+          });
+        } else {
+          console.warn('[RelayManager] Swarm discovery flush not confirmed; continuing initialization', {
+            relayKey: this.bootstrap,
+            status: flushResult.status,
+            elapsedMs: flushResult.elapsedMs,
+            timeoutMs: flushResult.timeoutMs,
+            error: flushResult.error || null
+          });
+        }
 
         console.log('Initializing relay');
-        if (this.relay.writable) {
+        if (this.relay.writable && !this.bootstrap) {
           try {
-            const initEventId = await this.initRelay();
+            const initEventId = await Promise.race([
+              this.initRelay(),
+              delay(RELAY_INIT_EVENT_TIMEOUT_MS).then(() => {
+                throw new Error(`relay-init-event-timeout-${RELAY_INIT_EVENT_TIMEOUT_MS}`);
+              })
+            ]);
             console.log('Relay initialized with event ID:', initEventId);
           } catch (error) {
             console.error('Failed to initialize relay:', error);
           }
+        } else if (this.relay.writable) {
+          console.log('[RelayManager] Skipping init event publish for joined relay', {
+            relayKey: this.bootstrap
+          });
         } else {
           console.log('Relay isn\'t writable yet');
           console.log('Have another writer add the following key:');

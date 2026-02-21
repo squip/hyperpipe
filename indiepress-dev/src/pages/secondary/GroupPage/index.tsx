@@ -771,6 +771,21 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   }, [groupId, joinFlows])
 
   useEffect(() => {
+    if (!joinFlow) return
+    if (joinFlow.phase === 'error' && joinFlow.error) {
+      setError(joinFlow.error)
+      return
+    }
+    if (
+      joinFlow.phase === 'success'
+      && joinFlow.writable === false
+      && (joinFlow.error || joinFlow.expectedWriterActive === false)
+    ) {
+      setError(joinFlow.error || 'Join completed, but writer material is unavailable right now.')
+    }
+  }, [joinFlow?.error, joinFlow?.expectedWriterActive, joinFlow?.phase, joinFlow?.writable])
+
+  useEffect(() => {
     if (!groupId) return
     if (!joinFlow?.writableAt || !joinFlow?.writable) return
     const writableRefreshKey = `${groupId}|${joinFlow.relayKey || ''}|${joinFlow.mode || ''}|${joinFlow.writableAt}`
@@ -1089,6 +1104,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       }
 
       if (shouldUseWorkerJoin) {
+        const joinMetadata = effectiveDetail?.metadata || fallbackMeta || null
+        const inferredWriterIssuer =
+          inviteData?.writerIssuerPubkey ||
+          joinMetadata?.writerIssuerPubkey ||
+          decodeNpub(groupId.split(':')?.[0] || '')
+
         await startJoinFlow(groupId, {
           fileSharing: isOpenGroup,
           isOpen: isOpenGroup,
@@ -1103,18 +1124,20 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           writerCoreHex: inviteData?.writerCoreHex,
           autobaseLocal: inviteData?.autobaseLocal,
           writerSecret: inviteData?.writerSecret,
-          discoveryTopic: inviteData?.discoveryTopic || detail?.metadata?.discoveryTopic || undefined,
+          discoveryTopic: inviteData?.discoveryTopic || joinMetadata?.discoveryTopic || undefined,
           hostPeerKeys:
             Array.isArray(inviteData?.hostPeerKeys)
               ? inviteData.hostPeerKeys
-              : Array.isArray(detail?.metadata?.hostPeerKeys)
-                ? detail?.metadata?.hostPeerKeys
+              : Array.isArray(joinMetadata?.hostPeerKeys)
+                ? joinMetadata?.hostPeerKeys
                 : undefined,
-          memberPeerKeys: Array.isArray(inviteData?.memberPeerKeys) ? inviteData.memberPeerKeys : undefined,
-          writerIssuerPubkey:
-            inviteData?.writerIssuerPubkey
-            || detail?.metadata?.writerIssuerPubkey
-            || undefined,
+          memberPeerKeys:
+            Array.isArray(inviteData?.memberPeerKeys)
+              ? inviteData.memberPeerKeys
+              : Array.isArray(joinMetadata?.memberPeerKeys)
+                ? joinMetadata?.memberPeerKeys
+                : undefined,
+          writerIssuerPubkey: inferredWriterIssuer || undefined,
           fastForward: inviteData?.fastForward || undefined
         })
         return
@@ -2058,10 +2081,16 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                   </Button>
                 )}
               </div>
-              {joinFlow && joinFlow.phase !== 'idle' && joinFlow.phase !== 'success' && (
+              {joinFlow &&
+                joinFlow.phase !== 'idle' &&
+                (joinFlow.phase !== 'success' || joinFlow.writable === false) && (
                 <div className="text-xs text-muted-foreground">
                   Hypertuna join flow: <span className="capitalize">{joinFlow.phase}</span>
-                  {joinFlow.error ? ` — ${joinFlow.error}` : ''}
+                  {joinFlow.error
+                    ? ` — ${joinFlow.error}`
+                    : joinFlow.phase === 'success' && joinFlow.writable === false
+                      ? ' — relay is not writable yet'
+                      : ''}
                 </div>
               )}
             </CardContent>

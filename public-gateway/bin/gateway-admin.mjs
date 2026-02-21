@@ -80,12 +80,66 @@ function parseEnvRaw(raw = '') {
   return out;
 }
 
+function parseCsvRaw(value) {
+  return String(value || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function parseBooleanRaw(value, fallback = false) {
+  if (value === undefined || value === null || String(value).trim().length === 0) return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  return ['1', 'true', 'yes', 'y', 'on'].includes(normalized);
+}
+
+function pickDefinedEntries(input = {}) {
+  return Object.fromEntries(
+    Object.entries(input).filter(([, value]) => value !== undefined && value !== null && value !== '')
+  );
+}
+
 async function readRuntimeEnv() {
   if (!await fileExists(ENV_FILE)) {
     throw new Error(`Runtime env not found at ${ENV_FILE}. Run \`gateway-admin init\` first.`);
   }
   const raw = await readFile(ENV_FILE, 'utf8');
   return parseEnvRaw(raw);
+}
+
+async function loadWizardDefaults() {
+  const stored = await loadStoredConfig();
+  const runtimeEnv = await readRuntimeEnv().catch(() => null);
+  if (!runtimeEnv) return stored;
+
+  const envDerived = pickDefinedEntries({
+    profile: runtimeEnv.GATEWAY_PROFILE,
+    gatewayBindPort: runtimeEnv.GATEWAY_BIND_PORT,
+    gatewayHost: runtimeEnv.GATEWAY_HOST,
+    letsencryptEmail: runtimeEnv.LETSENCRYPT_EMAIL,
+    gatewayPublicUrl: runtimeEnv.GATEWAY_PUBLIC_URL,
+    registrationSecret: runtimeEnv.GATEWAY_REGISTRATION_SECRET,
+    operatorNsecHex: runtimeEnv.GATEWAY_OPERATOR_NSEC_HEX,
+    operatorPubkeyHex: runtimeEnv.GATEWAY_OPERATOR_PUBKEY_HEX,
+    relaySeedHex: runtimeEnv.GATEWAY_RELAY_SEED,
+    relayNamespace: runtimeEnv.GATEWAY_RELAY_NAMESPACE,
+    relayReplicationTopic: runtimeEnv.GATEWAY_RELAY_REPLICATION_TOPIC,
+    relayAdminPublicKeyHex: runtimeEnv.GATEWAY_RELAY_ADMIN_PUBLIC_KEY,
+    relayAdminSecretKeyHex: runtimeEnv.GATEWAY_RELAY_ADMIN_SECRET_KEY,
+    policy: runtimeEnv.GATEWAY_POLICY,
+    allowList: parseCsvRaw(runtimeEnv.GATEWAY_ALLOW_LIST),
+    banList: parseCsvRaw(runtimeEnv.GATEWAY_BAN_LIST),
+    discoveryRelays: parseCsvRaw(runtimeEnv.GATEWAY_DISCOVERY_RELAYS),
+    inviteOnly: parseBooleanRaw(runtimeEnv.GATEWAY_INVITE_ONLY, stored.inviteOnly === true),
+    authJwtSecret: runtimeEnv.GATEWAY_AUTH_JWT_SECRET,
+    metricsEnabled: parseBooleanRaw(runtimeEnv.GATEWAY_METRICS_ENABLED, stored.metricsEnabled !== false),
+    gatewayHostLogPath: runtimeEnv.GATEWAY_HOST_LOG_PATH
+  });
+
+  return {
+    ...stored,
+    ...envDerived
+  };
 }
 
 function requiredRuntimeFiles() {
@@ -101,7 +155,7 @@ async function assertRuntimeInitialized() {
 }
 
 async function runInit(mode = 'init') {
-  const existing = await loadStoredConfig();
+  const existing = await loadWizardDefaults();
   const config = await runConfigWizard({ existing, mode });
   const envMap = buildEnvMap(config);
   await writeRuntimeConfig(config, envMap);
@@ -114,12 +168,31 @@ async function runInit(mode = 'init') {
 async function deployUp() {
   await assertRuntimeInitialized();
   const env = await readRuntimeEnv();
-  await runCompose({
-    runtimeDir: RUNTIME_DIR,
-    composeFile: COMPOSE_FILE,
-    envFile: ENV_FILE,
-    args: ['up', '-d', '--build']
-  });
+
+  const runUp = async (args = []) => {
+    const result = await runCompose({
+      runtimeDir: RUNTIME_DIR,
+      composeFile: COMPOSE_FILE,
+      envFile: ENV_FILE,
+      args,
+      capture: true
+    });
+    const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+    if (output.length) {
+      console.log(output);
+    }
+  };
+
+  try {
+    await runUp(['up', '-d', '--build']);
+  } catch (error) {
+    const combined = `${error?.stdout || ''}\n${error?.stderr || ''}\n${error?.message || ''}`;
+    const knownComposeMetadataBug = combined.includes('tmp-compose-build-metadataFile')
+      && combined.includes('no such file or directory');
+    if (!knownComposeMetadataBug) throw error;
+    console.warn('[gateway-admin] Detected docker compose metadata-file bug after build; retrying with `up -d`.');
+    await runUp(['up', '-d']);
+  }
 
   const publicUrl = env.GATEWAY_PUBLIC_URL || 'http://127.0.0.1:4430';
   const health = await waitForGatewayHealth(publicUrl, { timeoutMs: 150000, intervalMs: 2500 });
@@ -192,12 +265,16 @@ async function showConfig() {
     ...config,
     registrationSecret: config.registrationSecret ? '<redacted>' : undefined,
     operatorNsecHex: config.operatorNsecHex ? '<redacted>' : undefined,
+    relaySeedHex: config.relaySeedHex ? '<redacted>' : undefined,
+    relayAdminSecretKeyHex: config.relayAdminSecretKeyHex ? '<redacted>' : undefined,
     authJwtSecret: config.authJwtSecret ? '<redacted>' : undefined,
     envPreview: {
       GATEWAY_PUBLIC_URL: env.GATEWAY_PUBLIC_URL,
       GATEWAY_POLICY: env.GATEWAY_POLICY,
       GATEWAY_ENABLE_MULTI: env.GATEWAY_ENABLE_MULTI,
-      GATEWAY_ADMIN_UI_ENABLED: env.GATEWAY_ADMIN_UI_ENABLED
+      GATEWAY_ADMIN_UI_ENABLED: env.GATEWAY_ADMIN_UI_ENABLED,
+      GATEWAY_RELAY_NAMESPACE: env.GATEWAY_RELAY_NAMESPACE,
+      GATEWAY_RELAY_REPLICATION_TOPIC: env.GATEWAY_RELAY_REPLICATION_TOPIC
     }
   };
   console.log(JSON.stringify(redacted, null, 2));

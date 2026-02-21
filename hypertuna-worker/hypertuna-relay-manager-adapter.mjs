@@ -1510,7 +1510,8 @@ export async function joinRelay(options = {}) {
         gatewayOrigins = null,
         suppressInitMessage = false,
         useSharedCorestore = false,
-        corestore = null
+        corestore = null,
+        deferCoreRefSync = false
     } = options;
     
     // Store config globally if provided
@@ -1932,18 +1933,41 @@ export async function joinRelay(options = {}) {
         const postJoinCoreRefs = normalizeCoreRefs(profileInfo.core_refs || profileInfo.coreRefs);
         let postJoinSync = null;
         if (typeof global.syncActiveRelayCoreRefs === 'function' && postJoinCoreRefs.length) {
-            try {
-                postJoinSync = await global.syncActiveRelayCoreRefs({
-                    relayKey,
-                    publicIdentifier: profileInfo.public_identifier || publicIdentifier,
-                    coreRefs: postJoinCoreRefs,
-                    reason: 'post-join'
-                });
-            } catch (error) {
-                console.warn('[RelayAdapter] Post-join writer sync failed', {
-                    relayKey,
-                    error: error?.message || error
-                });
+            const syncPayload = {
+                relayKey,
+                publicIdentifier: profileInfo.public_identifier || publicIdentifier,
+                coreRefs: postJoinCoreRefs,
+                reason: 'post-join'
+            };
+            if (deferCoreRefSync) {
+                postJoinSync = {
+                    status: 'deferred',
+                    writerSummary: { status: 'deferred', added: 0 }
+                };
+                global.syncActiveRelayCoreRefs(syncPayload)
+                    .then((summary) => {
+                        console.log('[RelayAdapter] Deferred post-join writer sync complete', {
+                            relayKey,
+                            status: summary?.status ?? null,
+                            writerStatus: summary?.writerSummary?.status ?? null,
+                            writerAdded: summary?.writerSummary?.added ?? 0
+                        });
+                    })
+                    .catch((error) => {
+                        console.warn('[RelayAdapter] Deferred post-join writer sync failed', {
+                            relayKey,
+                            error: error?.message || error
+                        });
+                    });
+            } else {
+                try {
+                    postJoinSync = await global.syncActiveRelayCoreRefs(syncPayload);
+                } catch (error) {
+                    console.warn('[RelayAdapter] Post-join writer sync failed', {
+                        relayKey,
+                        error: error?.message || error
+                    });
+                }
             }
         }
 

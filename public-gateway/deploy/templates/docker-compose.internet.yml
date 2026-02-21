@@ -45,6 +45,7 @@ services:
     volumes:
       - gateway-relay-data:/data/gateway-relay
       - gateway-blind-peer-data:/data/blind-peer
+      - ${GATEWAY_HOST_LOG_PATH}:/app/public-gateway/logs
 
 volumes:
   redis-data:
