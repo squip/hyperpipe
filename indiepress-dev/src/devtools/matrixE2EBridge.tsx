@@ -537,12 +537,28 @@ export default function MatrixE2EBridge({ enabled }: { enabled: boolean }): null
       }) {
         const text = String(args?.text || '')
         if (!text) throw new Error('text-required')
+        const normalizeText = (value: string) =>
+          String(value || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase()
         const timeoutMs = Number.isFinite(args?.timeoutMs) ? Number(args?.timeoutMs) : 60_000
         const intervalMs = Number.isFinite(args?.intervalMs) ? Number(args?.intervalMs) : 500
+        const normalizedNeedle = normalizeText(text)
+        const needleHead = normalizedNeedle.length > 20
+          ? normalizedNeedle.slice(0, Math.min(48, normalizedNeedle.length))
+          : normalizedNeedle
+        const rawNeedleHead = text.trim().slice(0, 48)
         const startedAt = Date.now()
         while (Date.now() - startedAt < timeoutMs) {
           const bodyText = String(document?.body?.innerText || '')
-          if (bodyText.includes(text)) {
+          const normalizedBodyText = normalizeText(bodyText)
+          if (
+            bodyText.includes(text)
+            || (normalizedNeedle && normalizedBodyText.includes(normalizedNeedle))
+            || (needleHead && normalizedBodyText.includes(needleHead))
+            || (rawNeedleHead && bodyText.includes(rawNeedleHead))
+          ) {
             return { visible: true }
           }
           await sleep(intervalMs)

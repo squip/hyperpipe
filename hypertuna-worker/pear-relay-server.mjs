@@ -7728,7 +7728,7 @@ export async function startJoinAuthentication(options) {
     console.log(`[RelayServer] IV base64: ${ivBase64}`);
 
     console.log(`[RelayServer] Sending verification request directly to peer ${selectedPeerKey.substring(0, 8)}...`);
-    const hasPreProvisionedWriterMaterial = Boolean(
+    const hasPreProvisionedWriterMaterial = !openJoin && Boolean(
       writerSecret && (writerCore || writerCoreHex || autobaseLocal)
     );
 

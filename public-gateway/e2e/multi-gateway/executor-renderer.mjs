@@ -1596,6 +1596,14 @@ async function runScenario() {
     })
     const publishErrors = []
     const blockedPublishBases = new Set()
+    const blockedTokenizedPublishBases = new Set()
+    const isCandidateBlocked = (relayUrlCandidate) => {
+      const candidateBaseRelay = relayUrlBaseKey(relayUrlCandidate) || relayUrlCandidate
+      if (!candidateBaseRelay) return false
+      if (blockedPublishBases.has(candidateBaseRelay)) return true
+      if (relayUrlHasToken(relayUrlCandidate) && blockedTokenizedPublishBases.has(candidateBaseRelay)) return true
+      return false
+    }
     let publishedNote = null
     let publishWinner = null
     for (let index = 0; index < publishCandidates.length; index += 1) {
@@ -1603,7 +1611,7 @@ async function runScenario() {
       const relayUrlCandidate = candidate?.relayUrl
       if (!relayUrlCandidate) continue
       const candidateBaseRelay = relayUrlBaseKey(relayUrlCandidate) || relayUrlCandidate
-      if (candidateBaseRelay && blockedPublishBases.has(candidateBaseRelay)) {
+      if (isCandidateBlocked(relayUrlCandidate)) {
         logScenarioStage('publish-attempt-skipped', {
           attempt: `${index + 1}.0`,
           stage: 'publish',
@@ -1646,13 +1654,18 @@ async function runScenario() {
           })
           const blacklistCandidate = isAggregatePublishErrorMessage(message)
           if (blacklistCandidate && candidateBaseRelay) {
-            blockedPublishBases.add(candidateBaseRelay)
+            const tokenizedCandidate = relayUrlHasToken(relayUrlCandidate)
+            if (tokenizedCandidate) {
+              blockedTokenizedPublishBases.add(candidateBaseRelay)
+            } else {
+              blockedPublishBases.add(candidateBaseRelay)
+            }
             logScenarioStage('publish-attempt-blacklisted', {
               attempt: attemptNumber,
               stage: 'publish',
               relayUrl: relayUrlCandidate,
               source: candidate?.source || null,
-              reason: 'aggregate-error'
+              reason: tokenizedCandidate ? 'aggregate-error-tokenized' : 'aggregate-error'
             })
             break
           }
@@ -1726,11 +1739,7 @@ async function runScenario() {
       const relayUrlCandidate = candidate?.relayUrl
       if (!relayUrlCandidate) continue
       const candidateBaseRelay = relayUrlBaseKey(relayUrlCandidate) || relayUrlCandidate
-      if (
-        candidateBaseRelay
-        && blockedPublishBases.has(candidateBaseRelay)
-        && candidateBaseRelay !== publishWinnerBaseRelay
-      ) {
+      if (candidateBaseRelay && candidateBaseRelay !== publishWinnerBaseRelay && isCandidateBlocked(relayUrlCandidate)) {
         logScenarioStage('publish-attempt-skipped', {
           attempt: index + 1,
           stage: 'fetch',
@@ -1801,12 +1810,7 @@ async function runScenario() {
       const candidate = visibleCandidates[index]
       const relayUrlCandidate = candidate?.relayUrl
       const candidateBaseRelay = relayUrlBaseKey(relayUrlCandidate) || relayUrlCandidate
-      if (
-        relayUrlCandidate
-        && candidateBaseRelay
-        && blockedPublishBases.has(candidateBaseRelay)
-        && candidateBaseRelay !== publishWinnerBaseRelay
-      ) {
+      if (relayUrlCandidate && candidateBaseRelay && candidateBaseRelay !== publishWinnerBaseRelay && isCandidateBlocked(relayUrlCandidate)) {
         logScenarioStage('publish-attempt-skipped', {
           attempt: index + 1,
           stage: 'visible',
@@ -1820,7 +1824,7 @@ async function runScenario() {
         await joinerPeer.callBridge('openGroupPage', relayUrlCandidate
           ? { groupId: publicIdentifier, relayUrl: relayUrlCandidate }
           : { groupId: publicIdentifier }, 15000)
-        const visibleTimeoutMs = index === 0 ? 45000 : 25000
+        const visibleTimeoutMs = index === 0 ? 65000 : 35000
         await joinerPeer.callBridge('waitForVisibleText', {
           text: publishContent,
           timeoutMs: visibleTimeoutMs

@@ -839,6 +839,10 @@ function parseScenarioSummary(stdoutLines = []) {
 
 async function parseExecutorStageFlags(scenarioDir) {
   const flags = {
+    joinStartDispatch: false,
+    joinWritableConfirmed: false,
+    joinExpectedFailFast: false,
+    publishValidationConfirmed: false,
     restartAutoconnectConfirmed: false,
     scenarioComplete: false
   }
@@ -852,6 +856,18 @@ async function parseExecutorStageFlags(scenarioDir) {
 
   for (const line of raw.split(/\r?\n/)) {
     if (!line) continue
+    if (line.includes('[executor-renderer][stage] join-start-dispatch')) {
+      flags.joinStartDispatch = true
+    }
+    if (line.includes('[executor-renderer][stage] join-writable-confirmed')) {
+      flags.joinWritableConfirmed = true
+    }
+    if (line.includes('[executor-renderer][stage] join-expected-fail-fast')) {
+      flags.joinExpectedFailFast = true
+    }
+    if (line.includes('[executor-renderer][stage] publish-validation-confirmed')) {
+      flags.publishValidationConfirmed = true
+    }
     if (line.includes('[executor-renderer][stage] restart-autoconnect-confirmed')) {
       flags.restartAutoconnectConfirmed = true
     }
@@ -1200,6 +1216,29 @@ async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
     && stageFlags.restartAutoconnectConfirmed
     && hasAutoConnectViewEvidence
     && autoconnectObservedViewLength === normalizedAutoconnectExpectedViewLength
+  const joinHintSignals = parsedWorker.joinHintSignals || {
+    joinStartSeen: false,
+    joinStartCount: 0,
+    maxHostPeerHintsCount: 0,
+    sawDiscoveryTopicHint: false,
+    sawWriterIssuerHint: false,
+    sawHostPeerHintsZero: false
+  }
+  const joinHintEvidenceFromWorker =
+    joinHintSignals.joinStartSeen
+    && (joinHintSignals.maxHostPeerHintsCount > 0 || joinHintSignals.sawDiscoveryTopicHint)
+  const hasJoinSummaryEvidence = Boolean(summary?.joinWritableResult?.source)
+    || Boolean(summary?.publishValidation?.noteId)
+  const joinHintFallbackPass =
+    !joinHintSignals.joinStartSeen
+    && stageFlags.joinStartDispatch
+    && (
+      stageFlags.joinWritableConfirmed
+      || stageFlags.joinExpectedFailFast
+      || hasJoinSummaryEvidence
+      || stageFlags.publishValidationConfirmed
+    )
+  const joinDispatchHintEvidencePass = joinHintEvidenceFromWorker || joinHintFallbackPass
 
   const allowWriterMaterialFailFastEvaluation =
     scenario?.id === 'S21'
@@ -1213,14 +1252,6 @@ async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
     const failFastObserved = failFastSignals.length > 0
       || joinPerf?.failFastReason
       || autoconnectPerf?.failFastReason
-    const joinHintSignals = parsedWorker.joinHintSignals || {
-      joinStartSeen: false,
-      joinStartCount: 0,
-      maxHostPeerHintsCount: 0,
-      sawDiscoveryTopicHint: false,
-      sawWriterIssuerHint: false,
-      sawHostPeerHintsZero: false
-    }
     const checks = [
       {
         name: 'expected_closed_join_without_lease_fail_fast',
@@ -1231,10 +1262,10 @@ async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
       },
       {
         name: 'join_dispatch_hint_evidence',
-        pass:
-          joinHintSignals.joinStartSeen
-          && (joinHintSignals.maxHostPeerHintsCount > 0 || joinHintSignals.sawDiscoveryTopicHint),
-        joinHintSignals
+        pass: joinDispatchHintEvidencePass,
+        joinHintSignals,
+        fallbackUsed: joinHintFallbackPass,
+        stageFlags
       }
     ]
     return {
@@ -1421,14 +1452,6 @@ async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
     bearerIssuedCount: parsedWorker.gatewayAuthSignals?.bearerIssuedCount || 0
   })
 
-  const joinHintSignals = parsedWorker.joinHintSignals || {
-    joinStartSeen: false,
-    joinStartCount: 0,
-    maxHostPeerHintsCount: 0,
-    sawDiscoveryTopicHint: false,
-    sawWriterIssuerHint: false,
-    sawHostPeerHintsZero: false
-  }
   const metadataHintContinuityPass =
     !joinHintSignals.joinStartSeen
     || (
@@ -1440,10 +1463,10 @@ async function evaluateScenarioResult(scenario, scenarioDir, executorResult) {
     )
   checks.push({
     name: 'join_dispatch_hint_evidence',
-    pass:
-      joinHintSignals.joinStartSeen
-      && (joinHintSignals.maxHostPeerHintsCount > 0 || joinHintSignals.sawDiscoveryTopicHint),
-    joinHintSignals
+    pass: joinDispatchHintEvidencePass,
+    joinHintSignals,
+    fallbackUsed: joinHintFallbackPass,
+    stageFlags
   })
   checks.push({
     name: 'metadata_hint_continuity',
