@@ -16,14 +16,20 @@ import {
   requestFileFromPeer,
   requestPfpFromPeer
 } from './HyperswarmClient.mjs';
-import PublicGatewayRegistrar from './PublicGatewayRegistrar.mjs';
+import PublicGatewayAuthClient from './PublicGatewayAuthClient.mjs';
+import PublicGatewayControlClient from './PublicGatewayControlClient.mjs';
 import PublicGatewayDiscoveryClient from './PublicGatewayDiscoveryClient.mjs';
 import PublicGatewayRelayClient from './PublicGatewayRelayClient.mjs';
 import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGatewayHyperbeeAdapter.mjs';
 import PublicGatewayVirtualRelayManager from './PublicGatewayVirtualRelayManager.mjs';
 import {
   registerVirtualRelay,
-  unregisterVirtualRelay
+  unregisterVirtualRelay,
+  handleRelayMessage,
+  handleRelaySubscription,
+  updateRelaySubscriptions,
+  publicToKey,
+  keyToPublic
 } from '../hypertuna-relay-manager-adapter.mjs';
 import { activeRelays as relayManagerMap } from '../hypertuna-relay-manager-adapter.mjs';
 import { getRelayAuthStore } from '../relay-auth-store.mjs';
@@ -288,6 +294,9 @@ export class GatewayService extends EventEmitter {
     this.getCurrentPubkey = typeof options.getCurrentPubkey === 'function'
       ? options.getCurrentPubkey
       : () => options.currentPubkey || null;
+    this.getCurrentNsec = typeof options.getCurrentNsec === 'function'
+      ? options.getCurrentNsec
+      : () => options.currentNsec || null;
 
     this.#configurePublicGateway();
   }
@@ -295,7 +304,6 @@ export class GatewayService extends EventEmitter {
   #normalizePublicGatewayConfig(rawConfig = {}) {
     const envEnabled = process.env.PUBLIC_GATEWAY_ENABLED === 'true';
     const envBaseUrl = (process.env.PUBLIC_GATEWAY_URL || '').trim();
-    const envSecret = (process.env.PUBLIC_GATEWAY_SECRET || '').trim();
     const envTtl = Number(process.env.PUBLIC_GATEWAY_DEFAULT_TOKEN_TTL);
     const envDelegateRaw = process.env.PUBLIC_GATEWAY_DELEGATE_REQS;
     const envDelegate = envDelegateRaw === 'true' ? true : envDelegateRaw === 'false' ? false : null;
@@ -324,15 +332,12 @@ export class GatewayService extends EventEmitter {
         ? rawConfig.selectedGatewayId.trim() || null
         : null,
       baseUrl: typeof rawConfig?.baseUrl === 'string' ? rawConfig.baseUrl.trim() : '',
-      sharedSecret: typeof rawConfig?.sharedSecret === 'string' ? rawConfig.sharedSecret.trim() : '',
       preferredBaseUrl: typeof rawConfig?.preferredBaseUrl === 'string'
         ? rawConfig.preferredBaseUrl.trim()
         : '',
       defaultTokenTtl,
       tokenRefreshWindowSeconds,
       resolvedGatewayId: rawConfig?.resolvedGatewayId || null,
-      resolvedSecretVersion: rawConfig?.resolvedSecretVersion || null,
-      resolvedSharedSecretHash: rawConfig?.resolvedSharedSecretHash || null,
       resolvedDisplayName: rawConfig?.resolvedDisplayName || null,
       resolvedRegion: rawConfig?.resolvedRegion || null,
       resolvedWsUrl: rawConfig?.resolvedWsUrl || null,
@@ -358,7 +363,7 @@ export class GatewayService extends EventEmitter {
     }
 
     if (!config.selectionMode) {
-      config.selectionMode = envSecret ? 'manual' : 'default';
+      config.selectionMode = 'default';
     }
 
     if (!config.preferredBaseUrl) {
@@ -372,14 +377,9 @@ export class GatewayService extends EventEmitter {
       config.baseUrl = envBaseUrl || config.preferredBaseUrl || 'https://hypertuna.com';
     }
 
-    if (envBaseUrl && envSecret) {
-      config.enabled = true;
-      config.selectionMode = 'manual';
+    if (envBaseUrl && config.selectionMode === 'manual' && !config.baseUrl) {
       config.baseUrl = envBaseUrl;
       config.preferredBaseUrl = envBaseUrl;
-      config.sharedSecret = envSecret;
-    } else if (envSecret && config.selectionMode === 'manual' && !config.sharedSecret) {
-      config.sharedSecret = envSecret;
     }
 
     if (!config.baseUrl && config.selectionMode !== 'default') {
@@ -454,12 +454,10 @@ export class GatewayService extends EventEmitter {
   #configurePublicGateway() {
     const config = this.publicGatewaySettings || { enabled: false };
     const hasBaseUrl = !!(config.baseUrl && String(config.baseUrl).trim());
-    const hasSharedSecret = !!(config.sharedSecret && String(config.sharedSecret).trim());
 
-    console.info('[PublicGateway] Registrar config', {
+    console.info('[PublicGateway] Control client config', {
       enabled: !!config.enabled,
       hasBaseUrl,
-      hasSharedSecret,
       baseUrl: hasBaseUrl ? config.baseUrl : null
     });
 
@@ -475,11 +473,21 @@ export class GatewayService extends EventEmitter {
       this.hyperbeeAdapter.logger = this.loggerBridge;
     }
 
-    if (config.enabled && config.baseUrl && config.sharedSecret) {
-      this.publicGatewayRegistrar = new PublicGatewayRegistrar({
+    if (config.enabled && config.baseUrl) {
+      const authClient = new PublicGatewayAuthClient({
         baseUrl: config.baseUrl,
-        sharedSecret: config.sharedSecret,
-        logger: this.loggerBridge
+        logger: this.loggerBridge,
+        getAuthContext: () => ({
+          pubkey: this.getCurrentPubkey?.() || null,
+          nsecHex: this.getCurrentNsec?.() || null
+        }),
+        fetchImpl: globalThis.fetch
+      });
+      this.publicGatewayRegistrar = new PublicGatewayControlClient({
+        baseUrl: config.baseUrl,
+        authClient,
+        logger: this.loggerBridge,
+        fetchImpl: globalThis.fetch
       });
       this.publicGatewayWsBase = this.#computePublicGatewayWsBase(config.baseUrl);
     } else {
@@ -845,10 +853,7 @@ export class GatewayService extends EventEmitter {
     this.discoveryWarning = null;
     const previousResolved = {
       baseUrl: config.baseUrl,
-      sharedSecret: config.sharedSecret,
       resolvedGatewayId: config.resolvedGatewayId,
-      resolvedSecretVersion: config.resolvedSecretVersion,
-      resolvedSharedSecretHash: config.resolvedSharedSecretHash,
       resolvedDisplayName: config.resolvedDisplayName,
       resolvedRegion: config.resolvedRegion,
       resolvedWsUrl: config.resolvedWsUrl,
@@ -864,8 +869,6 @@ export class GatewayService extends EventEmitter {
     config.resolvedFallback = false;
     config.disabledReason = null;
     config.resolvedGatewayId = null;
-    config.resolvedSecretVersion = null;
-    config.resolvedSharedSecretHash = null;
     config.resolvedDisplayName = null;
     config.resolvedRegion = null;
     config.resolvedWsUrl = null;
@@ -882,12 +885,7 @@ export class GatewayService extends EventEmitter {
       if (previousResolved.baseUrl != null && previousResolved.baseUrl !== '') {
         config.baseUrl = previousResolved.baseUrl;
       }
-      if (previousResolved.sharedSecret != null) {
-        config.sharedSecret = previousResolved.sharedSecret;
-      }
       config.resolvedGatewayId = previousResolved.resolvedGatewayId || null;
-      config.resolvedSecretVersion = previousResolved.resolvedSecretVersion || null;
-      config.resolvedSharedSecretHash = previousResolved.resolvedSharedSecretHash || null;
       config.resolvedDisplayName = previousResolved.resolvedDisplayName || null;
       config.resolvedRegion = previousResolved.resolvedRegion || null;
       config.resolvedWsUrl = previousResolved.resolvedWsUrl || null;
@@ -902,16 +900,14 @@ export class GatewayService extends EventEmitter {
 
     if (!config.enabled) {
       config.baseUrl = '';
-      config.sharedSecret = '';
       return config;
     }
 
     if (config.selectionMode === 'manual') {
-      if (!config.baseUrl || !config.sharedSecret) {
+      if (!config.baseUrl) {
         config.enabled = false;
-        config.disabledReason = 'Manual configuration requires base URL and shared secret';
+        config.disabledReason = 'Manual configuration requires base URL';
         config.baseUrl = '';
-        config.sharedSecret = '';
       }
       return config;
     }
@@ -932,42 +928,20 @@ export class GatewayService extends EventEmitter {
 
     refreshCatalog();
 
-    const ensureEntrySecret = async (entry) => {
-      if (!entry) return null;
-      try {
-        await this.discoveryClient.ensureSecret(entry.gatewayId);
-        refreshCatalog();
-        return this.discoveryClient.getGatewayById(entry.gatewayId);
-      } catch (error) {
-        this.log('warn', `[PublicGateway] Failed to retrieve shared secret for gateway ${entry.gatewayId}: ${error.message}`);
-        return null;
-      }
-    };
-
     let resolvedEntry = null;
 
     if (config.selectionMode === 'discovered') {
       if (!config.selectedGatewayId) {
         config.disabledReason = 'No public gateway selected';
-        config.sharedSecret = '';
         return config;
       }
 
       const entry = this.discoveryClient.getGatewayById(config.selectedGatewayId);
       if (!entry) {
         config.disabledReason = 'Selected public gateway is offline';
-        config.sharedSecret = '';
         return config;
       }
-
-      resolvedEntry = await ensureEntrySecret(entry);
-      if (!resolvedEntry || !resolvedEntry.sharedSecret) {
-        config.disabledReason = entry.isExpired
-          ? 'Selected public gateway advertisement expired'
-          : 'Unable to retrieve shared secret for selected gateway';
-        config.sharedSecret = '';
-        return config;
-      }
+      resolvedEntry = entry;
     } else {
       const preferredUrl = config.preferredBaseUrl || config.baseUrl || 'https://hypertuna.com';
       let entry = this.discoveryClient.findGatewayByUrl(preferredUrl);
@@ -975,32 +949,29 @@ export class GatewayService extends EventEmitter {
         entry = null;
       }
 
-      resolvedEntry = await ensureEntrySecret(entry);
+      resolvedEntry = entry;
 
-      if (!resolvedEntry || !resolvedEntry.sharedSecret) {
+      if (!resolvedEntry) {
         const candidates = (this.discoveryClient.getGateways() || [])
-          .filter((candidate) => candidate.sharedSecret && !candidate.isExpired);
+          .filter((candidate) => !candidate.isExpired);
         if (candidates.length) {
-          resolvedEntry = await ensureEntrySecret(candidates[0]);
-          if (resolvedEntry && resolvedEntry.sharedSecret) {
+          resolvedEntry = candidates[0];
+          if (resolvedEntry) {
             config.resolvedFallback = true;
           }
         }
       }
 
-      if (!resolvedEntry || !resolvedEntry.sharedSecret) {
+      if (!resolvedEntry) {
         this.discoveryWarning = 'No open public gateways available; using cached discovery state';
-        this.log('debug', '[PublicGateway] Discovery catalog empty; reusing cached gateway credentials');
+        this.log('debug', '[PublicGateway] Discovery catalog empty; reusing cached gateway endpoints');
         restorePreviousResolved();
         return config;
       }
     }
 
     config.baseUrl = resolvedEntry.publicUrl || config.baseUrl || config.preferredBaseUrl;
-    config.sharedSecret = resolvedEntry.sharedSecret || '';
     config.resolvedGatewayId = resolvedEntry.gatewayId;
-    config.resolvedSecretVersion = resolvedEntry.sharedSecretVersion || null;
-    config.resolvedSharedSecretHash = resolvedEntry.secretHash || null;
     config.resolvedDisplayName = resolvedEntry.displayName || null;
     config.resolvedRegion = resolvedEntry.region || null;
     config.resolvedWsUrl = resolvedEntry.wsUrl || null;
@@ -1917,7 +1888,6 @@ export class GatewayService extends EventEmitter {
       resolvedGatewayId: config.resolvedGatewayId || null,
       resolvedDisplayName: config.resolvedDisplayName || null,
       resolvedRegion: config.resolvedRegion || null,
-      resolvedSecretVersion: config.resolvedSecretVersion || null,
       resolvedFallback: !!config.resolvedFallback,
       resolvedFromDiscovery: !!config.resolvedFromDiscovery,
       resolvedAt: config.resolvedAt || null,
@@ -2197,7 +2167,7 @@ export class GatewayService extends EventEmitter {
     }
   }
 
-  async syncPublicGatewayRelay(relayKey, { forceTokenRefresh = true } = {}) {
+  async syncPublicGatewayRelay(relayKey, { forceTokenRefresh = false } = {}) {
     await this.#syncPublicGatewayRelay(relayKey, { forceTokenRefresh });
   }
 
@@ -2215,7 +2185,7 @@ export class GatewayService extends EventEmitter {
       this.#ensurePublicGatewayRelayEntry();
       try {
         // eslint-disable-next-line no-await-in-loop
-        await this.#syncPublicGatewayRelay(gatewayRelayKey, { forceTokenRefresh: true });
+        await this.#syncPublicGatewayRelay(gatewayRelayKey, { forceTokenRefresh: false });
       } catch (error) {
         this.log('warn', `[PublicGateway] Failed to sync gateway relay replica: ${error.message}`);
       }
@@ -2225,7 +2195,7 @@ export class GatewayService extends EventEmitter {
       if (this.#isPublicGatewayRelayKey(key)) continue;
       // Sequential resync to avoid saturating registrar
       // eslint-disable-next-line no-await-in-loop
-      await this.#syncPublicGatewayRelay(key, { forceTokenRefresh: true });
+      await this.#syncPublicGatewayRelay(key, { forceTokenRefresh: false });
     }
   }
 
@@ -2251,12 +2221,12 @@ export class GatewayService extends EventEmitter {
       this.#clearAllRelayTokens();
     }
 
-    const previousHash = previousSettings?.resolvedSharedSecretHash || null;
-    const nextHash = this.publicGatewaySettings?.resolvedSharedSecretHash || null;
     const statusChanged = Boolean(previousSettings?.enabled) !== Boolean(this.publicGatewaySettings?.enabled);
-    const secretChanged = previousHash !== nextHash && nextHash !== null;
+    const baseUrlChanged = (previousSettings?.baseUrl || null) !== (this.publicGatewaySettings?.baseUrl || null);
+    const selectionChanged = (previousSettings?.selectionMode || null) !== (this.publicGatewaySettings?.selectionMode || null);
+    const selectedGatewayChanged = (previousSettings?.selectedGatewayId || null) !== (this.publicGatewaySettings?.selectedGatewayId || null);
 
-    if (statusChanged || secretChanged) {
+    if (statusChanged || baseUrlChanged || selectionChanged || selectedGatewayChanged) {
       try {
         await updatePublicGatewaySettings(this.publicGatewaySettings);
       } catch (error) {
@@ -3118,7 +3088,7 @@ export class GatewayService extends EventEmitter {
     peer.lastSeen = Date.now();
 
     updatedRelays.forEach(identifier => {
-      this.#syncPublicGatewayRelay(identifier, { forceTokenRefresh: true }).catch(error => {
+      this.#syncPublicGatewayRelay(identifier, { forceTokenRefresh: false }).catch(error => {
         this.log('warn', `[PublicGateway] Sync error for ${identifier}: ${error.message}`);
       });
     });
@@ -3538,10 +3508,12 @@ export class GatewayService extends EventEmitter {
         let frameType = null;
         let frameSubscriptionId = null;
         let frameEventId = null;
+        let parsedFrame = null;
         if (typeof msg === 'string' || msg instanceof Buffer) {
           try {
             const parsed = JSON.parse(typeof msg === 'string' ? msg : msg.toString());
             if (Array.isArray(parsed)) {
+              parsedFrame = parsed;
               frameType = parsed[0];
               frameSubscriptionId =
                 (frameType === 'REQ' || frameType === 'CLOSE') && typeof parsed[1] === 'string'
@@ -3559,6 +3531,31 @@ export class GatewayService extends EventEmitter {
 
         const wasPolling = connData.shouldPollPeers;
         let shouldTriggerImmediatePoll = false;
+
+        const localFrameResult = await this.#maybeHandleRelayFrameLocally(connData, msg, parsedFrame);
+        if (localFrameResult?.handled) {
+          connData.shouldPollPeers = localFrameResult?.shouldPollPeers === true;
+          if (localFrameResult.subscriptionId) {
+            if (localFrameResult.frameType === 'CLOSE') {
+              connData.localServedSubscriptions.delete(localFrameResult.subscriptionId);
+              connData.delegatedSubscriptions.delete(localFrameResult.subscriptionId);
+              connData.pendingDelegations?.delete?.(localFrameResult.subscriptionId);
+            } else if (localFrameResult.frameType === 'REQ') {
+              connData.localServedSubscriptions.add(localFrameResult.subscriptionId);
+              connData.delegatedSubscriptions.delete(localFrameResult.subscriptionId);
+              connData.pendingDelegations?.delete?.(localFrameResult.subscriptionId);
+            }
+          }
+          this.log('debug', '[PublicGateway] Served websocket frame via local relay manager', {
+            connectionKey,
+            relayKey: connData.relayKey,
+            localRelayKey: localFrameResult.localRelayKey || null,
+            frameType: localFrameResult.frameType || frameType || null,
+            subscriptionId: localFrameResult.subscriptionId || null,
+            responses: localFrameResult.responses || 0
+          });
+          return;
+        }
 
         const localResult = await this.#maybeHandleReqLocally(connData, msg);
         if (localResult?.handled) {
@@ -3649,7 +3646,11 @@ export class GatewayService extends EventEmitter {
         const healthyPeer = await this.findHealthyPeerForRelay(identifier, requiresRetryingPeerLookup);
         if (!healthyPeer) {
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(['NOTICE', 'No healthy peers available for this relay']));
+            if (frameType === 'EVENT' && frameEventId) {
+              ws.send(JSON.stringify(['OK', frameEventId, false, 'publish-failed-no-healthy-peer']));
+            } else {
+              ws.send(JSON.stringify(['NOTICE', 'No healthy peers available for this relay']));
+            }
           }
           connData.shouldPollPeers = (connData.delegatedSubscriptions.size > 0) ||
             (connData.pendingDelegations?.size > 0);
@@ -3697,41 +3698,25 @@ export class GatewayService extends EventEmitter {
           };
 
           let responses = null;
-          let eventAckSent = false;
           if (frameType === 'EVENT') {
             responses = await Promise.race([
               forwardPromise,
-              new Promise((resolve) => setTimeout(() => resolve(null), EVENT_FORWARD_ACK_TIMEOUT_MS))
+              new Promise((_, reject) => {
+                setTimeout(() => {
+                  reject(new Error('publish-forward-timeout'));
+                }, EVENT_FORWARD_ACK_TIMEOUT_MS);
+              })
             ]);
-            if (responses === null) {
-              if (frameEventId && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify(['OK', frameEventId, true, 'accepted: pending']));
-                eventAckSent = true;
-              }
-              forwardPromise
-                .then((lateResponses) => {
-                  flushForwardResponses(lateResponses);
-                })
-                .catch((error) => {
-                  this.log('warn', '[PublicGateway] Late EVENT forward failed after provisional ack', {
-                    connectionKey,
-                    relayKey: identifier,
-                    peer: healthyPeer.publicKey?.slice(0, 12) || 'unknown',
-                    error: error?.message || String(error)
-                  });
-                });
-              responses = [];
-            }
           } else {
             responses = await forwardPromise;
           }
 
           const sentCount = flushForwardResponses(responses);
-          if (frameType === 'EVENT' && sentCount === 0 && !eventAckSent && frameEventId && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(['OK', frameEventId, true, '']));
+          if (frameType === 'EVENT' && sentCount === 0 && frameEventId && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(['OK', frameEventId, false, 'publish-forward-empty']));
           }
 
-          forwardSucceeded = true;
+          forwardSucceeded = frameType === 'EVENT' ? sentCount > 0 : true;
         } catch (error) {
           const pendingEntry = subscriptionId ? connData.pendingDelegations?.get?.(subscriptionId) : null;
           if (pendingEntry) {
@@ -3740,7 +3725,11 @@ export class GatewayService extends EventEmitter {
             connData.pendingDelegations.set(subscriptionId, pendingEntry);
           }
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(['NOTICE', `Error: ${error.message}`]));
+            if (frameType === 'EVENT' && frameEventId) {
+              ws.send(JSON.stringify(['OK', frameEventId, false, `publish-failed:${error.message}`]));
+            } else {
+              ws.send(JSON.stringify(['NOTICE', `Error: ${error.message}`]));
+            }
           }
           connData.shouldPollPeers = (connData.delegatedSubscriptions.size > 0) ||
             (connData.pendingDelegations?.size > 0);
@@ -3785,6 +3774,156 @@ export class GatewayService extends EventEmitter {
     });
 
     this.startEventChecking(connectionKey);
+  }
+
+  #resolveLocalRelayManagerKey(identifier) {
+    const normalizedIdentifier = this._normalizeRelayIdentifier(identifier) || identifier || null;
+    if (!normalizedIdentifier) return null;
+
+    if (relayManagerMap?.has?.(normalizedIdentifier)) {
+      return normalizedIdentifier;
+    }
+
+    const mappedFromPublic = publicToKey?.get?.(normalizedIdentifier) || null;
+    if (mappedFromPublic && relayManagerMap?.has?.(mappedFromPublic)) {
+      return mappedFromPublic;
+    }
+
+    const mappedFromRelay = keyToPublic?.get?.(normalizedIdentifier) || null;
+    if (mappedFromRelay && relayManagerMap?.has?.(mappedFromRelay)) {
+      return mappedFromRelay;
+    }
+
+    const relayEntry = this.activeRelays.get(normalizedIdentifier);
+    const metadataRelayKey = this._normalizeRelayIdentifier(relayEntry?.metadata?.relayKey || null);
+    if (metadataRelayKey && relayManagerMap?.has?.(metadataRelayKey)) {
+      return metadataRelayKey;
+    }
+
+    for (const [relayKey, manager] of relayManagerMap.entries()) {
+      if (manager?.publicIdentifier && manager.publicIdentifier === normalizedIdentifier) {
+        return relayKey;
+      }
+    }
+
+    return null;
+  }
+
+  async #maybeHandleRelayFrameLocally(connData, rawMessage, parsedFrame = null) {
+    const response = {
+      handled: false,
+      frameType: null,
+      subscriptionId: null,
+      responses: 0,
+      shouldPollPeers: false,
+      localRelayKey: null
+    };
+
+    const { ws, relayKey } = connData || {};
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return response;
+    }
+    if (!relayKey || this.#isPublicGatewayRelayKey(relayKey)) {
+      return response;
+    }
+
+    let frame = parsedFrame;
+    try {
+      if (!Array.isArray(frame)) {
+        const textPayload = typeof rawMessage === 'string' ? rawMessage : rawMessage.toString();
+        frame = JSON.parse(textPayload);
+      }
+    } catch (_) {
+      return response;
+    }
+
+    if (!Array.isArray(frame) || typeof frame[0] !== 'string') {
+      return response;
+    }
+
+    const frameType = frame[0];
+    if (frameType !== 'REQ' && frameType !== 'EVENT' && frameType !== 'CLOSE') {
+      return response;
+    }
+
+    const localRelayKey = this.#resolveLocalRelayManagerKey(relayKey);
+    if (!localRelayKey) {
+      return response;
+    }
+
+    response.localRelayKey = localRelayKey;
+    response.frameType = frameType;
+    response.subscriptionId =
+      (frameType === 'REQ' || frameType === 'CLOSE') && typeof frame[1] === 'string'
+        ? frame[1]
+        : null;
+
+    try {
+      await handleRelayMessage(
+        localRelayKey,
+        frame,
+        (relayFrame) => {
+          if (!relayFrame || ws.readyState !== WebSocket.OPEN) return;
+          ws.send(JSON.stringify(relayFrame));
+          response.responses += 1;
+        },
+        connData.connectionKey
+      );
+
+      if (frameType === 'REQ') {
+        const [events, activeSubscriptionsUpdated] = await handleRelaySubscription(
+          localRelayKey,
+          connData.connectionKey
+        );
+        if (Array.isArray(events)) {
+          for (const relayFrame of events) {
+            if (!relayFrame || ws.readyState !== WebSocket.OPEN) continue;
+            ws.send(JSON.stringify(relayFrame));
+            response.responses += 1;
+          }
+        }
+        if (activeSubscriptionsUpdated) {
+          try {
+            await updateRelaySubscriptions(localRelayKey, connData.connectionKey, activeSubscriptionsUpdated);
+          } catch (updateError) {
+            this.log('warn', '[PublicGateway] Failed to persist local subscription replay snapshot', {
+              relayKey,
+              localRelayKey,
+              connectionKey: connData.connectionKey,
+              error: updateError?.message || String(updateError)
+            });
+          }
+        }
+      }
+
+      response.handled = true;
+      return response;
+    } catch (error) {
+      const eventCandidate = frameType === 'EVENT'
+        ? ((frame[1] && typeof frame[1] === 'object' && typeof frame[1].id === 'string')
+          ? frame[1]
+          : ((frame[2] && typeof frame[2] === 'object' && typeof frame[2].id === 'string')
+            ? frame[2]
+            : null))
+        : null;
+      const eventId = eventCandidate?.id || null;
+
+      if (ws.readyState === WebSocket.OPEN) {
+        if (frameType === 'EVENT' && eventId) {
+          ws.send(JSON.stringify(['OK', eventId, false, `publish-local-failed:${error?.message || error}`]));
+        } else {
+          ws.send(JSON.stringify(['NOTICE', `Error: ${error?.message || error}`]));
+        }
+      }
+      this.log('warn', '[PublicGateway] Local relay manager frame handling failed', {
+        relayKey,
+        localRelayKey,
+        frameType,
+        error: error?.message || String(error)
+      });
+      response.handled = true;
+      return response;
+    }
   }
 
   async #maybeHandleReqLocally(connData, rawMessage) {

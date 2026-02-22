@@ -1,9 +1,9 @@
-import { URL } from 'node:url';
 import Hyperswarm from 'hyperswarm';
 
 import {
   DISCOVERY_TOPIC,
-  computeSecretHash,
+  GATEWAY_AUTH_MODE_NOSTR_CHALLENGE_V1,
+  GATEWAY_DISCOVERY_PROTOCOL_VERSION,
   encodeAnnouncement,
   deriveKeyPair,
   signAnnouncement
@@ -16,18 +16,12 @@ class GatewayAdvertiser {
   constructor({
     logger,
     discoveryConfig,
-    getSharedSecret,
-    getSharedSecretVersion,
     getRelayInfo,
     publicUrl,
     wsUrl
   }) {
     this.logger = logger || console;
     this.config = discoveryConfig || {};
-    this.getSharedSecret = typeof getSharedSecret === 'function' ? getSharedSecret : async () => null;
-    this.getSharedSecretVersion = typeof getSharedSecretVersion === 'function'
-      ? getSharedSecretVersion
-      : async () => null;
     this.getRelayInfo = typeof getRelayInfo === 'function' ? getRelayInfo : async () => null;
     this.publicUrl = publicUrl || null;
     this.wsUrl = wsUrl || null;
@@ -36,7 +30,9 @@ class GatewayAdvertiser {
     this.swarm = null;
     this.discovery = null;
     this.running = false;
-    this.secretUrl = this.#resolveSecretUrl(this.config.secretPath);
+    this.authMode = typeof this.config.authMode === 'string' && this.config.authMode.trim().length
+      ? this.config.authMode.trim()
+      : GATEWAY_AUTH_MODE_NOSTR_CHALLENGE_V1;
     this.ttl = Number.isFinite(this.config.ttlSeconds) && this.config.ttlSeconds > 0
       ? Math.round(this.config.ttlSeconds)
       : DEFAULT_TTL_SECONDS;
@@ -50,7 +46,7 @@ class GatewayAdvertiser {
     this.logger?.debug?.('[GatewayAdvertiser] Initialized discovery advertiser', {
       enabled: !!this.config.enabled,
       openAccess: !!this.config.openAccess,
-      secretUrl: this.secretUrl,
+      authMode: this.authMode,
       ttl: this.ttl,
       refreshInterval: this.refreshInterval
     });
@@ -165,15 +161,13 @@ class GatewayAdvertiser {
   }
 
   async #buildAnnouncement() {
-    const sharedSecret = await this.getSharedSecret();
-    const sharedSecretVersion = await this.getSharedSecretVersion();
     const relayInfo = await this.getRelayInfo?.();
     const timestamp = Date.now();
     const displayName = this.config.displayName || null;
     const region = this.config.region || null;
     const protocolVersion = Number.isFinite(this.config.protocolVersion)
       ? Math.round(this.config.protocolVersion)
-      : 1;
+      : GATEWAY_DISCOVERY_PROTOCOL_VERSION;
 
     const toPositiveInt = (value) => {
       const num = Number(value);
@@ -191,10 +185,8 @@ class GatewayAdvertiser {
       ttl: this.ttl,
       publicUrl: this.publicUrl || '',
       wsUrl: this.wsUrl || '',
-      secretUrl: this.secretUrl || '',
-      secretHash: computeSecretHash(sharedSecret || ''),
       openAccess: true,
-      sharedSecretVersion: sharedSecretVersion || '',
+      authMode: this.authMode,
       displayName: displayName || '',
       region: region || '',
       protocolVersion,
@@ -215,26 +207,6 @@ class GatewayAdvertiser {
 
     payload.signature = signAnnouncement(payload, this.keyPair.secretKey);
     return payload;
-  }
-
-  #resolveSecretUrl(secretPath) {
-    if (!secretPath) {
-      return this.publicUrl ? new URL('/.well-known/hypertuna-gateway-secret', this.publicUrl).toString() : '';
-    }
-    if (!this.publicUrl) return secretPath;
-    try {
-      if (secretPath.startsWith('http://') || secretPath.startsWith('https://')) {
-        return secretPath;
-      }
-      const normalizedPath = secretPath.startsWith('/') ? secretPath : `/${secretPath}`;
-      return new URL(normalizedPath, this.publicUrl).toString();
-    } catch (error) {
-      this.logger?.warn?.('[GatewayAdvertiser] Failed to resolve secret URL', {
-        secretPath,
-        error: error?.message || error
-      });
-      return '';
-    }
   }
 }
 

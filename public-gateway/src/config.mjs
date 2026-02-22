@@ -19,7 +19,6 @@ const DEFAULT_CONFIG = {
     path: process.env.GATEWAY_METRICS_PATH || '/metrics'
   },
   registration: {
-    sharedSecret: process.env.GATEWAY_REGISTRATION_SECRET || null,
     redisUrl: process.env.GATEWAY_REGISTRATION_REDIS || null,
     redisPrefix: process.env.GATEWAY_REGISTRATION_REDIS_PREFIX || 'gateway:registrations:',
     cacheTtlSeconds: Number(process.env.GATEWAY_REGISTRATION_TTL || 1800),
@@ -42,9 +41,8 @@ const DEFAULT_CONFIG = {
     keySeed: process.env.GATEWAY_DISCOVERY_KEY_SEED || null,
     ttlSeconds: Number(process.env.GATEWAY_DISCOVERY_TTL || 60),
     refreshIntervalMs: Number(process.env.GATEWAY_DISCOVERY_REFRESH_MS || 30000),
-    secretPath: process.env.GATEWAY_DISCOVERY_SECRET_PATH || '/.well-known/hypertuna-gateway-secret',
-    sharedSecretVersion: process.env.GATEWAY_DISCOVERY_SECRET_VERSION || '',
-    protocolVersion: Number(process.env.GATEWAY_DISCOVERY_PROTOCOL_VERSION || 1)
+    authMode: process.env.GATEWAY_DISCOVERY_AUTH_MODE || 'nostr-challenge-v1',
+    protocolVersion: Number(process.env.GATEWAY_DISCOVERY_PROTOCOL_VERSION || 2)
   },
   relay: {
     storageDir: process.env.GATEWAY_RELAY_STORAGE || null,
@@ -96,6 +94,7 @@ const DEFAULT_CONFIG = {
     discoveryRelays: parseCsvValues(process.env.GATEWAY_DISCOVERY_RELAYS),
     inviteOnly: process.env.GATEWAY_INVITE_ONLY === 'true',
     authJwtSecret: process.env.GATEWAY_AUTH_JWT_SECRET || null,
+    relayTokenJwtSecret: process.env.GATEWAY_RELAY_TOKEN_JWT_SECRET || process.env.GATEWAY_AUTH_JWT_SECRET || null,
     authTokenTtlSec: Number(process.env.GATEWAY_AUTH_TOKEN_TTL_SEC || 3600),
     authChallengeTtlMs: Number(process.env.GATEWAY_AUTH_CHALLENGE_TTL_MS || (2 * 60 * 1000)),
     authWindowSec: Number(process.env.GATEWAY_AUTH_WINDOW_SEC || 300),
@@ -174,10 +173,6 @@ function loadConfig(overrides = {}) {
 
   if (!merged.publicBaseUrl) {
     throw new Error('Gateway requires a publicBaseUrl configuration value');
-  }
-
-  if (!merged.registration?.sharedSecret) {
-    merged.discovery.openAccess = false;
   }
 
   merged.relay = normalizeRelaySettings(merged.relay);

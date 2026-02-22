@@ -3,15 +3,23 @@ import assert from 'node:assert/strict';
 
 import RelayTokenService from '../src/relay/RelayTokenService.mjs';
 import MemoryRegistrationStore from '../src/stores/MemoryRegistrationStore.mjs';
+import GatewayAuthService from '../src/GatewayAuthService.mjs';
 
 const SHARED_SECRET = 'token-service-secret';
 
 async function createService() {
   const store = new MemoryRegistrationStore(10);
   await store.upsertRelay('relay:test', { relayKey: 'relay:test' });
+  const authService = new GatewayAuthService({
+    config: {
+      jwtSecret: SHARED_SECRET,
+      tokenTtlSec: 3600
+    },
+    logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} }
+  });
   const service = new RelayTokenService({
     registrationStore: store,
-    sharedSecret: SHARED_SECRET,
+    authService,
     defaultTtlSeconds: 60,
     refreshWindowSeconds: 10,
     logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} }

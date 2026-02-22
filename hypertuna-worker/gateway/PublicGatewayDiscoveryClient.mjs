@@ -3,10 +3,10 @@ import Hyperswarm from 'hyperswarm';
 
 import {
   DISCOVERY_TOPIC,
+  GATEWAY_AUTH_MODE_NOSTR_CHALLENGE_V1,
   decodeAnnouncement,
   isAnnouncementExpired,
-  verifyAnnouncementSignature,
-  computeSecretHash
+  verifyAnnouncementSignature
 } from '../../shared/public-gateway/GatewayDiscovery.mjs';
 
 function normalizeUrl(value) {
@@ -16,18 +16,16 @@ function normalizeUrl(value) {
     url.hash = '';
     return url.toString().replace(/\/$/, '');
   } catch (_) {
-    return value.trim();
+    return String(value || '').trim();
   }
 }
 
 class PublicGatewayDiscoveryClient extends EventEmitter {
-  constructor({ logger, fetchImpl = globalThis.fetch?.bind(globalThis), clock = () => Date.now() } = {}) {
+  constructor({ logger, fetchImpl, clock = () => Date.now() } = {}) {
     super();
-    if (typeof fetchImpl !== 'function') {
-      throw new Error('PublicGatewayDiscoveryClient requires a fetch implementation');
-    }
+    // fetchImpl is accepted for backward constructor compatibility.
+    void fetchImpl;
     this.logger = logger || console;
-    this.fetch = fetchImpl;
     this.clock = clock;
     this.swarm = null;
     this.discovery = null;
@@ -142,15 +140,6 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
     return null;
   }
 
-  async ensureSecret(gatewayId) {
-    const entry = this.gateways.get(gatewayId);
-    if (!entry) throw new Error('Gateway not found');
-    if (this.#isExpired(entry, this.clock())) throw new Error('Gateway announcement expired');
-    await this.#ensureSecretFetched(entry);
-    if (!entry.sharedSecret) throw new Error(entry.secretFetchError || 'Shared secret unavailable');
-    return this.#formatGateway(entry);
-  }
-
   async #handleConnection(socket) {
     const chunks = [];
     socket.on('data', (chunk) => {
@@ -211,31 +200,23 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
 
     const ttlMs = Math.max(5_000, (announcement.ttl || 60) * 1000);
     const expiresAt = announcement.timestamp + ttlMs;
-
     const existing = this.gateways.get(announcement.gatewayId) || {};
-    const normalizedPublicUrl = normalizeUrl(announcement.publicUrl);
-    const needsSecretRefresh = existing.secretHash !== announcement.secretHash;
 
     const entry = {
       gatewayId: announcement.gatewayId,
       publicUrl: announcement.publicUrl || '',
-      normalizedPublicUrl,
+      normalizedPublicUrl: normalizeUrl(announcement.publicUrl),
       wsUrl: announcement.wsUrl || '',
-      secretUrl: announcement.secretUrl || '',
+      authMode: typeof announcement.authMode === 'string' && announcement.authMode.trim().length
+        ? announcement.authMode.trim()
+        : (existing.authMode || GATEWAY_AUTH_MODE_NOSTR_CHALLENGE_V1),
       displayName: announcement.displayName || '',
       region: announcement.region || '',
-      sharedSecretVersion: announcement.sharedSecretVersion || '',
       signatureKey: announcement.signatureKey || '',
       ttl: announcement.ttl || 60,
-      secretHash: announcement.secretHash || '',
       lastSeenAt: now,
       expiresAt,
       openAccess: true,
-      sharedSecret: needsSecretRefresh ? null : existing.sharedSecret || null,
-      secretFetchedAt: needsSecretRefresh ? 0 : existing.secretFetchedAt || 0,
-      secretFetchError: needsSecretRefresh ? null : existing.secretFetchError || null,
-      secretHashVerified: needsSecretRefresh ? false : existing.secretHashVerified || false,
-      fetchPromise: existing.fetchPromise || null,
       relayHyperbeeKey: announcement.relayKey || existing.relayHyperbeeKey || '',
       relayDiscoveryKey: announcement.relayDiscoveryKey || existing.relayDiscoveryKey || '',
       relayReplicationTopic: announcement.relayReplicationTopic || existing.relayReplicationTopic || '',
@@ -246,73 +227,6 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
 
     this.gateways.set(entry.gatewayId, entry);
     this.emit('updated', this.getGateways());
-
-    if (entry.secretUrl && entry.secretHash && (needsSecretRefresh || !entry.sharedSecret)) {
-      this.#ensureSecretFetched(entry).catch((error) => {
-        this.logger?.warn?.('[PublicGatewayDiscovery] Secret fetch failed', {
-          gatewayId: entry.gatewayId,
-          url: entry.secretUrl,
-          error: error?.message || error
-        });
-      });
-    }
-  }
-
-  async #ensureSecretFetched(entry) {
-    if (!entry.secretUrl) return;
-    if (entry.fetchPromise) {
-      await entry.fetchPromise;
-      return;
-    }
-
-    if (entry.sharedSecret && entry.secretHashVerified) {
-      const maxAge = Math.max(30_000, entry.ttl * 1000);
-      if (entry.secretFetchedAt && (this.clock() - entry.secretFetchedAt) < maxAge) {
-        return;
-      }
-    }
-
-    entry.fetchPromise = (async () => {
-      try {
-        const response = await this.fetch(entry.secretUrl, {
-          method: 'GET',
-          headers: { accept: 'application/json' }
-        });
-        if (!response.ok) {
-          throw new Error(`Secret fetch failed with status ${response.status}`);
-        }
-        const payload = await response.json();
-        const sharedSecret = typeof payload?.sharedSecret === 'string' ? payload.sharedSecret.trim() : '';
-        if (!sharedSecret) {
-          throw new Error('Secret payload missing sharedSecret');
-        }
-        const hash = computeSecretHash(sharedSecret);
-        if (entry.secretHash && hash !== entry.secretHash) {
-          throw new Error('Secret hash mismatch');
-        }
-        entry.sharedSecret = sharedSecret;
-        entry.secretHashVerified = hash === entry.secretHash;
-        entry.secretFetchedAt = this.clock();
-        entry.secretFetchError = null;
-        if (typeof payload?.version === 'string' && payload.version) {
-          entry.sharedSecretVersion = payload.version;
-        }
-        if (typeof payload?.wsUrl === 'string' && payload.wsUrl) {
-          entry.wsUrl = payload.wsUrl;
-        }
-      } catch (error) {
-        entry.sharedSecret = null;
-        entry.secretFetchedAt = this.clock();
-        entry.secretFetchError = error?.message || String(error);
-        entry.secretHashVerified = false;
-        throw error;
-      } finally {
-        entry.fetchPromise = null;
-        this.emit('updated', this.getGateways());
-      }
-    })();
-
-    await entry.fetchPromise;
   }
 
   #cleanupExpired() {
@@ -340,15 +254,9 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
       gatewayId: entry.gatewayId,
       publicUrl: entry.publicUrl,
       wsUrl: entry.wsUrl,
-      secretUrl: entry.secretUrl,
+      authMode: entry.authMode || GATEWAY_AUTH_MODE_NOSTR_CHALLENGE_V1,
       displayName: entry.displayName || null,
       region: entry.region || null,
-      sharedSecretVersion: entry.sharedSecretVersion || null,
-      secretHash: entry.secretHash || null,
-      sharedSecret: entry.sharedSecret || null,
-      secretHashVerified: !!entry.secretHashVerified,
-      secretFetchedAt: entry.secretFetchedAt || null,
-      secretFetchError: entry.secretFetchError || null,
       lastSeenAt: entry.lastSeenAt || null,
       expiresAt: entry.expiresAt || null,
       ttl: entry.ttl || 60,

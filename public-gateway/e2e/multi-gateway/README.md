@@ -66,6 +66,8 @@ Warning:
 Additional regression checks:
 - `join_dispatch_hint_evidence`
 - `metadata_hint_continuity`
+- `legacy_shared_secret_fallback_not_used`
+- `gateway_nostr_bearer_auth_observed` (when a gateway writer path is selected)
 - required telemetry/source checks for S19-S22 (`JOIN_PATH_SELECTED`, `JOIN_WRITER_SOURCE`)
 
 ## Commands

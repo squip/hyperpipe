@@ -15,11 +15,6 @@ import {
   getEventsFromPeerHyperswarm,
   requestFileFromPeer
 } from '../../shared/public-gateway/HyperswarmClient.mjs';
-import { computeSecretHash } from '../../shared/public-gateway/GatewayDiscovery.mjs';
-import {
-  verifySignature,
-  verifyClientToken
-} from '../../shared/auth/PublicGatewayTokens.mjs';
 import {
   register,
   metricsMiddleware,
@@ -89,28 +84,20 @@ class PublicGatewayService {
     this.tlsOptions = tlsOptions;
     this.registrationStore = registrationStore || new MemoryRegistrationStore(config.registration?.cacheTtlSeconds);
     this.adminStateStore = adminStateStore || null;
-    this.sharedSecret = config.registration?.sharedSecret || null;
     this.openJoinConfig = this.#normalizeOpenJoinConfig(config?.openJoin);
     this.openJoinChallenges = new Map();
     this.openJoinLeaseLocks = new Set();
     this.discoveryConfig = config.discovery || {};
-    this.explicitSharedSecretVersion = this.discoveryConfig?.sharedSecretVersion || null;
-    this.sharedSecretVersion = this.explicitSharedSecretVersion;
-    this.secretEndpointPath = this.#normalizeSecretPath(this.discoveryConfig?.secretPath);
     this.wsBaseUrl = this.#computeWsBase(this.config.publicBaseUrl);
     this.gatewayAdvertiser = null;
-    if (this.discoveryConfig?.enabled && this.discoveryConfig.openAccess && this.sharedSecret) {
+    if (this.discoveryConfig?.enabled && this.discoveryConfig.openAccess) {
       this.gatewayAdvertiser = new GatewayAdvertiser({
         logger: this.logger,
         discoveryConfig: this.discoveryConfig,
-        getSharedSecret: async () => this.sharedSecret,
-        getSharedSecretVersion: async () => this.#getSharedSecretVersion(),
         getRelayInfo: async () => this.#getRelayHostInfo(),
         publicUrl: this.config.publicBaseUrl,
         wsUrl: this.wsBaseUrl
       });
-    } else if (this.discoveryConfig?.enabled && this.discoveryConfig.openAccess && !this.sharedSecret) {
-      this.logger?.warn?.('Gateway discovery enabled but shared secret missing; advertisement disabled');
     }
 
     this.app = express();
@@ -239,6 +226,16 @@ class PublicGatewayService {
         issuer: `hypertuna-public-gateway:${this.gatewayOrigin || 'unknown'}`
       }
     });
+    this.relayTokenAuthService = new GatewayAuthService({
+      logger: this.logger,
+      config: {
+        jwtSecret: this.config?.gateway?.relayTokenJwtSecret || this.config?.gateway?.authJwtSecret || null,
+        tokenTtlSec: this.config?.registration?.defaultTokenTtl || this.config?.gateway?.authTokenTtlSec || 3600,
+        challengeTtlMs: this.config?.gateway?.authChallengeTtlMs || (2 * 60 * 1000),
+        authWindowSec: this.config?.gateway?.authWindowSec || 300,
+        issuer: `hypertuna-public-gateway-relay:${this.gatewayOrigin || 'unknown'}`
+      }
+    });
     this.gatewayInviteService = new GatewayInviteService({
       logger: this.logger,
       adminStateStore: this.adminStateStore
@@ -285,16 +282,14 @@ class PublicGatewayService {
         relayGcAfterMs: this.config?.registration?.relayGcAfterMs ?? null
       });
     }
-    if (this.featureFlags.tokenEnforcementEnabled && this.sharedSecret) {
+    if (this.featureFlags.tokenEnforcementEnabled) {
       this.tokenService = new RelayTokenService({
         registrationStore: this.registrationStore,
-        sharedSecret: this.sharedSecret,
+        authService: this.relayTokenAuthService,
         logger: this.logger,
         defaultTtlSeconds: this.config.registration?.defaultTokenTtl,
         refreshWindowSeconds: this.config.registration?.tokenRefreshWindowSeconds
       });
-    } else if (this.featureFlags.tokenEnforcementEnabled && !this.sharedSecret) {
-      this.logger?.warn?.('Token enforcement enabled but shared secret missing; token service disabled');
     }
     if (this.#isHyperbeeRelayEnabled()) {
       await this.#ensureRelayHost();
@@ -540,10 +535,6 @@ class PublicGatewayService {
       }));
     }
 
-    if (this.#shouldExposeSecretEndpoint()) {
-      app.get(this.secretEndpointPath, (req, res) => this.#handleSecretRequest(req, res));
-    }
-
     app.get('/drive/:identifier/:file', async (req, res) => {
       const { identifier, file } = req.params;
       try {
@@ -745,6 +736,13 @@ class PublicGatewayService {
       if (/^[a-f0-9]{64}$/i.test(trimmed)) return trimmed;
     }
     return null;
+  }
+
+  #normalizePubkeyHex(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/i.test(trimmed)) return null;
+    return trimmed;
   }
 
   #verifyGatewayBearer(req, { requiredScopes = [], relayKey = null, pubkey = null } = {}) {
@@ -1651,63 +1649,6 @@ class PublicGatewayService {
     }
   }
 
-  #normalizeSecretPath(secretPath) {
-    if (!secretPath) return '/.well-known/hypertuna-gateway-secret';
-    if (typeof secretPath !== 'string') return '/.well-known/hypertuna-gateway-secret';
-    const trimmed = secretPath.trim();
-    if (!trimmed) return '/.well-known/hypertuna-gateway-secret';
-    try {
-      if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-        const parsed = new URL(trimmed);
-        return parsed.pathname || '/.well-known/hypertuna-gateway-secret';
-      }
-    } catch (error) {
-      this.logger?.warn?.('Failed to parse discovery secret path as URL', {
-        secretPath,
-        error: error?.message || error
-      });
-    }
-    return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
-  }
-
-  #deriveSharedSecretVersion(secret) {
-    if (!secret) return '';
-    return computeSecretHash(secret).slice(0, 24);
-  }
-
-  #getSharedSecretVersion() {
-    if (this.explicitSharedSecretVersion) return this.explicitSharedSecretVersion;
-    if (!this.sharedSecretVersion) {
-      this.sharedSecretVersion = this.#deriveSharedSecretVersion(this.sharedSecret);
-    }
-    return this.sharedSecretVersion || '';
-  }
-
-  #shouldExposeSecretEndpoint() {
-    return Boolean(this.sharedSecret && this.discoveryConfig?.enabled && this.discoveryConfig.openAccess);
-  }
-
-  #handleSecretRequest(_req, res) {
-    if (!this.#shouldExposeSecretEndpoint()) {
-      return res.status(404).json({ error: 'Gateway secret not available' });
-    }
-    if (!this.sharedSecret) {
-      return res.status(503).json({ error: 'Gateway shared secret not configured' });
-    }
-
-    const payload = {
-      gatewayId: this.gatewayAdvertiser?.gatewayId || null,
-      sharedSecret: this.sharedSecret,
-      version: this.#getSharedSecretVersion(),
-      hash: computeSecretHash(this.sharedSecret),
-      wsUrl: this.wsBaseUrl,
-      publicUrl: this.config.publicBaseUrl,
-      timestamp: Date.now()
-    };
-
-    res.json(payload);
-  }
-
   #handleWebSocket(ws, req) {
     this.#initializeSession(ws, req).catch((error) => {
       this.logger.error?.({
@@ -1723,13 +1664,6 @@ class PublicGatewayService {
   }
 
   async #initializeSession(ws, req) {
-    if (!this.sharedSecret) {
-      this.logger.error?.('WebSocket rejected: shared secret missing');
-      ws.close(1011, 'Gateway not configured');
-      ws.terminate();
-      return;
-    }
-
     const { relayKey, token } = this.#parseWebSocketRequest(req);
 
     if (!relayKey) {
@@ -4064,31 +3998,30 @@ class PublicGatewayService {
     return res.json({ status: 'ok' });
   }
 
-  #verifySignedPayload(payload, signature) {
-    if (!this.sharedSecret) return false;
-    if (!payload || typeof payload !== 'object' || !signature) return false;
-    try {
-      return verifySignature(payload, signature, this.sharedSecret);
-    } catch (error) {
-      this.logger?.warn?.('Signed payload verification failed', { error: error?.message || error });
-      return false;
-    }
+  #isLegacySignedEnvelope(body) {
+    if (!body || typeof body !== 'object') return false;
+    if (Object.prototype.hasOwnProperty.call(body, 'signature')) return true;
+    if (Object.prototype.hasOwnProperty.call(body, 'payload')) return true;
+    if (Object.prototype.hasOwnProperty.call(body, 'registration')) return true;
+    return false;
   }
 
   async #handleTokenIssue(req, res) {
     if (!this.tokenService) {
       return res.status(503).json({ error: 'Token service disabled' });
     }
-    const { payload, signature } = req.body || {};
-    if (!this.#verifySignedPayload(payload, signature)) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    const payload = req.body && typeof req.body === 'object' ? req.body : {};
+    if (this.#isLegacySignedEnvelope(payload)) {
+      return res.status(400).json({ error: 'legacy-signed-envelope-unsupported' });
     }
-
     const relayKey = payload?.relayKey;
     const relayAuthToken = payload?.relayAuthToken;
+    const auth = this.#requireGatewayScope(req, res, ['gateway:relay-token'], { relayKey });
+    if (!auth) return;
     if (!relayKey || !relayAuthToken) {
       return res.status(400).json({ error: 'relayKey and relayAuthToken are required' });
     }
+    const actorPubkey = auth?.pubkey || auth?.sub || null;
     const relayKeyType = this.#isHexRelayKey(relayKey) ? 'hex' : 'alias';
     this.logger?.info?.('[PublicGateway] Relay token issue request', {
       relayKey,
@@ -4098,7 +4031,7 @@ class PublicGatewayService {
     try {
       const result = await this.tokenService.issueToken(relayKey, {
         relayAuthToken,
-        pubkey: payload?.pubkey || null,
+        pubkey: actorPubkey || payload?.pubkey || null,
         scope: payload?.scope,
         ttlSeconds: payload?.ttlSeconds
       });
@@ -4119,13 +4052,15 @@ class PublicGatewayService {
     if (!this.tokenService) {
       return res.status(503).json({ error: 'Token service disabled' });
     }
-    const { payload, signature } = req.body || {};
-    if (!this.#verifySignedPayload(payload, signature)) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    const payload = req.body && typeof req.body === 'object' ? req.body : {};
+    if (this.#isLegacySignedEnvelope(payload)) {
+      return res.status(400).json({ error: 'legacy-signed-envelope-unsupported' });
     }
 
     const relayKey = payload?.relayKey;
     const token = payload?.token;
+    const auth = this.#requireGatewayScope(req, res, ['gateway:relay-token'], { relayKey });
+    if (!auth) return;
     if (!relayKey || !token) {
       return res.status(400).json({ error: 'relayKey and token are required' });
     }
@@ -4157,12 +4092,14 @@ class PublicGatewayService {
     if (!this.tokenService) {
       return res.status(503).json({ error: 'Token service disabled' });
     }
-    const { payload, signature } = req.body || {};
-    if (!this.#verifySignedPayload(payload, signature)) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    const payload = req.body && typeof req.body === 'object' ? req.body : {};
+    if (this.#isLegacySignedEnvelope(payload)) {
+      return res.status(400).json({ error: 'legacy-signed-envelope-unsupported' });
     }
 
     const relayKey = payload?.relayKey;
+    const auth = this.#requireGatewayScope(req, res, ['gateway:relay-token'], { relayKey });
+    if (!auth) return;
     if (!relayKey) {
       return res.status(400).json({ error: 'relayKey is required' });
     }
@@ -4671,18 +4608,19 @@ class PublicGatewayService {
   }
 
   async #handleRelayRegistration(req, res) {
-    if (!this.sharedSecret) {
-      return res.status(503).json({ error: 'Registration disabled' });
-    }
-
-    const { registration, signature } = req.body || {};
-    if (!registration || !signature) {
-      return res.status(400).json({ error: 'Missing registration payload or signature' });
+    const registration = req.body && typeof req.body === 'object' ? req.body : {};
+    if (this.#isLegacySignedEnvelope(registration)) {
+      return res.status(400).json({ error: 'legacy-signed-envelope-unsupported' });
     }
 
     if (!registration.relayKey) {
       return res.status(400).json({ error: 'relayKey is required' });
     }
+    const auth = this.#requireGatewayScope(req, res, ['gateway:relay-register'], {
+      relayKey: registration.relayKey
+    });
+    if (!auth) return;
+    const actorPubkey = this.#normalizePubkeyHex(auth?.pubkey || auth?.sub || null);
     const relayKeyType = this.#isHexRelayKey(registration.relayKey) ? 'hex' : 'alias';
 
     const relayCoreMetadata = Array.isArray(registration.relayCores)
@@ -4693,7 +4631,7 @@ class PublicGatewayService {
             role: typeof entry.role === 'string' ? entry.role : null
           }))
       : null;
-    const relayAdminPubkey = this.#extractRelayAdminPubkey(registration);
+    const relayAdminPubkey = actorPubkey || this.#extractRelayAdminPubkey(registration);
     if (this.multiGatewayEnabled) {
       const policyDecision = this.gatewayPolicyService.canRegisterRelay({
         adminPubkey: relayAdminPubkey
@@ -4714,12 +4652,12 @@ class PublicGatewayService {
       }
     }
 
-    const valid = verifySignature(registration, signature, this.sharedSecret);
-    if (!valid) {
-      return res.status(401).json({ error: 'Invalid signature' });
-    }
-
     try {
+      const actorStampedRegistration = { ...registration };
+      if (actorPubkey) {
+        actorStampedRegistration.nostrPubkeyHex = actorPubkey;
+        actorStampedRegistration.ownerPubkey = actorPubkey;
+      }
       const relayCoreModeRaw = typeof registration?.relayCoresMode === 'string'
         ? registration.relayCoresMode.trim().toLowerCase()
         : null;
@@ -4730,8 +4668,8 @@ class PublicGatewayService {
         ? await this.registrationStore.getRelay(registration.relayKey)
         : null;
       const upsertPayload = relayCoreMetadata
-        ? { ...registration, relayCores: relayCoreMetadata }
-        : { ...registration };
+        ? { ...actorStampedRegistration, relayCores: relayCoreMetadata }
+        : { ...actorStampedRegistration };
       if (mergeRelayCores) {
         const existingRelayCores = Array.isArray(existing?.relayCores) ? existing.relayCores : [];
         const incomingRelayCores = relayCoreMetadata || [];
@@ -4765,24 +4703,12 @@ class PublicGatewayService {
   }
 
   async #handleRelayDeletion(req, res) {
-    if (!this.sharedSecret) {
-      return res.status(503).json({ error: 'Registration disabled' });
-    }
-
     const relayKey = req.params?.relayKey;
     if (!relayKey) {
       return res.status(400).json({ error: 'relayKey param is required' });
     }
-
-    const signature = req.headers['x-signature'];
-    if (!signature) {
-      return res.status(401).json({ error: 'Missing signature' });
-    }
-
-    const valid = verifySignature({ relayKey }, signature, this.sharedSecret);
-    if (!valid) {
-      return res.status(401).json({ error: 'Invalid signature' });
-    }
+    const auth = this.#requireGatewayScope(req, res, ['gateway:relay-register'], { relayKey });
+    if (!auth) return;
 
     try {
       await this.registrationStore.removeRelay(relayKey);
@@ -4916,19 +4842,17 @@ class PublicGatewayService {
     if (!this.openJoinConfig?.enabled) {
       return res.status(503).json({ error: 'open-join-disabled' });
     }
-    if (!this.sharedSecret) {
-      return res.status(503).json({ error: 'registration-disabled' });
-    }
-
-    const { payload, signature } = req.body || {};
-    if (!this.#verifySignedPayload(payload, signature)) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    const payload = req.body && typeof req.body === 'object' ? req.body : {};
+    if (this.#isLegacySignedEnvelope(payload)) {
+      return res.status(400).json({ error: 'legacy-signed-envelope-unsupported' });
     }
 
     const relayKey = payload?.relayKey || req.params?.relayKey;
     if (!relayKey) {
       return res.status(400).json({ error: 'relayKey is required' });
     }
+    const auth = this.#requireGatewayScope(req, res, ['gateway:open-join-pool'], { relayKey });
+    if (!auth) return;
     const relayKeyType = this.#isHexRelayKey(relayKey) ? 'hex' : 'alias';
     this.logger?.info?.('[PublicGateway] Open join pool update request', {
       relayKey,
@@ -5549,51 +5473,20 @@ class PublicGatewayService {
   }
 
   async #validateToken(token, relayKey) {
-    if (this.tokenService) {
-      try {
-        return await this.tokenService.verifyToken(token, relayKey);
-      } catch (error) {
-        this.logger.warn?.({
-          relayKey,
-          error: error?.message || error
-        }, 'Token verification failed');
-        return null;
-      }
-    }
-
-    const payload = verifyClientToken(token, this.sharedSecret);
-    if (!payload) {
-      this.logger.warn?.({ relayKey }, 'Token verification failed - signature mismatch');
+    if (!this.tokenService) {
+      this.logger.warn?.({ relayKey }, 'Token verification failed - token service disabled');
       return null;
     }
 
-    if (payload.relayKey && payload.relayKey !== relayKey) {
+    try {
+      return await this.tokenService.verifyToken(token, relayKey);
+    } catch (error) {
       this.logger.warn?.({
         relayKey,
-        tokenRelayKey: payload.relayKey
-      }, 'Token verification failed - relay mismatch');
+        error: error?.message || error
+      }, 'Token verification failed');
       return null;
     }
-
-    if (payload.expiresAt && payload.expiresAt < Date.now()) {
-      this.logger.warn?.({
-        relayKey,
-        expiresAt: payload.expiresAt
-      }, 'Token verification failed - token expired');
-      return null;
-    }
-
-    if (!payload.relayAuthToken || typeof payload.relayAuthToken !== 'string') {
-      this.logger.warn?.({ relayKey }, 'Token verification failed - missing relay auth token');
-      return null;
-    }
-
-    return {
-      payload,
-      relayAuthToken: payload.relayAuthToken,
-      pubkey: payload.pubkey || null,
-      scope: payload.scope || null
-    };
   }
 
   #normalizePeerRawKey(value) {

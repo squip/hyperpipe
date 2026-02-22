@@ -2811,23 +2811,55 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [fetchMembershipPreview, myGroupList, pubkey]
   )
 
-  const tokenizedPreviewRefreshByGroupRef = useRef<Map<string, string>>(new Map())
+  type TokenizedPreviewRefreshState = {
+    relayUrl: string
+    baseRelayUrl: string
+    token: string
+    lastRefreshAt: number
+  }
+
+  const tokenizedPreviewRefreshByGroupRef = useRef<Map<string, TokenizedPreviewRefreshState>>(new Map())
+  const tokenizedPreviewRefreshInFlightRef = useRef<Map<string, Promise<void>>>(new Map())
+  const TOKENIZED_PREVIEW_REFRESH_DEBOUNCE_MS = 15_000
 
   useEffect(() => {
     if (!pubkey) return
     if (!myGroupList.length) return
     if (!workerRelays.length) return
 
-    const hasTokenInRelayUrl = (relayUrl?: string | null) => {
-      if (!relayUrl) return false
+    const parseRelayTokenState = (relayUrl?: string | null) => {
+      if (!relayUrl) return null
       try {
-        return new URL(relayUrl).searchParams.has('token')
+        const parsed = new URL(relayUrl)
+        const token = parsed.searchParams.get('token')
+        if (!token?.trim()) return null
+        parsed.searchParams.delete('token')
+        return {
+          token: token.trim(),
+          baseRelayUrl: parsed.toString()
+        }
       } catch (_err) {
-        return /[?&]token=/.test(relayUrl)
+        const match = relayUrl.match(/[?&]token=([^&]+)/i)
+        if (!match?.[1]) return null
+        let tokenValue = match[1]
+        try {
+          tokenValue = decodeURIComponent(match[1])
+        } catch {
+          tokenValue = match[1]
+        }
+        const baseRelayUrl = relayUrl
+          .replace(/([?&])token=[^&]*&?/i, '$1')
+          .replace(/\?&/, '?')
+          .replace(/[?&]$/, '')
+        return {
+          token: tokenValue.trim(),
+          baseRelayUrl: baseRelayUrl || relayUrl
+        }
       }
     }
 
-    const nextByGroup = new Map<string, string>()
+    const nextByGroup = new Map<string, TokenizedPreviewRefreshState>()
+    const now = Date.now()
 
     myGroupList.forEach((entry) => {
       const relayEntry =
@@ -2837,25 +2869,58 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       if (!relayEntry?.connectionUrl) return
 
       const resolvedRelay = resolveRelayUrl(relayEntry.connectionUrl) || relayEntry.connectionUrl
-      if (!hasTokenInRelayUrl(resolvedRelay)) return
+      const tokenState = parseRelayTokenState(resolvedRelay)
+      if (!tokenState?.token) return
 
-      nextByGroup.set(entry.groupId, resolvedRelay)
-      const prevRelay = tokenizedPreviewRefreshByGroupRef.current.get(entry.groupId)
-      if (prevRelay === resolvedRelay) return
+      const prevState = tokenizedPreviewRefreshByGroupRef.current.get(entry.groupId)
+      const sameRelayUrl = prevState?.relayUrl === resolvedRelay
+      const sameBaseRelay = prevState?.baseRelayUrl === tokenState.baseRelayUrl
+      const tokenChanged = !!prevState && prevState.token !== tokenState.token
+      const tokenOnlyChange = sameBaseRelay && tokenChanged
+      const recentlyRefreshed =
+        tokenOnlyChange
+        && Number.isFinite(prevState?.lastRefreshAt)
+        && now - Number(prevState?.lastRefreshAt) < TOKENIZED_PREVIEW_REFRESH_DEBOUNCE_MS
+
+      const shouldRefresh =
+        !prevState
+        || !sameBaseRelay
+        || (tokenOnlyChange && !recentlyRefreshed)
+
+      nextByGroup.set(entry.groupId, {
+        relayUrl: resolvedRelay,
+        baseRelayUrl: tokenState.baseRelayUrl,
+        token: tokenState.token,
+        lastRefreshAt: shouldRefresh ? now : (prevState?.lastRefreshAt || now)
+      })
+
+      if (!shouldRefresh || sameRelayUrl) return
+      if (tokenizedPreviewRefreshInFlightRef.current.has(entry.groupId)) return
 
       console.info('[GroupsProvider] tokenized relay observed; forcing member preview refresh', {
         groupId: entry.groupId,
-        relay: resolvedRelay
+        relay: resolvedRelay,
+        baseRelay: tokenState.baseRelayUrl,
+        tokenChanged
       })
 
-      invalidateGroupMemberPreview(entry.groupId, resolvedRelay, {
-        reason: 'worker-relay-tokenized-update'
-      })
-      refreshGroupMemberPreview(entry.groupId, resolvedRelay, {
-        force: true,
-        reason: 'worker-relay-tokenized-update'
-      }).catch(() => {})
-      fetchGroupDetail(entry.groupId, resolvedRelay, { preferRelay: true }).catch(() => {})
+      const refreshTask = Promise.resolve()
+        .then(() => {
+          invalidateGroupMemberPreview(entry.groupId, resolvedRelay, {
+            reason: 'worker-relay-tokenized-update'
+          })
+          return refreshGroupMemberPreview(entry.groupId, resolvedRelay, {
+            force: true,
+            reason: 'worker-relay-tokenized-update'
+          })
+        })
+        .then(() => fetchGroupDetail(entry.groupId, resolvedRelay, { preferRelay: true }))
+        .catch(() => {})
+        .finally(() => {
+          tokenizedPreviewRefreshInFlightRef.current.delete(entry.groupId)
+        })
+
+      tokenizedPreviewRefreshInFlightRef.current.set(entry.groupId, refreshTask)
     })
 
     tokenizedPreviewRefreshByGroupRef.current = nextByGroup

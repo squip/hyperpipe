@@ -89,12 +89,6 @@ async function runConfigWizard({ existing = {}, mode = 'init' } = {}) {
       : `http://127.0.0.1:${bindPort || '4430'}`;
     const gatewayPublicUrl = await promptWithDefault(rl, 'Gateway public URL', existing.gatewayPublicUrl || defaultPublicUrl);
 
-    const registrationSecret = await promptWithDefault(
-      rl,
-      'Registration secret (hex)',
-      existing.registrationSecret || randomBytes(32).toString('hex')
-    );
-
     const operatorNsecHex = normalizeHex64(await promptWithDefault(
       rl,
       'Operator nsec hex',
@@ -170,7 +164,6 @@ async function runConfigWizard({ existing = {}, mode = 'init' } = {}) {
       gatewayHost,
       letsencryptEmail,
       gatewayPublicUrl,
-      registrationSecret,
       operatorNsecHex,
       operatorPubkeyHex,
       relaySeedHex,
@@ -230,7 +223,6 @@ function buildEnvMap(config = {}) {
     GATEWAY_RATELIMIT_ENABLED: 'true',
     GATEWAY_RATELIMIT_WINDOW: '60',
     GATEWAY_RATELIMIT_MAX: '120',
-    GATEWAY_REGISTRATION_SECRET: config.registrationSecret,
     GATEWAY_REGISTRATION_REDIS: 'redis://redis:6379',
     GATEWAY_REGISTRATION_REDIS_PREFIX: redisPrefix,
     GATEWAY_REGISTRATION_TTL: '0',
@@ -261,6 +253,7 @@ function buildEnvMap(config = {}) {
     GATEWAY_DISCOVERY_RELAYS: (config.discoveryRelays || []).join(','),
     GATEWAY_INVITE_ONLY: config.inviteOnly ? 'true' : 'false',
     GATEWAY_AUTH_JWT_SECRET: config.authJwtSecret,
+    GATEWAY_RELAY_TOKEN_JWT_SECRET: config.relayTokenJwtSecret || config.authJwtSecret,
     GATEWAY_AUTH_TOKEN_TTL_SEC: '3600',
     GATEWAY_AUTH_CHALLENGE_TTL_MS: '120000',
     GATEWAY_AUTH_WINDOW_SEC: '300',

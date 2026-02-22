@@ -564,7 +564,6 @@ let gatewayToggleLogsButton = null
 let publicGatewayEnableToggle = null
 let publicGatewaySelectionSelect = null
 let publicGatewayUrlInput = null
-let publicGatewaySecretInput = null
 let publicGatewaySaveButton = null
 let publicGatewayDefaultTtlInput = null
 let publicGatewayManualFields = null
@@ -578,12 +577,10 @@ let publicGatewayConfig = {
   selectedGatewayId: null,
   preferredBaseUrl: DEFAULT_PUBLIC_GATEWAY_URL,
   baseUrl: DEFAULT_PUBLIC_GATEWAY_URL,
-  sharedSecret: '',
   defaultTokenTtl: 3600,
   resolvedGatewayId: null,
   resolvedDisplayName: null,
   resolvedRegion: null,
-  resolvedSecretVersion: null,
   resolvedFallback: false,
   resolvedFromDiscovery: false,
   resolvedAt: null,
@@ -689,10 +686,6 @@ function buildPublicGatewaySummary() {
     status = 'warning'
     const label = selectedGateway.displayName || selectedGateway.publicUrl || 'Selected gateway'
     text = `${label} is currently offline.`
-  } else if (selectionMode === 'discovered' && selectedGateway?.secretFetchError) {
-    status = 'warning'
-    const label = selectedGateway.displayName || selectedGateway.publicUrl || 'Selected gateway'
-    text = `${label} secret unavailable: ${selectedGateway.secretFetchError}`
   } else if (bridgeEnabled && publicGatewayState?.disabledReason) {
     status = 'error'
     text = `Bridge unavailable: ${publicGatewayState.disabledReason}`
@@ -708,7 +701,6 @@ function buildPublicGatewaySummary() {
       || DEFAULT_PUBLIC_GATEWAY_URL
     const parts = [`Connected to ${label}`]
     if (publicGatewayState.resolvedRegion) parts.push(publicGatewayState.resolvedRegion)
-    if (publicGatewayState.resolvedSecretVersion) parts.push(`secret v${publicGatewayState.resolvedSecretVersion}`)
     if (publicGatewayState.resolvedFallback) parts.push('fallback in use')
     if (publicGatewayState.resolvedAt) parts.push(`updated ${formatRelativeTime(publicGatewayState.resolvedAt)}`)
     text = parts.join(' • ')
@@ -938,7 +930,6 @@ function normalizePublicGatewayConfig(config = {}) {
     ? config.preferredBaseUrl.trim() || DEFAULT_PUBLIC_GATEWAY_URL
     : DEFAULT_PUBLIC_GATEWAY_URL
   const baseUrlRaw = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : ''
-  const sharedSecretRaw = typeof config.sharedSecret === 'string' ? config.sharedSecret.trim() : ''
   const ttlRaw = Number(config.defaultTokenTtl)
   const defaultTokenTtl = Number.isFinite(ttlRaw) && ttlRaw > 0 ? Math.max(60, Math.round(ttlRaw)) : 3600
 
@@ -948,12 +939,10 @@ function normalizePublicGatewayConfig(config = {}) {
     selectedGatewayId,
     preferredBaseUrl: preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL,
     baseUrl: baseUrlRaw || DEFAULT_PUBLIC_GATEWAY_URL,
-    sharedSecret: sharedSecretRaw,
     defaultTokenTtl,
     resolvedGatewayId: config.resolvedGatewayId || null,
     resolvedDisplayName: config.resolvedDisplayName || null,
     resolvedRegion: config.resolvedRegion || null,
-    resolvedSecretVersion: config.resolvedSecretVersion || null,
     resolvedFallback: !!config.resolvedFallback,
     resolvedFromDiscovery: !!config.resolvedFromDiscovery,
     resolvedAt: config.resolvedAt || null,
@@ -963,11 +952,8 @@ function normalizePublicGatewayConfig(config = {}) {
   if (normalized.selectionMode === 'default') {
     normalized.selectedGatewayId = null
     normalized.baseUrl = normalized.preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL
-    normalized.sharedSecret = ''
   } else if (normalized.selectionMode === 'manual') {
     if (!normalized.baseUrl) normalized.baseUrl = normalized.preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL
-  } else if (normalized.selectionMode === 'discovered') {
-    normalized.sharedSecret = ''
   }
 
   return normalized
@@ -982,11 +968,6 @@ function applyPublicGatewayConfigToUI() {
     publicGatewayUrlInput.value = publicGatewayConfig.baseUrl || ''
   } else if (publicGatewayUrlInput && !publicGatewayUrlInput.value) {
     publicGatewayUrlInput.value = ''
-  }
-  if (publicGatewaySecretInput && publicGatewayConfig.selectionMode === 'manual') {
-    publicGatewaySecretInput.value = publicGatewayConfig.sharedSecret || ''
-  } else if (publicGatewaySecretInput && publicGatewaySecretInput.value) {
-    publicGatewaySecretInput.value = ''
   }
   if (publicGatewayDefaultTtlInput) {
     const minutes = Math.max(1, Math.round((publicGatewayConfig.defaultTokenTtl || 3600) / 60))
@@ -1028,22 +1009,11 @@ function updatePublicGatewayFormState() {
     }
   }
 
-  if (publicGatewaySecretInput) {
-    if (selectionMode === 'manual') {
-      publicGatewaySecretInput.readOnly = false
-      publicGatewaySecretInput.disabled = !bridgeEnabled
-    } else {
-      publicGatewaySecretInput.readOnly = true
-      publicGatewaySecretInput.disabled = true
-      publicGatewaySecretInput.value = ''
-    }
-  }
-
   if (publicGatewaySelectionHelp) {
     if (selectionMode === 'manual') {
-      publicGatewaySelectionHelp.textContent = 'Provide the gateway details and shared secret supplied by the administrator.'
+      publicGatewaySelectionHelp.textContent = 'Provide the public gateway URL for this environment.'
     } else if (selectionMode === 'discovered') {
-      publicGatewaySelectionHelp.textContent = 'Open public gateways share their connection secret automatically when selected.'
+      publicGatewaySelectionHelp.textContent = 'Select an online public gateway discovered from the network.'
     } else {
       publicGatewaySelectionHelp.textContent = 'Hypertuna.com will be used by default unless it is unavailable.'
     }
@@ -1101,12 +1071,12 @@ function populatePublicGatewaySelectionOptions() {
     const name = gateway.displayName || gateway.publicUrl || gateway.gatewayId
     const descriptors = []
     if (gateway.region) descriptors.push(gateway.region)
+    if (gateway.authMode && gateway.authMode !== 'nostr-challenge-v1') descriptors.push(`auth:${gateway.authMode}`)
     if (gateway.isExpired) descriptors.push('offline')
-    else if (gateway.secretFetchError) descriptors.push('error')
     else descriptors.push('online')
     option.textContent = descriptors.length ? `${name} (${descriptors.join(' • ')})` : name
     option.dataset.url = gateway.publicUrl || ''
-    if (gateway.isExpired || !gateway.sharedSecret) {
+    if (gateway.isExpired || (gateway.authMode && gateway.authMode !== 'nostr-challenge-v1')) {
       option.disabled = true
     }
     publicGatewaySelectionSelect.appendChild(option)
@@ -1233,15 +1203,13 @@ async function handlePublicGatewaySave(event) {
   let selectedGatewayId = null
   let preferredBaseUrl = publicGatewayConfig.preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL
   let baseUrl = ''
-  let sharedSecret = ''
 
   if (selectionValue === 'manual') {
     selectionMode = 'manual'
     baseUrl = publicGatewayUrlInput?.value?.trim() || ''
-    sharedSecret = publicGatewaySecretInput?.value?.trim() || ''
     preferredBaseUrl = baseUrl || preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL
-    if (enabled && (!baseUrl || !sharedSecret)) {
-      emitPublicGatewayMessage('error', 'Base URL and shared secret are required for manual configuration.')
+    if (enabled && !baseUrl) {
+      emitPublicGatewayMessage('error', 'Base URL is required for manual configuration.')
       return
     }
   } else if (selectionValue.startsWith('gateway:')) {
@@ -1249,7 +1217,6 @@ async function handlePublicGatewaySave(event) {
     selectedGatewayId = selectionValue.slice(8)
     const selectedGateway = publicGatewayDiscovered.find((entry) => entry.gatewayId === selectedGatewayId)
     baseUrl = selectedGateway?.publicUrl || publicGatewayConfig.baseUrl || ''
-    sharedSecret = ''
     if (enabled && (!selectedGatewayId || !baseUrl)) {
       emitPublicGatewayMessage('error', 'Select an available public gateway before saving.')
       return
@@ -1258,7 +1225,6 @@ async function handlePublicGatewaySave(event) {
     selectionMode = 'default'
     preferredBaseUrl = publicGatewayConfig.preferredBaseUrl || DEFAULT_PUBLIC_GATEWAY_URL
     baseUrl = preferredBaseUrl
-    sharedSecret = ''
   }
 
   const ttlMinutes = Number(publicGatewayDefaultTtlInput?.value)
@@ -1271,7 +1237,6 @@ async function handlePublicGatewaySave(event) {
     selectedGatewayId,
     preferredBaseUrl,
     baseUrl,
-    sharedSecret,
     defaultTokenTtl: ttlSeconds
   })
 
@@ -2933,7 +2898,6 @@ function initializeDOMElements() {
   publicGatewayEnableToggle = document.getElementById('public-gateway-enable')
   publicGatewaySelectionSelect = document.getElementById('public-gateway-selection')
   publicGatewayUrlInput = document.getElementById('public-gateway-url')
-  publicGatewaySecretInput = document.getElementById('public-gateway-secret')
   publicGatewaySaveButton = document.getElementById('public-gateway-save')
   publicGatewayDefaultTtlInput = document.getElementById('public-gateway-token-ttl')
   publicGatewayManualFields = document.getElementById('public-gateway-manual-fields')
@@ -2968,7 +2932,6 @@ function initializeDOMElements() {
     publicGatewayEnableToggle,
     publicGatewaySelectionSelect,
     publicGatewayUrlInput,
-    publicGatewaySecretInput,
     publicGatewaySaveButton,
     publicGatewayDefaultTtlInput,
     publicGatewayManualFields,

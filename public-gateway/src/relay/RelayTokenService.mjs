@@ -1,10 +1,6 @@
-import {
-  issueClientToken,
-  verifyClientToken
-} from '../../../shared/auth/PublicGatewayTokens.mjs';
-
 const DEFAULT_TTL_SECONDS = 3600;
 const DEFAULT_REFRESH_WINDOW_SECONDS = 300;
+const DEFAULT_RELAY_ACCESS_SCOPE = 'gateway:relay-access';
 
 function toNumber(value, fallback) {
   const n = Number(value);
@@ -14,15 +10,17 @@ function toNumber(value, fallback) {
 export default class RelayTokenService {
   constructor({
     registrationStore,
-    sharedSecret,
+    authService,
     logger = console,
     defaultTtlSeconds = DEFAULT_TTL_SECONDS,
     refreshWindowSeconds = DEFAULT_REFRESH_WINDOW_SECONDS
   } = {}) {
     if (!registrationStore) throw new Error('RelayTokenService requires a registrationStore');
-    if (!sharedSecret) throw new Error('RelayTokenService requires shared secret');
+    if (!authService || typeof authService.issueToken !== 'function' || typeof authService.verifyToken !== 'function') {
+      throw new Error('RelayTokenService requires GatewayAuthService');
+    }
     this.registrationStore = registrationStore;
-    this.sharedSecret = sharedSecret;
+    this.authService = authService;
     this.logger = logger;
     this.defaultTtlSeconds = toNumber(defaultTtlSeconds, DEFAULT_TTL_SECONDS);
     this.refreshWindowMs = toNumber(refreshWindowSeconds, DEFAULT_REFRESH_WINDOW_SECONDS) * 1000;
@@ -48,12 +46,11 @@ export default class RelayTokenService {
       relayKey,
       relayAuthToken: options.relayAuthToken,
       pubkey: options.pubkey || null,
-      scope: options.scope || 'relay-access',
-      expiresAt,
+      scope: options.scope || DEFAULT_RELAY_ACCESS_SCOPE,
       sequence
     };
 
-    const token = issueClientToken(payload, this.sharedSecret);
+    const token = this.authService.issueToken(payload, { ttlSec: ttlSeconds });
     await this.registrationStore.storeTokenMetadata?.(relayKey, {
       token,
       relayAuthToken: options.relayAuthToken,
@@ -132,17 +129,15 @@ export default class RelayTokenService {
     }
     if (!relayKey) throw new Error('relayKey required');
 
-    const payload = verifyClientToken(token, this.sharedSecret);
-    if (!payload) {
-      throw new Error('token-invalid');
+    const verified = this.authService.verifyToken(token, { relayKey });
+    if (!verified?.ok) {
+      throw new Error(verified?.reason || 'token-invalid');
     }
+    const payload = verified.payload || {};
+    const payloadExpMs = Number.isFinite(payload?.exp) ? Number(payload.exp) * 1000 : null;
 
     if (payload.relayKey && payload.relayKey !== relayKey) {
       throw new Error('relay-mismatch');
-    }
-
-    if (payload.expiresAt && payload.expiresAt < Date.now()) {
-      throw new Error('token-expired');
     }
 
     const metadata = await this.registrationStore.getTokenMetadata?.(relayKey);
@@ -162,11 +157,13 @@ export default class RelayTokenService {
       token,
       relayAuthToken: payload.relayAuthToken || metadata?.relayAuthToken || null,
       pubkey: payload.pubkey || metadata?.pubkey || null,
-      scope: payload.scope || metadata?.scope || null,
+      scope: payload.scope || metadata?.scope || DEFAULT_RELAY_ACCESS_SCOPE,
       sequence: payload.sequence || metadata?.sequence || 0,
       issuedAt: metadata?.issuedAt || payload.issuedAt || Date.now(),
-      expiresAt: payload.expiresAt || metadata?.expiresAt || Date.now(),
-      refreshAfter: metadata?.refreshAfter || (payload.expiresAt ? Math.max(Date.now(), payload.expiresAt - this.refreshWindowMs) : null),
+      expiresAt: payloadExpMs || metadata?.expiresAt || Date.now(),
+      refreshAfter:
+        metadata?.refreshAfter
+        || (payloadExpMs ? Math.max(Date.now(), payloadExpMs - this.refreshWindowMs) : null),
       lastValidatedAt: Date.now()
     });
 

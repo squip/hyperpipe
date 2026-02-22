@@ -52,8 +52,6 @@ const GATEWAYS = {
   }
 }
 
-const REGISTRATION_SHARED_SECRET = process.env.HT_REGISTRATION_SHARED_SECRET || 'e2e-registration-secret'
-
 const WORKER_A_PRIVKEY =
   normalizeHexKey(process.env.HT_MULTI_GATEWAY_WORKER_A_PRIVKEY)
   || '3333333333333333333333333333333333333333333333333333333333333333'
@@ -488,7 +486,6 @@ async function writeGatewaySettings(storageDir, gatewayBaseUrl) {
       selectionMode: 'manual',
       preferredBaseUrl: baseUrl,
       baseUrl,
-      sharedSecret: REGISTRATION_SHARED_SECRET,
       delegateReqToPeers: false
     }, null, 2),
     'utf8'

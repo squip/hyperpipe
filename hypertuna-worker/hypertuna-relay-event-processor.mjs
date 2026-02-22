@@ -164,12 +164,34 @@ export default class NostrRelay extends Autobee {
     const key = queueKey || 'unknown';
     const previous = this.subscriptionWriteQueue.get(key) || Promise.resolve();
     const next = previous.catch(() => null).then(task);
-    this.subscriptionWriteQueue.set(key, next.finally(() => {
-      if (this.subscriptionWriteQueue.get(key) === next) {
-        this.subscriptionWriteQueue.delete(key);
+    const tracked = next.then(
+      () => {
+        if (this.subscriptionWriteQueue.get(key) === tracked) {
+          this.subscriptionWriteQueue.delete(key);
+        }
+      },
+      () => {
+        if (this.subscriptionWriteQueue.get(key) === tracked) {
+          this.subscriptionWriteQueue.delete(key);
+        }
       }
-    }));
+    );
+    this.subscriptionWriteQueue.set(key, tracked);
     return next;
+  }
+
+  _isRetriableSubscriptionAppendError(error) {
+    if (!this.writable) return true;
+    const message = String(error?.message || error || '').toLowerCase();
+    if (!message) return false;
+    return (
+      message.includes('autobase is closing') ||
+      message.includes('not writable') ||
+      message.includes('already closed') ||
+      message.includes('core is closed') ||
+      message.includes('session is closed') ||
+      message.includes('channel is closed')
+    );
   }
 
   _enqueuePendingSubscriptionWrite(entry) {
@@ -1443,10 +1465,34 @@ async publishSubscription(connectionKey, reqMessage, activeSubscriptions = null,
         viewVersion: this.view?.version ?? null
       });
 
-      await this.append({
-        type: 'subscriptions',
-        subscriptions: JSON.stringify(subscriptionObject)
-      });
+      try {
+        await this.append({
+          type: 'subscriptions',
+          subscriptions: JSON.stringify(subscriptionObject)
+        });
+      } catch (error) {
+        if (this._isRetriableSubscriptionAppendError(error)) {
+          this._enqueuePendingSubscriptionWrite({
+            connectionKey,
+            reqMessage,
+            clientId,
+            subscriptionId,
+            queuedAt: Date.now()
+          });
+          logWithTimestamp('publishSubscription: append deferred; queued subscription write', {
+            connectionKey,
+            subscriptionId,
+            error: error?.message || error,
+            pending: this.pendingSubscriptionWrites.length
+          });
+          this._schedulePendingSubscriptionFlush('append-retry');
+          if (this._isEphemeralSubscriptionId(subscriptionId)) {
+            return null;
+          }
+          return ['NOTICE', 'Relay updating; subscription queued'];
+        }
+        throw error;
+      }
 
       const stored = await this.view.get(key);
       if (stored) {

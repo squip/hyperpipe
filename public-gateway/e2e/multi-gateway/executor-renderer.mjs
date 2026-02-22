@@ -59,7 +59,6 @@ const GATEWAYS = {
   }
 }
 
-const REGISTRATION_SHARED_SECRET = process.env.HT_REGISTRATION_SHARED_SECRET || 'e2e-registration-secret'
 const RENDERER_URL_OVERRIDE = resolveRendererUrl(
   process.env.HT_MATRIX_RENDERER_URL
   || process.env.RENDERER_URL
@@ -288,7 +287,6 @@ async function writeGatewaySettings(userDataDir, gatewayBaseUrl) {
         selectionMode: 'manual',
         preferredBaseUrl: baseUrl,
         baseUrl,
-        sharedSecret: REGISTRATION_SHARED_SECRET,
         delegateReqToPeers: false
       },
       null,
@@ -851,7 +849,13 @@ async function waitForRelayEntry(peer, { relayKey = null, publicIdentifier = nul
   throw new Error(`relay-entry-timeout:${publicIdentifier || relayKey || 'unknown'}${suffix}`)
 }
 
-function selectRelayUrlFromWritableResult(result, fallback = null) {
+function normalizeRelayUrlCandidate(candidate) {
+  if (typeof candidate !== 'string') return null
+  const trimmed = candidate.trim()
+  return trimmed || null
+}
+
+function selectRelayUrlsFromWritableResult(result, fallback = null) {
   const candidates = [
     result?.relay?.localConnectionUrl,
     result?.relay?.connectionUrl,
@@ -864,31 +868,158 @@ function selectRelayUrlFromWritableResult(result, fallback = null) {
     result?.relayUrl,
     fallback
   ]
+  const seen = new Set()
+  const urls = []
   for (const candidate of candidates) {
-    if (typeof candidate === 'string' && candidate.trim()) {
-      return candidate.trim()
-    }
+    const normalized = normalizeRelayUrlCandidate(candidate)
+    if (!normalized || seen.has(normalized)) continue
+    seen.add(normalized)
+    urls.push(normalized)
   }
-  return null
+  return urls
 }
 
-function selectRelayUrlFromRelayEntry(entry) {
-  if (!entry || typeof entry !== 'object') return null
+function selectRelayUrlFromWritableResult(result, fallback = null) {
+  const urls = selectRelayUrlsFromWritableResult(result, fallback)
+  return urls.length ? urls[0] : null
+}
+
+function selectRelayUrlsFromRelayEntry(entry) {
+  if (!entry || typeof entry !== 'object') return []
   const candidates = [
     entry.localConnectionUrl,
     entry.connectionUrl,
     entry.relayUrl,
     entry.gatewayConnectionUrl
   ]
+  const seen = new Set()
+  const urls = []
   for (const candidate of candidates) {
-    if (typeof candidate === 'string' && candidate.trim()) {
-      return candidate.trim()
-    }
+    const normalized = normalizeRelayUrlCandidate(candidate)
+    if (!normalized || seen.has(normalized)) continue
+    seen.add(normalized)
+    urls.push(normalized)
   }
-  return null
+  return urls
 }
 
-async function resolvePublishRelayUrl(
+function selectRelayUrlFromRelayEntry(entry) {
+  const urls = selectRelayUrlsFromRelayEntry(entry)
+  return Array.isArray(urls) && urls.length ? urls[0] : null
+}
+
+function isLocalRelayUrl(candidate) {
+  if (typeof candidate !== 'string' || !candidate.trim()) return false
+  try {
+    const parsed = new URL(candidate.trim())
+    if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') return false
+    const hostname = String(parsed.hostname || '').trim().toLowerCase()
+    return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1'
+  } catch {
+    return false
+  }
+}
+
+function stripRelayTokenParam(candidate) {
+  const normalized = normalizeRelayUrlCandidate(candidate)
+  if (!normalized) return null
+  try {
+    const parsed = new URL(normalized)
+    if (!parsed.searchParams.has('token')) return null
+    parsed.searchParams.delete('token')
+    return parsed.toString()
+  } catch {
+    return null
+  }
+}
+
+function relayUrlHasToken(candidate) {
+  const normalized = normalizeRelayUrlCandidate(candidate)
+  if (!normalized) return false
+  try {
+    const parsed = new URL(normalized)
+    return parsed.searchParams.has('token')
+  } catch {
+    return /[?&]token=/.test(normalized)
+  }
+}
+
+function relayUrlBaseKey(candidate) {
+  const normalized = normalizeRelayUrlCandidate(candidate)
+  if (!normalized) return null
+  return stripRelayTokenParam(normalized) || normalized
+}
+
+function relayCandidatePriority(relayUrl, source = 'unknown') {
+  let score = 0
+  const normalizedSource = String(source || '').toLowerCase()
+  if (isLocalRelayUrl(relayUrl)) score += 40
+  if (relayUrl.startsWith('wss://')) score += 20
+  if (relayUrl.includes('token=')) score += 8
+  if (normalizedSource.includes('joined-relay')) score += 12
+  if (normalizedSource.includes('writable-result')) score += 10
+  if (normalizedSource.includes('relay-list-local')) score += 8
+  if (normalizedSource.includes('relay-list')) score += 6
+  if (normalizedSource.includes('fallback')) score -= 2
+  if (normalizedSource.includes('tokenless')) score -= 4
+  return score
+}
+
+function buildRelayCandidateList(seedCandidates = []) {
+  const byUrl = new Map()
+  let nextOrder = 0
+  const upsert = (relayUrl, source = 'unknown') => {
+    const normalizedUrl = normalizeRelayUrlCandidate(relayUrl)
+    if (!normalizedUrl) return
+    const normalizedSource = String(source || 'unknown')
+    const priority = relayCandidatePriority(normalizedUrl, normalizedSource)
+    const existing = byUrl.get(normalizedUrl)
+    if (existing) {
+      if (!existing.sources.includes(normalizedSource)) {
+        existing.sources.push(normalizedSource)
+      }
+      if (priority > existing.priority) {
+        existing.priority = priority
+        existing.source = normalizedSource
+      }
+      return
+    }
+    byUrl.set(normalizedUrl, {
+      relayUrl: normalizedUrl,
+      source: normalizedSource,
+      sources: [normalizedSource],
+      priority,
+      order: nextOrder
+    })
+    nextOrder += 1
+  }
+
+  for (const candidate of seedCandidates) {
+    if (typeof candidate === 'string') {
+      upsert(candidate, 'unknown')
+      const tokenless = stripRelayTokenParam(candidate)
+      if (tokenless) upsert(tokenless, 'unknown:tokenless')
+      continue
+    }
+    if (!candidate || typeof candidate !== 'object') continue
+    const relayUrl = candidate.relayUrl
+    const source = candidate.source || 'unknown'
+    upsert(relayUrl, source)
+    const tokenless = stripRelayTokenParam(relayUrl)
+    if (tokenless) upsert(tokenless, `${source}:tokenless`)
+  }
+
+  const ranked = Array.from(byUrl.values())
+    .sort((left, right) => {
+      if (right.priority !== left.priority) return right.priority - left.priority
+      return left.order - right.order
+    })
+    .map(({ relayUrl, source, sources, priority }) => ({ relayUrl, source, sources, priority }))
+
+  return ranked
+}
+
+async function resolvePublishRelayCandidates(
   peer,
   {
     relayKey = null,
@@ -899,55 +1030,109 @@ async function resolvePublishRelayUrl(
     timeoutMs = 30000
   } = {}
 ) {
-  const fromJoinedRelay = selectRelayUrlFromRelayEntry(joinedRelay)
-  if (fromJoinedRelay) {
-    return {
-      relayUrl: fromJoinedRelay,
+  let candidates = buildRelayCandidateList([
+    ...selectRelayUrlsFromRelayEntry(joinedRelay).map((relayUrl) => ({
+      relayUrl,
       source: 'joined-relay'
-    }
-  }
-
-  const fromWritableResult = selectRelayUrlFromWritableResult(joinWritableResult)
-  if (fromWritableResult) {
-    return {
-      relayUrl: fromWritableResult,
+    })),
+    ...selectRelayUrlsFromWritableResult(joinWritableResult).map((relayUrl) => ({
+      relayUrl,
       source: 'writable-result'
-    }
-  }
+    }))
+  ])
 
   const startedAt = nowTs()
-  while (nowTs() - startedAt < timeoutMs) {
-    try {
-      const relays = await peer.getRelays()
-      const matching = (Array.isArray(relays) ? relays : []).find((entry) => {
-        if (relayKey && entry?.relayKey === relayKey) return true
-        if (publicIdentifier && entry?.publicIdentifier === publicIdentifier) return true
-        return false
-      })
-      const resolved = selectRelayUrlFromRelayEntry(matching)
-      if (resolved) {
-        return {
-          relayUrl: resolved,
-          source: 'relay-list'
+  const localRelayWindowMs = Math.min(timeoutMs, 12000)
+  const pollRelayList = async (deadlineMs, { requireLocal = false } = {}) => {
+    let found = false
+    while (nowTs() < deadlineMs) {
+      let relays = null
+      let matching = null
+      let relayListSource = 'relay-list'
+      try {
+        relays = await peer.getRelays()
+        matching = (Array.isArray(relays) ? relays : []).find((entry) => {
+          if (relayKey && entry?.relayKey === relayKey) return true
+          if (publicIdentifier && entry?.publicIdentifier === publicIdentifier) return true
+          return false
+        })
+      } catch (_) {
+        // Retry until timeout.
+      }
+      if (matching) {
+        found = true
+        relayListSource = isLocalRelayUrl(selectRelayUrlFromRelayEntry(matching))
+          ? 'relay-list-local'
+          : 'relay-list'
+        const relayListCandidates = selectRelayUrlsFromRelayEntry(matching).map((relayUrl) => ({
+          relayUrl,
+          source: relayListSource
+        }))
+        candidates = buildRelayCandidateList([...candidates, ...relayListCandidates])
+        if (!requireLocal || candidates.some((candidate) => isLocalRelayUrl(candidate.relayUrl))) {
+          return true
         }
       }
-    } catch (_) {
-      // Retry until timeout.
+      await sleep(500)
     }
-    await sleep(500)
+    return found
+  }
+
+  await pollRelayList(startedAt + localRelayWindowMs, { requireLocal: true })
+
+  const noLocalCandidates = !candidates.some((candidate) => isLocalRelayUrl(candidate.relayUrl))
+  if (!candidates.length || noLocalCandidates) {
+    await pollRelayList(startedAt + timeoutMs, { requireLocal: false })
   }
 
   if (typeof fallbackRelayUrl === 'string' && fallbackRelayUrl.trim()) {
-    return {
-      relayUrl: fallbackRelayUrl.trim(),
-      source: 'fallback'
-    }
+    candidates = buildRelayCandidateList([
+      ...candidates,
+      {
+        relayUrl: fallbackRelayUrl.trim(),
+        source: 'fallback'
+      }
+    ])
   }
 
+  const relayUrl = candidates[0]?.relayUrl || null
+  const source = candidates[0]?.source || 'none'
   return {
-    relayUrl: null,
-    source: 'none'
+    relayUrl,
+    source,
+    candidates
   }
+}
+
+function summarizeCandidateErrors(errors = [], limit = 3) {
+  if (!Array.isArray(errors) || !errors.length) return 'unknown'
+  return errors
+    .slice(0, Math.max(1, limit))
+    .map((entry) => {
+      const stage = String(entry?.stage || 'unknown')
+      const source = String(entry?.source || 'unknown')
+      const relayUrl = String(entry?.relayUrl || 'unknown')
+      const error = String(entry?.error || 'unknown-error')
+      return `${stage}:${source}:${relayUrl}:${error}`
+    })
+    .join('|')
+}
+
+function dedupeRelayCandidates(candidates = []) {
+  const seen = new Set()
+  const deduped = []
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'object') continue
+    const relayUrl = normalizeRelayUrlCandidate(candidate.relayUrl)
+    const dedupeKey = relayUrl || `default:${candidate.source || 'unknown'}`
+    if (seen.has(dedupeKey)) continue
+    seen.add(dedupeKey)
+    deduped.push({
+      relayUrl,
+      source: candidate.source || 'unknown'
+    })
+  }
+  return deduped
 }
 
 async function resolveRelayLikeFromWritableResult(
@@ -971,6 +1156,46 @@ async function requestProvision(hostPeer, data) {
     throw new Error(response?.error || 'provision-writer-for-invitee failed')
   }
   return response.data || null
+}
+
+async function leaveGroupForCleanup(peer, { relayKey = null, publicIdentifier = null } = {}) {
+  if (!peer) {
+    return { peer: null, status: 'skipped', reason: 'peer-unavailable' }
+  }
+  if (!relayKey && !publicIdentifier) {
+    return { peer: peer.name, status: 'skipped', reason: 'missing-relay-identifiers' }
+  }
+
+  try {
+    const response = await withTimeout(
+      peer.sendWorkerAwait(
+        'leave-group',
+        {
+          relayKey: relayKey || undefined,
+          publicIdentifier: publicIdentifier || undefined,
+          saveRelaySnapshot: false,
+          saveSharedFiles: false
+        },
+        25000
+      ),
+      30000,
+      `leave-group-cleanup:${peer.name || 'peer'}`
+    )
+    if (!response?.success) {
+      return {
+        peer: peer.name,
+        status: 'error',
+        reason: response?.error || 'leave-group-response-failed'
+      }
+    }
+    return { peer: peer.name, status: 'ok' }
+  } catch (error) {
+    return {
+      peer: peer.name,
+      status: 'error',
+      reason: error?.message || String(error)
+    }
+  }
 }
 
 async function readWorkerSwarmPeerKey(userDataDir, pubkeyHex, timeoutMs = 30000) {
@@ -1029,6 +1254,7 @@ async function runScenario() {
   const workerCLog = path.join(SCENARIO_DIR, 'workerC.log')
   const summary = {
     scenarioId: SCENARIO_ID,
+    scenarioName,
     workerLogs: [workerALog, workerBLog, workerBRestartLog],
     observedViewLength: null,
     expectedViewLength: null,
@@ -1036,8 +1262,13 @@ async function runScenario() {
     autoConnectExpectedViewLength: null,
     publishValidation: null,
     joinExpectedFailure: expectJoinFailure,
-    joinFailFastReason: null
+    joinFailFastReason: null,
+    relayKey: null,
+    publicIdentifier: null,
+    cleanup: []
   }
+  let createdRelayKey = null
+  let createdPublicIdentifier = null
 
   const hostPeer = new RendererPeer({
     name: 'workerA',
@@ -1092,6 +1323,16 @@ async function runScenario() {
       fileSharing: true,
       gateways: gatewayDescriptorsForCreate(SCENARIO)
     })
+    const discoveryTopicHint =
+      typeof createResult?.discoveryTopic === 'string' && createResult.discoveryTopic.trim()
+        ? createResult.discoveryTopic.trim()
+        : null
+    const writerIssuerPubkeyHint =
+      typeof createResult?.writerIssuerPubkey === 'string' && createResult.writerIssuerPubkey.trim()
+        ? createResult.writerIssuerPubkey.trim()
+        : null
+    const hostPeerKeysHint = hostSwarmPeerKey ? [hostSwarmPeerKey] : []
+    const memberPeerKeysHint = memberSwarmPeerKey ? [memberSwarmPeerKey] : []
 
     const publicIdentifier =
       typeof createResult?.groupId === 'string' && createResult.groupId.trim()
@@ -1100,6 +1341,8 @@ async function runScenario() {
     if (!publicIdentifier) {
       throw new Error('create-group-missing-public-identifier')
     }
+    createdPublicIdentifier = publicIdentifier
+    summary.publicIdentifier = publicIdentifier
     logScenarioStage('group-created', { publicIdentifier })
 
     const hostRelay = await waitForRelayEntry(hostPeer, { publicIdentifier }, 180000)
@@ -1107,6 +1350,8 @@ async function runScenario() {
     if (!relayKey) {
       throw new Error('create-group-missing-relay-key')
     }
+    createdRelayKey = relayKey
+    summary.relayKey = relayKey
 
     const relayUrl =
       typeof hostRelay?.connectionUrl === 'string' && hostRelay.connectionUrl.trim()
@@ -1150,6 +1395,10 @@ async function runScenario() {
         openJoin: SCENARIO?.groupType === 'OPEN',
         token: memberToken,
         gatewayOrigins: joinOrigins,
+        discoveryTopic: discoveryTopicHint,
+        hostPeerKeys: hostPeerKeysHint,
+        memberPeerKeys: memberPeerKeysHint,
+        writerIssuerPubkey: writerIssuerPubkeyHint,
         writerCore: memberProvision?.writerCore || null,
         writerCoreHex: memberProvision?.writerCoreHex || null,
         autobaseLocal: memberProvision?.autobaseLocal || null,
@@ -1217,6 +1466,10 @@ async function runScenario() {
       openJoin: SCENARIO?.groupType === 'OPEN',
       token: SCENARIO?.groupType === 'OPEN' ? null : inviteToken,
       gatewayOrigins: joinOrigins,
+      discoveryTopic: discoveryTopicHint,
+      hostPeerKeys: hostPeerKeysHint,
+      memberPeerKeys: memberPeerKeysHint,
+      writerIssuerPubkey: writerIssuerPubkeyHint,
       writerCore: shouldPreseedWriterMaterial ? (provisionResult?.writerCore || null) : null,
       writerCoreHex: shouldPreseedWriterMaterial ? (provisionResult?.writerCoreHex || null) : null,
       autobaseLocal: shouldPreseedWriterMaterial ? (provisionResult?.autobaseLocal || null) : null,
@@ -1272,55 +1525,241 @@ async function runScenario() {
     summary.observedViewLength = joinedMetrics.observedViewLength
     summary.expectedViewLength = joinedMetrics.expectedViewLength
 
-    const publishRelayResolution = await resolvePublishRelayUrl(joinerPeer, {
+    const publishRelayResolution = await resolvePublishRelayCandidates(joinerPeer, {
       relayKey,
       publicIdentifier,
       joinedRelay,
       joinWritableResult,
-      fallbackRelayUrl: relayUrl,
+      fallbackRelayUrl: null,
       timeoutMs: 30000
     })
-    const publishRelayUrl = publishRelayResolution?.relayUrl || null
-    if (!publishRelayUrl) {
+    const publishCandidates = dedupeRelayCandidates(
+      (Array.isArray(publishRelayResolution?.candidates) ? publishRelayResolution.candidates : []).slice(0, 8)
+    )
+    if (!publishCandidates.length) {
       throw new Error('publish-relay-url-unavailable')
     }
+    const primaryPublishRelay = publishCandidates[0]
     const publishContent = `[matrix ${SCENARIO_ID}] publish validation ${Date.now()}`
     logScenarioStage('publish-validation-start', {
-      relayUrl: publishRelayUrl,
-      source: publishRelayResolution?.source || null,
+      relayUrl: primaryPublishRelay?.relayUrl || null,
+      source: primaryPublishRelay?.source || publishRelayResolution?.source || null,
+      candidateCount: publishCandidates.length,
+      candidateRelayUrls: publishCandidates.map((candidate) => candidate.relayUrl),
       contentPreview: publishContent.slice(0, 48)
     })
-    const publishedNote = await joinerPeer.callBridge('publishGroupNote', {
-      groupId: publicIdentifier,
-      relayUrl: publishRelayUrl,
-      content: publishContent
-    }, 45000)
-    logScenarioStage('publish-call-ok', {
-      noteId: publishedNote?.id || null
-    })
+    const publishErrors = []
+    let publishedNote = null
+    let publishWinner = null
+    for (let index = 0; index < publishCandidates.length; index += 1) {
+      const candidate = publishCandidates[index]
+      const relayUrlCandidate = candidate?.relayUrl
+      if (!relayUrlCandidate) continue
+      const maxAttemptsPerCandidate = index === 0 ? 3 : 1
+      for (let retry = 0; retry < maxAttemptsPerCandidate; retry += 1) {
+        const attemptNumber = `${index + 1}.${retry + 1}`
+        logScenarioStage('publish-attempt-start', {
+          attempt: attemptNumber,
+          relayUrl: relayUrlCandidate,
+          source: candidate?.source || null
+        })
+        try {
+          publishedNote = await joinerPeer.callBridge('publishGroupNote', {
+            groupId: publicIdentifier,
+            relayUrl: relayUrlCandidate,
+            content: publishContent
+          }, 45000)
+          publishWinner = candidate
+          break
+        } catch (error) {
+          const message = String(error?.message || error || 'publish-call-failed').replace(/\s+/g, ' ').slice(0, 320)
+          publishErrors.push({
+            stage: 'publish',
+            source: candidate?.source || 'unknown',
+            relayUrl: relayUrlCandidate,
+            error: message
+          })
+          logScenarioStage('publish-attempt-failed', {
+            attempt: attemptNumber,
+            stage: 'publish',
+            relayUrl: relayUrlCandidate,
+            source: candidate?.source || null,
+            error: message
+          })
+          if (retry + 1 < maxAttemptsPerCandidate) {
+            const backoffMs = (retry + 1) * 2000
+            logScenarioStage('publish-attempt-retry', {
+              attempt: attemptNumber,
+              relayUrl: relayUrlCandidate,
+              source: candidate?.source || null,
+              backoffMs
+            })
+            await sleep(backoffMs)
+          }
+        }
+      }
+      if (publishedNote && publishWinner) {
+        break
+      }
+    }
+    if (!publishedNote || !publishWinner) {
+      throw new Error(`publish-call-failed:${summarizeCandidateErrors(publishErrors, 5)}`)
+    }
     const noteId = typeof publishedNote?.id === 'string' && publishedNote.id.trim()
       ? publishedNote.id.trim()
       : null
-    await joinerPeer.callBridge('waitForGroupNote', {
-      groupId: publicIdentifier,
-      relayUrl: publishRelayUrl,
+    if (!noteId) {
+      throw new Error('publish-note-id-unavailable')
+    }
+    logScenarioStage('publish-call-ok', {
       noteId,
-      content: publishContent,
-      authorPubkey: WORKER_B_PUBKEY,
-      timeoutMs: 90000
-    }, 100000)
-    logScenarioStage('publish-fetch-ok', { noteId })
-    await joinerPeer.callBridge('openGroupPage', {
-      groupId: publicIdentifier,
-      relayUrl: publishRelayUrl
-    }, 15000)
-    await joinerPeer.callBridge('waitForVisibleText', {
-      text: publishContent,
-      timeoutMs: 90000
-    }, 100000)
-    logScenarioStage('publish-visible-ok', { noteId })
+      relayUrl: publishWinner.relayUrl,
+      source: publishWinner.source || null
+    })
+
+    const publishWinnerHasToken = relayUrlHasToken(publishWinner.relayUrl)
+    const publishWinnerBaseRelay = relayUrlBaseKey(publishWinner.relayUrl)
+    const postPublishSnapshotWaitMs = publishWinnerHasToken ? 1_200 : 3_500
+    logScenarioStage('publish-post-snapshot-wait', {
+      relayUrl: publishWinner.relayUrl,
+      hasToken: publishWinnerHasToken,
+      waitMs: postPublishSnapshotWaitMs
+    })
+    await sleep(postPublishSnapshotWaitMs)
+    await waitForRelayEntry(
+      joinerPeer,
+      { relayKey, publicIdentifier },
+      12_000
+    ).catch(() => null)
+
+    const fetchCandidates = dedupeRelayCandidates([
+      publishWinner,
+      ...publishCandidates
+    ]).sort((left, right) => {
+      const score = (candidate) => {
+        const relayUrlCandidate = normalizeRelayUrlCandidate(candidate?.relayUrl)
+        if (!relayUrlCandidate) return -1000
+        let rank = 0
+        if (relayUrlCandidate === publishWinner.relayUrl) rank += 200
+        const candidateBaseRelay = relayUrlBaseKey(relayUrlCandidate)
+        const sameBaseRelay = publishWinnerBaseRelay && candidateBaseRelay === publishWinnerBaseRelay
+        if (sameBaseRelay) rank += 120
+        if (sameBaseRelay && !relayUrlHasToken(relayUrlCandidate)) rank += 40
+        if (isLocalRelayUrl(relayUrlCandidate)) rank += 12
+        return rank
+      }
+      return score(right) - score(left)
+    })
+    let fetchWinner = null
+    for (let index = 0; index < fetchCandidates.length; index += 1) {
+      const candidate = fetchCandidates[index]
+      const relayUrlCandidate = candidate?.relayUrl
+      if (!relayUrlCandidate) continue
+      try {
+        const candidateHasToken = relayUrlHasToken(relayUrlCandidate)
+        const candidateBaseRelay = relayUrlBaseKey(relayUrlCandidate)
+        const sameBaseRelay = publishWinnerBaseRelay && candidateBaseRelay === publishWinnerBaseRelay
+        let fetchTimeoutMs = 20_000
+        if (index === 0) {
+          fetchTimeoutMs = publishWinnerHasToken ? 45_000 : 65_000
+        } else if (sameBaseRelay && !candidateHasToken) {
+          fetchTimeoutMs = 45_000
+        } else if (sameBaseRelay) {
+          fetchTimeoutMs = 30_000
+        }
+        await joinerPeer.callBridge('waitForGroupNote', {
+          groupId: publicIdentifier,
+          relayUrl: relayUrlCandidate,
+          noteId,
+          content: publishContent,
+          authorPubkey: WORKER_B_PUBKEY,
+          timeoutMs: fetchTimeoutMs
+        }, fetchTimeoutMs + 15000)
+        fetchWinner = candidate
+        break
+      } catch (error) {
+        const message = String(error?.message || error || 'publish-fetch-failed').replace(/\s+/g, ' ').slice(0, 320)
+        publishErrors.push({
+          stage: 'fetch',
+          source: candidate?.source || 'unknown',
+          relayUrl: relayUrlCandidate,
+          error: message
+        })
+        logScenarioStage('publish-attempt-failed', {
+          attempt: index + 1,
+          stage: 'fetch',
+          relayUrl: relayUrlCandidate,
+          source: candidate?.source || null,
+          error: message
+        })
+      }
+    }
+    if (!fetchWinner) {
+      const tokenizedFetchFailures = publishErrors.some(
+        (entry) => entry?.stage === 'fetch' && relayUrlHasToken(entry?.relayUrl)
+      )
+      const fetchFailureKind =
+        !publishWinnerHasToken && tokenizedFetchFailures
+          ? 'publish-ok-fetch-timeout-token-churn'
+          : 'publish-fetch-failed'
+      throw new Error(`${fetchFailureKind}:${summarizeCandidateErrors(publishErrors, 6)}`)
+    }
+    logScenarioStage('publish-fetch-ok', { noteId, relayUrl: fetchWinner.relayUrl, source: fetchWinner.source || null })
+
+    const visibleCandidates = dedupeRelayCandidates([
+      { relayUrl: fetchWinner.relayUrl, source: `${fetchWinner.source || 'unknown'}:fetch-winner` },
+      { relayUrl: publishWinner.relayUrl, source: `${publishWinner.source || 'unknown'}:publish-winner` },
+      ...publishCandidates,
+      { relayUrl: null, source: 'default-route' }
+    ])
+    let visibleWinner = null
+    for (let index = 0; index < visibleCandidates.length; index += 1) {
+      const candidate = visibleCandidates[index]
+      const relayUrlCandidate = candidate?.relayUrl
+      try {
+        await joinerPeer.callBridge('openGroupPage', relayUrlCandidate
+          ? { groupId: publicIdentifier, relayUrl: relayUrlCandidate }
+          : { groupId: publicIdentifier }, 15000)
+        const visibleTimeoutMs = index === 0 ? 45000 : 25000
+        await joinerPeer.callBridge('waitForVisibleText', {
+          text: publishContent,
+          timeoutMs: visibleTimeoutMs
+        }, visibleTimeoutMs + 15000)
+        visibleWinner = candidate
+        break
+      } catch (error) {
+        const message = String(error?.message || error || 'publish-visible-failed').replace(/\s+/g, ' ').slice(0, 320)
+        publishErrors.push({
+          stage: 'visible',
+          source: candidate?.source || 'unknown',
+          relayUrl: relayUrlCandidate || 'default-route',
+          error: message
+        })
+        logScenarioStage('publish-attempt-failed', {
+          attempt: index + 1,
+          stage: 'visible',
+          relayUrl: relayUrlCandidate || null,
+          source: candidate?.source || null,
+          error: message
+        })
+      }
+    }
+    if (!visibleWinner) {
+      throw new Error(`publish-visible-failed:${summarizeCandidateErrors(publishErrors, 7)}`)
+    }
+    logScenarioStage('publish-visible-ok', {
+      noteId,
+      relayUrl: visibleWinner.relayUrl || null,
+      source: visibleWinner.source || null
+    })
     summary.publishValidation = {
-      relayUrl: publishRelayUrl,
+      relayUrl: publishWinner.relayUrl,
+      fetchRelayUrl: fetchWinner.relayUrl,
+      visibleRelayUrl: visibleWinner.relayUrl || null,
+      relayCandidates: publishCandidates.map((candidate) => ({
+        relayUrl: candidate.relayUrl,
+        source: candidate.source || null
+      })),
       noteId,
       content: publishContent
     }
@@ -1406,6 +1845,28 @@ async function runScenario() {
 
     return summary
   } finally {
+    if (createdRelayKey || createdPublicIdentifier) {
+      const cleanupPeers = [hostPeer, joinerPeer, memberPeer, restartedJoinerPeer].filter(Boolean)
+      const cleanupResults = await Promise.all(
+        cleanupPeers.map((peer) =>
+          leaveGroupForCleanup(peer, {
+            relayKey: createdRelayKey,
+            publicIdentifier: createdPublicIdentifier
+          })
+        )
+      )
+      summary.cleanup = cleanupResults
+      logScenarioStage('scenario-relay-cleanup', {
+        relayKey: createdRelayKey,
+        publicIdentifier: createdPublicIdentifier,
+        results: cleanupResults.map((entry) => ({
+          peer: entry.peer,
+          status: entry.status,
+          reason: entry.reason || null
+        }))
+      })
+    }
+
     const stopWithTimeout = async (peer, label) => {
       if (!peer) return
       try {

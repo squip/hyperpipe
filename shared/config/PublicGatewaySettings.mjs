@@ -6,7 +6,6 @@ const DEFAULT_SETTINGS = Object.freeze({
   selectedGatewayId: null,
   preferredBaseUrl: 'https://hypertuna.com',
   baseUrl: 'https://hypertuna.com',
-  sharedSecret: '',
   delegateReqToPeers: false,
   blindPeerEnabled: false,
   blindPeerKeys: [],
@@ -24,9 +23,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   dispatcherCircuitBreakerThreshold: 5,
   dispatcherCircuitBreakerTimeoutMs: 60_000,
   resolvedGatewayId: null,
-  resolvedSecretVersion: null,
   resolvedAt: null,
-  resolvedSharedSecretHash: null,
   resolvedDisplayName: null,
   resolvedRegion: null,
   resolvedWsUrl: null,
@@ -78,10 +75,6 @@ function normalizeSettings(raw = {}) {
   if (typeof raw.preferredBaseUrl === 'string') {
     const value = raw.preferredBaseUrl.trim();
     normalized.preferredBaseUrl = value || null;
-  }
-
-  if (typeof raw.sharedSecret === 'string') {
-    normalized.sharedSecret = raw.sharedSecret.trim();
   }
 
   if (typeof raw.delegateReqToPeers === 'boolean') {
@@ -189,21 +182,11 @@ function normalizeSettings(raw = {}) {
     normalized.resolvedGatewayId = value || null;
   }
 
-  if (typeof raw.resolvedSecretVersion === 'string') {
-    const value = raw.resolvedSecretVersion.trim();
-    normalized.resolvedSecretVersion = value || null;
-  }
-
   if (raw.resolvedAt != null) {
     const timestamp = Number(raw.resolvedAt);
     if (Number.isFinite(timestamp) && timestamp > 0) {
       normalized.resolvedAt = timestamp;
     }
-  }
-
-  if (typeof raw.resolvedSharedSecretHash === 'string') {
-    const value = raw.resolvedSharedSecretHash.trim();
-    normalized.resolvedSharedSecretHash = value || null;
   }
 
   if (typeof raw.resolvedDisplayName === 'string') {
@@ -285,14 +268,12 @@ function withDefaults(raw = {}) {
     merged.preferredBaseUrl = DEFAULT_SETTINGS.preferredBaseUrl;
   }
 
-  if (normalized.enabled === false && (!normalized.sharedSecret || normalized.sharedSecret.length === 0) && (normalized.selectionMode || 'default') !== 'manual') {
+  if (normalized.enabled === false && (normalized.selectionMode || 'default') !== 'manual') {
     merged.enabled = true;
   }
 
-  const hasLegacySecret = typeof normalized.sharedSecret === 'string' && normalized.sharedSecret.trim().length > 0;
-
   if (!merged.selectionMode || !VALID_SELECTION_MODES.has(merged.selectionMode)) {
-    if ((merged.baseUrl && merged.baseUrl !== DEFAULT_SETTINGS.baseUrl) || hasLegacySecret) {
+    if (merged.baseUrl && merged.baseUrl !== DEFAULT_SETTINGS.baseUrl) {
       merged.selectionMode = 'manual';
     } else {
       merged.selectionMode = 'default';
@@ -312,8 +293,6 @@ function withDefaults(raw = {}) {
 
   if (merged.selectionMode !== 'discovered') {
     merged.resolvedGatewayId = null;
-    merged.resolvedSecretVersion = null;
-    merged.resolvedSharedSecretHash = null;
     merged.resolvedDisplayName = null;
     merged.resolvedRegion = null;
     merged.resolvedWsUrl = null;
@@ -325,7 +304,6 @@ function withDefaults(raw = {}) {
   }
 
   if (!merged.baseUrl) merged.baseUrl = DEFAULT_SETTINGS.baseUrl;
-  if (!merged.sharedSecret) merged.sharedSecret = '';
   if (!Number.isFinite(merged.defaultTokenTtl) || merged.defaultTokenTtl <= 0) {
     merged.defaultTokenTtl = DEFAULT_SETTINGS.defaultTokenTtl;
   }

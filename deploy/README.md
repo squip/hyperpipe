@@ -15,7 +15,8 @@ This directory contains a turnkey docker-compose setup that launches the public 
    # edit .env and set:
    # GATEWAY_HOST=your.domain
    # LETSENCRYPT_EMAIL=admin@domain
-   # GATEWAY_REGISTRATION_SECRET=openssl rand -hex 32
+   # GATEWAY_AUTH_JWT_SECRET=openssl rand -hex 32
+   # GATEWAY_RELAY_TOKEN_JWT_SECRET=openssl rand -hex 32   # optional
    ```
 
 3. **Start the stack**
@@ -50,4 +51,4 @@ docker compose down
 Add `-v` to remove persisted volumes.
 
 ## Desktop Configuration
-In the desktop app, enable the Public Gateway bridge and set the base URL to `https://your.domain` with the same registration secret used above.
+In the desktop app, enable the Public Gateway bridge and set the base URL to `https://your.domain`.

@@ -118,7 +118,6 @@ async function loadWizardDefaults() {
     gatewayHost: runtimeEnv.GATEWAY_HOST,
     letsencryptEmail: runtimeEnv.LETSENCRYPT_EMAIL,
     gatewayPublicUrl: runtimeEnv.GATEWAY_PUBLIC_URL,
-    registrationSecret: runtimeEnv.GATEWAY_REGISTRATION_SECRET,
     operatorNsecHex: runtimeEnv.GATEWAY_OPERATOR_NSEC_HEX,
     operatorPubkeyHex: runtimeEnv.GATEWAY_OPERATOR_PUBKEY_HEX,
     relaySeedHex: runtimeEnv.GATEWAY_RELAY_SEED,
@@ -132,6 +131,7 @@ async function loadWizardDefaults() {
     discoveryRelays: parseCsvRaw(runtimeEnv.GATEWAY_DISCOVERY_RELAYS),
     inviteOnly: parseBooleanRaw(runtimeEnv.GATEWAY_INVITE_ONLY, stored.inviteOnly === true),
     authJwtSecret: runtimeEnv.GATEWAY_AUTH_JWT_SECRET,
+    relayTokenJwtSecret: runtimeEnv.GATEWAY_RELAY_TOKEN_JWT_SECRET,
     metricsEnabled: parseBooleanRaw(runtimeEnv.GATEWAY_METRICS_ENABLED, stored.metricsEnabled !== false),
     gatewayHostLogPath: runtimeEnv.GATEWAY_HOST_LOG_PATH
   });
@@ -263,11 +263,11 @@ async function showConfig() {
   const env = await readRuntimeEnv().catch(() => ({}));
   const redacted = {
     ...config,
-    registrationSecret: config.registrationSecret ? '<redacted>' : undefined,
     operatorNsecHex: config.operatorNsecHex ? '<redacted>' : undefined,
     relaySeedHex: config.relaySeedHex ? '<redacted>' : undefined,
     relayAdminSecretKeyHex: config.relayAdminSecretKeyHex ? '<redacted>' : undefined,
     authJwtSecret: config.authJwtSecret ? '<redacted>' : undefined,
+    relayTokenJwtSecret: config.relayTokenJwtSecret ? '<redacted>' : undefined,
     envPreview: {
       GATEWAY_PUBLIC_URL: env.GATEWAY_PUBLIC_URL,
       GATEWAY_POLICY: env.GATEWAY_POLICY,

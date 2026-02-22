@@ -123,7 +123,6 @@ async function createRunningGateway({
         authWindowSeconds: 300
       },
       registration: {
-        sharedSecret: 'integration-shared-secret',
         cacheTtlSeconds: 0,
         mirrorTtlSeconds: 0,
         openJoinPoolTtlSeconds: 0,
