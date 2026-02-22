@@ -1825,7 +1825,8 @@ function startJoinTelemetrySession({
   relayKey = null,
   gatewayOrigins = [],
   hasFastForward = false,
-  hasWriterMaterial = false
+  hasWriterMaterial = false,
+  isOpen = null
 } = {}) {
   const identifier = typeof publicIdentifier === 'string' ? publicIdentifier.trim() : ''
   if (!identifier) return null
@@ -1836,6 +1837,7 @@ function startJoinTelemetrySession({
     traceId: createJoinTraceId(),
     startedAt,
     gatewayOrigins: normalizeGatewayOriginList(gatewayOrigins),
+    isOpen: typeof isOpen === 'boolean' ? isOpen : null,
     writerMaterialApplied: false,
     fastForwardApplied: hasFastForward ? false : true,
     writableConfirmed: false,
@@ -1852,7 +1854,8 @@ function startJoinTelemetrySession({
     gatewayOrigins: session.gatewayOrigins,
     meta: {
       hasFastForward,
-      hasWriterMaterial
+      hasWriterMaterial,
+      isOpen: session.isOpen
     }
   })
 
@@ -2110,7 +2113,8 @@ function startAutoConnectTelemetrySession({
   publicIdentifier = null,
   gatewayOrigins = [],
   hasFastForward = false,
-  hasWriterMaterial = false
+  hasWriterMaterial = false,
+  isOpen = null
 } = {}) {
   const sessionKey = makeAutoConnectTelemetrySessionKey({ relayKey, publicIdentifier })
   if (!sessionKey) return null
@@ -2127,6 +2131,7 @@ function startAutoConnectTelemetrySession({
     traceId: createAutoConnectTraceId(),
     startedAt,
     gatewayOrigins: normalizeGatewayOriginList(gatewayOrigins),
+    isOpen: typeof isOpen === 'boolean' ? isOpen : null,
     hasFastForward: hasFastForward === true,
     hasWriterMaterial: hasWriterMaterial === true,
     writerMaterialApplied: false,
@@ -2150,7 +2155,8 @@ function startAutoConnectTelemetrySession({
     gatewayOrigins: session.gatewayOrigins,
     meta: {
       hasFastForward,
-      hasWriterMaterial
+      hasWriterMaterial,
+      isOpen: session.isOpen
     }
   })
 
@@ -2210,6 +2216,49 @@ function startAutoConnectTelemetrySession({
   return session
 }
 
+function shouldSkipOpenJoinAppendForSession(session) {
+  return session?.isOpen === false
+}
+
+function normalizeFanoutOpenJoinAppendResult(appendResult) {
+  if (!appendResult || typeof appendResult !== 'object') return appendResult
+  if (appendResult.status !== 'error') return appendResult
+  const reasonText = [appendResult.reason, appendResult.error]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .join(' ')
+  const authDenied = /\b(?:challenge|verify)\s+status\s+(?:401|403|404)\b/i.test(reasonText)
+    || /\b(?:status|http)\s+(?:401|403|404)\b/i.test(reasonText)
+    || /open-join-(?:challenge|verify|append)-failed/i.test(reasonText)
+  if (!authDenied) return appendResult
+  return {
+    ...appendResult,
+    status: 'skipped',
+    reason: 'open-join-auth-unavailable',
+    error: null
+  }
+}
+
+async function runOpenJoinAppendForFanout(session, {
+  relayKey = null,
+  publicIdentifier = null,
+  origins = null,
+  reason = 'join-fanout'
+} = {}) {
+  if (shouldSkipOpenJoinAppendForSession(session)) {
+    return {
+      status: 'skipped',
+      reason: 'closed-relay-no-open-join-append'
+    }
+  }
+  const appendResult = await appendOpenJoinMirrorCores({
+    relayKey,
+    publicIdentifier,
+    origins,
+    reason
+  })
+  return normalizeFanoutOpenJoinAppendResult(appendResult)
+}
+
 async function runAutoConnectMirrorFanout(session, {
   relayKey = null,
   publicIdentifier = null,
@@ -2241,7 +2290,7 @@ async function runAutoConnectMirrorFanout(session, {
           relayManager: targetRelayKey ? activeRelays.get(targetRelayKey) : null,
           reason: 'autoconnect-fanout'
         })
-        const appendResult = await appendOpenJoinMirrorCores({
+        const appendResult = await runOpenJoinAppendForFanout(session, {
           relayKey: targetRelayKey || targetIdentifier,
           publicIdentifier: targetIdentifier,
           origins: [origin],
@@ -2335,7 +2384,7 @@ async function runJoinMirrorFanout(session, { relayKey = null, publicIdentifier 
           relayManager: targetRelayKey ? activeRelays.get(targetRelayKey) : null,
           reason: 'join-fanout'
         })
-        const appendResult = await appendOpenJoinMirrorCores({
+        const appendResult = await runOpenJoinAppendForFanout(session, {
           relayKey: targetRelayKey || targetIdentifier,
           publicIdentifier: targetIdentifier,
           origins: [origin],
@@ -7851,7 +7900,8 @@ async function handleMessageObject(message) {
             relayKey: joinRelayKey,
             gatewayOrigins: rankedGatewayOrigins,
             hasFastForward: !!fastForward,
-            hasWriterMaterial: !!(writerSecret && (writerCore || writerCoreHex || autobaseLocal))
+            hasWriterMaterial: !!(writerSecret && (writerCore || writerCoreHex || autobaseLocal)),
+            isOpen
           })
 
           const relayIdentifierForProbe = joinRelayKey || publicIdentifier

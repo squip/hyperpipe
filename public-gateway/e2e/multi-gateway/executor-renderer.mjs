@@ -1118,6 +1118,13 @@ function summarizeCandidateErrors(errors = [], limit = 3) {
     .join('|')
 }
 
+function isAggregatePublishErrorMessage(message) {
+  const normalized = String(message || '').toLowerCase()
+  if (!normalized) return false
+  return normalized.includes('aggregateerror')
+    || normalized.includes('all promises were rejected')
+}
+
 function dedupeRelayCandidates(candidates = []) {
   const seen = new Set()
   const deduped = []
@@ -1158,12 +1165,39 @@ async function requestProvision(hostPeer, data) {
   return response.data || null
 }
 
+function classifyCleanupSkipReason(value) {
+  const message = String(value || '').trim().toLowerCase()
+  if (!message) return null
+  if (message.includes('page-not-ready') || message.includes('electron-app-not-ready')) {
+    return 'peer-not-running'
+  }
+  if (message.includes('target page, context or browser has been closed')) {
+    return 'renderer-closed'
+  }
+  if (message.includes('execution context was destroyed')) {
+    return 'renderer-context-destroyed'
+  }
+  if (message.includes('bridge-method-unavailable') || message.includes('bridge-sendworkerawait-unavailable')) {
+    return 'bridge-unavailable'
+  }
+  if (message.includes('leave-group-cleanup') && message.includes('-timeout')) {
+    return 'cleanup-timeout-after-shutdown'
+  }
+  if (message.includes('worker reply timeout')) {
+    return 'worker-reply-timeout-after-shutdown'
+  }
+  return null
+}
+
 async function leaveGroupForCleanup(peer, { relayKey = null, publicIdentifier = null } = {}) {
   if (!peer) {
     return { peer: null, status: 'skipped', reason: 'peer-unavailable' }
   }
   if (!relayKey && !publicIdentifier) {
     return { peer: peer.name, status: 'skipped', reason: 'missing-relay-identifiers' }
+  }
+  if (!peer.app || !peer.page) {
+    return { peer: peer.name, status: 'skipped', reason: 'peer-not-running' }
   }
 
   try {
@@ -1182,6 +1216,10 @@ async function leaveGroupForCleanup(peer, { relayKey = null, publicIdentifier = 
       `leave-group-cleanup:${peer.name || 'peer'}`
     )
     if (!response?.success) {
+      const skipReason = classifyCleanupSkipReason(response?.error)
+      if (skipReason) {
+        return { peer: peer.name, status: 'skipped', reason: skipReason }
+      }
       return {
         peer: peer.name,
         status: 'error',
@@ -1190,6 +1228,14 @@ async function leaveGroupForCleanup(peer, { relayKey = null, publicIdentifier = 
     }
     return { peer: peer.name, status: 'ok' }
   } catch (error) {
+    const skipReason = classifyCleanupSkipReason(error?.message || error)
+    if (skipReason) {
+      return {
+        peer: peer.name,
+        status: 'skipped',
+        reason: skipReason
+      }
+    }
     return {
       peer: peer.name,
       status: 'error',
@@ -1549,12 +1595,24 @@ async function runScenario() {
       contentPreview: publishContent.slice(0, 48)
     })
     const publishErrors = []
+    const blockedPublishBases = new Set()
     let publishedNote = null
     let publishWinner = null
     for (let index = 0; index < publishCandidates.length; index += 1) {
       const candidate = publishCandidates[index]
       const relayUrlCandidate = candidate?.relayUrl
       if (!relayUrlCandidate) continue
+      const candidateBaseRelay = relayUrlBaseKey(relayUrlCandidate) || relayUrlCandidate
+      if (candidateBaseRelay && blockedPublishBases.has(candidateBaseRelay)) {
+        logScenarioStage('publish-attempt-skipped', {
+          attempt: `${index + 1}.0`,
+          stage: 'publish',
+          relayUrl: relayUrlCandidate,
+          source: candidate?.source || null,
+          reason: 'candidate-base-blacklisted'
+        })
+        continue
+      }
       const maxAttemptsPerCandidate = index === 0 ? 3 : 1
       for (let retry = 0; retry < maxAttemptsPerCandidate; retry += 1) {
         const attemptNumber = `${index + 1}.${retry + 1}`
@@ -1586,6 +1644,18 @@ async function runScenario() {
             source: candidate?.source || null,
             error: message
           })
+          const blacklistCandidate = isAggregatePublishErrorMessage(message)
+          if (blacklistCandidate && candidateBaseRelay) {
+            blockedPublishBases.add(candidateBaseRelay)
+            logScenarioStage('publish-attempt-blacklisted', {
+              attempt: attemptNumber,
+              stage: 'publish',
+              relayUrl: relayUrlCandidate,
+              source: candidate?.source || null,
+              reason: 'aggregate-error'
+            })
+            break
+          }
           if (retry + 1 < maxAttemptsPerCandidate) {
             const backoffMs = (retry + 1) * 2000
             logScenarioStage('publish-attempt-retry', {
@@ -1655,9 +1725,23 @@ async function runScenario() {
       const candidate = fetchCandidates[index]
       const relayUrlCandidate = candidate?.relayUrl
       if (!relayUrlCandidate) continue
+      const candidateBaseRelay = relayUrlBaseKey(relayUrlCandidate) || relayUrlCandidate
+      if (
+        candidateBaseRelay
+        && blockedPublishBases.has(candidateBaseRelay)
+        && candidateBaseRelay !== publishWinnerBaseRelay
+      ) {
+        logScenarioStage('publish-attempt-skipped', {
+          attempt: index + 1,
+          stage: 'fetch',
+          relayUrl: relayUrlCandidate,
+          source: candidate?.source || null,
+          reason: 'candidate-base-blacklisted'
+        })
+        continue
+      }
       try {
         const candidateHasToken = relayUrlHasToken(relayUrlCandidate)
-        const candidateBaseRelay = relayUrlBaseKey(relayUrlCandidate)
         const sameBaseRelay = publishWinnerBaseRelay && candidateBaseRelay === publishWinnerBaseRelay
         let fetchTimeoutMs = 20_000
         if (index === 0) {
@@ -1716,6 +1800,22 @@ async function runScenario() {
     for (let index = 0; index < visibleCandidates.length; index += 1) {
       const candidate = visibleCandidates[index]
       const relayUrlCandidate = candidate?.relayUrl
+      const candidateBaseRelay = relayUrlBaseKey(relayUrlCandidate) || relayUrlCandidate
+      if (
+        relayUrlCandidate
+        && candidateBaseRelay
+        && blockedPublishBases.has(candidateBaseRelay)
+        && candidateBaseRelay !== publishWinnerBaseRelay
+      ) {
+        logScenarioStage('publish-attempt-skipped', {
+          attempt: index + 1,
+          stage: 'visible',
+          relayUrl: relayUrlCandidate,
+          source: candidate?.source || null,
+          reason: 'candidate-base-blacklisted'
+        })
+        continue
+      }
       try {
         await joinerPeer.callBridge('openGroupPage', relayUrlCandidate
           ? { groupId: publicIdentifier, relayUrl: relayUrlCandidate }
