@@ -29,6 +29,17 @@ function avatarFallbackText(entry: TGatewayDirectoryEntry): string {
   return shortPubkey(entry.operatorPubkey, 2).replace('…', '').toUpperCase() || 'GW'
 }
 
+function gatewayDomain(origin: string): string {
+  const normalized = String(origin || '').trim()
+  if (!normalized) return '-'
+  try {
+    const parsed = new URL(normalized)
+    return parsed.host || normalized
+  } catch (_err) {
+    return normalized
+  }
+}
+
 export default function GatewaySelector({
   value,
   onChange,
@@ -77,10 +88,10 @@ export default function GatewaySelector({
   }, [directory, maxResults, query])
 
   const reachabilityStatusLabel = (status: TGatewayReachabilityStatus) => {
-    if (status === 'online') return 'online'
-    if (status === 'offline') return 'offline'
-    if (status === 'checking') return 'checking'
-    return 'unknown'
+    if (status === 'online') return 'Online'
+    if (status === 'checking') return 'Checking'
+    if (status === 'unknown') return 'Unknown'
+    return 'Offline'
   }
 
   const reachabilityStatusDotClass = (status: TGatewayReachabilityStatus) => {
@@ -126,7 +137,9 @@ export default function GatewaySelector({
               <button
                 key={entry.origin}
                 type="button"
-                className="flex w-full items-center justify-between gap-2 rounded-md border px-2 py-2 text-left hover:bg-accent"
+                className={`flex w-full items-center justify-between gap-2 rounded-md border px-2 py-2 text-left transition-colors hover:bg-accent ${
+                  selected ? 'border-primary/70 bg-accent/60 ring-1 ring-primary/25' : ''
+                }`}
                 onClick={() => {
                   if (selected) {
                     removeGateway(entry.origin)
@@ -143,27 +156,26 @@ export default function GatewaySelector({
                   <div className="min-w-0">
                     <div className="truncate text-xs font-medium">
                       {entry.operatorName || shortPubkey(entry.operatorPubkey)}
-                      {entry.followedOperator ? ` • ${t('followed')}` : ''}
                     </div>
                     <div className="truncate text-[11px] text-muted-foreground">
-                      {entry.operatorNip05 || shortPubkey(entry.operatorPubkey, 12)}
+                      {gatewayDomain(entry.origin)} •{' '}
+                      <span className="inline-flex items-center gap-1">
+                        <span
+                          className={`inline-block h-2 w-2 rounded-full ${reachabilityStatusDotClass(
+                            reachabilityStatus
+                          )}`}
+                          aria-hidden="true"
+                        />
+                        <span>{reachabilityStatusLabel(reachabilityStatus)}</span>
+                      </span>
                     </div>
-                    <div className="truncate text-[11px] text-muted-foreground">{entry.origin}</div>
                   </div>
                 </div>
                 <div className="shrink-0 text-right text-[11px] text-muted-foreground">
-                  <div className="flex items-center justify-end gap-1">
-                    <span
-                      className={`inline-block h-2 w-2 rounded-full ${reachabilityStatusDotClass(
-                        reachabilityStatus
-                      )}`}
-                      aria-hidden="true"
-                    />
-                    <span>{reachabilityStatusLabel(reachabilityStatus)}</span>
+                  <div className="uppercase">{entry.policy}</div>
+                  <div>
+                    used by: {entry.popularityCount} {entry.popularityCount === 1 ? 'group' : 'groups'}
                   </div>
-                  <div>{entry.policy}</div>
-                  <div>{t('used')}: {entry.popularityCount}</div>
-                  <div>{selected ? '[x]' : '[ ]'}</div>
                 </div>
               </button>
             )
