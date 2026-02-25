@@ -80,8 +80,29 @@ export type GatewayStatus = {
 
 export type PublicGatewayStatus = {
   enabled?: boolean
+  selectionMode?: 'default' | 'discovered' | 'manual' | string
+  selectedGatewayId?: string | null
+  preferredBaseUrl?: string | null
   baseUrl?: string
   wsBase?: string
+  resolvedGatewayId?: string | null
+  resolvedDisplayName?: string | null
+  resolvedRegion?: string | null
+  discoveryUnavailableReason?: string | null
+  discoveryWarning?: string | null
+  disabledReason?: string | null
+  discoveredGateways?: Array<{
+    gatewayId?: string | null
+    publicUrl?: string | null
+    wsUrl?: string | null
+    authMode?: string | null
+    displayName?: string | null
+    region?: string | null
+    lastSeenAt?: number | null
+    expiresAt?: number | null
+    ttl?: number | null
+    isExpired?: boolean
+  }>
   defaultTokenTtl?: number
   lastUpdatedAt?: number
   relays?: Record<

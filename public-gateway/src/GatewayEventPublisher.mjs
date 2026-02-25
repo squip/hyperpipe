@@ -13,10 +13,11 @@ function encryptBanListStub(banList = []) {
 }
 
 class GatewayEventPublisher {
-  constructor({ logger = console, gatewayOrigin, policyService } = {}) {
+  constructor({ logger = console, gatewayOrigin, policyService, eventRelayPublisher = null } = {}) {
     this.logger = logger;
     this.gatewayOrigin = gatewayOrigin || null;
     this.policyService = policyService || null;
+    this.eventRelayPublisher = typeof eventRelayPublisher === 'function' ? eventRelayPublisher : null;
     this.latestMetadataEvent = null;
   }
 
@@ -62,6 +63,13 @@ class GatewayEventPublisher {
         ? Math.max(event.tags.find((tag) => tag[0] === 'allow-list').length - 1, 0)
         : 0
     });
+    if (this.eventRelayPublisher) {
+      Promise.resolve(this.eventRelayPublisher(event, { type: 'gateway-metadata', reason })).catch((error) => {
+        this.logger?.warn?.('[GatewayEvents] Failed to publish metadata event to discovery relays', {
+          error: error?.message || error
+        });
+      });
+    }
     return event;
   }
 
@@ -90,6 +98,13 @@ class GatewayEventPublisher {
       gatewayOrigin: this.gatewayOrigin,
       inviteePubkey: input.inviteePubkey ? String(input.inviteePubkey).slice(0, 12) : null
     });
+    if (this.eventRelayPublisher) {
+      Promise.resolve(this.eventRelayPublisher(event, { type: 'gateway-invite' })).catch((error) => {
+        this.logger?.warn?.('[GatewayEvents] Failed to publish invite event to discovery relays', {
+          error: error?.message || error
+        });
+      });
+    }
     return event;
   }
 }

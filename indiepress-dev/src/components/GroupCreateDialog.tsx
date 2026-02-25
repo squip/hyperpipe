@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -22,7 +22,14 @@ export default function GroupCreateDialog({
   onOpenChange: (open: boolean) => void
 }) {
   const { t } = useTranslation()
-  const { createHypertunaRelayGroup, gatewayMetadata, gatewayDirectory } = useGroups()
+  const {
+    createHypertunaRelayGroup,
+    gatewayMetadata,
+    gatewayDirectory,
+    gatewayReachabilityByOrigin,
+    refreshGatewayDirectory,
+    refreshGatewayReachability
+  } = useGroups()
   const { pubkey } = useNostr()
   const [name, setName] = useState('')
   const [about, setAbout] = useState('')
@@ -33,6 +40,12 @@ export default function GroupCreateDialog({
     { origin: string; operatorPubkey: string; policy: 'OPEN' | 'CLOSED' }[]
   >([])
   const [isSaving, setIsSaving] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    void refreshGatewayDirectory()
+    void refreshGatewayReachability()
+  }, [open, refreshGatewayDirectory, refreshGatewayReachability])
 
   const gatewayMetadataByOrigin = useMemo(() => {
     const map = new Map<string, { policy: 'OPEN' | 'CLOSED'; allowList: Set<string> }>()
@@ -195,6 +208,7 @@ export default function GroupCreateDialog({
               value={selectedGateways}
               onChange={setSelectedGateways}
               directory={gatewayDirectory}
+              reachabilityByOrigin={gatewayReachabilityByOrigin}
             />
             {gatewayMetadata.length > 0 ? (
               <div className="text-xs text-muted-foreground">

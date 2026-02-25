@@ -34,6 +34,7 @@ import {
   TGatewayInvite,
   TGatewayJoinRequest,
   TGatewayMetadata,
+  TGatewayReachabilityEntry,
   TGroupInvite,
   TGroupListEntry,
   TGroupMembershipStatus,
@@ -76,6 +77,10 @@ const GROUP_MEMBER_PREVIEW_TTL_MS = 2 * 60 * 1000
 const LEAVE_PUBLISH_RETRY_BASE_DELAY_MS = 5000
 const LEAVE_PUBLISH_RETRY_MAX_DELAY_MS = 60 * 60 * 1000
 const GROUP_GATEWAY_SYNC_THROTTLE_MS = 1500
+const GATEWAY_POLICY_CACHE_TTL_MS = 5 * 60 * 1000
+const GATEWAY_POLICY_FETCH_TIMEOUT_MS = 5000
+const GATEWAY_REACHABILITY_TTL_MS = 30 * 1000
+const GATEWAY_REACHABILITY_TIMEOUT_MS = 3500
 
 type GroupMemberPreviewEntry = {
   members: string[]
@@ -92,6 +97,15 @@ type GroupMemberPreviewEntry = {
 type ProvisionalGroupMetadataEntry = {
   metadata: TGroupMetadata
   source: 'invite' | 'create' | 'update'
+  updatedAt: number
+}
+
+type GatewayPolicySnapshot = {
+  origin: string
+  operatorPubkey: string
+  policy: 'OPEN' | 'CLOSED'
+  allowList: string[]
+  discoveryRelays: string[]
   updatedAt: number
 }
 
@@ -131,6 +145,7 @@ type TGroupsContext = {
   invites: TGroupInvite[]
   gatewayMetadata: TGatewayMetadata[]
   gatewayDirectory: TGatewayDirectoryEntry[]
+  gatewayReachabilityByOrigin: Record<string, TGatewayReachabilityEntry>
   gatewayInvites: TGatewayInvite[]
   gatewayJoinRequests: TGatewayJoinRequest[]
   pendingInviteCount: number
@@ -143,6 +158,7 @@ type TGroupsContext = {
   joinRequestsError: string | null
   refreshDiscovery: () => Promise<void>
   refreshGatewayDirectory: () => Promise<void>
+  refreshGatewayReachability: (origins?: string[]) => Promise<void>
   refreshInvites: () => Promise<void>
   dismissInvite: (inviteId: string) => void
   markInviteAccepted: (inviteId: string, groupId?: string) => void
@@ -276,6 +292,7 @@ export const useGroups = () => {
       invites: [],
       gatewayMetadata: [],
       gatewayDirectory: [],
+      gatewayReachabilityByOrigin: {},
       gatewayInvites: [],
       gatewayJoinRequests: [],
       pendingInviteCount: 0,
@@ -288,6 +305,7 @@ export const useGroups = () => {
       joinRequestsError: null,
       refreshDiscovery: async () => {},
       refreshGatewayDirectory: async () => {},
+      refreshGatewayReachability: async () => {},
       refreshInvites: async () => {},
       dismissInvite: () => {},
       markInviteAccepted: () => {},
@@ -491,6 +509,32 @@ const normalizeGatewayOriginsFromDescriptors = (
         .filter(Boolean)
     )
   )
+
+const normalizeGatewayOrigin = (value?: string | null): string | null => {
+  if (!value) return null
+  try {
+    const parsed = new URL(String(value).trim())
+    if (parsed.protocol === 'wss:') parsed.protocol = 'https:'
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:'
+    if (parsed.protocol === 'http:') parsed.protocol = 'https:'
+    if (parsed.protocol !== 'https:') return null
+    return parsed.origin
+  } catch (_err) {
+    return null
+  }
+}
+
+const normalizeGatewayPubkeyHex = (value?: string | null): string | null => {
+  if (!value) return null
+  const normalized = String(value).trim().toLowerCase()
+  if (!/^[a-f0-9]{64}$/i.test(normalized)) return null
+  return normalized
+}
+
+const normalizeGatewayPolicy = (value?: string | null): 'OPEN' | 'CLOSED' => {
+  const upper = typeof value === 'string' ? value.trim().toUpperCase() : ''
+  return upper === 'CLOSED' ? 'CLOSED' : 'OPEN'
+}
 
 const isLikelyRelayUrl = (value: unknown): value is string =>
   typeof value === 'string' && /^(wss?|https?):\/\//i.test(value.trim())
@@ -710,11 +754,22 @@ const mergeMembershipEvents = <T extends { id?: string | null }>(primary: T[], s
 
 export function GroupsProvider({ children }: { children: ReactNode }) {
   const { pubkey, publish, relayList, nip04Decrypt, nip04Encrypt, followList } = useNostr()
-  const { relays: workerRelays, gatewayStatus, joinFlows, createRelay, sendToWorker } = useWorkerBridge()
+  const {
+    relays: workerRelays,
+    gatewayStatus,
+    publicGatewayStatus,
+    joinFlows,
+    createRelay,
+    sendToWorker
+  } = useWorkerBridge()
   const [discoveryGroups, setDiscoveryGroups] = useState<TGroupMetadata[]>([])
   const [invites, setInvites] = useState<TGroupInvite[]>([])
   const [gatewayMetadata, setGatewayMetadata] = useState<TGatewayMetadata[]>([])
+  const [gatewayPolicyByOrigin, setGatewayPolicyByOrigin] = useState<Record<string, GatewayPolicySnapshot>>({})
   const [gatewayDirectory, setGatewayDirectory] = useState<TGatewayDirectoryEntry[]>([])
+  const [gatewayReachabilityByOrigin, setGatewayReachabilityByOrigin] = useState<
+    Record<string, TGatewayReachabilityEntry>
+  >({})
   const [gatewayInvites, setGatewayInvites] = useState<TGatewayInvite[]>([])
   const [gatewayJoinRequests, setGatewayJoinRequests] = useState<TGatewayJoinRequest[]>([])
   const [joinRequests, setJoinRequests] = useState<Record<string, TJoinRequest[]>>({})
@@ -771,6 +826,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const groupMemberPreviewByKeyRef = useRef<Record<string, GroupMemberPreviewEntry>>({})
   const groupMemberPreviewInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map())
   const inviteRefreshInFlightRef = useRef(false)
+  const gatewayPolicyByOriginRef = useRef<Record<string, GatewayPolicySnapshot>>({})
+  const gatewayPolicyRefreshInFlightRef = useRef(false)
+  const gatewayReachabilityByOriginRef = useRef<Record<string, TGatewayReachabilityEntry>>({})
+  const gatewayReachabilityRefreshInFlightRef = useRef(false)
   const groupGatewaySyncSenderRef = useRef(sendToWorker)
   const groupGatewaySyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const groupGatewaySyncPendingRef = useRef<
@@ -787,6 +846,14 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   >(null)
   const groupGatewaySyncLastSignatureRef = useRef<string | null>(null)
   const groupGatewaySyncLastSentAtRef = useRef(0)
+
+  useEffect(() => {
+    gatewayPolicyByOriginRef.current = gatewayPolicyByOrigin
+  }, [gatewayPolicyByOrigin])
+
+  useEffect(() => {
+    gatewayReachabilityByOriginRef.current = gatewayReachabilityByOrigin
+  }, [gatewayReachabilityByOrigin])
 
   const workerRelayUrlMap = useMemo(() => {
     const map = new Map<string, string>()
@@ -1285,6 +1352,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     groupMemberPreviewByKeyRef.current = {}
     groupMemberPreviewInFlightRef.current.clear()
     setProvisionalGroupMetadataByKey({})
+    setGatewayPolicyByOrigin({})
+    setGatewayReachabilityByOrigin({})
   }, [pubkey])
 
   useEffect(() => {
@@ -1384,6 +1453,131 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     }
   }, [discoveryRelays])
 
+  const collectGatewayCandidateOrigins = useCallback(() => {
+    const origins = new Set<string>()
+    origins.add(DEFAULT_PUBLIC_GATEWAY_BASE)
+    gatewayMetadata.forEach((entry) => {
+      const normalized = normalizeGatewayOrigin(entry?.origin || null)
+      if (normalized) origins.add(normalized)
+    })
+    discoveryGroups.forEach((group) => {
+      ;(Array.isArray(group?.gateways) ? group.gateways : []).forEach((gateway) => {
+        const normalized = normalizeGatewayOrigin(gateway?.origin || null)
+        if (normalized) origins.add(normalized)
+      })
+    })
+    const discoveredGateways = Array.isArray(publicGatewayStatus?.discoveredGateways)
+      ? publicGatewayStatus.discoveredGateways
+      : []
+    discoveredGateways.forEach((entry) => {
+      const normalized = normalizeGatewayOrigin(entry?.publicUrl || null)
+      if (normalized) origins.add(normalized)
+    })
+    const selectedOrResolved = [
+      publicGatewayStatus?.baseUrl,
+      publicGatewayStatus?.preferredBaseUrl
+    ]
+    selectedOrResolved.forEach((candidate) => {
+      const normalized = normalizeGatewayOrigin(candidate || null)
+      if (normalized) origins.add(normalized)
+    })
+    Object.keys(gatewayPolicyByOriginRef.current).forEach((origin) => {
+      const normalized = normalizeGatewayOrigin(origin)
+      if (normalized) origins.add(normalized)
+    })
+    return Array.from(origins)
+  }, [discoveryGroups, gatewayMetadata, publicGatewayStatus])
+
+  const refreshGatewayPolicyDirectorySources = useCallback(async () => {
+    if (typeof window === 'undefined') return
+    if (gatewayPolicyRefreshInFlightRef.current) return
+    gatewayPolicyRefreshInFlightRef.current = true
+    try {
+      const origins = collectGatewayCandidateOrigins()
+      if (!origins.length) return
+
+      const now = Date.now()
+      const existingFromMetadata = new Set(
+        gatewayMetadata
+          .map((entry) => normalizeGatewayOrigin(entry?.origin || null))
+          .filter((entry): entry is string => !!entry)
+      )
+      const cached = gatewayPolicyByOriginRef.current
+
+      const targets = origins.filter((origin) => {
+        const snapshot = cached[origin]
+        if (snapshot && now - snapshot.updatedAt < GATEWAY_POLICY_CACHE_TTL_MS) {
+          return false
+        }
+        if (existingFromMetadata.has(origin) && snapshot && now - snapshot.updatedAt < GATEWAY_POLICY_CACHE_TTL_MS) {
+          return false
+        }
+        return true
+      })
+      if (!targets.length) return
+
+      const fetched = await Promise.allSettled(
+        targets.slice(0, 40).map(async (origin) => {
+          const controller = new AbortController()
+          const timeoutId = window.setTimeout(() => controller.abort(), GATEWAY_POLICY_FETCH_TIMEOUT_MS)
+          try {
+            const response = await fetch(`${origin}/api/gateway/policy`, {
+              method: 'GET',
+              headers: { Accept: 'application/json' },
+              cache: 'no-store',
+              signal: controller.signal
+            })
+            if (!response.ok) return null
+            const payload = await response.json().catch(() => null)
+            const operatorPubkey = normalizeGatewayPubkeyHex(payload?.operatorPubkey || null)
+            if (!operatorPubkey) return null
+            const allowList = Array.from(
+              new Set(
+                (Array.isArray(payload?.allowList) ? payload.allowList : [])
+                  .map((value: unknown) => normalizeGatewayPubkeyHex(String(value || '')))
+                  .filter((value: string | null): value is string => !!value)
+              )
+            )
+            const discoveryRelays = Array.from(
+              new Set(
+                (Array.isArray(payload?.discoveryRelays) ? payload.discoveryRelays : [])
+                  .map((value: unknown) => String(value || '').trim())
+                  .filter(Boolean)
+              )
+            )
+            return {
+              origin,
+              operatorPubkey,
+              policy: normalizeGatewayPolicy(payload?.policy),
+              allowList,
+              discoveryRelays,
+              updatedAt: Date.now()
+            } as GatewayPolicySnapshot
+          } catch (_error) {
+            return null
+          } finally {
+            window.clearTimeout(timeoutId)
+          }
+        })
+      )
+
+      const valid = fetched
+        .map((entry) => (entry.status === 'fulfilled' ? entry.value : null))
+        .filter((entry): entry is GatewayPolicySnapshot => !!entry)
+      if (!valid.length) return
+
+      setGatewayPolicyByOrigin((prev) => {
+        const next = { ...prev }
+        valid.forEach((entry) => {
+          next[entry.origin] = entry
+        })
+        return next
+      })
+    } finally {
+      gatewayPolicyRefreshInFlightRef.current = false
+    }
+  }, [collectGatewayCandidateOrigins, gatewayMetadata])
+
   const refreshGatewayDirectory = useCallback(async () => {
     const operatorPubkeys = new Set<string>()
     gatewayMetadata.forEach((entry) => {
@@ -1395,6 +1589,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         const normalized = String(gateway?.operatorPubkey || '').trim().toLowerCase()
         if (/^[a-f0-9]{64}$/i.test(normalized)) operatorPubkeys.add(normalized)
       })
+    })
+    Object.values(gatewayPolicyByOrigin).forEach((entry) => {
+      const normalized = normalizeGatewayPubkeyHex(entry?.operatorPubkey || null)
+      if (normalized) operatorPubkeys.add(normalized)
     })
 
     const nextProfiles = { ...gatewayOperatorProfilesRef.current }
@@ -1437,16 +1635,188 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       .map((entry) => String(entry || '').trim().toLowerCase())
       .filter(Boolean)
 
-    setGatewayDirectory(
-      buildGatewayDirectory({
-        discoveryGroups,
-        gatewayMetadata,
-        currentPubkey: pubkey || undefined,
-        followedPubkeys,
-        operatorProfiles: gatewayOperatorProfilesRef.current
+    const fromDiscovery = buildGatewayDirectory({
+      discoveryGroups,
+      gatewayMetadata,
+      currentPubkey: pubkey || undefined,
+      followedPubkeys,
+      operatorProfiles: gatewayOperatorProfilesRef.current
+    })
+
+    const popularityByOrigin = new Map<string, number>()
+    discoveryGroups.forEach((group) => {
+      ;(Array.isArray(group?.gateways) ? group.gateways : []).forEach((gateway) => {
+        const normalizedOrigin = normalizeGatewayOrigin(gateway?.origin || null)
+        if (!normalizedOrigin) return
+        popularityByOrigin.set(normalizedOrigin, Number(popularityByOrigin.get(normalizedOrigin) || 0) + 1)
       })
+    })
+
+    const normalizedCurrentPubkey = normalizeGatewayPubkeyHex(pubkey || null)
+    const followedSet = new Set(
+      followedPubkeys
+        .map((entry) => normalizeGatewayPubkeyHex(entry))
+        .filter((entry): entry is string => !!entry)
     )
-  }, [discoveryGroups, followList, gatewayMetadata, pubkey])
+    const directoryByOrigin = new Map<string, TGatewayDirectoryEntry>()
+    fromDiscovery.forEach((entry) => directoryByOrigin.set(entry.origin, entry))
+
+    Object.values(gatewayPolicyByOrigin).forEach((entry) => {
+      const origin = normalizeGatewayOrigin(entry?.origin || null)
+      if (!origin || directoryByOrigin.has(origin)) return
+      const operatorPubkey = normalizeGatewayPubkeyHex(entry?.operatorPubkey || null)
+      if (!operatorPubkey) return
+      const policy = normalizeGatewayPolicy(entry?.policy)
+      const allowList = new Set(
+        (Array.isArray(entry?.allowList) ? entry.allowList : [])
+          .map((value) => normalizeGatewayPubkeyHex(value))
+          .filter((value): value is string => !!value)
+      )
+      const allowListed = policy === 'OPEN'
+        ? true
+        : !!normalizedCurrentPubkey && allowList.has(normalizedCurrentPubkey)
+      if (policy === 'CLOSED' && !allowListed) return
+      const profile = gatewayOperatorProfilesRef.current[operatorPubkey]
+      directoryByOrigin.set(origin, {
+        origin,
+        operatorPubkey,
+        policy,
+        allowListed,
+        popularityCount: Number(popularityByOrigin.get(origin) || 0),
+        followedOperator: followedSet.has(operatorPubkey),
+        operatorName: profile?.name || null,
+        operatorNip05: profile?.nip05 || null,
+        operatorPicture: profile?.picture || null
+      })
+    })
+
+    const merged = Array.from(directoryByOrigin.values()).sort((left, right) => {
+      if (left.followedOperator !== right.followedOperator) {
+        return left.followedOperator ? -1 : 1
+      }
+      if (left.popularityCount !== right.popularityCount) {
+        return right.popularityCount - left.popularityCount
+      }
+      if (left.policy !== right.policy) {
+        return left.policy === 'OPEN' ? -1 : 1
+      }
+      return left.origin.localeCompare(right.origin)
+    })
+
+    setGatewayDirectory(merged)
+  }, [discoveryGroups, followList, gatewayMetadata, gatewayPolicyByOrigin, pubkey])
+
+  const refreshGatewayReachability = useCallback(async (origins?: string[]) => {
+    if (typeof window === 'undefined') return
+    if (gatewayReachabilityRefreshInFlightRef.current) return
+    gatewayReachabilityRefreshInFlightRef.current = true
+    try {
+      const candidates = new Set<string>()
+      ;(Array.isArray(origins) ? origins : []).forEach((entry) => {
+        const normalized = normalizeGatewayOrigin(entry)
+        if (normalized) candidates.add(normalized)
+      })
+      gatewayDirectory.forEach((entry) => {
+        const normalized = normalizeGatewayOrigin(entry?.origin || null)
+        if (normalized) candidates.add(normalized)
+      })
+      collectGatewayCandidateOrigins().forEach((origin) => candidates.add(origin))
+
+      const allOrigins = Array.from(candidates)
+      if (!allOrigins.length) return
+
+      const now = Date.now()
+      const current = gatewayReachabilityByOriginRef.current
+      const toProbe = allOrigins.filter((origin) => {
+        const existing = current[origin]
+        if (!existing?.checkedAt) return true
+        return now - existing.checkedAt > GATEWAY_REACHABILITY_TTL_MS
+      })
+      if (!toProbe.length) return
+
+      setGatewayReachabilityByOrigin((prev) => {
+        const next = { ...prev }
+        toProbe.forEach((origin) => {
+          next[origin] = {
+            ...(next[origin] || {}),
+            status: 'checking'
+          }
+        })
+        return next
+      })
+
+      const probe = async (origin: string): Promise<[string, TGatewayReachabilityEntry]> => {
+        const withTimeout = async (requestInit?: RequestInit) => {
+          const controller = new AbortController()
+          const timeoutId = window.setTimeout(() => controller.abort(), GATEWAY_REACHABILITY_TIMEOUT_MS)
+          try {
+            return await fetch(`${origin}/health`, {
+              method: 'GET',
+              cache: 'no-store',
+              signal: controller.signal,
+              ...requestInit
+            })
+          } finally {
+            window.clearTimeout(timeoutId)
+          }
+        }
+
+        const startedAt = Date.now()
+        try {
+          const response = await withTimeout()
+          const latencyMs = Date.now() - startedAt
+          return [
+            origin,
+            {
+              status: 'online',
+              checkedAt: Date.now(),
+              latencyMs,
+              error: response.ok ? null : `http-${response.status}`
+            }
+          ]
+        } catch (firstError) {
+          try {
+            await withTimeout({ mode: 'no-cors' })
+            return [
+              origin,
+              {
+                status: 'online',
+                checkedAt: Date.now(),
+                latencyMs: Date.now() - startedAt,
+                error: 'opaque-response'
+              }
+            ]
+          } catch (secondError) {
+            const errorMessage = String(
+              (secondError as Error)?.message || (firstError as Error)?.message || 'request-failed'
+            )
+            return [
+              origin,
+              {
+                status: 'offline',
+                checkedAt: Date.now(),
+                latencyMs: null,
+                error: errorMessage
+              }
+            ]
+          }
+        }
+      }
+
+      const results = await Promise.allSettled(toProbe.map((origin) => probe(origin)))
+      setGatewayReachabilityByOrigin((prev) => {
+        const next = { ...prev }
+        results.forEach((result) => {
+          if (result.status !== 'fulfilled') return
+          const [origin, entry] = result.value
+          next[origin] = entry
+        })
+        return next
+      })
+    } finally {
+      gatewayReachabilityRefreshInFlightRef.current = false
+    }
+  }, [collectGatewayCandidateOrigins, gatewayDirectory])
 
   const dismissInvite = useCallback((inviteId: string) => {
     const normalizedInviteId = String(inviteId || '').trim()
@@ -2915,6 +3285,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           })
         })
         .then(() => fetchGroupDetail(entry.groupId, resolvedRelay, { preferRelay: true }))
+        .then(() => undefined)
         .catch(() => {})
         .finally(() => {
           tokenizedPreviewRefreshInFlightRef.current.delete(entry.groupId)
@@ -4853,6 +5224,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       invites,
       gatewayMetadata,
       gatewayDirectory,
+      gatewayReachabilityByOrigin,
       gatewayInvites,
       gatewayJoinRequests,
       pendingInviteCount,
@@ -4865,6 +5237,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       joinRequestsError,
       refreshDiscovery,
       refreshGatewayDirectory,
+      refreshGatewayReachability,
       refreshInvites,
       dismissInvite,
       markInviteAccepted,
@@ -5003,6 +5376,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       invites,
       gatewayMetadata,
       gatewayDirectory,
+      gatewayReachabilityByOrigin,
       gatewayInvites,
       gatewayJoinRequests,
       pendingInviteCount,
@@ -5014,6 +5388,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       joinRequestsError,
       refreshDiscovery,
       refreshGatewayDirectory,
+      refreshGatewayReachability,
       refreshInvites,
       dismissInvite,
       markInviteAccepted,
@@ -5053,8 +5428,22 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   }, [refreshDiscovery])
 
   useEffect(() => {
+    void refreshGatewayPolicyDirectorySources()
+  }, [refreshGatewayPolicyDirectorySources])
+
+  useEffect(() => {
     void refreshGatewayDirectory()
   }, [refreshGatewayDirectory])
+
+  useEffect(() => {
+    void refreshGatewayReachability()
+    if (typeof window === 'undefined') return
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === 'hidden') return
+      void refreshGatewayReachability()
+    }, GATEWAY_REACHABILITY_TTL_MS)
+    return () => window.clearInterval(intervalId)
+  }, [refreshGatewayReachability])
 
   useEffect(() => {
     if (!pubkey) {

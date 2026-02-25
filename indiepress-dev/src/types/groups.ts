@@ -35,6 +35,15 @@ export type TGatewayDirectoryEntry = {
   operatorPicture?: string | null
 }
 
+export type TGatewayReachabilityStatus = 'unknown' | 'checking' | 'online' | 'offline'
+
+export type TGatewayReachabilityEntry = {
+  status: TGatewayReachabilityStatus
+  checkedAt?: number | null
+  latencyMs?: number | null
+  error?: string | null
+}
+
 export type TGatewayInvite = {
   origin: string
   inviteePubkey: string

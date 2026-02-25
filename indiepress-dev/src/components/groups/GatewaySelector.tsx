@@ -6,7 +6,12 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { dedupeGatewayDescriptors, parseGatewayDescriptorInput, serializeGatewayDescriptorInput } from '@/lib/gateway-tags'
-import { TGatewayDescriptor, TGatewayDirectoryEntry } from '@/types/groups'
+import {
+  TGatewayDescriptor,
+  TGatewayDirectoryEntry,
+  TGatewayReachabilityEntry,
+  TGatewayReachabilityStatus
+} from '@/types/groups'
 
 function shortPubkey(value: string, size = 8): string {
   const normalized = String(value || '').trim()
@@ -28,11 +33,13 @@ export default function GatewaySelector({
   value,
   onChange,
   directory,
+  reachabilityByOrigin = {},
   maxResults = 10
 }: {
   value: TGatewayDescriptor[]
   onChange: (next: TGatewayDescriptor[]) => void
   directory: TGatewayDirectoryEntry[]
+  reachabilityByOrigin?: Record<string, TGatewayReachabilityEntry>
   maxResults?: number
 }) {
   const { t } = useTranslation()
@@ -69,6 +76,20 @@ export default function GatewaySelector({
       .slice(0, maxResults)
   }, [directory, maxResults, query])
 
+  const reachabilityStatusLabel = (status: TGatewayReachabilityStatus) => {
+    if (status === 'online') return 'online'
+    if (status === 'offline') return 'offline'
+    if (status === 'checking') return 'checking'
+    return 'unknown'
+  }
+
+  const reachabilityStatusDotClass = (status: TGatewayReachabilityStatus) => {
+    if (status === 'online') return 'bg-emerald-500'
+    if (status === 'offline') return 'bg-red-500'
+    if (status === 'checking') return 'bg-amber-400'
+    return 'bg-slate-400'
+  }
+
   const setSelectedGateways = (next: TGatewayDescriptor[]) => {
     onChange(dedupeGatewayDescriptors(next))
   }
@@ -99,6 +120,8 @@ export default function GatewaySelector({
         <div className="mt-2 max-h-56 space-y-1 overflow-y-auto pr-1">
           {visibleEntries.map((entry) => {
             const selected = selectedByOrigin.has(entry.origin)
+            const reachability = reachabilityByOrigin[entry.origin]
+            const reachabilityStatus = reachability?.status || 'unknown'
             return (
               <button
                 key={entry.origin}
@@ -129,6 +152,15 @@ export default function GatewaySelector({
                   </div>
                 </div>
                 <div className="shrink-0 text-right text-[11px] text-muted-foreground">
+                  <div className="flex items-center justify-end gap-1">
+                    <span
+                      className={`inline-block h-2 w-2 rounded-full ${reachabilityStatusDotClass(
+                        reachabilityStatus
+                      )}`}
+                      aria-hidden="true"
+                    />
+                    <span>{reachabilityStatusLabel(reachabilityStatus)}</span>
+                  </div>
                   <div>{entry.policy}</div>
                   <div>{t('used')}: {entry.popularityCount}</div>
                   <div>{selected ? '[x]' : '[ ]'}</div>

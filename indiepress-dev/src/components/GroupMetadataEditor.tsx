@@ -35,7 +35,13 @@ export default function GroupMetadataEditor({
   saving?: boolean
   isOpen?: boolean
 }) {
-  const { gatewayDirectory, gatewayMetadata } = useGroups()
+  const {
+    gatewayDirectory,
+    gatewayMetadata,
+    gatewayReachabilityByOrigin,
+    refreshGatewayDirectory,
+    refreshGatewayReachability
+  } = useGroups()
   const { pubkey } = useNostr()
   const [form, setForm] = useState<TGroupMetadataForm>({
     name: initial?.name ?? '',
@@ -67,6 +73,12 @@ export default function GroupMetadataEditor({
     setHasInteracted(false)
     setForm(nextFormFromInitial())
   }, [isOpen])
+
+  useEffect(() => {
+    if (isOpen === false) return
+    void refreshGatewayDirectory()
+    void refreshGatewayReachability()
+  }, [isOpen, refreshGatewayDirectory, refreshGatewayReachability])
 
   const gatewayMetadataByOrigin = useMemo(() => {
     const map = new Map<string, { policy: 'OPEN' | 'CLOSED'; allowList: Set<string> }>()
@@ -199,6 +211,7 @@ export default function GroupMetadataEditor({
             setForm((current) => ({ ...current, gateways: nextGateways }))
           }}
           directory={gatewayDirectory}
+          reachabilityByOrigin={gatewayReachabilityByOrigin}
         />
         <div className="text-xs text-muted-foreground">
           CLOSED gateways are shown only when your pubkey is allow-listed in gateway metadata.

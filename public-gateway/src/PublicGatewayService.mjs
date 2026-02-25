@@ -50,6 +50,7 @@ import GatewayPolicyService from './GatewayPolicyService.mjs';
 import GatewayAuthService, { parseBearerToken } from './GatewayAuthService.mjs';
 import GatewayEventPublisher from './GatewayEventPublisher.mjs';
 import GatewayInviteService from './GatewayInviteService.mjs';
+import { publishGatewayEventToNostrRelays } from './GatewayNostrPublisher.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores';
@@ -243,7 +244,8 @@ class PublicGatewayService {
     this.gatewayEventPublisher = new GatewayEventPublisher({
       logger: this.logger,
       gatewayOrigin: this.gatewayOrigin,
-      policyService: this.gatewayPolicyService
+      policyService: this.gatewayPolicyService,
+      eventRelayPublisher: (event, meta) => this.#publishGatewayEventToNostrRelays(event, meta)
     });
 
     if (this.dispatcher) {
@@ -876,6 +878,53 @@ class PublicGatewayService {
       };
       console.log('[PublicGateway][MultiGateway]', JSON.stringify(line));
     } catch (_) {}
+  }
+
+  async #publishGatewayEventToNostrRelays(event, meta = {}) {
+    if (!event || typeof event !== 'object') return null;
+    const snapshot = this.gatewayPolicyService?.getSnapshot?.() || {};
+    const relayUrls = Array.isArray(snapshot.discoveryRelays) && snapshot.discoveryRelays.length
+      ? snapshot.discoveryRelays
+      : (Array.isArray(this.config?.gateway?.discoveryRelays) ? this.config.gateway.discoveryRelays : []);
+    if (!relayUrls.length) {
+      return { eventId: null, total: 0, successCount: 0, results: [] };
+    }
+
+    const operatorNsecHex = snapshot.operatorNsecHex || this.config?.gateway?.operatorNsecHex || null;
+    const operatorPubkey = snapshot.operatorPubkey || this.config?.gateway?.operatorPubkey || null;
+    if (!operatorNsecHex) {
+      this.logger?.debug?.('[GatewayEvents] Skipping Nostr discovery publish: operator nsec missing');
+      return { eventId: null, total: relayUrls.length, successCount: 0, results: [] };
+    }
+
+    try {
+      const result = await publishGatewayEventToNostrRelays({
+        eventTemplate: event,
+        relayUrls,
+        operatorNsecHex,
+        operatorPubkey,
+        logger: this.logger
+      });
+      this.logger?.info?.('[GatewayEvents] Published gateway event to discovery relays', {
+        eventType: meta?.type || null,
+        reason: meta?.reason || null,
+        total: result?.total || 0,
+        successCount: result?.successCount || 0
+      });
+      return result;
+    } catch (error) {
+      this.logger?.warn?.('[GatewayEvents] Failed publishing gateway event to discovery relays', {
+        eventType: meta?.type || null,
+        reason: meta?.reason || null,
+        error: error?.message || error
+      });
+      return {
+        eventId: null,
+        total: relayUrls.length,
+        successCount: 0,
+        results: []
+      };
+    }
   }
 
   #resolveRelayPeerCount(record) {
