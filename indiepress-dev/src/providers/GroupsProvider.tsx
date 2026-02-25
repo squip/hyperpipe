@@ -105,6 +105,7 @@ type GatewayPolicySnapshot = {
   operatorPubkey: string
   policy: 'OPEN' | 'CLOSED'
   allowList: string[]
+  banList: string[]
   discoveryRelays: string[]
   updatedAt: number
 }
@@ -1538,6 +1539,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                   .filter((value: string | null): value is string => !!value)
               )
             )
+            const banList = Array.from(
+              new Set(
+                (Array.isArray(payload?.banList) ? payload.banList : [])
+                  .map((value: unknown) => normalizeGatewayPubkeyHex(String(value || '')))
+                  .filter((value: string | null): value is string => !!value)
+              )
+            )
             const discoveryRelays = Array.from(
               new Set(
                 (Array.isArray(payload?.discoveryRelays) ? payload.discoveryRelays : [])
@@ -1550,6 +1558,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               operatorPubkey,
               policy: normalizeGatewayPolicy(payload?.policy),
               allowList,
+              banList,
               discoveryRelays,
               updatedAt: Date.now()
             } as GatewayPolicySnapshot
@@ -1661,12 +1670,44 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     const directoryByOrigin = new Map<string, TGatewayDirectoryEntry>()
     fromDiscovery.forEach((entry) => directoryByOrigin.set(entry.origin, entry))
 
+    if (normalizedCurrentPubkey) {
+      Array.from(directoryByOrigin.keys()).forEach((origin) => {
+        const policySnapshot = gatewayPolicyByOrigin[origin]
+        if (!policySnapshot) return
+        const banList = new Set(
+          (Array.isArray(policySnapshot.banList) ? policySnapshot.banList : [])
+            .map((value) => normalizeGatewayPubkeyHex(value))
+            .filter((value): value is string => !!value)
+        )
+        if (banList.has(normalizedCurrentPubkey)) {
+          directoryByOrigin.delete(origin)
+          return
+        }
+        const policy = normalizeGatewayPolicy(policySnapshot.policy)
+        if (policy !== 'CLOSED') return
+        const allowList = new Set(
+          (Array.isArray(policySnapshot.allowList) ? policySnapshot.allowList : [])
+            .map((value) => normalizeGatewayPubkeyHex(value))
+            .filter((value): value is string => !!value)
+        )
+        if (!allowList.has(normalizedCurrentPubkey)) {
+          directoryByOrigin.delete(origin)
+        }
+      })
+    }
+
     Object.values(gatewayPolicyByOrigin).forEach((entry) => {
       const origin = normalizeGatewayOrigin(entry?.origin || null)
       if (!origin || directoryByOrigin.has(origin)) return
       const operatorPubkey = normalizeGatewayPubkeyHex(entry?.operatorPubkey || null)
       if (!operatorPubkey) return
       const policy = normalizeGatewayPolicy(entry?.policy)
+      const banList = new Set(
+        (Array.isArray(entry?.banList) ? entry.banList : [])
+          .map((value) => normalizeGatewayPubkeyHex(value))
+          .filter((value): value is string => !!value)
+      )
+      if (normalizedCurrentPubkey && banList.has(normalizedCurrentPubkey)) return
       const allowList = new Set(
         (Array.isArray(entry?.allowList) ? entry.allowList : [])
           .map((value) => normalizeGatewayPubkeyHex(value))

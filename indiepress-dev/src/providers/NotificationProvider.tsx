@@ -39,7 +39,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
   const { current } = usePrimaryPage()
   const active = useMemo(() => current === 'notifications', [current])
   const { pubkey, notificationsSeenAt, updateNotificationsSeenAt } = useNostr()
-  const { invites } = useGroups()
+  const { invites, gatewayInvites } = useGroups()
   const { invites: conversationInvites } = useMessenger()
   const { hideUntrustedNotifications, isUserTrusted } = useUserTrust()
   const { mutePubkeySet } = useMuteList()
@@ -91,6 +91,14 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
         count += 1
       }
     }
+    for (const invite of gatewayInvites) {
+      const inviteEventId = invite.event?.id
+      if (!inviteEventId || seenInviteEventIds.has(inviteEventId)) continue
+      seenInviteEventIds.add(inviteEventId)
+      if (invite.event.created_at > notificationsSeenAt) {
+        count += 1
+      }
+    }
     const seenConversationInviteIds = new Set<string>()
     for (const invite of conversationInvites) {
       const inviteId = invite.id
@@ -104,7 +112,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       }
     }
     return count
-  }, [active, invites, conversationInvites, notificationsSeenAt])
+  }, [active, invites, gatewayInvites, conversationInvites, notificationsSeenAt])
 
   const newNotificationCount = filteredNewNotifications.length + newInviteNotificationCount
 

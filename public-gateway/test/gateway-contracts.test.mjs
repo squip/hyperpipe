@@ -13,6 +13,7 @@ import {
 const OPERATOR = '1'.repeat(64)
 const INVITEE = '2'.repeat(64)
 const REQUESTER = '3'.repeat(64)
+const BANNED = '4'.repeat(64)
 
 test('gateway tag parser normalizes, dedupes, and enforces HTTPS origin', () => {
   const tags = [
@@ -78,6 +79,7 @@ test('parses kind 30078 metadata/invite/join-request variants', () => {
       ['operator', OPERATOR],
       ['policy', 'CLOSED'],
       ['allow-list', OPERATOR, INVITEE],
+      ['ban-list', BANNED],
       ['r', 'wss://relay.one'],
       ['r', 'wss://relay.two']
     ]
@@ -118,6 +120,7 @@ test('parses kind 30078 metadata/invite/join-request variants', () => {
     operatorPubkey: OPERATOR,
     policy: 'CLOSED',
     allowList: [OPERATOR, INVITEE],
+    banList: [BANNED],
     discoveryRelays: ['wss://relay.one', 'wss://relay.two'],
     content: 'encrypted-ban-list'
   })

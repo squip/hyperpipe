@@ -33,7 +33,7 @@ const NotificationList = forwardRef((_, ref) => {
   const active = useMemo(() => current === 'notifications' && display, [current, display])
   const { pubkey } = useNostr()
   const { getNotificationsSeenAt } = useNotification()
-  const { invites } = useGroups()
+  const { invites, gatewayInvites } = useGroups()
   const { invites: conversationInvites } = useMessenger()
   const { notificationListStyle } = useUserPreferences()
   const [notificationType, setNotificationType] = useState<TNotificationType>('all')
@@ -58,13 +58,18 @@ const NotificationList = forwardRef((_, ref) => {
       if (!inviteEvent?.id) continue
       inviteByEventId.set(inviteEvent.id, inviteEvent)
     }
+    for (const invite of gatewayInvites) {
+      const inviteEvent = invite?.event
+      if (!inviteEvent?.id) continue
+      inviteByEventId.set(inviteEvent.id, inviteEvent)
+    }
     for (const invite of conversationInvites) {
       const inviteEvent = toConversationInviteNotificationEvent(invite)
       if (!inviteEvent?.id) continue
       inviteByEventId.set(inviteEvent.id, inviteEvent)
     }
     return Array.from(inviteByEventId.values())
-  }, [invites, conversationInvites, notificationType])
+  }, [invites, gatewayInvites, conversationInvites, notificationType])
 
   const displayNotifications = useMemo(() => {
     if (notificationType !== 'all') return filteredNotifications

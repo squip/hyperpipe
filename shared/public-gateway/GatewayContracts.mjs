@@ -152,6 +152,83 @@ function parseAllowList(tags = []) {
   return allowList;
 }
 
+function parseBanListFromTags(tags = []) {
+  if (!Array.isArray(tags)) return [];
+  const banTag = tags.find((tag) => Array.isArray(tag) && tag[0] === 'ban-list');
+  if (!banTag) return [];
+  const banList = [];
+  const seen = new Set();
+  for (const value of banTag.slice(1)) {
+    const pubkey = normalizePubkeyHex(value);
+    if (!pubkey || seen.has(pubkey)) continue;
+    seen.add(pubkey);
+    banList.push(pubkey);
+  }
+  return banList;
+}
+
+function decodeBase64UrlUtf8(input = '') {
+  if (typeof input !== 'string') return null;
+  const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
+  if (!normalized) return null;
+  const padding = '='.repeat((4 - (normalized.length % 4 || 4)) % 4);
+  const padded = normalized + padding;
+  try {
+    return Buffer.from(padded, 'base64').toString('utf8');
+  } catch (_err) {
+    return null;
+  }
+}
+
+function normalizeBanPayload(payload) {
+  if (!payload || typeof payload !== 'object') return [];
+  const source = Array.isArray(payload.pubkeys)
+    ? payload.pubkeys
+    : Array.isArray(payload.banList)
+      ? payload.banList
+      : Array.isArray(payload.ban_list)
+        ? payload.ban_list
+        : [];
+  const out = [];
+  const seen = new Set();
+  for (const value of source) {
+    const pubkey = normalizePubkeyHex(value);
+    if (!pubkey || seen.has(pubkey)) continue;
+    seen.add(pubkey);
+    out.push(pubkey);
+  }
+  return out;
+}
+
+function parseBanListFromContent(content = '') {
+  if (typeof content !== 'string') return [];
+  const trimmed = content.trim();
+  if (!trimmed) return [];
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    const direct = normalizeBanPayload(parsed);
+    if (direct.length) return direct;
+  } catch (_err) {
+    // Continue to base64url decode fallback.
+  }
+
+  const decoded = decodeBase64UrlUtf8(trimmed);
+  if (!decoded) return [];
+  try {
+    const parsed = JSON.parse(decoded);
+    return normalizeBanPayload(parsed);
+  } catch (_err) {
+    return [];
+  }
+}
+
+function parseBanList(tags = [], content = '') {
+  const fromTags = parseBanListFromTags(tags);
+  if (fromTags.length) return fromTags;
+  return parseBanListFromContent(content);
+}
+
 function parseGatewayMetadataEvent(event) {
   if (!event || event.kind !== KIND_GATEWAY_EVENT || !Array.isArray(event.tags)) return null;
   const h = parseHTag(event.tags);
@@ -173,6 +250,7 @@ function parseGatewayMetadataEvent(event) {
     operatorPubkey,
     policy: normalizeGatewayPolicy(policyTag?.[1], GATEWAY_POLICY_OPEN),
     allowList: parseAllowList(event.tags),
+    banList: parseBanList(event.tags, typeof event.content === 'string' ? event.content : ''),
     discoveryRelays: parseRTags(event.tags),
     content: typeof event.content === 'string' ? event.content : ''
   };

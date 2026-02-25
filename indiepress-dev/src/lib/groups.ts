@@ -112,6 +112,98 @@ function parseGatewayAllowList(tags: string[][]): string[] {
   return allowList
 }
 
+function parseGatewayBanListTag(tags: string[][]): string[] {
+  const banTag = tags.find((tag) => tag[0] === 'ban-list')
+  if (!banTag) return []
+  const seen = new Set<string>()
+  const banList: string[] = []
+  banTag.slice(1).forEach((entry) => {
+    const normalized = normalizePubkey(String(entry || ''))
+    if (!normalized || seen.has(normalized)) return
+    seen.add(normalized)
+    banList.push(normalized)
+  })
+  return banList
+}
+
+function decodeBase64UrlUtf8(content: string): string | null {
+  const normalized = String(content || '')
+    .replace(/-/g, '+')
+    .replace(/_/g, '/')
+  if (!normalized) return null
+  const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4 || 4)) % 4), '=')
+  try {
+    if (typeof atob === 'function') {
+      const binary = atob(padded)
+      const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0))
+      if (typeof TextDecoder !== 'undefined') {
+        return new TextDecoder().decode(bytes)
+      }
+      return binary
+    }
+  } catch (_err) {
+    // Fall through to Buffer fallback.
+  }
+  try {
+    const maybeBuffer = (globalThis as { Buffer?: { from: (value: string, encoding: string) => { toString: (enc: string) => string } } }).Buffer
+    if (maybeBuffer?.from) {
+      return maybeBuffer.from(padded, 'base64').toString('utf8')
+    }
+  } catch (_err) {
+    // Ignore decode failures.
+  }
+  return null
+}
+
+function parseGatewayBanListContent(content: string | null | undefined): string[] {
+  const raw = String(content || '').trim()
+  if (!raw) return []
+
+  const normalizePayload = (payload: unknown): string[] => {
+    if (!payload || typeof payload !== 'object') return []
+    const record = payload as Record<string, unknown>
+    const values = Array.isArray(record.pubkeys)
+      ? record.pubkeys
+      : Array.isArray(record.banList)
+        ? record.banList
+        : Array.isArray(record.ban_list)
+          ? record.ban_list
+          : []
+    const seen = new Set<string>()
+    const out: string[] = []
+    values.forEach((value) => {
+      const normalized = normalizePubkey(String(value || ''))
+      if (!normalized || seen.has(normalized)) return
+      seen.add(normalized)
+      out.push(normalized)
+    })
+    return out
+  }
+
+  try {
+    const parsed = JSON.parse(raw)
+    const direct = normalizePayload(parsed)
+    if (direct.length) return direct
+  } catch (_err) {
+    // Not plain JSON; continue to base64url decode.
+  }
+
+  const decoded = decodeBase64UrlUtf8(raw)
+  if (!decoded) return []
+  try {
+    const parsed = JSON.parse(decoded)
+    return normalizePayload(parsed)
+  } catch (_err) {
+    return []
+  }
+}
+
+function parseGatewayBanList(tags: string[][], content: string | null | undefined): string[] {
+  const fromTags = parseGatewayBanListTag(tags)
+  if (fromTags.length) return fromTags
+  return parseGatewayBanListContent(content)
+}
+
 function parseSwarmTopicTag(tags: string[][]): string | null {
   const tag = tags.find((entry) => entry[0] === 'swarm-topic' && entry[1])
   if (!tag?.[1]) return null
@@ -321,6 +413,7 @@ export function parseGatewayMetadataEvent(event: Event): TGatewayMetadata | null
     operatorPubkey,
     policy: normalizeGatewayPolicy(policyTag),
     allowList: parseGatewayAllowList(event.tags),
+    banList: parseGatewayBanList(event.tags, typeof event.content === 'string' ? event.content : ''),
     discoveryRelays: parseGatewayDiscoveryRelays(event.tags),
     content: typeof event.content === 'string' ? event.content : '',
     createdAt: Number.isFinite(event.created_at) ? event.created_at : null,

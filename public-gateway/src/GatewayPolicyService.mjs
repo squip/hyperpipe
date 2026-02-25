@@ -169,9 +169,10 @@ class GatewayPolicyService {
     if (!normalized) {
       return { ok: false, reason: 'invalid-pubkey' };
     }
+    const allowListRemoved = this.allowList.delete(normalized);
     this.banList.add(normalized);
     await this.#persistState();
-    return { ok: true, pubkey: normalized };
+    return { ok: true, pubkey: normalized, allowListRemoved };
   }
 
   async removeBan(pubkey) {

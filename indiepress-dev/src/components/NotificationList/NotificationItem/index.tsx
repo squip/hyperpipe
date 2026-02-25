@@ -1,4 +1,5 @@
 import { ExtendedKind } from '@/constants'
+import { parseGatewayInviteEvent } from '@/lib/groups'
 import { notificationFilter } from '@/lib/notification'
 import { useContentPolicy } from '@/providers/ContentPolicyProvider'
 import { useMuteList } from '@/providers/MuteListProvider'
@@ -15,6 +16,7 @@ import { RepostNotification } from './RepostNotification'
 import { ZapNotification } from './ZapNotification'
 import { GroupInviteNotification } from './GroupInviteNotification'
 import { ConversationInviteNotification } from './ConversationInviteNotification'
+import { GatewayInviteNotification } from './GatewayInviteNotification'
 
 const GROUP_INVITE_KIND = 9009
 
@@ -51,6 +53,9 @@ export function NotificationItem({
   }
   if (notification.kind === CONVERSATION_INVITE_NOTIFICATION_KIND) {
     return <ConversationInviteNotification notification={notification} isNew={isNew} />
+  }
+  if (notification.kind === 30078 && parseGatewayInviteEvent(notification)) {
+    return <GatewayInviteNotification notification={notification} isNew={isNew} />
   }
   if (notification.kind === kinds.Reaction) {
     return <ReactionNotification notification={notification} isNew={isNew} />

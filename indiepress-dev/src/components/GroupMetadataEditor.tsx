@@ -81,7 +81,7 @@ export default function GroupMetadataEditor({
   }, [isOpen, refreshGatewayDirectory, refreshGatewayReachability])
 
   const gatewayMetadataByOrigin = useMemo(() => {
-    const map = new Map<string, { policy: 'OPEN' | 'CLOSED'; allowList: Set<string> }>()
+    const map = new Map<string, { policy: 'OPEN' | 'CLOSED'; allowList: Set<string>; banList: Set<string> }>()
     gatewayMetadata.forEach((entry) => {
       const origin = String(entry?.origin || '').trim()
       if (!origin) return
@@ -89,6 +89,11 @@ export default function GroupMetadataEditor({
         policy: String(entry?.policy || '').toUpperCase() === 'CLOSED' ? 'CLOSED' : 'OPEN',
         allowList: new Set(
           (Array.isArray(entry?.allowList) ? entry.allowList : [])
+            .map((value) => String(value || '').trim().toLowerCase())
+            .filter(Boolean)
+        ),
+        banList: new Set(
+          (Array.isArray(entry?.banList) ? entry.banList : [])
             .map((value) => String(value || '').trim().toLowerCase())
             .filter(Boolean)
         )
@@ -214,7 +219,8 @@ export default function GroupMetadataEditor({
           reachabilityByOrigin={gatewayReachabilityByOrigin}
         />
         <div className="text-xs text-muted-foreground">
-          CLOSED gateways are shown only when your pubkey is allow-listed in gateway metadata.
+          CLOSED gateways are shown only when your pubkey is allow-listed. Gateways that ban your
+          pubkey are hidden.
         </div>
       </div>
       <div className="flex gap-2 justify-end">
@@ -224,19 +230,30 @@ export default function GroupMetadataEditor({
         <Button
           onClick={() => {
             const currentPubkey = String(pubkey || '').trim().toLowerCase()
-            const deniedClosedGateways: string[] = []
+            const deniedClosedGateways = new Set<string>()
+            const bannedGateways = new Set<string>()
             const gateways = (Array.isArray(form.gateways) ? form.gateways : []).filter((gateway) => {
               const metadata = gatewayMetadataByOrigin.get(gateway.origin)
               const policy = metadata?.policy || gateway.policy
+              const banList = metadata?.banList
+              if (banList && currentPubkey && banList.has(currentPubkey)) {
+                bannedGateways.add(gateway.origin)
+                return false
+              }
               if (policy !== 'CLOSED') return true
               const allowList = metadata?.allowList
               if (allowList && currentPubkey && allowList.has(currentPubkey)) return true
-              deniedClosedGateways.push(gateway.origin)
+              deniedClosedGateways.add(gateway.origin)
               return false
             })
-            if (deniedClosedGateways.length) {
+            if (bannedGateways.size) {
               toast.warning(
-                `Skipped CLOSED gateways without allow-list access: ${deniedClosedGateways.join(', ')}`
+                `Skipped gateways where your pubkey is ban-listed: ${Array.from(bannedGateways).join(', ')}`
+              )
+            }
+            if (deniedClosedGateways.size) {
+              toast.warning(
+                `Skipped CLOSED gateways without allow-list access: ${Array.from(deniedClosedGateways).join(', ')}`
               )
             }
             onSave({

@@ -96,6 +96,12 @@ export function buildGatewayDirectory(args: {
         .map((entry) => normalizePubkey(entry))
         .filter((entry): entry is string => !!entry)
     )
+    const banList = new Set(
+      (Array.isArray(metadata?.banList) ? metadata.banList : [])
+        .map((entry) => normalizePubkey(entry))
+        .filter((entry): entry is string => !!entry)
+    )
+    if (currentPubkey && banList.has(currentPubkey)) continue
     const allowListed = policy === 'OPEN' ? true : !!currentPubkey && allowList.has(currentPubkey)
     if (policy === 'CLOSED' && !allowListed) continue
 

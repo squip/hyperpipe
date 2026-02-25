@@ -45,6 +45,22 @@ test('GatewayPolicyService enforces OPEN/CLOSED allow/ban rules', () => {
   assert.equal(bannedDenied.allowed, false)
 })
 
+test('GatewayPolicyService addBan removes matching allow-list entry', async () => {
+  const policy = new GatewayPolicyService({
+    config: {
+      policy: 'CLOSED',
+      allowList: [MEMBER]
+    }
+  })
+
+  assert.equal(policy.isAllowListed(MEMBER), true)
+  const result = await policy.addBan(MEMBER)
+  assert.equal(result.ok, true)
+  assert.equal(result.allowListRemoved, true)
+  assert.equal(policy.isAllowListed(MEMBER), false)
+  assert.equal(policy.isBanned(MEMBER), true)
+})
+
 test('GatewayAuthService verifies challenge signatures and JWT scopes', async () => {
   const kp = createKeypair()
   const authService = new GatewayAuthService({
@@ -199,6 +215,7 @@ test('GatewayEventPublisher includes metadata + invite tags', () => {
   assert.equal(metadata?.tags?.find((tag) => tag[0] === 'h')?.[1], 'hypertuna_gateway:metadata')
   assert.equal(metadata?.tags?.find((tag) => tag[0] === 'policy')?.[1], 'CLOSED')
   assert.deepEqual(metadata?.tags?.find((tag) => tag[0] === 'allow-list')?.slice(1), [ADMIN, MEMBER])
+  assert.deepEqual(metadata?.tags?.find((tag) => tag[0] === 'ban-list')?.slice(1), [BANNED])
 
   const invite = publisher.buildInviteEvent({
     inviteePubkey: MEMBER,

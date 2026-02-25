@@ -17,6 +17,7 @@ export type TGatewayMetadata = {
   operatorPubkey: string
   policy: 'OPEN' | 'CLOSED'
   allowList: string[]
+  banList: string[]
   discoveryRelays: string[]
   content: string
   createdAt?: number | null

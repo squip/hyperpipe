@@ -35,6 +35,9 @@ class GatewayEventPublisher {
     if (policy.allowList.length) {
       tags.push(['allow-list', ...policy.allowList]);
     }
+    if (policy.banList.length) {
+      tags.push(['ban-list', ...policy.banList]);
+    }
     for (const relayUrl of policy.discoveryRelays || []) {
       tags.push(['r', relayUrl]);
     }

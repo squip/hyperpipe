@@ -3552,6 +3552,7 @@ class PublicGatewayService {
       policy: snapshot.policy,
       operatorPubkey: snapshot.operatorPubkey,
       allowList: snapshot.allowList,
+      banList: snapshot.banList,
       inviteOnly: snapshot.inviteOnly,
       discoveryRelays: snapshot.discoveryRelays,
       banCount: snapshot.banList.length
@@ -3812,6 +3813,7 @@ class PublicGatewayService {
     return res.json({
       status: 'ok',
       pubkey: result.pubkey,
+      allowListRemoved: result.allowListRemoved === true,
       banCount: this.gatewayPolicyService.getSnapshot().banList.length
     });
   }
