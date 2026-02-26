@@ -259,9 +259,13 @@ class PublicGatewayService {
         const snapshot = this.gatewayPolicyService?.getSnapshot?.() || {};
         return Array.isArray(snapshot.discoveryRelays) ? snapshot.discoveryRelays : [];
       },
+      getLocalCandidatePubkeys: async () => this.#collectProfileSearchCandidatePubkeys(),
       queryTimeoutMs: this.config?.gateway?.adminProfileQueryTimeoutMs || 4000,
       cacheTtlSec: this.config?.gateway?.adminProfileCacheTtlSec || 1800,
-      defaultSearchLimit: this.config?.gateway?.adminProfileSearchLimit || 12
+      defaultSearchLimit: this.config?.gateway?.adminProfileSearchLimit || 12,
+      participantRefreshMs: this.config?.gateway?.adminProfileParticipantRefreshMs || (2 * 60 * 1000),
+      participantEventLimit: this.config?.gateway?.adminProfileParticipantEventLimit || 800,
+      candidateResolveLimit: this.config?.gateway?.adminProfileCandidateResolveLimit || 240
     });
 
     if (this.dispatcher) {
@@ -3947,6 +3951,44 @@ class PublicGatewayService {
       blindPeer: blindPeerStatus,
       metrics: summary
     });
+  }
+
+  #collectProfileSearchCandidatePubkeys() {
+    const pubkeys = new Set();
+    const addPubkey = (value) => {
+      const normalized = this.#normalizePubkeyHex(value);
+      if (normalized) {
+        pubkeys.add(normalized);
+      }
+    };
+
+    const policySnapshot = this.gatewayPolicyService?.getSnapshot?.() || {};
+    addPubkey(policySnapshot?.operatorPubkey);
+    for (const entry of Array.isArray(policySnapshot?.allowList) ? policySnapshot.allowList : []) {
+      addPubkey(entry);
+    }
+    for (const entry of Array.isArray(policySnapshot?.banList) ? policySnapshot.banList : []) {
+      addPubkey(entry);
+    }
+
+    const invites = this.gatewayInviteService?.invites instanceof Map
+      ? Array.from(this.gatewayInviteService.invites.values())
+      : [];
+    for (const invite of invites) {
+      addPubkey(invite?.pubkey);
+      addPubkey(invite?.metadata?.inviterPubkey);
+      addPubkey(invite?.metadata?.operatorPubkey);
+    }
+
+    const joinRequests = this.gatewayInviteService?.joinRequests instanceof Map
+      ? Array.from(this.gatewayInviteService.joinRequests.values())
+      : [];
+    for (const request of joinRequests) {
+      addPubkey(request?.pubkey);
+      addPubkey(request?.metadata?.requesterPubkey);
+    }
+
+    return Array.from(pubkeys);
   }
 
   async #handleAdminProfilesResolve(req, res) {

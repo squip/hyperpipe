@@ -7,6 +7,13 @@ const DEFAULT_SEARCH_LIMIT = 12;
 const MAX_SEARCH_LIMIT = 50;
 const MAX_RESOLVE_KEYS = 200;
 const MAX_RELAY_COUNT = 8;
+const HYPERTUNA_IDENTIFIER_TAG = 'hypertuna:relay';
+const DEFAULT_PARTICIPANT_REFRESH_MS = 2 * 60 * 1000;
+const DEFAULT_PARTICIPANT_EVENT_LIMIT = 800;
+const DEFAULT_CANDIDATE_RESOLVE_LIMIT = 240;
+const MAX_PARTICIPANT_EVENT_LIMIT = 5000;
+const MAX_CANDIDATE_RESOLVE_LIMIT = 1000;
+const MAX_PARTICIPANT_INDEX_SIZE = 5000;
 
 const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
 const BECH32_CHARKEY = Object.fromEntries(Array.from(BECH32_CHARSET).map((char, index) => [char, index]));
@@ -192,7 +199,31 @@ function decodeNpubHex(value) {
   return Buffer.from(decoded).toString('hex');
 }
 
-function computeProfileSearchScore(profile, query, { exactPubkey = null, exactNpub = null } = {}) {
+function isLikelyPubkeyQuery(query) {
+  if (typeof query !== 'string') return false;
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized.startsWith('npub1')) return true;
+  return /^[a-f0-9]{16,64}$/.test(normalized);
+}
+
+function hasTextualProfileMatch(profile, query) {
+  if (!profile || !query) return false;
+  const normalizedQuery = String(query).trim().toLowerCase();
+  if (!normalizedQuery) return false;
+  const displayName = String(profile.displayName || '').toLowerCase();
+  const name = String(profile.name || '').toLowerCase();
+  const nip05 = String(profile.nip05 || '').toLowerCase();
+  return displayName.includes(normalizedQuery)
+    || name.includes(normalizedQuery)
+    || nip05.includes(normalizedQuery);
+}
+
+function computeProfileSearchScore(
+  profile,
+  query,
+  { exactPubkey = null, exactNpub = null, allowPubkeyFuzzy = true } = {}
+) {
   if (!profile || !query) return 0;
   const normalizedQuery = query.toLowerCase();
   const pubkey = String(profile.pubkey || '').toLowerCase();
@@ -212,12 +243,12 @@ function computeProfileSearchScore(profile, query, { exactPubkey = null, exactNp
   if (displayName.startsWith(normalizedQuery)) score += 900;
   if (name.startsWith(normalizedQuery)) score += 800;
   if (nip05.startsWith(normalizedQuery)) score += 760;
-  if (pubkey.startsWith(normalizedQuery)) score += 700;
+  if (allowPubkeyFuzzy && pubkey.startsWith(normalizedQuery)) score += 700;
 
   if (displayName.includes(normalizedQuery)) score += 520;
   if (name.includes(normalizedQuery)) score += 480;
   if (nip05.includes(normalizedQuery)) score += 440;
-  if (pubkey.includes(normalizedQuery)) score += 360;
+  if (allowPubkeyFuzzy && pubkey.includes(normalizedQuery)) score += 360;
 
   if (Number.isFinite(profile.createdAt) && profile.createdAt > 0) {
     score += Math.min(Math.floor(profile.createdAt / 1000000), 300);
@@ -231,15 +262,22 @@ class GatewayNostrProfileService {
     logger = console,
     relayUrls = [],
     getRelayUrls = null,
+    getLocalCandidatePubkeys = null,
     queryTimeoutMs = DEFAULT_QUERY_TIMEOUT_MS,
     cacheTtlSec = DEFAULT_CACHE_TTL_SEC,
     defaultSearchLimit = DEFAULT_SEARCH_LIMIT,
     maxSearchLimit = MAX_SEARCH_LIMIT,
-    maxResolveKeys = MAX_RESOLVE_KEYS
+    maxResolveKeys = MAX_RESOLVE_KEYS,
+    participantRefreshMs = DEFAULT_PARTICIPANT_REFRESH_MS,
+    participantEventLimit = DEFAULT_PARTICIPANT_EVENT_LIMIT,
+    candidateResolveLimit = DEFAULT_CANDIDATE_RESOLVE_LIMIT
   } = {}) {
     this.logger = logger;
     this.relayUrls = Array.isArray(relayUrls) ? relayUrls : [];
     this.getRelayUrls = typeof getRelayUrls === 'function' ? getRelayUrls : null;
+    this.getLocalCandidatePubkeys = typeof getLocalCandidatePubkeys === 'function'
+      ? getLocalCandidatePubkeys
+      : null;
     this.queryTimeoutMs = Number.isFinite(queryTimeoutMs) && queryTimeoutMs > 0
       ? Math.trunc(queryTimeoutMs)
       : DEFAULT_QUERY_TIMEOUT_MS;
@@ -255,7 +293,19 @@ class GatewayNostrProfileService {
     this.maxResolveKeys = Number.isFinite(maxResolveKeys) && maxResolveKeys > 0
       ? Math.min(Math.trunc(maxResolveKeys), 2000)
       : MAX_RESOLVE_KEYS;
+    this.participantRefreshMs = Number.isFinite(participantRefreshMs) && participantRefreshMs > 0
+      ? Math.trunc(participantRefreshMs)
+      : DEFAULT_PARTICIPANT_REFRESH_MS;
+    this.participantEventLimit = Number.isFinite(participantEventLimit) && participantEventLimit > 0
+      ? Math.min(Math.trunc(participantEventLimit), MAX_PARTICIPANT_EVENT_LIMIT)
+      : DEFAULT_PARTICIPANT_EVENT_LIMIT;
+    this.candidateResolveLimit = Number.isFinite(candidateResolveLimit) && candidateResolveLimit > 0
+      ? Math.min(Math.trunc(candidateResolveLimit), MAX_CANDIDATE_RESOLVE_LIMIT)
+      : DEFAULT_CANDIDATE_RESOLVE_LIMIT;
     this.cache = new Map();
+    this.participantIndex = new Map();
+    this.participantIndexLastRefreshedAt = 0;
+    this.participantIndexRefreshInFlight = null;
   }
 
   #getRelayUrls() {
@@ -316,6 +366,115 @@ class GatewayNostrProfileService {
       ...entry.profile,
       source: 'cache'
     }));
+  }
+
+  #collectParticipantPubkeys(limit = MAX_PARTICIPANT_INDEX_SIZE) {
+    const entries = Array.from(this.participantIndex.entries())
+      .sort((left, right) => Number(right[1] || 0) - Number(left[1] || 0));
+    if (!Number.isFinite(limit) || limit <= 0) {
+      return entries.map((entry) => entry[0]);
+    }
+    return entries.slice(0, Math.trunc(limit)).map((entry) => entry[0]);
+  }
+
+  #recordParticipantPubkey(pubkey, createdAt = Date.now()) {
+    const normalized = normalizePubkey(pubkey);
+    if (!normalized) return;
+    const createdAtMs = Number.isFinite(createdAt) && createdAt > 0
+      ? Math.trunc(createdAt >= 1_000_000_000_000 ? createdAt : createdAt * 1000)
+      : Date.now();
+    const existing = Number(this.participantIndex.get(normalized) || 0);
+    if (createdAtMs >= existing) {
+      this.participantIndex.set(normalized, createdAtMs);
+    }
+  }
+
+  async #loadLocalCandidatePubkeys() {
+    if (!this.getLocalCandidatePubkeys) return [];
+    try {
+      const values = await this.getLocalCandidatePubkeys();
+      return Array.from(
+        new Set(
+          (Array.isArray(values) ? values : [])
+            .map((entry) => normalizePubkey(entry))
+            .filter((entry) => !!entry)
+        )
+      );
+    } catch (error) {
+      this.logger?.debug?.('[GatewayProfiles] Failed to load local candidate pubkeys', {
+        error: error?.message || error
+      });
+      return [];
+    }
+  }
+
+  async #refreshParticipantIndex({ force = false } = {}) {
+    const now = Date.now();
+    if (!force && now - this.participantIndexLastRefreshedAt < this.participantRefreshMs) {
+      return this.#collectParticipantPubkeys(MAX_PARTICIPANT_INDEX_SIZE);
+    }
+    if (this.participantIndexRefreshInFlight) {
+      return this.participantIndexRefreshInFlight;
+    }
+
+    this.participantIndexRefreshInFlight = (async () => {
+      const localCandidates = await this.#loadLocalCandidatePubkeys();
+      localCandidates.forEach((pubkey) => this.#recordParticipantPubkey(pubkey));
+
+      const participantKinds = [39000, 39002, 9000, 9001, 9002, 9009, 9021, 9022];
+      const filters = [
+        {
+          kinds: participantKinds,
+          '#i': [HYPERTUNA_IDENTIFIER_TAG],
+          limit: this.participantEventLimit
+        }
+      ];
+
+      if (localCandidates.length) {
+        filters.push({
+          kinds: [3],
+          authors: localCandidates.slice(0, 24),
+          limit: Math.min(localCandidates.length, 24)
+        });
+      }
+
+      try {
+        const events = await this.#fetchEventsFromRelays(filters);
+        for (const event of events) {
+          if (!event || typeof event !== 'object') continue;
+          const createdAt = Number(event.created_at || 0);
+          this.#recordParticipantPubkey(event.pubkey, createdAt);
+          const tags = Array.isArray(event.tags) ? event.tags : [];
+          for (const tag of tags) {
+            if (!Array.isArray(tag) || tag[0] !== 'p' || !tag[1]) continue;
+            this.#recordParticipantPubkey(tag[1], createdAt);
+          }
+        }
+      } catch (error) {
+        this.logger?.debug?.('[GatewayProfiles] Participant index refresh failed', {
+          error: error?.message || error
+        });
+      }
+
+      const orderedEntries = Array.from(this.participantIndex.entries())
+        .sort((left, right) => Number(right[1] || 0) - Number(left[1] || 0));
+      if (orderedEntries.length > MAX_PARTICIPANT_INDEX_SIZE) {
+        const keep = new Set(
+          orderedEntries.slice(0, MAX_PARTICIPANT_INDEX_SIZE).map((entry) => entry[0])
+        );
+        for (const pubkey of this.participantIndex.keys()) {
+          if (!keep.has(pubkey)) {
+            this.participantIndex.delete(pubkey);
+          }
+        }
+      }
+      this.participantIndexLastRefreshedAt = Date.now();
+      return this.#collectParticipantPubkeys(MAX_PARTICIPANT_INDEX_SIZE);
+    })().finally(() => {
+      this.participantIndexRefreshInFlight = null;
+    });
+
+    return this.participantIndexRefreshInFlight;
   }
 
   async resolvePubkeys(pubkeys = []) {
@@ -407,6 +566,16 @@ class GatewayNostrProfileService {
       : this.defaultSearchLimit;
 
     const exactHex = normalizePubkey(normalizedQuery) || decodeNpubHex(normalizedQuery);
+    const likelyPubkeyQuery = Boolean(exactHex) || isLikelyPubkeyQuery(normalizedQuery);
+
+    const [localCandidates, indexedCandidates] = await Promise.all([
+      this.#loadLocalCandidatePubkeys(),
+      this.#refreshParticipantIndex().catch(() => [])
+    ]);
+    const candidatePool = Array.from(
+      new Set([...(Array.isArray(localCandidates) ? localCandidates : []), ...(Array.isArray(indexedCandidates) ? indexedCandidates : [])])
+    );
+    const localCandidateSet = new Set(candidatePool);
 
     const byPubkey = new Map();
     const applyProfile = (profile) => {
@@ -422,6 +591,26 @@ class GatewayNostrProfileService {
     const cachedProfiles = this.#listCachedProfiles();
     cachedProfiles.forEach(applyProfile);
 
+    const localResolveTarget = Math.min(
+      this.candidateResolveLimit,
+      Math.max(resolvedLimit * 8, 40)
+    );
+    const unresolvedLocalCandidates = candidatePool
+      .filter((pubkey) => !byPubkey.has(pubkey))
+      .slice(0, localResolveTarget);
+    if (unresolvedLocalCandidates.length) {
+      try {
+        const resolved = await this.resolvePubkeys(unresolvedLocalCandidates);
+        for (const profile of Array.isArray(resolved?.profiles) ? resolved.profiles : []) {
+          applyProfile(profile);
+        }
+      } catch (error) {
+        this.logger?.debug?.('[GatewayProfiles] Local candidate resolve failed', {
+          error: error?.message || error
+        });
+      }
+    }
+
     const filters = [];
     if (exactHex) {
       filters.push({
@@ -431,10 +620,19 @@ class GatewayNostrProfileService {
       });
     }
 
-    const searchFetchLimit = Math.min(Math.max(resolvedLimit * 6, 60), 300);
+    const searchFetchLimit = Math.min(Math.max(resolvedLimit * 4, 40), 220);
     filters.push({
       kinds: [PROFILE_EVENT_KIND],
+      search: normalizedQuery,
       limit: searchFetchLimit
+    });
+
+    const broadFetchLimit = likelyPubkeyQuery
+      ? Math.min(Math.max(resolvedLimit * 6, 60), 300)
+      : Math.min(Math.max(resolvedLimit * 3, 30), 120);
+    filters.push({
+      kinds: [PROFILE_EVENT_KIND],
+      limit: broadFetchLimit
     });
 
     const relayEvents = await this.#fetchProfileEventsFromRelays(filters);
@@ -450,10 +648,15 @@ class GatewayNostrProfileService {
         profile,
         score: computeProfileSearchScore(profile, normalizedQuery, {
           exactPubkey: exactHex,
-          exactNpub: normalizedQuery.startsWith('npub1') ? normalizedQuery : null
+          exactNpub: normalizedQuery.startsWith('npub1') ? normalizedQuery : null,
+          allowPubkeyFuzzy: likelyPubkeyQuery
         })
       }))
-      .filter((entry) => entry.score > 0)
+      .filter((entry) => {
+        if (entry.score <= 0) return false;
+        if (likelyPubkeyQuery) return true;
+        return hasTextualProfileMatch(entry.profile, normalizedQuery);
+      })
       .sort((left, right) => {
         if (left.score !== right.score) return right.score - left.score;
         const leftCreated = Number(left.profile?.createdAt || 0);
@@ -470,8 +673,11 @@ class GatewayNostrProfileService {
       } else {
         acc.relays += 1;
       }
+      if (localCandidateSet.has(profile?.pubkey)) {
+        acc.local += 1;
+      }
       return acc;
-    }, { cache: 0, relays: 0 });
+    }, { cache: 0, relays: 0, local: 0 });
 
     return {
       profiles: scored,
@@ -495,40 +701,55 @@ class GatewayNostrProfileService {
   }
 
   async #fetchProfileEventsFromRelays(filters = []) {
-    const relayUrls = this.#getRelayUrls();
-    if (!relayUrls.length) {
-      return [];
-    }
-
-    const normalizedFilters = (Array.isArray(filters) ? filters : [])
-      .filter((entry) => entry && typeof entry === 'object')
-      .map((entry) => ({ ...entry }));
-
-    if (!normalizedFilters.length) {
-      return [];
-    }
-
-    const settled = await Promise.allSettled(
-      relayUrls.map((relayUrl) => this.#fetchFromRelay(relayUrl, normalizedFilters))
-    );
-
+    const events = await this.#fetchEventsFromRelays(filters);
     const eventsByPubkey = new Map();
-    for (const result of settled) {
-      if (result.status !== 'fulfilled') continue;
-      for (const event of result.value) {
-        if (!event || Number(event.kind) !== PROFILE_EVENT_KIND) continue;
-        const pubkey = normalizePubkey(event.pubkey);
-        if (!pubkey) continue;
-        const current = eventsByPubkey.get(pubkey);
-        const currentCreatedAt = Number(current?.created_at || 0);
-        const nextCreatedAt = Number(event?.created_at || 0);
-        if (!current || nextCreatedAt >= currentCreatedAt) {
-          eventsByPubkey.set(pubkey, event);
-        }
+    for (const event of events) {
+      if (!event || Number(event.kind) !== PROFILE_EVENT_KIND) continue;
+      const pubkey = normalizePubkey(event.pubkey);
+      if (!pubkey) continue;
+      const current = eventsByPubkey.get(pubkey);
+      const currentCreatedAt = Number(current?.created_at || 0);
+      const nextCreatedAt = Number(event?.created_at || 0);
+      if (!current || nextCreatedAt >= currentCreatedAt) {
+        eventsByPubkey.set(pubkey, event);
       }
     }
 
     return Array.from(eventsByPubkey.values());
+  }
+
+  async #fetchEventsFromRelays(filters = []) {
+    const relayUrls = this.#getRelayUrls();
+    if (!relayUrls.length) return [];
+
+    const normalizedFilters = (Array.isArray(filters) ? filters : [])
+      .filter((entry) => entry && typeof entry === 'object')
+      .map((entry) => ({ ...entry }));
+    if (!normalizedFilters.length) return [];
+
+    const settled = await Promise.allSettled(
+      relayUrls.map((relayUrl) => this.#fetchFromRelay(relayUrl, normalizedFilters))
+    );
+    const eventsById = new Map();
+    const eventsWithoutId = [];
+    for (const result of settled) {
+      if (result.status !== 'fulfilled') continue;
+      for (const event of result.value) {
+        if (!event || typeof event !== 'object') continue;
+        const eventId = typeof event.id === 'string' ? event.id : '';
+        if (eventId) {
+          const existing = eventsById.get(eventId);
+          const existingCreatedAt = Number(existing?.created_at || 0);
+          const nextCreatedAt = Number(event?.created_at || 0);
+          if (!existing || nextCreatedAt >= existingCreatedAt) {
+            eventsById.set(eventId, event);
+          }
+          continue;
+        }
+        eventsWithoutId.push(event);
+      }
+    }
+    return [...eventsById.values(), ...eventsWithoutId];
   }
 
   async #fetchFromRelay(relayUrl, filters) {

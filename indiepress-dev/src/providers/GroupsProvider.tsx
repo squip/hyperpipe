@@ -740,6 +740,24 @@ const buildMembershipPublishTargets = (
   return Array.from(targets)
 }
 
+const appendHypertunaGroupTags = (
+  tags: string[][],
+  groupId: string,
+  options?: {
+    includeGroupTag?: boolean
+  }
+) => {
+  if (!groupId.includes(':')) return tags
+  const includeGroupTag = options?.includeGroupTag !== false
+  if (includeGroupTag && !tags.some((tag) => tag[0] === 'hypertuna')) {
+    tags.push(['hypertuna', groupId])
+  }
+  if (!tags.some((tag) => tag[0] === 'i' && tag[1] === HYPERTUNA_IDENTIFIER_TAG)) {
+    tags.push(['i', HYPERTUNA_IDENTIFIER_TAG])
+  }
+  return tags
+}
+
 const mergeMembershipEvents = <T extends { id?: string | null }>(primary: T[], shadow: T[]) => {
   if (!shadow.length) return primary
   const seenIds = new Set(primary.map((event) => event?.id).filter((id): id is string => !!id))
@@ -3514,7 +3532,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const draftEvent: TDraftEvent = {
         kind: 9022,
         created_at: Math.floor(Date.now() / 1000),
-        tags: [['h', groupId]],
+        tags: appendHypertunaGroupTags([['h', groupId]], groupId),
         content: reason ?? ''
       }
       const provisional = getProvisionalGroupMetadata(groupId, resolved || relay || undefined)
@@ -3549,7 +3567,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const shadowLeaveEvent: TDraftEvent = {
         kind: 9022,
         created_at: Math.floor(Date.now() / 1000),
-        tags: [['h', shadowRef]],
+        tags: appendHypertunaGroupTags([['h', shadowRef]], groupId, { includeGroupTag: false }),
         content: ''
       }
       const shadowTargets =
@@ -3928,10 +3946,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         const memberEvent: TDraftEvent = {
           kind: 9000,
           created_at: Math.floor(Date.now() / 1000),
-          tags: [
-            ['h', identifier],
-            ['p', pubkey]
-          ],
+          tags: appendHypertunaGroupTags(
+            [
+              ['h', identifier],
+              ['p', pubkey]
+            ],
+            identifier
+          ),
           content: ''
         }
         try {
@@ -4526,7 +4547,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const sendJoinRequest = useCallback(
     async (groupId: string, relay?: string, code?: string, reason?: string) => {
       if (!pubkey) throw new Error('Not logged in')
-      const tags: string[][] = [['h', groupId]]
+      const tags: string[][] = appendHypertunaGroupTags([['h', groupId]], groupId)
       if (code) {
         tags.push(['code', code])
       }
@@ -4771,9 +4792,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           })
           const inviteTags: string[][] = [
             ['h', groupId],
-            ['p', invitee],
-            ['i', 'hypertuna']
+            ['p', invitee]
           ]
+          appendHypertunaGroupTags(inviteTags, groupId)
+          // Legacy compatibility for older clients that still filter on i=hypertuna.
+          if (!inviteTags.some((tag) => tag[0] === 'i' && tag[1] === 'hypertuna')) {
+            inviteTags.push(['i', 'hypertuna'])
+          }
           if (inviteName) inviteTags.push(['name', inviteName])
           if (inviteAbout) inviteTags.push(['about', inviteAbout])
           if (invitePicture) inviteTags.push(['picture', invitePicture])
@@ -4784,10 +4809,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             const putUser: TDraftEvent = {
               kind: 9000,
               created_at: Math.floor(Date.now() / 1000),
-              tags: [
-                ['h', groupId],
-                ['p', invitee, 'member', token]
-              ],
+              tags: appendHypertunaGroupTags(
+                [
+                  ['h', groupId],
+                  ['p', invitee, 'member', token]
+                ],
+                groupId
+              ),
               content: ''
             }
             if (membershipRelayUrls.length) {
@@ -5026,8 +5054,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         commandTags.push([data.isPublic ? 'public' : 'private'])
       if (typeof data.isOpen === 'boolean') commandTags.push([data.isOpen ? 'open' : 'closed'])
       if (shouldUpdateGateways) commandTags.push(...buildGatewayTags(nextGatewayTags))
+      const hasCommandPayload = commandTags.length > 1
+      if (hasCommandPayload) {
+        appendHypertunaGroupTags(commandTags, groupId)
+      }
 
-      if (commandTags.length > 1) {
+      if (hasCommandPayload) {
         const draftEvent: TDraftEvent = {
           kind: 9002,
           created_at: Math.floor(Date.now() / 1000),
@@ -5151,10 +5183,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const draftEvent: TDraftEvent = {
         kind: 9000,
         created_at: Math.floor(Date.now() / 1000),
-        tags: [
-          ['h', groupId],
-          ['p', targetPubkey]
-        ],
+        tags: appendHypertunaGroupTags(
+          [
+            ['h', groupId],
+            ['p', targetPubkey]
+          ],
+          groupId
+        ),
         content: ''
       }
       await publish(draftEvent, { specifiedRelayUrls: relayUrls })
@@ -5209,10 +5244,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const draftEvent: TDraftEvent = {
         kind: 9001,
         created_at: Math.floor(Date.now() / 1000),
-        tags: [
-          ['h', groupId],
-          ['p', targetPubkey]
-        ],
+        tags: appendHypertunaGroupTags(
+          [
+            ['h', groupId],
+            ['p', targetPubkey]
+          ],
+          groupId
+        ),
         content: ''
       }
       await publish(draftEvent, { specifiedRelayUrls: relayUrls })

@@ -45,6 +45,76 @@ function createSuggestionRow(profile, onSelect) {
   return row;
 }
 
+function isLikelyPubkeyQuery(query) {
+  if (typeof query !== 'string') return false;
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized.startsWith('npub1')) return true;
+  return /^[a-f0-9]{16,64}$/.test(normalized);
+}
+
+function scoreProfileForQuery(profile, query) {
+  if (!profile || !query) return 0;
+  const normalizedQuery = String(query).trim().toLowerCase();
+  if (!normalizedQuery) return 0;
+
+  const identity = normalizeProfileIdentity(profile, profile?.pubkey || null);
+  const displayName = String(identity.displayName || '').toLowerCase();
+  const secondary = String(identity.secondary || '').toLowerCase();
+  const name = String(profile?.name || '').toLowerCase();
+  const nip05 = String(profile?.nip05 || '').toLowerCase();
+  const pubkey = String(profile?.pubkey || '').toLowerCase();
+  const explicitHex = normalizeHex64(normalizedQuery);
+  const queryLooksLikePubkey = !!explicitHex || isLikelyPubkeyQuery(normalizedQuery);
+
+  let score = 0;
+  let textMatch = false;
+
+  const textFields = [displayName, name, nip05, secondary];
+  for (const field of textFields) {
+    if (!field) continue;
+    if (field === normalizedQuery) {
+      score += 1200;
+      textMatch = true;
+      continue;
+    }
+    if (field.startsWith(normalizedQuery)) {
+      score += 760;
+      textMatch = true;
+      continue;
+    }
+    if (field.includes(normalizedQuery)) {
+      score += 420;
+      textMatch = true;
+    }
+  }
+
+  if (queryLooksLikePubkey) {
+    if (explicitHex && pubkey === explicitHex) score += 2200;
+    if (pubkey.startsWith(normalizedQuery)) score += 700;
+    if (pubkey.includes(normalizedQuery)) score += 360;
+  } else if (!textMatch) {
+    return 0;
+  }
+
+  return score;
+}
+
+function rankProfilesForQuery(list, query) {
+  const scored = (Array.isArray(list) ? list : [])
+    .map((profile, index) => ({
+      profile,
+      index,
+      score: scoreProfileForQuery(profile, query)
+    }))
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => {
+      if (left.score !== right.score) return right.score - left.score;
+      return left.index - right.index;
+    });
+  return scored.map((entry) => entry.profile);
+}
+
 export function createUserPicker({
   title = 'User',
   placeholder = 'Search users',
@@ -140,7 +210,7 @@ export function createUserPicker({
       const results = await searchFn(trimmed);
       if (currentRequest !== requestId) return;
 
-      const list = Array.isArray(results) ? results : [];
+      const list = rankProfilesForQuery(results, trimmed);
       suggestions.innerHTML = '';
       if (!list.length) {
         suggestions.innerHTML = '<div class="suggestion-empty">No users found</div>';

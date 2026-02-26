@@ -176,7 +176,7 @@ function renderCurrentRoute() {
       appState.userAuthorizationTab = tabId;
       renderCurrentRoute();
     },
-    onSearchProfiles: async (query) => await searchProfiles(query, 8),
+    onSearchProfiles: async (query) => await searchProfiles(query),
     onAddAllow: async (pubkey) => runMutation(
       async () => {
         await addAllow(pubkey);

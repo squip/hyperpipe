@@ -110,11 +110,14 @@ export async function initializeSession() {
   return session.token;
 }
 
-export async function searchProfiles(query, limit = 8) {
+export async function searchProfiles(query, limit) {
   const normalizedQuery = String(query || '').trim();
   if (!normalizedQuery) return [];
-  const resolvedLimit = Number.isFinite(limit) && limit > 0 ? Math.min(Math.trunc(limit), 25) : 8;
-  const params = new URLSearchParams({ q: normalizedQuery, limit: String(resolvedLimit) });
+  const params = new URLSearchParams({ q: normalizedQuery });
+  if (Number.isFinite(limit) && limit > 0) {
+    const resolvedLimit = Math.min(Math.trunc(limit), 25);
+    params.set('limit', String(resolvedLimit));
+  }
   const payload = await request(`/api/admin/profiles/search?${params.toString()}`);
   return Array.isArray(payload?.profiles) ? payload.profiles : [];
 }

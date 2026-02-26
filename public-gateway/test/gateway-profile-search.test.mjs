@@ -32,16 +32,39 @@ function createProfileEvent({ pubkey, createdAt, metadata }) {
   };
 }
 
-function matchesFilter(event, filter = {}) {
+function buildHexPubkeyFromNumber(value) {
+  const numeric = Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+  return numeric.toString(16).padStart(64, '0').slice(-64);
+}
+
+function matchesFilter(event, filter = {}, { supportsSearch = true } = {}) {
   if (!event || !filter) return false;
   if (Array.isArray(filter.kinds) && filter.kinds.length && !filter.kinds.includes(event.kind)) return false;
   if (Array.isArray(filter.authors) && filter.authors.length && !filter.authors.includes(event.pubkey)) return false;
   if (Number.isFinite(filter.since) && event.created_at < filter.since) return false;
   if (Number.isFinite(filter.until) && event.created_at > filter.until) return false;
+  if (supportsSearch && typeof filter.search === 'string' && filter.search.trim()) {
+    const query = filter.search.trim().toLowerCase();
+    let metadata = {};
+    try {
+      metadata = JSON.parse(String(event.content || '{}')) || {};
+    } catch {
+      metadata = {};
+    }
+    const haystack = [
+      String(metadata?.display_name || ''),
+      String(metadata?.name || ''),
+      String(metadata?.nip05 || ''),
+      String(event.pubkey || '')
+    ]
+      .join(' ')
+      .toLowerCase();
+    if (!haystack.includes(query)) return false;
+  }
   return true;
 }
 
-async function createMockNostrRelay(events = []) {
+async function createMockNostrRelay(events = [], { supportsSearch = true } = {}) {
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
 
   server.on('connection', (socket) => {
@@ -61,7 +84,7 @@ async function createMockNostrRelay(events = []) {
       const emitted = new Set();
       for (const filter of filters) {
         const matched = events
-          .filter((event) => matchesFilter(event, filter))
+          .filter((event) => matchesFilter(event, filter, { supportsSearch }))
           .sort((left, right) => Number(right.created_at || 0) - Number(left.created_at || 0));
         const limited = Number.isFinite(filter?.limit) && filter.limit > 0
           ? matched.slice(0, Math.trunc(filter.limit))
@@ -283,6 +306,107 @@ test('GatewayNostrProfileService resolves and searches relay-backed profile meta
   }
 });
 
+test('GatewayNostrProfileService search avoids pubkey-noise for human text queries', async () => {
+  const deadPubkey = 'dead'.repeat(16);
+  const beefPubkey = 'beef'.repeat(16);
+  const relay = await createMockNostrRelay([
+    createProfileEvent({
+      pubkey: deadPubkey,
+      createdAt: 1_730_000_301,
+      metadata: {
+        display_name: 'Harbor Operator',
+        name: 'harbor'
+      }
+    }),
+    createProfileEvent({
+      pubkey: beefPubkey,
+      createdAt: 1_730_000_302,
+      metadata: {
+        display_name: 'Generic User',
+        name: 'generic'
+      }
+    })
+  ]);
+
+  const service = new GatewayNostrProfileService({
+    logger: createTestLogger(),
+    relayUrls: [relay.url],
+    queryTimeoutMs: 1500,
+    cacheTtlSec: 600,
+    defaultSearchLimit: 10
+  });
+
+  try {
+    const humanQuery = await service.searchProfiles('beef', 10);
+    assert.equal(humanQuery.profiles.length, 0);
+
+    const pubkeyQuery = await service.searchProfiles('beefbeefbeefbeef', 10);
+    assert.equal(pubkeyQuery.profiles.length > 0, true);
+    assert.equal(pubkeyQuery.profiles[0]?.pubkey, beefPubkey);
+  } finally {
+    await relay.stop();
+  }
+});
+
+test('GatewayNostrProfileService uses participant index candidates when relay text search is weak', async () => {
+  const targetPubkey = createKeypair().publicKeyHex;
+  const participantAuthor = buildHexPubkeyFromNumber(9_999);
+  const noiseProfiles = Array.from({ length: 180 }).map((_, index) =>
+    createProfileEvent({
+      pubkey: buildHexPubkeyFromNumber(index + 1),
+      createdAt: 1_730_100_000 + index,
+      metadata: {
+        display_name: `Noise ${index + 1}`,
+        name: `noise-${index + 1}`
+      }
+    })
+  );
+  const targetProfile = createProfileEvent({
+    pubkey: targetPubkey,
+    createdAt: 1_720_000_000,
+    metadata: {
+      display_name: 'Captain Target',
+      name: 'captain-target',
+      nip05: 'captain@hypertuna.com'
+    }
+  });
+  const participantEvent = {
+    id: `participant-${Date.now()}`,
+    pubkey: participantAuthor,
+    kind: 39002,
+    created_at: 1_730_200_000,
+    tags: [
+      ['h', 'group:example'],
+      ['i', 'hypertuna:relay'],
+      ['p', targetPubkey]
+    ],
+    content: ''
+  };
+  const relay = await createMockNostrRelay(
+    [...noiseProfiles, targetProfile, participantEvent],
+    { supportsSearch: false }
+  );
+
+  const service = new GatewayNostrProfileService({
+    logger: createTestLogger(),
+    relayUrls: [relay.url],
+    queryTimeoutMs: 1500,
+    cacheTtlSec: 600,
+    defaultSearchLimit: 8,
+    participantEventLimit: 200,
+    candidateResolveLimit: 240
+  });
+
+  try {
+    const search = await service.searchProfiles('captain', 8);
+    assert.equal(search.profiles.length > 0, true);
+    assert.equal(search.profiles[0]?.pubkey, targetPubkey);
+    assert.equal(Number(search.sources?.local || 0) >= 1, true);
+  } finally {
+    await relay.stop();
+  }
+});
+
 test('admin profile resolve/search endpoints require operator scope and return normalized payloads', async () => {
   const operator = createKeypair();
   const invitee = createKeypair().publicKeyHex;
@@ -323,6 +447,14 @@ test('admin profile resolve/search endpoints require operator scope and return n
     assert.equal(Array.isArray(search.data?.profiles), true);
     assert.equal(search.data.profiles[0]?.pubkey, invitee);
     assert.equal(typeof search.data?.profiles[0]?.displayName, 'string');
+
+    const defaultLimitSearch = await requestJson(gateway.baseUrl, '/api/admin/profiles/search?q=invitee', {
+      headers: {
+        authorization: `Bearer ${token}`
+      }
+    });
+    assert.equal(defaultLimitSearch.ok, true);
+    assert.equal(defaultLimitSearch.data?.limit, 10);
 
     const resolve = await requestJson(
       gateway.baseUrl,

@@ -107,7 +107,10 @@ const DEFAULT_CONFIG = {
     adminProfileSearchLimit: Number(process.env.GATEWAY_ADMIN_PROFILE_SEARCH_LIMIT || 12),
     adminProfileQueryTimeoutMs: Number(process.env.GATEWAY_ADMIN_PROFILE_QUERY_TIMEOUT_MS || 4000),
     adminProfileCacheTtlSec: Number(process.env.GATEWAY_ADMIN_PROFILE_CACHE_TTL_SEC || 1800),
-    adminProfileSearchRelays: parseCsvValues(process.env.GATEWAY_ADMIN_PROFILE_SEARCH_RELAYS)
+    adminProfileSearchRelays: parseCsvValues(process.env.GATEWAY_ADMIN_PROFILE_SEARCH_RELAYS),
+    adminProfileParticipantRefreshMs: Number(process.env.GATEWAY_ADMIN_PROFILE_PARTICIPANT_REFRESH_MS || (2 * 60 * 1000)),
+    adminProfileParticipantEventLimit: Number(process.env.GATEWAY_ADMIN_PROFILE_PARTICIPANT_EVENT_LIMIT || 800),
+    adminProfileCandidateResolveLimit: Number(process.env.GATEWAY_ADMIN_PROFILE_CANDIDATE_RESOLVE_LIMIT || 240)
   }
 };
 

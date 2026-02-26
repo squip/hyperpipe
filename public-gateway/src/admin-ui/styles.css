@@ -10,6 +10,7 @@
   --primary-ink: #ffffff;
   --danger: #c1283d;
   --shadow: 0 12px 28px rgba(16, 33, 50, 0.08);
+  --sidebar-nav-item-height: 44px;
 }
 
 * {
@@ -171,6 +172,7 @@ select:focus {
   padding: 1.1rem;
   display: grid;
   grid-template-rows: auto 1fr;
+  align-content: start;
   gap: 1rem;
 }
 
@@ -184,7 +186,9 @@ select:focus {
 }
 
 .sidebar-nav {
-  display: grid;
+  display: flex;
+  flex-direction: column;
+  align-content: start;
   gap: 0.4rem;
 }
 
@@ -194,7 +198,11 @@ select:focus {
   background: transparent;
   color: inherit;
   text-align: left;
-  padding: 0.6rem 0.7rem;
+  min-height: var(--sidebar-nav-item-height);
+  height: var(--sidebar-nav-item-height);
+  padding: 0 0.7rem;
+  display: flex;
+  align-items: center;
   cursor: pointer;
 }
 
