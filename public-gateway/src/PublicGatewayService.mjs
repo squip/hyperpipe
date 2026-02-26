@@ -50,6 +50,7 @@ import GatewayPolicyService from './GatewayPolicyService.mjs';
 import GatewayAuthService, { parseBearerToken } from './GatewayAuthService.mjs';
 import GatewayEventPublisher from './GatewayEventPublisher.mjs';
 import GatewayInviteService from './GatewayInviteService.mjs';
+import GatewayNostrProfileService from './GatewayNostrProfileService.mjs';
 import { publishGatewayEventToNostrRelays } from './GatewayNostrPublisher.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
@@ -246,6 +247,21 @@ class PublicGatewayService {
       gatewayOrigin: this.gatewayOrigin,
       policyService: this.gatewayPolicyService,
       eventRelayPublisher: (event, meta) => this.#publishGatewayEventToNostrRelays(event, meta)
+    });
+    this.gatewayProfileService = new GatewayNostrProfileService({
+      logger: this.logger,
+      relayUrls: this.config?.gateway?.adminProfileSearchRelays || [],
+      getRelayUrls: () => {
+        const configuredRelays = Array.isArray(this.config?.gateway?.adminProfileSearchRelays)
+          ? this.config.gateway.adminProfileSearchRelays
+          : [];
+        if (configuredRelays.length) return configuredRelays;
+        const snapshot = this.gatewayPolicyService?.getSnapshot?.() || {};
+        return Array.isArray(snapshot.discoveryRelays) ? snapshot.discoveryRelays : [];
+      },
+      queryTimeoutMs: this.config?.gateway?.adminProfileQueryTimeoutMs || 4000,
+      cacheTtlSec: this.config?.gateway?.adminProfileCacheTtlSec || 1800,
+      defaultSearchLimit: this.config?.gateway?.adminProfileSearchLimit || 12
     });
 
     if (this.dispatcher) {
@@ -492,6 +508,8 @@ class PublicGatewayService {
     app.delete('/api/gateway/ban-list/:pubkey', (req, res) => this.#handleGatewayBanRemove(req, res));
     app.get('/api/admin/overview', (req, res) => this.#handleAdminOverview(req, res));
     app.get('/api/admin/metrics/summary', (req, res) => this.#handleAdminMetricsSummary(req, res));
+    app.get('/api/admin/profiles/resolve', (req, res) => this.#handleAdminProfilesResolve(req, res));
+    app.get('/api/admin/profiles/search', (req, res) => this.#handleAdminProfilesSearch(req, res));
     app.get('/api/admin/activity', (req, res) => this.#handleAdminActivity(req, res));
     app.get('/api/admin/invites', (req, res) => this.#handleAdminInvites(req, res));
     app.post('/api/admin/actions/republish-metadata', (req, res) => this.#handleAdminRepublishMetadata(req, res));
@@ -513,7 +531,7 @@ class PublicGatewayService {
         "font-src 'self' https: data:",
         "form-action 'self'",
         "frame-ancestors 'self'",
-        "img-src 'self' data:",
+        "img-src 'self' https: data: blob:",
         "object-src 'none'",
         "script-src 'self' 'unsafe-inline'",
         "script-src-attr 'none'",
@@ -3929,6 +3947,71 @@ class PublicGatewayService {
       blindPeer: blindPeerStatus,
       metrics: summary
     });
+  }
+
+  async #handleAdminProfilesResolve(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    const rawPubkeys = typeof req.query?.pubkeys === 'string'
+      ? req.query.pubkeys
+      : Array.isArray(req.query?.pubkeys)
+        ? req.query.pubkeys.join(',')
+        : '';
+    const pubkeys = Array.from(
+      new Set(
+        String(rawPubkeys || '')
+          .split(',')
+          .map((entry) => this.#normalizePubkeyHex(entry))
+          .filter((entry) => !!entry)
+      )
+    ).slice(0, 200);
+
+    if (!pubkeys.length) {
+      return res.status(400).json({ error: 'invalid-pubkeys' });
+    }
+
+    try {
+      const resolved = await this.gatewayProfileService.resolvePubkeys(pubkeys);
+      return res.json({
+        status: 'ok',
+        profiles: Array.isArray(resolved?.profiles) ? resolved.profiles : [],
+        missing: Array.isArray(resolved?.missing) ? resolved.missing : [],
+        sources: resolved?.sources || { cache: 0, relays: 0 }
+      });
+    } catch (error) {
+      return res.status(500).json({ error: 'profile-resolve-failed', message: error?.message || String(error) });
+    }
+  }
+
+  async #handleAdminProfilesSearch(req, res) {
+    const auth = this.#requireGatewayScope(req, res, ['gateway:operator']);
+    if (!auth) return;
+    const query = typeof req.query?.q === 'string' ? req.query.q.trim() : '';
+    if (!query) {
+      return res.status(400).json({ error: 'missing-query' });
+    }
+
+    const limitRaw = Number(req.query?.limit);
+    const configuredDefault = Number(this.config?.gateway?.adminProfileSearchLimit || 12);
+    const fallbackLimit = Number.isFinite(configuredDefault) && configuredDefault > 0
+      ? Math.min(Math.trunc(configuredDefault), 50)
+      : 12;
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0
+      ? Math.min(Math.trunc(limitRaw), 50)
+      : fallbackLimit;
+
+    try {
+      const result = await this.gatewayProfileService.searchProfiles(query, limit);
+      return res.json({
+        status: 'ok',
+        query,
+        limit,
+        profiles: Array.isArray(result?.profiles) ? result.profiles : [],
+        sources: result?.sources || { cache: 0, relays: 0 }
+      });
+    } catch (error) {
+      return res.status(500).json({ error: 'profile-search-failed', message: error?.message || String(error) });
+    }
   }
 
   async #handleAdminActivity(req, res) {

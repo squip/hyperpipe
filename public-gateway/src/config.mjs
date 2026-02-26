@@ -103,7 +103,11 @@ const DEFAULT_CONFIG = {
     adminSessionCookieName: process.env.GATEWAY_ADMIN_SESSION_COOKIE_NAME || 'ht_gateway_admin',
     adminSessionTtlSec: Number(process.env.GATEWAY_ADMIN_SESSION_TTL_SEC || 3600),
     adminActivityRetention: Number(process.env.GATEWAY_ADMIN_ACTIVITY_RETENTION || 5000),
-    adminStateRedisPrefix: process.env.GATEWAY_ADMIN_STATE_REDIS_PREFIX || 'gateway:admin:'
+    adminStateRedisPrefix: process.env.GATEWAY_ADMIN_STATE_REDIS_PREFIX || 'gateway:admin:',
+    adminProfileSearchLimit: Number(process.env.GATEWAY_ADMIN_PROFILE_SEARCH_LIMIT || 12),
+    adminProfileQueryTimeoutMs: Number(process.env.GATEWAY_ADMIN_PROFILE_QUERY_TIMEOUT_MS || 4000),
+    adminProfileCacheTtlSec: Number(process.env.GATEWAY_ADMIN_PROFILE_CACHE_TTL_SEC || 1800),
+    adminProfileSearchRelays: parseCsvValues(process.env.GATEWAY_ADMIN_PROFILE_SEARCH_RELAYS)
   }
 };
 
