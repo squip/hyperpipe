@@ -5,6 +5,7 @@
   "license": "Apache-2.0",
   "scripts": {
     "dev": "pear run -d .",
+    "postinstall": "node ./scripts/patch-hyperbee.cjs",
     "test": "brittle test/*.test.js",
     "test:ipc": "brittle test/group-file-ipc.test.js test/public-gateway-hyperbee-adapter.test.js"
   },

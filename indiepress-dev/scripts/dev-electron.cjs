@@ -42,7 +42,12 @@ async function main() {
     const electron = spawn('npm', ['run', 'dev'], {
       cwd: electronDir,
       stdio: 'inherit',
-      env: { ...process.env, RENDERER_URL: rendererUrl }
+      env: {
+        ...process.env,
+        RENDERER_URL: rendererUrl,
+        // Keep worker runtime aligned with the Node version running this script.
+        HYPERTUNA_WORKER_NODE_BIN: process.execPath
+      }
     })
 
     electron.on('exit', (code) => {

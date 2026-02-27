@@ -1,7 +1,7 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const { promises: fs, existsSync } = require('fs');
-const { spawn, execFile } = require('child_process');
+const { spawn, execFile, spawnSync } = require('child_process');
 const { promisify } = require('util');
 const { PluginSupervisor } = require('./plugin-supervisor.cjs');
 
@@ -478,6 +478,45 @@ function applyUrlQuery(baseUrl, queryString) {
   }
 }
 
+function resolveWorkerRuntime() {
+  const candidates = [];
+  const envWorkerBin = typeof process.env.HYPERTUNA_WORKER_NODE_BIN === 'string'
+    ? process.env.HYPERTUNA_WORKER_NODE_BIN.trim()
+    : '';
+  const envNodeBin = typeof process.env.HYPERTUNA_NODE_BIN === 'string'
+    ? process.env.HYPERTUNA_NODE_BIN.trim()
+    : '';
+  const nvmBin = typeof process.env.NVM_BIN === 'string'
+    ? process.env.NVM_BIN.trim()
+    : '';
+
+  if (envWorkerBin) candidates.push({ cmd: envWorkerBin, source: 'HYPERTUNA_WORKER_NODE_BIN' });
+  if (envNodeBin) candidates.push({ cmd: envNodeBin, source: 'HYPERTUNA_NODE_BIN' });
+  if (nvmBin) candidates.push({ cmd: path.join(nvmBin, 'node'), source: 'NVM_BIN' });
+  candidates.push({ cmd: 'node', source: 'PATH' });
+
+  for (const candidate of candidates) {
+    try {
+      const probe = spawnSync(candidate.cmd, ['-v'], { encoding: 'utf8' });
+      if (probe.status === 0) {
+        return {
+          command: candidate.cmd,
+          source: candidate.source,
+          envPatch: {}
+        };
+      }
+    } catch (_) {
+      // Keep probing candidates.
+    }
+  }
+
+  return {
+    command: process.execPath,
+    source: 'electron-fallback',
+    envPatch: { ELECTRON_RUN_AS_NODE: '1' }
+  };
+}
+
 async function appendLogLineWithBackoff(line) {
   const payload = typeof line === 'string' ? line : String(line ?? '');
   if (!payload) return;
@@ -594,12 +633,15 @@ async function startWorkerProcess(workerConfig = null) {
   try {
     await ensureStorageDir();
 
+    const workerRuntime = resolveWorkerRuntime();
+    console.log('[Main] Worker runtime resolved', workerRuntime);
+
     // IMPORTANT: STORAGE_DIR is the base; worker will scope by USER_KEY to avoid double-nesting.
-    workerProcess = spawn(process.execPath, [workerEntry], {
+    workerProcess = spawn(workerRuntime.command, [workerEntry], {
       cwd: workerRoot,
       env: {
         ...process.env,
-        ELECTRON_RUN_AS_NODE: '1',
+        ...workerRuntime.envPatch,
         APP_DIR: workerRoot,
         STORAGE_DIR: storagePath,
         USER_KEY: nextUserKey
