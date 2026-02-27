@@ -1,0 +1,28 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "300", "1"]
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+  public-gateway:
+    build:
+      context: ../../../
+      dockerfile: public-gateway/Dockerfile
+    env_file:
+      - ./.env
+    depends_on:
+      - redis
+    ports:
+      - "${GATEWAY_BIND_PORT}:4430"
+    restart: unless-stopped
+    volumes:
+      - gateway-relay-data:/data/gateway-relay
+      - gateway-blind-peer-data:/data/blind-peer
+      - /home/squip/public-gateway-logs:/app/public-gateway/logs
+
+volumes:
+  redis-data:
+  gateway-relay-data:
+  gateway-blind-peer-data:

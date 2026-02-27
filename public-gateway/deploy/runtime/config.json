@@ -1,0 +1,25 @@
+{
+  "profile": "local",
+  "gatewayBindPort": "4450",
+  "gatewayHost": "",
+  "letsencryptEmail": "",
+  "gatewayPublicUrl": "http://127.0.0.1:4450",
+  "registrationSecret": "dry-reg-secret-20260218",
+  "operatorNsecHex": "6365eb1ed4c3e82e4fd9ffc50f3f4fa30d6ddf51376395fa42f76d4c97225f0b",
+  "operatorPubkeyHex": "68121a41ddeca140f344206a8c18734bd738e3eb69d32a652b99c2cbef13c48d",
+  "policy": "OPEN",
+  "inviteOnly": false,
+  "allowList": [],
+  "banList": [],
+  "discoveryRelays": [
+    "wss://relay.damus.io",
+    "wss://nos.lol"
+  ],
+  "authJwtSecret": "dry-jwt-secret-20260218",
+  "metricsEnabled": true,
+  "runtime": {
+    "composeFile": "/Users/essorensen/hypertuna-electron/public-gateway/deploy/runtime/docker-compose.yml",
+    "envFile": "/Users/essorensen/hypertuna-electron/public-gateway/deploy/runtime/.env",
+    "updatedAt": 1771448435750
+  }
+}
