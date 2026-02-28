@@ -3316,7 +3316,7 @@ export class TuiController {
 
       const gatewayMode = input.gatewayMode === 'disabled' ? 'disabled' : 'auto'
       if (gatewayMode === 'auto') {
-        void this.ensureGatewayParityReady({
+        await this.ensureGatewayParityReady({
           reason: 'start-join-flow',
           refreshPublicGateway: true
         }).catch((error) => {

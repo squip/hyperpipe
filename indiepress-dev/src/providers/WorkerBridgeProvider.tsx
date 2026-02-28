@@ -439,6 +439,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
   const autostartEnabledRef = useRef(autostartEnabled)
   const sessionStopRequestedRef = useRef(sessionStopRequested)
   const identityReadyRef = useRef(identityReady)
+  const relayServerReadyRef = useRef(relayServerReady)
   const relayCreateResolversRef = useRef<
     Array<{
       resolve: (payload: RelayCreatedPayload) => void
@@ -471,6 +472,10 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
   useEffect(() => {
     identityReadyRef.current = identityReady
   }, [identityReady])
+
+  useEffect(() => {
+    relayServerReadyRef.current = relayServerReady
+  }, [relayServerReady])
 
   const clearRestartTimeout = useCallback(() => {
     if (restartTimeoutRef.current == null) return
@@ -611,6 +616,70 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     [buildWorkerConfig, clearRestartTimeout, identityReady]
   )
 
+  const waitForRelayServerReady = useCallback(async (timeoutMs = 45_000) => {
+    if (relayServerReadyRef.current) return
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < timeoutMs) {
+      await new Promise((resolve) => window.setTimeout(resolve, 250))
+      if (relayServerReadyRef.current) return
+    }
+    throw new Error(`Timed out waiting for relay server readiness (${timeoutMs}ms)`)
+  }, [])
+
+  const ensureWorkerIdentityAligned = useCallback(async () => {
+    if (!isElectron() || !identityReady || !userKey) return
+    const expectedUserKey = userKey.toLowerCase()
+    const expectedPubkey = pubkeyHex ? pubkeyHex.toLowerCase() : null
+    let workerUserKey: string | null = null
+    let workerPubkey: string | null = null
+
+    try {
+      const result = await electronIpc.getWorkerIdentity()
+      if (result?.success && result.identity && typeof result.identity === 'object') {
+        const identity = result.identity as {
+          userKey?: string | null
+          pubkeyHex?: string | null
+        }
+        workerUserKey =
+          typeof identity.userKey === 'string' && identity.userKey
+            ? identity.userKey.toLowerCase()
+            : null
+        workerPubkey =
+          typeof identity.pubkeyHex === 'string' && identity.pubkeyHex
+            ? identity.pubkeyHex.toLowerCase()
+            : null
+      }
+    } catch (_err) {
+      // best effort; fallback to status payload below
+    }
+
+    if (!workerUserKey) {
+      const statusUser = statusV1?.state?.user
+      workerUserKey =
+        typeof statusUser?.userKey === 'string' && statusUser.userKey
+          ? statusUser.userKey.toLowerCase()
+          : null
+      if (!workerPubkey) {
+        workerPubkey =
+          typeof statusUser?.pubkeyHex === 'string' && statusUser.pubkeyHex
+            ? statusUser.pubkeyHex.toLowerCase()
+            : null
+      }
+    }
+
+    const userMismatch = !!workerUserKey && workerUserKey !== expectedUserKey
+    const pubkeyMismatch = !!expectedPubkey && !!workerPubkey && workerPubkey !== expectedPubkey
+    if (!userMismatch && !pubkeyMismatch) return
+
+    console.warn('[WorkerBridge] Worker identity mismatch detected; restarting worker with current account', {
+      workerUserKey: workerUserKey || null,
+      expectedUserKey,
+      workerPubkey: workerPubkey || null,
+      expectedPubkey
+    })
+    await startWorkerInternal({ resetRestartAttempts: true })
+  }, [identityReady, pubkeyHex, startWorkerInternal, statusV1, userKey])
+
   const clearJoinFlow = useCallback((publicIdentifier: string) => {
     const key = String(publicIdentifier || '').trim()
     if (!key) return
@@ -677,13 +746,15 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       if (!statusV1) {
         await startWorkerInternal({ resetRestartAttempts: false })
       }
+      await ensureWorkerIdentityAligned()
+      await waitForRelayServerReady()
 
       const gatewayMode = opts?.gatewayMode === 'disabled' ? 'disabled' : 'auto'
       if (gatewayMode === 'auto') {
         if (!gatewayStatus?.running) {
-          void electronIpc.sendToWorker({ type: 'start-gateway', options: {} }).catch(() => {})
+          await electronIpc.sendToWorker({ type: 'start-gateway', options: {} }).catch(() => {})
         }
-        void electronIpc.sendToWorker({ type: 'get-gateway-status' }).catch(() => {})
+        await electronIpc.sendToWorker({ type: 'get-gateway-status' }).catch(() => {})
       }
 
       const fileSharing = opts?.fileSharing !== false
@@ -754,7 +825,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         }
       })
     },
-    [gatewayStatus, startWorkerInternal, statusV1]
+    [ensureWorkerIdentityAligned, gatewayStatus, startWorkerInternal, statusV1, waitForRelayServerReady]
   )
 
   const createRelayInternal = useCallback(
@@ -765,6 +836,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       if (!statusV1) {
         await startWorkerInternal({ resetRestartAttempts: false })
       }
+      await ensureWorkerIdentityAligned()
+      await waitForRelayServerReady()
 
       return await new Promise<RelayCreatedPayload>((resolve, reject) => {
         const timeoutId = window.setTimeout(() => {
@@ -813,7 +886,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           })
       })
     },
-    [startWorkerInternal, statusV1]
+    [ensureWorkerIdentityAligned, startWorkerInternal, statusV1, waitForRelayServerReady]
   )
 
   const warmWorkerState = useCallback(

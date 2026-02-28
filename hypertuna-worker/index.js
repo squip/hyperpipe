@@ -196,7 +196,7 @@ const RELAY_SUBSCRIPTION_REFRESH_MAX_TRACKED = 512
 const relaySubscriptionRefreshRecent = new Map()
 const relaySubscriptionRefreshInFlight = new Map()
 const joinFlowPathHints = new Map()
-const JOIN_DIRECT_DISCOVERY_V2_DEFAULT = false
+const JOIN_DIRECT_DISCOVERY_V2_DEFAULT = true
 const JOIN_DIRECT_DISCOVERY_PROBE_TIMEOUT_MS = 4000
 const JOIN_DIRECT_DISCOVERY_PROBE_PER_PEER_TIMEOUT_MS = 2200
 const JOIN_WRITABLE_DEADLINE_MS = 60000
@@ -2350,7 +2350,29 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
       lastError = new Error('challenge missing')
       continue
     }
-    const resolvedPublicIdentifier = publicIdentifier || challengeData?.publicIdentifier || relayIdentifier
+    const challengePublicIdentifier =
+      typeof challengeData?.publicIdentifier === 'string'
+        ? challengeData.publicIdentifier.trim()
+        : ''
+    const providedPublicIdentifier =
+      typeof publicIdentifier === 'string'
+        ? publicIdentifier.trim()
+        : ''
+    const resolvedPublicIdentifier =
+      challengePublicIdentifier ||
+      providedPublicIdentifier ||
+      relayIdentifier
+    if (
+      challengePublicIdentifier &&
+      providedPublicIdentifier &&
+      challengePublicIdentifier !== providedPublicIdentifier
+    ) {
+      console.warn('[Worker] Open join append public identifier mismatch; preferring challenge identifier', {
+        relayIdentifier: previewValue(relayIdentifier, 32),
+        challengePublicIdentifier: previewValue(challengePublicIdentifier, 32),
+        providedPublicIdentifier: previewValue(providedPublicIdentifier, 32)
+      })
+    }
     const tags = [
       ['relay', base],
       ['challenge', challenge],
@@ -5531,6 +5553,7 @@ async function handleMessageObject(message) {
     }
 
     case 'get-worker-identity': {
+      const requestId = extractMessageRequestId(message)
       const pubkeyHex =
         typeof config?.nostr_pubkey_hex === 'string'
           ? config.nostr_pubkey_hex
@@ -5543,13 +5566,15 @@ async function handleMessageObject(message) {
           : typeof storedParentConfig?.userKey === 'string'
             ? storedParentConfig.userKey
             : null
+      const identity = {
+        pubkeyHex: pubkeyHex ? String(pubkeyHex) : null,
+        userKey: userKey || null
+      }
       sendMessage({
         type: 'worker-identity',
-        data: {
-          pubkeyHex: pubkeyHex ? String(pubkeyHex) : null,
-          userKey: userKey || null
-        }
+        data: identity
       })
+      sendWorkerResponse(requestId, { success: true, data: identity })
       break
     }
 

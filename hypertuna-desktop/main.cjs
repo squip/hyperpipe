@@ -1053,6 +1053,28 @@ ipcMain.handle('send-to-worker-await', async (_event, payload) => {
   return sendWorkerRequestAwait(authorization.message, 30000);
 });
 
+ipcMain.handle('get-worker-identity', async () => {
+  const result = await sendWorkerRequestAwait(
+    {
+      message: {
+        type: 'get-worker-identity'
+      },
+      timeoutMs: 5000
+    },
+    5000
+  );
+  if (!result?.success) {
+    return {
+      success: false,
+      error: result?.error || 'Failed to read worker identity'
+    };
+  }
+  return {
+    success: true,
+    identity: result?.data || null
+  };
+});
+
 ipcMain.handle('media-command', async (_event, payload) => {
   const command = payload && typeof payload === 'object' ? payload : {};
   const type = typeof command.type === 'string' ? command.type : '';

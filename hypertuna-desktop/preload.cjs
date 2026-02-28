@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   stopWorker: () => ipcRenderer.invoke('stop-worker'),
   sendToWorker: (message) => ipcRenderer.invoke('send-to-worker', message),
   sendToWorkerAwait: (payload) => ipcRenderer.invoke('send-to-worker-await', payload),
+  getWorkerIdentity: () => ipcRenderer.invoke('get-worker-identity'),
   mediaCommand: (payload) => ipcRenderer.invoke('media-command', payload),
   listPlugins: () => ipcRenderer.invoke('plugin-list'),
   discoverPlugin: (payload) => ipcRenderer.invoke('plugin-discover', payload),
