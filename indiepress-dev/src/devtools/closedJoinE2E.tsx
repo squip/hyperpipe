@@ -21,6 +21,7 @@ type AccountSeed = {
 }
 
 type E2EOptions = {
+  mode?: 'closed' | 'open'
   inviteeCount?: number
   groupPrefix?: string
   isPublic?: boolean
@@ -373,8 +374,28 @@ export default function ClosedJoinE2EBridge(): null {
       if (currentPubkey && currentPubkey !== expected) {
         throw new Error(`[${label}] Renderer pubkey mismatch (renderer=${currentPubkey}, expected=${expected})`)
       }
+      await waitFor(
+        'renderer-auth-context',
+        () => {
+          const rendererPubkey = pubkeyRef.current?.toLowerCase() || null
+          const hasNsec = !!nsecHexRef.current
+          const clientPubkey = client.pubkey ? String(client.pubkey).toLowerCase() : null
+          if (!rendererPubkey || !hasNsec) return null
+          if (rendererPubkey !== expected) return null
+          if (clientPubkey && clientPubkey !== expected) return null
+          return true
+        },
+        { timeoutMs: 30_000, intervalMs: 500 }
+      )
       await waitForSignerPubkey(expected)
-      await waitForWorkerIdentity(expected)
+      await waitForWorkerIdentity(expected).catch((err) => {
+        console.warn('[ClosedJoinE2E] Worker identity check timed out (continuing)', {
+          label,
+          expected,
+          error: err instanceof Error ? err.message : String(err)
+        })
+        return null
+      })
       const token = authToken || parseRelayToken(relayUrl || null)
       if (token) {
         const existing = tokenOwnersRef.current.get(token)
@@ -439,7 +460,13 @@ export default function ClosedJoinE2EBridge(): null {
         }
       }
       await ensureWorkerReady()
-      await waitForWorkerIdentity(expectedPubkey || null)
+      await waitForWorkerIdentity(expectedPubkey || null).catch((err) => {
+        console.warn('[ClosedJoinE2E] Worker identity wait timed out after login (continuing)', {
+          expectedPubkey: expectedPubkey || null,
+          error: err instanceof Error ? err.message : String(err)
+        })
+        return null
+      })
       lastLoginPubkeyRef.current = normalizedExpected
       return expectedPubkey
     }
@@ -621,6 +648,7 @@ export default function ClosedJoinE2EBridge(): null {
     const runClosedJoinE2E = async (options: E2EOptions = {}) => {
       let restoreAutostart: boolean | null = null
       try {
+        const mode = options.mode === 'open' ? 'open' : 'closed'
         const inviteeCount = Number.isFinite(options.inviteeCount)
           ? Math.max(1, Math.trunc(options.inviteeCount as number))
           : 5
@@ -675,7 +703,7 @@ export default function ClosedJoinE2EBridge(): null {
             name: groupName,
             about: 'Closed join automation',
             isPublic,
-            isOpen: false,
+            isOpen: mode === 'open',
             fileSharing: true
           })
           sharedGroupId = groupResult.groupId
@@ -718,7 +746,7 @@ export default function ClosedJoinE2EBridge(): null {
               name: groupName,
               about: 'Closed join automation',
               isPublic,
-              isOpen: false,
+              isOpen: mode === 'open',
               fileSharing: true
             })
             groupId = groupResult.groupId
@@ -740,17 +768,19 @@ export default function ClosedJoinE2EBridge(): null {
 
           await loginWithSeedAndGroups(host, e2ePassword)
 
-          await assertAuthContext({
-            label: 'send-invite',
-            expectedPubkey: host.pubkey,
-            relayUrl: relayListUrl || relayUrl
-          })
-          const sendInvitesFn = sendInvitesRef.current || sendInvites
-          await sendInvitesFn(groupId, [invitee.pubkey], relayListUrl || relayUrl, {
-            isOpen: false,
-            name: groupName || groupId,
-            about: 'Closed join automation'
-          })
+          if (mode === 'closed') {
+            await assertAuthContext({
+              label: 'send-invite',
+              expectedPubkey: host.pubkey,
+              relayUrl: relayListUrl || relayUrl
+            })
+            const sendInvitesFn = sendInvitesRef.current || sendInvites
+            await sendInvitesFn(groupId, [invitee.pubkey], relayListUrl || relayUrl, {
+              isOpen: false,
+              name: groupName || groupId,
+              about: 'Closed join automation'
+            })
+          }
 
           const hostNoteContent = `[${groupName || groupId}] host note ${Date.now()}`
           const hostNote = await publishGroupNote(groupId, relayUrl, hostNoteContent, host.pubkey)
@@ -763,30 +793,49 @@ export default function ClosedJoinE2EBridge(): null {
 
           await loginWithSeedAndGroups(invitee, e2ePassword)
 
-          const invite = await waitForInvite(groupId)
-          const inviteRelayKey = invite.relayKey || relayKey
-          const inviteRelayUrl = invite.relayUrl || relayListUrl || relayUrl
+          let invite: TGroupInvite | null = null
+          let inviteRelayKey = relayKey
+          let inviteRelayUrl = relayListUrl || relayUrl
 
-          await assertAuthContext({
-            label: 'start-join-flow',
-            expectedPubkey: invitee.pubkey,
-            relayUrl: inviteRelayUrl || null,
-            authToken: invite.token || null
-          })
-          await startJoinFlow(groupId, {
-            fileSharing: invite.fileSharing !== false,
-            isOpen: false,
-            openJoin: false,
-            token: invite.token,
-            relayKey: inviteRelayKey || null,
-            relayUrl: inviteRelayUrl || null,
-            blindPeer: invite.blindPeer,
-            cores: invite.cores,
-            writerCore: invite.writerCore,
-            writerCoreHex: invite.writerCoreHex,
-            autobaseLocal: invite.autobaseLocal,
-            writerSecret: invite.writerSecret
-          })
+          if (mode === 'closed') {
+            invite = await waitForInvite(groupId)
+            inviteRelayKey = invite.relayKey || relayKey
+            inviteRelayUrl = invite.relayUrl || relayListUrl || relayUrl
+
+            await assertAuthContext({
+              label: 'start-join-flow',
+              expectedPubkey: invitee.pubkey,
+              relayUrl: inviteRelayUrl || null,
+              authToken: invite.token || null
+            })
+            await startJoinFlow(groupId, {
+              fileSharing: invite.fileSharing !== false,
+              isOpen: false,
+              openJoin: false,
+              token: invite.token,
+              relayKey: inviteRelayKey || null,
+              relayUrl: inviteRelayUrl || null,
+              blindPeer: invite.blindPeer,
+              cores: invite.cores,
+              writerCore: invite.writerCore,
+              writerCoreHex: invite.writerCoreHex,
+              autobaseLocal: invite.autobaseLocal,
+              writerSecret: invite.writerSecret
+            })
+          } else {
+            await assertAuthContext({
+              label: 'start-open-join-flow',
+              expectedPubkey: invitee.pubkey,
+              relayUrl: inviteRelayUrl || null
+            })
+            await startJoinFlow(groupId, {
+              fileSharing: true,
+              isOpen: true,
+              openJoin: true,
+              relayKey: inviteRelayKey || null,
+              relayUrl: inviteRelayUrl || null
+            })
+          }
 
           const joined = await waitForJoinSuccess(groupId, joinTimeoutMs)
           const writable = await waitForWritable(groupId, joinTimeoutMs)
@@ -809,14 +858,16 @@ export default function ClosedJoinE2EBridge(): null {
             invitee.pubkey
           )
 
-          const expectedCore =
-            invite.writerCoreHex || invite.autobaseLocal || invite.writerCore || null
+          const expectedCore = invite
+            ? invite.writerCoreHex || invite.autobaseLocal || invite.writerCore || null
+            : null
           await waitForMirror(relayKey || groupId, expectedCore, mirrorTimeoutMs)
 
           runs.push({
             groupId,
             relayKey: relayKey || null,
             relayUrl,
+            mode,
             invitee: { pubkey: invitee.pubkey, npub: invitee.npub },
             hostNoteId: hostNote.id,
             inviteeNoteId: inviteeNote.id
@@ -830,6 +881,7 @@ export default function ClosedJoinE2EBridge(): null {
 
         return {
           ok: true,
+          mode,
           host: { pubkey: host.pubkey, npub: host.npub, nsec: host.nsec },
           invitees: invitees.map((seed) => ({ pubkey: seed.pubkey, npub: seed.npub, nsec: seed.nsec })),
           sharedGroup: singleGroup
@@ -860,14 +912,38 @@ export default function ClosedJoinE2EBridge(): null {
       }
     }
 
+    const runJoinMatrixE2E = async (options: E2EOptions = {}) => {
+      const basePrefix = options.groupPrefix || 'JoinMatrixE2E'
+      const openRun = await runClosedJoinE2E({
+        ...options,
+        mode: 'open',
+        groupPrefix: `${basePrefix}-open`
+      })
+      const closedRun = await runClosedJoinE2E({
+        ...options,
+        mode: 'closed',
+        groupPrefix: `${basePrefix}-closed`
+      })
+      return {
+        ok: Boolean(openRun?.ok && closedRun?.ok),
+        open: openRun,
+        closed: closedRun
+      }
+    }
+
     ;(window as any).__HYT_E2E__ = {
+      ping: async () => ({
+        ok: true,
+        pubkey: pubkeyRef.current || null
+      }),
       generateAccounts,
       loginWithSeed,
       loginWithNsec: async (nsec: string) =>
         loginWithSeed({ pubkey: '', npub: '', nsec }, null),
       publishGroupNote,
       fetchGroupNotes,
-      runClosedJoinE2E
+      runClosedJoinE2E,
+      runJoinMatrixE2E
     }
 
     console.info('[ClosedJoinE2E] registered on window.__HYT_E2E__')

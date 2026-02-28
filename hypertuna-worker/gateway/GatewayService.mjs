@@ -254,6 +254,7 @@ export class GatewayService extends EventEmitter {
     };
     this.publicGatewayRelayTokens = new Map();
     this.publicGatewayRelayTokenTimers = new Map();
+    this.publicGatewayRelayTokenRefreshInFlight = new Map();
     this.gatewayTelemetryTimers = new Map();
     this.gatewayProtocols = new Map();
     this.publicGatewayRelayClient = new PublicGatewayRelayClient({ logger: this.#createExternalLogger?.() || console });
@@ -543,16 +544,87 @@ export class GatewayService extends EventEmitter {
     });
   }
 
+  #normalizeRelayTokenIdentifier(relayKey) {
+    const normalized = this._normalizeRelayIdentifier(relayKey)
+      || (typeof relayKey === 'string' ? relayKey.trim() : null);
+    if (!normalized) return null;
+    if (/^[0-9a-fA-F]{64}$/.test(normalized)) {
+      return normalized.toLowerCase();
+    }
+    return normalized;
+  }
+
+  #resolveRelayTokenApiKey(relayKey) {
+    const canonical = this.#normalizeRelayTokenIdentifier(relayKey);
+    if (!canonical || canonical === relayKey) {
+      return relayKey;
+    }
+    if (this.activeRelays.has(canonical)
+      || this.publicGatewayRelayState.has(canonical)
+      || this.publicGatewayRelayTokens.has(canonical)) {
+      return canonical;
+    }
+    return relayKey;
+  }
+
+  #resolveRelayTokenCacheEntry(relayKey) {
+    if (!relayKey) return { key: null, info: null };
+    const direct = this.publicGatewayRelayTokens.get(relayKey) || null;
+    if (direct) {
+      return { key: relayKey, info: direct };
+    }
+    const canonical = this.#normalizeRelayTokenIdentifier(relayKey);
+    if (canonical && canonical !== relayKey) {
+      const info = this.publicGatewayRelayTokens.get(canonical) || null;
+      return { key: canonical, info };
+    }
+    return { key: relayKey, info: null };
+  }
+
+  #resolveRelayTokenState(relayKey) {
+    if (!relayKey) return { key: null, state: null };
+    const direct = this.publicGatewayRelayState.get(relayKey) || null;
+    if (direct) {
+      return { key: relayKey, state: direct };
+    }
+    const canonical = this.#normalizeRelayTokenIdentifier(relayKey);
+    if (canonical && canonical !== relayKey) {
+      const state = this.publicGatewayRelayState.get(canonical) || null;
+      return { key: canonical, state };
+    }
+    return { key: relayKey, state: null };
+  }
+
+  #isRecoverableRelayTokenRefreshError(error) {
+    const message = String(error?.message || '').toLowerCase();
+    return message.includes('token-mismatch')
+      || message.includes('token-stale')
+      || message.includes('no-active-token')
+      || message.includes('token-invalid')
+      || message.includes('relay-mismatch');
+  }
+
   #clearRelayToken(relayKey) {
     if (!relayKey) return;
-    const timer = this.publicGatewayRelayTokenTimers.get(relayKey);
-    if (timer) {
-      clearTimeout(timer);
-      this.publicGatewayRelayTokenTimers.delete(relayKey);
+    const canonical = this.#normalizeRelayTokenIdentifier(relayKey);
+    const candidateKeys = new Set([relayKey]);
+    if (canonical) {
+      candidateKeys.add(canonical);
     }
-    this.publicGatewayRelayTokens.delete(relayKey);
-    if (this.publicGatewayRelayState.has(relayKey)) {
-      const current = this.publicGatewayRelayState.get(relayKey);
+
+    for (const key of candidateKeys) {
+      const timer = this.publicGatewayRelayTokenTimers.get(key);
+      if (timer) {
+        clearTimeout(timer);
+        this.publicGatewayRelayTokenTimers.delete(key);
+      }
+      this.publicGatewayRelayTokenRefreshInFlight.delete(key);
+      this.publicGatewayRelayTokens.delete(key);
+    }
+
+    for (const key of candidateKeys) {
+      if (!this.publicGatewayRelayState.has(key)) continue;
+      const current = this.publicGatewayRelayState.get(key);
       if (current) {
         const next = { ...current };
         delete next.token;
@@ -560,7 +632,7 @@ export class GatewayService extends EventEmitter {
         delete next.ttlSeconds;
         delete next.connectionUrl;
         delete next.tokenIssuedAt;
-        this.publicGatewayRelayState.set(relayKey, next);
+        this.publicGatewayRelayState.set(key, next);
       }
     }
   }
@@ -571,6 +643,7 @@ export class GatewayService extends EventEmitter {
     }
     this.publicGatewayRelayTokenTimers.clear();
     this.publicGatewayRelayTokens.clear();
+    this.publicGatewayRelayTokenRefreshInFlight.clear();
     for (const [relayKey, state] of this.publicGatewayRelayState.entries()) {
       if (!state) continue;
       const next = { ...state };
@@ -585,29 +658,31 @@ export class GatewayService extends EventEmitter {
 
   #scheduleRelayTokenRetry(relayKey) {
     if (!relayKey) return;
-    const existing = this.publicGatewayRelayTokenTimers.get(relayKey);
+    const timerKey = this.#normalizeRelayTokenIdentifier(relayKey) || relayKey;
+    const existing = this.publicGatewayRelayTokenTimers.get(timerKey);
     if (existing) {
       clearTimeout(existing);
-      this.publicGatewayRelayTokenTimers.delete(relayKey);
+      this.publicGatewayRelayTokenTimers.delete(timerKey);
     }
     const handle = setTimeout(() => {
-      this.publicGatewayRelayTokenTimers.delete(relayKey);
+      this.publicGatewayRelayTokenTimers.delete(timerKey);
       this.#refreshRelayToken(relayKey, { force: true }).catch((error) => {
         this.log('warn', `[PublicGateway] Token retry failed for ${relayKey}: ${error.message}`);
         this.#scheduleRelayTokenRetry(relayKey);
       });
     }, 30_000);
     handle.unref?.();
-    this.publicGatewayRelayTokenTimers.set(relayKey, handle);
+    this.publicGatewayRelayTokenTimers.set(timerKey, handle);
   }
 
   #scheduleRelayTokenRefresh(relayKey, targetTime, fallbackExpiresAt = null) {
     if (!relayKey) return;
     if (!Number.isFinite(targetTime)) return;
-    const existing = this.publicGatewayRelayTokenTimers.get(relayKey);
+    const timerKey = this.#normalizeRelayTokenIdentifier(relayKey) || relayKey;
+    const existing = this.publicGatewayRelayTokenTimers.get(timerKey);
     if (existing) {
       clearTimeout(existing);
-      this.publicGatewayRelayTokenTimers.delete(relayKey);
+      this.publicGatewayRelayTokenTimers.delete(timerKey);
     }
     const now = Date.now();
     let delay = targetTime - now;
@@ -619,14 +694,14 @@ export class GatewayService extends EventEmitter {
       delay = fallback > now ? Math.max(5_000, fallback - now - 5_000) : 5_000;
     }
     const handle = setTimeout(() => {
-      this.publicGatewayRelayTokenTimers.delete(relayKey);
+      this.publicGatewayRelayTokenTimers.delete(timerKey);
       this.#refreshRelayToken(relayKey, { force: true }).catch((error) => {
         this.log('warn', `[PublicGateway] Automatic token refresh failed for ${relayKey}: ${error.message}`);
         this.#scheduleRelayTokenRetry(relayKey);
       });
     }, Math.max(5_000, delay));
     handle.unref?.();
-    this.publicGatewayRelayTokenTimers.set(relayKey, handle);
+    this.publicGatewayRelayTokenTimers.set(timerKey, handle);
   }
 
   #resolveRelayAuth(relayKey, requestingPubkey) {
@@ -688,15 +763,24 @@ export class GatewayService extends EventEmitter {
   #recordRelayToken(relayKey, info, { schedule = true } = {}) {
     if (!relayKey || !info) return;
     const storedInfo = { ...info };
+    const canonical = this.#normalizeRelayTokenIdentifier(relayKey);
     this.publicGatewayRelayTokens.set(relayKey, storedInfo);
+    if (canonical && canonical !== relayKey) {
+      this.publicGatewayRelayTokens.set(canonical, { ...storedInfo });
+    }
     if (schedule) {
       const targetTime = storedInfo.refreshAfter || storedInfo.expiresAt;
       if (Number.isFinite(targetTime)) {
         this.#scheduleRelayTokenRefresh(relayKey, targetTime, storedInfo.expiresAt);
       }
     }
-    const current = this.publicGatewayRelayState.get(relayKey);
-    if (current) {
+    const stateKeys = new Set([relayKey]);
+    if (canonical) {
+      stateKeys.add(canonical);
+    }
+    for (const stateKey of stateKeys) {
+      const current = this.publicGatewayRelayState.get(stateKey);
+      if (!current) continue;
       const issuedAt = Number.isFinite(info.issuedAt) ? info.issuedAt : null;
       const next = {
         ...current,
@@ -706,108 +790,150 @@ export class GatewayService extends EventEmitter {
         connectionUrl: info.connectionUrl,
         tokenIssuedAt: issuedAt
       };
-      this.publicGatewayRelayState.set(relayKey, next);
-      this.#emitPublicGatewayStatus();
+      this.publicGatewayRelayState.set(stateKey, next);
     }
+    this.#emitPublicGatewayStatus();
   }
 
   async #refreshRelayToken(relayKey, { force = false } = {}) {
     if (!relayKey) return;
-    const state = this.publicGatewayRelayState.get(relayKey);
-    const isBridgeEnabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
-    if (!isBridgeEnabled || !state || state.status !== 'registered') {
-      this.#clearRelayToken(relayKey);
-      this.#emitPublicGatewayStatus();
-      return;
+    const refreshKey = this.#normalizeRelayTokenIdentifier(relayKey) || relayKey;
+    const inFlight = this.publicGatewayRelayTokenRefreshInFlight.get(refreshKey);
+    if (inFlight) {
+      this.log('debug', `[PublicGateway] Token refresh already in progress for ${relayKey}; joining existing request`);
+      return inFlight;
     }
 
-    const requestingPubkey = this.getCurrentPubkey?.() || null;
-    if (!requestingPubkey) {
-      this.log('debug', `[PublicGateway] Skipping token refresh for ${relayKey}: no active pubkey`);
-      this.#clearRelayToken(relayKey);
-      this.#emitPublicGatewayStatus();
-      return;
-    }
-
-    const authResolution = this.#resolveRelayAuth(relayKey, requestingPubkey);
-    if (!authResolution?.token) {
-      this.log('debug', `[PublicGateway] Skipping token refresh for ${relayKey}: no relay auth available`);
-      this.#clearRelayToken(relayKey);
-      this.#scheduleRelayTokenRetry(relayKey);
-      return;
-    }
-
-    const authToken = authResolution.token;
-    const existing = this.publicGatewayRelayTokens.get(relayKey);
-    const now = Date.now();
-    const tokenMismatch = !existing?.relayAuthToken || existing.relayAuthToken !== authToken;
-    const ttlSeconds = this.publicGatewaySettings?.defaultTokenTtl || 3600;
-
-    if (existing) {
-      existing.relayAuthToken = authToken;
-      this.publicGatewayRelayTokens.set(relayKey, { ...existing });
-    }
-
-    const refreshAfter = existing?.refreshAfter || existing?.expiresAt || null;
-
-    if (!force && refreshAfter && (refreshAfter - now) > 30_000 && !tokenMismatch) {
-      this.#scheduleRelayTokenRefresh(relayKey, refreshAfter, existing?.expiresAt);
-      const next = {
-        ...state,
-        token: existing.token,
-        expiresAt: existing.expiresAt,
-        ttlSeconds: existing.ttlSeconds,
-        connectionUrl: existing.connectionUrl,
-        tokenIssuedAt: existing.issuedAt || null
-      };
-      this.publicGatewayRelayState.set(relayKey, next);
-      this.#emitPublicGatewayStatus();
-      return;
-    }
-
-    if (tokenMismatch) {
-      this.log('debug', `[PublicGateway] Relay auth updated for ${relayKey}; issuing new public gateway token`);
-    }
-
-    try {
-      if (existing?.token && !tokenMismatch) {
-        const refreshed = await this.publicGatewayRegistrar.refreshGatewayToken(relayKey, {
-          token: existing.token,
-          ttlSeconds
-        });
-        const expiresAt = Number(refreshed?.expiresAt) || (now + ttlSeconds * 1000);
-        const refreshAfterResult = Number(refreshed?.refreshAfter) || null;
-        const sequence = refreshed?.sequence || existing?.sequence || null;
-
-        const metadata = this.activeRelays.get(relayKey)?.metadata || {};
-        let gatewayPath = metadata.gatewayPath || null;
-        if (!gatewayPath) {
-          gatewayPath = this._normalizeGatewayPath(relayKey, metadata.gatewayPath, metadata.connectionUrl);
-        }
-        if (!gatewayPath) {
-          gatewayPath = relayKey.includes(':') ? relayKey.replace(':', '/') : relayKey;
-        }
-        const connectionUrl = `${this.publicGatewayWsBase}/${gatewayPath}?token=${encodeURIComponent(refreshed.token)}`;
-
-        this.#recordRelayToken(relayKey, {
-          token: refreshed.token,
-          expiresAt,
-          ttlSeconds,
-          connectionUrl,
-          baseUrl: this.publicGatewaySettings.baseUrl,
-          issuedForPubkey: requestingPubkey,
-          issuedAt: now,
-          relayAuthToken: authToken,
-          refreshAfter: refreshAfterResult,
-          sequence
-        }, { schedule: true });
+    const refreshPromise = (async () => {
+      const { key: stateKey, state } = this.#resolveRelayTokenState(relayKey);
+      const effectiveRelayKey = stateKey || relayKey;
+      const isBridgeEnabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+      if (!isBridgeEnabled || !state || state.status !== 'registered') {
+        this.#clearRelayToken(effectiveRelayKey);
+        this.#emitPublicGatewayStatus();
         return;
       }
 
-      await this.issuePublicGatewayToken(relayKey, { ttlSeconds });
-    } catch (error) {
-      this.log('warn', `[PublicGateway] Failed to refresh relay token for ${relayKey}: ${error.message}`);
-      this.#scheduleRelayTokenRetry(relayKey);
+      const requestingPubkey = this.getCurrentPubkey?.() || null;
+      if (!requestingPubkey) {
+        this.log('debug', `[PublicGateway] Skipping token refresh for ${effectiveRelayKey}: no active pubkey`);
+        this.#clearRelayToken(effectiveRelayKey);
+        this.#emitPublicGatewayStatus();
+        return;
+      }
+
+      const authResolution = this.#resolveRelayAuth(effectiveRelayKey, requestingPubkey);
+      if (!authResolution?.token) {
+        this.log('debug', `[PublicGateway] Skipping token refresh for ${effectiveRelayKey}: no relay auth available`);
+        this.#clearRelayToken(effectiveRelayKey);
+        this.#scheduleRelayTokenRetry(effectiveRelayKey);
+        return;
+      }
+
+      const authToken = authResolution.token;
+      const { key: tokenKey, info: existingInfo } = this.#resolveRelayTokenCacheEntry(effectiveRelayKey);
+      const existing = existingInfo ? { ...existingInfo } : null;
+      const now = Date.now();
+      const tokenMismatch = !existing?.relayAuthToken || existing.relayAuthToken !== authToken;
+      const ttlSeconds = this.publicGatewaySettings?.defaultTokenTtl || 3600;
+
+      if (existing) {
+        existing.relayAuthToken = authToken;
+        const persistKey = tokenKey || effectiveRelayKey;
+        this.publicGatewayRelayTokens.set(persistKey, { ...existing });
+        if (persistKey !== effectiveRelayKey) {
+          this.publicGatewayRelayTokens.set(effectiveRelayKey, { ...existing });
+        }
+      }
+
+      const refreshAfter = existing?.refreshAfter || existing?.expiresAt || null;
+
+      if (!force && refreshAfter && (refreshAfter - now) > 30_000 && !tokenMismatch) {
+        this.#scheduleRelayTokenRefresh(effectiveRelayKey, refreshAfter, existing?.expiresAt);
+        const next = {
+          ...state,
+          token: existing.token,
+          expiresAt: existing.expiresAt,
+          ttlSeconds: existing.ttlSeconds,
+          connectionUrl: existing.connectionUrl,
+          tokenIssuedAt: existing.issuedAt || null
+        };
+        this.publicGatewayRelayState.set(effectiveRelayKey, next);
+        this.#emitPublicGatewayStatus();
+        return;
+      }
+
+      if (tokenMismatch) {
+        this.log('debug', `[PublicGateway] Relay auth updated for ${effectiveRelayKey}; issuing new public gateway token`);
+      }
+
+      const requestRelayKey = this.#resolveRelayTokenApiKey(effectiveRelayKey);
+
+      try {
+        if (existing?.token && !tokenMismatch) {
+          try {
+            const refreshed = await this.publicGatewayRegistrar.refreshGatewayToken(requestRelayKey, {
+              token: existing.token,
+              ttlSeconds
+            });
+            const expiresAt = Number(refreshed?.expiresAt) || (now + ttlSeconds * 1000);
+            const refreshAfterResult = Number(refreshed?.refreshAfter) || null;
+            const sequence = refreshed?.sequence || existing?.sequence || null;
+
+            const metadata = this.activeRelays.get(effectiveRelayKey)?.metadata || {};
+            let gatewayPath = metadata.gatewayPath || null;
+            if (!gatewayPath) {
+              gatewayPath = this._normalizeGatewayPath(effectiveRelayKey, metadata.gatewayPath, metadata.connectionUrl);
+            }
+            if (!gatewayPath) {
+              gatewayPath = effectiveRelayKey.includes(':') ? effectiveRelayKey.replace(':', '/') : effectiveRelayKey;
+            }
+            const connectionUrl = `${this.publicGatewayWsBase}/${gatewayPath}?token=${encodeURIComponent(refreshed.token)}`;
+
+            this.#recordRelayToken(effectiveRelayKey, {
+              token: refreshed.token,
+              expiresAt,
+              ttlSeconds,
+              connectionUrl,
+              baseUrl: this.publicGatewaySettings.baseUrl,
+              issuedForPubkey: requestingPubkey,
+              issuedAt: now,
+              relayAuthToken: authToken,
+              refreshAfter: refreshAfterResult,
+              sequence
+            }, { schedule: true });
+            return;
+          } catch (refreshError) {
+            if (this.#isRecoverableRelayTokenRefreshError(refreshError)) {
+              this.log('warn', `[PublicGateway] Token refresh stale for ${effectiveRelayKey} (${refreshError.message}); issuing replacement token`);
+              await this.issuePublicGatewayToken(effectiveRelayKey, {
+                ttlSeconds,
+                gatewayRelayKey: requestRelayKey
+              });
+              return;
+            }
+            throw refreshError;
+          }
+        }
+
+        await this.issuePublicGatewayToken(effectiveRelayKey, {
+          ttlSeconds,
+          gatewayRelayKey: requestRelayKey
+        });
+      } catch (error) {
+        this.log('warn', `[PublicGateway] Failed to refresh relay token for ${effectiveRelayKey}: ${error.message}`);
+        this.#scheduleRelayTokenRetry(effectiveRelayKey);
+      }
+    })();
+
+    this.publicGatewayRelayTokenRefreshInFlight.set(refreshKey, refreshPromise);
+    try {
+      await refreshPromise;
+    } finally {
+      const current = this.publicGatewayRelayTokenRefreshInFlight.get(refreshKey);
+      if (current === refreshPromise) {
+        this.publicGatewayRelayTokenRefreshInFlight.delete(refreshKey);
+      }
     }
   }
 
@@ -2244,9 +2370,13 @@ export class GatewayService extends EventEmitter {
       ? Math.round(ttl)
       : this.publicGatewaySettings?.defaultTokenTtl || 3600;
 
+    const gatewayRelayKey = typeof options?.gatewayRelayKey === 'string' && options.gatewayRelayKey.trim()
+      ? options.gatewayRelayKey.trim()
+      : this.#resolveRelayTokenApiKey(relayKey);
+
     const issuedAt = Date.now();
 
-    const tokenResponse = await this.publicGatewayRegistrar.issueGatewayToken(relayKey, {
+    const tokenResponse = await this.publicGatewayRegistrar.issueGatewayToken(gatewayRelayKey, {
       ttlSeconds,
       relayAuthToken,
       pubkey: requestingPubkey,
@@ -2278,6 +2408,7 @@ export class GatewayService extends EventEmitter {
 
     const logDetails = {
       relayKey,
+      gatewayRelayKey,
       expiresAt,
       ttlSeconds,
       gatewayPath,

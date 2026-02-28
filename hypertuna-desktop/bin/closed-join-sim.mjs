@@ -45,19 +45,22 @@ Commands:
   send-invite --invitee <pubkey> [--name <name>] [--about <about>]
   approve --requester <pubkey>
   join
-  e2e-run [--invitees <n>] [--group-prefix <name>] [--public]
+  e2e-run [--invitees <n>] [--group-prefix <name>] [--public] [--mode <open|closed>]
+  e2e-matrix [--invitees <n>] [--group-prefix <name>] [--public]
 
 Options:
   --port <port>     CLI server port (default: ${DEFAULT_PORT})
   --token <token>   Optional auth token (HYT_CLOSED_JOIN_SIM_TOKEN)
   --target <name>   Override target window global (default depends on command)
+  --mode <name>     Join mode for e2e-run (open|closed, default: closed)
   --multi-group     Create a new group per invitee (default is single shared group)
   --disable-autostart <true|false>  Toggle worker autostart during e2e-run (default: true)
   --json            Output raw JSON response
 
 Notes:
   - The app must be running with HYT_CLOSED_JOIN_SIM=1 (and optional port/token env vars).
-  - Open the group page with ?closedJoinSim=1 so window.__HYT_CLOSED_JOIN_SIM__ is registered.
+  - __HYT_E2E__ is auto-enabled via ?closedJoinE2E=1 when HYT_CLOSED_JOIN_SIM=1.
+  - For __HYT_CLOSED_JOIN_SIM__, open a group page with ?closedJoinSim=1.
 `;
   console.log(text.trim());
 };
@@ -103,11 +106,34 @@ const payloadForAction = () => {
       const isPublic = hasFlag('--public');
       const singleGroup = !hasFlag('--multi-group');
       const disableAutostart = readBoolFlag('--disable-autostart');
+      const modeRaw = String(readFlag('--mode') || 'closed').trim().toLowerCase();
+      const mode = modeRaw === 'open' ? 'open' : 'closed';
       return {
         action: 'runClosedJoinE2E',
         args: [
           {
+            mode,
             inviteeCount: Number.isFinite(invitees) && invitees > 0 ? Math.trunc(invitees) : 5,
+            groupPrefix,
+            isPublic,
+            singleGroup,
+            disableAutostart: disableAutostart ?? undefined
+          }
+        ],
+        target: targetOverride || '__HYT_E2E__'
+      };
+    }
+    case 'e2e-matrix': {
+      const invitees = Number(readFlag('--invitees') || 2);
+      const groupPrefix = readFlag('--group-prefix') || 'JoinMatrixE2E';
+      const isPublic = hasFlag('--public');
+      const singleGroup = !hasFlag('--multi-group');
+      const disableAutostart = readBoolFlag('--disable-autostart');
+      return {
+        action: 'runJoinMatrixE2E',
+        args: [
+          {
+            inviteeCount: Number.isFinite(invitees) && invitees > 0 ? Math.trunc(invitees) : 2,
             groupPrefix,
             isPublic,
             singleGroup,

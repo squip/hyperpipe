@@ -1,0 +1,122 @@
+{
+  "generatedAt": "2026-02-28T09:51:34.216Z",
+  "storageDir": "/Users/essorensen/Library/Application Support/hypertuna-desktop/hypertuna-data",
+  "user1": "22aea6502c94a85a568a40e49869cb190ed8a8512dad18bb7ab5ee2283380422",
+  "user2": "c42a9a747bf011ec15b9594c1ea45499af62150e772f1d630561f6d15d1eac00",
+  "rows": [
+    {
+      "scenario": "Public/Open Group (create + join + pane stability)",
+      "status": "PASS",
+      "checks": [
+        {
+          "name": "create public/open group",
+          "status": "PASS",
+          "evidence": "group=npub1y2h2v5pvjj595452grjfs6wtry8d32z39kk33wm6khhz9qecqs3qlp6eqz:pub-open-mm64l5f0"
+        },
+        {
+          "name": "creator relay metadata has tokenized URL",
+          "status": "PASS",
+          "evidence": "ws://127.0.0.1:8443/npub1y2h2v5pvjj595452grjfs6wtry8d32z39kk33wm6khhz9qecqs3qlp6eqz/pub-open-mm64l5f0?token=0afee3aae11574bb6f804d2a0723b37825fd3786884e83e252cf759864394f92"
+        },
+        {
+          "name": "user2 sees group in Browse Groups",
+          "status": "PASS",
+          "evidence": "group=npub1y2h2v5pvjj595452grjfs6wtry8d32z39kk33wm6khhz9qecqs3qlp6eqz:pub-open-mm64l5f0"
+        },
+        {
+          "name": "user2 joined public/open group relay",
+          "status": "PASS",
+          "evidence": "ws://127.0.0.1:59928/npub1y2h2v5pvjj595452grjfs6wtry8d32z39kk33wm6khhz9qecqs3qlp6eqz/pub-open-mm64l5f0?token=18fbfe4784ceefb48a9b73f08cb72a3fe2a861019f1e12b4e3228080d71fae81"
+        },
+        {
+          "name": "user2 My Groups hydrated after public/open join",
+          "status": "PASS",
+          "evidence": "npub1y2h2v5pvjj595452grjfs6wtry8d32z39kk33wm6khhz9qecqs3qlp6eqz:pub-open-mm64l5f0"
+        },
+        {
+          "name": "top-right pane navigation remains stable",
+          "status": "PASS",
+          "evidence": "App handled repeated right-top up/down keys and command navigation remained responsive"
+        }
+      ]
+    },
+    {
+      "scenario": "Public/Closed Group (request invite flow)",
+      "status": "FAIL",
+      "checks": [
+        {
+          "name": "create public/closed group",
+          "status": "PASS",
+          "evidence": "group=npub1y2h2v5pvjj595452grjfs6wtry8d32z39kk33wm6khhz9qecqs3qlp6eqz:pub-closed-request-mm64o07t"
+        },
+        {
+          "name": "user2 submits request-invite",
+          "status": "PASS",
+          "evidence": "group=npub1y2h2v5pvjj595452grjfs6wtry8d32z39kk33wm6khhz9qecqs3qlp6eqz:pub-closed-request-mm64o07t"
+        },
+        {
+          "name": "admin approves join request",
+          "status": "PASS",
+          "evidence": "requestPubkey=c42a9a747bf0…"
+        },
+        {
+          "name": "request-invite accept joins relay with tokenized URL",
+          "status": "FAIL",
+          "evidence": "acceptGroupInvite request flow timed out after 120000ms"
+        }
+      ]
+    },
+    {
+      "scenario": "Public/Closed Group (admin direct invite flow)",
+      "status": "PASS",
+      "checks": [
+        {
+          "name": "admin sends direct group invite",
+          "status": "PASS",
+          "evidence": "group=npub1y2h2v5pvjj595452grjfs6wtry8d32z39kk33wm6khhz9qecqs3qlp6eqz:pub-closed-admin-mm64vzqi invitee=c42a9a747bf0…"
+        },
+        {
+          "name": "direct invite accept joins relay with tokenized URL",
+          "status": "PASS",
+          "evidence": "ws://127.0.0.1:59928/npub1y2h2v5pvjj595452grjfs6wtry8d32z39kk33wm6khhz9qecqs3qlp6eqz/pub-closed-admin-mm64vzqi?token=a2612f2d6435877ccdb8b3c47dbec75d184446d655ee56e058a57108e10e6eef"
+        },
+        {
+          "name": "direct-invite user My Groups hydrated after accept",
+          "status": "PASS",
+          "evidence": "npub1y2h2v5pvjj595452grjfs6wtry8d32z39kk33wm6khhz9qecqs3qlp6eqz:pub-closed-admin-mm64vzqi"
+        }
+      ]
+    },
+    {
+      "scenario": "Chats (create + invite + accept + bi-directional messages)",
+      "status": "PASS",
+      "checks": [
+        {
+          "name": "user2 chat bootstrap",
+          "status": "PASS",
+          "evidence": "initChats completed"
+        },
+        {
+          "name": "user1 creates chat and invites user2",
+          "status": "PASS",
+          "evidence": "conversation=30a2055f548c86f60038edda443191baab808247e18dc98e0a2ab8a5773cc192"
+        },
+        {
+          "name": "user2 accepts invite and sends message",
+          "status": "PASS",
+          "evidence": "invite=2ced18edf4ba4cb34daa0c1d030bca6bac82aa1efba672519d5e3ab26fb30dbf"
+        },
+        {
+          "name": "user1 receives and replies",
+          "status": "PASS",
+          "evidence": "conversation=30a2055f548c86f60038edda443191baab808247e18dc98e0a2ab8a5773cc192"
+        },
+        {
+          "name": "user2 receives user1 message",
+          "status": "PASS",
+          "evidence": "conversation=30a2055f548c86f60038edda443191baab808247e18dc98e0a2ab8a5773cc192"
+        }
+      ]
+    }
+  ]
+}

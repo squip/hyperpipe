@@ -1,0 +1,71 @@
+{
+  "generatedAt": "2026-02-28T06:47:08.042Z",
+  "storageDir": "/var/folders/8c/l5gt1q1j4bj5g8dv_tgl8qzw0000gn/T/hypertuna-live-matrix/mm5yj4k6-mqcg9g",
+  "profile": "2e40674ac5e633f6bafc14b647180d27d61e1d6cda43f3c046027bed689ab74d",
+  "rows": [
+    {
+      "workflow": "Groups -> My Groups",
+      "status": "PASS",
+      "checks": [
+        {
+          "name": "create group from workflow",
+          "status": "PASS",
+          "evidence": "group=npub19eqxwjk9uceldwhuzjmywxqdyltpu8tvmfpl8szxqfa766y6kaxst6r6av:matrix-group-mm5yjooc"
+        },
+        {
+          "name": "my groups count increments",
+          "status": "PASS",
+          "evidence": "before=0 after=1"
+        },
+        {
+          "name": "relay list contains created group relay",
+          "status": "PASS",
+          "evidence": "publicIdentifier=npub19eqxwjk9uceldwhuzjmywxqdyltpu8tvmfpl8szxqfa766y6kaxst6r6av:matrix-group-mm5yjooc"
+        }
+      ]
+    },
+    {
+      "workflow": "Invites -> Group",
+      "status": "PASS",
+      "checks": [
+        {
+          "name": "send group invite",
+          "status": "PASS",
+          "evidence": "group=npub19eqxwjk9uceldwhuzjmywxqdyltpu8tvmfpl8szxqfa766y6kaxst6r6av:matrix-group-mm5yjooc invitee=c66f3ad4c273…"
+        },
+        {
+          "name": "accept/dismiss inbound group invite",
+          "status": "SKIP",
+          "evidence": "no inbound group invite available in current account"
+        }
+      ]
+    },
+    {
+      "workflow": "Invites -> Chat",
+      "status": "SKIP",
+      "checks": [
+        {
+          "name": "send chat invite",
+          "status": "SKIP",
+          "evidence": "auto-generated invitee has no published key package (c66f3ad4c273…)"
+        },
+        {
+          "name": "accept/dismiss inbound chat invite",
+          "status": "SKIP",
+          "evidence": "no inbound chat invite available in current account"
+        }
+      ]
+    },
+    {
+      "workflow": "Files",
+      "status": "SKIP",
+      "checks": [
+        {
+          "name": "file preflight",
+          "status": "SKIP",
+          "evidence": "no group files with sha256 available"
+        }
+      ]
+    }
+  ]
+}

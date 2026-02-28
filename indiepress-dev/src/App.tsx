@@ -28,12 +28,18 @@ import { ZapProvider } from '@/providers/ZapProvider'
 import { MessengerProvider } from '@/providers/MessengerProvider'
 import { NotepadProvider } from '@/providers/NotepadProvider'
 import { PluginRegistryProvider } from '@/providers/PluginRegistryProvider'
+import ClosedJoinE2EBridge from '@/devtools/closedJoinE2E'
 import { PageManager } from './PageManager'
 import { GroupFilesProvider } from './providers/GroupFilesProvider'
 import { GroupsProvider } from './providers/GroupsProvider'
 import { WorkerBridgeProvider } from './providers/WorkerBridgeProvider'
 
 export default function App(): JSX.Element {
+  const enableClosedJoinE2EBridge =
+    import.meta.env.DEV &&
+    typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).has('closedJoinE2E')
+
   return (
     <ScreenSizeProvider>
       <UserPreferencesProvider>
@@ -64,6 +70,7 @@ export default function App(): JSX.Element {
                                                         <GroupFilesProvider>
                                                           <PluginRegistryProvider>
                                                             <PageManager />
+                                                            {enableClosedJoinE2EBridge ? <ClosedJoinE2EBridge /> : null}
                                                           </PluginRegistryProvider>
                                                         </GroupFilesProvider>
                                                       </GroupsProvider>

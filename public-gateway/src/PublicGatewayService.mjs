@@ -53,6 +53,9 @@ import BlindPeerReplicaManager from './blind-peer/BlindPeerReplicaManager.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores';
+const EVENT_POLL_BASE_INTERVAL_MS = 1000;
+const EVENT_POLL_MAX_INTERVAL_MS = 8000;
+const EVENT_POLL_JITTER_MS = 250;
 
 function safeString(value) {
   if (typeof value === 'string') return value;
@@ -149,6 +152,8 @@ class PublicGatewayService {
     this.healthInterval = null;
     this.pruneInterval = null;
     this.eventCheckTimers = new Map();
+    this.activeEventPolls = new Map();
+    this.eventPollFailures = new Map();
     this.delegationFallbackTimers = new Map();
     this.relayPeerIndex = new Map();
     this.peerMetadata = new Map();
@@ -318,6 +323,8 @@ class PublicGatewayService {
       clearTimeout(timer);
     }
     this.eventCheckTimers.clear();
+    this.activeEventPolls.clear();
+    this.eventPollFailures.clear();
 
     for (const timer of this.delegationFallbackTimers.values()) {
       clearTimeout(timer);
@@ -1601,6 +1608,8 @@ class PublicGatewayService {
       clearTimeout(timer);
       this.eventCheckTimers.delete(connectionKey);
     }
+    this.activeEventPolls.delete(connectionKey);
+    this.eventPollFailures.delete(connectionKey);
 
     const fallbackTimer = this.delegationFallbackTimers.get(connectionKey);
     if (fallbackTimer) {
@@ -1923,58 +1932,124 @@ class PublicGatewayService {
   }
 
   #startEventChecking(session) {
-    const run = async () => {
+    const computeDelay = (connectionKey, hadError) => {
+      const failureCount = hadError ? (this.eventPollFailures.get(connectionKey) || 0) + 1 : 0;
+      if (hadError) {
+        this.eventPollFailures.set(connectionKey, failureCount);
+      } else {
+        this.eventPollFailures.delete(connectionKey);
+      }
+      const exp = hadError ? Math.min(failureCount, 3) : 0;
+      const base = hadError
+        ? Math.min(EVENT_POLL_BASE_INTERVAL_MS * Math.pow(2, exp), EVENT_POLL_MAX_INTERVAL_MS)
+        : EVENT_POLL_BASE_INTERVAL_MS;
+      const jitter = Math.floor(Math.random() * EVENT_POLL_JITTER_MS);
+      return base + jitter;
+    };
+
+    const schedule = (delayMs) => {
       if (!this.sessions.has(session.connectionKey)) {
         this.eventCheckTimers.delete(session.connectionKey);
         return;
       }
-
-      try {
-        if (session.localOnly) {
-          await this.#pollLocalHyperbee(session);
-        } else {
-          const registration = await this.registrationStore.getRelay(session.relayKey);
-          if (registration) {
-            session.peers = this.#getUsablePeersFromRegistration(registration);
-          }
-
-          if (!session.localOnly
-            && session.delegateReqToPeers
-            && Array.isArray(session.pendingDelegatedMessages)
-            && session.pendingDelegatedMessages.length
-            && session.peers?.length) {
-            await this.#flushPendingDelegatedMessages(session);
-          }
-
-          const events = await this.#withPeer(session, async (peerKey) => {
-            return getEventsFromPeerHyperswarm(
-              peerKey,
-              session.relayKey,
-              session.connectionKey,
-              this.connectionPool,
-              session.relayAuthToken
-            );
-          });
-
-          if (Array.isArray(events) && events.length && session.ws.readyState === WebSocket.OPEN) {
-            for (const event of events) {
-              if (!event) continue;
-              session.ws.send(JSON.stringify(event));
-            }
-          }
-        }
-      } catch (error) {
-        this.logger.debug?.({ relayKey: session.relayKey, error: error.message }, 'Event polling error');
-      } finally {
-        const timer = setTimeout(run, 1000);
-        timer.unref?.();
-        this.eventCheckTimers.set(session.connectionKey, timer);
-      }
+      const timer = setTimeout(() => {
+        run().catch((error) => {
+          this.logger.debug?.({
+            relayKey: session.relayKey,
+            connectionKey: session.connectionKey,
+            error: error?.message || error
+          }, 'Event polling loop error');
+        });
+      }, delayMs);
+      timer.unref?.();
+      this.eventCheckTimers.set(session.connectionKey, timer);
     };
 
-    const timer = setTimeout(run, 1000);
-    timer.unref?.();
-    this.eventCheckTimers.set(session.connectionKey, timer);
+    const run = async () => {
+      if (!this.sessions.has(session.connectionKey)) {
+        this.eventCheckTimers.delete(session.connectionKey);
+        this.activeEventPolls.delete(session.connectionKey);
+        this.eventPollFailures.delete(session.connectionKey);
+        return;
+      }
+
+      if (this.activeEventPolls.has(session.connectionKey)) {
+        schedule(250 + Math.floor(Math.random() * EVENT_POLL_JITTER_MS));
+        return;
+      }
+
+      let hadError = false;
+      const pollPromise = (async () => {
+        try {
+          if (session.localOnly) {
+            await this.#pollLocalHyperbee(session);
+          } else {
+            const registration = await this.registrationStore.getRelay(session.relayKey);
+            if (registration) {
+              session.peers = this.#getUsablePeersFromRegistration(registration);
+            }
+
+            if (!session.localOnly
+              && session.delegateReqToPeers
+              && Array.isArray(session.pendingDelegatedMessages)
+              && session.pendingDelegatedMessages.length
+              && session.peers?.length) {
+              await this.#flushPendingDelegatedMessages(session);
+            }
+
+            const events = await this.#withPeer(session, async (peerKey) => {
+              return getEventsFromPeerHyperswarm(
+                peerKey,
+                session.relayKey,
+                session.connectionKey,
+                this.connectionPool,
+                session.relayAuthToken
+              );
+            });
+
+            if (Array.isArray(events) && events.length && session.ws.readyState === WebSocket.OPEN) {
+              for (const event of events) {
+                if (!event) continue;
+                session.ws.send(JSON.stringify(event));
+              }
+            }
+          }
+        } catch (error) {
+          hadError = true;
+          const nextFailureCount = (this.eventPollFailures.get(session.connectionKey) || 0) + 1;
+          const message = error?.message || String(error);
+          if (nextFailureCount >= 4) {
+            this.logger.warn?.({
+              relayKey: session.relayKey,
+              connectionKey: session.connectionKey,
+              failureCount: nextFailureCount,
+              error: message
+            }, 'Event polling error (backoff active)');
+          } else {
+            this.logger.debug?.({
+              relayKey: session.relayKey,
+              connectionKey: session.connectionKey,
+              failureCount: nextFailureCount,
+              error: message
+            }, 'Event polling error');
+          }
+        }
+      })();
+
+      this.activeEventPolls.set(session.connectionKey, pollPromise);
+      try {
+        await pollPromise;
+      } finally {
+        if (this.activeEventPolls.get(session.connectionKey) === pollPromise) {
+          this.activeEventPolls.delete(session.connectionKey);
+        }
+      }
+
+      const delayMs = computeDelay(session.connectionKey, hadError);
+      schedule(delayMs);
+    };
+
+    schedule(EVENT_POLL_BASE_INTERVAL_MS + Math.floor(Math.random() * EVENT_POLL_JITTER_MS));
   }
 
   async #pollLocalHyperbee(session) {
@@ -3145,7 +3220,8 @@ class PublicGatewayService {
         token,
         ttlSeconds: payload?.ttlSeconds
       });
-      this.tokenMetrics.refreshCounter.inc({ result: 'success' });
+      const refreshResultLabel = result?.reused ? 'success_reused' : 'success';
+      this.tokenMetrics.refreshCounter.inc({ result: refreshResultLabel });
       return res.json(result);
     } catch (error) {
       this.logger?.warn?.('Failed to refresh relay token', {
@@ -3153,7 +3229,15 @@ class PublicGatewayService {
         relayKeyType,
         error: error?.message || error
       });
-      this.tokenMetrics.refreshCounter.inc({ result: 'error' });
+      const errorMessage = String(error?.message || 'error').toLowerCase();
+      const refreshResultLabel = errorMessage === 'token-mismatch'
+        ? 'token_mismatch'
+        : errorMessage === 'token-stale'
+          ? 'token_stale'
+          : errorMessage === 'no-active-token'
+            ? 'no_active_token'
+            : 'error';
+      this.tokenMetrics.refreshCounter.inc({ result: refreshResultLabel });
       return res.status(400).json({ error: error?.message || 'Failed to refresh token' });
     }
   }

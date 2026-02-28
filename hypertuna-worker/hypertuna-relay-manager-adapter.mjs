@@ -2591,6 +2591,8 @@ export async function getActiveRelays() {
             ? profile.public_identifier.replace(':', '/')
             : key;
 
+        const queryReady = manager?.relay?.writable === true;
+
         activeRelayList.push({
             relayKey: key,
             publicIdentifier: profile?.public_identifier || null,
@@ -2600,7 +2602,8 @@ export async function getActiveRelays() {
             connectionUrl: `${buildGatewayWebsocketBase(globalConfig || { proxy_server_address: 'localhost', proxy_websocket_protocol: 'wss' })}/${identifierPath}`,
             createdAt: profile?.created_at || profile?.joined_at || null,
             isActive: true,
-            writable: manager?.relay?.writable === true,
+            writable: queryReady,
+            queryReady,
             isOpen: profile?.isOpen === true,
             isPublic: profile?.isPublic === true,
             isHosted: !!profile?.created_at,
@@ -2629,6 +2632,7 @@ export async function getActiveRelays() {
             createdAt: profile?.created_at || profile?.joined_at || null,
             isActive: true,
             writable: false,
+            queryReady: false,
             isOpen: profile?.isOpen === true,
             isPublic: profile?.isPublic === true,
             isHosted: !!profile?.created_at,

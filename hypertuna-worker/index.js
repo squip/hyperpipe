@@ -4476,6 +4476,7 @@ async function addAuthInfoToRelays(relays) {
       const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`
       const connectionUrl = token ? `${baseUrl}?token=${token}` : baseUrl
       const requiresAuth = profile.auth_config?.requiresAuth || false
+      const queryReady = r?.queryReady === true || r?.writable === true
       const writable = r?.writable === true
       let tokenPresent = !!token
       if (!tokenPresent) {
@@ -4486,13 +4487,14 @@ async function addAuthInfoToRelays(relays) {
           tokenPresent = /[?&]token=/.test(connectionUrl)
         }
       }
-      const readyForReq = writable && (!requiresAuth || tokenPresent)
+      const readyForReq = queryReady && (!requiresAuth || tokenPresent)
 
       console.log('[Worker][addAuthInfoToRelays]', {
         relayKey: r.relayKey,
         publicIdentifier: profile.public_identifier || null,
         requiresAuth,
         writable,
+        queryReady,
         readyForReq,
         fromProfileToken: !!token, // token derived above (profile auth_adds/auth_tokens)
         fromLegacyToken: !!(profile.auth_tokens && profile.auth_tokens[config.nostr_pubkey_hex]),
@@ -4513,6 +4515,7 @@ async function addAuthInfoToRelays(relays) {
         userAuthToken: token,
         requiresAuth,
         writable,
+        queryReady,
         readyForReq,
         registrationStatus: statusEntry?.status || 'unknown',
         registrationError: statusEntry?.error || null

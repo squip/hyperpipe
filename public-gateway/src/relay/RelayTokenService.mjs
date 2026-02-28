@@ -5,6 +5,7 @@ import {
 
 const DEFAULT_TTL_SECONDS = 3600;
 const DEFAULT_REFRESH_WINDOW_SECONDS = 300;
+const DEFAULT_PREVIOUS_TOKEN_GRACE_SECONDS = 30;
 
 function toNumber(value, fallback) {
   const n = Number(value);
@@ -17,7 +18,8 @@ export default class RelayTokenService {
     sharedSecret,
     logger = console,
     defaultTtlSeconds = DEFAULT_TTL_SECONDS,
-    refreshWindowSeconds = DEFAULT_REFRESH_WINDOW_SECONDS
+    refreshWindowSeconds = DEFAULT_REFRESH_WINDOW_SECONDS,
+    previousTokenGraceSeconds = DEFAULT_PREVIOUS_TOKEN_GRACE_SECONDS
   } = {}) {
     if (!registrationStore) throw new Error('RelayTokenService requires a registrationStore');
     if (!sharedSecret) throw new Error('RelayTokenService requires shared secret');
@@ -26,6 +28,7 @@ export default class RelayTokenService {
     this.logger = logger;
     this.defaultTtlSeconds = toNumber(defaultTtlSeconds, DEFAULT_TTL_SECONDS);
     this.refreshWindowMs = toNumber(refreshWindowSeconds, DEFAULT_REFRESH_WINDOW_SECONDS) * 1000;
+    this.previousTokenGraceMs = toNumber(previousTokenGraceSeconds, DEFAULT_PREVIOUS_TOKEN_GRACE_SECONDS) * 1000;
   }
 
   async issueToken(relayKey, options = {}) {
@@ -38,6 +41,7 @@ export default class RelayTokenService {
     }
 
     const existingMetadata = await this.registrationStore.getTokenMetadata?.(relayKey) || null;
+    const previousToken = existingMetadata?.token || null;
     const sequence = (existingMetadata?.sequence || 0) + 1;
     const issuedAt = Date.now();
     const ttlSeconds = toNumber(options.ttlSeconds, this.defaultTtlSeconds);
@@ -63,6 +67,9 @@ export default class RelayTokenService {
       issuedAt,
       expiresAt,
       refreshAfter,
+      previousToken,
+      previousSequence: existingMetadata?.sequence || null,
+      previousTokenGraceUntil: previousToken ? (issuedAt + this.previousTokenGraceMs) : null,
       lastValidatedAt: issuedAt
     });
 
@@ -89,6 +96,22 @@ export default class RelayTokenService {
       throw new Error('no-active-token');
     }
     if (currentState.token !== options.token) {
+      if (currentState.previousToken
+        && currentState.previousToken === options.token
+        && Number.isFinite(currentState.previousTokenGraceUntil)
+        && currentState.previousTokenGraceUntil >= Date.now()) {
+        this.logger?.warn?.('[RelayTokenService] Refresh accepted using previous token within grace window', {
+          relayKey,
+          sequence: currentState.sequence || null
+        });
+        return {
+          token: currentState.token,
+          expiresAt: currentState.expiresAt || null,
+          refreshAfter: currentState.refreshAfter || null,
+          sequence: currentState.sequence || null,
+          reused: true
+        };
+      }
       throw new Error('token-mismatch');
     }
 
@@ -114,6 +137,9 @@ export default class RelayTokenService {
       pubkey: metadata?.pubkey || null,
       scope: metadata?.scope || null,
       sequence: nextSequence,
+      previousToken: null,
+      previousSequence: null,
+      previousTokenGraceUntil: null,
       revokedAt: Date.now(),
       revocationReason: reason || null
     });
@@ -167,6 +193,9 @@ export default class RelayTokenService {
       issuedAt: metadata?.issuedAt || payload.issuedAt || Date.now(),
       expiresAt: payload.expiresAt || metadata?.expiresAt || Date.now(),
       refreshAfter: metadata?.refreshAfter || (payload.expiresAt ? Math.max(Date.now(), payload.expiresAt - this.refreshWindowMs) : null),
+      previousToken: metadata?.previousToken || null,
+      previousSequence: metadata?.previousSequence || null,
+      previousTokenGraceUntil: metadata?.previousTokenGraceUntil || null,
       lastValidatedAt: Date.now()
     });
 

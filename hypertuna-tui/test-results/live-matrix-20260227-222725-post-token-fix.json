@@ -1,0 +1,71 @@
+{
+  "generatedAt": "2026-02-28T06:28:37.704Z",
+  "storageDir": "/tmp/hypertuna-live-matrix-20260227-222725",
+  "profile": "4290e3172bd47f11bb36d726cac749b59820a43628f2b9aa50cbc7f8ff5f3d17",
+  "rows": [
+    {
+      "workflow": "Groups -> My Groups",
+      "status": "PASS",
+      "checks": [
+        {
+          "name": "create group from workflow",
+          "status": "PASS",
+          "evidence": "group=npub1g2gwx9et63l3rwek6unv436fkkvzpfpk9retn2jse0rl3l6l85tst06jp4:matrix-group-mm5xw0v7"
+        },
+        {
+          "name": "my groups count increments",
+          "status": "PASS",
+          "evidence": "before=0 after=1"
+        },
+        {
+          "name": "relay list contains created group relay",
+          "status": "PASS",
+          "evidence": "publicIdentifier=npub1g2gwx9et63l3rwek6unv436fkkvzpfpk9retn2jse0rl3l6l85tst06jp4:matrix-group-mm5xw0v7"
+        }
+      ]
+    },
+    {
+      "workflow": "Invites -> Group",
+      "status": "FAIL",
+      "checks": [
+        {
+          "name": "send group invite",
+          "status": "FAIL",
+          "evidence": "bad point: is not on curve, sqrt error: Cannot find square root"
+        },
+        {
+          "name": "accept/dismiss inbound group invite",
+          "status": "SKIP",
+          "evidence": "no inbound group invite available in current account"
+        }
+      ]
+    },
+    {
+      "workflow": "Invites -> Chat",
+      "status": "FAIL",
+      "checks": [
+        {
+          "name": "send chat invite",
+          "status": "FAIL",
+          "evidence": "failed=bbbbbbbbbbbb…:No key package event found for bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        {
+          "name": "accept/dismiss inbound chat invite",
+          "status": "SKIP",
+          "evidence": "no inbound chat invite available in current account"
+        }
+      ]
+    },
+    {
+      "workflow": "Files",
+      "status": "SKIP",
+      "checks": [
+        {
+          "name": "file preflight",
+          "status": "SKIP",
+          "evidence": "no group files with sha256 available"
+        }
+      ]
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
+const http = require('http');
 const path = require('path');
 const { promises: fs, existsSync } = require('fs');
 const { spawn, execFile } = require('child_process');
@@ -17,6 +18,7 @@ let publicGatewayConfigCache = null;
 let publicGatewayStatusCache = null;
 let currentWorkerUserKey = null;
 let pluginSupervisor = null;
+let closedJoinSimServer = null;
 
 function isHex64(value) {
   return typeof value === 'string' && /^[a-fA-F0-9]{64}$/.test(value);
@@ -94,6 +96,16 @@ const gatewaySettingsPath = path.join(storagePath, 'gateway-settings.json');
 const publicGatewaySettingsPath = path.join(storagePath, 'public-gateway-settings.json');
 const LOG_APPEND_EMFILE_RETRIES = 4;
 const LOG_APPEND_EMFILE_BASE_DELAY_MS = 25;
+const CLOSED_JOIN_SIM_ENABLED = String(process.env.HYT_CLOSED_JOIN_SIM || '').trim() === '1';
+const CLOSED_JOIN_SIM_PORT_RAW = Number(
+  process.env.HYT_CLOSED_JOIN_SIM_PORT || process.env.CLOSED_JOIN_SIM_PORT || 17665
+);
+const CLOSED_JOIN_SIM_PORT =
+  Number.isFinite(CLOSED_JOIN_SIM_PORT_RAW) && CLOSED_JOIN_SIM_PORT_RAW > 0
+    ? Math.trunc(CLOSED_JOIN_SIM_PORT_RAW)
+    : 17665;
+const CLOSED_JOIN_SIM_TOKEN = String(process.env.HYT_CLOSED_JOIN_SIM_TOKEN || '').trim() || null;
+const CLOSED_JOIN_SIM_PATH = '/__closed_join_sim__';
 let logAppendChain = Promise.resolve();
 const DEFAULT_CERT_ALLOWLIST = new Set(['relay.nostr.band', 'relay.damus.io', 'nos.lol']);
 const envAllowlist = (process.env.NOSTR_CERT_ALLOWLIST || '')
@@ -152,6 +164,199 @@ function asObject(value) {
 
 function toArray(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function withClosedJoinE2EParam(inputUrl) {
+  if (!inputUrl || !CLOSED_JOIN_SIM_ENABLED) return inputUrl;
+  try {
+    const parsed = new URL(inputUrl);
+    if (!parsed.searchParams.has('closedJoinE2E')) {
+      parsed.searchParams.set('closedJoinE2E', '1');
+    }
+    return parsed.toString();
+  } catch (_) {
+    return inputUrl;
+  }
+}
+
+function sendJson(res, statusCode, payload) {
+  try {
+    const body = JSON.stringify(payload);
+    res.writeHead(statusCode, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': Buffer.byteLength(body)
+    });
+    res.end(body);
+  } catch (error) {
+    try {
+      res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: error?.message || String(error) }));
+    } catch (_) {}
+  }
+}
+
+function readRequestBody(req, maxBytes = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let total = 0;
+    const chunks = [];
+
+    req.on('data', (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        reject(new Error('request-too-large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    req.on('end', () => {
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+
+    req.on('error', (error) => {
+      reject(error);
+    });
+  });
+}
+
+function buildRendererBridgeCallScript(target, action, args) {
+  const safeTarget = JSON.stringify(target);
+  const safeAction = JSON.stringify(action);
+  const safeArgs = JSON.stringify(Array.isArray(args) ? args : []);
+  return `
+    (async () => {
+      const targetRef = window[${safeTarget}];
+      if (!targetRef || typeof targetRef !== 'object') {
+        return { ok: false, error: 'bridge-target-not-found' };
+      }
+      const fn = targetRef[${safeAction}];
+      if (typeof fn !== 'function') {
+        return { ok: false, error: 'bridge-action-not-found' };
+      }
+      try {
+        const result = await fn(...${safeArgs});
+        return { ok: true, result };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error?.message || String(error || 'bridge-call-failed'),
+          stack: error?.stack || null
+        };
+      }
+    })();
+  `;
+}
+
+async function waitForRendererBridgeTarget(target, { timeoutMs = 45000, intervalMs = 250 } = {}) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      throw new Error('renderer-window-unavailable');
+    }
+    const available = await mainWindow.webContents.executeJavaScript(
+      `Boolean(window[${JSON.stringify(target)}] && typeof window[${JSON.stringify(target)}] === 'object')`,
+      true
+    ).catch(() => false);
+    if (available) return;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(`bridge-target-timeout:${target}`);
+}
+
+async function invokeRendererBridge({ target, action, args }) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    throw new Error('renderer-window-unavailable');
+  }
+
+  await waitForRendererBridgeTarget(target);
+  const script = buildRendererBridgeCallScript(target, action, args);
+  const payload = await mainWindow.webContents.executeJavaScript(script, true);
+  if (payload?.ok) {
+    return payload.result;
+  }
+  const detail = payload?.error || 'bridge-call-failed';
+  const err = new Error(detail);
+  if (payload?.stack) err.stack = payload.stack;
+  throw err;
+}
+
+async function handleClosedJoinSimRequest(req, res) {
+  if (CLOSED_JOIN_SIM_TOKEN) {
+    const supplied = String(req.headers['x-hyt-sim-token'] || '').trim();
+    if (!supplied || supplied !== CLOSED_JOIN_SIM_TOKEN) {
+      sendJson(res, 401, { ok: false, error: 'unauthorized' });
+      return;
+    }
+  }
+
+  let body = null;
+  try {
+    const raw = await readRequestBody(req);
+    body = JSON.parse(raw || '{}');
+  } catch (error) {
+    sendJson(res, 400, { ok: false, error: 'invalid-json-body' });
+    return;
+  }
+
+  const target = typeof body?.target === 'string' && body.target.trim()
+    ? body.target.trim()
+    : '__HYT_E2E__';
+  const action = typeof body?.action === 'string' && body.action.trim()
+    ? body.action.trim()
+    : 'ping';
+  const args = Array.isArray(body?.args) ? body.args : [];
+
+  try {
+    const result = await invokeRendererBridge({ target, action, args });
+    sendJson(res, 200, { ok: true, result });
+  } catch (error) {
+    sendJson(res, 500, {
+      ok: false,
+      error: error?.message || String(error),
+      stack: error?.stack || null
+    });
+  }
+}
+
+function startClosedJoinSimServer() {
+  if (!CLOSED_JOIN_SIM_ENABLED || closedJoinSimServer) return;
+
+  closedJoinSimServer = http.createServer((req, res) => {
+    const reqPath = String(req.url || '').split('?')[0];
+    if (reqPath !== CLOSED_JOIN_SIM_PATH) {
+      sendJson(res, 404, { ok: false, error: 'not-found' });
+      return;
+    }
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { ok: false, error: 'method-not-allowed' });
+      return;
+    }
+    handleClosedJoinSimRequest(req, res).catch((error) => {
+      sendJson(res, 500, { ok: false, error: error?.message || String(error) });
+    });
+  });
+
+  closedJoinSimServer.on('error', (error) => {
+    console.error('[Main] Closed-join sim server error', error?.message || error);
+  });
+
+  closedJoinSimServer.listen(CLOSED_JOIN_SIM_PORT, '127.0.0.1', () => {
+    console.log(`[Main] Closed-join sim server listening on 127.0.0.1:${CLOSED_JOIN_SIM_PORT}${CLOSED_JOIN_SIM_PATH}`);
+  });
+}
+
+async function stopClosedJoinSimServer() {
+  if (!closedJoinSimServer) return;
+  const server = closedJoinSimServer;
+  closedJoinSimServer = null;
+  await new Promise((resolve) => {
+    try {
+      server.close(() => resolve());
+    } catch (_) {
+      resolve();
+    }
+  });
 }
 
 function getReferencePluginPaths() {
@@ -495,7 +700,7 @@ function createWindow() {
     mainWindow = null;
   });
 
-  const devUrl = process.env.RENDERER_URL;
+  const devUrl = withClosedJoinE2EParam(process.env.RENDERER_URL);
   if (devUrl) {
     const loadDev = (url) => {
       if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -510,7 +715,13 @@ function createWindow() {
     loadDev(devUrl);
   } else {
     const rendererPath = path.join(__dirname, '..', 'indiepress-dev', 'dist', 'index.html');
-    mainWindow.loadFile(rendererPath);
+    if (CLOSED_JOIN_SIM_ENABLED) {
+      mainWindow.loadFile(rendererPath, {
+        query: { closedJoinE2E: '1' }
+      });
+    } else {
+      mainWindow.loadFile(rendererPath);
+    }
   }
 }
 
@@ -1366,6 +1577,7 @@ app.whenReady().then(async () => {
   await ensureStorageDir();
   await ensurePluginSupervisor();
   createWindow();
+  startClosedJoinSimServer();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -1376,6 +1588,7 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
+    void stopClosedJoinSimServer();
     if (pluginSupervisor) {
       pluginSupervisor.stopAll().catch((error) => {
         console.warn('[Main] Failed to stop plugin supervisor on shutdown', error?.message || error);
@@ -1394,6 +1607,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  void stopClosedJoinSimServer();
   if (pluginSupervisor) {
     pluginSupervisor.stopAll().catch((error) => {
       console.warn('[Main] Failed to stop plugin supervisor before quit', error?.message || error);

@@ -407,6 +407,8 @@ const GROUP_METADATA_TIMEOUT_MS = 2_500
 const LOCAL_PROFILE_CACHE_TTL_MS = 5_000
 const CREATE_RELAY_RECONCILE_TIMEOUT_MS = 90_000
 const CREATE_RELAY_RECONCILE_POLL_MS = 1_500
+const RELAY_QUERY_READY_WAIT_TIMEOUT_MS = 8_000
+const RELAY_QUERY_READY_WAIT_POLL_MS = 500
 
 type LocalRelayProfileSnapshot = {
   relayKey: string
@@ -459,6 +461,7 @@ export class TuiController {
   private profileNameCache = new Map<string, string>()
   private localProfileCache: { loadedAt: number; entries: LocalRelayProfileSnapshot[] } | null = null
   private gatewayPeerRelayMap: Record<string, string[]> = {}
+  private relayQueryReadyWaitInFlight: Promise<boolean> | null = null
 
   private state: ControllerState = {
     initialized: false,
@@ -2655,10 +2658,14 @@ export class TuiController {
     const urls: string[] = []
     for (const entry of this.state.relays) {
       if (!entry.connectionUrl) continue
-      const isReady = entry.readyForReq === true
-      const isWritable = entry.writable === true
-      const noAuthRequired = entry.requiresAuth !== true
-      if (isReady || isWritable || noAuthRequired) {
+      if (entry.requiresAuth === true) {
+        if (!this.relayHasAuthToken(entry)) continue
+        if (!this.isRelayQueryReady(entry)) continue
+        urls.push(entry.connectionUrl)
+        continue
+      }
+
+      if (this.isRelayQueryReady(entry)) {
         urls.push(entry.connectionUrl)
       }
     }
@@ -2675,6 +2682,18 @@ export class TuiController {
   private getJoinedGroupRelayUrls(): string[] {
     const candidateRelays = new Set<string>()
     for (const entry of this.state.myGroupList) {
+      const connected = this.findConnectedRelayByIdentifier(entry.groupId)
+      if (connected?.connectionUrl) {
+        const canReadConnected =
+          this.isRelayQueryReady(connected)
+          && (connected.requiresAuth !== true || this.relayHasAuthToken(connected))
+        if (canReadConnected) {
+          const resolvedConnected = this.resolveRelayUrl(connected.connectionUrl)
+          if (resolvedConnected) candidateRelays.add(resolvedConnected)
+        }
+        continue
+      }
+
       const relay = this.resolveRelayUrl(entry.relay)
       if (relay) candidateRelays.add(relay)
       const match = this.state.groupDiscover.find((group) => group.id === entry.groupId && group.relay)
@@ -2684,6 +2703,95 @@ export class TuiController {
       }
     }
     return uniqueRelayUrls(Array.from(candidateRelays))
+  }
+
+  private isRelayQueryReady(entry: RelayEntry): boolean {
+    if (!entry?.connectionUrl) return false
+    if (typeof entry.queryReady === 'boolean') return entry.queryReady
+    if (typeof entry.writable === 'boolean') return entry.writable
+    return entry.readyForReq === true
+  }
+
+  private relayHasAuthToken(entry: RelayEntry): boolean {
+    if (!entry?.connectionUrl) return false
+    if (entry.userAuthToken) return true
+    try {
+      const parsed = new URL(entry.connectionUrl)
+      return !!parsed.searchParams.get('token')
+    } catch {
+      return /[?&]token=/.test(entry.connectionUrl)
+    }
+  }
+
+  private pendingRelayQueryReadyEntries(): RelayEntry[] {
+    return this.state.relays.filter((entry) => {
+      if (!entry?.connectionUrl) return false
+      if (entry.requiresAuth !== true) return false
+      if (!this.relayHasAuthToken(entry)) return false
+      return !this.isRelayQueryReady(entry)
+    })
+  }
+
+  private async probeRelayReadinessSnapshot(): Promise<void> {
+    try {
+      const relays = await this.withTimeout(
+        this.relayService.getRelays(),
+        Math.min(RELAY_REFRESH_TIMEOUT_MS, 4_000),
+        'Relay query-ready probe'
+      ) as RelayEntry[]
+      this.patchState({
+        relays
+      })
+    } catch {
+      // best-effort readiness probe
+    }
+  }
+
+  private async waitForRelayQueryReady(reason: string): Promise<boolean> {
+    if (!this.workerHost.isRunning()) return true
+    await this.probeRelayReadinessSnapshot()
+    const pending = this.pendingRelayQueryReadyEntries()
+    if (!pending.length) return true
+
+    const inFlight = this.relayQueryReadyWaitInFlight
+    if (inFlight) {
+      return await inFlight
+    }
+
+    const timeoutMs = Math.max(1_000, RELAY_QUERY_READY_WAIT_TIMEOUT_MS)
+    const pollMs = Math.max(150, RELAY_QUERY_READY_WAIT_POLL_MS)
+
+    const waitTask = (async () => {
+      const startedAt = Date.now()
+      let remaining = pending
+      while (remaining.length > 0 && (Date.now() - startedAt) < timeoutMs) {
+        await this.pause(pollMs)
+        await this.probeRelayReadinessSnapshot()
+        remaining = this.pendingRelayQueryReadyEntries()
+      }
+
+      const allReady = remaining.length === 0
+      if (remaining.length > 0) {
+        const sample = remaining
+          .slice(0, 3)
+          .map((entry) => String(entry.publicIdentifier || entry.relayKey || entry.connectionUrl || 'unknown'))
+          .join(', ')
+        this.log(
+          'debug',
+          `Proceeding before all relays became query-ready for ${reason} (pending=${remaining.length}${sample ? `; sample=${sample}` : ''})`
+        )
+      }
+      return allReady
+    })()
+
+    this.relayQueryReadyWaitInFlight = waitTask
+    try {
+      return await waitTask
+    } finally {
+      if (this.relayQueryReadyWaitInFlight === waitTask) {
+        this.relayQueryReadyWaitInFlight = null
+      }
+    }
   }
 
   private currentRelayUrls(): string[] {
@@ -3112,7 +3220,12 @@ export class TuiController {
       }
 
       const existingRelay = this.findConnectedRelayByIdentifier(normalizedPublicIdentifier)
-      if (existingRelay && existingRelay.connectionUrl && existingRelay.readyForReq) {
+      if (
+        existingRelay
+        && existingRelay.connectionUrl
+        && this.isRelayQueryReady(existingRelay)
+        && (existingRelay.requiresAuth !== true || this.relayHasAuthToken(existingRelay))
+      ) {
         this.log('info', `Relay already connected for ${normalizedPublicIdentifier}; skipping join`)
         return {
           relayKey: existingRelay.relayKey,
@@ -3613,6 +3726,7 @@ export class TuiController {
 
   async refreshGroups(): Promise<void> {
     await this.runTask('Refresh groups', async () => {
+      await this.waitForRelayQueryReady('group refresh')
       const discoveryRelays = this.searchableRelayUrls(18)
       const myListRelays = this.searchableRelayUrls(14)
       const [groups, loadedMyGroupList, localGroups] = await Promise.all([
@@ -3684,6 +3798,7 @@ export class TuiController {
     }
 
     await this.runTask('Refresh invites', async () => {
+      await this.waitForRelayQueryReady('invite refresh')
       const session = this.requireSession()
       const invites = await this.withTimeout(
         this.groupService.discoverInvites(
@@ -3852,6 +3967,7 @@ export class TuiController {
 
   async refreshJoinRequests(groupId: string, relay?: string): Promise<void> {
     await this.runTask('Refresh join requests', async () => {
+      await this.waitForRelayQueryReady('join request refresh')
       const groupKey = relay ? `${relay}|${groupId}` : groupId
       const requests = await this.groupService.loadJoinRequests(
         this.searchableRelayUrls(),
@@ -4524,6 +4640,7 @@ export class TuiController {
 
   async refreshGroupNotes(groupId: string, relay?: string): Promise<void> {
     await this.runTask('Refresh group notes', async () => {
+      await this.waitForRelayQueryReady('group note refresh')
       const normalizedGroupId = String(groupId || '').trim()
       if (!normalizedGroupId) {
         throw new Error('groupId is required')
@@ -4562,6 +4679,7 @@ export class TuiController {
 
   async refreshGroupFiles(groupId?: string): Promise<void> {
     await this.runTask('Refresh files', async () => {
+      await this.waitForRelayQueryReady('group file refresh')
       let files: GroupFileRecord[] = []
       if (groupId) {
         files = await this.fileService.fetchGroupFiles(this.searchableRelayUrls(), groupId)
@@ -4635,6 +4753,7 @@ export class TuiController {
 
   async refreshChats(): Promise<void> {
     await this.runTask('Refresh chats', async () => {
+      await this.waitForRelayQueryReady('chat refresh')
       try {
         const snapshot = await this.fetchChatSnapshot(12_000, 'Chat refresh')
         this.clearChatRetryTimer()

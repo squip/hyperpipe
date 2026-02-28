@@ -6,6 +6,8 @@ import RelayProtocol from './RelayProtocol.mjs';
 
 const GET_CONN_TRACE_WINDOW_MS = 5000;
 const GET_CONN_TRACE_THRESHOLDS = new Set([1, 2, 5, 10, 20, 50, 100, 200, 500]);
+const GET_CONN_LOOP_THRESHOLD = 20;
+const inflightGetEventsRequests = new Map();
 
 const formatGetConnectionContext = (context) => {
   if (!context) return null;
@@ -79,6 +81,7 @@ class HyperswarmConnection {
     this.lastUsed = Date.now();
     this.connectionAttempts = 0;
     this.lastHealthyAt = 0;
+    this.healthFailureStreak = 0;
     this.failureCount = 0;
     this._lifecycleCleanup = null;
     this._connectionClosed = false;
@@ -234,6 +237,7 @@ class HyperswarmConnection {
     this.connecting = false;
     this.lastUsed = Date.now();
     this.failureCount = 0;
+    this.healthFailureStreak = 0;
     this.lastHealthyAt = Date.now();
     this._bindLifecycleHandlers();
   }
@@ -436,6 +440,7 @@ class HyperswarmConnection {
     const response = await this.protocol.sendHealthCheck();
     this.lastHealthyAt = Date.now();
     this.failureCount = 0;
+    this.healthFailureStreak = 0;
     return response;
   }
 
@@ -601,13 +606,15 @@ class EnhancedHyperswarmPool {
       windowStart: now,
       count: 0,
       lastLogAt: 0,
-      loopLogged: false
+      loopLogged: false,
+      loopWarned: false
     };
     if (now - stats.windowStart > GET_CONN_TRACE_WINDOW_MS) {
       stats.windowStart = now;
       stats.count = 0;
       stats.lastLogAt = 0;
       stats.loopLogged = false;
+      stats.loopWarned = false;
     }
     stats.count += 1;
     this._getConnectionStats.set(publicKey, stats);
@@ -622,20 +629,44 @@ class EnhancedHyperswarmPool {
       });
     }
 
-    if (!stats.loopLogged && stats.count >= 20) {
+    const stateLooksHealthy = state.connected === true
+      && state.connecting !== true
+      && state.streamClosed !== true
+      && state.streamDestroyed !== true;
+
+    if (!stats.loopLogged && stats.count >= GET_CONN_LOOP_THRESHOLD) {
       stats.loopLogged = true;
-      const stack = new Error().stack
-        ?.split('\n')
-        .slice(1, 6)
-        .map(line => line.trim())
-        .join(' | ');
-      this.logger?.warn?.('Hyperswarm getConnection loop detected', {
+      if (stateLooksHealthy) {
+        this.logger?.info?.('Hyperswarm getConnection high volume (healthy)', {
+          peer: publicKey,
+          count: stats.count,
+          windowMs: now - stats.windowStart,
+          context: contextInfo,
+          state
+        });
+      } else {
+        const stack = new Error().stack
+          ?.split('\n')
+          .slice(1, 6)
+          .map(line => line.trim())
+          .join(' | ');
+        this.logger?.warn?.('Hyperswarm getConnection loop detected', {
+          peer: publicKey,
+          count: stats.count,
+          windowMs: now - stats.windowStart,
+          context: contextInfo,
+          state,
+          stack
+        });
+        stats.loopWarned = true;
+      }
+    } else if (stats.loopWarned && stateLooksHealthy) {
+      stats.loopWarned = false;
+      this.logger?.info?.('Hyperswarm getConnection loop recovered', {
         peer: publicKey,
         count: stats.count,
         windowMs: now - stats.windowStart,
-        context: contextInfo,
-        state,
-        stack
+        context: contextInfo
       });
     }
 
@@ -828,22 +859,33 @@ class EnhancedHyperswarmPool {
 
   async _checkConnectionHealth(publicKey, connection) {
     if (!connection || connection.connecting) return;
+    const idleForMs = Number.isFinite(connection.lastUsed)
+      ? Math.max(0, Date.now() - connection.lastUsed)
+      : Number.POSITIVE_INFINITY;
+    // Avoid probing very hot connections; request traffic already proves liveness.
+    if (idleForMs < 5000) return;
     try {
       await connection.healthCheck();
+      connection.healthFailureStreak = 0;
       this._emitHealthUpdate(publicKey, {
         healthy: true,
         lastHealthyAt: connection.lastHealthyAt
       });
     } catch (error) {
+      connection.healthFailureStreak = (connection.healthFailureStreak || 0) + 1;
       this.logger?.warn?.('Hyperswarm connection health check failed', {
         peer: publicKey,
+        idleForMs,
+        streak: connection.healthFailureStreak,
         error: error?.message || error
       });
       this._emitHealthUpdate(publicKey, {
         healthy: false,
         error: error instanceof Error ? error : new Error(String(error))
       });
-      connection.destroy('health-check-failed', error instanceof Error ? error : new Error(String(error)));
+      if (connection.healthFailureStreak >= 2) {
+        connection.destroy('health-check-failed', error instanceof Error ? error : new Error(String(error)));
+      }
     }
   }
 
@@ -1007,29 +1049,51 @@ async function requestPfpFromPeer(peer, owner, file, connectionPool) {
 }
 
 async function getEventsFromPeerHyperswarm(peerPublicKey, relayKey, connectionKey, connectionPool, authToken = null) {
-  const connection = await connectionPool.getConnection(peerPublicKey, {
-    reason: 'get-events',
-    method: 'GET',
-    path: `/get/relay/${relayKey}/${connectionKey}`,
-    relayKey
-  });
-
-  const headers = { accept: 'application/json' };
-  if (authToken) {
-    headers['x-auth-token'] = authToken;
+  const key = `${peerPublicKey}|${relayKey}|${connectionKey}|${authToken || ''}`;
+  const existing = inflightGetEventsRequests.get(key);
+  if (existing) {
+    connectionPool?.logger?.debug?.('Coalescing in-flight get-events request', {
+      peer: peerPublicKey,
+      relayKey,
+      connectionKey
+    });
+    return existing;
   }
 
-  const response = await connection.sendRequest({
-    method: 'GET',
-    path: `/get/relay/${relayKey}/${connectionKey}`,
-    headers
-  });
+  const requestPromise = (async () => {
+    const connection = await connectionPool.getConnection(peerPublicKey, {
+      reason: 'get-events',
+      method: 'GET',
+      path: `/get/relay/${relayKey}/${connectionKey}`,
+      relayKey
+    });
 
-  if (response.statusCode !== 200) {
-    throw new Error(`Peer returned status ${response.statusCode}`);
+    const headers = { accept: 'application/json' };
+    if (authToken) {
+      headers['x-auth-token'] = authToken;
+    }
+
+    const response = await connection.sendRequest({
+      method: 'GET',
+      path: `/get/relay/${relayKey}/${connectionKey}`,
+      headers
+    });
+
+    if (response.statusCode !== 200) {
+      throw new Error(`Peer returned status ${response.statusCode}`);
+    }
+
+    return JSON.parse(response.body.toString());
+  })();
+
+  inflightGetEventsRequests.set(key, requestPromise);
+  try {
+    return await requestPromise;
+  } finally {
+    if (inflightGetEventsRequests.get(key) === requestPromise) {
+      inflightGetEventsRequests.delete(key);
+    }
   }
-
-  return JSON.parse(response.body.toString());
 }
 
 export {

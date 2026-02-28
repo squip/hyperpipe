@@ -1,9 +1,10 @@
 import path from 'node:path'
+import os from 'node:os'
 import { constants as fsConstants, promises as fs } from 'node:fs'
 import { parseArgs } from 'node:util'
+import { generateSecretKey, getPublicKey } from 'nostr-tools'
 import { TuiController, type RuntimeOptions } from '../../src/domain/controller.js'
 import type { LogLevel } from '../../src/domain/types.js'
-import { resolveDesktopParityStorageDir } from '../../src/storage/defaultStorageDir.js'
 
 type CheckStatus = 'PASS' | 'FAIL' | 'SKIP'
 type RowStatus = 'PASS' | 'FAIL' | 'SKIP'
@@ -51,6 +52,11 @@ function summarizeChecks(checks: CheckResult[]): RowStatus {
   return 'SKIP'
 }
 
+function isMissingKeyPackageError(value: unknown): boolean {
+  const message = String(value || '').toLowerCase()
+  return message.includes('no key package event found')
+}
+
 async function fileExists(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath, fsConstants.F_OK)
@@ -94,6 +100,18 @@ function printHumanTable(rows: MatrixRow[]): void {
   process.stdout.write(`${lines.join('\n')}\n`)
 }
 
+function defaultMatrixStorageDir(): string {
+  return path.join(
+    os.tmpdir(),
+    'hypertuna-live-matrix',
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  )
+}
+
+function generateDefaultInviteePubkey(): string {
+  return getPublicKey(generateSecretKey()).toLowerCase()
+}
+
 const parsed = parseArgs({
   args: process.argv.slice(2),
   options: {
@@ -112,12 +130,20 @@ const parsed = parseArgs({
 const cwd = process.cwd()
 const storageDir = parsed.values['storage-dir']
   ? path.resolve(cwd, parsed.values['storage-dir'])
-  : resolveDesktopParityStorageDir(cwd)
+  : defaultMatrixStorageDir()
 const inviteePubkey = String(
   parsed.values['invitee-pubkey']
   || process.env.HYPERTUNA_TUI_INVITEE_PUBKEY
-  || 'b'.repeat(64)
+  || generateDefaultInviteePubkey()
 ).trim().toLowerCase()
+
+const usingDefaultInvitee =
+  !parsed.values['invitee-pubkey']
+  && !process.env.HYPERTUNA_TUI_INVITEE_PUBKEY
+
+if (usingDefaultInvitee) {
+  process.stdout.write(`[info] Using generated invitee pubkey ${shortId(inviteePubkey, 16)} for matrix invite checks\n`)
+}
 
 const runtime: RuntimeOptions = {
   cwd,
@@ -131,6 +157,7 @@ const controller = new TuiController(runtime)
 const rows: MatrixRow[] = []
 
 try {
+  await fs.mkdir(storageDir, { recursive: true })
   await controller.initialize()
   await bootstrapAccount(controller, {
     nsec: parsed.values.nsec,
@@ -314,18 +341,31 @@ try {
         try {
           const result = await controller.inviteChatMembers(conversation.id, [inviteePubkey])
           const invited = result.invited.includes(inviteePubkey)
+          const onlyMissingKeyPackage =
+            result.failed.length > 0
+            && result.failed.every((entry) => isMissingKeyPackageError(entry.error))
+          const failureSummary = result.failed
+            .map((entry) => `${shortId(entry.pubkey)}:${entry.error}`)
+            .join(',')
           checks.push({
             name: 'send chat invite',
-            status: invited ? 'PASS' : 'FAIL',
+            status: invited
+              ? 'PASS'
+              : (usingDefaultInvitee && onlyMissingKeyPackage ? 'SKIP' : 'FAIL'),
             evidence: invited
               ? `conversation=${conversation.id}`
-              : `failed=${result.failed.map((entry) => `${shortId(entry.pubkey)}:${entry.error}`).join(',') || 'none'}`
+              : (usingDefaultInvitee && onlyMissingKeyPackage
+                ? `auto-generated invitee has no published key package (${shortId(inviteePubkey)})`
+                : `failed=${failureSummary || 'none'}`)
           })
         } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
           checks.push({
             name: 'send chat invite',
-            status: 'FAIL',
-            evidence: error instanceof Error ? error.message : String(error)
+            status: usingDefaultInvitee && isMissingKeyPackageError(message) ? 'SKIP' : 'FAIL',
+            evidence: usingDefaultInvitee && isMissingKeyPackageError(message)
+              ? `auto-generated invitee has no published key package (${shortId(inviteePubkey)})`
+              : message
           })
         }
 

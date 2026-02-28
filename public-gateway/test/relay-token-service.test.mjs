@@ -55,3 +55,14 @@ test('RelayTokenService refreshes and revokes tokens', async () => {
 
   await assert.rejects(() => service.verifyToken(refreshed.token, 'relay:test'), /token-revoked|token-mismatch|token-stale/);
 });
+
+test('RelayTokenService accepts previous refresh token during grace window', async () => {
+  const { service } = await createService();
+  const first = await service.issueToken('relay:test', { relayAuthToken: 'auth-token', scope: 'relay-access' });
+  const refreshed = await service.refreshToken('relay:test', { token: first.token });
+  const raced = await service.refreshToken('relay:test', { token: first.token });
+
+  assert.equal(raced.reused, true);
+  assert.equal(raced.sequence, refreshed.sequence);
+  assert.equal(raced.token, refreshed.token);
+});

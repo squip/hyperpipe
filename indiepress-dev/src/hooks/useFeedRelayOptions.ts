@@ -96,11 +96,13 @@ export default function useFeedRelayOptions() {
       const relayIdentity = getRelayIdentity(resolvedRelayUrl) || target.relayIdentity
       const requiresAuth = relayEntry?.requiresAuth === true
       const writable = relayEntry?.writable === true
+      const queryReady =
+        typeof relayEntry?.queryReady === 'boolean' ? relayEntry.queryReady : writable
       const tokenPresent =
         !!relayEntry?.userAuthToken
         || hasTokenInRelayUrl(relayEntry?.connectionUrl)
         || hasTokenInRelayUrl(resolvedRelayUrl)
-      const fallbackReadyForReq = writable && (!requiresAuth || tokenPresent)
+      const fallbackReadyForReq = queryReady && (!requiresAuth || tokenPresent)
       const relayReadyForReq =
         typeof relayEntry?.readyForReq === 'boolean' ? relayEntry.readyForReq : fallbackReadyForReq
 
