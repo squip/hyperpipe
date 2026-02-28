@@ -37,6 +37,32 @@ function normalizeEntry(entry) {
   const writerSecret = typeof entry.writerSecret === 'string' ? entry.writerSecret : null;
   const issuedAt = Number.isFinite(entry.issuedAt) ? entry.issuedAt : null;
   const expiresAt = Number.isFinite(entry.expiresAt) ? entry.expiresAt : null;
+  const leaseId = typeof entry.leaseId === 'string' ? entry.leaseId : null;
+  const inviteePubkey =
+    typeof entry.inviteePubkey === 'string' ? entry.inviteePubkey.toLowerCase() : null;
+  const tokenHash = typeof entry.tokenHash === 'string' ? entry.tokenHash.toLowerCase() : null;
+  const issuerPubkey =
+    typeof entry.issuerPubkey === 'string' ? entry.issuerPubkey.toLowerCase() : null;
+  const issuerSwarmPeerKey =
+    typeof entry.issuerSwarmPeerKey === 'string' ? entry.issuerSwarmPeerKey.toLowerCase() : null;
+  const publicIdentifier =
+    typeof entry.publicIdentifier === 'string' ? entry.publicIdentifier : null;
+  const relayKey = typeof entry.relayKey === 'string' ? entry.relayKey.toLowerCase() : null;
+  const signature = typeof entry.signature === 'string' ? entry.signature : null;
+  const leaseExpiresAt = Number.isFinite(entry.leaseExpiresAt) ? entry.leaseExpiresAt : null;
+  const writerLeaseEnvelope =
+    entry.writerLeaseEnvelope && typeof entry.writerLeaseEnvelope === 'object'
+      ? entry.writerLeaseEnvelope
+      : null;
+  const leaseReplicaPeerKeys = Array.isArray(entry.leaseReplicaPeerKeys)
+    ? Array.from(
+      new Set(
+        entry.leaseReplicaPeerKeys
+          .map((value) => (typeof value === 'string' ? value.trim().toLowerCase() : ''))
+          .filter((value) => value && /^[0-9a-f]{64}$/i.test(value))
+      )
+    )
+    : [];
   if (!writerCore && !writerCoreHex && !autobaseLocal) return null;
   if (!writerSecret) return null;
   return {
@@ -45,7 +71,18 @@ function normalizeEntry(entry) {
     autobaseLocal,
     writerSecret,
     issuedAt,
-    expiresAt
+    expiresAt,
+    leaseId,
+    inviteePubkey,
+    tokenHash,
+    issuerPubkey,
+    issuerSwarmPeerKey,
+    publicIdentifier,
+    relayKey,
+    signature,
+    leaseExpiresAt,
+    writerLeaseEnvelope,
+    leaseReplicaPeerKeys
   };
 }
 
@@ -56,6 +93,7 @@ export function pruneWriterPoolEntries(entries = [], now = Date.now()) {
     const normalized = normalizeEntry(entry);
     if (!normalized) continue;
     if (Number.isFinite(normalized.expiresAt) && normalized.expiresAt <= now) continue;
+    if (Number.isFinite(normalized.leaseExpiresAt) && normalized.leaseExpiresAt <= now) continue;
     result.push(normalized);
   }
   return result;

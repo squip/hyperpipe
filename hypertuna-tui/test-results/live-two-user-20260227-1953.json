@@ -1,0 +1,127 @@
+{
+  "generatedAt": "2026-02-28T04:07:44.924Z",
+  "storageDir": "/tmp/hypertuna-live-two-user-20260227-1953",
+  "user1": "d8ae66f39d0df9c1629b43033a8015d3ba30272b422aa98beb23fa5e5d98b3f6",
+  "user2": "68feeb353299966f2a3f6f7e7084bd8ff451bfa0322b2d9aa638fb6381dd5575",
+  "rows": [
+    {
+      "scenario": "Public/Open Group (create + join + pane stability)",
+      "status": "PASS",
+      "checks": [
+        {
+          "name": "create public/open group",
+          "status": "PASS",
+          "evidence": "group=npub1mzhxduuaphuuzc5mgvpn4qq46warqfetgg42nzlty0a9uhvck0mq9asvf5:pub-open-mm5sc4sx"
+        },
+        {
+          "name": "creator relay metadata has tokenized URL",
+          "status": "PASS",
+          "evidence": "ws://127.0.0.1:8443/npub1mzhxduuaphuuzc5mgvpn4qq46warqfetgg42nzlty0a9uhvck0mq9asvf5/pub-open-mm5sc4sx?token=42bdf07745143157220660d7d3296b52a99a2c106c5d49af827c055797e66bf1"
+        },
+        {
+          "name": "user2 sees group in Browse Groups",
+          "status": "PASS",
+          "evidence": "group=npub1mzhxduuaphuuzc5mgvpn4qq46warqfetgg42nzlty0a9uhvck0mq9asvf5:pub-open-mm5sc4sx"
+        },
+        {
+          "name": "user2 joined public/open group relay",
+          "status": "PASS",
+          "evidence": "ws://127.0.0.1:8443/npub1mzhxduuaphuuzc5mgvpn4qq46warqfetgg42nzlty0a9uhvck0mq9asvf5/pub-open-mm5sc4sx?token=aebdbe08c095ceb9c5fd3f7684258f46739ba0c97f439ee599172bf6ecc34a62"
+        },
+        {
+          "name": "user2 My Groups hydrated after public/open join",
+          "status": "PASS",
+          "evidence": "npub1mzhxduuaphuuzc5mgvpn4qq46warqfetgg42nzlty0a9uhvck0mq9asvf5:pub-open-mm5sc4sx"
+        },
+        {
+          "name": "top-right pane navigation remains stable",
+          "status": "PASS",
+          "evidence": "App handled repeated right-top up/down keys and command navigation remained responsive"
+        }
+      ]
+    },
+    {
+      "scenario": "Public/Closed Group (request invite flow)",
+      "status": "PASS",
+      "checks": [
+        {
+          "name": "create public/closed group",
+          "status": "PASS",
+          "evidence": "group=npub1mzhxduuaphuuzc5mgvpn4qq46warqfetgg42nzlty0a9uhvck0mq9asvf5:pub-closed-request-mm5sf8u0"
+        },
+        {
+          "name": "user2 submits request-invite",
+          "status": "PASS",
+          "evidence": "group=npub1mzhxduuaphuuzc5mgvpn4qq46warqfetgg42nzlty0a9uhvck0mq9asvf5:pub-closed-request-mm5sf8u0"
+        },
+        {
+          "name": "admin approves join request",
+          "status": "PASS",
+          "evidence": "requestPubkey=68feeb353299…"
+        },
+        {
+          "name": "request-invite accept joins relay with tokenized URL",
+          "status": "PASS",
+          "evidence": "ws://127.0.0.1:8443/npub1mzhxduuaphuuzc5mgvpn4qq46warqfetgg42nzlty0a9uhvck0mq9asvf5/pub-closed-request-mm5sf8u0?token=cf9404127d6c1ad78cc39ac1"
+        },
+        {
+          "name": "request-invite user My Groups hydrated after accept",
+          "status": "PASS",
+          "evidence": "npub1mzhxduuaphuuzc5mgvpn4qq46warqfetgg42nzlty0a9uhvck0mq9asvf5:pub-closed-request-mm5sf8u0"
+        }
+      ]
+    },
+    {
+      "scenario": "Public/Closed Group (admin direct invite flow)",
+      "status": "FAIL",
+      "checks": [
+        {
+          "name": "admin sends direct group invite",
+          "status": "PASS",
+          "evidence": "group=npub1mzhxduuaphuuzc5mgvpn4qq46warqfetgg42nzlty0a9uhvck0mq9asvf5:pub-closed-admin-mm5skjwj invitee=68feeb353299…"
+        },
+        {
+          "name": "direct invite accept joins relay with tokenized URL",
+          "status": "PASS",
+          "evidence": "ws://127.0.0.1:8443/npub1mzhxduuaphuuzc5mgvpn4qq46warqfetgg42nzlty0a9uhvck0mq9asvf5/pub-closed-admin-mm5skjwj?token=89b746db070c3c5278218f7bc1affc8add542096fdc515b82ff4dda78664dedc"
+        },
+        {
+          "name": "direct-invite user My Groups hydrated after accept",
+          "status": "FAIL",
+          "evidence": "user2 My Groups includes direct-invite group timed out"
+        }
+      ]
+    },
+    {
+      "scenario": "Chats (create + invite + accept + bi-directional messages)",
+      "status": "PASS",
+      "checks": [
+        {
+          "name": "user2 chat bootstrap",
+          "status": "PASS",
+          "evidence": "initChats completed"
+        },
+        {
+          "name": "user1 creates chat and invites user2",
+          "status": "PASS",
+          "evidence": "conversation=358bf1667dd1ec518e06e762a20fe26f61750cd788680d9dda02afbd2d7fd6e5"
+        },
+        {
+          "name": "user2 accepts invite and sends message",
+          "status": "PASS",
+          "evidence": "invite=dfc8038a75ab0c5e76c0bad28e1d3793dec38a495680f6bcb088f4e3fded3845"
+        },
+        {
+          "name": "user1 receives and replies",
+          "status": "PASS",
+          "evidence": "conversation=358bf1667dd1ec518e06e762a20fe26f61750cd788680d9dda02afbd2d7fd6e5"
+        },
+        {
+          "name": "user2 receives user1 message",
+          "status": "PASS",
+          "evidence": "conversation=358bf1667dd1ec518e06e762a20fe26f61750cd788680d9dda02afbd2d7fd6e5"
+        }
+      ]
+    }
+  ]
+}

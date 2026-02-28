@@ -149,6 +149,52 @@ export function parseGroupInviteWithPayload(args: {
       : typeof payload.relay_key === 'string'
         ? payload.relay_key
         : null
+  const discoveryTopic =
+    typeof payload.discoveryTopic === 'string'
+      ? payload.discoveryTopic
+      : typeof payload.discovery_topic === 'string'
+        ? payload.discovery_topic
+        : null
+  const hostPeerKeys = Array.from(
+    new Set(
+      (Array.isArray(payload.hostPeerKeys)
+        ? payload.hostPeerKeys
+        : Array.isArray(payload.host_peers)
+          ? payload.host_peers
+          : [])
+        .map((entry) => String(entry || '').trim().toLowerCase())
+        .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+    )
+  )
+  const writerIssuerPubkey =
+    typeof payload.writerIssuerPubkey === 'string'
+      ? payload.writerIssuerPubkey
+      : typeof payload.writer_issuer_pubkey === 'string'
+        ? payload.writer_issuer_pubkey
+        : null
+  const leaseReplicaPeerKeys = Array.from(
+    new Set(
+      (Array.isArray(payload.leaseReplicaPeerKeys)
+        ? payload.leaseReplicaPeerKeys
+        : Array.isArray(payload.lease_replica_peer_keys)
+          ? payload.lease_replica_peer_keys
+          : [])
+        .map((entry) => String(entry || '').trim().toLowerCase())
+        .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+    )
+  )
+  const writerLeaseEnvelope =
+    payload.writerLeaseEnvelope && typeof payload.writerLeaseEnvelope === 'object'
+      ? payload.writerLeaseEnvelope as Record<string, unknown>
+      : payload.writer_lease_envelope && typeof payload.writer_lease_envelope === 'object'
+        ? payload.writer_lease_envelope as Record<string, unknown>
+        : null
+  const gatewayMode: GroupInvite['gatewayMode'] =
+    payload.gatewayMode === 'disabled'
+      ? 'disabled'
+      : payload.gatewayMode === 'auto'
+        ? 'auto'
+        : undefined
   const token = typeof payload.token === 'string' ? payload.token : undefined
   const fileSharing = typeof payload.fileSharing === 'boolean' ? payload.fileSharing : parsed.fileSharing
   const isPublic = typeof payload.isPublic === 'boolean' ? payload.isPublic : parsed.isPublic
@@ -251,6 +297,12 @@ export function parseGroupInviteWithPayload(args: {
     relay,
     relayUrl: relayUrl || null,
     relayKey,
+    discoveryTopic,
+    hostPeerKeys: hostPeerKeys.length ? hostPeerKeys : undefined,
+    writerIssuerPubkey,
+    leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : undefined,
+    writerLeaseEnvelope,
+    gatewayMode,
     groupName,
     groupPicture,
     name: groupName,

@@ -66,6 +66,9 @@ export type GroupSummary = {
   picture?: string
   isPublic?: boolean
   isOpen?: boolean
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
   adminPubkey?: string | null
   adminName?: string | null
   members?: string[]
@@ -81,6 +84,12 @@ export type GroupInvite = {
   relay?: string
   relayUrl?: string | null
   relayKey?: string | null
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
+  leaseReplicaPeerKeys?: string[]
+  writerLeaseEnvelope?: Record<string, unknown> | null
+  gatewayMode?: 'auto' | 'disabled'
   groupName?: string
   groupPicture?: string
   name?: string
@@ -399,6 +408,11 @@ export interface RelayService {
     relayUrl?: string
     openJoin?: boolean
     hostPeers?: string[]
+    discoveryTopic?: string
+    hostPeerKeys?: string[]
+    writerIssuerPubkey?: string
+    leaseReplicaPeerKeys?: string[]
+    gatewayMode?: 'auto' | 'disabled'
     blindPeer?: {
       publicKey?: string | null
       encryptionKey?: string | null

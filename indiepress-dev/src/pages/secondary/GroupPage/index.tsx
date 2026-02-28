@@ -1089,6 +1089,20 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           token: inviteToken,
           relayKey,
           relayUrl: relayUrlForJoin,
+          discoveryTopic:
+            inviteData?.discoveryTopic
+            || detail?.metadata?.discoveryTopic
+            || undefined,
+          hostPeerKeys:
+            inviteData?.hostPeerKeys
+            || detail?.metadata?.hostPeerKeys
+            || undefined,
+          writerIssuerPubkey:
+            inviteData?.writerIssuerPubkey
+            || detail?.metadata?.writerIssuerPubkey
+            || undefined,
+          leaseReplicaPeerKeys: inviteData?.leaseReplicaPeerKeys || undefined,
+          gatewayMode: inviteData?.gatewayMode || undefined,
           blindPeer: inviteData?.blindPeer,
           cores: inviteData?.cores,
           writerCore: inviteData?.writerCore,

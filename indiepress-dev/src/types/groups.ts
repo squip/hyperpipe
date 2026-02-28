@@ -14,8 +14,37 @@ export type TGroupMetadata = {
   picture?: string
   isPublic?: boolean
   isOpen?: boolean
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
   tags: string[]
   event: Event
+}
+
+export type TWriterLeaseEnvelope = {
+  version?: string | number
+  leaseId?: string
+  relayKey?: string | null
+  publicIdentifier?: string | null
+  inviteePubkey?: string | null
+  tokenHash?: string | null
+  writerCore?: string | null
+  writerCoreHex?: string | null
+  autobaseLocal?: string | null
+  writerSecret?: string | null
+  coreRefs?: Array<string | { key: string; role?: string | null }>
+  fastForward?: {
+    key?: string | null
+    length?: number | null
+    signedLength?: number | null
+    timeoutMs?: number | null
+  } | null
+  issuedAt?: number | null
+  expiresAt?: number | null
+  issuerPubkey?: string | null
+  issuerSwarmPeerKey?: string | null
+  signature?: string | null
+  signedEvent?: Event | Record<string, unknown> | null
 }
 
 export type TGroupAdmin = {
@@ -47,6 +76,12 @@ export type TGroupInvite = {
   isPublic?: boolean
   relayUrl?: string | null
   relayKey?: string | null
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
+  leaseReplicaPeerKeys?: string[]
+  writerLeaseEnvelope?: TWriterLeaseEnvelope | null
+  gatewayMode?: 'auto' | 'disabled'
   writerCore?: string | null
   writerCoreHex?: string | null
   autobaseLocal?: string | null

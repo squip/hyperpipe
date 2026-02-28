@@ -101,6 +101,15 @@ import {
   setRelayWriterPool,
   pruneWriterPoolEntries
 } from './relay-writer-pool-store.mjs'
+import {
+  configureRelayDiscoveryStore,
+  mergeRelayDiscoveryHints,
+  getRelayDiscoveryState,
+  getDiscoveryCandidates,
+  recordCapabilityProbe,
+  recordJoinSuccessPeer,
+  pruneRelayDiscoveryState
+} from './relay-discovery-store.mjs'
 import MarmotService from './marmot-service.mjs'
 import ConversationFileIndex from './conversation-file-index.mjs'
 import MediaServiceManager from './media/MediaServiceManager.mjs'
@@ -156,6 +165,7 @@ global.userConfig = {
 
 configureRelayCoreRefsStore({ storageBase: defaultStorageDir, logger: console })
 configureRelayWriterPoolStore({ storageBase: defaultStorageDir, logger: console })
+configureRelayDiscoveryStore({ storageBase: defaultStorageDir, logger: console })
 
 const relayMirrorSubscriptions = new Map()
 const relayMirrorSyncState = new Map()
@@ -185,6 +195,64 @@ const RELAY_SUBSCRIPTION_REFRESH_CACHE_TTL_MS = 60 * 1000
 const RELAY_SUBSCRIPTION_REFRESH_MAX_TRACKED = 512
 const relaySubscriptionRefreshRecent = new Map()
 const relaySubscriptionRefreshInFlight = new Map()
+const joinFlowPathHints = new Map()
+const JOIN_DIRECT_DISCOVERY_V2_DEFAULT = false
+const JOIN_DIRECT_DISCOVERY_PROBE_TIMEOUT_MS = 4000
+const JOIN_DIRECT_DISCOVERY_PROBE_PER_PEER_TIMEOUT_MS = 2200
+const JOIN_WRITABLE_DEADLINE_MS = 60000
+
+function parseBooleanLike(value, fallback = false) {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  if (typeof value !== 'string') return fallback
+  const normalized = value.trim().toLowerCase()
+  if (!normalized) return fallback
+  if (['1', 'true', 'yes', 'on', 'enabled'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off', 'disabled'].includes(normalized)) return false
+  return fallback
+}
+
+function isJoinDirectDiscoveryV2Enabled() {
+  const envToggle =
+    process.env.JOIN_DIRECT_DISCOVERY_V2 ??
+    process.env.HT_JOIN_DIRECT_DISCOVERY_V2 ??
+    null
+  if (envToggle !== null && typeof envToggle !== 'undefined') {
+    return parseBooleanLike(envToggle, JOIN_DIRECT_DISCOVERY_V2_DEFAULT)
+  }
+  const cfgToggle =
+    config?.joinDirectDiscoveryV2 ??
+    config?.join_direct_discovery_v2 ??
+    config?.join?.directDiscoveryV2 ??
+    null
+  if (cfgToggle !== null && typeof cfgToggle !== 'undefined') {
+    return parseBooleanLike(cfgToggle, JOIN_DIRECT_DISCOVERY_V2_DEFAULT)
+  }
+  return JOIN_DIRECT_DISCOVERY_V2_DEFAULT
+}
+
+function emitJoinTelemetry(event, payload = {}) {
+  const eventName = String(event || '').trim()
+  if (!eventName) return
+  sendMessage({
+    type: 'join-telemetry',
+    data: {
+      event: eventName,
+      at: Date.now(),
+      ...(payload && typeof payload === 'object' ? payload : {})
+    }
+  })
+}
+
+function hashJoinToken(token) {
+  if (typeof token !== 'string' || !token.trim()) return null
+  try {
+    return nodeCrypto.createHash('sha256').update(token.trim(), 'utf8').digest('hex')
+  } catch (error) {
+    console.warn('[Worker] Failed to hash join token', error?.message || error)
+    return null
+  }
+}
 
 function resolveClosedJoinPoolEntryTtlMs(config) {
   const fromConfig =
@@ -313,6 +381,222 @@ function resolveHostPeersFromGatewayStatus(status, identifier) {
       .filter((key) => !localPeerKey || key !== localPeerKey)
     if (normalized.length) return normalized
   }
+  return []
+}
+
+function normalizePeerKeys(values = []) {
+  return Array.from(
+    new Set(
+      (Array.isArray(values) ? values : [])
+        .map((value) => String(value || '').trim().toLowerCase())
+        .filter((value) => /^[a-f0-9]{64}$/i.test(value))
+    )
+  )
+}
+
+function normalizeGatewayMode(value) {
+  return value === 'disabled' ? 'disabled' : 'auto'
+}
+
+async function collectJoinCandidatePeers({
+  publicIdentifier,
+  relayKey = null,
+  hostPeers = [],
+  hostPeerKeys = [],
+  leaseReplicaPeerKeys = [],
+  discoveryTopic = null,
+  gatewayMode = 'auto'
+} = {}) {
+  const sourceByPeer = new Map()
+  const addWithSource = (peers, source) => {
+    for (const peer of normalizePeerKeys(peers)) {
+      if (!sourceByPeer.has(peer)) {
+        sourceByPeer.set(peer, new Set())
+      }
+      sourceByPeer.get(peer).add(source)
+    }
+  }
+
+  const normalizedGatewayMode = normalizeGatewayMode(gatewayMode)
+
+  await pruneRelayDiscoveryState().catch(() => {})
+  const discoveryState = await getRelayDiscoveryState({
+    identifier: publicIdentifier,
+    relayKey,
+    publicIdentifier
+  }).catch(() => null)
+  const discoveryCandidates = await getDiscoveryCandidates({
+    identifier: publicIdentifier,
+    relayKey,
+    publicIdentifier
+  }).catch(() => ({ hostPeerKeys: [], leaseReplicaPeerKeys: [], successfulProbePeers: [] }))
+
+  addWithSource(hostPeers, 'start-join-flow')
+  addWithSource(hostPeerKeys, 'start-join-flow')
+  addWithSource(leaseReplicaPeerKeys, 'invite')
+  addWithSource(discoveryCandidates?.hostPeerKeys || [], 'cache-host')
+  addWithSource(discoveryCandidates?.leaseReplicaPeerKeys || [], 'cache-lease')
+  addWithSource(discoveryCandidates?.successfulProbePeers || [], 'cache-probe-success')
+
+  if (discoveryTopic && discoveryState?.discoveryTopic && discoveryState.discoveryTopic === discoveryTopic) {
+    addWithSource(discoveryState.hostPeerKeys || [], 'topic-cache')
+    addWithSource(discoveryState.leaseReplicaPeerKeys || [], 'topic-cache')
+  }
+
+  if (normalizedGatewayMode === 'auto') {
+    addWithSource(
+      resolveHostPeersFromGatewayStatus(getGatewayStatus(), relayKey || publicIdentifier),
+      'gateway-peer-map'
+    )
+  }
+
+  const candidates = Array.from(sourceByPeer.keys())
+  const sourceSummary = {}
+  for (const [peer, sources] of sourceByPeer.entries()) {
+    sourceSummary[peer] = Array.from(sources)
+  }
+  return {
+    candidates,
+    sourceSummary,
+    discoveryState
+  }
+}
+
+function selectJoinPathFromProbes({
+  openJoin = false,
+  gatewayMode = 'auto',
+  probes = []
+} = {}) {
+  const successful = (Array.isArray(probes) ? probes : []).filter((entry) => entry?.ok && entry?.capabilities)
+  const sorted = successful.sort((left, right) => {
+    const leftRtt = Number.isFinite(left?.rttMs) ? left.rttMs : Number.POSITIVE_INFINITY
+    const rightRtt = Number.isFinite(right?.rttMs) ? right.rttMs : Number.POSITIVE_INFINITY
+    return leftRtt - rightRtt
+  })
+
+  if (openJoin) {
+    const match = sorted.find((entry) =>
+      entry.capabilities?.canDirectChallenge === true ||
+      entry.capabilities?.canProvisionOpenWriter === true
+    )
+    if (match) {
+      return {
+        path: 'direct',
+        peerKey: match.peerKey,
+        probe: match
+      }
+    }
+  } else {
+    const match = sorted.find((entry) =>
+      entry.capabilities?.canDirectChallenge === true ||
+      entry.capabilities?.hasMatchingLease === true
+    )
+    if (match) {
+      return {
+        path: match.capabilities?.canDirectChallenge === true ? 'direct' : 'lease-claim',
+        peerKey: match.peerKey,
+        probe: match
+      }
+    }
+  }
+
+  if (normalizeGatewayMode(gatewayMode) === 'auto') {
+    return { path: 'gateway-fallback', peerKey: null, probe: null }
+  }
+  return { path: 'none', peerKey: null, probe: null }
+}
+
+async function probeJoinCandidates({
+  candidates = [],
+  publicIdentifier,
+  relayKey = null,
+  openJoin = false,
+  inviteToken = null,
+  inviteePubkey = null
+} = {}) {
+  if (!relayServer?.probeJoinCapabilities || !Array.isArray(candidates) || !candidates.length) return []
+
+  const tokenHash = hashJoinToken(inviteToken)
+  const cappedCandidates = normalizePeerKeys(candidates).slice(0, 12)
+  const probeTasks = cappedCandidates.map(async (peerKey) => {
+    const nonce = nodeCrypto.randomBytes(12).toString('hex')
+    const startedAt = Date.now()
+    try {
+      const capabilities = await relayServer.probeJoinCapabilities({
+        peerKey,
+        publicIdentifier,
+        relayKey,
+        openJoin,
+        nonce,
+        tokenHash,
+        inviteePubkey: inviteePubkey || config?.nostr_pubkey_hex || null,
+        timeoutMs: JOIN_DIRECT_DISCOVERY_PROBE_PER_PEER_TIMEOUT_MS
+      })
+      const rttMs = Date.now() - startedAt
+      const ok = capabilities?.nonce === nonce
+      await recordCapabilityProbe({
+        identifier: publicIdentifier,
+        relayKey,
+        publicIdentifier,
+        peerKey,
+        success: ok,
+        rttMs,
+        capabilities
+      }).catch(() => {})
+      emitJoinTelemetry('JOIN_PROBE_RESULT', {
+        publicIdentifier,
+        relayKey: previewValue(relayKey, 16),
+        peerKey: previewValue(peerKey, 16),
+        ok,
+        rttMs,
+        canDirectChallenge: capabilities?.canDirectChallenge === true,
+        canProvisionOpenWriter: capabilities?.canProvisionOpenWriter === true,
+        hasMatchingLease: capabilities?.hasMatchingLease === true
+      })
+      return {
+        ok,
+        peerKey,
+        rttMs,
+        capabilities
+      }
+    } catch (error) {
+      const rttMs = Date.now() - startedAt
+      await recordCapabilityProbe({
+        identifier: publicIdentifier,
+        relayKey,
+        publicIdentifier,
+        peerKey,
+        success: false,
+        rttMs,
+        capabilities: null
+      }).catch(() => {})
+      emitJoinTelemetry('JOIN_PROBE_RESULT', {
+        publicIdentifier,
+        relayKey: previewValue(relayKey, 16),
+        peerKey: previewValue(peerKey, 16),
+        ok: false,
+        rttMs,
+        error: error?.message || String(error)
+      })
+      return {
+        ok: false,
+        peerKey,
+        rttMs,
+        capabilities: null,
+        error: error?.message || String(error)
+      }
+    }
+  })
+
+  const probeTimeout = new Promise((resolve) => {
+    setTimeout(() => resolve('timeout'), JOIN_DIRECT_DISCOVERY_PROBE_TIMEOUT_MS)
+  })
+  const settled = await Promise.race([
+    Promise.all(probeTasks),
+    probeTimeout
+  ])
+
+  if (Array.isArray(settled)) return settled
   return []
 }
 
@@ -1236,6 +1520,283 @@ function collectClosedJoinPoolCoreRefs(entries = []) {
     if (coreKey) refs.push(coreKey)
   }
   return normalizeCoreRefList(refs)
+}
+
+function resolveWriterPoolKeys({ relayKey = null, publicIdentifier = null } = {}) {
+  const keys = []
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey)
+  const normalizedPublicIdentifier =
+    typeof publicIdentifier === 'string' ? publicIdentifier.trim() : null
+  if (normalizedRelayKey) keys.push(normalizedRelayKey)
+  if (normalizedPublicIdentifier && !keys.includes(normalizedPublicIdentifier)) {
+    keys.push(normalizedPublicIdentifier)
+  }
+  return keys
+}
+
+function normalizeWriterLeaseEnvelope(envelope) {
+  if (!envelope || typeof envelope !== 'object') return null
+  const inviteePubkey =
+    typeof envelope.inviteePubkey === 'string'
+      ? envelope.inviteePubkey.trim().toLowerCase()
+      : null
+  const tokenHash =
+    typeof envelope.tokenHash === 'string'
+      ? envelope.tokenHash.trim().toLowerCase()
+      : null
+  const writerCore = typeof envelope.writerCore === 'string' ? envelope.writerCore : null
+  let writerCoreHex =
+    typeof envelope.writerCoreHex === 'string'
+      ? envelope.writerCoreHex
+      : typeof envelope.autobaseLocal === 'string'
+        ? envelope.autobaseLocal
+        : null
+  let autobaseLocal =
+    typeof envelope.autobaseLocal === 'string'
+      ? envelope.autobaseLocal
+      : writerCoreHex
+  if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
+  if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
+  const writerSecret = typeof envelope.writerSecret === 'string' ? envelope.writerSecret : null
+  const leaseId = typeof envelope.leaseId === 'string' ? envelope.leaseId : null
+  const issuedAt = Number.isFinite(Number(envelope.issuedAt)) ? Number(envelope.issuedAt) : null
+  const expiresAt = Number.isFinite(Number(envelope.expiresAt)) ? Number(envelope.expiresAt) : null
+  const signature = typeof envelope.signature === 'string' ? envelope.signature : null
+  const issuerPubkey =
+    typeof envelope.issuerPubkey === 'string' ? envelope.issuerPubkey.trim().toLowerCase() : null
+  const issuerSwarmPeerKey =
+    typeof envelope.issuerSwarmPeerKey === 'string'
+      ? envelope.issuerSwarmPeerKey.trim().toLowerCase()
+      : null
+  const signedEvent =
+    envelope.signedEvent && typeof envelope.signedEvent === 'object'
+      ? envelope.signedEvent
+      : null
+  const relayKey = normalizeRelayKeyHex(envelope.relayKey)
+  const publicIdentifier =
+    typeof envelope.publicIdentifier === 'string' ? envelope.publicIdentifier.trim() : null
+  const coreRefs = Array.isArray(envelope.coreRefs) ? normalizeCoreRefList(envelope.coreRefs) : []
+  const fastForward =
+    envelope.fastForward && typeof envelope.fastForward === 'object'
+      ? envelope.fastForward
+      : null
+
+  if (!inviteePubkey || !tokenHash || !writerSecret) return null
+  if (!writerCore && !writerCoreHex && !autobaseLocal) return null
+  if (!leaseId || !signature || !issuerPubkey || !signedEvent) return null
+
+  return {
+    version: envelope.version || 1,
+    leaseId,
+    relayKey: relayKey || null,
+    publicIdentifier: publicIdentifier || null,
+    inviteePubkey,
+    tokenHash,
+    writerCore,
+    writerCoreHex,
+    autobaseLocal,
+    writerSecret,
+    coreRefs,
+    fastForward,
+    issuedAt,
+    expiresAt,
+    issuerPubkey,
+    issuerSwarmPeerKey,
+    signature,
+    signedEvent
+  }
+}
+
+function isWriterLeaseEnvelopeExpired(envelope, now = Date.now()) {
+  const expiresAt = Number.isFinite(Number(envelope?.expiresAt)) ? Number(envelope.expiresAt) : null
+  return Number.isFinite(expiresAt) && expiresAt <= now
+}
+
+async function verifyWriterLeaseEnvelopeSignature(envelope) {
+  const normalized = normalizeWriterLeaseEnvelope(envelope)
+  if (!normalized) return false
+  try {
+    const signedEvent = normalized.signedEvent
+    if (!signedEvent || typeof signedEvent !== 'object') return false
+    if (signedEvent.sig !== normalized.signature) return false
+    if (String(signedEvent.pubkey || '').toLowerCase() !== normalized.issuerPubkey) return false
+    const verified = await NostrUtils.verifySignature(signedEvent)
+    if (!verified) return false
+    const signedPayload = JSON.parse(String(signedEvent.content || '{}'))
+    const signedInvitee = String(signedPayload.inviteePubkey || '').toLowerCase()
+    const signedTokenHash = String(signedPayload.tokenHash || '').toLowerCase()
+    if (signedInvitee !== normalized.inviteePubkey) return false
+    if (signedTokenHash !== normalized.tokenHash) return false
+    return true
+  } catch (error) {
+    console.warn('[Worker] Writer lease signature verify failed', error?.message || error)
+    return false
+  }
+}
+
+async function createWriterLeaseEnvelope({
+  relayKey = null,
+  publicIdentifier = null,
+  inviteePubkey = null,
+  token = null,
+  writerCore = null,
+  writerCoreHex = null,
+  autobaseLocal = null,
+  writerSecret = null,
+  coreRefs = [],
+  fastForward = null,
+  expiresAt = null
+} = {}) {
+  if (!config?.nostr_nsec_hex || !config?.nostr_pubkey_hex) return null
+  const normalizedInvitee =
+    typeof inviteePubkey === 'string' ? inviteePubkey.trim().toLowerCase() : null
+  const tokenHash = hashJoinToken(token)
+  if (!normalizedInvitee || !tokenHash || !writerSecret) return null
+  const now = Date.now()
+  const leaseId = nodeCrypto.randomBytes(16).toString('hex')
+  const expiresAtMs = Number.isFinite(Number(expiresAt))
+    ? Number(expiresAt)
+    : now + CLOSED_JOIN_POOL_ENTRY_TTL_MS
+  const payload = {
+    version: 1,
+    leaseId,
+    relayKey: normalizeRelayKeyHex(relayKey) || null,
+    publicIdentifier: publicIdentifier || null,
+    inviteePubkey: normalizedInvitee,
+    tokenHash,
+    writerCore: writerCore || null,
+    writerCoreHex: writerCoreHex || autobaseLocal || null,
+    autobaseLocal: autobaseLocal || writerCoreHex || null,
+    writerSecret: writerSecret || null,
+    coreRefs: normalizeCoreRefList(coreRefs || []),
+    fastForward: fastForward || null,
+    issuedAt: now,
+    expiresAt: expiresAtMs,
+    issuerPubkey: config.nostr_pubkey_hex,
+    issuerSwarmPeerKey: config.swarmPublicKey || null
+  }
+  const signedEvent = await NostrUtils.signEvent(
+    {
+      kind: 30167,
+      created_at: Math.floor(now / 1000),
+      tags: [
+        ['h', publicIdentifier || relayKey || ''],
+        ['lease-id', leaseId],
+        ['invitee', normalizedInvitee],
+        ['token-hash', tokenHash]
+      ],
+      content: JSON.stringify(payload),
+      pubkey: config.nostr_pubkey_hex
+    },
+    config.nostr_nsec_hex
+  )
+  return {
+    ...payload,
+    signature: signedEvent.sig,
+    signedEvent
+  }
+}
+
+async function storeReplicatedWriterLeaseEnvelope({
+  relayKey = null,
+  publicIdentifier = null,
+  envelope = null,
+  leaseReplicaPeerKeys = []
+} = {}) {
+  const normalized = normalizeWriterLeaseEnvelope(envelope)
+  if (!normalized) return null
+  if (isWriterLeaseEnvelopeExpired(normalized)) return null
+  const verified = await verifyWriterLeaseEnvelopeSignature(normalized)
+  if (!verified) return null
+
+  const poolKeys = resolveWriterPoolKeys({
+    relayKey: normalized.relayKey || relayKey,
+    publicIdentifier: normalized.publicIdentifier || publicIdentifier
+  })
+  if (!poolKeys.length) return null
+
+  const now = Date.now()
+  const entry = {
+    writerCore: normalized.writerCore,
+    writerCoreHex: normalized.writerCoreHex,
+    autobaseLocal: normalized.autobaseLocal,
+    writerSecret: normalized.writerSecret,
+    issuedAt: normalized.issuedAt || now,
+    expiresAt: normalized.expiresAt || now + CLOSED_JOIN_POOL_ENTRY_TTL_MS,
+    leaseId: normalized.leaseId,
+    inviteePubkey: normalized.inviteePubkey,
+    tokenHash: normalized.tokenHash,
+    issuerPubkey: normalized.issuerPubkey,
+    issuerSwarmPeerKey: normalized.issuerSwarmPeerKey,
+    publicIdentifier: normalized.publicIdentifier || publicIdentifier || null,
+    relayKey: normalized.relayKey || relayKey || null,
+    signature: normalized.signature,
+    leaseExpiresAt: normalized.expiresAt || null,
+    writerLeaseEnvelope: normalized,
+    leaseReplicaPeerKeys: normalizePeerKeys(leaseReplicaPeerKeys || [])
+  }
+
+  for (const poolKey of poolKeys) {
+    const cached = await getRelayWriterPool(poolKey)
+    const entries = pruneWriterPoolEntries(cached.entries, now).filter((candidate) => {
+      if (!candidate) return false
+      if (candidate.leaseId && candidate.leaseId === normalized.leaseId) return false
+      return true
+    })
+    entries.push(entry)
+    await setRelayWriterPool(poolKey, entries, now)
+  }
+
+  return entry
+}
+
+async function claimReplicatedWriterLeaseEnvelope({
+  relayKey = null,
+  publicIdentifier = null,
+  inviteePubkey = null,
+  token = null,
+  tokenHash = null
+} = {}) {
+  const normalizedInvitee =
+    typeof inviteePubkey === 'string' ? inviteePubkey.trim().toLowerCase() : null
+  const normalizedTokenHash =
+    typeof tokenHash === 'string' && tokenHash.trim()
+      ? tokenHash.trim().toLowerCase()
+      : hashJoinToken(token)
+  if (!normalizedInvitee || !normalizedTokenHash) return null
+
+  const now = Date.now()
+  const poolKeys = resolveWriterPoolKeys({ relayKey, publicIdentifier })
+  if (!poolKeys.length) return null
+
+  for (const poolKey of poolKeys) {
+    const cached = await getRelayWriterPool(poolKey)
+    const entries = pruneWriterPoolEntries(cached.entries, now)
+    for (const entry of entries) {
+      const entryInvitee = String(entry?.inviteePubkey || '').toLowerCase()
+      const entryTokenHash = String(entry?.tokenHash || '').toLowerCase()
+      const envelope = entry?.writerLeaseEnvelope || null
+      if (!entryInvitee || !entryTokenHash || !envelope) continue
+      if (entryInvitee !== normalizedInvitee) continue
+      if (entryTokenHash !== normalizedTokenHash) continue
+      if (isWriterLeaseEnvelopeExpired(envelope, now)) continue
+      const verified = await verifyWriterLeaseEnvelopeSignature(envelope)
+      if (!verified) continue
+      return {
+        envelope,
+        writerCore: envelope.writerCore || null,
+        writerCoreHex: envelope.writerCoreHex || envelope.autobaseLocal || null,
+        autobaseLocal: envelope.autobaseLocal || envelope.writerCoreHex || null,
+        writerSecret: envelope.writerSecret || null,
+        coreRefs: normalizeCoreRefList(envelope.coreRefs || []),
+        fastForward: envelope.fastForward || null,
+        leaseId: envelope.leaseId || null,
+        issuerPubkey: envelope.issuerPubkey || null,
+        expiresAt: envelope.expiresAt || null
+      }
+    }
+  }
+  return null
 }
 
 async function ensureClosedJoinWriterPool({
@@ -3348,6 +3909,31 @@ function trackOpenJoinReauthState(message) {
     const data = message.data || {}
     const identifier = data.publicIdentifier
     if (!identifier) return
+    const hint = joinFlowPathHints.get(identifier) || null
+    const selectedPeerKey =
+      (typeof data.hostPeer === 'string' ? data.hostPeer : null) ||
+      (typeof hint?.selectedPeerKey === 'string' ? hint.selectedPeerKey : null)
+    const hintRelayKey = hint?.relayKey || null
+    const hintTopic = hint?.discoveryTopic || null
+    if (selectedPeerKey) {
+      void recordJoinSuccessPeer({
+        identifier,
+        relayKey: data.relayKey || hintRelayKey || null,
+        publicIdentifier: identifier,
+        peerKey: selectedPeerKey,
+        discoveryTopic: hintTopic
+      }).catch(() => {})
+    }
+    if (hint) {
+      joinFlowPathHints.delete(identifier)
+    }
+    emitJoinTelemetry('JOIN_WRITABLE_DEADLINE_RESULT', {
+      publicIdentifier: identifier,
+      relayKey: previewValue(data.relayKey || hintRelayKey, 16),
+      ok: true,
+      reason: data.mode || hint?.path || 'join-auth-success',
+      deadlineMs: JOIN_WRITABLE_DEADLINE_MS
+    })
     recordOpenJoinContext({
       publicIdentifier: identifier,
       relayKey: data.relayKey || null,
@@ -3372,6 +3958,16 @@ function trackOpenJoinReauthState(message) {
   if (message.type === 'join-auth-error') {
     const identifier = message?.data?.publicIdentifier
     if (!identifier) return
+    emitJoinTelemetry('JOIN_WRITABLE_DEADLINE_RESULT', {
+      publicIdentifier: identifier,
+      relayKey: null,
+      ok: false,
+      reason: message?.data?.error || 'join-auth-error',
+      deadlineMs: JOIN_WRITABLE_DEADLINE_MS
+    })
+    if (joinFlowPathHints.has(identifier)) {
+      joinFlowPathHints.delete(identifier)
+    }
     const entry = pendingOpenJoinReauth.get(identifier)
     if (entry) {
       pendingOpenJoinReauth.set(identifier, {
@@ -4528,6 +5124,10 @@ function startHealthLogger(intervalMs = 60000) {
   }, intervalMs)
 }
 
+setInterval(() => {
+  pruneRelayDiscoveryState().catch(() => {})
+}, 10 * 60 * 1000).unref?.()
+
 // Make pipe and sendMessage globally available for the relay server
 global.workerPipe = workerPipe
 global.sendMessage = sendMessage
@@ -4538,6 +5138,12 @@ global.syncActiveRelayCoreRefs = syncActiveRelayCoreRefs
 global.appendOpenJoinMirrorCores = appendOpenJoinMirrorCores
 global.recoverRelayDriveFile = recoverRelayDriveFile
 global.recoverConversationDriveFile = recoverConversationDriveFile
+global.storeReplicatedWriterLeaseEnvelope = storeReplicatedWriterLeaseEnvelope
+global.claimReplicatedWriterLeaseEnvelope = claimReplicatedWriterLeaseEnvelope
+global.verifyWriterLeaseEnvelopeSignature = verifyWriterLeaseEnvelopeSignature
+global.createWriterLeaseEnvelope = createWriterLeaseEnvelope
+global.getRelayDiscoveryState = getRelayDiscoveryState
+global.mergeRelayDiscoveryHints = mergeRelayDiscoveryHints
 global.requestRelaySubscriptionRefresh = async (relayKey = null, { reason = 'manual' } = {}) => {
   console.log('[Worker] Subscription refresh requested before relay server ready', {
     relayKey,
@@ -5438,6 +6044,18 @@ async function handleMessageObject(message) {
       if (relayServer) {
         try {
           const result = await relayServer.createRelay(message.data)
+          if (isJoinDirectDiscoveryV2Enabled()) {
+            await mergeRelayDiscoveryHints({
+              identifier: result?.publicIdentifier || result?.relayKey || null,
+              relayKey: result?.relayKey || null,
+              publicIdentifier: result?.publicIdentifier || null,
+              discoveryTopic: result?.discoveryTopic || null,
+              hostPeerKeys: Array.isArray(result?.hostPeerKeys)
+                ? result.hostPeerKeys
+                : (result?.hostPeerKey ? [result.hostPeerKey] : []),
+              writerIssuerPubkey: result?.writerIssuerPubkey || config?.nostr_pubkey_hex || null
+            }).catch(() => {})
+          }
           relayMembers.set(result.relayKey, result.profile?.members || [])
           await ensureRelayFolder(result.profile?.public_identifier || result.relayKey)
           await applyPendingAuthUpdates(updateRelayAuthToken, result.relayKey, result.profile?.public_identifier)
@@ -5772,6 +6390,16 @@ async function handleMessageObject(message) {
               ? true
               : undefined
         const inviteToken = typeof data.token === 'string' ? data.token.trim() : null
+        const joinDirectDiscoveryV2Enabled = isJoinDirectDiscoveryV2Enabled()
+        const gatewayMode = normalizeGatewayMode(data.gatewayMode)
+        const discoveryTopic =
+          typeof data.discoveryTopic === 'string' ? data.discoveryTopic.trim() : null
+        const hostPeerKeys = normalizePeerKeys(data.hostPeerKeys || [])
+        const leaseReplicaPeerKeys = normalizePeerKeys(data.leaseReplicaPeerKeys || [])
+        const writerIssuerPubkey =
+          typeof data.writerIssuerPubkey === 'string'
+            ? data.writerIssuerPubkey.trim().toLowerCase()
+            : null
         let joinBlindPeeringManager = null
         let joinRelayIdentifierForTracking = null
         try {
@@ -5797,18 +6425,21 @@ async function handleMessageObject(message) {
           if (writerCoreKey) {
             writerCoreRefs = mergeCoreRefLists(writerCoreRefs, [writerCoreKey])
           }
-          hostPeers = hostPeers
-            .map((key) => String(key || '').trim().toLowerCase())
-            .filter(Boolean)
+          hostPeers = normalizePeerKeys([...hostPeers, ...hostPeerKeys])
 
           console.info('[Worker] Start join flow input', {
             publicIdentifier,
             openJoin,
             isOpen,
+            gatewayMode,
+            joinDirectDiscoveryV2Enabled,
             hasInviteToken: !!inviteToken,
             relayKey: previewValue(joinRelayKey, 16),
             relayUrl: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
             hostPeersCount: hostPeers.length,
+            hostPeerKeysCount: hostPeerKeys.length,
+            leaseReplicaPeerKeysCount: leaseReplicaPeerKeys.length,
+            hasDiscoveryTopic: !!discoveryTopic,
             hasBlindPeer: !!blindPeer?.publicKey,
             coreRefsCount: coreRefs.length,
             coreRefsPreview: summarizeCoreRefs(coreRefs),
@@ -5819,6 +6450,18 @@ async function handleMessageObject(message) {
             hasFastForward: !!fastForward
           })
 
+          if (joinDirectDiscoveryV2Enabled) {
+            await mergeRelayDiscoveryHints({
+              identifier: publicIdentifier || joinRelayKey,
+              relayKey: joinRelayKey,
+              publicIdentifier,
+              discoveryTopic,
+              hostPeerKeys: [...hostPeers, ...hostPeerKeys],
+              leaseReplicaPeerKeys,
+              writerIssuerPubkey
+            }).catch(() => {})
+          }
+
           if (openJoin && publicIdentifier) {
             recordOpenJoinContext({
               publicIdentifier,
@@ -5828,7 +6471,169 @@ async function handleMessageObject(message) {
             })
           }
 
-          if (openJoin && !inviteToken && (!writerCore || !writerSecret)) {
+          if (joinDirectDiscoveryV2Enabled && publicIdentifier) {
+            const discovery = await collectJoinCandidatePeers({
+              publicIdentifier,
+              relayKey: joinRelayKey,
+              hostPeers,
+              hostPeerKeys,
+              leaseReplicaPeerKeys,
+              discoveryTopic,
+              gatewayMode
+            })
+            emitJoinTelemetry('JOIN_DISCOVERY_SOURCES', {
+              publicIdentifier,
+              relayKey: previewValue(joinRelayKey, 16),
+              gatewayMode,
+              discoveryTopic: discoveryTopic || null,
+              candidateCount: discovery.candidates.length,
+              sources: discovery.sourceSummary
+            })
+
+            const probeResults = await probeJoinCandidates({
+              candidates: discovery.candidates,
+              publicIdentifier,
+              relayKey: joinRelayKey,
+              openJoin,
+              inviteToken,
+              inviteePubkey: config?.nostr_pubkey_hex || null
+            })
+            const selectedPath = selectJoinPathFromProbes({
+              openJoin,
+              gatewayMode,
+              probes: probeResults
+            })
+            emitJoinTelemetry('JOIN_PATH_SELECTED', {
+              publicIdentifier,
+              relayKey: previewValue(joinRelayKey, 16),
+              gatewayMode,
+              path: selectedPath.path,
+              peerKey: previewValue(selectedPath.peerKey, 16),
+              canDirectChallenge: selectedPath.probe?.capabilities?.canDirectChallenge === true,
+              canProvisionOpenWriter:
+                selectedPath.probe?.capabilities?.canProvisionOpenWriter === true,
+              hasMatchingLease: selectedPath.probe?.capabilities?.hasMatchingLease === true
+            })
+
+            if (selectedPath.path === 'direct' && selectedPath.peerKey) {
+              hostPeers = normalizePeerKeys([selectedPath.peerKey, ...hostPeers, ...discovery.candidates])
+              emitJoinTelemetry('JOIN_WRITER_SOURCE', {
+                publicIdentifier,
+                relayKey: previewValue(joinRelayKey, 16),
+                source: 'direct-challenge',
+                peerKey: previewValue(selectedPath.peerKey, 16)
+              })
+              joinFlowPathHints.set(publicIdentifier, {
+                selectedPeerKey: selectedPath.peerKey,
+                relayKey: joinRelayKey || null,
+                discoveryTopic: discoveryTopic || null,
+                path: 'direct',
+                updatedAt: Date.now()
+              })
+            } else if (selectedPath.path === 'lease-claim' && selectedPath.peerKey) {
+              let leaseClaim = null
+              if (relayServer?.claimWriterLeaseFromPeer && inviteToken) {
+                try {
+                  leaseClaim = await relayServer.claimWriterLeaseFromPeer({
+                    peerKey: selectedPath.peerKey,
+                    publicIdentifier,
+                    relayKey: joinRelayKey,
+                    inviteePubkey: config?.nostr_pubkey_hex || null,
+                    token: inviteToken,
+                    timeoutMs: 4000
+                  })
+                } catch (error) {
+                  console.warn('[Worker] Failed claiming lease from peer', {
+                    publicIdentifier,
+                    peerKey: previewValue(selectedPath.peerKey, 16),
+                    error: error?.message || error
+                  })
+                }
+              }
+              if (!leaseClaim && inviteToken) {
+                leaseClaim = await claimReplicatedWriterLeaseEnvelope({
+                  relayKey: joinRelayKey,
+                  publicIdentifier,
+                  inviteePubkey: config?.nostr_pubkey_hex || null,
+                  token: inviteToken
+                }).catch(() => null)
+              }
+              if (leaseClaim?.writerSecret) {
+                if (leaseClaim?.envelope) {
+                  await storeReplicatedWriterLeaseEnvelope({
+                    relayKey: joinRelayKey,
+                    publicIdentifier,
+                    envelope: leaseClaim.envelope
+                  }).catch(() => {})
+                }
+                writerCore = leaseClaim.writerCore || writerCore || null
+                writerCoreHex =
+                  leaseClaim.writerCoreHex || leaseClaim.autobaseLocal || writerCoreHex || null
+                autobaseLocal =
+                  leaseClaim.autobaseLocal || leaseClaim.writerCoreHex || autobaseLocal || null
+                writerSecret = leaseClaim.writerSecret || writerSecret || null
+                if (Array.isArray(leaseClaim.coreRefs) && leaseClaim.coreRefs.length) {
+                  coreRefs = mergeCoreRefLists(coreRefs, normalizeCoreRefList(leaseClaim.coreRefs))
+                  writerCoreRefs = mergeCoreRefLists(
+                    writerCoreRefs,
+                    normalizeCoreRefList(leaseClaim.coreRefs)
+                  )
+                }
+                if (!fastForward && leaseClaim.fastForward) {
+                  fastForward = leaseClaim.fastForward
+                }
+                joinFlowPathHints.set(publicIdentifier, {
+                  selectedPeerKey: selectedPath.peerKey,
+                  relayKey: joinRelayKey || null,
+                  discoveryTopic: discoveryTopic || null,
+                  path: 'lease-claim',
+                  updatedAt: Date.now()
+                })
+                emitJoinTelemetry('JOIN_WRITER_SOURCE', {
+                  publicIdentifier,
+                  relayKey: previewValue(joinRelayKey, 16),
+                  source: 'peer-lease-claim',
+                  peerKey: previewValue(selectedPath.peerKey, 16),
+                  hasWriterCore: !!writerCore,
+                  hasWriterCoreHex: !!writerCoreHex,
+                  hasWriterSecret: !!writerSecret
+                })
+              }
+            } else if (selectedPath.path === 'none' && gatewayMode === 'disabled') {
+              const hasInviteWriterMaterial = Boolean(
+                inviteToken &&
+                writerSecret &&
+                (joinRelayKey || publicIdentifier)
+              )
+              if (hasInviteWriterMaterial) {
+                emitJoinTelemetry('JOIN_WRITER_SOURCE', {
+                  publicIdentifier,
+                  relayKey: previewValue(joinRelayKey, 16),
+                  source: 'invite-payload',
+                  hasWriterCore: !!writerCore,
+                  hasWriterCoreHex: !!writerCoreHex,
+                  hasWriterSecret: !!writerSecret
+                })
+              } else {
+              emitJoinTelemetry('JOIN_WRITABLE_DEADLINE_RESULT', {
+                publicIdentifier,
+                relayKey: previewValue(joinRelayKey, 16),
+                ok: false,
+                reason: 'no-writer-guaranteed-path',
+                deadlineMs: JOIN_WRITABLE_DEADLINE_MS
+              })
+              throw new Error('No direct writer-guaranteed path available and gateway mode is disabled')
+              }
+            } else if (selectedPath.path === 'gateway-fallback') {
+              emitJoinTelemetry('JOIN_WRITER_SOURCE', {
+                publicIdentifier,
+                relayKey: previewValue(joinRelayKey, 16),
+                source: 'gateway-fallback'
+              })
+            }
+          }
+
+          if (gatewayMode === 'auto' && openJoin && !inviteToken && (!writerCore || !writerSecret)) {
             const relayIdentifier = joinRelayKey || publicIdentifier
             if (relayIdentifier) {
               try {
@@ -5902,7 +6707,7 @@ async function handleMessageObject(message) {
             }
           }
 
-          if ((!hostPeers || hostPeers.length === 0) && (!blindPeer || !blindPeer.publicKey)) {
+          if (gatewayMode === 'auto' && (!hostPeers || hostPeers.length === 0) && (!blindPeer || !blindPeer.publicKey)) {
             const relayIdentifier = joinRelayKey || publicIdentifier
             if (relayIdentifier) {
               try {
@@ -6070,7 +6875,7 @@ async function handleMessageObject(message) {
             }
           }
 
-          if (!hostPeers.length) {
+          if (gatewayMode === 'auto' && !hostPeers.length) {
             hostPeers = resolveHostPeersFromGatewayStatus(getGatewayStatus(), publicIdentifier)
           }
 
@@ -6081,10 +6886,13 @@ async function handleMessageObject(message) {
             publicIdentifier,
             openJoin,
             isOpen,
+            gatewayMode,
             hasInviteToken: !!inviteToken,
             relayKey: previewValue(joinRelayKey, 16),
             relayUrl: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
             hostPeersCount: hostPeers.length,
+            discoveryTopic: discoveryTopic || null,
+            leaseReplicaPeerKeysCount: leaseReplicaPeerKeys.length,
             hasBlindPeer: !!blindPeer?.publicKey,
             coreRefsCount: coreRefs.length,
             coreRefsPreview: summarizeCoreRefs(coreRefs),
@@ -6094,6 +6902,18 @@ async function handleMessageObject(message) {
             writerSecretLen: writerSecret ? String(writerSecret).length : 0,
             hasFastForward: !!fastForward
           })
+
+          if (joinDirectDiscoveryV2Enabled) {
+            await mergeRelayDiscoveryHints({
+              identifier: publicIdentifier || joinRelayKey,
+              relayKey: joinRelayKey,
+              publicIdentifier,
+              discoveryTopic,
+              hostPeerKeys: hostPeers,
+              leaseReplicaPeerKeys,
+              writerIssuerPubkey
+            }).catch(() => {})
+          }
 
           await relayServer.startJoinAuthentication({
             ...data,
@@ -6111,7 +6931,12 @@ async function handleMessageObject(message) {
             writerCoreHex,
             autobaseLocal,
             writerSecret,
-            fastForward
+            fastForward,
+            discoveryTopic,
+            hostPeerKeys,
+            writerIssuerPubkey,
+            leaseReplicaPeerKeys,
+            gatewayMode
           })
           if (joinBlindPeeringManager && joinRelayIdentifierForTracking && typeof joinBlindPeeringManager.markJoinEnd === 'function') {
             joinBlindPeeringManager.markJoinEnd({
@@ -6165,6 +6990,11 @@ async function handleMessageObject(message) {
         const requestId = message?.requestId
         if (!relayServer?.provisionWriterForInvitee) throw new Error('Relay server unavailable')
         const relayKey = normalizeRelayKeyHex(requestData.relayKey) || requestData.relayKey || null
+        const inviteToken = typeof requestData.token === 'string' ? requestData.token.trim() : null
+        const inviteePubkey =
+          typeof requestData.inviteePubkey === 'string'
+            ? requestData.inviteePubkey.trim().toLowerCase()
+            : null
         let poolResult = null
         let result = null
         if (requestData.useWriterPool !== false) {
@@ -6194,12 +7024,112 @@ async function handleMessageObject(message) {
           result?.writerCoreHex || result?.autobaseLocal || result?.writerCore || null
         ])
         const fastForward = resolvedRelayKey ? buildFastForwardCheckpoint(resolvedRelayKey) : null
+        let writerLeaseEnvelope = null
+        const leaseReplicaPeerKeys = []
+        const discoveryState = await getRelayDiscoveryState({
+          identifier: requestData.publicIdentifier || resolvedRelayKey,
+          relayKey: resolvedRelayKey,
+          publicIdentifier: requestData.publicIdentifier || null
+        }).catch(() => null)
+
+        if (
+          isJoinDirectDiscoveryV2Enabled() &&
+          inviteToken &&
+          inviteePubkey &&
+          result?.writerSecret &&
+          (requestData.useWriterPool !== false)
+        ) {
+          try {
+            writerLeaseEnvelope = await createWriterLeaseEnvelope({
+              relayKey: resolvedRelayKey,
+              publicIdentifier: requestData.publicIdentifier || null,
+              inviteePubkey,
+              token: inviteToken,
+              writerCore: result?.writerCore || null,
+              writerCoreHex: result?.writerCoreHex || result?.autobaseLocal || null,
+              autobaseLocal: result?.autobaseLocal || result?.writerCoreHex || null,
+              writerSecret: result?.writerSecret || null,
+              coreRefs: poolCoreRefs,
+              fastForward,
+              expiresAt: poolResult?.entry?.expiresAt || null
+            })
+
+            if (writerLeaseEnvelope) {
+              await storeReplicatedWriterLeaseEnvelope({
+                relayKey: resolvedRelayKey,
+                publicIdentifier: requestData.publicIdentifier || null,
+                envelope: writerLeaseEnvelope
+              })
+
+              const ownPeerKey = String(config?.swarmPublicKey || '').trim().toLowerCase()
+              const replicaCandidates = normalizePeerKeys([
+                ...(Array.isArray(requestData.leaseReplicaPeerKeys)
+                  ? requestData.leaseReplicaPeerKeys
+                  : []),
+                ...resolveHostPeersFromGatewayStatus(
+                  getGatewayStatus(),
+                  requestData.publicIdentifier || resolvedRelayKey
+                )
+              ]).filter((peerKey) => !ownPeerKey || peerKey !== ownPeerKey)
+
+              for (const peerKey of replicaCandidates.slice(0, 2)) {
+                if (!relayServer?.syncWriterLeaseToPeer) break
+                try {
+                  const syncResult = await relayServer.syncWriterLeaseToPeer({
+                    peerKey,
+                    publicIdentifier: requestData.publicIdentifier || null,
+                    relayKey: resolvedRelayKey,
+                    envelope: writerLeaseEnvelope,
+                    timeoutMs: 3000
+                  })
+                  if (syncResult?.ok) {
+                    leaseReplicaPeerKeys.push(peerKey)
+                  }
+                } catch (error) {
+                  console.warn('[Worker] Failed syncing writer lease to replica peer', {
+                    peerKey: previewValue(peerKey, 16),
+                    relayKey: previewValue(resolvedRelayKey, 16),
+                    error: error?.message || error
+                  })
+                }
+              }
+
+              await mergeRelayDiscoveryHints({
+                identifier: requestData.publicIdentifier || resolvedRelayKey,
+                relayKey: resolvedRelayKey,
+                publicIdentifier: requestData.publicIdentifier || null,
+                leaseReplicaPeerKeys,
+                writerIssuerPubkey: config?.nostr_pubkey_hex || null
+              }).catch(() => {})
+            }
+          } catch (error) {
+            console.warn('[Worker] Failed to generate writer lease envelope', {
+              relayKey: previewValue(resolvedRelayKey, 16),
+              publicIdentifier: requestData.publicIdentifier || null,
+              invitee: previewValue(inviteePubkey, 16),
+              error: error?.message || error
+            })
+          }
+        }
+
         const responsePayload = {
           ...(result || {}),
           poolCoreRefs,
           poolAvailable: poolResult?.pool?.available ?? null,
           poolKey: poolResult?.pool?.poolKey ? previewValue(poolResult.pool.poolKey, 16) : null,
-          fastForward
+          fastForward,
+          discoveryTopic: discoveryState?.discoveryTopic || null,
+          hostPeerKeys: Array.isArray(discoveryState?.hostPeerKeys)
+            ? discoveryState.hostPeerKeys
+            : undefined,
+          writerIssuerPubkey: discoveryState?.writerIssuerPubkey || config?.nostr_pubkey_hex || null,
+          writerLeaseEnvelope: writerLeaseEnvelope || null,
+          leaseReplicaPeerKeys: normalizePeerKeys([
+            ...(leaseReplicaPeerKeys || []),
+            ...(Array.isArray(discoveryState?.leaseReplicaPeerKeys)
+              ? discoveryState.leaseReplicaPeerKeys
+              : [])
+          ])
         }
 
         sendMessage({ type: 'provision-writer-for-invitee:result', requestId, data: responsePayload })

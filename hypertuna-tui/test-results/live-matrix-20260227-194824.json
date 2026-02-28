@@ -1,0 +1,76 @@
+{
+  "generatedAt": "2026-02-28T03:51:38.469Z",
+  "storageDir": "/Users/essorensen/Library/Application Support/hypertuna-desktop/hypertuna-data",
+  "profile": "d6679c4b00ca84d7f6e295baee5e7966da63331facc2448756b6746872668eaa",
+  "rows": [
+    {
+      "workflow": "Groups -> My Groups",
+      "status": "PASS",
+      "checks": [
+        {
+          "name": "create group from workflow",
+          "status": "PASS",
+          "evidence": "group=npub16enecjcqe2zd0ahzjkawuhnevmdxxvcl4npyfp6kke6xsunx364qglpyyy:matrix-group-mm5s7qiz"
+        },
+        {
+          "name": "my groups count increments",
+          "status": "PASS",
+          "evidence": "before=4 after=5"
+        },
+        {
+          "name": "relay list contains created group relay",
+          "status": "PASS",
+          "evidence": "publicIdentifier=npub16enecjcqe2zd0ahzjkawuhnevmdxxvcl4npyfp6kke6xsunx364qglpyyy:matrix-group-mm5s7qiz"
+        }
+      ]
+    },
+    {
+      "workflow": "Invites -> Group",
+      "status": "FAIL",
+      "checks": [
+        {
+          "name": "send group invite",
+          "status": "FAIL",
+          "evidence": "bad point: is not on curve, sqrt error: Cannot find square root"
+        },
+        {
+          "name": "accept/dismiss inbound group invite",
+          "status": "SKIP",
+          "evidence": "no inbound group invite available in current account"
+        }
+      ]
+    },
+    {
+      "workflow": "Invites -> Chat",
+      "status": "FAIL",
+      "checks": [
+        {
+          "name": "admin-owned chat preflight",
+          "status": "FAIL",
+          "evidence": "unable to resolve or create admin-owned chat"
+        }
+      ]
+    },
+    {
+      "workflow": "Files",
+      "status": "FAIL",
+      "checks": [
+        {
+          "name": "download file to OS path",
+          "status": "PASS",
+          "evidence": "/Users/essorensen/Downloads/312c429723a90e60d7a91cc34ff73ceb7e08adea33b1c72bc7a1127f702e520c (3) (1).mp4"
+        },
+        {
+          "name": "delete hides file row",
+          "status": "FAIL",
+          "evidence": "deleted=true hidden=false"
+        },
+        {
+          "name": "file workflow",
+          "status": "FAIL",
+          "evidence": "Worker exited with code=1"
+        }
+      ]
+    }
+  ]
+}

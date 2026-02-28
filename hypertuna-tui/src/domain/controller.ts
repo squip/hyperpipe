@@ -3172,6 +3172,11 @@ export class TuiController {
     relayUrl?: string
     openJoin?: boolean
     hostPeers?: string[]
+    discoveryTopic?: string
+    hostPeerKeys?: string[]
+    writerIssuerPubkey?: string
+    leaseReplicaPeerKeys?: string[]
+    gatewayMode?: 'auto' | 'disabled'
     blindPeer?: {
       publicKey?: string | null
       encryptionKey?: string | null
@@ -3196,12 +3201,15 @@ export class TuiController {
     await this.runTask('Start join flow', async () => {
       await this.ensureWorkerReadyForOperation('start join flow')
 
-      await this.ensureGatewayParityReady({
-        reason: 'start-join-flow',
-        refreshPublicGateway: true
-      }).catch((error) => {
-        this.log('warn', `Gateway parity preflight failed before join flow: ${error instanceof Error ? error.message : String(error)}`)
-      })
+      const gatewayMode = input.gatewayMode === 'disabled' ? 'disabled' : 'auto'
+      if (gatewayMode === 'auto') {
+        void this.ensureGatewayParityReady({
+          reason: 'start-join-flow',
+          refreshPublicGateway: true
+        }).catch((error) => {
+          this.log('warn', `Gateway parity preflight failed before join flow: ${error instanceof Error ? error.message : String(error)}`)
+        })
+      }
 
       const normalizedIdentifier = String(input.publicIdentifier || '').trim()
       const relayKey =
@@ -3211,20 +3219,26 @@ export class TuiController {
         || await this.resolveRelayKeyForIdentifier(normalizedIdentifier)
         || undefined
       const relayUrl = String(input.relayUrl || '').trim() || undefined
-      const hostPeers = Array.from(new Set([
-        ...(Array.isArray(input.hostPeers) ? input.hostPeers : []).map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean),
-        ...this.resolveGatewayHostPeers({
+      const gatewayHostPeers = gatewayMode === 'auto'
+        ? this.resolveGatewayHostPeers({
           publicIdentifier: normalizedIdentifier,
           relayKey: relayKey || null,
           relayUrl: relayUrl || null
         })
-      ]))
+        : []
+      const hostPeers = Array.from(new Set([
+        ...(Array.isArray(input.hostPeers) ? input.hostPeers : []),
+        ...(Array.isArray(input.hostPeerKeys) ? input.hostPeerKeys : []),
+        ...gatewayHostPeers
+      ].map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean)))
 
       await this.relayService.startJoinFlow({
         ...input,
         relayKey,
         relayUrl,
-        hostPeers: hostPeers.length ? hostPeers : undefined
+        gatewayMode,
+        hostPeers: hostPeers.length ? hostPeers : undefined,
+        hostPeerKeys: hostPeers.length ? hostPeers : undefined
       })
       this.localProfileCache = null
     })
@@ -3717,6 +3731,11 @@ export class TuiController {
         relayUrl: target.relayUrl || target.relay,
         fileSharing: target.fileSharing,
         openJoin: !target.token && target.fileSharing !== false,
+        discoveryTopic: target.discoveryTopic || undefined,
+        hostPeerKeys: target.hostPeerKeys || undefined,
+        writerIssuerPubkey: target.writerIssuerPubkey || undefined,
+        leaseReplicaPeerKeys: target.leaseReplicaPeerKeys || undefined,
+        gatewayMode: target.gatewayMode || undefined,
         blindPeer: target.blindPeer || undefined,
         cores: target.cores || undefined,
         writerCore: target.writerCore || undefined,
@@ -3725,6 +3744,73 @@ export class TuiController {
         writerSecret: target.writerSecret || undefined,
         fastForward: target.fastForward || undefined
       })
+
+      const normalizedGroupId = String(target.groupId || '').trim()
+      const resolvedRelay =
+        this.resolveRelayUrl(target.relayUrl || target.relay || undefined)
+        || String(target.relayUrl || target.relay || '').trim()
+        || undefined
+      const baseRelayUrl = resolvedRelay ? (getBaseRelayUrl(resolvedRelay) || resolvedRelay) : undefined
+
+      if (normalizedGroupId) {
+        const existing = this.state.myGroupList.find((entry) => entry.groupId === normalizedGroupId)
+        const existingRelay = this.resolveRelayUrl(existing?.relay)
+        const normalizedExistingRelay = existingRelay ? (getBaseRelayUrl(existingRelay) || existingRelay) : null
+        const shouldUpsertMyGroup =
+          !existing
+          || (!normalizedExistingRelay && Boolean(baseRelayUrl))
+          || (normalizedExistingRelay !== null && Boolean(baseRelayUrl) && normalizedExistingRelay !== baseRelayUrl)
+
+        if (shouldUpsertMyGroup) {
+          const nextMyGroupList = this.mergeMyGroupList(
+            [
+              ...this.state.myGroupList.filter((entry) => entry.groupId !== normalizedGroupId),
+              {
+                groupId: normalizedGroupId,
+                relay: baseRelayUrl || undefined
+              }
+            ],
+            []
+          )
+          this.patchState({ myGroupList: nextMyGroupList })
+
+          const session = this.state.session
+          if (session) {
+            await this.groupService.saveMyGroupList(
+              this.searchableRelayUrls(14),
+              session.pubkey,
+              session.nsecHex,
+              nextMyGroupList
+            ).catch((error) => {
+              this.log('warn', `Failed to persist my-group list after invite accept: ${error instanceof Error ? error.message : String(error)}`)
+            })
+          }
+        }
+
+        if (!this.rawGroupDiscover.some((group) => group.id === normalizedGroupId)) {
+          this.rawGroupDiscover = [
+            {
+              id: normalizedGroupId,
+              relay: baseRelayUrl || undefined,
+              name:
+                String(target.groupName || target.name || '').trim()
+                || this.fallbackGroupNameFromIdentifier(normalizedGroupId),
+              about: String(target.about || '').trim(),
+              picture: String(target.groupPicture || '').trim() || undefined,
+              isPublic: target.isPublic !== false,
+              isOpen: !target.token,
+              members: [],
+              membersCount: 0,
+              peersOnline: this.resolveGroupPeerCount(normalizedGroupId, baseRelayUrl || undefined),
+              createdAt: Number.isFinite(target.event?.created_at)
+                ? Number(target.event.created_at)
+                : null
+            },
+            ...this.rawGroupDiscover
+          ]
+          this.syncGroupView()
+        }
+      }
 
       const accepted = this.groupService.markInviteAccepted(
         new Set(this.state.acceptedGroupInviteIds),
@@ -3968,6 +4054,7 @@ export class TuiController {
                 relayKey: resolvedRelayKey,
                 publicIdentifier: normalizedGroupId,
                 inviteePubkey: normalizedInvitee,
+                token: inviteToken || undefined,
                 useWriterPool: true
               }
             },
@@ -3982,9 +4069,51 @@ export class TuiController {
       const writerCore = typeof writerProvision?.writerCore === 'string' ? writerProvision.writerCore : null
       let writerCoreHex = typeof writerProvision?.writerCoreHex === 'string' ? writerProvision.writerCoreHex : null
       let autobaseLocal = typeof writerProvision?.autobaseLocal === 'string' ? writerProvision.autobaseLocal : null
+      const discoveryTopic =
+        typeof writerProvision?.discoveryTopic === 'string'
+          ? writerProvision.discoveryTopic
+          : (typeof payloadInput.discoveryTopic === 'string'
+            ? payloadInput.discoveryTopic
+            : typeof payloadInput.discovery_topic === 'string'
+              ? payloadInput.discovery_topic
+              : null)
+      const hostPeerKeys = Array.from(new Set(
+        [
+          ...(Array.isArray(payloadInput.hostPeerKeys)
+            ? payloadInput.hostPeerKeys
+            : Array.isArray(payloadInput.hostPeers)
+              ? payloadInput.hostPeers
+              : []),
+          ...(Array.isArray(writerProvision?.hostPeerKeys)
+            ? writerProvision.hostPeerKeys
+            : [])
+        ]
+          .map((entry) => String(entry || '').trim().toLowerCase())
+          .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+      ))
+      const writerIssuerPubkey =
+        (typeof writerProvision?.writerIssuerPubkey === 'string'
+          ? writerProvision.writerIssuerPubkey
+          : null)
+        || (typeof payloadInput.writerIssuerPubkey === 'string'
+          ? payloadInput.writerIssuerPubkey
+          : typeof payloadInput.writer_issuer_pubkey === 'string'
+            ? payloadInput.writer_issuer_pubkey
+            : null)
       if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
       if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
       const writerSecret = typeof writerProvision?.writerSecret === 'string' ? writerProvision.writerSecret : null
+      const writerLeaseEnvelope =
+        writerProvision?.writerLeaseEnvelope && typeof writerProvision.writerLeaseEnvelope === 'object'
+          ? writerProvision.writerLeaseEnvelope
+          : null
+      const leaseReplicaPeerKeys = Array.from(new Set(
+        (Array.isArray(writerProvision?.leaseReplicaPeerKeys)
+          ? writerProvision.leaseReplicaPeerKeys
+          : [])
+          .map((entry) => String(entry || '').trim().toLowerCase())
+          .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+      ))
       const fastForward = writerProvision?.fastForward && typeof writerProvision.fastForward === 'object'
         ? writerProvision.fastForward
         : null
@@ -4024,6 +4153,20 @@ export class TuiController {
         relayUrl: resolvedRelayUrl,
         relayKey: resolvedRelayKey || payloadInput.relayKey || null,
         token: inviteToken || null,
+        discoveryTopic: discoveryTopic || null,
+        hostPeerKeys,
+        writerIssuerPubkey: writerIssuerPubkey || null,
+        leaseReplicaPeerKeys:
+          leaseReplicaPeerKeys.length > 0
+            ? leaseReplicaPeerKeys
+            : Array.isArray(payloadInput.leaseReplicaPeerKeys)
+              ? payloadInput.leaseReplicaPeerKeys
+              : undefined,
+        writerLeaseEnvelope:
+          writerLeaseEnvelope
+          || (payloadInput.writerLeaseEnvelope && typeof payloadInput.writerLeaseEnvelope === 'object'
+            ? payloadInput.writerLeaseEnvelope
+            : null),
         writerCore: writerCore || payloadInput.writerCore || null,
         writerCoreHex: writerCoreHex || payloadInput.writerCoreHex || payloadInput.writer_core_hex || null,
         autobaseLocal: autobaseLocal || payloadInput.autobaseLocal || payloadInput.autobase_local || null,

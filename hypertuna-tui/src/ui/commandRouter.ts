@@ -24,6 +24,9 @@ type GeneratedAccount = {
 type SelectedGroupRef = {
   id: string
   relay?: string | null
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
 }
 
 type SelectedGroupInviteRef = {
@@ -127,6 +130,11 @@ export interface CommandController {
     relayUrl?: string
     openJoin?: boolean
     hostPeers?: string[]
+    discoveryTopic?: string
+    hostPeerKeys?: string[]
+    writerIssuerPubkey?: string
+    leaseReplicaPeerKeys?: string[]
+    gatewayMode?: 'auto' | 'disabled'
     blindPeer?: {
       publicKey?: string | null
       encryptionKey?: string | null
@@ -880,8 +888,8 @@ export async function executeCommand(
     if (action === 'join-flow') {
       let publicIdentifier = args[2]
       const token = args[3]
+      let selectedGroup = resolveSelectedGroup(context)
       if (!publicIdentifier) {
-        const selectedGroup = resolveSelectedGroup(context)
         const selectedGroupInvite = resolveSelectedInvite(context)
         if (selectedGroup?.id) {
           publicIdentifier = selectedGroup.id
@@ -893,7 +901,10 @@ export async function executeCommand(
       await controller.startJoinFlow({
         publicIdentifier,
         token,
-        openJoin: args.includes('--open')
+        openJoin: args.includes('--open'),
+        discoveryTopic: selectedGroup?.discoveryTopic || undefined,
+        hostPeerKeys: selectedGroup?.hostPeerKeys || undefined,
+        writerIssuerPubkey: selectedGroup?.writerIssuerPubkey || undefined
       })
       return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }
@@ -1033,7 +1044,10 @@ export async function executeCommand(
       await controller.startJoinFlow({
         publicIdentifier,
         token,
-        openJoin: args.includes('--open')
+        openJoin: args.includes('--open'),
+        discoveryTopic: selectedGroup?.discoveryTopic || undefined,
+        hostPeerKeys: selectedGroup?.hostPeerKeys || undefined,
+        writerIssuerPubkey: selectedGroup?.writerIssuerPubkey || undefined
       })
       return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }

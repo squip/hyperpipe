@@ -8,6 +8,9 @@ export const KIND_GROUP_METADATA = 39000
 export const KIND_GROUP_ADMIN_LIST = 39001
 export const KIND_GROUP_MEMBER_LIST = 39002
 export const KIND_HYPERTUNA_RELAY = 30166
+export const HYPERTUNA_TOPIC_TAG = 'hypertuna-topic'
+export const HYPERTUNA_HOST_PEER_TAG = 'hypertuna-host-peer'
+export const HYPERTUNA_WRITER_ISSUER_TAG = 'hypertuna-writer-issuer'
 
 export function getBaseRelayUrl(url: string): string {
   try {
@@ -54,9 +57,17 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   fileSharing?: boolean
   relayWsUrl: string
   pictureTagUrl?: string
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
+  includeDiscoveryHints?: boolean
 }): { groupCreateEvent: TDraftEvent; metadataEvent: TDraftEvent; hypertunaEvent: TDraftEvent } {
   const now = Math.floor(Date.now() / 1000)
   const fileSharingEnabled = args.fileSharing !== false
+  const includeDiscoveryHints =
+    typeof args.includeDiscoveryHints === 'boolean'
+      ? args.includeDiscoveryHints
+      : args.isPublic && args.isOpen
 
   const groupTags: string[][] = [
     ['h', args.publicIdentifier],
@@ -94,6 +105,27 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
 
   if (args.pictureTagUrl) {
     metadataTags.push(['picture', args.pictureTagUrl, 'hypertuna:drive:pfp'])
+  }
+
+  if (includeDiscoveryHints) {
+    const topic = typeof args.discoveryTopic === 'string' ? args.discoveryTopic.trim() : ''
+    if (topic) metadataTags.push([HYPERTUNA_TOPIC_TAG, topic])
+
+    const hostPeerKeys = Array.from(
+      new Set(
+        (Array.isArray(args.hostPeerKeys) ? args.hostPeerKeys : [])
+          .map((key) => String(key || '').trim().toLowerCase())
+          .filter(Boolean)
+      )
+    )
+    hostPeerKeys.forEach((key) => {
+      metadataTags.push([HYPERTUNA_HOST_PEER_TAG, key])
+    })
+
+    const writerIssuer = typeof args.writerIssuerPubkey === 'string'
+      ? args.writerIssuerPubkey.trim().toLowerCase()
+      : ''
+    if (writerIssuer) metadataTags.push([HYPERTUNA_WRITER_ISSUER_TAG, writerIssuer])
   }
 
   const metadataEvent: TDraftEvent = {

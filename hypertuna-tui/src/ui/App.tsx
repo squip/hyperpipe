@@ -2068,7 +2068,10 @@ export function App({
           await controller.startJoinFlow({
             publicIdentifier: group.id,
             relayUrl: group.relay || undefined,
-            openJoin: group.isPublic !== false && group.isOpen !== false
+            openJoin: group.isPublic !== false && group.isOpen !== false,
+            discoveryTopic: group.discoveryTopic || undefined,
+            hostPeerKeys: group.hostPeerKeys || undefined,
+            writerIssuerPubkey: group.writerIssuerPubkey || undefined
           })
           await Promise.all([
             controller.refreshGroups(),

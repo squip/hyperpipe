@@ -225,6 +225,7 @@ type WorkerBridgeContextValue = {
       token?: string
       relayKey?: string | null
       relayUrl?: string | null
+      hostPeers?: string[]
       blindPeer?: {
         publicKey?: string | null
         encryptionKey?: string | null
@@ -237,6 +238,11 @@ type WorkerBridgeContextValue = {
       autobaseLocal?: string | null
       writerSecret?: string | null
       openJoin?: boolean
+      discoveryTopic?: string
+      hostPeerKeys?: string[]
+      writerIssuerPubkey?: string
+      leaseReplicaPeerKeys?: string[]
+      gatewayMode?: 'auto' | 'disabled'
       fastForward?: {
         key?: string | null
         length?: number | null
@@ -624,6 +630,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         token?: string
         relayKey?: string | null
         relayUrl?: string | null
+        hostPeers?: string[]
         blindPeer?: {
           publicKey?: string | null
           encryptionKey?: string | null
@@ -636,6 +643,11 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         autobaseLocal?: string | null
         writerSecret?: string | null
         openJoin?: boolean
+        discoveryTopic?: string
+        hostPeerKeys?: string[]
+        writerIssuerPubkey?: string
+        leaseReplicaPeerKeys?: string[]
+        gatewayMode?: 'auto' | 'disabled'
         fastForward?: {
           key?: string | null
           length?: number | null
@@ -665,25 +677,39 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         await startWorkerInternal({ resetRestartAttempts: false })
       }
 
-      // The gateway is the source of truth for relay host peers. Ensure it's running.
-      if (!gatewayStatus?.running) {
-        await electronIpc.sendToWorker({ type: 'start-gateway', options: {} }).catch(() => {})
+      const gatewayMode = opts?.gatewayMode === 'disabled' ? 'disabled' : 'auto'
+      if (gatewayMode === 'auto') {
+        if (!gatewayStatus?.running) {
+          void electronIpc.sendToWorker({ type: 'start-gateway', options: {} }).catch(() => {})
+        }
+        void electronIpc.sendToWorker({ type: 'get-gateway-status' }).catch(() => {})
       }
-
-      // Refresh gateway status so peerRelayMap is as current as possible.
-      await electronIpc.sendToWorker({ type: 'get-gateway-status' }).catch(() => {})
 
       const fileSharing = opts?.fileSharing !== false
 
-      // Best-effort host peer discovery fast-path; worker has a fallback too.
+      // Best-effort host peer discovery fast-path; worker has fallbacks too.
       let hostPeers: string[] | undefined
       try {
-        const peerRelayMap = gatewayStatus?.peerRelayMap
-        const entry =
-          peerRelayMap?.[identifier] ||
-          (identifier.includes(':') ? peerRelayMap?.[identifier.replace(':', '/')] : null)
-        if (Array.isArray(entry?.peers) && entry.peers.length) {
-          hostPeers = entry.peers.map((p) => String(p || '').trim()).filter(Boolean)
+        const fromHints = [
+          ...(Array.isArray(opts?.hostPeers) ? opts.hostPeers : []),
+          ...(Array.isArray(opts?.hostPeerKeys) ? opts.hostPeerKeys : [])
+        ]
+          .map((p) => String(p || '').trim().toLowerCase())
+          .filter(Boolean)
+        const fromGateway =
+          gatewayMode === 'auto'
+            ? (() => {
+                const peerRelayMap = gatewayStatus?.peerRelayMap
+                const entry =
+                  peerRelayMap?.[identifier] ||
+                  (identifier.includes(':') ? peerRelayMap?.[identifier.replace(':', '/')] : null)
+                if (!Array.isArray(entry?.peers) || !entry.peers.length) return []
+                return entry.peers.map((p) => String(p || '').trim().toLowerCase()).filter(Boolean)
+              })()
+            : []
+        const merged = Array.from(new Set([...fromHints, ...fromGateway]))
+        if (merged.length) {
+          hostPeers = merged
         }
       } catch (err) {
         void err
@@ -703,6 +729,11 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         writerCoreHex: opts?.writerCoreHex,
         autobaseLocal: opts?.autobaseLocal,
         writerSecret: opts?.writerSecret,
+        discoveryTopic: opts?.discoveryTopic || undefined,
+        hostPeerKeys: opts?.hostPeerKeys || undefined,
+        writerIssuerPubkey: opts?.writerIssuerPubkey || undefined,
+        leaseReplicaPeerKeys: opts?.leaseReplicaPeerKeys || undefined,
+        gatewayMode,
         fastForward: opts?.fastForward || undefined
       }
       if (hostPeers && hostPeers.length) data.hostPeers = hostPeers

@@ -73,6 +73,10 @@ const KIND_GROUP_METADATA = 39000;
 const KIND_GROUP_ADMIN_LIST = 39001;
 const KIND_GROUP_MEMBER_LIST = 39002;
 const KIND_HYPERTUNA_RELAY = 30166;
+const HYPERTUNA_TOPIC_TAG = 'hypertuna-topic';
+const HYPERTUNA_HOST_PEER_TAG = 'hypertuna-host-peer';
+const HYPERTUNA_WRITER_ISSUER_TAG = 'hypertuna-writer-issuer';
+const RELAY_DISCOVERY_TOPIC_NAMESPACE = 'hypertuna:relay-discovery:v2';
 const CREATE_RELAY_BOOTSTRAP_MAX_ATTEMPTS = 3;
 // Keep discovery bootstrap targets aligned with renderer/TUI BIG relay defaults.
 const CREATE_RELAY_DISCOVERY_RELAYS = [
@@ -81,6 +85,20 @@ const CREATE_RELAY_DISCOVERY_RELAYS = [
   'wss://nos.lol/',
   'wss://hypertuna.com/relay'
 ];
+
+function normalizePeerPublicKey(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed || !/^[0-9a-f]{64}$/i.test(trimmed)) return null;
+  return trimmed;
+}
+
+function deriveRelayDiscoveryTopic(identifier) {
+  const normalizedIdentifier = normalizeRelayIdentifier(identifier || '');
+  if (!normalizedIdentifier) return null;
+  const seed = `${RELAY_DISCOVERY_TOPIC_NAMESPACE}:${normalizedIdentifier}`;
+  return b4a.toString(crypto.hash(b4a.from(seed)), 'hex');
+}
 
 function isHex64(value) {
   return typeof value === 'string' && /^[0-9a-fA-F]{64}$/.test(value.trim());
@@ -1038,6 +1056,107 @@ async function waitForPeerProtocol(publicKey, timeoutMs = 20000) {
   });
 }
 
+export async function probeJoinCapabilities({
+  peerKey,
+  publicIdentifier = null,
+  relayKey = null,
+  nonce = null,
+  tokenHash = null,
+  inviteePubkey = null,
+  openJoin = false,
+  timeoutMs = 2500
+} = {}) {
+  const identifier = normalizeRelayIdentifier(publicIdentifier || relayKey || '');
+  if (!identifier) {
+    throw new Error('Missing identifier for capability probe');
+  }
+  const protocol = await waitForPeerProtocol(peerKey, timeoutMs);
+  const params = new URLSearchParams();
+  if (nonce) params.set('nonce', String(nonce));
+  if (tokenHash) params.set('tokenHash', String(tokenHash));
+  if (inviteePubkey) params.set('inviteePubkey', String(inviteePubkey).toLowerCase());
+  if (openJoin) params.set('openJoin', '1');
+  const query = params.toString();
+  const path = `/join-capabilities/${identifier}${query ? `?${query}` : ''}`;
+  const response = await protocol.sendRequest({
+    method: 'GET',
+    path,
+    headers: { 'content-type': 'application/json' },
+    body: b4a.alloc(0)
+  });
+
+  if ((response.statusCode || 200) >= 400) {
+    const body = toBuffer(response.body).toString('utf8');
+    throw new Error(`Capability probe failed (${response.statusCode}): ${body}`);
+  }
+  return parseJsonBody(response.body) || {};
+}
+
+export async function syncWriterLeaseToPeer({
+  peerKey,
+  publicIdentifier = null,
+  relayKey = null,
+  envelope,
+  leaseReplicaPeerKeys = [],
+  timeoutMs = 4000
+} = {}) {
+  const identifier = normalizeRelayIdentifier(publicIdentifier || relayKey || '');
+  if (!identifier) throw new Error('Missing identifier for lease sync');
+  if (!envelope || typeof envelope !== 'object') throw new Error('Missing lease envelope');
+  const protocol = await waitForPeerProtocol(peerKey, timeoutMs);
+  const response = await protocol.sendRequest({
+    method: 'POST',
+    path: `/relay/${identifier}/writer-lease-sync`,
+    headers: { 'content-type': 'application/json' },
+    body: b4a.from(JSON.stringify({
+      relayKey,
+      publicIdentifier: publicIdentifier || identifier,
+      envelope,
+      leaseReplicaPeerKeys
+    }))
+  });
+  if ((response.statusCode || 200) >= 400) {
+    const body = toBuffer(response.body).toString('utf8');
+    throw new Error(`Lease sync failed (${response.statusCode}): ${body}`);
+  }
+  return parseJsonBody(response.body) || { ok: true };
+}
+
+export async function claimWriterLeaseFromPeer({
+  peerKey,
+  publicIdentifier = null,
+  relayKey = null,
+  inviteePubkey = null,
+  token = null,
+  tokenHash = null,
+  timeoutMs = 4000
+} = {}) {
+  const identifier = normalizeRelayIdentifier(publicIdentifier || relayKey || '');
+  if (!identifier) throw new Error('Missing identifier for lease claim');
+  if (!inviteePubkey) throw new Error('Missing invitee pubkey for lease claim');
+  if (!token && !tokenHash) throw new Error('Missing token/tokenHash for lease claim');
+  const protocol = await waitForPeerProtocol(peerKey, timeoutMs);
+  const response = await protocol.sendRequest({
+    method: 'POST',
+    path: `/relay/${identifier}/writer-lease-claim`,
+    headers: { 'content-type': 'application/json' },
+    body: b4a.from(JSON.stringify({
+      relayKey,
+      publicIdentifier: publicIdentifier || identifier,
+      inviteePubkey,
+      token: token || null,
+      tokenHash: tokenHash || null
+    }))
+  });
+  if ((response.statusCode || 200) >= 400) {
+    const body = toBuffer(response.body).toString('utf8');
+    throw new Error(`Lease claim failed (${response.statusCode}): ${body}`);
+  }
+  const parsed = parseJsonBody(response.body) || null;
+  if (!parsed?.ok) return null;
+  return parsed;
+}
+
 // Handle incoming peer connections
 function handlePeerConnection(stream, peerInfo) {
   const publicKey = peerInfo.publicKey.toString('hex');
@@ -1681,6 +1800,211 @@ function setupProtocolHandlers(protocol) {
         statusCode: 500,
         headers: { 'content-type': 'application/json' },
         body: b4a.from(JSON.stringify({ error: error.message }))
+      };
+    }
+  });
+
+  protocol.handle('/join-capabilities/:identifier', async (request) => {
+    const rawIdentifier = request.params.identifier;
+    const identifier = normalizeRelayIdentifier(rawIdentifier);
+    const queryNonce = typeof request.query?.nonce === 'string' ? request.query.nonce : null;
+    const inviteePubkey = typeof request.query?.inviteePubkey === 'string'
+      ? String(request.query.inviteePubkey).trim().toLowerCase()
+      : null;
+    const tokenHash = typeof request.query?.tokenHash === 'string'
+      ? String(request.query.tokenHash).trim().toLowerCase()
+      : null;
+
+    try {
+      const resolvedRelayKey = await getRelayKeyFromPublicIdentifier(identifier) || identifier;
+      let profile = await getRelayProfileByKey(resolvedRelayKey);
+      if (!profile) {
+        profile = await getRelayProfileByPublicIdentifier(identifier);
+      }
+      const relayManager = activeRelays.get(resolvedRelayKey);
+      const isOpenRelay = profile?.isOpen !== false;
+      const active = !!relayManager?.relay;
+      const writable = relayManager?.relay?.writable === true;
+      let hasMatchingLease = false;
+      let leaseExpiresAt = null;
+
+      if (profile?.isOpen === false && inviteePubkey && tokenHash && typeof global.claimReplicatedWriterLeaseEnvelope === 'function') {
+        const lease = await global.claimReplicatedWriterLeaseEnvelope({
+          relayKey: resolvedRelayKey,
+          publicIdentifier: profile?.public_identifier || identifier,
+          inviteePubkey,
+          tokenHash
+        }).catch(() => null);
+        if (lease?.writerSecret) {
+          hasMatchingLease = true;
+          leaseExpiresAt = Number.isFinite(Number(lease?.expiresAt)) ? Number(lease.expiresAt) : null;
+        }
+      }
+
+      const responsePayload = {
+        nonce: queryNonce || null,
+        identifier,
+        relayKey: resolvedRelayKey || null,
+        publicIdentifier: profile?.public_identifier || identifier || null,
+        active,
+        writable,
+        canDirectChallenge: active && isOpenRelay,
+        canProvisionOpenWriter: active && profile?.isOpen === true,
+        hasMatchingLease,
+        leaseExpiresAt
+      };
+
+      updateMetrics(true);
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify(responsePayload))
+      };
+    } catch (error) {
+      updateMetrics(false);
+      return {
+        statusCode: 500,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: error?.message || String(error), nonce: queryNonce || null }))
+      };
+    }
+  });
+
+  protocol.handle('/relay/:identifier/writer-lease-sync', async (request) => {
+    const rawIdentifier = request.params.identifier;
+    const identifier = normalizeRelayIdentifier(rawIdentifier);
+
+    try {
+      const body = parseJsonBody(request.body) || {};
+      const envelope = body?.envelope && typeof body.envelope === 'object' ? body.envelope : null;
+      if (!envelope) {
+        updateMetrics(false);
+        return {
+          statusCode: 400,
+          headers: { 'content-type': 'application/json' },
+          body: b4a.from(JSON.stringify({ error: 'Missing writer lease envelope' }))
+        };
+      }
+      if (typeof global.storeReplicatedWriterLeaseEnvelope !== 'function') {
+        updateMetrics(false);
+        return {
+          statusCode: 503,
+          headers: { 'content-type': 'application/json' },
+          body: b4a.from(JSON.stringify({ error: 'Lease store unavailable' }))
+        };
+      }
+
+      const stored = await global.storeReplicatedWriterLeaseEnvelope({
+        relayKey: body?.relayKey || null,
+        publicIdentifier: body?.publicIdentifier || identifier,
+        envelope,
+        leaseReplicaPeerKeys: Array.isArray(body?.leaseReplicaPeerKeys)
+          ? body.leaseReplicaPeerKeys
+          : []
+      });
+
+      if (!stored) {
+        updateMetrics(false);
+        return {
+          statusCode: 400,
+          headers: { 'content-type': 'application/json' },
+          body: b4a.from(JSON.stringify({ error: 'Invalid or expired lease envelope' }))
+        };
+      }
+
+      updateMetrics(true);
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({
+          ok: true,
+          relayKey: stored?.relayKey || body?.relayKey || null,
+          publicIdentifier: stored?.publicIdentifier || body?.publicIdentifier || identifier,
+          leaseId: stored?.leaseId || null,
+          expiresAt: stored?.leaseExpiresAt || stored?.expiresAt || null
+        }))
+      };
+    } catch (error) {
+      updateMetrics(false);
+      return {
+        statusCode: 500,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: error?.message || String(error) }))
+      };
+    }
+  });
+
+  protocol.handle('/relay/:identifier/writer-lease-claim', async (request) => {
+    const rawIdentifier = request.params.identifier;
+    const identifier = normalizeRelayIdentifier(rawIdentifier);
+
+    try {
+      const body = parseJsonBody(request.body) || {};
+      const inviteePubkey = typeof body?.inviteePubkey === 'string'
+        ? String(body.inviteePubkey).trim().toLowerCase()
+        : null;
+      const token = typeof body?.token === 'string' ? String(body.token).trim() : null;
+      const tokenHash = typeof body?.tokenHash === 'string' ? String(body.tokenHash).trim().toLowerCase() : null;
+      if (!inviteePubkey || (!token && !tokenHash)) {
+        updateMetrics(false);
+        return {
+          statusCode: 400,
+          headers: { 'content-type': 'application/json' },
+          body: b4a.from(JSON.stringify({ error: 'Missing inviteePubkey and token/tokenHash' }))
+        };
+      }
+      if (typeof global.claimReplicatedWriterLeaseEnvelope !== 'function') {
+        updateMetrics(false);
+        return {
+          statusCode: 503,
+          headers: { 'content-type': 'application/json' },
+          body: b4a.from(JSON.stringify({ error: 'Lease claim unavailable' }))
+        };
+      }
+
+      const claim = await global.claimReplicatedWriterLeaseEnvelope({
+        relayKey: body?.relayKey || null,
+        publicIdentifier: body?.publicIdentifier || identifier,
+        inviteePubkey,
+        token: token || null,
+        tokenHash: tokenHash || null
+      });
+
+      if (!claim?.writerSecret) {
+        updateMetrics(true);
+        return {
+          statusCode: 404,
+          headers: { 'content-type': 'application/json' },
+          body: b4a.from(JSON.stringify({ ok: false, reason: 'lease-not-found' }))
+        };
+      }
+
+      updateMetrics(true);
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({
+          ok: true,
+          relayKey: body?.relayKey || null,
+          publicIdentifier: body?.publicIdentifier || identifier,
+          envelope: claim?.envelope || null,
+          writerCore: claim?.writerCore || null,
+          writerCoreHex: claim?.writerCoreHex || claim?.autobaseLocal || null,
+          autobaseLocal: claim?.autobaseLocal || claim?.writerCoreHex || null,
+          writerSecret: claim?.writerSecret || null,
+          coreRefs: Array.isArray(claim?.coreRefs) ? claim.coreRefs : [],
+          fastForward: claim?.fastForward || null,
+          leaseId: claim?.leaseId || null,
+          issuerPubkey: claim?.issuerPubkey || null,
+          expiresAt: claim?.expiresAt || null
+        }))
+      };
+    } catch (error) {
+      updateMetrics(false);
+      return {
+        statusCode: 500,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: error?.message || String(error) }))
       };
     }
   });
@@ -2844,7 +3168,10 @@ function buildCreateRelayBootstrapDraftEvents({
   isOpen,
   fileSharing,
   relayWsUrl,
-  picture
+  picture,
+  discoveryTopic = null,
+  hostPeerKey = null,
+  writerIssuerPubkey = null
 }) {
   const canonicalIdentifier = normalizeRelayIdentifier(publicIdentifier);
   const now = Math.floor(Date.now() / 1000);
@@ -2852,6 +3179,20 @@ function buildCreateRelayBootstrapDraftEvents({
   const about = description ? String(description) : '';
   const fileSharingEnabled = fileSharing !== false;
   const pictureTag = typeof picture === 'string' && picture.trim() ? picture.trim() : null;
+  const includeDiscoveryHints = isPublic === true && isOpen === true;
+  const resolvedDiscoveryTopic = includeDiscoveryHints
+    ? (typeof discoveryTopic === 'string' && discoveryTopic.trim()
+      ? discoveryTopic.trim()
+      : deriveRelayDiscoveryTopic(canonicalIdentifier))
+    : null;
+  const resolvedHostPeerKey = includeDiscoveryHints
+    ? normalizePeerPublicKey(hostPeerKey || config?.swarmPublicKey || null)
+    : null;
+  const resolvedWriterIssuer = includeDiscoveryHints
+    ? (typeof writerIssuerPubkey === 'string' && writerIssuerPubkey.trim()
+      ? writerIssuerPubkey.trim().toLowerCase()
+      : String(adminPubkey || '').trim().toLowerCase() || null)
+    : null;
 
   const groupTags = [
     ['h', canonicalIdentifier],
@@ -2876,6 +3217,15 @@ function buildCreateRelayBootstrapDraftEvents({
     [isOpen ? 'open' : 'closed'],
     [fileSharingEnabled ? 'file-sharing-on' : 'file-sharing-off']
   ];
+  if (includeDiscoveryHints && resolvedDiscoveryTopic) {
+    metadataTags.push([HYPERTUNA_TOPIC_TAG, resolvedDiscoveryTopic]);
+  }
+  if (includeDiscoveryHints && resolvedHostPeerKey) {
+    metadataTags.push([HYPERTUNA_HOST_PEER_TAG, resolvedHostPeerKey]);
+  }
+  if (includeDiscoveryHints && resolvedWriterIssuer) {
+    metadataTags.push([HYPERTUNA_WRITER_ISSUER_TAG, resolvedWriterIssuer]);
+  }
   if (pictureTag) metadataTags.push(['picture', pictureTag, 'hypertuna:drive:pfp']);
 
   const adminTags = [
@@ -3028,6 +3378,8 @@ async function publishCreateRelayBootstrapEvents({
   }
 
   const relayWsUrl = `${buildGatewayWebsocketBase(config)}/${canonicalIdentifier.replace(':', '/')}`;
+  const discoveryTopic = deriveRelayDiscoveryTopic(canonicalIdentifier);
+  const hostPeerKey = normalizePeerPublicKey(config?.swarmPublicKey || null);
   const drafts = buildCreateRelayBootstrapDraftEvents({
     publicIdentifier: canonicalIdentifier,
     adminPubkey,
@@ -3037,7 +3389,10 @@ async function publishCreateRelayBootstrapEvents({
     isOpen,
     fileSharing,
     relayWsUrl,
-    picture
+    picture,
+    discoveryTopic,
+    hostPeerKey,
+    writerIssuerPubkey: adminPubkey
   });
 
   let lastError = null;
@@ -4781,6 +5136,10 @@ export async function createRelay(options) {
     }
 
     result.bootstrapPublish = bootstrapPublish;
+    result.discoveryTopic = deriveRelayDiscoveryTopic(result.publicIdentifier || result.relayKey || null);
+    result.hostPeerKey = normalizePeerPublicKey(config?.swarmPublicKey || null);
+    result.hostPeerKeys = result.hostPeerKey ? [result.hostPeerKey] : [];
+    result.writerIssuerPubkey = config?.nostr_pubkey_hex || null;
   }
   
   return result;
@@ -4917,8 +5276,10 @@ export async function startJoinAuthentication(options) {
     autobaseLocal = null,
     coreRefs = [],
     writerCoreRefs = [],
-    fastForward = null
+    fastForward = null,
+    gatewayMode = 'auto'
   } = options;
+  const allowGatewayFallback = gatewayMode !== 'disabled';
   const expectedWriter = resolveExpectedWriterKey({ writerCoreHex, autobaseLocal, writerCore });
   const expectedWriterKey = expectedWriter.expectedWriterKey;
   const expectedWriterSource = expectedWriter.source;
@@ -4961,7 +5322,12 @@ export async function startJoinAuthentication(options) {
   let checkpointInJoinRefs = checkpointRefForJoin
     ? normalizeCoreRefList(coreRefsForJoin).includes(checkpointRefForJoin)
     : null;
-  if (!checkpointInJoinRefs && typeof global.fetchAndApplyRelayMirrorMetadata === 'function' && (relayKeyHint || publicIdentifierHint)) {
+  if (
+    allowGatewayFallback &&
+    !checkpointInJoinRefs &&
+    typeof global.fetchAndApplyRelayMirrorMetadata === 'function' &&
+    (relayKeyHint || publicIdentifierHint)
+  ) {
     try {
       const mirrorResult = await global.fetchAndApplyRelayMirrorMetadata({
         relayKey: relayKeyHint || publicIdentifierHint,
@@ -5001,6 +5367,7 @@ export async function startJoinAuthentication(options) {
   writerCoreRefsForJoin = Array.from(new Set(writerCoreRefsForJoin));
   console.log('[RelayServer] startJoinAuthentication payload', {
     publicIdentifier,
+    gatewayMode,
     hasWriterSecret: !!writerSecret,
     hasWriterCore: !!writerCore,
     hasWriterCoreHex: !!writerCoreHex,
@@ -5154,7 +5521,7 @@ export async function startJoinAuthentication(options) {
             // ignore
           }
         }
-        if (!resolvedRelayKey) {
+        if (!resolvedRelayKey && allowGatewayFallback) {
           const mirrorIdentifier = publicIdentifier || extractIdentifierFromRelayUrl(inviteRelayUrl);
           if (mirrorIdentifier) {
             const mirrorResult = await fetchMirrorMetadataFromGateway(mirrorIdentifier, {
