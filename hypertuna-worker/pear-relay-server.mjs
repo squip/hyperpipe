@@ -643,6 +643,17 @@ function buildGatewayWebsocketBase(cfg = config) {
   return `${protocol}://${host}`;
 }
 
+function buildCanonicalRelayUrl(identifier, authToken = null, cfg = config) {
+  const normalizedIdentifier = normalizeRelayIdentifier(identifier || '') || String(identifier || '').trim();
+  if (!normalizedIdentifier) return null;
+  const identifierPath = normalizedIdentifier.includes(':')
+    ? normalizedIdentifier.replace(':', '/')
+    : normalizedIdentifier;
+  const baseUrl = `${buildGatewayWebsocketBase(cfg)}/${identifierPath}`;
+  const token = normalizeAuthTokenValue(authToken);
+  return token ? `${baseUrl}?token=${token}` : baseUrl;
+}
+
 function previewValue(value, limit = 16) {
   if (!value) return null;
   const str = String(value);
@@ -2638,7 +2649,7 @@ function setupProtocolHandlers(protocol) {
       if (!profile) {
         profile = await getRelayProfileByPublicIdentifier(canonicalIdentifier);
       }
-      const relayUrl = `${buildGatewayWebsocketBase(config)}/${canonicalIdentifier.replace(':', '/')}?token=${result.token}`;
+      const relayUrl = buildCanonicalRelayUrl(canonicalIdentifier, result.token, config);
       const shouldProvisionWriter = Boolean(profile && profile.isOpen !== false);
       const writerProvisionTask = shouldProvisionWriter
         ? provisionWriterForInvitee({
@@ -6884,6 +6895,15 @@ export async function startJoinAuthentication(options) {
     const finalExpectedWriterKey = directExpectedWriter.expectedWriterKey;
     const finalExpectedWriterSource = directExpectedWriter.source;
     const finalExpectedWriterKeyHex = resolveWriterKeyHex(finalExpectedWriterKey);
+    const canonicalRelayUrl = buildCanonicalRelayUrl(finalIdentifier, authToken, config);
+    if (relayUrl && canonicalRelayUrl && relayUrl !== canonicalRelayUrl) {
+      console.log('[RelayServer] Normalizing relay URL from verify response', {
+        publicIdentifier: finalIdentifier,
+        relayKey,
+        remoteRelayUrl: String(relayUrl).slice(0, 120),
+        canonicalRelayUrl: String(canonicalRelayUrl).slice(0, 120)
+      });
+    }
     let directCoreRefs = coreRefsForJoin;
     const finalCoreRef = normalizeCoreRefString(finalExpectedWriterKey);
     if (finalCoreRef && !directCoreRefs.includes(finalCoreRef)) {
@@ -6902,8 +6922,8 @@ export async function startJoinAuthentication(options) {
       expectedWriterKeyHex: finalExpectedWriterKeyHex,
       coreRefs: directCoreRefs
     });
-    if (!authToken || !relayUrl || !relayKey) {
-      throw new Error('Final response from relay host missing authToken, relayKey, or relayUrl');
+    if (!authToken || !relayKey || !canonicalRelayUrl) {
+      throw new Error('Final response from relay host missing authToken, relayKey, or resolvable relayUrl');
     }
 
     assertTokenOwnerMatchesExpectedPubkey({
@@ -6929,6 +6949,8 @@ export async function startJoinAuthentication(options) {
       config,
       fileSharing,
       isOpen,
+      publicIdentifier: finalIdentifier,
+      authToken,
       writerSecret: finalWriterSecret,
       writerCore: finalWriterCore,
       writerCoreHex: finalWriterCoreHex,
@@ -6975,7 +6997,7 @@ export async function startJoinAuthentication(options) {
       const relayWritablePayload = {
         relayKey,
         publicIdentifier: finalIdentifier,
-        relayUrl,
+        relayUrl: canonicalRelayUrl,
         authToken,
         mode: 'direct-join',
         writable: directWaitResult?.writable ?? null,
@@ -7007,7 +7029,7 @@ export async function startJoinAuthentication(options) {
           expectedWriterKey: finalExpectedWriterKey,
           publicIdentifier: finalIdentifier,
           authToken,
-          relayUrl,
+          relayUrl: canonicalRelayUrl,
           mode: 'direct-join',
           requireWritable: true,
           reason: 'direct-join'
@@ -7027,7 +7049,7 @@ export async function startJoinAuthentication(options) {
           publicIdentifier: finalIdentifier,
           relayKey,
           authToken,
-          relayUrl,
+          relayUrl: canonicalRelayUrl,
           hostPeer: selectedPeerKey,
           mode: 'direct-join',
           provisional: false

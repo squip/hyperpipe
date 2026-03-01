@@ -6,6 +6,7 @@ import RelayProtocol from './RelayProtocol.mjs';
 
 const GET_CONN_TRACE_WINDOW_MS = 5000;
 const GET_CONN_TRACE_THRESHOLDS = new Set([1, 2, 5, 10, 20, 50, 100, 200, 500]);
+const pendingStreamErrorGuards = new WeakMap();
 
 const formatGetConnectionContext = (context) => {
   if (!context) return null;
@@ -65,6 +66,30 @@ const buildConnectionState = (connection, now = Date.now()) => {
   };
 };
 
+const attachPendingStreamErrorGuard = (stream, logger, peer) => {
+  if (!stream || typeof stream.once !== 'function') return;
+  if (pendingStreamErrorGuards.has(stream)) return;
+  const handler = (error) => {
+    pendingStreamErrorGuards.delete(stream);
+    logger?.warn?.('Hyperswarm stream error before lifecycle handlers attached', {
+      peer,
+      error: error?.message || error
+    });
+  };
+  pendingStreamErrorGuards.set(stream, handler);
+  stream.once('error', handler);
+};
+
+const clearPendingStreamErrorGuard = (stream) => {
+  if (!stream) return;
+  const handler = pendingStreamErrorGuards.get(stream);
+  if (!handler) return;
+  pendingStreamErrorGuards.delete(stream);
+  try {
+    stream.removeListener?.('error', handler);
+  } catch (_) {}
+};
+
 class HyperswarmConnection {
   constructor(publicKey, swarm, pool, logger = console) {
     this.publicKey = publicKey;
@@ -115,6 +140,7 @@ class HyperswarmConnection {
         }
 
         this.stream = connection;
+        this._bindLifecycleHandlers();
         const handshakeData = this.pool._buildHandshakeData(false, {
           publicKey: this.publicKey,
           connection,
@@ -244,6 +270,9 @@ class HyperswarmConnection {
     const stream = this.stream;
     const protocol = this.protocol;
     if (!stream && !protocol) return;
+    if (stream) {
+      clearPendingStreamErrorGuard(stream);
+    }
 
     const onStreamClose = () => this._handleConnectionClosed('stream-close');
     const onStreamEnd = () => this._handleConnectionClosed('stream-end');
@@ -317,6 +346,7 @@ class HyperswarmConnection {
         try { this.protocol.destroy(); } catch (_) {}
       }
       if (this.stream) {
+        clearPendingStreamErrorGuard(this.stream);
         try { this.stream.destroy(error instanceof Error ? error : undefined); } catch (_) {}
       }
     }
@@ -349,6 +379,7 @@ class HyperswarmConnection {
       const existing = this.pool.connections.get(targetPublicKey);
       if (existing && existing !== this && existing.stream) {
         this.logger?.info?.({ peer: targetPublicKey }, 'Reusing existing stream for peer');
+        attachPendingStreamErrorGuard(existing.stream, this.logger, targetPublicKey);
         resolve(existing.stream);
         return;
       }
@@ -356,6 +387,7 @@ class HyperswarmConnection {
       for (const conn of this.pool.swarm?.connections || []) {
         if (conn.remotePublicKey && conn.remotePublicKey.equals(targetBuffer)) {
           this.logger?.info?.({ peer: targetPublicKey }, 'Found active swarm connection for peer');
+          attachPendingStreamErrorGuard(conn, this.logger, targetPublicKey);
           resolve(conn);
           return;
         }
@@ -372,6 +404,7 @@ class HyperswarmConnection {
 
       const succeed = (stream) => {
         if (settled) return;
+        attachPendingStreamErrorGuard(stream, this.logger, targetPublicKey);
         cleanup();
         this.logger?.info?.({ peer: targetPublicKey }, 'Hyperswarm dial succeeded');
         resolve(stream);
@@ -526,6 +559,7 @@ class EnhancedHyperswarmPool {
 
     this.swarm.on('connection', (connection, peerInfo) => {
       const publicKey = peerInfo.publicKey.toString('hex');
+      attachPendingStreamErrorGuard(connection, this.logger, publicKey);
       const existing = this.connections.get(publicKey);
       if (existing) {
         if (existing.connecting && !existing.connected) {

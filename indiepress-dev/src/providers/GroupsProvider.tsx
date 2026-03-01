@@ -61,6 +61,7 @@ const INVITE_ACCEPTED_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_v1'
 const INVITE_ACCEPTED_GROUPS_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_groups_v1'
 const JOIN_REQUESTS_HANDLED_STORAGE_KEY = 'hypertuna_join_requests_handled_v1'
 const GROUP_MEMBER_PREVIEW_TTL_MS = 2 * 60 * 1000
+const TOKENIZED_RELAY_REFRESH_MIN_INTERVAL_MS = 5000
 const LEAVE_PUBLISH_RETRY_BASE_DELAY_MS = 5000
 const LEAVE_PUBLISH_RETRY_MAX_DELAY_MS = 60 * 60 * 1000
 
@@ -642,6 +643,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
     const addKey = (key?: string, value?: string) => {
       if (!key || !value) return
+      const existing = map.get(key)
+      if (existing) {
+        const existingTokenized = hasRelayAuthToken(existing)
+        const incomingTokenized = hasRelayAuthToken(value)
+        if (existingTokenized && !incomingTokenized) return
+        if (existing === value) return
+      }
       map.set(key, value)
     }
 
@@ -2351,6 +2359,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   )
 
   const tokenizedPreviewRefreshByGroupRef = useRef<Map<string, string>>(new Map())
+  const tokenizedPreviewLastRefreshByGroupRef = useRef<Map<string, number>>(new Map())
 
   useEffect(() => {
     if (!pubkey) return
@@ -2367,6 +2376,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     }
 
     const nextByGroup = new Map<string, string>()
+    const now = Date.now()
 
     myGroupList.forEach((entry) => {
       const relayEntry =
@@ -2380,12 +2390,23 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       nextByGroup.set(entry.groupId, resolvedRelay)
       const prevRelay = tokenizedPreviewRefreshByGroupRef.current.get(entry.groupId)
+      const lastRefreshAt = tokenizedPreviewLastRefreshByGroupRef.current.get(entry.groupId) || 0
+      const withinCooldown = now - lastRefreshAt < TOKENIZED_RELAY_REFRESH_MIN_INTERVAL_MS
       if (prevRelay === resolvedRelay) return
+      if (withinCooldown) {
+        console.info('[GroupsProvider] tokenized relay refresh suppressed by cooldown', {
+          groupId: entry.groupId,
+          relay: resolvedRelay,
+          lastRefreshAgoMs: now - lastRefreshAt
+        })
+        return
+      }
 
       console.info('[GroupsProvider] tokenized relay observed; forcing member preview refresh', {
         groupId: entry.groupId,
         relay: resolvedRelay
       })
+      tokenizedPreviewLastRefreshByGroupRef.current.set(entry.groupId, now)
 
       invalidateGroupMemberPreview(entry.groupId, resolvedRelay, {
         reason: 'worker-relay-tokenized-update'
@@ -2394,12 +2415,18 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         force: true,
         reason: 'worker-relay-tokenized-update'
       }).catch(() => {})
-      fetchGroupDetail(entry.groupId, resolvedRelay, { preferRelay: true }).catch(() => {})
     })
 
     tokenizedPreviewRefreshByGroupRef.current = nextByGroup
+    const nextRefreshAt = new Map<string, number>()
+    nextByGroup.forEach((_relay, groupId) => {
+      const refreshAt = tokenizedPreviewLastRefreshByGroupRef.current.get(groupId)
+      if (Number.isFinite(refreshAt)) {
+        nextRefreshAt.set(groupId, Number(refreshAt))
+      }
+    })
+    tokenizedPreviewLastRefreshByGroupRef.current = nextRefreshAt
   }, [
-    fetchGroupDetail,
     invalidateGroupMemberPreview,
     myGroupList,
     pubkey,

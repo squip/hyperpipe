@@ -823,6 +823,17 @@ function buildGatewayWebsocketBase(config) {
     return `${protocol}://${host}`;
 }
 
+function buildRelayConnectionUrls(config, { relayKey, publicIdentifier = null, authToken = null } = {}) {
+    const normalizedIdentifier = normalizeRelayIdentifier(publicIdentifier || '') || (publicIdentifier || relayKey || '');
+    const identifierPath = normalizedIdentifier.includes(':')
+        ? normalizedIdentifier.replace(':', '/')
+        : normalizedIdentifier;
+    const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
+    const token = typeof authToken === 'string' ? authToken.trim() : '';
+    const connectionUrl = token ? `${baseUrl}?token=${token}` : baseUrl;
+    return { baseUrl, connectionUrl, identifierPath };
+}
+
 export function setRelayMapping(relayKey, publicIdentifier) {
     if (!relayKey) return;
     if (publicIdentifier) {
@@ -1147,11 +1158,11 @@ export async function createRelay(options = {}) {
         console.log(`[RelayAdapter] Connect at: ${gatewayBase}/${relayKey}`);
         
         // Build the authenticated relay URL
-        const identifierPath = publicIdentifier ? 
-            publicIdentifier.replace(':', '/') : 
-            relayKey;
-        const baseUrl = `${gatewayBase}/${identifierPath}`;
-        const authenticatedUrl = authToken ? `${baseUrl}?token=${authToken}` : baseUrl;
+        const { baseUrl, connectionUrl: authenticatedUrl } = buildRelayConnectionUrls(config, {
+            relayKey,
+            publicIdentifier,
+            authToken
+        });
         
         // Send relay initialized message for newly created relay
         if (global.sendMessage) {
@@ -1454,11 +1465,11 @@ export async function joinRelay(options = {}) {
                 userAuthToken = authToken;
             }
 
-            const identifierPath = profileInfo?.public_identifier ?
-                profileInfo.public_identifier.replace(':', '/') :
-                relayKey;
-            const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
-            const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
+            const { connectionUrl } = buildRelayConnectionUrls(config, {
+                relayKey,
+                publicIdentifier: profileInfo?.public_identifier,
+                authToken: userAuthToken
+            });
 
             // Still send initialized message since the UI might be waiting
             if (global.sendMessage && !suppressInitMessage) {
@@ -1759,10 +1770,11 @@ export async function joinRelay(options = {}) {
         
         // Send relay initialized message for joined relay ONLY if not from auto-connect
         if (!fromAutoConnect && global.sendMessage && !suppressInitMessage) {
-            const identifierPath = profileInfo.public_identifier ? profileInfo.public_identifier.replace(':', '/') : relayKey;
-            const gatewayBase = buildGatewayWebsocketBase(config);
-            const baseGw = `${gatewayBase}/${identifierPath}`;
-            const gw = authToken ? `${baseGw}?token=${authToken}` : baseGw;
+            const { connectionUrl: gw } = buildRelayConnectionUrls(config, {
+                relayKey,
+                publicIdentifier: profileInfo.public_identifier,
+                authToken
+            });
             console.log(`[RelayAdapter] [3] joinRelay -> Sending relay-initialized for ${relayKey} with URL ${gw}`);
             global.sendMessage({
                 type: 'relay-initialized',
@@ -1781,14 +1793,16 @@ export async function joinRelay(options = {}) {
             });
         }
         
-        const identifierPathReturn = profileInfo.public_identifier ? profileInfo.public_identifier.replace(':', '/') : relayKey;
-        const gatewayBaseReturn = buildGatewayWebsocketBase(config);
-        const returnBase = `${gatewayBaseReturn}/${identifierPathReturn}`;
+        const { connectionUrl: returnConnectionUrl } = buildRelayConnectionUrls(config, {
+            relayKey,
+            publicIdentifier: profileInfo.public_identifier,
+            authToken
+        });
         return {
             success: true,
             relayKey,
             publicIdentifier: profileInfo.public_identifier || null,
-            connectionUrl: authToken ? `${returnBase}?token=${authToken}` : returnBase,
+            connectionUrl: returnConnectionUrl,
             profile: profileInfo,
             storageDir: defaultStorageDir
         };
@@ -2037,9 +2051,11 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
                 userAuthToken = userAuth?.token || null;
             }
 
-            const identifierPath = publicIdentifier ? publicIdentifier.replace(':', '/') : relayKey;
-            const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
-            const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
+            const { connectionUrl } = buildRelayConnectionUrls(config, {
+                relayKey,
+                publicIdentifier,
+                authToken: userAuthToken
+            });
 
             if (global.sendMessage) {
                 global.sendMessage({
@@ -2384,9 +2400,11 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
             userAuthToken = userAuth?.token || null;
         }
 
-        const identifierPath = publicIdentifier ? publicIdentifier.replace(':', '/') : relayKey;
-        const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`;
-        const connectionUrl = userAuthToken ? `${baseUrl}?token=${userAuthToken}` : baseUrl;
+        const { connectionUrl } = buildRelayConnectionUrls(config, {
+            relayKey,
+            publicIdentifier,
+            authToken: userAuthToken
+        });
 
         if (global.sendMessage) {
             global.sendMessage({
@@ -2587,9 +2605,10 @@ export async function getActiveRelays() {
         // Find the profile for this relay
         const profile = profiles.find(p => p.relay_key === key);
 
-        const identifierPath = profile?.public_identifier
-            ? profile.public_identifier.replace(':', '/')
-            : key;
+        const { connectionUrl } = buildRelayConnectionUrls(
+            globalConfig || { proxy_server_address: 'localhost', proxy_websocket_protocol: 'wss' },
+            { relayKey: key, publicIdentifier: profile?.public_identifier }
+        );
 
         activeRelayList.push({
             relayKey: key,
@@ -2597,7 +2616,7 @@ export async function getActiveRelays() {
             peerCount,
             name: profile?.name || `Relay ${key.substring(0, 8)}`,
             description: profile?.description || '',
-            connectionUrl: `${buildGatewayWebsocketBase(globalConfig || { proxy_server_address: 'localhost', proxy_websocket_protocol: 'wss' })}/${identifierPath}`,
+            connectionUrl,
             createdAt: profile?.created_at || profile?.joined_at || null,
             isActive: true,
             writable: manager?.relay?.writable === true,
@@ -2615,9 +2634,10 @@ export async function getActiveRelays() {
         if (!relayKey || activeRelayKeys.has(relayKey)) continue;
         if (profile?.is_active === false) continue;
 
-        const identifierPath = profile?.public_identifier
-            ? profile.public_identifier.replace(':', '/')
-            : relayKey;
+        const { connectionUrl } = buildRelayConnectionUrls(
+            globalConfig || { proxy_server_address: 'localhost', proxy_websocket_protocol: 'wss' },
+            { relayKey, publicIdentifier: profile?.public_identifier }
+        );
 
         activeRelayList.push({
             relayKey,
@@ -2625,7 +2645,7 @@ export async function getActiveRelays() {
             peerCount: 0,
             name: profile?.name || `Relay ${relayKey.substring(0, 8)}`,
             description: profile?.description || '',
-            connectionUrl: `${buildGatewayWebsocketBase(globalConfig || { proxy_server_address: 'localhost', proxy_websocket_protocol: 'wss' })}/${identifierPath}`,
+            connectionUrl,
             createdAt: profile?.created_at || profile?.joined_at || null,
             isActive: true,
             writable: false,
