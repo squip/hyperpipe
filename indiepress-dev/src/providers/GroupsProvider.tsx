@@ -64,6 +64,7 @@ const GROUP_MEMBER_PREVIEW_TTL_MS = 2 * 60 * 1000
 const TOKENIZED_RELAY_REFRESH_MIN_INTERVAL_MS = 5000
 const LEAVE_PUBLISH_RETRY_BASE_DELAY_MS = 5000
 const LEAVE_PUBLISH_RETRY_MAX_DELAY_MS = 60 * 60 * 1000
+const JOIN_FLOW_SUCCESS_FRESH_MS = 15 * 60 * 1000
 
 type GroupMemberPreviewEntry = {
   members: string[]
@@ -424,6 +425,17 @@ const normalizePubkeyList = (values?: string[] | null) =>
         .filter(Boolean)
     )
   )
+
+const isLoopbackRelayUrl = (relayUrl?: string | null): boolean => {
+  if (!relayUrl) return false
+  try {
+    const parsed = new URL(relayUrl)
+    const host = String(parsed.hostname || '').toLowerCase()
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1'
+  } catch (_err) {
+    return /^wss?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(relayUrl)
+  }
+}
 
 const areSameMemberLists = (left: string[], right: string[]) =>
   left.length === right.length && left.every((value, idx) => value === right[idx])
@@ -1530,9 +1542,16 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const relayEntry = getRelayEntryForGroup(groupId)
       const isInMyGroups = myGroupList.some((entry) => entry.groupId === groupId)
       const relayHasAuthToken = hasRelayAuthToken(resolved)
+      const hasActiveRelayConnection = !!(
+        relayEntry &&
+        relayEntry.isActive !== false &&
+        relayEntry.connectionUrl
+      )
+      const relayLooksLoopback = isLoopbackRelayUrl(resolved)
       const preferRelay =
         !opts?.discoveryOnly &&
         !!resolved &&
+        (!relayLooksLoopback || hasActiveRelayConnection) &&
         (isInMyGroups || (!!opts?.preferRelay && relayHasAuthToken))
       const groupRelays = preferRelay && resolved ? [resolved] : defaultDiscoveryRelays
 
@@ -1678,9 +1697,16 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const relayEntry = getRelayEntryForGroup(groupId)
       const isInMyGroups = myGroupList.some((entry) => entry.groupId === groupId)
       const relayHasAuthToken = hasRelayAuthToken(resolved)
+      const hasActiveRelayConnection = !!(
+        relayEntry &&
+        relayEntry.isActive !== false &&
+        relayEntry.connectionUrl
+      )
+      const relayLooksLoopback = isLoopbackRelayUrl(resolved)
       const preferRelay =
         !opts?.discoveryOnly &&
         !!resolved &&
+        (!relayLooksLoopback || hasActiveRelayConnection) &&
         (isInMyGroups || (!!opts?.preferRelay && relayHasAuthToken))
       const provisionalMetadata = getProvisionalGroupMetadata(
         groupId,
@@ -3091,14 +3117,36 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       if (!identifier) return
       if (processedJoinFlowsRef.has(identifier)) return
 
-      const relayUrl = flow.relayUrl
+      const flowUpdatedAt =
+        typeof flow.updatedAt === 'number'
+          ? flow.updatedAt
+          : typeof flow.startedAt === 'number'
+            ? flow.startedAt
+            : 0
+      const relayEntry = getRelayEntryForGroup(identifier)
+      const hasActiveRelayConnection = !!(
+        relayEntry &&
+        relayEntry.isActive !== false &&
+        relayEntry.connectionUrl
+      )
+      const isFreshFlow =
+        flowUpdatedAt > 0 ? Date.now() - flowUpdatedAt <= JOIN_FLOW_SUCCESS_FRESH_MS : false
+      if (!hasActiveRelayConnection && !isFreshFlow) {
+        processedJoinFlowsRef.add(identifier)
+        return
+      }
+
+      const relayUrl = relayEntry?.connectionUrl || flow.relayUrl
       if (typeof relayUrl !== 'string' || !relayUrl) return
-      const baseUrl = getBaseRelayUrl(relayUrl)
+      const resolvedRelayUrl = resolveRelayUrl(relayUrl) || relayUrl
+      const baseUrl = getBaseRelayUrl(resolvedRelayUrl)
       if (!baseUrl) return
 
       announceOpenJoinMembership(flow, baseUrl)
 
-      const already = myGroupList.some((e) => e.groupId === identifier && e.relay === baseUrl)
+      const existing = myGroupList.find((e) => e.groupId === identifier) || null
+      const existingBaseRelay = existing?.relay ? getBaseRelayUrl(existing.relay) : null
+      const already = existingBaseRelay === baseUrl
       if (already) {
         processedJoinFlowsRef.add(identifier)
         hydrateProvisionalFromRelay(identifier, baseUrl)
@@ -3112,7 +3160,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       processedJoinFlowsRef.add(identifier)
       hydrateProvisionalFromRelay(identifier, baseUrl)
-      const updated = [...myGroupList, { groupId: identifier, relay: baseUrl }]
+      const updated = [
+        ...myGroupList.filter((entry) => entry.groupId !== identifier),
+        { groupId: identifier, relay: baseUrl }
+      ]
       saveMyGroupList(updated, { specifiedRelayUrls: BIG_RELAY_URLS }).catch(() => {})
       invalidateGroupMemberPreview(identifier, baseUrl, { reason: 'join-flow-success-added' })
       refreshGroupMemberPreview(identifier, baseUrl, {
@@ -3132,7 +3183,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     publish,
     republishMemberSnapshot39002,
     refreshGroupMemberPreview,
+    resolveRelayUrl,
     saveMyGroupList,
+    getRelayEntryForGroup,
     upsertProvisionalGroupMetadata
   ])
 
