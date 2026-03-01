@@ -156,6 +156,28 @@ export function parseGroupInviteWithPayload(args: {
     typeof payload.about === 'string'
       ? payload.about
       : parsed.about
+  const discoveryTopic =
+    typeof payload.discoveryTopic === 'string'
+      ? payload.discoveryTopic
+      : null
+  const hostPeerKeys = Array.isArray(payload.hostPeerKeys)
+    ? payload.hostPeerKeys
+      .map((entry) => String(entry || '').trim().toLowerCase())
+      .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+    : []
+  const leaseReplicaPeerKeys = Array.isArray(payload.leaseReplicaPeerKeys)
+    ? payload.leaseReplicaPeerKeys
+      .map((entry) => String(entry || '').trim().toLowerCase())
+      .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+    : []
+  const writerIssuerPubkey =
+    typeof payload.writerIssuerPubkey === 'string'
+      ? payload.writerIssuerPubkey.trim().toLowerCase()
+      : null
+  const writerLeaseEnvelope =
+    payload.writerLeaseEnvelope && typeof payload.writerLeaseEnvelope === 'object'
+      ? payload.writerLeaseEnvelope as Record<string, unknown>
+      : null
 
   const authorizedMemberPubkeysRaw = Array.isArray(payload.authorizedMemberPubkeys)
     ? payload.authorizedMemberPubkeys
@@ -257,6 +279,11 @@ export function parseGroupInviteWithPayload(args: {
     about,
     fileSharing,
     isPublic,
+    discoveryTopic,
+    hostPeerKeys: hostPeerKeys.length ? hostPeerKeys : undefined,
+    leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : undefined,
+    writerIssuerPubkey,
+    writerLeaseEnvelope,
     authorizedMemberPubkeys: authorizedMemberPubkeys.length ? authorizedMemberPubkeys : undefined,
     blindPeer,
     cores,

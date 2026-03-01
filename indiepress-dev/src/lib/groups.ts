@@ -33,6 +33,14 @@ export function parseGroupMetadataEvent(event: Event, relay?: string): TGroupMet
   const isPublic = event.tags.some((t) => t[0] === 'public')
   const isOpen = event.tags.some((t) => t[0] === 'open')
   const tags = event.tags.filter((t) => t[0] === 't' && t[1]).map((t) => t[1])
+  const discoveryTopic = event.tags.find((t) => t[0] === 'hypertuna-topic')?.[1] ?? null
+  const hostPeerKeys = event.tags
+    .filter((t) => t[0] === 'hypertuna-host-peer' && t[1])
+    .map((t) => t[1])
+  const leaseReplicaPeerKeys = event.tags
+    .filter((t) => t[0] === 'hypertuna-lease-replica-peer' && t[1])
+    .map((t) => t[1])
+  const writerIssuerPubkey = event.tags.find((t) => t[0] === 'hypertuna-writer-issuer')?.[1] ?? null
 
   return {
     id: d,
@@ -42,6 +50,10 @@ export function parseGroupMetadataEvent(event: Event, relay?: string): TGroupMet
     picture,
     isPublic,
     isOpen,
+    discoveryTopic,
+    hostPeerKeys,
+    leaseReplicaPeerKeys,
+    writerIssuerPubkey,
     tags,
     event
   }

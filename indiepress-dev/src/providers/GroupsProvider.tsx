@@ -437,6 +437,11 @@ const buildInvitePayload = (args: {
   token: string
   relayUrl: string | null
   relayKey?: string | null
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  leaseReplicaPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
+  writerLeaseEnvelope?: Record<string, unknown> | null
   meta?: TGroupMetadata | null
   groupName?: string
   groupPicture?: string
@@ -467,6 +472,11 @@ const buildInvitePayload = (args: {
   fileSharing: args.meta?.isOpen !== false,
   blindPeer: args.mirrorMetadata?.blindPeer,
   cores: args.mirrorMetadata?.cores,
+  discoveryTopic: args.discoveryTopic || null,
+  hostPeerKeys: normalizePubkeyList(args.hostPeerKeys || []),
+  leaseReplicaPeerKeys: normalizePubkeyList(args.leaseReplicaPeerKeys || []),
+  writerIssuerPubkey: args.writerIssuerPubkey || null,
+  writerLeaseEnvelope: args.writerLeaseEnvelope || null,
   fastForward: args.fastForward ?? null,
   writerCore: args.writerInfo?.writerCore || null,
   writerCoreHex: args.writerInfo?.writerCoreHex || args.writerInfo?.autobaseLocal || null,
@@ -477,12 +487,20 @@ const buildInvitePayload = (args: {
 const buildOpenInvitePayload = (args: {
   relayUrl: string | null
   relayKey?: string | null
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  leaseReplicaPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
   groupName?: string
   groupPicture?: string
   authorizedMemberPubkeys?: string[]
 }) => ({
   relayUrl: args.relayUrl,
   relayKey: args.relayKey ?? null,
+  discoveryTopic: args.discoveryTopic || null,
+  hostPeerKeys: normalizePubkeyList(args.hostPeerKeys || []),
+  leaseReplicaPeerKeys: normalizePubkeyList(args.leaseReplicaPeerKeys || []),
+  writerIssuerPubkey: args.writerIssuerPubkey || null,
   groupName: args.groupName || null,
   groupPicture: args.groupPicture || null,
   authorizedMemberPubkeys: normalizePubkeyList(args.authorizedMemberPubkeys)
@@ -1138,6 +1156,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let isPublic: boolean | undefined = invite.isPublic
             let blindPeer: TGroupInvite['blindPeer'] | null | undefined
             let cores: TGroupInvite['cores'] | undefined
+            let discoveryTopic: string | null | undefined
+            let hostPeerKeys: string[] | undefined
+            let leaseReplicaPeerKeys: string[] | undefined
+            let writerIssuerPubkey: string | null | undefined
+            let writerLeaseEnvelope: Record<string, unknown> | null | undefined
             let writerCore: string | null | undefined
             let writerCoreHex: string | null | undefined
             let autobaseLocal: string | null | undefined
@@ -1182,6 +1205,21 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 }
                 if (typeof payload.isPublic === 'boolean') {
                   isPublic = payload.isPublic
+                }
+                if (typeof payload.discoveryTopic === 'string') {
+                  discoveryTopic = payload.discoveryTopic
+                }
+                if (Array.isArray(payload.hostPeerKeys)) {
+                  hostPeerKeys = normalizePubkeyList(payload.hostPeerKeys)
+                }
+                if (Array.isArray(payload.leaseReplicaPeerKeys)) {
+                  leaseReplicaPeerKeys = normalizePubkeyList(payload.leaseReplicaPeerKeys)
+                }
+                if (typeof payload.writerIssuerPubkey === 'string') {
+                  writerIssuerPubkey = payload.writerIssuerPubkey
+                }
+                if (payload.writerLeaseEnvelope && typeof payload.writerLeaseEnvelope === 'object') {
+                  writerLeaseEnvelope = payload.writerLeaseEnvelope as Record<string, unknown>
                 }
                 if (typeof payload.writerCore === 'string') {
                   writerCore = payload.writerCore
@@ -1265,6 +1303,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               isPublic,
               blindPeer,
               cores,
+              discoveryTopic,
+              hostPeerKeys,
+              leaseReplicaPeerKeys,
+              writerIssuerPubkey,
+              writerLeaseEnvelope,
               writerCore,
               writerCoreHex,
               autobaseLocal,
@@ -3335,6 +3378,16 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       }
 
       const relayWsUrl = getBaseRelayUrl(authenticatedRelayUrl)
+      const discoveryTopic =
+        typeof result.discoveryTopic === 'string' && result.discoveryTopic.trim()
+          ? result.discoveryTopic.trim()
+          : null
+      const hostPeerKeys = normalizePubkeyList(result.hostPeerKeys || [])
+      const leaseReplicaPeerKeys = normalizePubkeyList(result.leaseReplicaPeerKeys || [])
+      const writerIssuerPubkey =
+        typeof result.writerIssuerPubkey === 'string' && result.writerIssuerPubkey.trim()
+          ? result.writerIssuerPubkey.trim()
+          : null
       upsertProvisionalGroupMetadata({
         groupId: publicIdentifier,
         relay: relayWsUrl,
@@ -3355,7 +3408,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           isOpen,
           fileSharing,
           relayWsUrl,
-          pictureTagUrl: picture
+          pictureTagUrl: picture,
+          discoveryTopic,
+          hostPeerKeys,
+          leaseReplicaPeerKeys,
+          writerIssuerPubkey
         })
       const { adminListEvent, memberListEvent } = buildHypertunaAdminBootstrapDraftEvents({
         publicIdentifier,
@@ -3528,6 +3585,20 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       const inviteRelayUrl = getBaseRelayUrl(resolved || relay || '') || resolved || relay || null
       const inviteRelayKey = relayEntry?.relayKey || extractRelayKeyFromUrl(inviteRelayUrl) || null
+      const discoveryTopic =
+        typeof meta?.discoveryTopic === 'string' && meta.discoveryTopic.trim()
+          ? meta.discoveryTopic.trim()
+          : null
+      const hostPeerKeys = Array.isArray(meta?.hostPeerKeys)
+        ? meta.hostPeerKeys.map((entry) => String(entry || '').trim()).filter(Boolean)
+        : []
+      const metadataLeaseReplicaPeerKeys = Array.isArray(meta?.leaseReplicaPeerKeys)
+        ? meta.leaseReplicaPeerKeys.map((entry) => String(entry || '').trim()).filter(Boolean)
+        : []
+      const metadataWriterIssuerPubkey =
+        typeof meta?.writerIssuerPubkey === 'string' && meta.writerIssuerPubkey.trim()
+          ? meta.writerIssuerPubkey.trim()
+          : null
       if (!isOpenGroup && !inviteRelayKey) {
         console.warn('[GroupsProvider] Missing relayKey for closed invite payload', {
           groupId,
@@ -3535,7 +3606,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         })
       }
 
-      const provisionWriterInfo = async (invitee: string) => {
+      const provisionWriterInfo = async (invitee: string, token: string | null) => {
         if (isOpenGroup) return null
         if (!sendToWorker || !relayEntry?.relayKey) return null
         try {
@@ -3545,6 +3616,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               relayKey: relayEntry.relayKey,
               publicIdentifier: groupId,
               inviteePubkey: invitee,
+              token: token || undefined,
+              leaseReplicaPeerKeys: metadataLeaseReplicaPeerKeys,
               useWriterPool: true
             }
           })
@@ -3557,7 +3630,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               poolCoreRefs: Array.isArray((res as any).poolCoreRefs)
                 ? (res as any).poolCoreRefs
                 : undefined,
-              fastForward: (res as any).fastForward || null
+              fastForward: (res as any).fastForward || null,
+              writerLeaseEnvelope:
+                (res as any).writerLeaseEnvelope && typeof (res as any).writerLeaseEnvelope === 'object'
+                  ? (res as any).writerLeaseEnvelope
+                  : null,
+              leaseReplicaPeerKeys: Array.isArray((res as any).leaseReplicaPeerKeys)
+                ? (res as any).leaseReplicaPeerKeys
+                : [],
+              writerIssuerPubkey: typeof (res as any).writerIssuerPubkey === 'string'
+                ? (res as any).writerIssuerPubkey
+                : null
             }
             console.info('[GroupsProvider] Writer provisioning result (invite)', {
               groupId,
@@ -3567,6 +3650,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               hasWriterCoreHex: !!writerInfo?.writerCoreHex,
               hasAutobaseLocal: !!writerInfo?.autobaseLocal,
               hasWriterSecret: !!writerInfo?.writerSecret,
+              hasWriterLeaseEnvelope: !!writerInfo?.writerLeaseEnvelope,
               hasPoolCoreRefs:
                 Array.isArray(writerInfo?.poolCoreRefs) && writerInfo.poolCoreRefs.length > 0,
               hasFastForward: !!writerInfo?.fastForward
@@ -3593,6 +3677,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           autobaseLocal?: string
           writerSecret?: string
           poolCoreRefs?: string[]
+          writerLeaseEnvelope?: Record<string, unknown> | null
+          leaseReplicaPeerKeys?: string[]
+          writerIssuerPubkey?: string | null
         } | null
       ) => {
         if (isOpenGroup) return null
@@ -3618,13 +3705,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       await Promise.all(
         invitees.map(async (invitee) => {
-          const writerInfo = await provisionWriterInfo(invitee)
-          const inviteMirrorMetadata = buildInviteMirrorMetadata(writerInfo)
           const token = isOpenGroup ? null : randomString(24)
+          const writerInfo = await provisionWriterInfo(invitee, token)
+          const inviteMirrorMetadata = buildInviteMirrorMetadata(writerInfo)
           const payload = isOpenGroup
             ? buildOpenInvitePayload({
                 relayUrl: inviteRelayUrl,
                 relayKey: inviteRelayKey,
+                discoveryTopic,
+                hostPeerKeys,
+                leaseReplicaPeerKeys: metadataLeaseReplicaPeerKeys,
+                writerIssuerPubkey: metadataWriterIssuerPubkey,
                 groupName: inviteName,
                 groupPicture: invitePicture,
                 authorizedMemberPubkeys: baseAuthorizedMemberPubkeys
@@ -3640,6 +3731,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                   ...baseAuthorizedMemberPubkeys,
                   invitee
                 ]),
+                discoveryTopic,
+                hostPeerKeys,
+                leaseReplicaPeerKeys: Array.isArray(writerInfo?.leaseReplicaPeerKeys)
+                  ? writerInfo.leaseReplicaPeerKeys
+                  : metadataLeaseReplicaPeerKeys,
+                writerIssuerPubkey: writerInfo?.writerIssuerPubkey || metadataWriterIssuerPubkey,
+                writerLeaseEnvelope: writerInfo?.writerLeaseEnvelope || null,
                 mirrorMetadata: inviteMirrorMetadata,
                 writerInfo,
                 fastForward: writerInfo?.fastForward || null
@@ -3918,9 +4016,33 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       if (typeof data.isOpen === 'boolean') metadataTags.push([data.isOpen ? 'open' : 'closed'])
 
       const isHypertuna = groupId.includes(':')
+      const nextIsPublic =
+        typeof data.isPublic === 'boolean' ? data.isPublic : cachedMetadata?.isPublic !== false
+      const nextIsOpen =
+        typeof data.isOpen === 'boolean' ? data.isOpen : cachedMetadata?.isOpen === true
       if (isHypertuna) {
         metadataTags.push(['hypertuna', groupId])
         metadataTags.push(['i', HYPERTUNA_IDENTIFIER_TAG])
+        const previousTags = Array.isArray(cachedMetadata?.event?.tags)
+          ? (cachedMetadata?.event?.tags as string[][])
+          : []
+        if (nextIsPublic && nextIsOpen) {
+          const discoveryTagNames = new Set([
+            'hypertuna-topic',
+            'hypertuna-host-peer',
+            'hypertuna-writer-issuer',
+            'hypertuna-lease-replica-peer'
+          ])
+          const existingTagKeys = new Set(metadataTags.map((tag) => `${tag[0]}:${tag[1] || ''}`))
+          for (const tag of previousTags) {
+            if (!Array.isArray(tag) || !tag[0] || !tag[1]) continue
+            if (!discoveryTagNames.has(tag[0])) continue
+            const key = `${tag[0]}:${tag[1]}`
+            if (existingTagKeys.has(key)) continue
+            metadataTags.push([tag[0], tag[1]])
+            existingTagKeys.add(key)
+          }
+        }
       }
 
       if (metadataTags.length > 2) {
@@ -3931,8 +4053,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           content: ''
         }
         console.info('[GroupsProvider] updateMetadata 39000', metadataEvent)
-        const isPublicGroup =
-          typeof data.isPublic === 'boolean' ? data.isPublic : cachedMetadata?.isPublic !== false
+        const isPublicGroup = nextIsPublic
         const relayUrls = buildMembershipPublishTargets(resolved, isPublicGroup)
         if (!relayUrls.length) {
           throw new Error('No relay targets available to publish metadata snapshot')

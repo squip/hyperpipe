@@ -138,6 +138,12 @@ export class RelayService implements IRelayService {
     token?: string
     relayKey?: string
     relayUrl?: string
+    gatewayMode?: 'auto' | 'disabled'
+    discoveryTopic?: string | null
+    hostPeerKeys?: string[]
+    leaseReplicaPeerKeys?: string[]
+    writerIssuerPubkey?: string | null
+    writerLeaseEnvelope?: Record<string, unknown> | null
     openJoin?: boolean
     hostPeers?: string[]
     blindPeer?: {

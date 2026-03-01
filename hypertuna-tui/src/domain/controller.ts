@@ -3170,6 +3170,12 @@ export class TuiController {
     token?: string
     relayKey?: string
     relayUrl?: string
+    gatewayMode?: 'auto' | 'disabled'
+    discoveryTopic?: string | null
+    hostPeerKeys?: string[]
+    leaseReplicaPeerKeys?: string[]
+    writerIssuerPubkey?: string | null
+    writerLeaseEnvelope?: Record<string, unknown> | null
     openJoin?: boolean
     hostPeers?: string[]
     blindPeer?: {
@@ -3195,13 +3201,16 @@ export class TuiController {
   }): Promise<void> {
     await this.runTask('Start join flow', async () => {
       await this.ensureWorkerReadyForOperation('start join flow')
+      const gatewayMode: 'auto' | 'disabled' = input.gatewayMode === 'disabled' ? 'disabled' : 'auto'
 
-      await this.ensureGatewayParityReady({
-        reason: 'start-join-flow',
-        refreshPublicGateway: true
-      }).catch((error) => {
-        this.log('warn', `Gateway parity preflight failed before join flow: ${error instanceof Error ? error.message : String(error)}`)
-      })
+      if (gatewayMode === 'auto') {
+        await this.ensureGatewayParityReady({
+          reason: 'start-join-flow',
+          refreshPublicGateway: true
+        }).catch((error) => {
+          this.log('warn', `Gateway parity preflight failed before join flow: ${error instanceof Error ? error.message : String(error)}`)
+        })
+      }
 
       const normalizedIdentifier = String(input.publicIdentifier || '').trim()
       const relayKey =
@@ -3213,18 +3222,23 @@ export class TuiController {
       const relayUrl = String(input.relayUrl || '').trim() || undefined
       const hostPeers = Array.from(new Set([
         ...(Array.isArray(input.hostPeers) ? input.hostPeers : []).map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean),
-        ...this.resolveGatewayHostPeers({
-          publicIdentifier: normalizedIdentifier,
-          relayKey: relayKey || null,
-          relayUrl: relayUrl || null
-        })
+        ...(Array.isArray(input.hostPeerKeys) ? input.hostPeerKeys : []).map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean),
+        ...(gatewayMode === 'auto'
+          ? this.resolveGatewayHostPeers({
+              publicIdentifier: normalizedIdentifier,
+              relayKey: relayKey || null,
+              relayUrl: relayUrl || null
+            })
+          : [])
       ]))
 
       await this.relayService.startJoinFlow({
         ...input,
+        gatewayMode,
         relayKey,
         relayUrl,
-        hostPeers: hostPeers.length ? hostPeers : undefined
+        hostPeers: hostPeers.length ? hostPeers : undefined,
+        hostPeerKeys: hostPeers.length ? hostPeers : undefined
       })
       this.localProfileCache = null
     })
@@ -3715,6 +3729,12 @@ export class TuiController {
         token: target.token,
         relayKey: target.relayKey || undefined,
         relayUrl: target.relayUrl || target.relay,
+        gatewayMode: 'auto',
+        discoveryTopic: target.discoveryTopic || undefined,
+        hostPeerKeys: target.hostPeerKeys || undefined,
+        leaseReplicaPeerKeys: target.leaseReplicaPeerKeys || undefined,
+        writerIssuerPubkey: target.writerIssuerPubkey || undefined,
+        writerLeaseEnvelope: target.writerLeaseEnvelope || undefined,
         fileSharing: target.fileSharing,
         openJoin: !target.token && target.fileSharing !== false,
         blindPeer: target.blindPeer || undefined,
@@ -3925,6 +3945,22 @@ export class TuiController {
       }
 
       const payloadInput = input.payload as Record<string, unknown>
+      const discoveryTopic = typeof payloadInput.discoveryTopic === 'string'
+        ? payloadInput.discoveryTopic
+        : null
+      const hostPeerKeys = Array.isArray(payloadInput.hostPeerKeys)
+        ? payloadInput.hostPeerKeys
+          .map((entry) => String(entry || '').trim().toLowerCase())
+          .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+        : []
+      const payloadLeaseReplicaPeerKeys = Array.isArray(payloadInput.leaseReplicaPeerKeys)
+        ? payloadInput.leaseReplicaPeerKeys
+          .map((entry) => String(entry || '').trim().toLowerCase())
+          .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+        : []
+      const payloadWriterIssuerPubkey = typeof payloadInput.writerIssuerPubkey === 'string'
+        ? payloadInput.writerIssuerPubkey.trim().toLowerCase()
+        : null
       const isOpenGroup = input.token
         ? false
         : (typeof payloadInput.fileSharing === 'boolean' ? payloadInput.fileSharing : true)
@@ -3968,6 +4004,8 @@ export class TuiController {
                 relayKey: resolvedRelayKey,
                 publicIdentifier: normalizedGroupId,
                 inviteePubkey: normalizedInvitee,
+                token: inviteToken || undefined,
+                leaseReplicaPeerKeys: payloadLeaseReplicaPeerKeys,
                 useWriterPool: true
               }
             },
@@ -3985,6 +4023,18 @@ export class TuiController {
       if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
       if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
       const writerSecret = typeof writerProvision?.writerSecret === 'string' ? writerProvision.writerSecret : null
+      const writerLeaseEnvelope =
+        writerProvision?.writerLeaseEnvelope && typeof writerProvision.writerLeaseEnvelope === 'object'
+          ? writerProvision.writerLeaseEnvelope as Record<string, unknown>
+          : null
+      const writerIssuerPubkey = typeof writerProvision?.writerIssuerPubkey === 'string'
+        ? writerProvision.writerIssuerPubkey
+        : payloadWriterIssuerPubkey
+      const leaseReplicaPeerKeys = Array.isArray(writerProvision?.leaseReplicaPeerKeys)
+        ? writerProvision.leaseReplicaPeerKeys
+            .map((entry) => String(entry || '').trim().toLowerCase())
+            .filter((entry) => /^[a-f0-9]{64}$/i.test(entry))
+        : payloadLeaseReplicaPeerKeys
       const fastForward = writerProvision?.fastForward && typeof writerProvision.fastForward === 'object'
         ? writerProvision.fastForward
         : null
@@ -4023,6 +4073,11 @@ export class TuiController {
         ...payloadInput,
         relayUrl: resolvedRelayUrl,
         relayKey: resolvedRelayKey || payloadInput.relayKey || null,
+        discoveryTopic: discoveryTopic || null,
+        hostPeerKeys: hostPeerKeys.length ? hostPeerKeys : undefined,
+        leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : undefined,
+        writerIssuerPubkey: writerIssuerPubkey || null,
+        writerLeaseEnvelope: writerLeaseEnvelope || null,
         token: inviteToken || null,
         writerCore: writerCore || payloadInput.writerCore || null,
         writerCoreHex: writerCoreHex || payloadInput.writerCoreHex || payloadInput.writer_core_hex || null,

@@ -14,6 +14,10 @@ export type TGroupMetadata = {
   picture?: string
   isPublic?: boolean
   isOpen?: boolean
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  leaseReplicaPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
   tags: string[]
   event: Event
 }
@@ -64,6 +68,11 @@ export type TGroupInvite = {
     maxBytes?: number | null
   } | null
   cores?: { key: string; role?: string | null }[]
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  leaseReplicaPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
+  writerLeaseEnvelope?: Record<string, unknown> | null
   token?: string
   event: Event
 }

@@ -1054,6 +1054,36 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       const relayUrlForJoin = resolvedGroupRelay || effectiveGroupRelay || null
       const inviteRelayKey = inviteData?.relayKey || null
       const relayKey = relayKeyForGroup || inviteRelayKey || null
+      const metadataHostPeers = Array.isArray(detail?.metadata?.hostPeerKeys)
+        ? detail?.metadata?.hostPeerKeys
+        : []
+      const inviteHostPeers = Array.isArray(inviteData?.hostPeerKeys)
+        ? inviteData?.hostPeerKeys
+        : []
+      const mergedHostPeerKeys = Array.from(
+        new Set([...metadataHostPeers, ...inviteHostPeers].map((entry) => String(entry || '').trim()).filter(Boolean))
+      )
+      const metadataLeaseReplicaPeers = Array.isArray(detail?.metadata?.leaseReplicaPeerKeys)
+        ? detail?.metadata?.leaseReplicaPeerKeys
+        : []
+      const inviteLeaseReplicaPeers = Array.isArray(inviteData?.leaseReplicaPeerKeys)
+        ? inviteData?.leaseReplicaPeerKeys
+        : []
+      const mergedLeaseReplicaPeerKeys = Array.from(
+        new Set(
+          [...metadataLeaseReplicaPeers, ...inviteLeaseReplicaPeers]
+            .map((entry) => String(entry || '').trim())
+            .filter(Boolean)
+        )
+      )
+      const writerIssuerPubkey =
+        inviteData?.writerIssuerPubkey ||
+        detail?.metadata?.writerIssuerPubkey ||
+        undefined
+      const discoveryTopic =
+        inviteData?.discoveryTopic ||
+        detail?.metadata?.discoveryTopic ||
+        undefined
       const shouldUseWorkerJoin =
         isElectron() &&
         (isHypertunaGroup || hasInviteJoinData || !!relayKeyForGroup || !!groupId?.includes(':'))
@@ -1089,6 +1119,12 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           token: inviteToken,
           relayKey,
           relayUrl: relayUrlForJoin,
+          gatewayMode: 'auto',
+          discoveryTopic,
+          hostPeerKeys: mergedHostPeerKeys.length ? mergedHostPeerKeys : undefined,
+          leaseReplicaPeerKeys: mergedLeaseReplicaPeerKeys.length ? mergedLeaseReplicaPeerKeys : undefined,
+          writerIssuerPubkey,
+          writerLeaseEnvelope: inviteData?.writerLeaseEnvelope || undefined,
           blindPeer: inviteData?.blindPeer,
           cores: inviteData?.cores,
           writerCore: inviteData?.writerCore,

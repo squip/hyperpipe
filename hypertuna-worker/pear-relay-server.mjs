@@ -4,6 +4,7 @@ import { RelayProtocol } from './relay-protocol-enhanced.mjs';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import process from 'node:process';
+import nodeCrypto from 'node:crypto';
 import crypto from 'hypercore-crypto';
 import Hypercore from 'hypercore';
 import hypercoreCaps from 'hypercore/lib/caps.js';
@@ -27,6 +28,15 @@ import {
   resolveRelayMirrorCoreRefs,
   updateRelayMirrorCoreRefs
 } from './relay-core-refs-store.mjs';
+import {
+  findMatchingRelayLeaseEnvelope,
+  recordRelayLeaseReplicaPeer,
+  upsertRelayLeaseEnvelope
+} from './relay-lease-replica-store.mjs';
+import {
+  recordRelayCapabilityProbe,
+  upsertRelayDiscoveryHints
+} from './relay-discovery-store.mjs';
 import {
   createRelay as createRelayManager,
   joinRelay as joinRelayManager,
@@ -91,6 +101,12 @@ function normalizeRelayKeyHex(value) {
   const trimmed = value.trim();
   if (!trimmed || !isHex64(trimmed)) return null;
   return trimmed.toLowerCase();
+}
+
+export function deriveRelayDiscoveryTopic(identifier) {
+  const normalized = normalizeRelayIdentifier(identifier || '');
+  if (!normalized) return null;
+  return sha256Hex(`hypertuna:relay-topic:v1:${normalized}`);
 }
 
 function parseNostrMessagePayload(message) {
@@ -487,8 +503,12 @@ const BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS = 90000;
 // only added latency. The logic has been removed; keep only cheap snapshot logs.
 const DIRECT_JOIN_WRITABLE_TIMEOUT_MS = 15000;
 const LATE_WRITER_RECOVERY_TIMEOUT_MS = 180000;
+const WRITER_LEASE_SYNC_RATE_LIMIT_MAX = 24;
+const WRITER_LEASE_SYNC_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const WRITER_LEASE_ENVELOPE_VERSION = 1;
 let pendingPeerProtocols = new Map(); // Awaiters for outbound connections
 const peerJoinHandles = new Map(); // Persistent joinPeer handles
+const writerLeaseSyncRateLimits = new Map();
 let healthMonitorTimer = null;
 
 // Enhanced health state tracking
@@ -981,6 +1001,237 @@ function parseJsonBody(body) {
   }
 }
 
+function sha256Hex(payload) {
+  return nodeCrypto.createHash('sha256').update(payload).digest('hex');
+}
+
+function normalizeHex64(value) {
+  if (!isHex64(value)) return null;
+  return String(value).trim().toLowerCase();
+}
+
+function normalizeCoreRefsForEnvelope(coreRefs) {
+  if (!Array.isArray(coreRefs)) return undefined;
+  const normalized = [];
+  const seen = new Set();
+  for (const entry of coreRefs) {
+    if (!entry || typeof entry !== 'object') continue;
+    const key = String(entry.key || '').trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    normalized.push({
+      key,
+      role: typeof entry.role === 'string' ? entry.role : null
+    });
+  }
+  if (!normalized.length) return undefined;
+  normalized.sort((left, right) => {
+    if (left.key !== right.key) return left.key.localeCompare(right.key);
+    return String(left.role || '').localeCompare(String(right.role || ''));
+  });
+  return normalized;
+}
+
+function normalizeFastForwardForEnvelope(fastForward) {
+  if (!fastForward || typeof fastForward !== 'object') return null;
+  const normalized = {
+    key: typeof fastForward.key === 'string' ? fastForward.key : undefined,
+    length: Number.isFinite(fastForward.length) ? Number(fastForward.length) : undefined,
+    signedLength: Number.isFinite(fastForward.signedLength) ? Number(fastForward.signedLength) : undefined,
+    timeoutMs: Number.isFinite(fastForward.timeoutMs) ? Number(fastForward.timeoutMs) : undefined
+  };
+  if (
+    typeof normalized.key !== 'string'
+    && !Number.isFinite(normalized.length)
+    && !Number.isFinite(normalized.signedLength)
+    && !Number.isFinite(normalized.timeoutMs)
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+function canonicalizeWriterLeaseEnvelopePayload(input) {
+  if (!input || typeof input !== 'object') return null;
+  const version = Number(input.version);
+  if (!Number.isFinite(version) || version !== WRITER_LEASE_ENVELOPE_VERSION) return null;
+
+  const leaseId = typeof input.leaseId === 'string' ? input.leaseId.trim() : '';
+  const relayKey = normalizeHex64(input.relayKey);
+  const publicIdentifier = typeof input.publicIdentifier === 'string' ? input.publicIdentifier.trim() : '';
+  const inviteePubkey = normalizeHex64(input.inviteePubkey);
+  const tokenHash = typeof input.tokenHash === 'string' ? input.tokenHash.trim().toLowerCase() : '';
+  const writerCore = typeof input.writerCore === 'string' ? input.writerCore.trim() : '';
+  const writerCoreHex = typeof input.writerCoreHex === 'string' ? input.writerCoreHex.trim() : undefined;
+  const autobaseLocal = typeof input.autobaseLocal === 'string' ? input.autobaseLocal.trim() : undefined;
+  const writerSecret = typeof input.writerSecret === 'string' ? input.writerSecret.trim() : '';
+  const issuedAt = Number(input.issuedAt);
+  const expiresAt = Number(input.expiresAt);
+  const issuerPubkey = normalizeHex64(input.issuerPubkey);
+  const issuerSwarmPeerKey = normalizeHex64(input.issuerSwarmPeerKey);
+  const coreRefs = normalizeCoreRefsForEnvelope(input.coreRefs);
+  const fastForward = normalizeFastForwardForEnvelope(input.fastForward);
+
+  if (!leaseId || !relayKey || !publicIdentifier || !inviteePubkey) return null;
+  if (!tokenHash || !writerCore || !writerSecret) return null;
+  if (!Number.isFinite(issuedAt) || !Number.isFinite(expiresAt) || expiresAt <= issuedAt) return null;
+  if (!issuerPubkey || !issuerSwarmPeerKey) return null;
+
+  return {
+    version: WRITER_LEASE_ENVELOPE_VERSION,
+    leaseId,
+    relayKey,
+    publicIdentifier,
+    inviteePubkey,
+    tokenHash,
+    writerCore,
+    writerCoreHex: writerCoreHex || undefined,
+    autobaseLocal: autobaseLocal || undefined,
+    writerSecret,
+    coreRefs,
+    fastForward,
+    issuedAt,
+    expiresAt,
+    issuerPubkey,
+    issuerSwarmPeerKey
+  };
+}
+
+function serializeWriterLeaseEnvelopePayload(payload) {
+  return JSON.stringify({
+    version: payload.version,
+    leaseId: payload.leaseId,
+    relayKey: payload.relayKey,
+    publicIdentifier: payload.publicIdentifier,
+    inviteePubkey: payload.inviteePubkey,
+    tokenHash: payload.tokenHash,
+    writerCore: payload.writerCore,
+    writerCoreHex: payload.writerCoreHex || null,
+    autobaseLocal: payload.autobaseLocal || null,
+    writerSecret: payload.writerSecret,
+    coreRefs: Array.isArray(payload.coreRefs) ? payload.coreRefs : [],
+    fastForward: payload.fastForward || null,
+    issuedAt: payload.issuedAt,
+    expiresAt: payload.expiresAt,
+    issuerPubkey: payload.issuerPubkey,
+    issuerSwarmPeerKey: payload.issuerSwarmPeerKey
+  });
+}
+
+async function signWriterLeaseEnvelopePayload(payload, privateKeyHex) {
+  const digestHex = sha256Hex(serializeWriterLeaseEnvelopePayload(payload));
+  const signatureBytes = await nobleSecp256k1.schnorr.sign(digestHex, privateKeyHex);
+  return NostrUtils.bytesToHex(signatureBytes);
+}
+
+export async function verifyWriterLeaseEnvelope(envelope) {
+  const payload = canonicalizeWriterLeaseEnvelopePayload(envelope);
+  if (!payload) return false;
+  const signature = typeof envelope?.signature === 'string' ? envelope.signature.trim() : '';
+  if (!signature) return false;
+  const digestHex = sha256Hex(serializeWriterLeaseEnvelopePayload(payload));
+  try {
+    return await nobleSecp256k1.schnorr.verify(signature, digestHex, payload.issuerPubkey);
+  } catch (_) {
+    return false;
+  }
+}
+
+export async function createSignedWriterLeaseEnvelope(input = {}) {
+  const issuerPrivateKey = typeof input.issuerPrivateKey === 'string' && input.issuerPrivateKey.trim()
+    ? input.issuerPrivateKey.trim()
+    : config?.nostr_nsec_hex || null;
+  if (!issuerPrivateKey) {
+    throw new Error('Missing issuer private key for writer lease envelope');
+  }
+  const issuerPubkey = normalizeHex64(
+    input.issuerPubkey || config?.nostr_pubkey_hex || NostrUtils.getPublicKey(issuerPrivateKey)
+  );
+  const issuerSwarmPeerKey = normalizeHex64(input.issuerSwarmPeerKey || config?.swarmPublicKey || null);
+  if (!issuerPubkey || !issuerSwarmPeerKey) {
+    throw new Error('Missing issuer identity for writer lease envelope');
+  }
+
+  const now = Number.isFinite(input.issuedAt) ? Number(input.issuedAt) : Date.now();
+  const expiresAt = Number.isFinite(input.expiresAt) ? Number(input.expiresAt) : (now + (3 * 24 * 60 * 60 * 1000));
+  const payload = canonicalizeWriterLeaseEnvelopePayload({
+    version: WRITER_LEASE_ENVELOPE_VERSION,
+    leaseId: input.leaseId || nodeCrypto.randomUUID(),
+    relayKey: input.relayKey,
+    publicIdentifier: input.publicIdentifier,
+    inviteePubkey: input.inviteePubkey,
+    tokenHash: input.tokenHash,
+    writerCore: input.writerCore,
+    writerCoreHex: input.writerCoreHex || null,
+    autobaseLocal: input.autobaseLocal || null,
+    writerSecret: input.writerSecret,
+    coreRefs: input.coreRefs || [],
+    fastForward: input.fastForward || null,
+    issuedAt: now,
+    expiresAt,
+    issuerPubkey,
+    issuerSwarmPeerKey
+  });
+  if (!payload) {
+    throw new Error('Invalid writer lease envelope payload');
+  }
+  const signature = await signWriterLeaseEnvelopePayload(payload, issuerPrivateKey);
+  return {
+    ...payload,
+    signature
+  };
+}
+
+function computeLeaseTokenHash(relayKey, token) {
+  const normalizedRelayKey = normalizeHex64(relayKey);
+  const normalizedToken = typeof token === 'string' ? token.trim() : '';
+  if (!normalizedRelayKey || !normalizedToken) return null;
+  return sha256Hex(`${normalizedRelayKey}:${normalizedToken}`);
+}
+
+function consumeWriterLeaseSyncRateLimit(peerKey) {
+  const normalized = normalizeHex64(peerKey);
+  if (!normalized) return true;
+  const now = Date.now();
+  const existing = writerLeaseSyncRateLimits.get(normalized);
+  if (!existing || now - existing.windowStartAt >= WRITER_LEASE_SYNC_RATE_LIMIT_WINDOW_MS) {
+    writerLeaseSyncRateLimits.set(normalized, { windowStartAt: now, count: 1 });
+    return true;
+  }
+  if (existing.count >= WRITER_LEASE_SYNC_RATE_LIMIT_MAX) {
+    return false;
+  }
+  existing.count += 1;
+  writerLeaseSyncRateLimits.set(normalized, existing);
+  return true;
+}
+
+async function resolveRelayRuntimeForIdentifier(identifier) {
+  const normalizedIdentifier = normalizeRelayIdentifier(identifier);
+  const directKey = normalizeHex64(normalizedIdentifier);
+  const relayKey = directKey || await getRelayKeyFromPublicIdentifier(normalizedIdentifier);
+  const relayManager = relayKey ? activeRelays.get(relayKey) : null;
+  const profile =
+    (relayKey ? await getRelayProfileByKey(relayKey) : null)
+    || await getRelayProfileByPublicIdentifier(normalizedIdentifier);
+  const publicIdentifier = profile?.public_identifier || normalizedIdentifier;
+  return {
+    normalizedIdentifier,
+    relayKey: relayKey || profile?.relay_key || null,
+    relayManager: relayManager || null,
+    profile: profile || null,
+    publicIdentifier
+  };
+}
+
+function parseRequestBodyJson(request) {
+  try {
+    return parseJsonBody(request?.body) || {};
+  } catch (_) {
+    return {};
+  }
+}
+
 async function waitForPeerProtocol(publicKey, timeoutMs = 20000) {
   const decodePeerKey = (key) => {
     if (!key) return null;
@@ -1036,6 +1287,265 @@ async function waitForPeerProtocol(publicKey, timeoutMs = 20000) {
     pending.push(pendingEntry);
     pendingPeerProtocols.set(normalized, pending);
   });
+}
+
+function withOperationTimeout(promise, timeoutMs, label = 'operation') {
+  const timeout = Math.max(250, Number.isFinite(timeoutMs) ? Number(timeoutMs) : 1500);
+  return new Promise((resolve, reject) => {
+    const handle = setTimeout(() => {
+      reject(new Error(`${label} timeout after ${timeout}ms`));
+    }, timeout);
+    handle.unref?.();
+    Promise.resolve(promise)
+      .then((value) => {
+        clearTimeout(handle);
+        resolve(value);
+      })
+      .catch((error) => {
+        clearTimeout(handle);
+        reject(error);
+      });
+  });
+}
+
+export async function discoverPeersOnTopic({
+  topicHex,
+  timeoutMs = 1200,
+  maxPeers = 12
+} = {}) {
+  const normalizedTopic = typeof topicHex === 'string' ? topicHex.trim().toLowerCase() : '';
+  if (!swarm || !/^[0-9a-f]{64}$/.test(normalizedTopic)) {
+    return [];
+  }
+  const waitMs = Math.max(200, Number.isFinite(timeoutMs) ? Number(timeoutMs) : 1200);
+  const peerCap = Math.max(1, Number.isFinite(maxPeers) ? Number(maxPeers) : 12);
+  const before = new Set(Array.from(connectedPeers.keys()));
+  const joinHandle = swarm.join(Buffer.from(normalizedTopic, 'hex'), {
+    server: false,
+    client: true
+  });
+  try {
+    await Promise.race([
+      joinHandle.flushed(),
+      new Promise((resolve) => setTimeout(resolve, Math.min(500, waitMs)))
+    ]);
+  } catch (_) {
+    // ignore flushed errors and continue with bounded wait
+  }
+  try {
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    const connectedKeys = Array.from(connectedPeers.keys())
+      .map((value) => normalizeHex64(value))
+      .filter(Boolean);
+    const newlyConnected = connectedKeys.filter((value) => !before.has(value));
+    const ordered = [...newlyConnected, ...connectedKeys.filter((value) => !newlyConnected.includes(value))];
+    return Array.from(new Set(ordered)).slice(0, peerCap);
+  } finally {
+    try {
+      joinHandle.destroy();
+    } catch (_) {
+      // ignore
+    }
+  }
+}
+
+export async function probeJoinCapabilities({
+  peerKey,
+  publicIdentifier,
+  inviteePubkey = null,
+  tokenHash = null,
+  timeoutMs = 1500,
+  nonce = null
+} = {}) {
+  const normalizedPeerKey = normalizeHex64(peerKey);
+  const normalizedIdentifier = normalizeRelayIdentifier(publicIdentifier || '');
+  if (!normalizedPeerKey || !normalizedIdentifier) {
+    return {
+      success: false,
+      supported: false,
+      statusCode: null,
+      error: 'invalid-probe-input'
+    };
+  }
+  const requestNonce = typeof nonce === 'string' && nonce.trim()
+    ? nonce.trim()
+    : nodeCrypto.randomUUID();
+  const startedAt = Date.now();
+  try {
+    const protocol = await withOperationTimeout(
+      waitForPeerProtocol(normalizedPeerKey, timeoutMs),
+      timeoutMs,
+      'wait-peer'
+    );
+    const responseRaw = await withOperationTimeout(
+      protocol.sendRequest({
+        method: 'POST',
+        path: `/post/join-capabilities/${normalizedIdentifier}`,
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify({
+          nonce: requestNonce,
+          inviteePubkey: normalizeHex64(inviteePubkey) || null,
+          tokenHash: typeof tokenHash === 'string' ? tokenHash.trim().toLowerCase() : null
+        }))
+      }),
+      timeoutMs,
+      'probe-request'
+    );
+    const statusCode = Number(responseRaw?.statusCode || 0) || null;
+    const parsed = parseJsonBody(responseRaw?.body) || {};
+    if ((statusCode || 200) >= 400) {
+      return {
+        success: false,
+        supported: statusCode !== 404,
+        statusCode,
+        rttMs: Date.now() - startedAt,
+        error: typeof parsed?.error === 'string' ? parsed.error : `status-${statusCode}`
+      };
+    }
+    const echoedNonce = typeof parsed?.nonce === 'string' ? parsed.nonce.trim() : '';
+    if (!echoedNonce || echoedNonce !== requestNonce) {
+      return {
+        success: false,
+        supported: true,
+        statusCode: statusCode || 200,
+        rttMs: Date.now() - startedAt,
+        error: 'nonce-mismatch'
+      };
+    }
+    return {
+      success: true,
+      supported: true,
+      statusCode: statusCode || 200,
+      rttMs: Date.now() - startedAt,
+      data: parsed
+    };
+  } catch (error) {
+    return {
+      success: false,
+      supported: false,
+      statusCode: null,
+      rttMs: Date.now() - startedAt,
+      error: error?.message || String(error)
+    };
+  }
+}
+
+export async function syncWriterLeaseToPeer({
+  peerKey,
+  publicIdentifier,
+  envelope,
+  timeoutMs = 4000
+} = {}) {
+  const normalizedPeerKey = normalizeHex64(peerKey);
+  const normalizedIdentifier = normalizeRelayIdentifier(publicIdentifier || '');
+  if (!normalizedPeerKey || !normalizedIdentifier || !envelope) {
+    return { acknowledged: false, statusCode: null, error: 'invalid-sync-input' };
+  }
+  try {
+    const protocol = await withOperationTimeout(
+      waitForPeerProtocol(normalizedPeerKey, timeoutMs),
+      timeoutMs,
+      'wait-peer'
+    );
+    const responseRaw = await withOperationTimeout(
+      protocol.sendRequest({
+        method: 'POST',
+        path: `/post/relay/${normalizedIdentifier}/writer-lease-sync`,
+        headers: {
+          'content-type': 'application/json',
+          'x-source-peer-key': config?.swarmPublicKey || ''
+        },
+        body: Buffer.from(JSON.stringify({ envelope }))
+      }),
+      timeoutMs,
+      'lease-sync'
+    );
+    const statusCode = Number(responseRaw?.statusCode || 0) || null;
+    const parsed = parseJsonBody(responseRaw?.body) || {};
+    if ((statusCode || 200) >= 400) {
+      return {
+        acknowledged: false,
+        statusCode,
+        error: typeof parsed?.error === 'string' ? parsed.error : `status-${statusCode}`
+      };
+    }
+    return {
+      acknowledged: parsed?.acknowledged === true,
+      statusCode: statusCode || 200,
+      data: parsed
+    };
+  } catch (error) {
+    return {
+      acknowledged: false,
+      statusCode: null,
+      error: error?.message || String(error)
+    };
+  }
+}
+
+export async function claimWriterLeaseFromPeer({
+  peerKey,
+  publicIdentifier,
+  inviteePubkey,
+  token = null,
+  tokenHash = null,
+  relayKey = null,
+  timeoutMs = 5000
+} = {}) {
+  const normalizedPeerKey = normalizeHex64(peerKey);
+  const normalizedIdentifier = normalizeRelayIdentifier(publicIdentifier || '');
+  const normalizedInvitee = normalizeHex64(inviteePubkey);
+  if (!normalizedPeerKey || !normalizedIdentifier || !normalizedInvitee) {
+    return { success: false, statusCode: null, error: 'invalid-claim-input' };
+  }
+  const computedTokenHash =
+    (typeof tokenHash === 'string' && tokenHash.trim().toLowerCase())
+    || computeLeaseTokenHash(relayKey, token)
+    || null;
+  if (!computedTokenHash) {
+    return { success: false, statusCode: null, error: 'missing-token-hash' };
+  }
+  try {
+    const protocol = await withOperationTimeout(
+      waitForPeerProtocol(normalizedPeerKey, timeoutMs),
+      timeoutMs,
+      'wait-peer'
+    );
+    const responseRaw = await withOperationTimeout(
+      protocol.sendRequest({
+        method: 'POST',
+        path: `/post/relay/${normalizedIdentifier}/writer-lease-claim`,
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify({
+          inviteePubkey: normalizedInvitee,
+          tokenHash: computedTokenHash,
+          relayKey: normalizeHex64(relayKey) || null
+        }))
+      }),
+      timeoutMs,
+      'lease-claim'
+    );
+    const statusCode = Number(responseRaw?.statusCode || 0) || null;
+    const parsed = parseJsonBody(responseRaw?.body) || {};
+    if ((statusCode || 200) >= 400) {
+      return {
+        success: false,
+        statusCode,
+        error: typeof parsed?.error === 'string' ? parsed.error : `status-${statusCode}`
+      };
+    }
+    return {
+      success: true,
+      statusCode: statusCode || 200,
+      data: parsed
+    };
+  } catch (error) {
+    return {
+      success: false,
+      statusCode: null,
+      error: error?.message || String(error)
+    };
+  }
 }
 
 // Handle incoming peer connections
@@ -1683,6 +2193,279 @@ function setupProtocolHandlers(protocol) {
         body: b4a.from(JSON.stringify({ error: error.message }))
       };
     }
+  });
+
+  protocol.handle('/post/join-capabilities/:identifier', async (request) => {
+    const rawIdentifier = request.params.identifier;
+    const runtime = await resolveRelayRuntimeForIdentifier(rawIdentifier);
+    const body = parseRequestBodyJson(request);
+    const nonce =
+      (typeof body.nonce === 'string' && body.nonce.trim())
+      || (typeof request?.query?.nonce === 'string' && request.query.nonce.trim())
+      || nodeCrypto.randomUUID();
+    const inviteePubkey = normalizeHex64(
+      body.inviteePubkey || request?.query?.inviteePubkey || null
+    );
+    const tokenHashRaw = body.tokenHash || request?.query?.tokenHash || null;
+    const tokenHash = typeof tokenHashRaw === 'string' ? tokenHashRaw.trim().toLowerCase() : null;
+    const observedAt = Date.now();
+    const relayActive = !!runtime?.relayManager?.relay;
+    const writable = runtime?.relayManager?.relay?.writable === true;
+    const isClosed = runtime?.profile?.isOpen === false;
+    const canDirectChallenge = relayActive && writable && !isClosed;
+    const canProvisionOpenWriter = canDirectChallenge;
+    const canStoreLeaseReplica = relayActive && writable;
+
+    let hasMatchingLease = false;
+    let leaseExpiresAt = null;
+    if (isClosed && inviteePubkey && tokenHash) {
+      const match = await findMatchingRelayLeaseEnvelope({
+        relayKey: runtime?.relayKey,
+        publicIdentifier: runtime?.publicIdentifier,
+        inviteePubkey,
+        tokenHash
+      });
+      hasMatchingLease = !!match?.envelope;
+      leaseExpiresAt = Number.isFinite(match?.leaseExpiresAt) ? Number(match.leaseExpiresAt) : null;
+    }
+
+    if (!relayActive && !runtime?.profile) {
+      updateMetrics(false);
+      return {
+        statusCode: 404,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({
+          error: 'Relay not found',
+          nonce,
+          observedAt
+        }))
+      };
+    }
+
+    const response = {
+      nonce,
+      relayKey: runtime?.relayKey || null,
+      publicIdentifier: runtime?.publicIdentifier || normalizeRelayIdentifier(rawIdentifier),
+      writable,
+      canDirectChallenge,
+      canProvisionOpenWriter,
+      hasMatchingLease,
+      canStoreLeaseReplica,
+      leaseExpiresAt,
+      observedAt
+    };
+
+    await recordRelayCapabilityProbe({
+      relayKey: response.relayKey,
+      publicIdentifier: response.publicIdentifier,
+      peerKey: config?.swarmPublicKey || null,
+      observedAt,
+      success: true,
+      supported: true,
+      canDirectChallenge,
+      canProvisionOpenWriter,
+      hasMatchingLease,
+      canStoreLeaseReplica,
+      leaseExpiresAt
+    }).catch(() => {});
+
+    await upsertRelayDiscoveryHints({
+      relayKey: response.relayKey,
+      publicIdentifier: response.publicIdentifier,
+      hostPeerKeys: config?.swarmPublicKey ? [config.swarmPublicKey] : [],
+      writerIssuerPubkey: runtime?.profile?.admin_pubkey || config?.nostr_pubkey_hex || null,
+      observedAt
+    }).catch(() => {});
+
+    updateMetrics(true);
+    return {
+      statusCode: 200,
+      headers: { 'content-type': 'application/json' },
+      body: b4a.from(JSON.stringify(response))
+    };
+  });
+
+  protocol.handle('/post/relay/:identifier/writer-lease-sync', async (request) => {
+    const rawIdentifier = request.params.identifier;
+    const runtime = await resolveRelayRuntimeForIdentifier(rawIdentifier);
+    const body = parseRequestBodyJson(request);
+    const headers = request?.headers || {};
+    const sourcePeerKey = normalizeHex64(
+      headers['x-source-peer-key']
+      || headers['x-source-peer']
+      || body?.sourcePeerKey
+      || null
+    );
+
+    if (!runtime?.relayManager?.relay) {
+      updateMetrics(false);
+      return {
+        statusCode: 404,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: 'Relay not active' }))
+      };
+    }
+    if (runtime.relayManager.relay.writable !== true) {
+      updateMetrics(false);
+      return {
+        statusCode: 409,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: 'Relay not writable for lease sync' }))
+      };
+    }
+    if (sourcePeerKey && !consumeWriterLeaseSyncRateLimit(sourcePeerKey)) {
+      updateMetrics(false);
+      return {
+        statusCode: 429,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: 'Rate limit exceeded' }))
+      };
+    }
+
+    const envelopeInput =
+      (body?.envelope && typeof body.envelope === 'object' ? body.envelope : null)
+      || (body?.writerLeaseEnvelope && typeof body.writerLeaseEnvelope === 'object' ? body.writerLeaseEnvelope : null);
+    const signature = typeof envelopeInput?.signature === 'string' ? envelopeInput.signature.trim() : '';
+    const payload = canonicalizeWriterLeaseEnvelopePayload(envelopeInput);
+    if (!payload || !signature) {
+      updateMetrics(false);
+      return {
+        statusCode: 400,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: 'Invalid lease envelope' }))
+      };
+    }
+
+    const relayKeyMismatch = runtime?.relayKey && payload.relayKey !== runtime.relayKey;
+    const identifierMismatch = runtime?.publicIdentifier && payload.publicIdentifier !== runtime.publicIdentifier;
+    if (relayKeyMismatch || identifierMismatch) {
+      updateMetrics(false);
+      return {
+        statusCode: 409,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: 'Lease envelope relay mismatch' }))
+      };
+    }
+
+    const envelope = { ...payload, signature };
+    const validSignature = await verifyWriterLeaseEnvelope(envelope);
+    if (!validSignature) {
+      updateMetrics(false);
+      return {
+        statusCode: 400,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: 'Invalid lease signature' }))
+      };
+    }
+
+    const observedAt = Date.now();
+    await upsertRelayLeaseEnvelope({
+      envelope,
+      relayKey: runtime?.relayKey || payload.relayKey,
+      publicIdentifier: runtime?.publicIdentifier || payload.publicIdentifier,
+      sourcePeerKey: sourcePeerKey || payload.issuerSwarmPeerKey || null,
+      observedAt
+    });
+    await recordRelayLeaseReplicaPeer({
+      relayKey: runtime?.relayKey || payload.relayKey,
+      publicIdentifier: runtime?.publicIdentifier || payload.publicIdentifier,
+      peerKey: sourcePeerKey || payload.issuerSwarmPeerKey || null,
+      observedAt
+    }).catch(() => {});
+    await upsertRelayDiscoveryHints({
+      relayKey: runtime?.relayKey || payload.relayKey,
+      publicIdentifier: runtime?.publicIdentifier || payload.publicIdentifier,
+      leaseReplicaPeerKeys: [
+        sourcePeerKey || null,
+        payload.issuerSwarmPeerKey || null,
+        config?.swarmPublicKey || null
+      ],
+      observedAt
+    }).catch(() => {});
+
+    updateMetrics(true);
+    return {
+      statusCode: 200,
+      headers: { 'content-type': 'application/json' },
+      body: b4a.from(JSON.stringify({
+        acknowledged: true,
+        leaseId: payload.leaseId,
+        expiresAt: payload.expiresAt,
+        observedAt
+      }))
+    };
+  });
+
+  protocol.handle('/post/relay/:identifier/writer-lease-claim', async (request) => {
+    const rawIdentifier = request.params.identifier;
+    const runtime = await resolveRelayRuntimeForIdentifier(rawIdentifier);
+    const body = parseRequestBodyJson(request);
+    const inviteePubkey = normalizeHex64(body?.inviteePubkey || null);
+    const relayKeyHint = normalizeHex64(body?.relayKey || runtime?.relayKey || null);
+    const tokenHash =
+      (typeof body?.tokenHash === 'string' && body.tokenHash.trim().toLowerCase())
+      || computeLeaseTokenHash(relayKeyHint || runtime?.relayKey || null, body?.token || null)
+      || null;
+
+    if (!inviteePubkey || !tokenHash) {
+      updateMetrics(false);
+      return {
+        statusCode: 400,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: 'Missing inviteePubkey or tokenHash' }))
+      };
+    }
+
+    const match = await findMatchingRelayLeaseEnvelope({
+      relayKey: relayKeyHint || runtime?.relayKey || null,
+      publicIdentifier: runtime?.publicIdentifier || normalizeRelayIdentifier(rawIdentifier),
+      inviteePubkey,
+      tokenHash
+    });
+    if (!match?.envelope) {
+      updateMetrics(false);
+      return {
+        statusCode: 404,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: 'No matching lease' }))
+      };
+    }
+
+    const validSignature = await verifyWriterLeaseEnvelope(match.envelope);
+    if (!validSignature) {
+      updateMetrics(false);
+      return {
+        statusCode: 409,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({ error: 'Stored lease signature invalid' }))
+      };
+    }
+
+    const observedAt = Date.now();
+    await recordRelayLeaseReplicaPeer({
+      relayKey: runtime?.relayKey || match.envelope.relayKey,
+      publicIdentifier: runtime?.publicIdentifier || match.envelope.publicIdentifier,
+      peerKey: config?.swarmPublicKey || null,
+      observedAt
+    }).catch(() => {});
+    await upsertRelayDiscoveryHints({
+      relayKey: runtime?.relayKey || match.envelope.relayKey,
+      publicIdentifier: runtime?.publicIdentifier || match.envelope.publicIdentifier,
+      leaseReplicaPeerKeys: [config?.swarmPublicKey || null],
+      observedAt
+    }).catch(() => {});
+
+    updateMetrics(true);
+    return {
+      statusCode: 200,
+      headers: { 'content-type': 'application/json' },
+      body: b4a.from(JSON.stringify({
+        ok: true,
+        envelope: match.envelope,
+        leaseExpiresAt: match.leaseExpiresAt || match.envelope.expiresAt || null,
+        observedAt
+      }))
+    };
   });
 
   // Handle verify ownership
@@ -2844,7 +3627,11 @@ function buildCreateRelayBootstrapDraftEvents({
   isOpen,
   fileSharing,
   relayWsUrl,
-  picture
+  picture,
+  discoveryTopic = null,
+  hostPeerKeys = [],
+  writerIssuerPubkey = null,
+  leaseReplicaPeerKeys = []
 }) {
   const canonicalIdentifier = normalizeRelayIdentifier(publicIdentifier);
   const now = Math.floor(Date.now() / 1000);
@@ -2877,6 +3664,42 @@ function buildCreateRelayBootstrapDraftEvents({
     [fileSharingEnabled ? 'file-sharing-on' : 'file-sharing-off']
   ];
   if (pictureTag) metadataTags.push(['picture', pictureTag, 'hypertuna:drive:pfp']);
+
+  if (isPublic && isOpen) {
+    const topic = typeof discoveryTopic === 'string' && discoveryTopic.trim()
+      ? discoveryTopic.trim()
+      : deriveRelayDiscoveryTopic(canonicalIdentifier);
+    if (topic) {
+      metadataTags.push(['hypertuna-topic', topic]);
+    }
+
+    const normalizedHostPeers = Array.from(
+      new Set(
+        (Array.isArray(hostPeerKeys) ? hostPeerKeys : [])
+          .map((value) => normalizeHex64(value))
+          .filter(Boolean)
+      )
+    );
+    normalizedHostPeers.forEach((peerKey) => {
+      metadataTags.push(['hypertuna-host-peer', peerKey]);
+    });
+
+    const normalizedWriterIssuer = normalizeHex64(writerIssuerPubkey || adminPubkey || null);
+    if (normalizedWriterIssuer) {
+      metadataTags.push(['hypertuna-writer-issuer', normalizedWriterIssuer]);
+    }
+
+    const normalizedLeaseReplicaPeers = Array.from(
+      new Set(
+        (Array.isArray(leaseReplicaPeerKeys) ? leaseReplicaPeerKeys : [])
+          .map((value) => normalizeHex64(value))
+          .filter(Boolean)
+      )
+    ).slice(0, 8);
+    normalizedLeaseReplicaPeers.forEach((peerKey) => {
+      metadataTags.push(['hypertuna-lease-replica-peer', peerKey]);
+    });
+  }
 
   const adminTags = [
     ['h', canonicalIdentifier],
@@ -3028,6 +3851,9 @@ async function publishCreateRelayBootstrapEvents({
   }
 
   const relayWsUrl = `${buildGatewayWebsocketBase(config)}/${canonicalIdentifier.replace(':', '/')}`;
+  const discoveryTopic = deriveRelayDiscoveryTopic(canonicalIdentifier);
+  const hostPeerKeys = config?.swarmPublicKey ? [config.swarmPublicKey] : [];
+  const writerIssuerPubkey = config?.nostr_pubkey_hex || adminPubkey || null;
   const drafts = buildCreateRelayBootstrapDraftEvents({
     publicIdentifier: canonicalIdentifier,
     adminPubkey,
@@ -3037,7 +3863,11 @@ async function publishCreateRelayBootstrapEvents({
     isOpen,
     fileSharing,
     relayWsUrl,
-    picture
+    picture,
+    discoveryTopic,
+    hostPeerKeys,
+    writerIssuerPubkey,
+    leaseReplicaPeerKeys: hostPeerKeys
   });
 
   let lastError = null;
@@ -4781,6 +5611,20 @@ export async function createRelay(options) {
     }
 
     result.bootstrapPublish = bootstrapPublish;
+    result.discoveryTopic = deriveRelayDiscoveryTopic(result.publicIdentifier || result.relayKey || null);
+    result.hostPeerKeys = config?.swarmPublicKey ? [String(config.swarmPublicKey).toLowerCase()] : [];
+    result.leaseReplicaPeerKeys = [...result.hostPeerKeys];
+    result.writerIssuerPubkey = normalizeHex64(config?.nostr_pubkey_hex || null);
+
+    await upsertRelayDiscoveryHints({
+      relayKey: result.relayKey || null,
+      publicIdentifier: result.publicIdentifier || null,
+      discoveryTopic: result.discoveryTopic || undefined,
+      hostPeerKeys: result.hostPeerKeys,
+      leaseReplicaPeerKeys: result.leaseReplicaPeerKeys,
+      writerIssuerPubkey: result.writerIssuerPubkey || undefined,
+      observedAt: Date.now()
+    }).catch(() => {});
   }
   
   return result;

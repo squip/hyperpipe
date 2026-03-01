@@ -7,6 +7,10 @@ export const KIND_GROUP_METADATA = 39000
 export const KIND_GROUP_ADMIN_LIST = 39001
 export const KIND_GROUP_MEMBER_LIST = 39002
 export const KIND_HYPERTUNA_RELAY = 30166
+export const HYPERTUNA_TOPIC_TAG = 'hypertuna-topic'
+export const HYPERTUNA_HOST_PEER_TAG = 'hypertuna-host-peer'
+export const HYPERTUNA_WRITER_ISSUER_TAG = 'hypertuna-writer-issuer'
+export const HYPERTUNA_LEASE_REPLICA_PEER_TAG = 'hypertuna-lease-replica-peer'
 
 export function getBaseRelayUrl(url: string): string {
   try {
@@ -47,6 +51,10 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   fileSharing?: boolean
   relayWsUrl: string
   pictureTagUrl?: string
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
+  leaseReplicaPeerKeys?: string[]
 }): { groupCreateEvent: EventTemplate; metadataEvent: EventTemplate; hypertunaEvent: EventTemplate } {
   const now = Math.floor(Date.now() / 1000)
   const fileSharingEnabled = args.fileSharing !== false
@@ -80,6 +88,37 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
 
   if (args.pictureTagUrl) {
     metadataTags.push(['picture', args.pictureTagUrl, 'hypertuna:drive:pfp'])
+  }
+  if (args.isPublic && args.isOpen) {
+    if (typeof args.discoveryTopic === 'string' && args.discoveryTopic.trim()) {
+      metadataTags.push([HYPERTUNA_TOPIC_TAG, args.discoveryTopic.trim()])
+    }
+    const hostPeerKeys = Array.from(
+      new Set(
+        (Array.isArray(args.hostPeerKeys) ? args.hostPeerKeys : [])
+          .map((entry) => String(entry || '').trim().toLowerCase())
+          .filter(Boolean)
+      )
+    )
+    hostPeerKeys.forEach((peerKey) => {
+      metadataTags.push([HYPERTUNA_HOST_PEER_TAG, peerKey])
+    })
+    const writerIssuer = typeof args.writerIssuerPubkey === 'string'
+      ? args.writerIssuerPubkey.trim().toLowerCase()
+      : ''
+    if (writerIssuer) {
+      metadataTags.push([HYPERTUNA_WRITER_ISSUER_TAG, writerIssuer])
+    }
+    const leaseReplicaPeers = Array.from(
+      new Set(
+        (Array.isArray(args.leaseReplicaPeerKeys) ? args.leaseReplicaPeerKeys : [])
+          .map((entry) => String(entry || '').trim().toLowerCase())
+          .filter(Boolean)
+      )
+    ).slice(0, 8)
+    leaseReplicaPeers.forEach((peerKey) => {
+      metadataTags.push([HYPERTUNA_LEASE_REPLICA_PEER_TAG, peerKey])
+    })
   }
 
   return {

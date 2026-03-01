@@ -165,6 +165,10 @@ type RelayCreatedPayload = {
   registrationError?: string
   members?: string[]
   bootstrapPublish?: RelayBootstrapPublishStatus
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  leaseReplicaPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
 }
 
 type RefreshRelaySubscriptionsResult = {
@@ -225,6 +229,12 @@ type WorkerBridgeContextValue = {
       token?: string
       relayKey?: string | null
       relayUrl?: string | null
+      gatewayMode?: 'auto' | 'disabled'
+      discoveryTopic?: string | null
+      hostPeerKeys?: string[]
+      leaseReplicaPeerKeys?: string[]
+      writerIssuerPubkey?: string | null
+      writerLeaseEnvelope?: Record<string, unknown> | null
       blindPeer?: {
         publicKey?: string | null
         encryptionKey?: string | null
@@ -624,6 +634,12 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         token?: string
         relayKey?: string | null
         relayUrl?: string | null
+        gatewayMode?: 'auto' | 'disabled'
+        discoveryTopic?: string | null
+        hostPeerKeys?: string[]
+        leaseReplicaPeerKeys?: string[]
+        writerIssuerPubkey?: string | null
+        writerLeaseEnvelope?: Record<string, unknown> | null
         blindPeer?: {
           publicKey?: string | null
           encryptionKey?: string | null
@@ -665,29 +681,34 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         await startWorkerInternal({ resetRestartAttempts: false })
       }
 
-      // The gateway is the source of truth for relay host peers. Ensure it's running.
-      if (!gatewayStatus?.running) {
-        await electronIpc.sendToWorker({ type: 'start-gateway', options: {} }).catch(() => {})
+      const gatewayMode = opts?.gatewayMode === 'disabled' ? 'disabled' : 'auto'
+      if (gatewayMode === 'auto') {
+        if (!gatewayStatus?.running) {
+          await electronIpc.sendToWorker({ type: 'start-gateway', options: {} }).catch(() => {})
+        }
+        await electronIpc.sendToWorker({ type: 'get-gateway-status' }).catch(() => {})
       }
-
-      // Refresh gateway status so peerRelayMap is as current as possible.
-      await electronIpc.sendToWorker({ type: 'get-gateway-status' }).catch(() => {})
 
       const fileSharing = opts?.fileSharing !== false
 
-      // Best-effort host peer discovery fast-path; worker has a fallback too.
       let hostPeers: string[] | undefined
-      try {
-        const peerRelayMap = gatewayStatus?.peerRelayMap
-        const entry =
-          peerRelayMap?.[identifier] ||
-          (identifier.includes(':') ? peerRelayMap?.[identifier.replace(':', '/')] : null)
-        if (Array.isArray(entry?.peers) && entry.peers.length) {
-          hostPeers = entry.peers.map((p) => String(p || '').trim()).filter(Boolean)
+      if (gatewayMode === 'auto') {
+        try {
+          const peerRelayMap = gatewayStatus?.peerRelayMap
+          const entry =
+            peerRelayMap?.[identifier] ||
+            (identifier.includes(':') ? peerRelayMap?.[identifier.replace(':', '/')] : null)
+          if (Array.isArray(entry?.peers) && entry.peers.length) {
+            hostPeers = entry.peers.map((p) => String(p || '').trim()).filter(Boolean)
+          }
+        } catch (err) {
+          void err
         }
-      } catch (err) {
-        void err
       }
+      const explicitHostPeers = (Array.isArray(opts?.hostPeerKeys) ? opts.hostPeerKeys : [])
+        .map((peer) => String(peer || '').trim())
+        .filter(Boolean)
+      const mergedHostPeers = Array.from(new Set([...(hostPeers || []), ...explicitHostPeers]))
 
       const data: any = {
         publicIdentifier: identifier,
@@ -703,9 +724,19 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         writerCoreHex: opts?.writerCoreHex,
         autobaseLocal: opts?.autobaseLocal,
         writerSecret: opts?.writerSecret,
-        fastForward: opts?.fastForward || undefined
+        fastForward: opts?.fastForward || undefined,
+        gatewayMode,
+        discoveryTopic: opts?.discoveryTopic || undefined,
+        leaseReplicaPeerKeys: Array.isArray(opts?.leaseReplicaPeerKeys)
+          ? opts.leaseReplicaPeerKeys
+          : undefined,
+        writerIssuerPubkey: opts?.writerIssuerPubkey || undefined,
+        writerLeaseEnvelope: opts?.writerLeaseEnvelope || undefined
       }
-      if (hostPeers && hostPeers.length) data.hostPeers = hostPeers
+      if (mergedHostPeers.length) {
+        data.hostPeers = mergedHostPeers
+        data.hostPeerKeys = mergedHostPeers
+      }
 
       await electronIpc.sendToWorker({ type: 'start-join-flow', data })
 
@@ -716,7 +747,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           ...prev,
           [identifier]: {
             ...current,
-            hostPeers,
+            hostPeers: mergedHostPeers.length ? mergedHostPeers : hostPeers,
             updatedAt: Date.now()
           }
         }
