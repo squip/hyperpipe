@@ -24,6 +24,16 @@ node dist/cli.js
 - `--no-animations`
 - `--log-level <debug|info|warn|error>`
 
+## File logging
+
+Set `TUI_LOG_FILE` to an absolute path to enable structured JSONL logging without shell redirection.
+
+```bash
+TUI_LOG_FILE=/var/log/hypertuna/tui.log npm run start
+```
+
+Each line is a JSON object with fields like `ts`, `level`, `source`, `message`, and `pid`, including mirrored `worker.stdout` / `worker.stderr` entries.
+
 ## Navigation
 
 - `Tab`: cycle focus `Left Tree -> Center List -> Right Top -> Right Bottom`

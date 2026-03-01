@@ -3,8 +3,27 @@ import Protomux from 'protomux';
 import c from 'compact-encoding';
 import { EventEmitter } from 'node:events';
 import b4a from 'b4a';
+import process from 'node:process';
 
-const REQUEST_TIMEOUT = 30000; // 30 seconds
+function resolveRequestTimeoutMs() {
+  const raw = process.env.RELAY_PROTOCOL_REQUEST_TIMEOUT_MS;
+  if (typeof raw !== 'string' || !raw.trim()) return 30000;
+  const normalized = raw.trim().toLowerCase();
+  if (
+    normalized === '0'
+    || normalized === 'false'
+    || normalized === 'off'
+    || normalized === 'disabled'
+    || normalized === 'none'
+  ) {
+    return null;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 30000;
+  return Math.floor(parsed);
+}
+
+const REQUEST_TIMEOUT = resolveRequestTimeoutMs();
 
 // Custom encoding for HTTP-like messages
 const httpMessageEncoding = {
@@ -139,6 +158,7 @@ export class RelayProtocol extends EventEmitter {
     
     // Reject all pending requests
     for (const [id, request] of this.requests) {
+      if (request.timeout) clearTimeout(request.timeout);
       request.reject(new Error('Channel closed'));
     }
     this.requests.clear();
@@ -299,17 +319,20 @@ export class RelayProtocol extends EventEmitter {
     };
     
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.requests.delete(id);
-        reject(new Error('Request timeout'));
-      }, REQUEST_TIMEOUT);
+      const timeout = Number.isFinite(REQUEST_TIMEOUT) && REQUEST_TIMEOUT > 0
+        ? setTimeout(() => {
+          this.requests.delete(id);
+          reject(new Error('Request timeout'));
+        }, REQUEST_TIMEOUT)
+        : null;
+      if (timeout?.unref) timeout.unref();
       
       this.requests.set(id, { resolve, reject, timeout });
       
       try {
         this.channel.messages[0].send(message);
       } catch (err) {
-        clearTimeout(timeout);
+        if (timeout) clearTimeout(timeout);
         this.requests.delete(id);
         reject(err);
       }

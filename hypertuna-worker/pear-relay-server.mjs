@@ -497,12 +497,51 @@ export async function requestRelaySubscriptionRefresh(relayKey, { reason = 'writ
   return summary;
 }
 const lateWriterRecoveryTasks = new Map();
-const BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS = 90000;
+function resolveTimeoutEnvMs(name, fallbackMs, { minMs = 1, allowDisable = false } = {}) {
+  const raw = process.env[name];
+  if (typeof raw !== 'string' || !raw.trim()) return fallbackMs;
+  const normalized = raw.trim().toLowerCase();
+  if (
+    allowDisable
+    && (
+      normalized === '0'
+      || normalized === 'false'
+      || normalized === 'off'
+      || normalized === 'disabled'
+      || normalized === 'none'
+    )
+  ) {
+    return null;
+  }
+  const parsed = Number(raw);
+  if (allowDisable && parsed <= 0) return null;
+  if (!Number.isFinite(parsed) || parsed < minMs) return fallbackMs;
+  return Math.floor(parsed);
+}
+
+const BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS = resolveTimeoutEnvMs(
+  'BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS',
+  90000,
+  { minMs: 1000 }
+);
 // NOTE: We previously experimented with a "join sync gate" that delayed calling
 // relay.update({ wait: true }) during cold-sync, but it commonly timed out and
 // only added latency. The logic has been removed; keep only cheap snapshot logs.
-const DIRECT_JOIN_WRITABLE_TIMEOUT_MS = 15000;
-const LATE_WRITER_RECOVERY_TIMEOUT_MS = 180000;
+const DIRECT_JOIN_WRITABLE_TIMEOUT_MS = resolveTimeoutEnvMs(
+  'DIRECT_JOIN_WRITABLE_TIMEOUT_MS',
+  15000,
+  { minMs: 1000 }
+);
+const DIRECT_JOIN_VERIFY_TIMEOUT_MS = resolveTimeoutEnvMs(
+  'DIRECT_JOIN_VERIFY_TIMEOUT_MS',
+  30000,
+  { minMs: 1000, allowDisable: true }
+);
+const LATE_WRITER_RECOVERY_TIMEOUT_MS = resolveTimeoutEnvMs(
+  'LATE_WRITER_RECOVERY_TIMEOUT_MS',
+  180000,
+  { minMs: 1000 }
+);
 const WRITER_LEASE_SYNC_RATE_LIMIT_MAX = 24;
 const WRITER_LEASE_SYNC_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const WRITER_LEASE_ENVELOPE_VERSION = 1;
@@ -2538,7 +2577,14 @@ function setupProtocolHandlers(protocol) {
         if (existingIndex >= 0) currentAdds[existingIndex] = memberAdd;
         else currentAdds.push(memberAdd);
         await updateRelayMemberSets(internalRelayKey, currentAdds, currentRemoves);
-        await publishMemberAddEvent(canonicalIdentifier, pubkey, result.token);
+        // Do not block verify response on membership event publish latency.
+        void publishMemberAddEvent(canonicalIdentifier, pubkey, result.token).catch((publishError) => {
+          console.warn('[RelayServer] Async member add publish failed during verify', {
+            identifier: canonicalIdentifier,
+            pubkey: pubkey.substring(0, 8),
+            error: publishError?.message || publishError
+          });
+        });
       }
 
       const relayUrl = `${buildGatewayWebsocketBase(config)}/${canonicalIdentifier.replace(':', '/')}?token=${result.token}`;
@@ -2547,7 +2593,10 @@ function setupProtocolHandlers(protocol) {
         try {
           writerInfo = await provisionWriterForInvitee({
             relayKey: internalRelayKey,
-            publicIdentifier: canonicalIdentifier
+            publicIdentifier: canonicalIdentifier,
+            // Keep verify-ownership response latency low; do not block on relay.update({ wait: true }).
+            skipUpdateWait: true,
+            reason: 'open-join-verify'
           });
           console.log('[RelayServer] Provisioned writer for open join', {
             relayKey: internalRelayKey,
@@ -5896,7 +5945,12 @@ export async function startJoinAuthentication(options) {
         }
       });
     }
-    return;
+    return {
+      ok: false,
+      code: 'missing-join-input',
+      error: errorMsg,
+      publicIdentifier: publicIdentifier || null
+    };
   }
 
   try {
@@ -6359,7 +6413,13 @@ export async function startJoinAuthentication(options) {
             }
           });
         }
-        return;
+        return {
+          ok: true,
+          mode: 'blind-peer-offline',
+          relayKey: fallbackRelayKey,
+          publicIdentifier,
+          hostPeer: blindPeerKey || null
+        };
       }
 
       if (openJoin) {
@@ -6524,7 +6584,13 @@ export async function startJoinAuthentication(options) {
             }
           });
         }
-        return;
+        return {
+          ok: true,
+          mode: 'open-offline',
+          relayKey: fallbackRelayKey,
+          publicIdentifier,
+          hostPeer: blindPeerKey || null
+        };
       }
 
       throw lastJoinError || new Error('Failed to contact relay host');
@@ -6570,9 +6636,17 @@ export async function startJoinAuthentication(options) {
     console.log(`[RelayServer] Ciphertext length: ${ciphertext.length}`);
     console.log(`[RelayServer] IV base64: ${ivBase64}`);
 
-    console.log(`[RelayServer] Sending verification request directly to peer ${selectedPeerKey.substring(0, 8)}...`);
+    const verifyTimeoutMs = Number.isFinite(DIRECT_JOIN_VERIFY_TIMEOUT_MS)
+      ? Math.max(1000, Number(DIRECT_JOIN_VERIFY_TIMEOUT_MS))
+      : null;
+    console.log('[RelayServer] Sending verification request directly to peer', {
+      peer: selectedPeerKey.substring(0, 8),
+      timeoutMs: verifyTimeoutMs,
+      timeoutDisabled: !Number.isFinite(verifyTimeoutMs)
+    });
 
-    const verifyResponseRaw = await joinProtocol.sendRequest({
+    const verifyStartedAt = Date.now();
+    const verifyRequest = joinProtocol.sendRequest({
       method: 'POST',
       path: `/verify-ownership`,
       headers: { 'content-type': 'application/json' },
@@ -6581,6 +6655,18 @@ export async function startJoinAuthentication(options) {
         ciphertext,
         iv: ivBase64
       }))
+    });
+    const verifyResponseRaw = Number.isFinite(verifyTimeoutMs)
+      ? await withOperationTimeout(
+        verifyRequest,
+        verifyTimeoutMs,
+        'verify-ownership request'
+      )
+      : await verifyRequest;
+    console.log('[RelayServer] Verification response received', {
+      peer: selectedPeerKey.substring(0, 8),
+      elapsedMs: Date.now() - verifyStartedAt,
+      statusCode: verifyResponseRaw?.statusCode || 200
     });
 
     if ((verifyResponseRaw.statusCode || 200) >= 400) {
@@ -6774,18 +6860,37 @@ export async function startJoinAuthentication(options) {
     }
 
     console.log(`[RelayServer] Join flow for ${finalIdentifier} completed successfully.`);
+    return {
+      ok: true,
+      mode: 'direct-join',
+      relayKey,
+      publicIdentifier: finalIdentifier,
+      hostPeer: selectedPeerKey || null
+    };
 
   } catch (error) {
+    const errorMessage = error?.message || String(error);
+    const errorCode = /timeout/i.test(errorMessage)
+      ? 'request-timeout'
+      : /closed-join-pending/i.test(errorMessage)
+        ? 'closed-join-pending'
+        : 'join-auth-failed';
     console.error(`[RelayServer] Error during join authentication for ${publicIdentifier}:`, error);
     if (global.sendMessage) {
       global.sendMessage({
         type: 'join-auth-error',
         data: {
           publicIdentifier,
-          error: error.message
+          error: errorMessage
         }
       });
     }
+    return {
+      ok: false,
+      code: errorCode,
+      error: errorMessage,
+      publicIdentifier: publicIdentifier || null
+    };
   }
 }
 

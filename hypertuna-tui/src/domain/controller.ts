@@ -59,6 +59,7 @@ import { NostrClient } from './nostrClient.js'
 import { WorkerHost, findDefaultWorkerRoot } from '../runtime/workerHost.js'
 import type { ClipboardCopyResult } from '../runtime/clipboard.js'
 import { waitForWorkerEvent } from '../runtime/waitForWorkerEvent.js'
+import { writeTuiFileLog } from '../runtime/tuiFileLogger.js'
 import { resolveStoragePaths } from '../storage/paths.js'
 import { UiStateStore } from '../storage/uiStateStore.js'
 import {
@@ -695,6 +696,7 @@ export class TuiController {
     }
 
     this.state.logs = trimLogs([...this.state.logs, entry])
+    writeTuiFileLog(level, 'controller', message)
     this.emitter.emit('change')
   }
 
@@ -1096,6 +1098,9 @@ export class TuiController {
       this.workerHost.onStdout((chunk) => {
         const lines = sanitizeWorkerChunk(chunk)
         if (!lines.length) return
+        for (const line of lines) {
+          writeTuiFileLog('info', 'worker.stdout', line)
+        }
         this.workerStdoutQueue.push(...lines)
         this.scheduleWorkerOutputFlush()
       })
@@ -1105,6 +1110,9 @@ export class TuiController {
       this.workerHost.onStderr((chunk) => {
         const lines = sanitizeWorkerChunk(chunk)
         if (!lines.length) return
+        for (const line of lines) {
+          writeTuiFileLog('error', 'worker.stderr', line)
+        }
         this.workerStderrQueue.push(...lines)
         this.scheduleWorkerOutputFlush()
       })

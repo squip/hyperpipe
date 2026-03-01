@@ -113,6 +113,13 @@ export type LeaveGroupResult = {
   failedCount: number
 }
 
+type TGroupMetadataDiscoveryHints = {
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  leaseReplicaPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
+}
+
 type TGroupsContext = {
   discoveryGroups: TGroupMetadata[]
   invites: TGroupInvite[]
@@ -3585,19 +3592,24 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       const inviteRelayUrl = getBaseRelayUrl(resolved || relay || '') || resolved || relay || null
       const inviteRelayKey = relayEntry?.relayKey || extractRelayKeyFromUrl(inviteRelayUrl) || null
+      const metadataHints = meta as (TGroupMetadata & TGroupMetadataDiscoveryHints) | null
       const discoveryTopic =
-        typeof meta?.discoveryTopic === 'string' && meta.discoveryTopic.trim()
-          ? meta.discoveryTopic.trim()
+        typeof metadataHints?.discoveryTopic === 'string' && metadataHints.discoveryTopic.trim()
+          ? metadataHints.discoveryTopic.trim()
           : null
-      const hostPeerKeys = Array.isArray(meta?.hostPeerKeys)
-        ? meta.hostPeerKeys.map((entry) => String(entry || '').trim()).filter(Boolean)
+      const hostPeerKeys = Array.isArray(metadataHints?.hostPeerKeys)
+        ? metadataHints.hostPeerKeys
+          .map((entry: string) => String(entry || '').trim())
+          .filter(Boolean)
         : []
-      const metadataLeaseReplicaPeerKeys = Array.isArray(meta?.leaseReplicaPeerKeys)
-        ? meta.leaseReplicaPeerKeys.map((entry) => String(entry || '').trim()).filter(Boolean)
+      const metadataLeaseReplicaPeerKeys = Array.isArray(metadataHints?.leaseReplicaPeerKeys)
+        ? metadataHints.leaseReplicaPeerKeys
+          .map((entry: string) => String(entry || '').trim())
+          .filter(Boolean)
         : []
       const metadataWriterIssuerPubkey =
-        typeof meta?.writerIssuerPubkey === 'string' && meta.writerIssuerPubkey.trim()
-          ? meta.writerIssuerPubkey.trim()
+        typeof metadataHints?.writerIssuerPubkey === 'string' && metadataHints.writerIssuerPubkey.trim()
+          ? metadataHints.writerIssuerPubkey.trim()
           : null
       if (!isOpenGroup && !inviteRelayKey) {
         console.warn('[GroupsProvider] Missing relayKey for closed invite payload', {

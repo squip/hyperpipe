@@ -1,0 +1,27 @@
+{
+  "generatedAt": "2026-03-01T06:35:58.836Z",
+  "baseDir": "/var/folders/8c/l5gt1q1j4bj5g8dv_tgl8qzw0000gn/T/hypertuna-direct-join-host-online-debug/mm7dkkr0-4n53ci",
+  "env": {
+    "JOIN_DIRECT_DISCOVERY_V2": "1",
+    "JOIN_TOTAL_DEADLINE_MS": "0",
+    "DIRECT_JOIN_VERIFY_TIMEOUT_MS": "0",
+    "DIRECT_JOIN_WRITABLE_TIMEOUT_MS": "180000"
+  },
+  "hostLogFile": "/var/folders/8c/l5gt1q1j4bj5g8dv_tgl8qzw0000gn/T/hypertuna-direct-join-host-online-debug/mm7dkkr0-4n53ci/host-worker.log",
+  "joinerLogFile": "/var/folders/8c/l5gt1q1j4bj5g8dv_tgl8qzw0000gn/T/hypertuna-direct-join-host-online-debug/mm7dkkr0-4n53ci/joiner-worker.log",
+  "timelineLogFile": "/var/folders/8c/l5gt1q1j4bj5g8dv_tgl8qzw0000gn/T/hypertuna-direct-join-host-online-debug/mm7dkkr0-4n53ci/timeline.log",
+  "result": {
+    "ok": true,
+    "reason": "joined-writable",
+    "elapsedMs": 79077,
+    "groupId": "npub1ukx03dxel0pflcw430ws2v27nuvmwdsrafqmlvpx2ndec8lctx5q7gnjx2:direct-host-online-mm7dl675",
+    "relayUrl": "ws://127.0.0.1:8443/npub1ukx03dxel0pflcw430ws2v27nuvmwdsrafqmlvpx2ndec8lctx5q7gnjx2/direct-host-online-mm7dl675?token=5fd4a6feeb5f144173d17c814a29533c2d4a7c46054dd8540e47f55584d568c6",
+    "discoveredRelayUrl": "ws://127.0.0.1:8443/npub1ukx03dxel0pflcw430ws2v27nuvmwdsrafqmlvpx2ndec8lctx5q7gnjx2/direct-host-online-mm7dl675",
+    "selectedPathMode": null,
+    "selectedPathPeer": null,
+    "writerDeadlineOk": null,
+    "writerDeadlineReason": null,
+    "hostAccountPubkey": "e58cf8b4d9fbc29fe1d58bdd05315e9f19b73603ea41bfb02654db9c1ff859a8",
+    "joinerAccountPubkey": "98f2c5901030eaeaeb772de0e796e3fc156f35f3e23356f8176af9e0c697daa2"
+  }
+}

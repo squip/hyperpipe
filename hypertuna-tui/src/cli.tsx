@@ -6,6 +6,12 @@ import { render } from 'ink'
 import { App } from './ui/App.js'
 import type { LogLevel, } from './domain/types.js'
 import { resolveDesktopParityStorageDir } from './storage/defaultStorageDir.js'
+import {
+  closeTuiFileLogger,
+  initializeTuiFileLogger,
+  mirrorConsoleToTuiFileLogger,
+  writeTuiFileLog
+} from './runtime/tuiFileLogger.js'
 
 function parseLogLevel(value: string | undefined): LogLevel {
   const normalized = String(value || 'info').trim().toLowerCase()
@@ -60,6 +66,12 @@ const storageDir = parsed.values['storage-dir']
   ? path.resolve(cwd, parsed.values['storage-dir'])
   : resolveDesktopParityStorageDir(cwd)
 
+const logFilePath = initializeTuiFileLogger()
+if (logFilePath) {
+  mirrorConsoleToTuiFileLogger()
+  writeTuiFileLog('info', 'cli', 'Structured file logging enabled', { path: logFilePath })
+}
+
 const app = render(
   React.createElement(App, {
     options: {
@@ -81,13 +93,18 @@ let shuttingDown = false
 function shutdown(exitCode = 0): void {
   if (shuttingDown) return
   shuttingDown = true
+  writeTuiFileLog('info', 'cli', 'Shutdown requested', { exitCode })
   try {
     app.unmount()
   } catch {
     // best effort
   }
   setTimeout(() => {
-    process.exit(exitCode)
+    closeTuiFileLogger()
+      .catch(() => {})
+      .finally(() => {
+        process.exit(exitCode)
+      })
   }, 400).unref()
 }
 
@@ -96,10 +113,12 @@ process.on('SIGTERM', () => shutdown(0))
 
 process.on('unhandledRejection', (error) => {
   process.stderr.write(`Unhandled rejection: ${String(error)}\n`)
+  writeTuiFileLog('error', 'process', 'Unhandled rejection', { error: String(error) })
   shutdown(1)
 })
 
 process.on('uncaughtException', (error) => {
   process.stderr.write(`Uncaught exception: ${String(error)}\n`)
+  writeTuiFileLog('error', 'process', 'Uncaught exception', { error: String(error) })
   shutdown(1)
 })

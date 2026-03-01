@@ -1229,6 +1229,10 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
             if (!identifier || !progress) break
             setJoinFlows((prev) => {
               const current = prev[identifier]
+              if (current?.writable === true) {
+                // Ignore background/provisional re-auth progress once relay is already writable.
+                return prev
+              }
               const startedAt = current?.startedAt ?? Date.now()
               return {
                 ...prev,
@@ -1284,8 +1288,14 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
             const identifier = msg?.data?.publicIdentifier
             const errorText = msg?.data?.error || 'Join authentication failed'
             if (!identifier) break
+            let shouldSetLastError = true
             setJoinFlows((prev) => {
               const current = prev[identifier]
+              if (current?.writable === true) {
+                // Ignore late/background auth errors after successful writable join.
+                shouldSetLastError = false
+                return prev
+              }
               const startedAt = current?.startedAt ?? Date.now()
               return {
                 ...prev,
@@ -1306,7 +1316,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                 }
               }
             })
-            setLastError(errorText)
+            if (shouldSetLastError) {
+              setLastError(errorText)
+            }
             break
           }
           case 'relay-writable': {
@@ -1336,13 +1348,14 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   ...prev,
                   [identifier]: {
                     ...current,
-                    phase: current.phase === 'error' ? current.phase : 'success',
+                    phase: 'success',
                     updatedAt: Date.now(),
                     relayKey: data.relayKey ?? current.relayKey,
                     relayUrl: data.relayUrl ?? current.relayUrl,
                     authToken: data.authToken ?? current.authToken,
                     mode: data.mode ?? current.mode,
                     expectedWriterActive: data.expectedWriterActive ?? current.expectedWriterActive,
+                    error: null,
                     writable: true,
                     writableAt: current.writableAt ?? Date.now()
                   }
