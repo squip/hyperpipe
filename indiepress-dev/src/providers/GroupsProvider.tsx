@@ -555,7 +555,14 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const [joinRequestsError, setJoinRequestsError] = useState<string | null>(null)
   const [discoveryRelays, setDiscoveryRelays] = useState<string[]>(() => {
     const stored = localStorageService.getGroupDiscoveryRelays()
-    return stored.length ? stored : defaultDiscoveryRelays
+    const base = stored.length ? stored : defaultDiscoveryRelays
+    return Array.from(
+      new Set(
+        [...base, ...defaultDiscoveryRelays]
+          .map((url) => String(url || '').trim())
+          .filter(Boolean)
+      )
+    )
   })
   const [handledJoinRequests, setHandledJoinRequests] = useState<Record<string, Set<string>>>(
     () => {

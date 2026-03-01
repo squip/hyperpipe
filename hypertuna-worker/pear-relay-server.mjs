@@ -74,7 +74,13 @@ const KIND_GROUP_ADMIN_LIST = 39001;
 const KIND_GROUP_MEMBER_LIST = 39002;
 const KIND_HYPERTUNA_RELAY = 30166;
 const CREATE_RELAY_BOOTSTRAP_MAX_ATTEMPTS = 3;
-const CREATE_RELAY_DISCOVERY_RELAYS = ['wss://hypertuna.com/relay'];
+// Keep discovery bootstrap targets aligned with renderer/TUI BIG relay defaults.
+const CREATE_RELAY_DISCOVERY_RELAYS = [
+  'wss://relay.damus.io/',
+  'wss://relay.primal.net/',
+  'wss://nos.lol/',
+  'wss://hypertuna.com/relay'
+];
 
 function isHex64(value) {
   return typeof value === 'string' && /^[0-9a-fA-F]{64}$/.test(value.trim());
