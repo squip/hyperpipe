@@ -1007,6 +1007,7 @@ export class TuiController {
         if (event.type === 'status') {
           const phase = typeof event.phase === 'string' ? event.phase : ''
           const message = typeof event.message === 'string' ? event.message : ''
+          const preserveReady = this.state.lifecycle === 'ready' && phase && phase !== 'stopping' && phase !== 'error'
           const lifecycle =
             phase === 'ready'
               ? 'ready'
@@ -1015,7 +1016,7 @@ export class TuiController {
                 : phase === 'error'
                   ? 'error'
                   : phase
-                    ? 'initializing'
+                    ? (preserveReady ? 'ready' : 'initializing')
                     : this.state.lifecycle
 
           this.patchState({
@@ -1038,6 +1039,28 @@ export class TuiController {
           } else if (lifecycle === 'stopping' || lifecycle === 'error') {
             this.clearChatRetryTimer()
             this.patchState({ chatNextRetryAt: null })
+          }
+          return
+        }
+
+        if (event.type === 'relay-server-ready') {
+          if (this.state.lifecycle === 'starting' || this.state.lifecycle === 'initializing') {
+            this.patchState({
+              lifecycle: 'ready',
+              readinessMessage: 'Relay server initialized (background relay sync in progress)'
+            })
+            this.patchState({
+              workerRecoveryState: {
+                ...this.state.workerRecoveryState,
+                status: 'idle',
+                attempt: 0,
+                nextDelayMs: 0,
+                lastError: null
+              }
+            })
+            if (this.state.chatRuntimeState !== 'ready' && !this.chatInitInFlight && !this.chatRetryTimer) {
+              this.scheduleChatRetry(800, 'relay-server-ready')
+            }
           }
           return
         }
@@ -3813,6 +3836,7 @@ export class TuiController {
 
   async approveJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void> {
     await this.runTask('Approve join request', async () => {
+      const approvalStartedAt = Date.now()
       const normalizedGroupId = String(groupId || '').trim()
       const normalizedPubkey = String(pubkey || '').trim().toLowerCase()
       if (!normalizedGroupId) {
@@ -3841,6 +3865,11 @@ export class TuiController {
           : (relayEntry?.relayKey || null)
       const isOpenGroup = selectedGroup?.isOpen === true
       const token = isOpenGroup ? undefined : Buffer.from(generateSecretKey()).toString('hex').slice(0, 24)
+      const inviteApprovalTraceId = `${normalizedGroupId.slice(0, 10)}:${normalizedPubkey.slice(0, 10)}:${approvalStartedAt.toString(36)}`
+      this.log(
+        'info',
+        `[invite-approval:${inviteApprovalTraceId}] start group=${normalizedGroupId} open=${isOpenGroup} relay=${relayUrl.slice(0, 80)}`
+      )
       const groupMembers = Array.isArray(selectedGroup?.members)
         ? selectedGroup.members.filter((member) => /^[a-f0-9]{64}$/i.test(String(member || '').trim()))
         : []
@@ -3888,6 +3917,10 @@ export class TuiController {
         payload,
         relayTargets: this.searchableRelayUrls(16)
       })
+      this.log(
+        'info',
+        `[invite-approval:${inviteApprovalTraceId}] invite sent elapsedMs=${Date.now() - approvalStartedAt} token=${token ? 'present' : 'none'}`
+      )
 
       const groupKey = relay ? `${relay}|${normalizedGroupId}` : normalizedGroupId
       const next = (this.state.groupJoinRequests[groupKey] || []).filter((request) => request.pubkey !== normalizedPubkey)
@@ -3928,10 +3961,13 @@ export class TuiController {
       const session = this.requireSession()
       const normalizedGroupId = String(input.groupId || '').trim()
       const normalizedInvitee = String(input.inviteePubkey || '').trim().toLowerCase()
+      const inviteSendStartedAt = Date.now()
+      const inviteTraceId = `${normalizedGroupId.slice(0, 10)}:${normalizedInvitee.slice(0, 10)}:${inviteSendStartedAt.toString(36)}`
       if (!normalizedGroupId) throw new Error('groupId is required')
       if (!/^[a-f0-9]{64}$/i.test(normalizedInvitee)) {
         throw new Error(`Invalid invitee pubkey: ${input.inviteePubkey}`)
       }
+      this.log('info', `[invite-send:${inviteTraceId}] start group=${normalizedGroupId}`)
 
       await this.ensureGatewayParityReady({
         reason: 'send-invite',
@@ -3979,6 +4015,14 @@ export class TuiController {
       const inviteToken = inviteTokenCandidate || (!isOpenGroup
         ? Buffer.from(generateSecretKey()).toString('hex').slice(0, 24)
         : '')
+      this.log(
+        'info',
+        `[invite-send:${inviteTraceId}] relay resolved relayKey=${resolvedRelayKey ? resolvedRelayKey.slice(0, 16) : 'none'} open=${isOpenGroup} token=${inviteToken ? 'present' : 'none'}`
+      )
+
+      if (!isOpenGroup && !resolvedRelayKey) {
+        throw new Error('Unable to resolve relay key for closed invite writer provisioning')
+      }
 
       if (!isOpenGroup && inviteToken) {
         try {
@@ -4004,6 +4048,11 @@ export class TuiController {
 
       let writerProvision: Record<string, unknown> | null = null
       if (!isOpenGroup && resolvedRelayKey) {
+        const provisionStartedAt = Date.now()
+        this.log(
+          'info',
+          `[invite-send:${inviteTraceId}] writer provisioning start relayKey=${resolvedRelayKey.slice(0, 16)}`
+        )
         try {
           writerProvision = await this.workerHost.request<Record<string, unknown>>(
             {
@@ -4014,14 +4063,23 @@ export class TuiController {
                 inviteePubkey: normalizedInvitee,
                 token: inviteToken || undefined,
                 leaseReplicaPeerKeys: payloadLeaseReplicaPeerKeys,
-                useWriterPool: true
+                useWriterPool: true,
+                inviteTraceId,
+                requireWriterMaterial: true
               }
             },
             90_000
           )
+          this.log(
+            'info',
+            `[invite-send:${inviteTraceId}] writer provisioning complete elapsedMs=${Date.now() - provisionStartedAt}`
+          )
         } catch (error) {
           const inviteePreview = normalizedInvitee ? `${normalizedInvitee.slice(0, 12)}…` : 'unknown'
-          this.log('warn', `Failed to provision writer for invitee ${inviteePreview}: ${error instanceof Error ? error.message : String(error)}`)
+          this.log(
+            'warn',
+            `[invite-send:${inviteTraceId}] failed to provision writer for invitee ${inviteePreview} elapsedMs=${Date.now() - provisionStartedAt}: ${error instanceof Error ? error.message : String(error)}`
+          )
         }
       }
 
@@ -4046,6 +4104,18 @@ export class TuiController {
       const fastForward = writerProvision?.fastForward && typeof writerProvision.fastForward === 'object'
         ? writerProvision.fastForward
         : null
+      const hasClosedWriterMaterial = Boolean(writerSecret || writerLeaseEnvelope)
+      if (!isOpenGroup) {
+        this.log(
+          'info',
+          `[invite-send:${inviteTraceId}] closed writer material writerSecret=${writerSecret ? 'yes' : 'no'} leaseEnvelope=${writerLeaseEnvelope ? 'yes' : 'no'} writerCore=${writerCore ? 'yes' : 'no'} writerCoreHex=${writerCoreHex ? 'yes' : 'no'}`
+        )
+      }
+      if (!isOpenGroup && !hasClosedWriterMaterial) {
+        throw new Error(
+          'Closed invite provisioning incomplete: missing writerSecret/writerLeaseEnvelope; invite not sent'
+        )
+      }
 
       const mergedCores = new Map<string, { key: string; role?: string | null }>()
       const upsertCore = (key: string, role?: string | null): void => {
@@ -4115,6 +4185,7 @@ export class TuiController {
           : this.searchableRelayUrls(),
         encrypt: (pubkey, plaintext) => nip04Encrypt(session.nsecHex, pubkey, plaintext)
       })
+      this.log('info', `[invite-send:${inviteTraceId}] published elapsedMs=${Date.now() - inviteSendStartedAt}`)
     })
   }
 

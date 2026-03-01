@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcess } from 'node:child_process'
 import path from 'node:path'
@@ -40,6 +40,12 @@ function normalizeTimeout(timeoutMs: number): number {
   return Math.max(1_000, Math.min(Math.trunc(timeoutMs), 300_000))
 }
 
+const STOP_WAIT_FOR_EXIT_MS = 8_000
+const STOP_SIGTERM_GRACE_MS = 4_000
+const STOP_SIGKILL_GRACE_MS = 1_500
+const STARTUP_ORPHAN_TERM_GRACE_MS = 2_500
+const STARTUP_ORPHAN_KILL_GRACE_MS = 1_500
+
 function resolveWorkerEntry(config: WorkerStartConfig): string {
   if (config.workerEntry) return config.workerEntry
   return path.join(config.workerRoot, 'index.js')
@@ -74,15 +80,24 @@ export class WorkerHost {
   private pendingRequests = new Map<string, PendingRequest>()
   private emitter = new EventEmitter()
   private parentExitHooksInstalled = false
+  private stopInFlight: Promise<void> | null = null
 
   private installParentExitHooks(): void {
     if (this.parentExitHooksInstalled) return
     this.parentExitHooksInstalled = true
 
     const shutdownChild = (): void => {
-      if (!this.workerProcess) return
+      const proc = this.workerProcess
+      if (!proc) return
+      if (typeof proc.send === 'function' && proc.connected) {
+        try {
+          proc.send({ type: 'shutdown' })
+        } catch {
+          // ignore
+        }
+      }
       try {
-        this.workerProcess.kill('SIGTERM')
+        proc.kill('SIGTERM')
       } catch {
         // ignore
       }
@@ -129,6 +144,13 @@ export class WorkerHost {
         this.currentWorkerUserKey = config.config.userKey
         return { success: true, alreadyRunning: true, configSent: true }
       }
+    }
+
+    try {
+      await this.cleanupOrphanedWorkers(workerEntry, config.config.userKey)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      this.emitter.emit('stderr', `[WorkerHost] Startup orphan worker cleanup failed: ${detail}`)
     }
 
     const workerProcess = spawn(process.execPath, [workerEntry], {
@@ -196,16 +218,52 @@ export class WorkerHost {
 
   async stop(): Promise<void> {
     if (!this.workerProcess) return
+    if (this.stopInFlight) {
+      await this.stopInFlight
+      return
+    }
 
     const proc = this.workerProcess
-    this.workerProcess = null
-    this.currentWorkerUserKey = null
+
+    this.stopInFlight = (async () => {
+      try {
+        if (typeof proc.send === 'function' && proc.connected) {
+          try {
+            proc.send({ type: 'shutdown' })
+          } catch {
+            // ignore
+          }
+        }
+
+        let exited = await this.waitForProcessExit(proc, STOP_WAIT_FOR_EXIT_MS)
+        if (!exited) {
+          try {
+            proc.kill('SIGTERM')
+          } catch {
+            // ignore
+          }
+          exited = await this.waitForProcessExit(proc, STOP_SIGTERM_GRACE_MS)
+        }
+
+        if (!exited) {
+          try {
+            proc.kill('SIGKILL')
+          } catch {
+            // ignore
+          }
+          await this.waitForProcessExit(proc, STOP_SIGKILL_GRACE_MS)
+        }
+      } finally {
+        this.workerProcess = null
+        this.currentWorkerUserKey = null
+        this.rejectPendingWorkerRequests('Worker stopped')
+      }
+    })()
 
     try {
-      proc.removeAllListeners()
-      proc.kill()
+      await this.stopInFlight
     } finally {
-      this.rejectPendingWorkerRequests('Worker stopped')
+      this.stopInFlight = null
     }
   }
 
@@ -303,6 +361,158 @@ export class WorkerHost {
 
   isRunning(): boolean {
     return !!this.workerProcess
+  }
+
+  private async waitForProcessExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
+    if (proc.exitCode !== null || proc.signalCode !== null) return true
+
+    const timeout = Math.max(250, Math.min(Math.trunc(timeoutMs || 0), 60_000))
+    return await new Promise<boolean>((resolve) => {
+      let settled = false
+
+      const finish = (result: boolean): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        proc.off('exit', onExit)
+        proc.off('close', onClose)
+        resolve(result)
+      }
+
+      const onExit = (): void => finish(true)
+      const onClose = (): void => finish(true)
+
+      const timer = setTimeout(() => finish(false), timeout)
+      proc.once('exit', onExit)
+      proc.once('close', onClose)
+    })
+  }
+
+  private async cleanupOrphanedWorkers(workerEntry: string, userKey: string): Promise<void> {
+    if (process.platform !== 'linux') return
+    if (!existsSync('/proc')) return
+
+    const normalizedWorkerEntry = path.resolve(workerEntry)
+    const procEntries = readdirSync('/proc', { withFileTypes: true })
+
+    for (const entry of procEntries) {
+      if (!entry.isDirectory()) continue
+      if (!/^\d+$/.test(entry.name)) continue
+
+      const pid = Number.parseInt(entry.name, 10)
+      if (!Number.isFinite(pid) || pid <= 1 || pid === process.pid) continue
+
+      const cmdline = this.readProcCmdline(pid)
+      if (!cmdline || !this.isWorkerEntryMatch(cmdline, normalizedWorkerEntry)) continue
+
+      const candidateUserKey = this.readProcEnvVar(pid, 'USER_KEY')
+      if (candidateUserKey && candidateUserKey !== userKey) continue
+
+      const ppid = this.readProcParentPid(pid)
+      if (!this.isOrphanProcess(ppid)) continue
+
+      this.emitter.emit(
+        'stderr',
+        `[WorkerHost] Cleaning orphaned worker pid=${pid} ppid=${ppid ?? 'unknown'}`
+      )
+      this.terminatePid(pid, 'SIGTERM')
+
+      let exited = await this.waitForPidExit(pid, STARTUP_ORPHAN_TERM_GRACE_MS)
+      if (!exited) {
+        this.terminatePid(pid, 'SIGKILL')
+        exited = await this.waitForPidExit(pid, STARTUP_ORPHAN_KILL_GRACE_MS)
+      }
+
+      if (!exited) {
+        this.emitter.emit(
+          'stderr',
+          `[WorkerHost] Failed to terminate orphaned worker pid=${pid}`
+        )
+      }
+    }
+  }
+
+  private readProcCmdline(pid: number): string[] | null {
+    try {
+      const raw = readFileSync(`/proc/${pid}/cmdline`)
+      if (!raw.length) return null
+      const tokens = raw
+        .toString('utf8')
+        .split('\0')
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0)
+      return tokens.length > 0 ? tokens : null
+    } catch {
+      return null
+    }
+  }
+
+  private readProcEnvVar(pid: number, key: string): string | null {
+    try {
+      const raw = readFileSync(`/proc/${pid}/environ`)
+      if (!raw.length) return null
+      const prefix = `${key}=`
+      for (const entry of raw.toString('utf8').split('\0')) {
+        if (!entry.startsWith(prefix)) continue
+        const value = entry.slice(prefix.length)
+        return value || null
+      }
+      return null
+    } catch {
+      return null
+    }
+  }
+
+  private readProcParentPid(pid: number): number | null {
+    try {
+      const status = readFileSync(`/proc/${pid}/status`, 'utf8')
+      const match = status.match(/^PPid:\s+(\d+)$/m)
+      if (!match) return null
+      const parsed = Number.parseInt(match[1], 10)
+      return Number.isFinite(parsed) ? parsed : null
+    } catch {
+      return null
+    }
+  }
+
+  private isWorkerEntryMatch(cmdline: string[], workerEntry: string): boolean {
+    for (let index = 1; index < cmdline.length; index += 1) {
+      const arg = cmdline[index]
+      if (!arg || !path.isAbsolute(arg)) continue
+      if (path.resolve(arg) === workerEntry) return true
+    }
+    return false
+  }
+
+  private isOrphanProcess(ppid: number | null): boolean {
+    if (!ppid || ppid <= 1) return true
+    return !this.isPidAlive(ppid)
+  }
+
+  private isPidAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  private terminatePid(pid: number, signal: NodeJS.Signals): void {
+    try {
+      process.kill(pid, signal)
+    } catch {
+      // ignore
+    }
+  }
+
+  private async waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + Math.max(250, Math.trunc(timeoutMs))
+    while (Date.now() < deadline) {
+      if (!this.isPidAlive(pid)) return true
+      await new Promise<void>((resolve) => setTimeout(resolve, 100))
+    }
+    return !this.isPidAlive(pid)
   }
 
   private resolveWorkerRequest(message: unknown): boolean {

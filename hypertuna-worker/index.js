@@ -789,6 +789,15 @@ async function syncActiveRelayCoreRefs({
   writerCoreRefs = [],
   reason = 'mirror-update'
 } = {}) {
+  const isFastWriterSyncReason = (() => {
+    const normalizedReason = typeof reason === 'string' ? reason.trim().toLowerCase() : ''
+    if (!normalizedReason) return false
+    if (normalizedReason === 'closed-join-pool') return true
+    if (normalizedReason === 'invite-writer') return true
+    if (normalizedReason === 'invite-fallback') return true
+    if (normalizedReason === 'invite-direct') return true
+    return normalizedReason.startsWith('invite-')
+  })()
   const normalized = normalizeCoreRefList(coreRefs)
   const writerTargets = normalizeCoreRefList(writerCoreRefs)
   const writerRefsResolved = writerTargets.length ? writerTargets : normalized
@@ -904,10 +913,23 @@ async function syncActiveRelayCoreRefs({
       coreRefs: normalized,
       corestore: relayCorestore
     })
+    if (isFastWriterSyncReason) {
+      console.log('[Worker] Mirror sync fast-path enabled', {
+        relayKey,
+        reason,
+        coreRefsCount: normalized.length,
+        writerRefsCount: writerRefsResolved.length
+      })
+    }
   }
 
   let primeSummary = null
-  if (manager?.started && typeof manager.primeRelayCoreRefs === 'function' && !coreRefsAlreadySynced) {
+  if (
+    manager?.started
+    && typeof manager.primeRelayCoreRefs === 'function'
+    && !coreRefsAlreadySynced
+    && !isFastWriterSyncReason
+  ) {
     primeSummary = await manager.primeRelayCoreRefs({
       relayKey,
       publicIdentifier: identifier,
@@ -918,7 +940,7 @@ async function syncActiveRelayCoreRefs({
     })
   }
 
-  const rehydrateSummary = manager?.started && !coreRefsAlreadySynced
+  const rehydrateSummary = manager?.started && !coreRefsAlreadySynced && !isFastWriterSyncReason
     ? await rehydrateMirrorsWithRetry(manager, {
       reason,
       timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS,
@@ -930,12 +952,14 @@ async function syncActiveRelayCoreRefs({
   const writerSummary = await ensureRelayWritersFromCoreRefs(relayManager, writerRefsResolved, reason)
 
   if (writerSummary?.status === 'ok' || writerSummary?.status === 'read-only') {
-    relayMirrorSyncState.set(relayKey, fingerprint)
+    if (!isFastWriterSyncReason || coreRefsAlreadySynced) {
+      relayMirrorSyncState.set(relayKey, fingerprint)
+    }
     if (writerFingerprint) {
       relayMirrorWriterSyncState.set(relayKey, writerFingerprint)
     }
   }
-  return { status: 'ok', primeSummary, rehydrateSummary, writerSummary }
+  return { status: 'ok', primeSummary, rehydrateSummary, writerSummary, fastPath: isFastWriterSyncReason }
 }
 
 function sanitizeBlindPeerMeta(blindPeer) {
@@ -1383,7 +1407,8 @@ async function ensureClosedJoinWriterPool({
   needed = null,
   targetSize = CLOSED_JOIN_POOL_TARGET_SIZE,
   mode = 'provision',
-  inviteePubkey = null
+  inviteePubkey = null,
+  inviteTraceId = null
 } = {}) {
   const normalizedRelayKey = normalizeRelayKeyHex(relayKey)
   const normalizedPublicIdentifier = typeof publicIdentifier === 'string' ? publicIdentifier.trim() : null
@@ -1400,6 +1425,7 @@ async function ensureClosedJoinWriterPool({
     requestIdentifier,
     relayKey: normalizedRelayKey || relayKey || null,
     publicIdentifier: normalizedPublicIdentifier || publicIdentifier || null,
+    trace: inviteTraceId || null,
     invitee: previewValue(inviteePubkey, 16),
     mode,
     requestedCount,
@@ -1425,6 +1451,7 @@ async function ensureClosedJoinWriterPool({
     canonicalRelayKey: previewValue(canonicalRelayKey, 16),
     canonicalPublicIdentifier,
     poolKey: previewValue(poolKey, 16),
+    trace: inviteTraceId || null,
     profileRelayKey: previewValue(profile?.relay_key || profile?.relayKey || null, 16),
     profilePublicIdentifier: profile?.public_identifier || profile?.publicIdentifier || null,
     profileIsOpen: profile?.isOpen ?? null,
@@ -1522,7 +1549,9 @@ async function ensureClosedJoinWriterPool({
         relayKey: canonicalRelayKey || relayKey,
         publicIdentifier: canonicalPublicIdentifier || publicIdentifier,
         skipUpdateWait: true,
-        reason: 'closed-join-pool'
+        reason: 'closed-join-pool',
+        inviteePubkey,
+        inviteTraceId
       })
       const writerCore = provision?.writerCore || null
       const writerCoreHex = provision?.writerCoreHex || provision?.autobaseLocal || null
@@ -1591,7 +1620,8 @@ async function ensureClosedJoinWriterPool({
 async function claimClosedJoinWriterPoolEntry({
   relayKey,
   publicIdentifier,
-  inviteePubkey = null
+  inviteePubkey = null,
+  inviteTraceId = null
 } = {}) {
   const normalizedRelayKey = normalizeRelayKeyHex(relayKey)
   const normalizedPublicIdentifier = typeof publicIdentifier === 'string' ? publicIdentifier.trim() : null
@@ -1603,7 +1633,8 @@ async function claimClosedJoinWriterPoolEntry({
     publicIdentifier: normalizedPublicIdentifier || publicIdentifier,
     needed: 1,
     mode: 'claim',
-    inviteePubkey
+    inviteePubkey,
+    inviteTraceId
   })
   const cached = await getRelayWriterPool(poolKey)
   const entries = pruneWriterPoolEntries(cached.entries, Date.now())
@@ -1624,7 +1655,8 @@ async function claimClosedJoinWriterPoolEntry({
       publicIdentifier: normalizedPublicIdentifier || publicIdentifier,
       needed: Math.max(CLOSED_JOIN_POOL_TARGET_SIZE - entries.length, 0),
       mode: 'top-up',
-      inviteePubkey
+      inviteePubkey,
+      inviteTraceId
     }).catch((error) => {
       console.warn('[Worker] Closed join pool top-up failed', {
         poolKey: previewValue(poolKey, 16),
@@ -3014,6 +3046,11 @@ function getGatewayLogs() {
 // Variable to store the relay server module
 let relayServer = null
 let isShuttingDown = false
+const SHUTDOWN_FORCE_EXIT_MS = Math.max(
+  1_000,
+  Number.parseInt(process.env.WORKER_SHUTDOWN_FORCE_EXIT_MS || '15000', 10) || 15_000
+)
+let shutdownPromise = null
 // Map of relayKey -> members array
 const relayMembers = new Map()
 const relayMemberAdds = new Map()
@@ -5565,12 +5602,10 @@ async function handleMessageObject(message) {
 
     case 'shutdown':
       console.log('[Worker] Shutdown requested')
-      isShuttingDown = true
       sendWorkerStatus('stopping', 'Shutting down...', {
         statePatch: { app: { shuttingDown: true } }
       })
-      await cleanup()
-      process.exit(0)
+      await shutdownAndExit(0, 'parent-command')
       break
 
     case 'config':
@@ -6714,6 +6749,32 @@ async function handleMessageObject(message) {
             hasFastForward: !!fastForward,
             gatewayMode
           })
+          const hasClosedWriterMaterial = Boolean(
+            writerSecret
+            || writerLeaseEnvelope?.writerSecret
+            || writerLeaseEnvelope
+          )
+          const hasVerifiedClosedDirectPath = Boolean(
+            selectedDirectCandidate
+            && (selectedDirectCandidate.mode === 'direct-challenge' || selectedDirectCandidate.mode === 'lease-claim')
+          )
+          if (
+            joinDirectDiscoveryV2
+            && !openJoin
+            && !!inviteToken
+            && !hasClosedWriterMaterial
+            && !hasVerifiedClosedDirectPath
+          ) {
+            console.warn('[Worker] Closed join guard: no writer material and no verified direct candidate', {
+              publicIdentifier,
+              relayKey: previewValue(joinRelayKey, 16),
+              hostPeersCount: hostPeers.length,
+              leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
+              hasBlindPeer: !!blindPeer?.publicKey,
+              gatewayMode
+            })
+            throw new Error('no-writer-path: closed invite missing writer material and no verified direct candidate')
+          }
 
           const buildJoinAuthPayload = (overrides = {}) => ({
             ...data,
@@ -6756,10 +6817,32 @@ async function handleMessageObject(message) {
           let joinAuthResult = await runStartJoinAuthentication(buildJoinAuthPayload())
           if (joinAuthResult?.ok === false) {
             const joinAuthError = String(joinAuthResult?.error || '')
+            const closedJoinPending =
+              joinAuthResult?.code === 'closed-join-pending'
+              || /closed-join-pending/i.test(joinAuthError)
             const requestTimedOut =
               joinAuthResult?.code === 'request-timeout'
               || /request timeout/i.test(joinAuthError)
               || /timeout/i.test(joinAuthError)
+            if (closedJoinPending) {
+              console.warn('[Worker] Closed join host returned pending', {
+                publicIdentifier,
+                relayKey: previewValue(joinRelayKey, 16),
+                selectedMode: selectedDirectCandidate?.mode || null,
+                selectedPeer: selectedDirectCandidate?.peerKey || null,
+                hasWriterSecret: !!writerSecret,
+                hasWriterLeaseEnvelope: !!writerLeaseEnvelope
+              })
+            }
+            if (
+              closedJoinPending
+              && joinDirectDiscoveryV2
+              && !!inviteToken
+              && !openJoin
+              && !(writerSecret || writerLeaseEnvelope)
+            ) {
+              throw new Error('no-writer-path: closed join pending and invite lacks writer material')
+            }
             const directPathLocked = !!selectedDirectCandidate?.peerKey
             const shouldRetryOpenFallback =
               requestTimedOut
@@ -6934,11 +7017,25 @@ async function handleMessageObject(message) {
     case 'provision-writer-for-invitee':
       try {
         const requestData = message?.data || {}
+        const provisionStartedAt = Date.now()
+        const inviteTraceId = typeof requestData?.inviteTraceId === 'string'
+          ? requestData.inviteTraceId.trim()
+          : null
+        const requireWriterMaterial = requestData?.requireWriterMaterial === true
+        const provisionTrace = inviteTraceId || message?.requestId || `provision-${Date.now().toString(36)}`
+        const timing = {
+          poolClaimMs: null,
+          directProvisionMs: null,
+          leaseEnvelopeMs: null,
+          totalMs: null
+        }
         console.log('[Worker] Provision writer requested', {
+          trace: provisionTrace,
           relayKey: previewValue(requestData.relayKey, 16),
           publicIdentifier: requestData.publicIdentifier || null,
           invitee: previewValue(requestData.inviteePubkey, 16),
-          useWriterPool: requestData.useWriterPool !== false
+          useWriterPool: requestData.useWriterPool !== false,
+          requireWriterMaterial
         })
         const requestId = message?.requestId
         if (!relayServer?.provisionWriterForInvitee) throw new Error('Relay server unavailable')
@@ -6946,11 +7043,14 @@ async function handleMessageObject(message) {
         let poolResult = null
         let result = null
         if (requestData.useWriterPool !== false) {
+          const poolClaimStartedAt = Date.now()
           poolResult = await claimClosedJoinWriterPoolEntry({
             relayKey,
             publicIdentifier: requestData.publicIdentifier || null,
-            inviteePubkey: requestData.inviteePubkey || null
+            inviteePubkey: requestData.inviteePubkey || null,
+            inviteTraceId: provisionTrace
           })
+          timing.poolClaimMs = Date.now() - poolClaimStartedAt
           if (poolResult?.entry) {
             result = {
               relayKey: relayKey || null,
@@ -6959,11 +7059,13 @@ async function handleMessageObject(message) {
           }
         }
         if (!result) {
+          const directProvisionStartedAt = Date.now()
           result = await relayServer.provisionWriterForInvitee({
             ...(message.data || {}),
             relayKey,
             reason: requestData.useWriterPool === false ? 'invite-direct' : 'invite-fallback'
           })
+          timing.directProvisionMs = Date.now() - directProvisionStartedAt
         }
 
         const resolvedRelayKey = result?.relayKey || relayKey || null
@@ -6987,6 +7089,7 @@ async function handleMessageObject(message) {
         ) {
           const tokenHash = computeLeaseTokenHash(resolvedRelayKey, inviteToken)
           if (tokenHash) {
+            const leaseEnvelopeStartedAt = Date.now()
             const leaseCoreRefs = normalizeCoreRefList([
               ...poolCoreRefs,
               result?.writerCoreHex || result?.autobaseLocal || result?.writerCore || null
@@ -7045,7 +7148,12 @@ async function handleMessageObject(message) {
                 })
               }).catch(() => {})
             }
+            timing.leaseEnvelopeMs = Date.now() - leaseEnvelopeStartedAt
           }
+        }
+        const hasWriterMaterial = Boolean(result?.writerSecret || writerLeaseEnvelope?.writerSecret || writerLeaseEnvelope)
+        if (requireWriterMaterial && !hasWriterMaterial) {
+          throw new Error('writer-provision-incomplete: missing writerSecret and writerLeaseEnvelope')
         }
         const responsePayload = {
           ...(result || {}),
@@ -7057,6 +7165,19 @@ async function handleMessageObject(message) {
           leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : null,
           writerIssuerPubkey: writerLeaseEnvelope?.issuerPubkey || null
         }
+        timing.totalMs = Date.now() - provisionStartedAt
+        console.info('[Worker] Provision writer result', {
+          trace: provisionTrace,
+          relayKey: previewValue(resolvedRelayKey, 16),
+          invitee: previewValue(normalizedInviteePubkey, 16),
+          source: poolResult?.entry ? 'writer-pool' : 'relay-provision',
+          hasWriterSecret: !!result?.writerSecret,
+          hasWriterLeaseEnvelope: !!writerLeaseEnvelope,
+          hasWriterCore: !!(result?.writerCore || result?.writerCoreHex || result?.autobaseLocal),
+          poolAvailable: poolResult?.pool?.available ?? null,
+          leaseReplicaPeerCount: Array.isArray(leaseReplicaPeerKeys) ? leaseReplicaPeerKeys.length : 0,
+          timing
+        })
 
         sendMessage({ type: 'provision-writer-for-invitee:result', requestId, data: responsePayload })
         sendWorkerResponse(requestId, { success: true, data: responsePayload })
@@ -7114,6 +7235,18 @@ async function handleMessageObject(message) {
         return result
       } catch (err) {
         const errorMessage = err?.message || String(err)
+        const requestData = message?.data || {}
+        const inviteTraceId = typeof requestData?.inviteTraceId === 'string'
+          ? requestData.inviteTraceId.trim()
+          : null
+        const provisionTrace = inviteTraceId || message?.requestId || `provision-${Date.now().toString(36)}`
+        console.warn('[Worker] Provision writer failed', {
+          trace: provisionTrace,
+          relayKey: previewValue(requestData?.relayKey, 16),
+          publicIdentifier: requestData?.publicIdentifier || null,
+          invitee: previewValue(requestData?.inviteePubkey, 16),
+          error: errorMessage
+        })
         sendMessage({
           type: 'provision-writer-for-invitee:error',
           requestId: message?.requestId,
@@ -7503,8 +7636,7 @@ if (workerPipe) {
   // Handle pipe close
   workerPipe.on('close', () => {
     console.log('[Worker] Pipe closed by parent')
-    isShuttingDown = true
-    cleanup().then(() => process.exit(0))
+    void shutdownAndExit(0, 'pipe-close')
   })
   
   // Handle pipe error
@@ -7524,29 +7656,57 @@ if (workerPipe) {
 
   process.on('disconnect', () => {
     console.log('[Worker] Parent process disconnected')
-    isShuttingDown = true
-    cleanup().then(() => process.exit(0))
+    void shutdownAndExit(0, 'parent-disconnect')
   })
 }
 
-// Setup teardown handler
-const handleShutdownSignal = async () => {
-  if (isShuttingDown) return
-  console.log('[Worker] Teardown initiated')
-  isShuttingDown = true
-  await cleanup()
-  process.exit(0)
+async function shutdownAndExit(exitCode = 0, reason = 'shutdown') {
+  if (shutdownPromise) return shutdownPromise
+
+  shutdownPromise = (async () => {
+    if (!isShuttingDown) {
+      console.log(`[Worker] Teardown initiated (${reason})`)
+    } else {
+      console.log(`[Worker] Shutdown already in progress (${reason})`)
+    }
+
+    isShuttingDown = true
+
+    const forceExitTimer = setTimeout(() => {
+      console.error(`[Worker] Forced exit after ${SHUTDOWN_FORCE_EXIT_MS}ms (${reason})`)
+      process.exit(exitCode === 0 ? 1 : exitCode)
+    }, SHUTDOWN_FORCE_EXIT_MS)
+    forceExitTimer.unref?.()
+
+    try {
+      await cleanup()
+    } catch (error) {
+      console.error('[Worker] Cleanup failed during shutdown:', error)
+    } finally {
+      clearTimeout(forceExitTimer)
+    }
+
+    process.exit(exitCode)
+  })()
+
+  return shutdownPromise
 }
 
-process.on('SIGTERM', handleShutdownSignal)
-process.on('SIGINT', handleShutdownSignal)
+// Setup teardown handler
+const handleShutdownSignal = async (signalName = 'signal') => {
+  await shutdownAndExit(0, signalName)
+}
+
+process.on('SIGTERM', () => {
+  void handleShutdownSignal('SIGTERM')
+})
+process.on('SIGINT', () => {
+  void handleShutdownSignal('SIGINT')
+})
 
 if (pearRuntime?.teardown) {
   pearRuntime.teardown(async () => {
-    if (isShuttingDown) return
-    console.log('[Worker] Pear teardown received')
-    isShuttingDown = true
-    await cleanup()
+    await shutdownAndExit(0, 'pear-teardown')
   })
 }
 
@@ -7861,6 +8021,37 @@ async function main() {
         gatewayService?.setOwnPeerPublicKey(derivedSwarmKey)
       }
 
+	      // Mark worker "ready" as soon as relay server is initialized. Stored relay
+	      // auto-connect and gateway startup continue in background and publish updates.
+	      if (!isShuttingDown) {
+	        sendMessage({
+	          type: 'status',
+	          message: 'Relay server initialized (syncing relays in background)',
+	          initialized: true,
+	          config: {
+	            port: config.port,
+	            proxy_server_address: config.proxy_server_address,
+	            gatewayUrl: config.gatewayUrl,
+	            registerWithGateway: config.registerWithGateway,
+	            relayCount: 0,
+	            mode: 'hyperswarm',
+	            gatewayReady: false
+	          }
+	        })
+	        sendWorkerStatus('ready', 'Relay server initialized (background relay sync in progress)', {
+	          legacy: { initialized: true },
+	          statePatch: {
+	            app: { initialized: true },
+	            gateway: { ready: false, running: false },
+	            relays: {
+	              expected: expectedRelayCount,
+	              active: 0
+	            }
+	          }
+	        })
+	        console.log('[Worker] Sent early ready status; auto-connect continuing in background')
+	      }
+
 	      const gatewayReadyPromise = (async () => {
 	        try {
 	          console.log('[Worker] Starting gateway service before auto-connecting relays...')
@@ -7898,64 +8089,79 @@ async function main() {
 	        }
 	      })()
 
-      const [connectedRelaysRaw, gatewayReadyResult] = await Promise.all([connectRelaysPromise, gatewayReadyPromise])
-      const connectedRelays = Array.isArray(connectedRelaysRaw) ? connectedRelaysRaw : []
-      const gatewayReady = !!gatewayReadyResult
+	      void (async () => {
+	        const [connectedRelaysResult, gatewayReadyResult] = await Promise.allSettled([connectRelaysPromise, gatewayReadyPromise])
+	        const connectedRelays = connectedRelaysResult.status === 'fulfilled' && Array.isArray(connectedRelaysResult.value)
+	          ? connectedRelaysResult.value
+	          : []
+	        const gatewayReady = gatewayReadyResult.status === 'fulfilled'
+	          ? !!gatewayReadyResult.value
+	          : false
 
-      if (Array.isArray(connectedRelays)) {
-        config.relays = connectedRelays
-      }
+	        if (connectedRelaysResult.status === 'rejected') {
+	          console.warn('[Worker] Stored relay auto-connect failed in background:', connectedRelaysResult.reason?.message || connectedRelaysResult.reason)
+	        }
+	        if (gatewayReadyResult.status === 'rejected') {
+	          console.warn('[Worker] Gateway startup failed in background:', gatewayReadyResult.reason?.message || gatewayReadyResult.reason)
+	        }
 
-      try {
-        const relaysSnapshot = await relayServer.getActiveRelays()
-        const relaysAuth = await addAuthInfoToRelays(relaysSnapshot)
-        console.log('[Worker][relay-update][auto-connect-complete] sending', relaysAuth.map(r => ({
-          relayKey: r.relayKey,
-          publicIdentifier: r.publicIdentifier,
-          connectionUrl: r.connectionUrl,
-          userAuthToken: r.userAuthToken,
-          requiresAuth: r.requiresAuth
-        })))
-        await syncGatewayPeerMetadata('auto-connect-complete', { relays: relaysAuth })
-        sendMessage({
-          type: 'relay-update',
-          relays: addMembersToRelays(relaysAuth)
-        })
-      } catch (syncError) {
-        console.warn('[Worker] Gateway metadata sync failed (auto-connect-complete):', syncError?.message || syncError)
-      }
+	        if (Array.isArray(connectedRelays)) {
+	          config.relays = connectedRelays
+	        }
 
-	      if (!isShuttingDown) {
-	        sendMessage({
-	          type: 'status',
-	          message: 'Relay server running with Hyperswarm',
-	          initialized: true,
-	          config: {
-	            port: config.port,
-	            proxy_server_address: config.proxy_server_address,
-	            gatewayUrl: config.gatewayUrl,
-	            registerWithGateway: config.registerWithGateway,
-	            relayCount: Array.isArray(connectedRelays) ? connectedRelays.length : (config.relays?.length || 0),
-	            mode: 'hyperswarm',
-	            gatewayReady
-	          }
-	        })
-	        sendWorkerStatus('ready', 'Relay server running with Hyperswarm', {
-	          legacy: { initialized: true },
-	          statePatch: {
-	            app: { initialized: true },
-	            gateway: { ready: gatewayReady, running: gatewayReady },
-	            relays: {
-	              expected: expectedRelayCount,
-	              active: Array.isArray(connectedRelays) ? connectedRelays.length : 0
+	        try {
+	          const relaysSnapshot = await relayServer.getActiveRelays()
+	          const relaysAuth = await addAuthInfoToRelays(relaysSnapshot)
+	          console.log('[Worker][relay-update][auto-connect-complete] sending', relaysAuth.map(r => ({
+	            relayKey: r.relayKey,
+	            publicIdentifier: r.publicIdentifier,
+	            connectionUrl: r.connectionUrl,
+	            userAuthToken: r.userAuthToken,
+	            requiresAuth: r.requiresAuth
+	          })))
+	          await syncGatewayPeerMetadata('auto-connect-complete', { relays: relaysAuth })
+	          sendMessage({
+	            type: 'relay-update',
+	            relays: addMembersToRelays(relaysAuth)
+	          })
+	        } catch (syncError) {
+	          console.warn('[Worker] Gateway metadata sync failed (auto-connect-complete):', syncError?.message || syncError)
+	        }
+
+	        if (!isShuttingDown) {
+	          sendMessage({
+	            type: 'status',
+	            message: 'Relay server running with Hyperswarm',
+	            initialized: true,
+	            config: {
+	              port: config.port,
+	              proxy_server_address: config.proxy_server_address,
+	              gatewayUrl: config.gatewayUrl,
+	              registerWithGateway: config.registerWithGateway,
+	              relayCount: Array.isArray(connectedRelays) ? connectedRelays.length : (config.relays?.length || 0),
+	              mode: 'hyperswarm',
+	              gatewayReady
 	            }
-	          }
-	        })
-	
-	        console.log('[Worker] Sent status message with initialized=true')
-	      }
+	          })
+	          sendWorkerStatus('ready', 'Relay server running with Hyperswarm', {
+	            legacy: { initialized: true },
+	            statePatch: {
+	              app: { initialized: true },
+	              gateway: { ready: gatewayReady, running: gatewayReady },
+	              relays: {
+	                expected: expectedRelayCount,
+	                active: Array.isArray(connectedRelays) ? connectedRelays.length : 0
+	              }
+	            }
+	          })
 
-	    } catch (error) {
+	          console.log('[Worker] Sent status message with initialized=true (auto-connect complete)')
+	        }
+	      })().catch((backgroundError) => {
+	        console.warn('[Worker] Background startup pipeline failed:', backgroundError?.message || backgroundError)
+	      })
+
+		    } catch (error) {
 	      console.error('[Worker] Failed to start relay server:', error)
 	      console.log('[Worker] Make sure pear-relay-server.mjs is in the worker directory')
 	      sendWorkerStatus('error', 'Failed to start relay server', { error })

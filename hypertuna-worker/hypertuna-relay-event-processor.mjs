@@ -164,11 +164,16 @@ export default class NostrRelay extends Autobee {
     const key = queueKey || 'unknown';
     const previous = this.subscriptionWriteQueue.get(key) || Promise.resolve();
     const next = previous.catch(() => null).then(task);
-    this.subscriptionWriteQueue.set(key, next.finally(() => {
-      if (this.subscriptionWriteQueue.get(key) === next) {
-        this.subscriptionWriteQueue.delete(key);
-      }
-    }));
+    // Store a non-rejecting queue tail so shutdown-time append failures do not
+    // become unhandled promise rejections when the tail is not awaited directly.
+    const queueTail = next
+      .catch(() => null)
+      .finally(() => {
+        if (this.subscriptionWriteQueue.get(key) === queueTail) {
+          this.subscriptionWriteQueue.delete(key);
+        }
+      });
+    this.subscriptionWriteQueue.set(key, queueTail);
     return next;
   }
 

@@ -7097,8 +7097,21 @@ export async function startJoinAuthentication(options) {
 }
 
 export async function provisionWriterForInvitee(options = {}) {
+  const provisionStartedAt = Date.now();
   const { relayKey, publicIdentifier, skipUpdateWait = false, reason = 'invite-writer' } = options;
+  const inviteTraceId = typeof options?.inviteTraceId === 'string' ? options.inviteTraceId.trim() : null;
+  const inviteePubkey = typeof options?.inviteePubkey === 'string'
+    ? options.inviteePubkey.trim().toLowerCase()
+    : null;
+  const timing = {
+    resolveRelayMs: null,
+    addWriterMs: null,
+    updateMs: null,
+    persistRefsMs: null,
+    totalMs: null
+  };
   const resolvedRelayKey = relayKey || (publicIdentifier ? await getRelayKeyFromPublicIdentifier(publicIdentifier) : null);
+  timing.resolveRelayMs = Date.now() - provisionStartedAt;
   if (!resolvedRelayKey) {
     throw new Error('relayKey or publicIdentifier is required to provision writer');
   }
@@ -7152,22 +7165,29 @@ export async function provisionWriterForInvitee(options = {}) {
 
   console.log('[RelayServer] Writing invite writer to relay', {
     relayKey: resolvedRelayKey,
+    trace: inviteTraceId || null,
+    invitee: inviteePubkey ? inviteePubkey.slice(0, 16) : null,
     writer: writerAddHex.slice(0, 16),
     writerSigner: writerHex.slice(0, 16),
     writerCoreHex: writerCoreHex ? writerCoreHex.slice(0, 16) : null,
     writable: relayManager.relay?.writable ?? null,
     skipUpdateWait
   });
+  const addWriterStartedAt = Date.now();
   await relayManager.addWriter(writerAddHex);
+  timing.addWriterMs = Date.now() - addWriterStartedAt;
   console.log('[RelayServer] Invite writer add committed', {
     relayKey: resolvedRelayKey,
+    trace: inviteTraceId || null,
     writer: writerAddHex.slice(0, 16),
     activeWriters: relayManager.relay?.activeWriters?.size ?? null,
-    viewVersion: relayManager.relay?.view?.version ?? null
+    viewVersion: relayManager.relay?.view?.version ?? null,
+    elapsedMs: timing.addWriterMs
   });
 
   try {
     if (typeof relayManager.relay?.update === 'function') {
+      const updateStartedAt = Date.now();
       const stopProgressLog = startRelayUpdateProgressLogger({
         relay: relayManager.relay,
         relayKey: resolvedRelayKey,
@@ -7191,15 +7211,24 @@ export async function provisionWriterForInvitee(options = {}) {
           stopProgressLog();
         }
       }
+      timing.updateMs = Date.now() - updateStartedAt;
+      console.log('[RelayServer] Invite writer relay update complete', {
+        relayKey: resolvedRelayKey,
+        trace: inviteTraceId || null,
+        elapsedMs: timing.updateMs,
+        skipUpdateWait
+      });
     }
   } catch (error) {
     console.warn('[RelayServer] Relay update failed after invite writer add', {
       relayKey: resolvedRelayKey,
+      trace: inviteTraceId || null,
       error: error?.message || error
     });
   }
 
   try {
+    const persistRefsStartedAt = Date.now();
     const relayIdentifier = publicIdentifier || relayManager?.publicIdentifier || null;
     const autobaseEntries = collectRelayCoreRefsFromAutobase(relayManager.relay);
     const autobaseRefs = normalizeCoreRefList(autobaseEntries);
@@ -7222,13 +7251,17 @@ export async function provisionWriterForInvitee(options = {}) {
         reason
       });
     }
+    timing.persistRefsMs = Date.now() - persistRefsStartedAt;
     console.log('[RelayServer] Persisted invite writer core refs', {
       relayKey: resolvedRelayKey,
-      coreRefs: mergedCoreRefs.length
+      trace: inviteTraceId || null,
+      coreRefs: mergedCoreRefs.length,
+      elapsedMs: timing.persistRefsMs
     });
   } catch (error) {
     console.warn('[RelayServer] Failed to persist invite writer core refs', {
       relayKey: resolvedRelayKey,
+      trace: inviteTraceId || null,
       error: error?.message || error
     });
   }
@@ -7251,8 +7284,16 @@ export async function provisionWriterForInvitee(options = {}) {
 
   console.log('[RelayServer] Provisioned writer for invitee', {
     relayKey: resolvedRelayKey,
+    trace: inviteTraceId || null,
+    invitee: inviteePubkey ? inviteePubkey.slice(0, 16) : null,
     writerCore,
     writerSecretPreview: writerSecret ? `${writerSecret.slice(0, 8)}...` : null
+  });
+  timing.totalMs = Date.now() - provisionStartedAt;
+  console.log('[RelayServer] Invite writer provisioning timing', {
+    relayKey: resolvedRelayKey,
+    trace: inviteTraceId || null,
+    timing
   });
 
   return {
