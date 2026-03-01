@@ -207,9 +207,13 @@ const JOIN_WRITABLE_BUDGET_MS = resolveTimeoutEnvMs('JOIN_WRITABLE_BUDGET_MS', 1
   minMs: 1000
 })
 const JOIN_DIRECT_DISCOVERY_V2 = isEnvEnabled(process.env.JOIN_DIRECT_DISCOVERY_V2)
+const JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT = isEnvEnabled(
+  process.env.JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT
+)
 
 console.info('[Worker] Join timing config', {
   joinDirectDiscoveryV2: JOIN_DIRECT_DISCOVERY_V2,
+  joinAllowOpenFallbackAfterDirectTimeout: JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT,
   joinTotalDeadlineMs: Number.isFinite(JOIN_TOTAL_DEADLINE_MS) ? JOIN_TOTAL_DEADLINE_MS : null,
   joinDeadlineDisabled: !Number.isFinite(JOIN_TOTAL_DEADLINE_MS),
   joinDiscoveryWindowMs: JOIN_DISCOVERY_WINDOW_MS,
@@ -6756,12 +6760,29 @@ async function handleMessageObject(message) {
               joinAuthResult?.code === 'request-timeout'
               || /request timeout/i.test(joinAuthError)
               || /timeout/i.test(joinAuthError)
+            const directPathLocked = !!selectedDirectCandidate?.peerKey
             const shouldRetryOpenFallback =
               requestTimedOut
               && openJoin
               && gatewayMode === 'auto'
               && !inviteToken
-              && !!selectedDirectCandidate?.peerKey
+              && directPathLocked
+              && JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT
+
+            if (
+              requestTimedOut
+              && openJoin
+              && gatewayMode === 'auto'
+              && !inviteToken
+              && directPathLocked
+              && !JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT
+            ) {
+              console.warn('[Worker] Direct join timed out; open-offline timeout recovery skipped due join-path lock', {
+                publicIdentifier,
+                peerKey: selectedDirectCandidate?.peerKey || null,
+                error: joinAuthResult?.error || null
+              })
+            }
 
             if (shouldRetryOpenFallback) {
               console.warn('[Worker] Direct join request timed out, retrying via open bootstrap fallback', {

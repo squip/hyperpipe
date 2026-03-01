@@ -103,6 +103,68 @@ function normalizeRelayKeyHex(value) {
   return trimmed.toLowerCase();
 }
 
+function normalizePubkeyHex(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed || !/^[0-9a-fA-F]{64}$/.test(trimmed)) return null;
+  return trimmed.toLowerCase();
+}
+
+function normalizeAuthTokenValue(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length ? trimmed : null;
+}
+
+function assertTokenOwnerMatchesExpectedPubkey({
+  relayKey,
+  publicIdentifier,
+  authToken,
+  expectedPubkey,
+  context = 'join'
+} = {}) {
+  const token = normalizeAuthTokenValue(authToken);
+  const normalizedExpectedPubkey =
+    normalizePubkeyHex(expectedPubkey) || (typeof expectedPubkey === 'string' ? expectedPubkey.trim().toLowerCase() : null);
+  if (!token || !normalizedExpectedPubkey) {
+    return { checked: false, matched: false, source: null };
+  }
+
+  const relayRefs = [];
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey) || (typeof relayKey === 'string' ? relayKey.trim() : null);
+  const normalizedIdentifier =
+    typeof publicIdentifier === 'string' && publicIdentifier.trim()
+      ? normalizeRelayIdentifier(publicIdentifier.trim()) || publicIdentifier.trim()
+      : null;
+  if (normalizedRelayKey) relayRefs.push(normalizedRelayKey);
+  if (normalizedIdentifier && !relayRefs.includes(normalizedIdentifier)) relayRefs.push(normalizedIdentifier);
+
+  if (!relayRefs.length) {
+    return { checked: false, matched: false, source: null };
+  }
+
+  const authStore = getRelayAuthStore();
+  for (const relayRef of relayRefs) {
+    const existing = authStore.verifyAuth(relayRef, token);
+    if (!existing?.pubkey) continue;
+    const tokenPubkey = normalizePubkeyHex(existing.pubkey) || String(existing.pubkey).trim().toLowerCase();
+    if (!tokenPubkey || tokenPubkey === normalizedExpectedPubkey) {
+      return { checked: true, matched: true, source: relayRef };
+    }
+    const mismatchError = new Error(
+      `auth-token-owner-mismatch (${context}) expected=${normalizedExpectedPubkey.slice(0, 8)} token=${tokenPubkey.slice(0, 8)}`
+    );
+    mismatchError.code = 'auth-token-owner-mismatch';
+    mismatchError.context = context;
+    mismatchError.relayRef = relayRef;
+    mismatchError.expectedPubkey = normalizedExpectedPubkey;
+    mismatchError.tokenPubkey = tokenPubkey;
+    throw mismatchError;
+  }
+
+  return { checked: true, matched: false, source: null };
+}
+
 export function deriveRelayDiscoveryTopic(identifier) {
   const normalized = normalizeRelayIdentifier(identifier || '');
   if (!normalized) return null;
@@ -548,6 +610,7 @@ const WRITER_LEASE_ENVELOPE_VERSION = 1;
 let pendingPeerProtocols = new Map(); // Awaiters for outbound connections
 const peerJoinHandles = new Map(); // Persistent joinPeer handles
 const writerLeaseSyncRateLimits = new Map();
+const joinAuthAttemptLocks = new Map(); // `${publicIdentifier}:${pubkey}` -> { startedAt, attemptId }
 let healthMonitorTimer = null;
 
 // Enhanced health state tracking
@@ -2557,6 +2620,14 @@ function setupProtocolHandlers(protocol) {
         internalRelayKey = resolvedKey;
       }
 
+      assertTokenOwnerMatchesExpectedPubkey({
+        relayKey: internalRelayKey,
+        publicIdentifier: canonicalIdentifier,
+        authToken: result.token,
+        expectedPubkey: pubkey,
+        context: 'verify-ownership'
+      });
+
       const authStore = getRelayAuthStore();
       authStore.addAuth(internalRelayKey, pubkey, result.token);
       if (internalRelayKey !== canonicalIdentifier) {
@@ -2567,48 +2638,70 @@ function setupProtocolHandlers(protocol) {
       if (!profile) {
         profile = await getRelayProfileByPublicIdentifier(canonicalIdentifier);
       }
-
-      if (profile) {
-        await updateRelayAuthToken(internalRelayKey, pubkey, result.token);
-        const currentAdds = profile.member_adds || [];
-        const currentRemoves = profile.member_removes || [];
-        const memberAdd = { pubkey, ts: Date.now() };
-        const existingIndex = currentAdds.findIndex(m => m.pubkey === pubkey);
-        if (existingIndex >= 0) currentAdds[existingIndex] = memberAdd;
-        else currentAdds.push(memberAdd);
-        await updateRelayMemberSets(internalRelayKey, currentAdds, currentRemoves);
-        // Do not block verify response on membership event publish latency.
-        void publishMemberAddEvent(canonicalIdentifier, pubkey, result.token).catch((publishError) => {
-          console.warn('[RelayServer] Async member add publish failed during verify', {
-            identifier: canonicalIdentifier,
-            pubkey: pubkey.substring(0, 8),
-            error: publishError?.message || publishError
-          });
-        });
-      }
-
       const relayUrl = `${buildGatewayWebsocketBase(config)}/${canonicalIdentifier.replace(':', '/')}?token=${result.token}`;
-      let writerInfo = null;
-      if (profile && profile.isOpen !== false) {
-        try {
-          writerInfo = await provisionWriterForInvitee({
-            relayKey: internalRelayKey,
-            publicIdentifier: canonicalIdentifier,
-            // Keep verify-ownership response latency low; do not block on relay.update({ wait: true }).
-            skipUpdateWait: true,
-            reason: 'open-join-verify'
-          });
-          console.log('[RelayServer] Provisioned writer for open join', {
+      const shouldProvisionWriter = Boolean(profile && profile.isOpen !== false);
+      const writerProvisionTask = shouldProvisionWriter
+        ? provisionWriterForInvitee({
+          relayKey: internalRelayKey,
+          publicIdentifier: canonicalIdentifier,
+          // Keep verify-ownership response latency low; do not block on relay.update({ wait: true }).
+          skipUpdateWait: true,
+          reason: 'open-join-verify'
+        }).then((writerInfo) => {
+          console.log('[RelayServer] Provisioned writer for open join (async verify tail)', {
             relayKey: internalRelayKey,
             publicIdentifier: canonicalIdentifier,
             writerCore: writerInfo?.writerCore ? String(writerInfo.writerCore).slice(0, 16) : null,
             writerCoreHex: writerInfo?.writerCoreHex ? String(writerInfo.writerCoreHex).slice(0, 16) : null,
             autobaseLocal: writerInfo?.autobaseLocal ? String(writerInfo.autobaseLocal).slice(0, 16) : null
           });
-        } catch (writerError) {
-          console.warn('[RelayServer] Failed to provision writer for open join', writerError?.message || writerError);
+          return writerInfo;
+        }).catch((writerError) => {
+          console.warn('[RelayServer] Failed to provision writer for open join (async verify tail)', writerError?.message || writerError);
+          return null;
+        })
+        : null;
+
+      // Keep verify-ownership latency bounded: commit membership/profile updates and
+      // open-writer provisioning in the background after returning auth success.
+      void (async () => {
+        if (profile) {
+          await updateRelayAuthToken(internalRelayKey, pubkey, result.token);
+          const currentAdds = profile.member_adds || [];
+          const currentRemoves = profile.member_removes || [];
+          const memberAdd = { pubkey, ts: Date.now() };
+          const existingIndex = currentAdds.findIndex((member) => member.pubkey === pubkey);
+          if (existingIndex >= 0) currentAdds[existingIndex] = memberAdd;
+          else currentAdds.push(memberAdd);
+          await updateRelayMemberSets(internalRelayKey, currentAdds, currentRemoves);
+          await publishMemberAddEvent(canonicalIdentifier, pubkey, result.token).catch((publishError) => {
+            console.warn('[RelayServer] Async member add publish failed during verify', {
+              identifier: canonicalIdentifier,
+              pubkey: pubkey.substring(0, 8),
+              error: publishError?.message || publishError
+            });
+          });
         }
+      })().catch((tailError) => {
+        console.warn('[RelayServer] Verify tail task failed', {
+          identifier: canonicalIdentifier,
+          pubkey: pubkey.substring(0, 8),
+          error: tailError?.message || tailError
+        });
+      });
+
+      const verifyResponseWriterWindowMs = 1200;
+      let writerInfo = null;
+      if (writerProvisionTask) {
+        writerInfo = await Promise.race([
+          writerProvisionTask,
+          new Promise((resolve) => {
+            const timer = setTimeout(() => resolve(null), verifyResponseWriterWindowMs);
+            timer.unref?.();
+          })
+        ]);
       }
+      const writerProvisionPending = shouldProvisionWriter && !writerInfo;
 
       console.log(`[RelayServer] Auth finalized successfully`);
       updateMetrics(true);
@@ -2624,7 +2717,8 @@ function setupProtocolHandlers(protocol) {
           writerCore: writerInfo?.writerCore || null,
           writerCoreHex: writerInfo?.writerCoreHex || null,
           autobaseLocal: writerInfo?.autobaseLocal || null,
-          writerSecret: writerInfo?.writerSecret || null
+          writerSecret: writerInfo?.writerSecret || null,
+          writerProvisionPending
         }))
       };
       
@@ -2635,6 +2729,15 @@ function setupProtocolHandlers(protocol) {
       console.error(`[RelayServer] Stack:`, error.stack);
       console.error(`[RelayServer] ========================================`);
       
+      if (error?.code === 'auth-token-owner-mismatch') {
+        updateMetrics(false);
+        return {
+          statusCode: 409,
+          headers: { 'content-type': 'application/json' },
+          body: b4a.from(JSON.stringify({ error: error.message, code: error.code }))
+        };
+      }
+
       updateMetrics(false);
       return {
         statusCode: 500,
@@ -5727,6 +5830,39 @@ async function createGroupJoinRequest(publicIdentifier, privateKey) {
   return NostrUtils.signEvent(event, privateKey);
 }
 
+function buildJoinAuthAttemptLockKey(publicIdentifier, userPubkey) {
+  const identifier =
+    typeof publicIdentifier === 'string' && publicIdentifier.trim().length
+      ? normalizeRelayIdentifier(publicIdentifier.trim()) || publicIdentifier.trim()
+      : null;
+  const pubkey =
+    typeof userPubkey === 'string' && userPubkey.trim().length
+      ? userPubkey.trim().toLowerCase()
+      : null;
+  if (!identifier || !pubkey) return null;
+  return `${identifier}:${pubkey}`;
+}
+
+function acquireJoinAuthAttemptLock(publicIdentifier, userPubkey) {
+  const lockKey = buildJoinAuthAttemptLockKey(publicIdentifier, userPubkey);
+  if (!lockKey) return { lockKey: null, attemptId: null, acquired: false, inFlight: false };
+  const existing = joinAuthAttemptLocks.get(lockKey);
+  if (existing?.attemptId) {
+    return { lockKey, attemptId: existing.attemptId, acquired: false, inFlight: true };
+  }
+  const attemptId = `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+  joinAuthAttemptLocks.set(lockKey, { startedAt: Date.now(), attemptId });
+  return { lockKey, attemptId, acquired: true, inFlight: false };
+}
+
+function releaseJoinAuthAttemptLock(lockKey, attemptId) {
+  if (!lockKey || !attemptId) return;
+  const current = joinAuthAttemptLocks.get(lockKey);
+  if (current?.attemptId === attemptId) {
+    joinAuthAttemptLocks.delete(lockKey);
+  }
+}
+
 async function preseedJoinMetadata({
   relayKey,
   publicIdentifier,
@@ -5953,6 +6089,22 @@ export async function startJoinAuthentication(options) {
     };
   }
 
+  const joinAttemptLock = acquireJoinAuthAttemptLock(publicIdentifier, userPubkey);
+  if (!joinAttemptLock.acquired && joinAttemptLock.inFlight) {
+    const errorMsg = 'Join authentication already in progress for this relay/user';
+    console.warn('[RelayServer] Join auth request rejected: in-flight attempt exists', {
+      publicIdentifier,
+      pubkey: userPubkey.substring(0, 8),
+      lockKey: joinAttemptLock.lockKey
+    });
+    return {
+      ok: false,
+      code: 'join-auth-in-flight',
+      error: errorMsg,
+      publicIdentifier: publicIdentifier || null
+    };
+  }
+
   try {
     // Send initial progress message to the desktop UI
     if (global.sendMessage) {
@@ -6083,6 +6235,14 @@ export async function startJoinAuthentication(options) {
         if (!writerSecret) {
           console.warn('[RelayServer] No writerSecret provided in invite; fallback join may be read-only');
         }
+
+        assertTokenOwnerMatchesExpectedPubkey({
+          relayKey: fallbackRelayKey,
+          publicIdentifier,
+          authToken: inviteToken,
+          expectedPubkey: userPubkey,
+          context: 'blind-peer-fallback'
+        });
 
         await preseedJoinMetadata({
           relayKey: fallbackRelayKey,
@@ -6451,6 +6611,14 @@ export async function startJoinAuthentication(options) {
           publicIdentifier
         });
 
+        assertTokenOwnerMatchesExpectedPubkey({
+          relayKey: fallbackRelayKey,
+          publicIdentifier,
+          authToken: provisionalToken,
+          expectedPubkey: userPubkey,
+          context: 'open-offline-fallback'
+        });
+
         await preseedJoinMetadata({
           relayKey: fallbackRelayKey,
           publicIdentifier,
@@ -6738,6 +6906,14 @@ export async function startJoinAuthentication(options) {
       throw new Error('Final response from relay host missing authToken, relayKey, or relayUrl');
     }
 
+    assertTokenOwnerMatchesExpectedPubkey({
+      relayKey,
+      publicIdentifier: finalIdentifier,
+      authToken,
+      expectedPubkey: userPubkey,
+      context: 'direct-join-verify-response'
+    });
+
     await preseedJoinMetadata({
       relayKey,
       publicIdentifier: finalIdentifier,
@@ -6870,11 +7046,13 @@ export async function startJoinAuthentication(options) {
 
   } catch (error) {
     const errorMessage = error?.message || String(error);
-    const errorCode = /timeout/i.test(errorMessage)
-      ? 'request-timeout'
-      : /closed-join-pending/i.test(errorMessage)
-        ? 'closed-join-pending'
-        : 'join-auth-failed';
+    const errorCode = error?.code === 'auth-token-owner-mismatch'
+      ? 'auth-token-owner-mismatch'
+      : /timeout/i.test(errorMessage)
+        ? 'request-timeout'
+        : /closed-join-pending/i.test(errorMessage)
+          ? 'closed-join-pending'
+          : 'join-auth-failed';
     console.error(`[RelayServer] Error during join authentication for ${publicIdentifier}:`, error);
     if (global.sendMessage) {
       global.sendMessage({
@@ -6891,6 +7069,8 @@ export async function startJoinAuthentication(options) {
       error: errorMessage,
       publicIdentifier: publicIdentifier || null
     };
+  } finally {
+    releaseJoinAuthAttemptLock(joinAttemptLock.lockKey, joinAttemptLock.attemptId);
   }
 }
 
