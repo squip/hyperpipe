@@ -55,6 +55,12 @@ const relayTokenRevocationCounter = new client.Counter({
   labelNames: ['result']
 });
 
+const openJoinPoolDepletionCounter = new client.Counter({
+  name: 'gateway_open_join_pool_depletion_total',
+  help: 'Count of open-join lease pool depletion events',
+  labelNames: ['stage']
+});
+
 const blindPeerActiveGauge = new client.Gauge({
   name: 'gateway_blind_peer_active',
   help: 'Indicates whether the blind-peer service is active (1) or disabled (0)'
@@ -102,6 +108,7 @@ register.registerMetric(relayErrorCounter);
 register.registerMetric(relayTokenIssueCounter);
 register.registerMetric(relayTokenRefreshCounter);
 register.registerMetric(relayTokenRevocationCounter);
+register.registerMetric(openJoinPoolDepletionCounter);
 register.registerMetric(blindPeerActiveGauge);
 register.registerMetric(blindPeerTrustedPeersGauge);
 register.registerMetric(blindPeerBytesGauge);
@@ -133,6 +140,7 @@ export {
   relayTokenIssueCounter,
   relayTokenRefreshCounter,
   relayTokenRevocationCounter,
+  openJoinPoolDepletionCounter,
   blindPeerActiveGauge,
   blindPeerTrustedPeersGauge,
   blindPeerBytesGauge,

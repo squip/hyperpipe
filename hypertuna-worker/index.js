@@ -210,6 +210,21 @@ const JOIN_DIRECT_DISCOVERY_V2 = isEnvEnabled(process.env.JOIN_DIRECT_DISCOVERY_
 const JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT = isEnvEnabled(
   process.env.JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT
 )
+const OPEN_JOIN_POOL_TARGET_SIZE = (() => {
+  const raw = Number(
+    process.env.OPEN_JOIN_POOL_TARGET_SIZE
+      || process.env.OPEN_JOIN_POOL_TARGET
+      || ''
+  )
+  if (!Number.isFinite(raw) || raw <= 0) return 25
+  return Math.max(1, Math.trunc(raw))
+})()
+const OPEN_JOIN_POOL_ENTRY_TTL_MS = (() => {
+  const raw = process.env.OPEN_JOIN_POOL_ENTRY_TTL_MS || process.env.OPEN_JOIN_POOL_TTL_MS || '0'
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return null
+  return Math.max(1000, Math.trunc(parsed))
+})()
 
 console.info('[Worker] Join timing config', {
   joinDirectDiscoveryV2: JOIN_DIRECT_DISCOVERY_V2,
@@ -227,7 +242,11 @@ console.info('[Worker] Join timing config', {
   directJoinVerifyTimeoutMs:
     process.env.DIRECT_JOIN_VERIFY_TIMEOUT_MS && process.env.DIRECT_JOIN_VERIFY_TIMEOUT_MS.trim()
       ? process.env.DIRECT_JOIN_VERIFY_TIMEOUT_MS
-      : 'default(30000)'
+      : 'default(30000)',
+  openJoinPoolTargetSize: OPEN_JOIN_POOL_TARGET_SIZE,
+  openJoinPoolEntryTtlMs: Number.isFinite(OPEN_JOIN_POOL_ENTRY_TTL_MS)
+    ? OPEN_JOIN_POOL_ENTRY_TTL_MS
+    : 'disabled(non-expiring)'
 })
 
 global.userConfig = {
@@ -253,8 +272,6 @@ let mirrorMetadataRefreshInFlight = null
 const openJoinContexts = new Map()
 const pendingOpenJoinReauth = new Map()
 const OPEN_JOIN_REAUTH_MIN_INTERVAL_MS = 30000
-const OPEN_JOIN_POOL_TARGET_SIZE = 10
-const OPEN_JOIN_POOL_ENTRY_TTL_MS = 6 * 60 * 60 * 1000
 const OPEN_JOIN_POOL_REFRESH_MS = 30 * 60 * 1000
 const CLOSED_JOIN_POOL_TARGET_SIZE = 10
 const DEFAULT_CLOSED_JOIN_POOL_ENTRY_TTL_MS = 90 * 24 * 60 * 60 * 1000
@@ -1286,7 +1303,8 @@ async function ensureOpenJoinWriterPool({
       requestedCount,
       poolNeeded,
       generateCount,
-      targetSize: resolvedTarget
+      targetSize: resolvedTarget,
+      entryTtlMs: Number.isFinite(OPEN_JOIN_POOL_ENTRY_TTL_MS) ? OPEN_JOIN_POOL_ENTRY_TTL_MS : null
     })
 
     if (generateCount <= 0) {
@@ -1320,14 +1338,15 @@ async function ensureOpenJoinWriterPool({
       const writerSecret = provision?.writerSecret || null
       if (!writerCore || !writerSecret) continue
       const issuedAt = Date.now()
-      const expiresAt = issuedAt + OPEN_JOIN_POOL_ENTRY_TTL_MS
       const entry = {
         writerCore,
         writerCoreHex,
         autobaseLocal: writerCoreHex,
         writerSecret,
-        issuedAt,
-        expiresAt
+        issuedAt
+      }
+      if (Number.isFinite(OPEN_JOIN_POOL_ENTRY_TTL_MS)) {
+        entry.expiresAt = issuedAt + OPEN_JOIN_POOL_ENTRY_TTL_MS
       }
       entries.push(entry)
       newEntries.push(entry)
@@ -2121,7 +2140,19 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
   })
   const encodedRelay = encodeURIComponent(relayIdentifier)
   let lastError = null
+  let lastErrorCode = null
+  let lastStatusCode = null
   let authPubkey = null
+  const parseGatewayErrorCode = (text) => {
+    if (typeof text !== 'string' || !text.trim()) return null
+    try {
+      const parsed = JSON.parse(text)
+      if (parsed && typeof parsed === 'object' && typeof parsed.error === 'string') {
+        return parsed.error.trim() || null
+      }
+    } catch (_) {}
+    return null
+  }
 
   try {
     authPubkey = NostrUtils.getPublicKey(config.nostr_nsec_hex)
@@ -2147,11 +2178,15 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
         try {
           body = await challengeResponse.text()
         } catch (_) {}
+        const errorCode = parseGatewayErrorCode(body)
+        lastStatusCode = challengeResponse.status
+        lastErrorCode = errorCode || lastErrorCode
         console.warn('[Worker] Open join challenge failed', {
           relayIdentifier,
           origin: base,
           status: challengeResponse.status,
-          body: body ? body.slice(0, 200) : null
+          body: body ? body.slice(0, 200) : null,
+          errorCode
         })
         lastError = new Error(`challenge status ${challengeResponse.status}`)
         continue
@@ -2240,11 +2275,15 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
         try {
           body = await joinResponse.text()
         } catch (_) {}
+        const errorCode = parseGatewayErrorCode(body)
+        lastStatusCode = joinResponse.status
+        lastErrorCode = errorCode || lastErrorCode
         console.warn('[Worker] Open join request failed', {
           relayIdentifier,
           origin: base,
           status: joinResponse.status,
-          body: body ? body.slice(0, 200) : null
+          body: body ? body.slice(0, 200) : null,
+          errorCode
         })
         lastError = new Error(`open-join status ${joinResponse.status}`)
         continue
@@ -2295,7 +2334,9 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
   return {
     status: 'error',
     reason: reason || 'open-join-failed',
-    error: lastError?.message || String(lastError || 'open-join-failed')
+    error: lastError?.message || String(lastError || 'open-join-failed'),
+    errorCode: lastErrorCode || null,
+    statusCode: Number.isFinite(lastStatusCode) ? lastStatusCode : null
   }
 }
 
@@ -6498,6 +6539,9 @@ async function handleMessageObject(message) {
                     'Open join bootstrap timeout'
                   )
                 }
+                if (bootstrapResult) {
+                  gatewayBootstrapResult = bootstrapResult
+                }
 
                 const mergedBootstrap = mergeOpenJoinBootstrap(bootstrapResult, {
                   relayIdentifier,
@@ -6525,6 +6569,35 @@ async function handleMessageObject(message) {
                 })
               }
             }
+          }
+
+          const gatewayBootstrapOpenJoinEmpty = Boolean(
+            gatewayMode === 'auto'
+            && openJoin
+            && !inviteToken
+            && joinDirectDiscoveryV2
+            && !selectedDirectCandidate?.peerKey
+            && !writerSecret
+            && (
+              gatewayBootstrapResult?.errorCode === 'open-join-empty'
+              || /open-join-empty/i.test(String(gatewayBootstrapResult?.error || ''))
+              || (
+                Number(gatewayBootstrapResult?.statusCode) === 409
+                && /open-join/i.test(String(gatewayBootstrapResult?.error || ''))
+              )
+            )
+          )
+          if (gatewayBootstrapOpenJoinEmpty) {
+            console.warn('[Worker] No writer path: gateway open-join pool empty and no verified direct candidate', {
+              publicIdentifier,
+              relayKey: previewValue(joinRelayKey, 16),
+              hostPeersCount: hostPeers.length,
+              leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
+              gatewayError: gatewayBootstrapResult?.error || null,
+              gatewayStatusCode: gatewayBootstrapResult?.statusCode || null,
+              gatewayErrorCode: gatewayBootstrapResult?.errorCode || null
+            })
+            throw new Error('no-writer-path: gateway-open-join-empty and no verified direct candidate')
           }
 
           if (
@@ -6721,6 +6794,42 @@ async function handleMessageObject(message) {
           }
           hostPeers = normalizePeerKeyList(hostPeers)
           leaseReplicaPeerKeys = normalizePeerKeyList(leaseReplicaPeerKeys)
+
+          const canUseGatewayOpenBootstrapPath = Boolean(
+            joinDirectDiscoveryV2
+            && gatewayMode === 'auto'
+            && openJoin
+            && !inviteToken
+            && !selectedDirectCandidate?.peerKey
+            && writerSecret
+            && (writerCore || writerCoreHex || autobaseLocal)
+          )
+          if (canUseGatewayOpenBootstrapPath) {
+            selectedJoinPathMode = 'open-gateway-bootstrap'
+            selectedJoinPeerKey = null
+            console.log('[Worker] Open join path lock applied', {
+              publicIdentifier,
+              relayKey: previewValue(joinRelayKey, 16),
+              mode: selectedJoinPathMode,
+              hostPeersCount: hostPeers.length,
+              hasBlindPeer: !!blindPeer?.publicKey,
+              writerCorePrefix: previewValue(writerCore, 16),
+              writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
+              writerSecretLen: writerSecret ? String(writerSecret).length : 0
+            })
+            sendMessage({
+              type: 'JOIN_PATH_SELECTED',
+              data: {
+                publicIdentifier,
+                mode: selectedJoinPathMode,
+                peerKey: null,
+                gatewayMode,
+                candidates: hostPeers.length,
+                discoveryWindowMs: JOIN_DISCOVERY_WINDOW_MS,
+                probeElapsedMs: null
+              }
+            })
+          }
 
           if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
           if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal

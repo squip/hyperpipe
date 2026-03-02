@@ -4,6 +4,14 @@ import { resolve } from 'node:path';
 const LEGACY_PUBLIC_GATEWAY_PATH = 'public-gateway/hyperbee';
 
 const DEFAULT_BLIND_PEER_MAX_BYTES = 25 * 1024 ** 3;
+const DEFAULT_OPEN_JOIN_POOL_ENTRY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+function parseEnvNumber(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
 
 const DEFAULT_CONFIG = {
   host: '0.0.0.0',
@@ -24,7 +32,7 @@ const DEFAULT_CONFIG = {
     redisPrefix: process.env.GATEWAY_REGISTRATION_REDIS_PREFIX || 'gateway:registrations:',
     cacheTtlSeconds: Number(process.env.GATEWAY_REGISTRATION_TTL || 1800),
     mirrorTtlSeconds: Number(process.env.GATEWAY_MIRROR_METADATA_TTL || 86400),
-    openJoinPoolTtlSeconds: Number(process.env.GATEWAY_OPEN_JOIN_POOL_TTL || 21600),
+    openJoinPoolTtlSeconds: parseEnvNumber('GATEWAY_OPEN_JOIN_POOL_TTL', 21600),
     relayGcAfterMs: Number(process.env.GATEWAY_RELAY_GC_AFTER_MS || (90 * 24 * 60 * 60 * 1000)),
     defaultTokenTtl: Number(process.env.GATEWAY_DEFAULT_TOKEN_TTL || 3600),
     tokenRefreshWindowSeconds: Number(process.env.GATEWAY_TOKEN_REFRESH_WINDOW || 300)
@@ -81,7 +89,8 @@ const DEFAULT_CONFIG = {
   },
   openJoin: {
     enabled: process.env.GATEWAY_OPEN_JOIN_ENABLED !== 'false',
-    poolEntryTtlMs: Number(process.env.GATEWAY_OPEN_JOIN_POOL_TTL_MS) || (30 * 24 * 60 * 60 * 1000),
+    // 0 means non-expiring pool entries unless a lease carries explicit expiresAt.
+    poolEntryTtlMs: Math.max(0, Math.trunc(parseEnvNumber('GATEWAY_OPEN_JOIN_POOL_TTL_MS', DEFAULT_OPEN_JOIN_POOL_ENTRY_TTL_MS))),
     challengeTtlMs: Number(process.env.GATEWAY_OPEN_JOIN_CHALLENGE_TTL_MS) || (2 * 60 * 1000),
     authWindowSeconds: Number(process.env.GATEWAY_OPEN_JOIN_AUTH_WINDOW || 300),
     maxPoolSize: Number(process.env.GATEWAY_OPEN_JOIN_MAX_POOL || 100)

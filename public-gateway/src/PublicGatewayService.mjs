@@ -31,6 +31,7 @@ import {
   relayTokenIssueCounter,
   relayTokenRefreshCounter,
   relayTokenRevocationCounter,
+  openJoinPoolDepletionCounter,
   blindPeerActiveGauge,
   blindPeerTrustedPeersGauge,
   blindPeerBytesGauge,
@@ -86,6 +87,14 @@ class PublicGatewayService {
     this.openJoinConfig = this.#normalizeOpenJoinConfig(config?.openJoin);
     this.openJoinChallenges = new Map();
     this.openJoinLeaseLocks = new Set();
+    this.openJoinTelemetry = {
+      poolDepletion: {
+        challengeBlockedEmpty: 0,
+        requestEmpty: 0,
+        lastAt: null,
+        lastRelayKey: null
+      }
+    };
     this.discoveryConfig = config.discovery || {};
     this.explicitSharedSecretVersion = this.discoveryConfig?.sharedSecretVersion || null;
     this.sharedSecretVersion = this.explicitSharedSecretVersion;
@@ -574,9 +583,13 @@ class PublicGatewayService {
     const maxPoolSize = Number(raw?.maxPoolSize);
     const maxAppendCores = Number(raw?.maxAppendCores);
     const maxRelayCores = Number(raw?.maxRelayCores);
+    const normalizedPoolEntryTtlMs = Number.isFinite(poolEntryTtlMs)
+      ? Math.max(0, Math.trunc(poolEntryTtlMs))
+      : (30 * 24 * 60 * 60 * 1000);
     return {
       enabled,
-      poolEntryTtlMs: Number.isFinite(poolEntryTtlMs) && poolEntryTtlMs > 0 ? poolEntryTtlMs : 6 * 60 * 60 * 1000,
+      // 0 means lease entries are non-expiring unless an entry carries explicit expiresAt.
+      poolEntryTtlMs: normalizedPoolEntryTtlMs,
       challengeTtlMs: Number.isFinite(challengeTtlMs) && challengeTtlMs > 0 ? challengeTtlMs : 2 * 60 * 1000,
       authWindowSeconds: Number.isFinite(authWindowSeconds) && authWindowSeconds > 0 ? authWindowSeconds : 300,
       maxPoolSize: Number.isFinite(maxPoolSize) && maxPoolSize > 0 ? Math.trunc(maxPoolSize) : 50,
@@ -862,6 +875,43 @@ class PublicGatewayService {
 
   #isOpenJoinPoolAllowed(pool) {
     return pool?.metadata?.isOpen === true;
+  }
+
+  #collectValidOpenJoinLeaseEntries(pool, now = Date.now()) {
+    if (!pool || typeof pool !== 'object') return [];
+    const entries = Array.isArray(pool.entries) ? pool.entries : [];
+    const valid = [];
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object') continue;
+      const writerCore = typeof entry.writerCore === 'string' ? entry.writerCore.trim() : '';
+      const writerSecret = typeof entry.writerSecret === 'string' ? entry.writerSecret.trim() : '';
+      if (!writerCore || !writerSecret) continue;
+      if (Number.isFinite(entry.expiresAt) && Number(entry.expiresAt) <= now) continue;
+      valid.push(entry);
+    }
+    return valid;
+  }
+
+  #recordOpenJoinPoolDepletion(stage, relayKey = null) {
+    const normalizedStage = typeof stage === 'string' && stage.trim()
+      ? stage.trim()
+      : 'unknown';
+    if (normalizedStage === 'challenge-blocked-empty') {
+      this.openJoinTelemetry.poolDepletion.challengeBlockedEmpty += 1;
+    } else if (normalizedStage === 'request-empty') {
+      this.openJoinTelemetry.poolDepletion.requestEmpty += 1;
+    }
+    this.openJoinTelemetry.poolDepletion.lastAt = Date.now();
+    this.openJoinTelemetry.poolDepletion.lastRelayKey = relayKey || null;
+    try {
+      openJoinPoolDepletionCounter.labels(normalizedStage).inc();
+    } catch (_) {}
+    return {
+      challengeBlockedEmpty: this.openJoinTelemetry.poolDepletion.challengeBlockedEmpty,
+      requestEmpty: this.openJoinTelemetry.poolDepletion.requestEmpty,
+      lastAt: this.openJoinTelemetry.poolDepletion.lastAt,
+      lastRelayKey: this.openJoinTelemetry.poolDepletion.lastRelayKey
+    };
   }
 
   #buildMirrorMetadataPayload(record, relayKey) {
@@ -3898,7 +3948,9 @@ class PublicGatewayService {
 
     const entriesRaw = Array.isArray(payload?.entries) ? payload.entries : [];
     const now = Date.now();
-    const ttlMs = this.openJoinConfig?.poolEntryTtlMs || 6 * 60 * 60 * 1000;
+    const ttlMs = Number.isFinite(this.openJoinConfig?.poolEntryTtlMs)
+      ? this.openJoinConfig.poolEntryTtlMs
+      : null;
     const maxPool = this.openJoinConfig?.maxPoolSize || 50;
     const targetSizeRaw = Number(payload?.targetSize);
     const targetSize = Number.isFinite(targetSizeRaw) && targetSizeRaw > 0
@@ -3954,15 +4006,17 @@ class PublicGatewayService {
       const writerSecret = typeof entry.writerSecret === 'string' ? entry.writerSecret : null;
       if (!writerCore || !writerSecret) return null;
       const issuedAt = Number.isFinite(entry.issuedAt) ? Math.trunc(entry.issuedAt) : now;
-      const expiresAt = Number.isFinite(entry.expiresAt) ? Math.trunc(entry.expiresAt) : (issuedAt + ttlMs);
-      if (expiresAt <= now) return null;
+      const hasExplicitExpiresAt = Number.isFinite(entry.expiresAt);
+      const expiresAt = hasExplicitExpiresAt ? Math.trunc(entry.expiresAt) : null;
+      if (hasExplicitExpiresAt && expiresAt <= now) return null;
       const writerCoreHex = typeof entry.writerCoreHex === 'string'
         ? entry.writerCoreHex
         : (typeof entry.writer_core_hex === 'string' ? entry.writer_core_hex : null);
       const autobaseLocal = typeof entry.autobaseLocal === 'string'
         ? entry.autobaseLocal
         : (typeof entry.autobase_local === 'string' ? entry.autobase_local : null);
-      const normalized = { writerCore, writerSecret, issuedAt, expiresAt };
+      const normalized = { writerCore, writerSecret, issuedAt };
+      if (hasExplicitExpiresAt) normalized.expiresAt = expiresAt;
       if (writerCoreHex) normalized.writerCoreHex = writerCoreHex;
       if (autobaseLocal) normalized.autobaseLocal = autobaseLocal;
       return normalized;
@@ -4011,16 +4065,19 @@ class PublicGatewayService {
         merged.set(entry.writerCore, entry);
         return;
       }
-      const currentExpires = Number.isFinite(current.expiresAt) ? current.expiresAt : 0;
-      const incomingExpires = Number.isFinite(entry.expiresAt) ? entry.expiresAt : 0;
-      if (incomingExpires > currentExpires) {
-        merged.set(entry.writerCore, {
+      const currentHasExpiry = Number.isFinite(current.expiresAt);
+      const incomingHasExpiry = Number.isFinite(entry.expiresAt);
+      const currentExpires = currentHasExpiry ? current.expiresAt : 0;
+      const incomingExpires = incomingHasExpiry ? entry.expiresAt : 0;
+      if ((!incomingHasExpiry && currentHasExpiry) || (incomingHasExpiry && currentHasExpiry && incomingExpires > currentExpires)) {
+        const replacement = {
           ...current,
           ...entry,
-          issuedAt: entry.issuedAt,
-          expiresAt: entry.expiresAt,
+          issuedAt: entry.issuedAt || current.issuedAt,
           writerSecret: entry.writerSecret
-        });
+        };
+        if (!incomingHasExpiry) delete replacement.expiresAt;
+        merged.set(entry.writerCore, replacement);
         return;
       }
       const mergedEntry = { ...current };
@@ -4033,7 +4090,8 @@ class PublicGatewayService {
     for (const entry of incomingEntries) mergeEntry(entry);
 
     let mergedEntries = Array.from(merged.values());
-    mergedEntries.sort((a, b) => (b.expiresAt || 0) - (a.expiresAt || 0));
+    const expiryRank = (entry) => (Number.isFinite(entry?.expiresAt) ? entry.expiresAt : Number.MAX_SAFE_INTEGER);
+    mergedEntries.sort((a, b) => expiryRank(b) - expiryRank(a));
     if (mergedEntries.length > maxPool) {
       mergedEntries = mergedEntries.slice(0, maxPool);
     }
@@ -4128,6 +4186,34 @@ class PublicGatewayService {
       const isAllowed = record ? this.#isOpenJoinAllowed(record) : this.#isOpenJoinPoolAllowed(pool);
       if (!isAllowed) {
         return res.status(403).json({ error: 'relay-not-open' });
+      }
+      if (purpose !== OPEN_JOIN_APPEND_CORES_PURPOSE) {
+        let poolSnapshot = pool;
+        if (!poolSnapshot && typeof this.registrationStore?.getOpenJoinPool === 'function') {
+          try {
+            poolSnapshot = await this.registrationStore.getOpenJoinPool(relayKey);
+          } catch (_) {
+            poolSnapshot = null;
+          }
+        }
+        const poolEntriesTotal = Array.isArray(poolSnapshot?.entries) ? poolSnapshot.entries.length : 0;
+        const poolEntriesValid = this.#collectValidOpenJoinLeaseEntries(poolSnapshot).length;
+        if (poolEntriesValid <= 0) {
+          const depletion = this.#recordOpenJoinPoolDepletion('challenge-blocked-empty', relayKey);
+          this.logger?.warn?.('[PublicGateway] Open join challenge blocked: pool empty', {
+            relayKey,
+            relayKeyType,
+            identifierType,
+            identifier,
+            publicIdentifier: record?.metadata?.identifier || poolSnapshot?.publicIdentifier || relayKey,
+            source: record ? 'registration' : 'pool',
+            purpose,
+            poolEntriesTotal,
+            poolEntriesValid,
+            depletion
+          });
+          return res.status(409).json({ error: 'open-join-empty' });
+        }
       }
 
       const publicIdentifier =
@@ -4253,6 +4339,7 @@ class PublicGatewayService {
       const poolAfterCount = Array.isArray(poolAfter?.entries) ? poolAfter.entries.length : 0;
 
       if (!lease) {
+        const depletion = this.#recordOpenJoinPoolDepletion('request-empty', relayKey);
         this.logger?.warn?.('[PublicGateway] Open join lease unavailable', {
           relayKey,
           relayKeyType,
@@ -4260,7 +4347,8 @@ class PublicGatewayService {
           publicIdentifier,
           identifier,
           poolBefore: poolBeforeCount,
-          poolAfter: poolAfterCount
+          poolAfter: poolAfterCount,
+          depletion
         });
         return res.status(409).json({ error: 'open-join-empty' });
       }

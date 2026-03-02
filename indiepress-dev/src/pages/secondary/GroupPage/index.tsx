@@ -79,9 +79,24 @@ type TJoinFlowHintFields = {
   writerLeaseEnvelope?: Record<string, unknown> | null
 }
 
+const RELAY_SUBSCRIPTION_REFRESH_NO_CLIENT_RETRY_ATTEMPTS = 6
+const RELAY_SUBSCRIPTION_REFRESH_RETRY_BASE_DELAY_MS = 250
+const RELAY_SUBSCRIPTION_REFRESH_RETRY_MAX_DELAY_MS = 1500
+
 function toJoinFlowHintFields(value: unknown): TJoinFlowHintFields {
   if (!value || typeof value !== 'object') return {}
   return value as TJoinFlowHintFields
+}
+
+function getRefreshRelayReasonCode(value: unknown): string | null {
+  if (!value || typeof value !== 'object') return null
+  const topReason = (value as { reason?: unknown }).reason
+  if (typeof topReason === 'string' && topReason.trim()) return topReason.trim()
+  const nested = (value as { result?: unknown }).result
+  if (!nested || typeof nested !== 'object') return null
+  const nestedReason = (nested as { reason?: unknown }).reason
+  if (typeof nestedReason === 'string' && nestedReason.trim()) return nestedReason.trim()
+  return null
 }
 
 type MemberActionsMenuProps = {
@@ -423,7 +438,14 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     myGroupList
   } = useGroups()
   const { pubkey, profile: nostrProfile } = useNostr()
-  const { joinFlows, startJoinFlow, relays, sendToWorker, relayServerReady } = useWorkerBridge()
+  const {
+    joinFlows,
+    startJoinFlow,
+    relays,
+    sendToWorker,
+    relayServerReady,
+    refreshRelaySubscriptions
+  } = useWorkerBridge()
   const { pop } = useSecondaryPage()
   const [isLoading, setIsLoading] = useState(true)
   const [activeTab, setActiveTab] = useState<'notes' | 'files' | 'members' | 'requests'>('notes')
@@ -484,12 +506,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const lastRouteSubscriptionRefreshRef = useRef<string | null>(null)
   const groupRelayWarmupKeyRef = useRef<string | null>(null)
   const lastWritableRefreshKeyRef = useRef<string | null>(null)
-  const sendToWorkerRef = useRef(sendToWorker)
+  const hydrateCursorResetKeyRef = useRef<string | null>(null)
   const relaySubscriptionRefreshThrottleRef = useRef<Map<string, number>>(new Map())
-
-  useEffect(() => {
-    sendToWorkerRef.current = sendToWorker
-  }, [sendToWorker])
 
   useEffect(() => {
     if (!isJoinGatewayModeTestToggleVisible()) return
@@ -520,12 +538,14 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       relayKey,
       publicIdentifier,
       reason,
-      minIntervalMs = 1500
+      minIntervalMs = 1500,
+      retryOnNoClients = true
     }: {
       relayKey?: string | null
       publicIdentifier?: string | null
       reason: string
       minIntervalMs?: number
+      retryOnNoClients?: boolean
     }) => {
       const normalizedPublicIdentifier =
         typeof publicIdentifier === 'string' && publicIdentifier.trim()
@@ -535,9 +555,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         typeof relayKey === 'string' && relayKey.trim() ? relayKey.trim() : null
       if (!normalizedPublicIdentifier && !normalizedRelayKey) return false
       if (!relayServerReady) return false
-
-      const send = sendToWorkerRef.current
-      if (!send) return false
 
       const key = `${normalizedPublicIdentifier || ''}|${normalizedRelayKey || ''}`
       const now = Date.now()
@@ -551,17 +568,44 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         }
       }
 
-      send({
-        type: 'refresh-relay-subscriptions',
-        data: {
-          relayKey: normalizedRelayKey,
-          publicIdentifier: normalizedPublicIdentifier,
-          reason
+      const attemptRefresh = async (attempt: number): Promise<void> => {
+        const attemptReason = attempt === 1 ? reason : `${reason}:retry-${attempt}`
+        try {
+          const refreshResult = await refreshRelaySubscriptions({
+            relayKey: normalizedRelayKey,
+            publicIdentifier: normalizedPublicIdentifier,
+            reason: attemptReason,
+            timeoutMs: 12_000
+          })
+          const refreshReasonCode = getRefreshRelayReasonCode(refreshResult)
+          const shouldRetryNoClients =
+            retryOnNoClients &&
+            refreshReasonCode === 'no-clients' &&
+            attempt < RELAY_SUBSCRIPTION_REFRESH_NO_CLIENT_RETRY_ATTEMPTS
+          if (shouldRetryNoClients) {
+            const retryDelayMs = Math.min(
+              RELAY_SUBSCRIPTION_REFRESH_RETRY_MAX_DELAY_MS,
+              RELAY_SUBSCRIPTION_REFRESH_RETRY_BASE_DELAY_MS * attempt
+            )
+            window.setTimeout(() => {
+              void attemptRefresh(attempt + 1)
+            }, retryDelayMs)
+          }
+        } catch (_error) {
+          if (attempt >= RELAY_SUBSCRIPTION_REFRESH_NO_CLIENT_RETRY_ATTEMPTS) return
+          const retryDelayMs = Math.min(
+            RELAY_SUBSCRIPTION_REFRESH_RETRY_MAX_DELAY_MS,
+            RELAY_SUBSCRIPTION_REFRESH_RETRY_BASE_DELAY_MS * attempt
+          )
+          window.setTimeout(() => {
+            void attemptRefresh(attempt + 1)
+          }, retryDelayMs)
         }
-      }).catch(() => {})
+      }
+      void attemptRefresh(1)
       return true
     },
-    [relayServerReady]
+    [refreshRelaySubscriptions, relayServerReady]
   )
 
   const myGroupRelay = useMemo(
@@ -826,7 +870,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       relayKey: joinFlow.relayKey || null,
       publicIdentifier: groupId,
       reason: 'group-page-join-writable',
-      minIntervalMs: 1200
+      minIntervalMs: 1200,
+      retryOnNoClients: true
     })
     if (!requested) return
     lastWritableRefreshKeyRef.current = writableRefreshKey
@@ -850,6 +895,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   useEffect(() => {
     setPinnedGroupRelay(null)
     lastWritableRefreshKeyRef.current = null
+    hydrateCursorResetKeyRef.current = null
   }, [groupKey])
 
   const isTokenizedRelayUrl = (relay?: string) => {
@@ -1652,7 +1698,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   }, [groupId, relays])
 
   useEffect(() => {
-    if (!sendToWorker || !groupId) return
+    if (!groupId) return
     const inviteRelayKey = inviteData?.relayKey || null
     const relayKey = relayKeyForGroup || inviteRelayKey || null
     const refreshKey = `${groupId}|${relayKey || ''}`
@@ -1669,8 +1715,38 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     groupId,
     inviteData?.relayKey,
     relayKeyForGroup,
-    requestRelaySubscriptionRefresh,
-    sendToWorker
+    requestRelaySubscriptionRefresh
+  ])
+
+  useEffect(() => {
+    if (!groupId) return
+    const relayKey = relayKeyForGroup || inviteData?.relayKey || joinFlow?.relayKey || null
+    const hydrateKey = `${groupId}|${relayKey || ''}`
+    if (hydrateCursorResetKeyRef.current === hydrateKey) return
+    hydrateCursorResetKeyRef.current = hydrateKey
+
+    const timer = window.setTimeout(() => {
+      const requested = requestRelaySubscriptionRefresh({
+        relayKey,
+        publicIdentifier: groupId,
+        reason: 'group-page-hydrate',
+        minIntervalMs: 0,
+        retryOnNoClients: true
+      })
+      if (requested) {
+        setJoinRelayRefreshNonce((prev) => prev + 1)
+      }
+    }, 450)
+
+    return () => {
+      window.clearTimeout(timer)
+    }
+  }, [
+    groupId,
+    inviteData?.relayKey,
+    joinFlow?.relayKey,
+    relayKeyForGroup,
+    requestRelaySubscriptionRefresh
   ])
 
   useEffect(() => {

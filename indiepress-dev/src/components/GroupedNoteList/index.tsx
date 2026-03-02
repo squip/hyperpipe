@@ -64,6 +64,20 @@ function debugGroupedNoteList(...args: unknown[]) {
   console.info(...args)
 }
 
+function hashGroupTimelineId(identifier: string): string {
+  let h1 = 0xdeadbeef ^ identifier.length
+  let h2 = 0x41c6ce57 ^ identifier.length
+  for (let i = 0; i < identifier.length; i++) {
+    const ch = identifier.charCodeAt(i)
+    h1 = Math.imul(h1 ^ ch, 2654435761)
+    h2 = Math.imul(h2 ^ ch, 1597334677)
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
+  const hash53 = 4294967296 * (2097151 & h2) + (h1 >>> 0)
+  return hash53.toString(36)
+}
+
 const GroupedNoteList = forwardRef(
   (
     {
@@ -148,10 +162,7 @@ const GroupedNoteList = forwardRef(
       )
       const hTag = relayReq ? (relayReq.filter as { ['#h']?: string[] })?.['#h']?.[0] : null
       if (!hTag) return undefined
-      const normalized = String(hTag)
-        .replace(/[^a-zA-Z0-9]/g, '')
-        .slice(0, 24)
-      return `f-timeline-group-${normalized || 'default'}`
+      return `f-timeline-group-${hashGroupTimelineId(String(hTag))}`
     }, [subRequests])
     const groupIdentifier = useMemo(() => {
       const relayReq = subRequests.find(

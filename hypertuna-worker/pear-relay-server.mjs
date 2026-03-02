@@ -5980,6 +5980,10 @@ export async function startJoinAuthentication(options) {
     normalizedJoinPathMode === 'closed-lease-direct'
     && !openJoin
     && !!inviteToken;
+  const openGatewayBootstrapPath =
+    normalizedJoinPathMode === 'open-gateway-bootstrap'
+    && !!openJoin
+    && !inviteToken;
   const requestedDirectPeerKey = typeof selectedDirectPeerKey === 'string'
     ? selectedDirectPeerKey.trim().toLowerCase()
     : null;
@@ -6191,6 +6195,15 @@ export async function startJoinAuthentication(options) {
         publicIdentifier,
         selectedDirectPeer: selectedPeerKey ? selectedPeerKey.substring(0, 8) : null,
         hostPeersCount: hostPeers.length
+      });
+    } else if (openGatewayBootstrapPath) {
+      console.log('[RelayServer] Open gateway-bootstrap path selected; skipping direct host dial', {
+        publicIdentifier,
+        hostPeersCount: hostPeers.length,
+        hasWriterSecret: !!writerSecret,
+        hasWriterCore: !!writerCore,
+        hasWriterCoreHex: !!writerCoreHex,
+        hasAutobaseLocal: !!autobaseLocal
       });
     } else {
       for (const hostPeerKey of hostPeers) {

@@ -254,6 +254,8 @@ export class GatewayService extends EventEmitter {
     };
     this.publicGatewayRelayTokens = new Map();
     this.publicGatewayRelayTokenTimers = new Map();
+    this.openJoinPoolSyncInterval = null;
+    this.openJoinPoolSyncLocks = new Set();
     this.gatewayTelemetryTimers = new Map();
     this.gatewayProtocols = new Map();
     this.publicGatewayRelayClient = new PublicGatewayRelayClient({ logger: this.#createExternalLogger?.() || console });
@@ -308,6 +310,14 @@ export class GatewayService extends EventEmitter {
     const tokenRefreshWindowSeconds = Number.isFinite(refreshNumber) && refreshNumber > 0
       ? Math.round(refreshNumber)
       : 300;
+    const openJoinPoolSyncIntervalCandidate = Number(
+      rawConfig?.openJoinPoolSyncIntervalMs
+        ?? process.env.PUBLIC_GATEWAY_OPEN_JOIN_POOL_SYNC_INTERVAL_MS
+        ?? 300000
+    );
+    const openJoinPoolSyncIntervalMs = Number.isFinite(openJoinPoolSyncIntervalCandidate)
+      ? Math.max(0, Math.trunc(openJoinPoolSyncIntervalCandidate))
+      : 300000;
 
     const selectionRaw = typeof rawConfig?.selectionMode === 'string'
       ? rawConfig.selectionMode.trim().toLowerCase()
@@ -329,6 +339,7 @@ export class GatewayService extends EventEmitter {
         : '',
       defaultTokenTtl,
       tokenRefreshWindowSeconds,
+      openJoinPoolSyncIntervalMs,
       resolvedGatewayId: rawConfig?.resolvedGatewayId || null,
       resolvedSecretVersion: rawConfig?.resolvedSecretVersion || null,
       resolvedSharedSecretHash: rawConfig?.resolvedSharedSecretHash || null,
@@ -1753,6 +1764,7 @@ export class GatewayService extends EventEmitter {
         this.healthState.lastCheck = Date.now();
         this.emit('status', this.getStatus());
       }, 30000);
+      this.#refreshOpenJoinPoolSyncInterval();
 
       this.emit('status', this.getStatus());
     } catch (error) {
@@ -1796,6 +1808,10 @@ export class GatewayService extends EventEmitter {
     if (this.healthInterval) {
       clearInterval(this.healthInterval);
       this.healthInterval = null;
+    }
+    if (this.openJoinPoolSyncInterval) {
+      clearInterval(this.openJoinPoolSyncInterval);
+      this.openJoinPoolSyncInterval = null;
     }
 
     for (const timer of this.eventCheckTimers.values()) {
@@ -1940,52 +1956,59 @@ export class GatewayService extends EventEmitter {
         expiresAt: entry?.expiresAt ?? null
       }));
     };
+    if (!relayKey) return;
+    if (this.openJoinPoolSyncLocks.has(relayKey)) {
+      this.log('debug', `[PublicGateway] Open join pool sync skipped: in-flight relay=${relayKey}`);
+      return;
+    }
+    this.openJoinPoolSyncLocks.add(relayKey);
 
-    if (!this.openJoinPoolProvider) {
-      console.info('[PublicGateway] Open join pool sync skipped: missing provider', { relayKey });
-      return;
-    }
-    if (!this.publicGatewayRegistrar?.isEnabled?.()) {
-      console.info('[PublicGateway] Open join pool sync skipped: registrar disabled', {
-        relayKey,
-        enabled: !!this.publicGatewaySettings?.enabled
-      });
-      return;
-    }
-    if (this.#isPublicGatewayRelayKey(relayKey)) {
-      console.info('[PublicGateway] Open join pool sync skipped: public gateway relay', { relayKey });
-      return;
-    }
+    try {
+      if (!this.openJoinPoolProvider) {
+        console.info('[PublicGateway] Open join pool sync skipped: missing provider', { relayKey });
+        return;
+      }
+      if (!this.publicGatewayRegistrar?.isEnabled?.()) {
+        console.info('[PublicGateway] Open join pool sync skipped: registrar disabled', {
+          relayKey,
+          enabled: !!this.publicGatewaySettings?.enabled
+        });
+        return;
+      }
+      if (this.#isPublicGatewayRelayKey(relayKey)) {
+        console.info('[PublicGateway] Open join pool sync skipped: public gateway relay', { relayKey });
+        return;
+      }
 
-    this.log('info', `[PublicGateway] Open join pool sync start relay=${relayKey}`, {
-      identifier: metadata?.identifier ?? null,
-      isOpen: metadata?.isOpen ?? null,
-      isHosted: metadata?.isHosted ?? null,
-      isJoined: metadata?.isJoined ?? null,
-      isPublic: metadata?.isPublic ?? null,
-      metadataUpdatedAt: metadata?.metadataUpdatedAt ?? null
-    });
-
-    if (metadata?.isHosted === false || metadata?.isJoined === true) {
-      console.info('[PublicGateway] Open join pool sync skipped: joined relay', {
-        relayKey,
-        isHosted: metadata?.isHosted ?? null,
-        isJoined: metadata?.isJoined ?? null
-      });
-      return;
-    }
-    if (!metadata || metadata.isOpen !== true) {
-      console.info('[PublicGateway] Open join pool sync skipped: relay not open', {
-        relayKey,
-        isOpen: metadata?.isOpen ?? null,
+      this.log('info', `[PublicGateway] Open join pool sync start relay=${relayKey}`, {
         identifier: metadata?.identifier ?? null,
+        isOpen: metadata?.isOpen ?? null,
         isHosted: metadata?.isHosted ?? null,
         isJoined: metadata?.isJoined ?? null,
+        isPublic: metadata?.isPublic ?? null,
         metadataUpdatedAt: metadata?.metadataUpdatedAt ?? null
       });
-      return;
-    }
-    try {
+
+      if (metadata?.isHosted === false || metadata?.isJoined === true) {
+        console.info('[PublicGateway] Open join pool sync skipped: joined relay', {
+          relayKey,
+          isHosted: metadata?.isHosted ?? null,
+          isJoined: metadata?.isJoined ?? null
+        });
+        return;
+      }
+      if (!metadata || metadata.isOpen !== true) {
+        console.info('[PublicGateway] Open join pool sync skipped: relay not open', {
+          relayKey,
+          isOpen: metadata?.isOpen ?? null,
+          identifier: metadata?.identifier ?? null,
+          isHosted: metadata?.isHosted ?? null,
+          isJoined: metadata?.isJoined ?? null,
+          metadataUpdatedAt: metadata?.metadataUpdatedAt ?? null
+        });
+        return;
+      }
+
       const metadataIdentifier = typeof metadata?.identifier === 'string' ? metadata.identifier : null;
       const relayUrl = typeof metadata?.connectionUrl === 'string'
         ? metadata.connectionUrl
@@ -2140,7 +2163,40 @@ export class GatewayService extends EventEmitter {
       });
     } catch (error) {
       this.log('warn', `[PublicGateway] Open join pool update failed relay=${relayKey}: ${error?.message || error}`);
+    } finally {
+      this.openJoinPoolSyncLocks.delete(relayKey);
     }
+  }
+
+  async #runOpenJoinPoolKeepWarm() {
+    if (!this.isRunning) return;
+    if (!(this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.())) return;
+    const relayEntries = Array.from(this.activeRelays.entries());
+    for (const [relayKey, relayData] of relayEntries) {
+      if (this.#isPublicGatewayRelayKey(relayKey)) continue;
+      // eslint-disable-next-line no-await-in-loop
+      await this.#syncOpenJoinPool(relayKey, relayData?.metadata || {});
+    }
+  }
+
+  #refreshOpenJoinPoolSyncInterval() {
+    if (this.openJoinPoolSyncInterval) {
+      clearInterval(this.openJoinPoolSyncInterval);
+      this.openJoinPoolSyncInterval = null;
+    }
+    if (!this.isRunning) return;
+    const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    const intervalMs = Number(this.publicGatewaySettings?.openJoinPoolSyncIntervalMs);
+    if (!enabled || !Number.isFinite(intervalMs) || intervalMs <= 0) {
+      this.log('debug', '[PublicGateway] Open join keep-warm disabled');
+      return;
+    }
+    this.log('info', `[PublicGateway] Open join keep-warm enabled intervalMs=${intervalMs}`);
+    this.openJoinPoolSyncInterval = setInterval(() => {
+      this.#runOpenJoinPoolKeepWarm().catch((error) => {
+        this.log('warn', `[PublicGateway] Open join keep-warm tick failed: ${error?.message || error}`);
+      });
+    }, intervalMs);
   }
 
   async syncPublicGatewayRelay(relayKey, { forceTokenRefresh = true } = {}) {
@@ -2196,6 +2252,7 @@ export class GatewayService extends EventEmitter {
       this.publicGatewayRelayState.clear();
       this.#clearAllRelayTokens();
     }
+    this.#refreshOpenJoinPoolSyncInterval();
 
     const previousHash = previousSettings?.resolvedSharedSecretHash || null;
     const nextHash = this.publicGatewaySettings?.resolvedSharedSecretHash || null;
