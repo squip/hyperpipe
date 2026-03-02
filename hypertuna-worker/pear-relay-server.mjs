@@ -581,6 +581,10 @@ function resolveTimeoutEnvMs(name, fallbackMs, { minMs = 1, allowDisable = false
   return Math.floor(parsed);
 }
 
+function normalizeGatewayMode(value) {
+  return value === 'disabled' ? 'disabled' : 'auto';
+}
+
 const BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS = resolveTimeoutEnvMs(
   'BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS',
   90000,
@@ -5949,6 +5953,9 @@ export async function startJoinAuthentication(options) {
     token: inviteToken = null,
     relayKey: inviteRelayKey = null,
     relayUrl: inviteRelayUrl = null,
+    gatewayMode = 'auto',
+    joinPathMode = null,
+    selectedDirectPeerKey = null,
     openJoin = false,
     isOpen = null,
     writerCore = null,
@@ -5963,6 +5970,19 @@ export async function startJoinAuthentication(options) {
   const expectedWriterKey = expectedWriter.expectedWriterKey;
   const expectedWriterSource = expectedWriter.source;
   const expectedWriterKeyHex = resolveWriterKeyHex(expectedWriterKey);
+  const normalizedGatewayMode = normalizeGatewayMode(gatewayMode);
+  const gatewayDisabled = normalizedGatewayMode === 'disabled';
+  const normalizedJoinPathMode =
+    typeof joinPathMode === 'string'
+      ? joinPathMode.trim().toLowerCase()
+      : null;
+  const closedLeaseDirectPath =
+    normalizedJoinPathMode === 'closed-lease-direct'
+    && !openJoin
+    && !!inviteToken;
+  const requestedDirectPeerKey = typeof selectedDirectPeerKey === 'string'
+    ? selectedDirectPeerKey.trim().toLowerCase()
+    : null;
   let resolvedCoreRefs = Array.isArray(coreRefs) ? [...coreRefs] : [];
   let resolvedWriterCoreRefs = Array.isArray(writerCoreRefs) ? writerCoreRefs.filter(Boolean) : [];
   const expectedCoreRef = normalizeCoreRefString(expectedWriterKey);
@@ -6001,7 +6021,12 @@ export async function startJoinAuthentication(options) {
   let checkpointInJoinRefs = checkpointRefForJoin
     ? normalizeCoreRefList(coreRefsForJoin).includes(checkpointRefForJoin)
     : null;
-  if (!checkpointInJoinRefs && typeof global.fetchAndApplyRelayMirrorMetadata === 'function' && (relayKeyHint || publicIdentifierHint)) {
+  if (
+    !checkpointInJoinRefs
+    && !gatewayDisabled
+    && typeof global.fetchAndApplyRelayMirrorMetadata === 'function'
+    && (relayKeyHint || publicIdentifierHint)
+  ) {
     try {
       const mirrorResult = await global.fetchAndApplyRelayMirrorMetadata({
         relayKey: relayKeyHint || publicIdentifierHint,
@@ -6036,6 +6061,15 @@ export async function startJoinAuthentication(options) {
         error: error?.message || error
       });
     }
+  } else if (
+    !checkpointInJoinRefs
+    && gatewayDisabled
+    && (relayKeyHint || publicIdentifierHint)
+  ) {
+    console.log('[RelayServer] Skipping mirror refresh during join (gateway disabled)', {
+      relayKey: relayKeyHint,
+      publicIdentifier: publicIdentifierHint
+    });
   }
 
   writerCoreRefsForJoin = Array.from(new Set(writerCoreRefsForJoin));
@@ -6054,6 +6088,9 @@ export async function startJoinAuthentication(options) {
     blindPeer: !!blindPeer,
     inviteRelayKey,
     openJoin,
+    gatewayMode: normalizedGatewayMode,
+    joinPathMode: normalizedJoinPathMode,
+    selectedDirectPeerKey: requestedDirectPeerKey,
     resolvedCoreRefsSource,
     resolvedCoreRefsCount: coreRefsForJoin.length,
     checkpointInJoinRefs
@@ -6133,69 +6170,84 @@ export async function startJoinAuthentication(options) {
     const joinEvent = await createGroupJoinRequest(publicIdentifier, userNsec);
     console.log(`[RelayServer] Created join event ID: ${joinEvent.id.substring(0, 8)}...`);
     
-  const hostPeers = Array.isArray(hostPeerList)
-    ? hostPeerList.map((key) => String(key || '').trim().toLowerCase()).filter(Boolean)
-    : [];
+    const hostPeers = Array.isArray(hostPeerList)
+      ? hostPeerList.map((key) => String(key || '').trim().toLowerCase()).filter(Boolean)
+      : [];
 
-  const blindPeerKey = blindPeer?.publicKey ? String(blindPeer.publicKey).trim().toLowerCase() : null;
+    const blindPeerKey = blindPeer?.publicKey ? String(blindPeer.publicKey).trim().toLowerCase() : null;
 
-  if (!hostPeers.length && !inviteToken && !openJoin) {
-    throw new Error('No hosting peers discovered for this relay');
-  }
+    if (!hostPeers.length && !inviteToken && !openJoin) {
+      throw new Error('No hosting peers discovered for this relay');
+    }
 
     let challengePayload = null;
     let relayPubkey = null;
-    let selectedPeerKey = null;
+    let selectedPeerKey = requestedDirectPeerKey || null;
     let joinProtocol = null;
     let lastJoinError = null;
 
-    for (const hostPeerKey of hostPeers) {
-      if (blindPeerKey && hostPeerKey === blindPeerKey) {
-        console.log('[RelayServer] Skipping direct join attempt for blind-peer host', hostPeerKey.substring(0, 8));
-        continue;
-      }
-      try {
-        console.log(`[RelayServer] Attempting direct join via peer ${hostPeerKey.substring(0, 8)}...`);
-        const protocol = await waitForPeerProtocol(hostPeerKey, 20000);
-        const joinResponse = await protocol.sendRequest({
-          method: 'POST',
-          path: `/post/join/${publicIdentifier}`,
-          headers: { 'content-type': 'application/json' },
-          body: Buffer.from(JSON.stringify({ event: joinEvent }))
-        });
-
-        if ((joinResponse.statusCode || 200) >= 400) {
-          const responseBody = toBuffer(joinResponse.body).toString('utf8');
-          throw new Error(`Peer returned status ${joinResponse.statusCode}: ${responseBody}`);
-        }
-
-        const parsed = parseJsonBody(joinResponse.body) || {};
-        if (parsed.status === 'pending') {
-          console.log('[RelayServer] Join request pending (closed relay)', {
-            publicIdentifier,
-            hostPeer: hostPeerKey.substring(0, 8)
-          });
-          lastJoinError = new Error('closed-join-pending');
+    if (closedLeaseDirectPath) {
+      console.log('[RelayServer] Closed lease-direct path selected; skipping direct challenge handshake', {
+        publicIdentifier,
+        selectedDirectPeer: selectedPeerKey ? selectedPeerKey.substring(0, 8) : null,
+        hostPeersCount: hostPeers.length
+      });
+    } else {
+      for (const hostPeerKey of hostPeers) {
+        if (blindPeerKey && hostPeerKey === blindPeerKey) {
+          console.log('[RelayServer] Skipping direct join attempt for blind-peer host', hostPeerKey.substring(0, 8));
           continue;
         }
-        if (!parsed.challenge || !parsed.relayPubkey) {
-          throw new Error('Invalid join response from peer');
-        }
+        try {
+          console.log(`[RelayServer] Attempting direct join via peer ${hostPeerKey.substring(0, 8)}...`);
+          const protocol = await waitForPeerProtocol(hostPeerKey, 20000);
+          const joinResponse = await protocol.sendRequest({
+            method: 'POST',
+            path: `/post/join/${publicIdentifier}`,
+            headers: { 'content-type': 'application/json' },
+            body: Buffer.from(JSON.stringify({ event: joinEvent }))
+          });
 
-        challengePayload = parsed;
-        relayPubkey = parsed.relayPubkey;
-        selectedPeerKey = hostPeerKey;
-        joinProtocol = protocol;
-        break;
-      } catch (error) {
-        console.error(`[RelayServer] Direct join attempt failed for ${hostPeerKey.substring(0, 8)}:`, error.message);
-        lastJoinError = error;
+          if ((joinResponse.statusCode || 200) >= 400) {
+            const responseBody = toBuffer(joinResponse.body).toString('utf8');
+            throw new Error(`Peer returned status ${joinResponse.statusCode}: ${responseBody}`);
+          }
+
+          const parsed = parseJsonBody(joinResponse.body) || {};
+          if (parsed.status === 'pending') {
+            console.log('[RelayServer] Join request pending (closed relay)', {
+              publicIdentifier,
+              hostPeer: hostPeerKey.substring(0, 8)
+            });
+            lastJoinError = new Error('closed-join-pending');
+            continue;
+          }
+          if (!parsed.challenge || !parsed.relayPubkey) {
+            throw new Error('Invalid join response from peer');
+          }
+
+          challengePayload = parsed;
+          relayPubkey = parsed.relayPubkey;
+          selectedPeerKey = hostPeerKey;
+          joinProtocol = protocol;
+          break;
+        } catch (error) {
+          console.error(`[RelayServer] Direct join attempt failed for ${hostPeerKey.substring(0, 8)}:`, error.message);
+          lastJoinError = error;
+        }
       }
     }
 
     if (!challengePayload || !relayPubkey || !joinProtocol) {
       // Offline/blind-peer fallback: if we have an invite token and relay info, finalize locally without a host handshake.
       if (inviteToken && (inviteRelayKey || publicIdentifier)) {
+        const inviteFallbackMode = closedLeaseDirectPath
+          ? 'closed-lease-direct'
+          : 'blind-peer-offline';
+        const inviteFallbackReason = closedLeaseDirectPath
+          ? 'closed-lease-direct'
+          : 'blind-peer-fallback';
+        const inviteFallbackHostPeer = selectedPeerKey || blindPeerKey || null;
         let resolvedRelayKey = inviteRelayKey || null;
         let relayKeySource = resolvedRelayKey ? 'invite' : null;
         if (!resolvedRelayKey && publicIdentifier) {
@@ -6215,11 +6267,11 @@ export async function startJoinAuthentication(options) {
             // ignore
           }
         }
-        if (!resolvedRelayKey) {
+        if (!resolvedRelayKey && !gatewayDisabled) {
           const mirrorIdentifier = publicIdentifier || extractIdentifierFromRelayUrl(inviteRelayUrl);
           if (mirrorIdentifier) {
             const mirrorResult = await fetchMirrorMetadataFromGateway(mirrorIdentifier, {
-              reason: 'invite-fallback'
+              reason: inviteFallbackReason
             });
             if (mirrorResult?.status === 'ok' && mirrorResult.data) {
               const mirrorRelayKey = mirrorResult.data.relayKey || mirrorResult.data.relay_key || null;
@@ -6234,13 +6286,17 @@ export async function startJoinAuthentication(options) {
           resolvedRelayKey = String(resolvedRelayKey).toLowerCase();
         }
         if (!resolvedRelayKey) {
+          if (gatewayDisabled) {
+            throw new Error('Missing relay key for invite fallback while gatewayMode=disabled');
+          }
           throw new Error('Missing relay key for invite fallback; cannot join relay');
         }
         const fallbackRelayKey = resolvedRelayKey;
         console.log('[RelayServer] Falling back to invite token path (no direct host)', {
           relayKey: fallbackRelayKey,
           publicIdentifier,
-          relayKeySource
+          relayKeySource,
+          mode: inviteFallbackMode
         });
 
         if (!writerSecret) {
@@ -6252,7 +6308,7 @@ export async function startJoinAuthentication(options) {
           publicIdentifier,
           authToken: inviteToken,
           expectedPubkey: userPubkey,
-          context: 'blind-peer-fallback'
+          context: inviteFallbackReason
         });
 
         await preseedJoinMetadata({
@@ -6261,7 +6317,7 @@ export async function startJoinAuthentication(options) {
           userPubkey,
           authToken: inviteToken,
           storageDir: join(config.storage || './data', 'relays', fallbackRelayKey),
-          reason: 'blind-peer-fallback'
+          reason: inviteFallbackReason
         });
 
         await joinRelayManager({
@@ -6335,7 +6391,7 @@ export async function startJoinAuthentication(options) {
               const writerSummary = collectRelayProgressSnapshot(relayManager.relay)?.writers || null;
               console.log('[RelayServer] Relay sync gate snapshot', {
                 relayKey: fallbackRelayKey,
-                reason: 'blind-peer-fallback',
+                reason: inviteFallbackReason,
                 gate,
                 snapshot,
                 writerSummary
@@ -6345,26 +6401,26 @@ export async function startJoinAuthentication(options) {
                 coreRefs: coreRefsForJoin,
                 writerRefsHint: writerCoreRefsForJoin,
                 relayKey: fallbackRelayKey,
-                reason: 'blind-peer-fallback',
+                reason: inviteFallbackReason,
                 context: 'pre-update'
               });
             } catch (error) {
               console.warn('[RelayServer] Failed to collect relay sync gate snapshot', {
                 relayKey: fallbackRelayKey,
-                reason: 'blind-peer-fallback',
+                reason: inviteFallbackReason,
                 error: error?.message || error
               });
             }
             const stopProgressLog = startRelayUpdateProgressLogger({
               relay: relayManager.relay,
               relayKey: fallbackRelayKey,
-              reason: 'blind-peer-fallback',
+              reason: inviteFallbackReason,
               coreRefs: coreRefsForJoin,
               expectedWriterKey
             });
             console.log('[RelayServer] Starting relay update after join (background)', {
               relayKey: fallbackRelayKey,
-              reason: 'blind-peer-fallback',
+              reason: inviteFallbackReason,
               stats: preUpdateStats
             });
             const updateTask = relayManager.relay.update().catch((error) => {
@@ -6424,10 +6480,10 @@ export async function startJoinAuthentication(options) {
             relayKey: fallbackRelayKey,
             expectedWriterKey,
             timeoutMs: BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS,
-            reason: 'blind-peer-fallback'
+            reason: inviteFallbackReason
           });
         }
-        console.log('[RelayServer] Blind-peer fallback writer wait result', {
+        console.log('[RelayServer] Invite fallback writer wait result', {
           relayKey: fallbackRelayKey,
           ok: relayWaitResult?.ok ?? null,
           writable: relayWaitResult?.writable ?? null,
@@ -6444,7 +6500,7 @@ export async function startJoinAuthentication(options) {
         const resolvedRelayUrl = inviteRelayUrl || connectionUrl;
 
         if (relayWaitResult?.ok && global.sendMessage) {
-          console.log('[RelayServer] Emitting relay-writable (blind-peer fallback)', {
+          console.log('[RelayServer] Emitting relay-writable (invite fallback)', {
             relayKey: fallbackRelayKey,
             publicIdentifier,
             writable: relayWaitResult?.writable ?? null,
@@ -6455,7 +6511,7 @@ export async function startJoinAuthentication(options) {
             publicIdentifier,
             relayUrl: resolvedRelayUrl,
             authToken: inviteToken,
-            mode: 'blind-peer-offline',
+            mode: inviteFallbackMode,
             writable: relayWaitResult?.writable ?? null,
             expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
           };
@@ -6481,9 +6537,9 @@ export async function startJoinAuthentication(options) {
             publicIdentifier,
             authToken: inviteToken,
             relayUrl: inviteRelayUrl,
-            mode: 'blind-peer-offline',
+            mode: inviteFallbackMode,
             requireWritable: true,
-            reason: 'blind-peer-fallback'
+            reason: inviteFallbackReason
           });
         }
 
@@ -6533,23 +6589,23 @@ export async function startJoinAuthentication(options) {
               });
             } else {
               const writerHex = b4a.toString(writerKey, 'hex');
-              console.log('[RelayServer] Adding local writer to relay during blind-peer fallback', { relayKey: fallbackRelayKey, writer: writerHex.substring(0, 8) });
+              console.log('[RelayServer] Adding local writer to relay during invite fallback', { relayKey: fallbackRelayKey, writer: writerHex.substring(0, 8) });
               await relayManager.addWriter(writerHex).catch((err) => {
-                console.warn('[RelayServer] Failed to add writer during blind-peer fallback', err?.message || err);
+                console.warn('[RelayServer] Failed to add writer during invite fallback', err?.message || err);
               });
             }
           }
         } catch (err) {
-          console.warn('[RelayServer] Writer bootstrap during blind-peer fallback failed', err?.message || err);
+          console.warn('[RelayServer] Writer bootstrap during invite fallback failed', err?.message || err);
         }
         if (!relayWritable) {
-          console.warn('[RelayServer] Relay still not writable after blind-peer fallback; writes will remain disabled', {
+          console.warn('[RelayServer] Relay still not writable after invite fallback; writes will remain disabled', {
             relayKey: fallbackRelayKey
           });
         }
 
         if (global.sendMessage) {
-          console.log('[RelayServer] Emitting relay-initialized (blind-peer fallback)', {
+          console.log('[RelayServer] Emitting relay-initialized (invite fallback)', {
             relayKey: fallbackRelayKey,
             publicIdentifier,
             writable: relayWaitResult?.writable ?? null,
@@ -6578,18 +6634,18 @@ export async function startJoinAuthentication(options) {
               relayKey: fallbackRelayKey,
               authToken: inviteToken,
               relayUrl: inviteRelayUrl || null,
-              hostPeer: blindPeerKey || null,
-              mode: 'blind-peer-offline',
+              hostPeer: inviteFallbackHostPeer,
+              mode: inviteFallbackMode,
               provisional: false
             }
           });
         }
         return {
           ok: true,
-          mode: 'blind-peer-offline',
+          mode: inviteFallbackMode,
           relayKey: fallbackRelayKey,
           publicIdentifier,
-          hostPeer: blindPeerKey || null
+          hostPeer: inviteFallbackHostPeer
         };
       }
 

@@ -6233,6 +6233,8 @@ async function handleMessageObject(message) {
           }
 
           let selectedDirectCandidate = null
+          let selectedJoinPathMode = null
+          let selectedJoinPeerKey = null
           if (joinDirectDiscoveryV2 && relayServer?.probeJoinCapabilities) {
             const inviteePubkey = isHex64(config?.nostr_pubkey_hex)
               ? String(config.nostr_pubkey_hex).trim().toLowerCase()
@@ -6406,7 +6408,12 @@ async function handleMessageObject(message) {
                 if (!fastForward && claimedEnvelope.fastForward && typeof claimedEnvelope.fastForward === 'object') {
                   fastForward = claimedEnvelope.fastForward
                 }
-                hostPeers = []
+                hostPeers = normalizePeerKeyList([
+                  selectedDirectCandidate.peerKey,
+                  ...hostPeers
+                ])
+                selectedJoinPathMode = 'closed-lease-direct'
+                selectedJoinPeerKey = selectedDirectCandidate.peerKey
                 sendMessage({
                   type: 'JOIN_WRITER_SOURCE',
                   data: {
@@ -6424,9 +6431,16 @@ async function handleMessageObject(message) {
                 }).catch(() => {})
               } else {
                 selectedDirectCandidate = null
+                selectedJoinPathMode = null
+                selectedJoinPeerKey = null
               }
             } else if (selectedDirectCandidate?.peerKey) {
               hostPeers = [selectedDirectCandidate.peerKey]
+              selectedJoinPathMode =
+                selectedDirectCandidate.mode === 'direct-challenge'
+                  ? 'direct-join'
+                  : selectedDirectCandidate.mode
+              selectedJoinPeerKey = selectedDirectCandidate.peerKey
             }
 
             if (
@@ -6783,6 +6797,8 @@ async function handleMessageObject(message) {
             openJoin,
             isOpen,
             gatewayMode,
+            joinPathMode: selectedJoinPathMode || undefined,
+            selectedDirectPeerKey: selectedJoinPeerKey || undefined,
             discoveryTopic: discoveryTopic || undefined,
             hostPeerKeys: hostPeers,
             leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : undefined,
@@ -6914,6 +6930,8 @@ async function handleMessageObject(message) {
 
               hostPeers = []
               selectedDirectCandidate = null
+              selectedJoinPathMode = null
+              selectedJoinPeerKey = null
               sendMessage({
                 type: 'JOIN_PATH_SELECTED',
                 data: {
