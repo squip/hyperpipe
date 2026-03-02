@@ -3748,19 +3748,24 @@ export class TuiController {
     }, { dedupeKey: 'refresh:group-invites', retries: 0 })
   }
 
-  async acceptGroupInvite(inviteId: string): Promise<void> {
+  async acceptGroupInvite(
+    inviteId: string,
+    options?: { gatewayMode?: 'auto' | 'disabled' }
+  ): Promise<void> {
     await this.runTask('Accept group invite', async () => {
       const target = this.state.groupInvites.find((invite) => invite.id === inviteId)
       if (!target) {
         throw new Error(`Group invite not found: ${inviteId}`)
       }
 
+      const gatewayMode: 'auto' | 'disabled' = options?.gatewayMode === 'disabled' ? 'disabled' : 'auto'
+
       await this.startJoinFlow({
         publicIdentifier: target.groupId,
         token: target.token,
         relayKey: target.relayKey || undefined,
         relayUrl: target.relayUrl || target.relay,
-        gatewayMode: 'auto',
+        gatewayMode,
         discoveryTopic: target.discoveryTopic || undefined,
         hostPeerKeys: target.hostPeerKeys || undefined,
         leaseReplicaPeerKeys: target.leaseReplicaPeerKeys || undefined,

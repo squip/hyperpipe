@@ -185,7 +185,10 @@ export interface CommandController {
     pubkey: string
     token: string
   }): Promise<void>
-  acceptGroupInvite(inviteId: string): Promise<void>
+  acceptGroupInvite(
+    inviteId: string,
+    options?: { gatewayMode?: 'auto' | 'disabled' }
+  ): Promise<void>
   dismissGroupInvite(inviteId: string): Promise<void>
   setGroupViewTab(tab: 'discover' | 'my'): Promise<void>
   refreshJoinRequests(groupId: string, relay?: string): Promise<void>
@@ -314,6 +317,26 @@ function looksLikeGroupIdentifier(value: string): boolean {
   if (normalized.includes(':')) return true
   if (normalized.startsWith('npub')) return true
   return isHex64(normalized)
+}
+
+function parseGatewayModeFlag(args: string[]): 'auto' | 'disabled' | undefined {
+  const inline = args
+    .find((arg) => arg.startsWith('--gateway-mode='))
+    ?.split('=')
+    ?.slice(1)
+    ?.join('=')
+    ?.trim()
+    ?.toLowerCase()
+  if (inline) {
+    if (inline === 'auto' || inline === 'disabled') return inline
+    throw new Error('Invalid --gateway-mode value (expected auto|disabled)')
+  }
+
+  const index = args.indexOf('--gateway-mode')
+  if (index < 0) return undefined
+  const value = String(args[index + 1] || '').trim().toLowerCase()
+  if (value === 'auto' || value === 'disabled') return value
+  throw new Error('Missing or invalid --gateway-mode value (expected auto|disabled)')
 }
 
 const NAV_ALIASES: Record<string, NavNodeId> = {
@@ -637,7 +660,7 @@ export async function executeCommand(
   if (cmd === 'help') {
     return {
       message:
-        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | relay refresh/create/join/disconnect/leave | group tab/refresh/invites/members/search/sort/filter/join-flow/request-invite/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept/dismiss | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/invite/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot'
+        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | relay refresh/create/join/disconnect/leave | group tab/refresh/invites/members/search/sort/filter/join-flow/request-invite/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept/dismiss | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/invite/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot | join flags: --gateway-mode auto|disabled'
     }
   }
 
@@ -884,8 +907,9 @@ export async function executeCommand(
     }
 
     if (action === 'join-flow') {
-      let publicIdentifier = args[2]
-      const token = args[3]
+      let publicIdentifier = args[2] && !args[2].startsWith('--') ? args[2] : undefined
+      const token = args[3] && !args[3].startsWith('--') ? args[3] : undefined
+      const gatewayMode = parseGatewayModeFlag(args)
       if (!publicIdentifier) {
         const selectedGroup = resolveSelectedGroup(context)
         const selectedGroupInvite = resolveSelectedInvite(context)
@@ -899,7 +923,8 @@ export async function executeCommand(
       await controller.startJoinFlow({
         publicIdentifier,
         token,
-        openJoin: args.includes('--open')
+        openJoin: args.includes('--open'),
+        gatewayMode
       })
       return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }
@@ -1021,7 +1046,8 @@ export async function executeCommand(
     if (action === 'join-flow') {
       const selectedGroup = resolveSelectedGroup(context)
       const selectedGroupInvite = resolveSelectedInvite(context)
-      const candidate = args[2]
+      const candidate = args[2] && !args[2].startsWith('--') ? args[2] : undefined
+      const gatewayMode = parseGatewayModeFlag(args)
       let publicIdentifier: string | undefined
       let token: string | undefined
 
@@ -1039,7 +1065,8 @@ export async function executeCommand(
       await controller.startJoinFlow({
         publicIdentifier,
         token,
-        openJoin: args.includes('--open')
+        openJoin: args.includes('--open'),
+        gatewayMode
       })
       return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }
@@ -1110,13 +1137,14 @@ export async function executeCommand(
     }
 
     if (action === 'invite-accept' || action === 'accept-invite') {
-      let inviteId = args[2]
+      let inviteId = args[2] && !args[2].startsWith('--') ? args[2] : undefined
+      const gatewayMode = parseGatewayModeFlag(args)
       if (!inviteId) {
         const selectedInvite = resolveSelectedInvite(context)
         if (selectedInvite?.kind === 'group') inviteId = selectedInvite.id
       }
       inviteId = requireArg(inviteId, 'inviteId')
-      await controller.acceptGroupInvite(inviteId)
+      await controller.acceptGroupInvite(inviteId, gatewayMode ? { gatewayMode } : undefined)
       return { message: `Group invite accepted ${inviteId}`, gotoNode: 'invites:group' }
     }
 
@@ -1227,12 +1255,13 @@ export async function executeCommand(
 
   if (cmd === 'invites') {
     const action = requireArg(args[1], 'invites action').toLowerCase()
+    const gatewayMode = parseGatewayModeFlag(args)
     if (action === 'refresh') {
       await Promise.all([controller.refreshInvites(), controller.refreshChats()])
       return { message: 'Invites refreshed', gotoNode: 'invites:group' }
     }
     const target = requireArg(args[2], 'invite target').toLowerCase()
-    const inviteId = args[3]
+    const inviteId = args[3] && !args[3].startsWith('--') ? args[3] : undefined
 
     const resolveGroupInviteId = () => {
       if (inviteId) return inviteId
@@ -1251,7 +1280,7 @@ export async function executeCommand(
     if (action === 'accept') {
       if (target === 'group') {
         const id = requireArg(resolveGroupInviteId(), 'inviteId')
-        await controller.acceptGroupInvite(id)
+        await controller.acceptGroupInvite(id, gatewayMode ? { gatewayMode } : undefined)
         return { message: `Accepted group invite ${id}`, gotoNode: 'invites:group' }
       }
       if (target === 'chat') {

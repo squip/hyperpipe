@@ -7,6 +7,13 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
+import {
+  JOIN_GATEWAY_MODE_TEST_OVERRIDE_KEY,
+  isJoinGatewayModeTestToggleVisible,
+  readJoinGatewayModeForTesting,
+  TJoinGatewayMode,
+  writeJoinGatewayModeForTesting
+} from '@/lib/join-gateway-mode'
 import { toGroup } from '@/lib/link'
 import { usePrimaryPage, useSecondaryPage } from '@/PageManager'
 import { useFetchProfile } from '@/hooks'
@@ -54,6 +61,19 @@ type InviteRow = {
   isPublic: boolean
   inviteDate: number
   invitedBy: string
+}
+
+type TJoinFlowHintFields = {
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  leaseReplicaPeerKeys?: string[]
+  writerIssuerPubkey?: string | null
+  writerLeaseEnvelope?: Record<string, unknown> | null
+}
+
+function toJoinFlowHintFields(value: unknown): TJoinFlowHintFields {
+  if (!value || typeof value !== 'object') return {}
+  return value as TJoinFlowHintFields
 }
 
 type GroupDetailCacheEntry = {
@@ -217,6 +237,9 @@ const GroupsPage = forwardRef<
   const [tab, setTab] = useState<TTab>(initialTab || 'discover')
   const [search, setSearch] = useState('')
   const [showCreate, setShowCreate] = useState(false)
+  const [joinGatewayModeForTests, setJoinGatewayModeForTests] = useState<TJoinGatewayMode>(
+    () => readJoinGatewayModeForTesting()
+  )
   const [joiningInviteId, setJoiningInviteId] = useState<string | null>(null)
   const [discoverSort, setDiscoverSort] = useState<GroupSortState>({ key: 'members', direction: 'desc' })
   const [mySort, setMySort] = useState<GroupSortState>({ key: 'createdAt', direction: 'desc' })
@@ -233,6 +256,30 @@ const GroupsPage = forwardRef<
     if (!initialTab) return
     setTab(initialTab)
   }, [initialTab, tabRequestId])
+
+  useEffect(() => {
+    if (!isJoinGatewayModeTestToggleVisible()) return
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === null || event.key === JOIN_GATEWAY_MODE_TEST_OVERRIDE_KEY) {
+        setJoinGatewayModeForTests(readJoinGatewayModeForTesting())
+      }
+    }
+    window.addEventListener('storage', onStorage)
+    return () => {
+      window.removeEventListener('storage', onStorage)
+    }
+  }, [])
+
+  const toggleJoinGatewayModeForTests = useCallback(() => {
+    const next: TJoinGatewayMode = joinGatewayModeForTests === 'disabled' ? 'auto' : 'disabled'
+    writeJoinGatewayModeForTesting(next)
+    setJoinGatewayModeForTests(next)
+    toast.message(
+      next === 'disabled'
+        ? 'Join gateway mode: disabled (test override)'
+        : 'Join gateway mode: auto (default)'
+    )
+  }, [joinGatewayModeForTests])
 
   const resolveGroupMeta = useCallback(
     (groupId: string, relay?: string) => {
@@ -702,6 +749,7 @@ const GroupsPage = forwardRef<
   const handleUseInvite = async (inv: TGroupInvite) => {
     if (!inv) return
     if (joiningInviteId) return
+    const inviteHints = toJoinFlowHintFields(inv)
     const relayUrl = inv.relayUrl ?? (inv.relay ? resolveRelayUrl(inv.relay) : null) ?? inv.relay ?? null
     const relayKey = inv.relayKey ?? null
     const openJoin = !inv.token && inv.fileSharing !== false
@@ -725,12 +773,12 @@ const GroupsPage = forwardRef<
         token: inv.token,
         relayKey,
         relayUrl,
-        gatewayMode: 'auto',
-        discoveryTopic: inv.discoveryTopic || undefined,
-        hostPeerKeys: inv.hostPeerKeys || undefined,
-        leaseReplicaPeerKeys: inv.leaseReplicaPeerKeys || undefined,
-        writerIssuerPubkey: inv.writerIssuerPubkey || undefined,
-        writerLeaseEnvelope: inv.writerLeaseEnvelope || undefined,
+        gatewayMode: joinGatewayModeForTests,
+        discoveryTopic: inviteHints.discoveryTopic || undefined,
+        hostPeerKeys: inviteHints.hostPeerKeys || undefined,
+        leaseReplicaPeerKeys: inviteHints.leaseReplicaPeerKeys || undefined,
+        writerIssuerPubkey: inviteHints.writerIssuerPubkey || undefined,
+        writerLeaseEnvelope: inviteHints.writerLeaseEnvelope || undefined,
         blindPeer: inv.blindPeer,
         cores: inv.cores,
         writerCore: inv.writerCore,
@@ -1232,6 +1280,17 @@ const GroupsPage = forwardRef<
             onChange={(event) => setSearch(event.target.value)}
             className="flex-1"
           />
+          {isJoinGatewayModeTestToggleVisible() && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="whitespace-nowrap"
+              onClick={toggleJoinGatewayModeForTests}
+            >
+              Join gateway: {joinGatewayModeForTests}
+            </Button>
+          )}
           <Button variant="ghost" size="icon" onClick={() => refreshDiscovery()}>
             <Loader2 className="w-4 h-4" />
           </Button>

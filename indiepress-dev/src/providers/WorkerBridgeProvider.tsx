@@ -18,6 +18,7 @@ import {
   RelayEntry
 } from '@/services/electron-ipc.service'
 import { isElectron } from '@/lib/platform'
+import { readJoinGatewayModeForTesting } from '@/lib/join-gateway-mode'
 import { useNostr } from '@/providers/NostrProvider'
 
 type WorkerStatusPhase =
@@ -681,7 +682,19 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         await startWorkerInternal({ resetRestartAttempts: false })
       }
 
-      const gatewayMode = opts?.gatewayMode === 'disabled' ? 'disabled' : 'auto'
+      const requestedGatewayMode = opts?.gatewayMode === 'disabled' ? 'disabled' : 'auto'
+      const gatewayModeOverride =
+        process.env.NODE_ENV === 'development'
+          ? readJoinGatewayModeForTesting()
+          : null
+      const gatewayMode = gatewayModeOverride || requestedGatewayMode
+      if (gatewayModeOverride && gatewayModeOverride !== requestedGatewayMode) {
+        console.info('[WorkerBridge] Applying test join gateway mode override', {
+          publicIdentifier: identifier,
+          requestedGatewayMode,
+          gatewayModeOverride
+        })
+      }
       if (gatewayMode === 'auto') {
         if (!gatewayStatus?.running) {
           await electronIpc.sendToWorker({ type: 'start-gateway', options: {} }).catch(() => {})
