@@ -6881,6 +6881,37 @@ async function handleMessageObject(message) {
             selectedDirectCandidate
             && (selectedDirectCandidate.mode === 'direct-challenge' || selectedDirectCandidate.mode === 'lease-claim')
           )
+          const closedInviteOfflineFallback = Boolean(
+            joinDirectDiscoveryV2
+            && !openJoin
+            && !!inviteToken
+            && hasClosedWriterMaterial
+            && !hasVerifiedClosedDirectPath
+          )
+          if (closedInviteOfflineFallback) {
+            selectedJoinPathMode = 'closed-lease-direct'
+            selectedJoinPeerKey = null
+            console.log('[Worker] Closed invite offline fallback path lock applied', {
+              publicIdentifier,
+              relayKey: previewValue(joinRelayKey, 16),
+              mode: 'closed-invite-offline-fallback',
+              hostPeersSuppressed: hostPeers.length,
+              hasWriterSecret: !!writerSecret,
+              hasWriterLeaseEnvelope: !!writerLeaseEnvelope
+            })
+            sendMessage({
+              type: 'JOIN_PATH_SELECTED',
+              data: {
+                publicIdentifier,
+                mode: 'closed-invite-offline-fallback',
+                peerKey: null,
+                gatewayMode,
+                candidates: hostPeers.length,
+                discoveryWindowMs: JOIN_DISCOVERY_WINDOW_MS,
+                probeElapsedMs: null
+              }
+            })
+          }
           if (
             joinDirectDiscoveryV2
             && !openJoin
@@ -6898,6 +6929,7 @@ async function handleMessageObject(message) {
             })
             throw new Error('no-writer-path: closed invite missing writer material and no verified direct candidate')
           }
+          const joinAuthHostPeers = closedInviteOfflineFallback ? [] : hostPeers
 
           const buildJoinAuthPayload = (overrides = {}) => ({
             ...data,
@@ -6909,14 +6941,14 @@ async function handleMessageObject(message) {
             joinPathMode: selectedJoinPathMode || undefined,
             selectedDirectPeerKey: selectedJoinPeerKey || undefined,
             discoveryTopic: discoveryTopic || undefined,
-            hostPeerKeys: hostPeers,
+            hostPeerKeys: joinAuthHostPeers,
             leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : undefined,
             writerIssuerPubkey: writerIssuerPubkey || undefined,
             writerLeaseEnvelope: writerLeaseEnvelope || undefined,
             relayKey: joinRelayKey || undefined,
             relayUrl: joinRelayUrl || undefined,
             blindPeer,
-            hostPeers,
+            hostPeers: joinAuthHostPeers,
             coreRefs,
             writerCoreRefs,
             writerCore,

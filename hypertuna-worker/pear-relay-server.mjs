@@ -5987,6 +5987,16 @@ export async function startJoinAuthentication(options) {
   const requestedDirectPeerKey = typeof selectedDirectPeerKey === 'string'
     ? selectedDirectPeerKey.trim().toLowerCase()
     : null;
+  const hasClosedInviteWriterMaterial = Boolean(
+    !openJoin
+    && !!inviteToken
+    && (writerSecret || expectedWriterKey || writerCore || writerCoreHex || autobaseLocal)
+  );
+  const closedInviteOfflineFallbackPath =
+    hasClosedInviteWriterMaterial
+    && !closedLeaseDirectPath
+    && !requestedDirectPeerKey
+    && normalizedJoinPathMode !== 'direct-join';
   let resolvedCoreRefs = Array.isArray(coreRefs) ? [...coreRefs] : [];
   let resolvedWriterCoreRefs = Array.isArray(writerCoreRefs) ? writerCoreRefs.filter(Boolean) : [];
   const expectedCoreRef = normalizeCoreRefString(expectedWriterKey);
@@ -6205,6 +6215,15 @@ export async function startJoinAuthentication(options) {
         hasWriterCoreHex: !!writerCoreHex,
         hasAutobaseLocal: !!autobaseLocal
       });
+    } else if (closedInviteOfflineFallbackPath) {
+      console.log('[RelayServer] Closed invite offline-fallback guard active; skipping direct host dial', {
+        publicIdentifier,
+        hostPeersSuppressed: hostPeers.length,
+        hasWriterSecret: !!writerSecret,
+        hasWriterCore: !!writerCore,
+        hasWriterCoreHex: !!writerCoreHex,
+        hasAutobaseLocal: !!autobaseLocal
+      });
     } else {
       for (const hostPeerKey of hostPeers) {
         if (blindPeerKey && hostPeerKey === blindPeerKey) {
@@ -6256,9 +6275,13 @@ export async function startJoinAuthentication(options) {
       if (inviteToken && (inviteRelayKey || publicIdentifier)) {
         const inviteFallbackMode = closedLeaseDirectPath
           ? 'closed-lease-direct'
+          : closedInviteOfflineFallbackPath
+            ? 'closed-invite-offline-fallback'
           : 'blind-peer-offline';
         const inviteFallbackReason = closedLeaseDirectPath
           ? 'closed-lease-direct'
+          : closedInviteOfflineFallbackPath
+            ? 'closed-invite-offline-fallback'
           : 'blind-peer-fallback';
         const inviteFallbackHostPeer = selectedPeerKey || blindPeerKey || null;
         let resolvedRelayKey = inviteRelayKey || null;
