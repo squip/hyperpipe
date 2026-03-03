@@ -590,6 +590,16 @@ const BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS = resolveTimeoutEnvMs(
   90000,
   { minMs: 1000 }
 );
+const MIRROR_WARM_GATE_TIMEOUT_MS = resolveTimeoutEnvMs(
+  'MIRROR_WARM_GATE_TIMEOUT_MS',
+  4000,
+  { minMs: 250, allowDisable: true }
+);
+const MIRROR_WARM_GATE_POLL_MS = resolveTimeoutEnvMs(
+  'MIRROR_WARM_GATE_POLL_MS',
+  250,
+  { minMs: 50 }
+);
 // NOTE: We previously experimented with a "join sync gate" that delayed calling
 // relay.update({ wait: true }) during cold-sync, but it commonly timed out and
 // only added latency. The logic has been removed; keep only cheap snapshot logs.
@@ -4612,6 +4622,7 @@ function collectRelayGateSnapshot(relay) {
       : null;
   return {
     hasRelay: true,
+    writable: relay?.writable ?? null,
     viewLength: typeof viewCore?.length === 'number' ? viewCore.length : null,
     viewKey: viewCore?.key ? b4a.toString(viewCore.key, 'hex').slice(0, 16) : null,
     peerCount,
@@ -5004,6 +5015,138 @@ async function waitForRelayWriterActivation(options = {}) {
     if (pollMs > 0) {
       pollId = setInterval(() => {
         checkReady('poll');
+      }, pollMs);
+      pollId.unref?.();
+    }
+  });
+}
+
+function resolveMirrorCheckpointMatch(relay, checkpointRef = null) {
+  const normalizedCheckpoint = normalizeCoreRef(checkpointRef) || normalizeCoreRefString(checkpointRef) || null;
+  if (!normalizedCheckpoint || !relay) return { checkpointRef: normalizedCheckpoint, hasCheckpoint: null };
+  const relayRefs = normalizeCoreRefList(collectRelayCoreRefsFromAutobase(relay));
+  return {
+    checkpointRef: normalizedCheckpoint,
+    hasCheckpoint: relayRefs.includes(normalizedCheckpoint)
+  };
+}
+
+async function waitForRelayMirrorWarmGate(options = {}) {
+  const {
+    relayKey,
+    checkpointRef = null,
+    timeoutMs = MIRROR_WARM_GATE_TIMEOUT_MS,
+    pollMs = MIRROR_WARM_GATE_POLL_MS,
+    reason = 'unknown'
+  } = options;
+  if (!relayKey) return { ok: false, warmed: false, reason, relayKey: null, error: 'missing-relay-key' };
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return { ok: true, warmed: false, skipped: true, reason, relayKey };
+  }
+
+  const { activeRelays } = await import('./hypertuna-relay-manager-adapter.mjs');
+  const relayManager = activeRelays.get(relayKey);
+  if (!relayManager?.relay) {
+    return { ok: false, warmed: false, reason, relayKey, error: 'relay-not-active' };
+  }
+
+  const relay = relayManager.relay;
+  const start = Date.now();
+  let timeoutId = null;
+  let pollId = null;
+  let lastSnapshot = null;
+
+  const snapshot = (context) => {
+    const gateSnapshot = collectRelayGateSnapshot(relay);
+    const checkpoint = resolveMirrorCheckpointMatch(relay, checkpointRef);
+    const viewReady = typeof gateSnapshot.viewLength === 'number' && gateSnapshot.viewLength > 0;
+    const writableReady = gateSnapshot.writable === true;
+    const checkpointReady = checkpoint.hasCheckpoint === true;
+    const warmReason = writableReady
+      ? 'writable'
+      : viewReady
+        ? 'view-length'
+        : checkpointReady
+          ? 'checkpoint'
+          : null;
+    return {
+      relayKey,
+      reason,
+      context,
+      checkpointRef: checkpoint.checkpointRef ? checkpoint.checkpointRef.slice(0, 16) : null,
+      hasCheckpoint: checkpoint.hasCheckpoint,
+      writable: gateSnapshot.writable,
+      viewLength: gateSnapshot.viewLength,
+      peerCount: gateSnapshot.peerCount,
+      activeWriters: gateSnapshot.activeWriters,
+      warmReason,
+      warmed: Boolean(warmReason),
+      elapsedMs: Date.now() - start
+    };
+  };
+
+  const shouldLog = (snap) => {
+    if (!lastSnapshot) return true;
+    return (
+      snap.warmed !== lastSnapshot.warmed
+      || snap.warmReason !== lastSnapshot.warmReason
+      || snap.writable !== lastSnapshot.writable
+      || snap.viewLength !== lastSnapshot.viewLength
+      || snap.hasCheckpoint !== lastSnapshot.hasCheckpoint
+      || snap.peerCount !== lastSnapshot.peerCount
+      || snap.activeWriters !== lastSnapshot.activeWriters
+    );
+  };
+
+  return await new Promise((resolve) => {
+    const cleanup = (result) => {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (pollId) clearInterval(pollId);
+      if (typeof relay.off === 'function') {
+        relay.off('update', onUpdate);
+        relay.off('writable', onWritable);
+      } else if (typeof relay.removeListener === 'function') {
+        relay.removeListener('update', onUpdate);
+        relay.removeListener('writable', onWritable);
+      }
+      resolve(result);
+    };
+
+    const check = (context) => {
+      const snap = snapshot(context);
+      if (shouldLog(snap)) {
+        lastSnapshot = snap;
+        console.log('[RelayServer] Mirror warm gate state', snap);
+      }
+      if (snap.warmed) {
+        cleanup({ ok: true, ...snap });
+        return true;
+      }
+      return false;
+    };
+
+    const onUpdate = () => { check('update'); };
+    const onWritable = () => { check('writable'); };
+
+    if (typeof relay.on === 'function') {
+      relay.on('update', onUpdate);
+      relay.on('writable', onWritable);
+    }
+
+    if (check('initial')) return;
+
+    timeoutId = setTimeout(() => {
+      const snap = snapshot('timeout');
+      if (shouldLog(snap)) {
+        lastSnapshot = snap;
+        console.warn('[RelayServer] Mirror warm gate timeout', snap);
+      }
+      cleanup({ ok: false, timeout: true, ...snap });
+    }, timeoutMs);
+
+    if (pollMs > 0) {
+      pollId = setInterval(() => {
+        check('poll');
       }, pollMs);
       pollId.unref?.();
     }
@@ -5680,7 +5823,7 @@ export async function createRelay(options) {
         elapsedMs: relayWaitResult?.elapsedMs ?? null
       });
 
-      if (relayWaitResult?.ok && global.sendMessage) {
+      if (relayWaitResult?.writable === true && global.sendMessage) {
         const relayWritablePayload = {
           relayKey: result.relayKey,
           publicIdentifier: result.publicIdentifier || null,
@@ -6487,7 +6630,9 @@ export async function startJoinAuthentication(options) {
         }
 
         let relayWaitResult = null;
-        const canBypassWait = Boolean(writerSecret && (expectedWriterKey || writerCore || writerCoreHex));
+        const hasBypassWriterMaterial = Boolean(writerSecret && (expectedWriterKey || writerCore || writerCoreHex));
+        const relayAlreadyWritable = relayManager?.relay?.writable === true;
+        const canBypassWait = hasBypassWriterMaterial && relayAlreadyWritable;
         if (canBypassWait) {
           let expectedWriterActive = null;
           try {
@@ -6512,6 +6657,13 @@ export async function startJoinAuthentication(options) {
             writable: relayWaitResult.writable
           });
         } else {
+          if (hasBypassWriterMaterial && !relayAlreadyWritable) {
+            console.log('[RelayServer] Relay-writable bypass suppressed (relay not yet writable)', {
+              relayKey: fallbackRelayKey,
+              publicIdentifier,
+              writable: relayManager?.relay?.writable ?? null
+            });
+          }
           relayWaitResult = await waitForRelayWriterActivation({
             relayKey: fallbackRelayKey,
             expectedWriterKey,
@@ -6535,7 +6687,7 @@ export async function startJoinAuthentication(options) {
         const connectionUrl = inviteToken ? `${baseUrl}?token=${inviteToken}` : baseUrl;
         const resolvedRelayUrl = inviteRelayUrl || connectionUrl;
 
-        if (relayWaitResult?.ok && global.sendMessage) {
+        if (relayWaitResult?.writable === true && global.sendMessage) {
           console.log('[RelayServer] Emitting relay-writable (invite fallback)', {
             relayKey: fallbackRelayKey,
             publicIdentifier,
@@ -6640,12 +6792,51 @@ export async function startJoinAuthentication(options) {
           });
         }
 
+        let mirrorWarmResult = null;
+        try {
+          mirrorWarmResult = await waitForRelayMirrorWarmGate({
+            relayKey: fallbackRelayKey,
+            checkpointRef: fastForward?.key || null,
+            reason: inviteFallbackReason
+          });
+          if (mirrorWarmResult?.ok && mirrorWarmResult?.warmed) {
+            console.log('[RelayServer] Invite fallback mirror warm gate satisfied', {
+              relayKey: fallbackRelayKey,
+              publicIdentifier,
+              warmReason: mirrorWarmResult?.warmReason || null,
+              elapsedMs: mirrorWarmResult?.elapsedMs ?? null
+            });
+          } else if (mirrorWarmResult?.skipped) {
+            console.log('[RelayServer] Invite fallback mirror warm gate skipped', {
+              relayKey: fallbackRelayKey,
+              publicIdentifier
+            });
+          } else {
+            console.warn('[RelayServer] Invite fallback mirror warm gate incomplete', {
+              relayKey: fallbackRelayKey,
+              publicIdentifier,
+              warmReason: mirrorWarmResult?.warmReason || null,
+              writable: mirrorWarmResult?.writable ?? null,
+              viewLength: mirrorWarmResult?.viewLength ?? null,
+              hasCheckpoint: mirrorWarmResult?.hasCheckpoint ?? null,
+              elapsedMs: mirrorWarmResult?.elapsedMs ?? null
+            });
+          }
+        } catch (error) {
+          console.warn('[RelayServer] Invite fallback mirror warm gate failed', {
+            relayKey: fallbackRelayKey,
+            publicIdentifier,
+            error: error?.message || error
+          });
+        }
+
         if (global.sendMessage) {
           console.log('[RelayServer] Emitting relay-initialized (invite fallback)', {
             relayKey: fallbackRelayKey,
             publicIdentifier,
             writable: relayWaitResult?.writable ?? null,
-            expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null
+            expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
+            mirrorWarmReason: mirrorWarmResult?.warmReason || null
           });
           global.sendMessage({
             type: 'relay-initialized',
@@ -6658,6 +6849,7 @@ export async function startJoinAuthentication(options) {
             userAuthToken: inviteToken,
             writable: relayWaitResult?.writable ?? null,
             expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
+            mirrorWarmReason: mirrorWarmResult?.warmReason || null,
             timestamp: new Date().toISOString()
           });
         }
@@ -6781,7 +6973,7 @@ export async function startJoinAuthentication(options) {
         const connectionUrl = provisionalToken ? `${baseUrl}?token=${provisionalToken}` : baseUrl;
         const resolvedRelayUrl = inviteRelayUrl || connectionUrl;
 
-        if (relayWaitResult?.ok && global.sendMessage) {
+        if (relayWaitResult?.writable === true && global.sendMessage) {
           console.log('[RelayServer] Emitting relay-writable (open join offline)', {
             relayKey: fallbackRelayKey,
             publicIdentifier,
@@ -6825,6 +7017,44 @@ export async function startJoinAuthentication(options) {
           });
         }
 
+        let mirrorWarmResult = null;
+        try {
+          mirrorWarmResult = await waitForRelayMirrorWarmGate({
+            relayKey: fallbackRelayKey,
+            checkpointRef: fastForward?.key || null,
+            reason: 'open-offline'
+          });
+          if (mirrorWarmResult?.ok && mirrorWarmResult?.warmed) {
+            console.log('[RelayServer] Open join offline mirror warm gate satisfied', {
+              relayKey: fallbackRelayKey,
+              publicIdentifier,
+              warmReason: mirrorWarmResult?.warmReason || null,
+              elapsedMs: mirrorWarmResult?.elapsedMs ?? null
+            });
+          } else if (mirrorWarmResult?.skipped) {
+            console.log('[RelayServer] Open join offline mirror warm gate skipped', {
+              relayKey: fallbackRelayKey,
+              publicIdentifier
+            });
+          } else {
+            console.warn('[RelayServer] Open join offline mirror warm gate incomplete', {
+              relayKey: fallbackRelayKey,
+              publicIdentifier,
+              warmReason: mirrorWarmResult?.warmReason || null,
+              writable: mirrorWarmResult?.writable ?? null,
+              viewLength: mirrorWarmResult?.viewLength ?? null,
+              hasCheckpoint: mirrorWarmResult?.hasCheckpoint ?? null,
+              elapsedMs: mirrorWarmResult?.elapsedMs ?? null
+            });
+          }
+        } catch (error) {
+          console.warn('[RelayServer] Open join offline mirror warm gate failed', {
+            relayKey: fallbackRelayKey,
+            publicIdentifier,
+            error: error?.message || error
+          });
+        }
+
         if (global.sendMessage) {
           global.sendMessage({
             type: 'relay-initialized',
@@ -6837,6 +7067,7 @@ export async function startJoinAuthentication(options) {
             userAuthToken: provisionalToken,
             writable: relayWaitResult?.writable ?? null,
             expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
+            mirrorWarmReason: mirrorWarmResult?.warmReason || null,
             timestamp: new Date().toISOString()
           });
         }
@@ -7079,7 +7310,7 @@ export async function startJoinAuthentication(options) {
       expectedWriterActive: directWaitResult?.expectedWriterActive ?? null,
       elapsedMs: directWaitResult?.elapsedMs ?? null
     });
-    if (directWaitResult?.ok && global.sendMessage) {
+    if (directWaitResult?.writable === true && global.sendMessage) {
       console.log('[RelayServer] Emitting relay-writable (direct join)', {
         relayKey,
         publicIdentifier: finalIdentifier,
@@ -7109,7 +7340,7 @@ export async function startJoinAuthentication(options) {
         }
       }
     }
-    if (!directWaitResult?.ok) {
+    if (!directWaitResult?.ok || !directWaitResult?.writable) {
       console.warn('[RelayServer] Relay did not become writable before membership publish', {
         relayKey,
         writable: directWaitResult?.writable ?? null,

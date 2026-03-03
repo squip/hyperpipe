@@ -210,6 +210,11 @@ const JOIN_DIRECT_DISCOVERY_V2 = isEnvEnabled(process.env.JOIN_DIRECT_DISCOVERY_
 const JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT = isEnvEnabled(
   process.env.JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT
 )
+const RELAY_WRITER_QUEUE_RETRY_INTERVAL_MS = resolveTimeoutEnvMs(
+  'RELAY_WRITER_QUEUE_RETRY_INTERVAL_MS',
+  1500,
+  { minMs: 100, allowDisable: true }
+)
 const OPEN_JOIN_POOL_TARGET_SIZE = (() => {
   const raw = Number(
     process.env.OPEN_JOIN_POOL_TARGET_SIZE
@@ -243,6 +248,9 @@ console.info('[Worker] Join timing config', {
     process.env.DIRECT_JOIN_VERIFY_TIMEOUT_MS && process.env.DIRECT_JOIN_VERIFY_TIMEOUT_MS.trim()
       ? process.env.DIRECT_JOIN_VERIFY_TIMEOUT_MS
       : 'default(30000)',
+  relayWriterQueueRetryIntervalMs: Number.isFinite(RELAY_WRITER_QUEUE_RETRY_INTERVAL_MS)
+    ? RELAY_WRITER_QUEUE_RETRY_INTERVAL_MS
+    : 'disabled',
   openJoinPoolTargetSize: OPEN_JOIN_POOL_TARGET_SIZE,
   openJoinPoolEntryTtlMs: Number.isFinite(OPEN_JOIN_POOL_ENTRY_TTL_MS)
     ? OPEN_JOIN_POOL_ENTRY_TTL_MS
@@ -263,6 +271,9 @@ const relayMirrorSubscriptions = new Map()
 const relayMirrorSyncState = new Map()
 const relayMirrorWriterSyncState = new Map()
 const relayWriterQueue = new Map()
+const relayWriterQueueWatchers = new Map()
+const relayWriterQueueFlushInFlight = new Set()
+let relayWriterQueueRetryTimer = null
 let lastBlindPeerFingerprint = null
 let lastDispatcherAssignmentFingerprint = null
 let pendingRelayRegistryRefresh = false
@@ -574,6 +585,113 @@ function resolveRelayKey(relayManager) {
   return null
 }
 
+function clearRelayWriterQueueWatcher(relayKey) {
+  const watcher = relayWriterQueueWatchers.get(relayKey)
+  if (!watcher) return
+  relayWriterQueueWatchers.delete(relayKey)
+  if (watcher.debounceTimer) {
+    clearTimeout(watcher.debounceTimer)
+  }
+  const relay = watcher.relay
+  if (relay) {
+    if (typeof relay.off === 'function') {
+      relay.off('update', watcher.onUpdate)
+      relay.off('writable', watcher.onWritable)
+      relay.off('peer-add', watcher.onPeerChange)
+      relay.off('peer-remove', watcher.onPeerChange)
+    } else if (typeof relay.removeListener === 'function') {
+      relay.removeListener('update', watcher.onUpdate)
+      relay.removeListener('writable', watcher.onWritable)
+      relay.removeListener('peer-add', watcher.onPeerChange)
+      relay.removeListener('peer-remove', watcher.onPeerChange)
+    }
+  }
+}
+
+function stopRelayWriterQueueRetryLoopIfIdle() {
+  if (relayWriterQueue.size > 0 || !relayWriterQueueRetryTimer) return
+  clearInterval(relayWriterQueueRetryTimer)
+  relayWriterQueueRetryTimer = null
+}
+
+async function triggerQueuedRelayWriterFlush(relayKey, trigger = 'queue-trigger') {
+  if (!relayKey || !relayWriterQueue.has(relayKey)) return
+  if (relayWriterQueueFlushInFlight.has(relayKey)) return
+  relayWriterQueueFlushInFlight.add(relayKey)
+  try {
+    await flushQueuedRelayWriters(relayKey, trigger)
+  } catch (error) {
+    console.warn('[Worker] Queued relay writer flush trigger failed', {
+      relayKey,
+      trigger,
+      error: error?.message || error
+    })
+  } finally {
+    relayWriterQueueFlushInFlight.delete(relayKey)
+  }
+}
+
+function attachRelayWriterQueueWatcher(relayKey, relayManager) {
+  if (!relayKey || !relayManager?.relay) return
+  const relay = relayManager.relay
+  if (typeof relay?.on !== 'function') return
+  const existing = relayWriterQueueWatchers.get(relayKey)
+  if (existing?.relay === relay) return
+  if (existing) clearRelayWriterQueueWatcher(relayKey)
+
+  const watcher = {
+    relay,
+    debounceTimer: null,
+    onUpdate: null,
+    onWritable: null,
+    onPeerChange: null
+  }
+  const scheduleFlush = (trigger) => {
+    if (!relayWriterQueue.has(relayKey)) {
+      clearRelayWriterQueueWatcher(relayKey)
+      stopRelayWriterQueueRetryLoopIfIdle()
+      return
+    }
+    if (watcher.debounceTimer) return
+    watcher.debounceTimer = setTimeout(() => {
+      watcher.debounceTimer = null
+      triggerQueuedRelayWriterFlush(relayKey, trigger).catch(() => {})
+    }, 100)
+    watcher.debounceTimer.unref?.()
+  }
+
+  watcher.onUpdate = () => scheduleFlush('relay-update')
+  watcher.onWritable = () => scheduleFlush('relay-writable-event')
+  watcher.onPeerChange = () => scheduleFlush('relay-peer-change')
+  relay.on('update', watcher.onUpdate)
+  relay.on('writable', watcher.onWritable)
+  relay.on('peer-add', watcher.onPeerChange)
+  relay.on('peer-remove', watcher.onPeerChange)
+  relayWriterQueueWatchers.set(relayKey, watcher)
+}
+
+function startRelayWriterQueueRetryLoop() {
+  if (relayWriterQueueRetryTimer) return
+  if (!Number.isFinite(RELAY_WRITER_QUEUE_RETRY_INTERVAL_MS) || RELAY_WRITER_QUEUE_RETRY_INTERVAL_MS <= 0) return
+  relayWriterQueueRetryTimer = setInterval(() => {
+    if (isShuttingDown) {
+      if (relayWriterQueueRetryTimer) {
+        clearInterval(relayWriterQueueRetryTimer)
+        relayWriterQueueRetryTimer = null
+      }
+      return
+    }
+    if (!relayWriterQueue.size) {
+      stopRelayWriterQueueRetryLoopIfIdle()
+      return
+    }
+    for (const relayKey of relayWriterQueue.keys()) {
+      triggerQueuedRelayWriterFlush(relayKey, 'retry-loop').catch(() => {})
+    }
+  }, RELAY_WRITER_QUEUE_RETRY_INTERVAL_MS)
+  relayWriterQueueRetryTimer.unref?.()
+}
+
 function queueRelayWriterRefs(relayKey, refs, reason) {
   if (!relayKey || !Array.isArray(refs) || !refs.length) return null
   const entry = relayWriterQueue.get(relayKey) || {
@@ -586,6 +704,7 @@ function queueRelayWriterRefs(relayKey, refs, reason) {
   entry.reason = reason
   entry.updatedAt = Date.now()
   relayWriterQueue.set(relayKey, entry)
+  startRelayWriterQueueRetryLoop()
   const totalQueued = entry.refs.size
   return {
     queued: Math.max(0, totalQueued - previousCount),
@@ -597,12 +716,16 @@ function queueRelayWriterRefs(relayKey, refs, reason) {
 async function flushQueuedRelayWriters(relayKey, trigger = 'relay-writable') {
   const entry = relayWriterQueue.get(relayKey)
   if (!entry || !entry.refs.size) {
+    clearRelayWriterQueueWatcher(relayKey)
+    stopRelayWriterQueueRetryLoopIfIdle()
     return { status: 'skipped', reason: 'no-queued-writers' }
   }
   const relayManager = activeRelays.get(relayKey)
   if (!relayManager?.relay) {
+    clearRelayWriterQueueWatcher(relayKey)
     return { status: 'skipped', reason: 'relay-not-active' }
   }
+  attachRelayWriterQueueWatcher(relayKey, relayManager)
   if (relayManager.relay?.writable === false) {
     return { status: 'skipped', reason: 'relay-not-writable' }
   }
@@ -620,6 +743,8 @@ async function flushQueuedRelayWriters(relayKey, trigger = 'relay-writable') {
   )
   if (summary?.status !== 'read-only') {
     relayWriterQueue.delete(relayKey)
+    clearRelayWriterQueueWatcher(relayKey)
+    stopRelayWriterQueueRetryLoopIfIdle()
   }
   console.log('[Worker] Queued relay writers flushed', JSON.stringify({
     relayKey,
@@ -642,6 +767,7 @@ async function ensureRelayWritersFromCoreRefs(relayManager, coreRefs, reason = '
     const relayKey = resolveRelayKey(relayManager)
     const queued = queueRelayWriterRefs(relayKey, normalized, reason)
     if (queued) {
+      attachRelayWriterQueueWatcher(relayKey, relayManager)
       console.log('[Worker] Queued relay writers until writable', {
         relayKey,
         reason,
@@ -4778,7 +4904,7 @@ global.onRelayWritable = (payload = {}) => {
     publicIdentifier: payload?.publicIdentifier || null
   })
   if (relayKey) {
-    flushQueuedRelayWriters(relayKey, 'relay-writable').catch((err) => {
+    triggerQueuedRelayWriterFlush(relayKey, 'relay-writable').catch((err) => {
       console.warn('[Worker] Failed to flush queued relay writers', {
         relayKey,
         error: err?.message || err
@@ -7876,6 +8002,16 @@ async function cleanup() {
       statePatch: { app: { shuttingDown: true } }
     })
   }
+
+  if (relayWriterQueueRetryTimer) {
+    clearInterval(relayWriterQueueRetryTimer)
+    relayWriterQueueRetryTimer = null
+  }
+  for (const relayKey of relayWriterQueueWatchers.keys()) {
+    clearRelayWriterQueueWatcher(relayKey)
+  }
+  relayWriterQueue.clear()
+  relayWriterQueueFlushInFlight.clear()
 
   if (marmotService?.stop) {
     try {
