@@ -7281,7 +7281,9 @@ export async function startJoinAuthentication(options) {
       blindPeer,
       coreRefs: directCoreRefs,
       fastForward,
-      expectedWriterKey: finalExpectedWriterKey
+      expectedWriterKey: finalExpectedWriterKey,
+      // Prevent early renderer websocket subscription attempts before join finalize completes.
+      suppressInitMessage: true
     });
     await applyPendingAuthUpdates(updateRelayAuthToken, relayKey, finalIdentifier);
 
@@ -7296,8 +7298,9 @@ export async function startJoinAuthentication(options) {
     console.log(`[RelayServer] Persisting auth token for ${userPubkey.substring(0, 8)}...`);
     await updateRelayAuthToken(relayKey, userPubkey, authToken);
 
-    // Wait for the relay to become writable or the expected writer to activate before announcing membership
-    const directWaitResult = await waitForRelayWriterActivation({
+    // Wait for the relay to become writable or the expected writer to activate before announcing membership.
+    // In gateway-disabled open-join mode, completion is blocked until writable to avoid false "success".
+    let directWaitResult = await waitForRelayWriterActivation({
       relayKey,
       expectedWriterKey: finalExpectedWriterKey,
       timeoutMs: DIRECT_JOIN_WRITABLE_TIMEOUT_MS,
@@ -7310,6 +7313,29 @@ export async function startJoinAuthentication(options) {
       expectedWriterActive: directWaitResult?.expectedWriterActive ?? null,
       elapsedMs: directWaitResult?.elapsedMs ?? null
     });
+    const enforceWritableBeforeCompletion = Boolean(openJoin && gatewayDisabled);
+    if (enforceWritableBeforeCompletion && (!directWaitResult?.ok || !directWaitResult?.writable)) {
+      console.warn('[RelayServer] Direct join writable gate not satisfied; waiting before completion', {
+        relayKey,
+        publicIdentifier: finalIdentifier,
+        gatewayMode: normalizedGatewayMode,
+        writable: directWaitResult?.writable ?? null,
+        expectedWriterActive: directWaitResult?.expectedWriterActive ?? null
+      });
+      directWaitResult = await waitForRelayWriterActivation({
+        relayKey,
+        expectedWriterKey: finalExpectedWriterKey,
+        timeoutMs: LATE_WRITER_RECOVERY_TIMEOUT_MS,
+        reason: 'direct-join-finalize'
+      });
+      console.log('[RelayServer] Direct join finalize writable wait result', {
+        relayKey,
+        ok: directWaitResult?.ok ?? null,
+        writable: directWaitResult?.writable ?? null,
+        expectedWriterActive: directWaitResult?.expectedWriterActive ?? null,
+        elapsedMs: directWaitResult?.elapsedMs ?? null
+      });
+    }
     if (directWaitResult?.writable === true && global.sendMessage) {
       console.log('[RelayServer] Emitting relay-writable (direct join)', {
         relayKey,
@@ -7341,6 +7367,9 @@ export async function startJoinAuthentication(options) {
       }
     }
     if (!directWaitResult?.ok || !directWaitResult?.writable) {
+      if (enforceWritableBeforeCompletion) {
+        throw new Error('Direct join writer activation timeout before completion');
+      }
       console.warn('[RelayServer] Relay did not become writable before membership publish', {
         relayKey,
         writable: directWaitResult?.writable ?? null,
@@ -7363,6 +7392,68 @@ export async function startJoinAuthentication(options) {
     // Publish kind 9000 event to announce the new member
     console.log('[RelayServer] Publishing kind 9000 member add event...');
     await publishMemberAddEvent(finalIdentifier, userPubkey, authToken);
+
+    let directMirrorWarmResult = null;
+    try {
+      directMirrorWarmResult = await waitForRelayMirrorWarmGate({
+        relayKey,
+        checkpointRef: fastForward?.key || null,
+        reason: 'direct-join'
+      });
+      if (directMirrorWarmResult?.ok && directMirrorWarmResult?.warmed) {
+        console.log('[RelayServer] Direct join mirror warm gate satisfied', {
+          relayKey,
+          publicIdentifier: finalIdentifier,
+          warmReason: directMirrorWarmResult?.warmReason || null,
+          elapsedMs: directMirrorWarmResult?.elapsedMs ?? null
+        });
+      } else if (directMirrorWarmResult?.skipped) {
+        console.log('[RelayServer] Direct join mirror warm gate skipped', {
+          relayKey,
+          publicIdentifier: finalIdentifier
+        });
+      } else {
+        console.warn('[RelayServer] Direct join mirror warm gate incomplete', {
+          relayKey,
+          publicIdentifier: finalIdentifier,
+          warmReason: directMirrorWarmResult?.warmReason || null,
+          writable: directMirrorWarmResult?.writable ?? null,
+          viewLength: directMirrorWarmResult?.viewLength ?? null,
+          hasCheckpoint: directMirrorWarmResult?.hasCheckpoint ?? null,
+          elapsedMs: directMirrorWarmResult?.elapsedMs ?? null
+        });
+      }
+    } catch (error) {
+      console.warn('[RelayServer] Direct join mirror warm gate failed', {
+        relayKey,
+        publicIdentifier: finalIdentifier,
+        error: error?.message || error
+      });
+    }
+
+    if (global.sendMessage) {
+      console.log('[RelayServer] Emitting relay-initialized (direct join)', {
+        relayKey,
+        publicIdentifier: finalIdentifier,
+        writable: directWaitResult?.writable ?? null,
+        expectedWriterActive: directWaitResult?.expectedWriterActive ?? null,
+        mirrorWarmReason: directMirrorWarmResult?.warmReason || null
+      });
+      global.sendMessage({
+        type: 'relay-initialized',
+        relayKey,
+        publicIdentifier: finalIdentifier,
+        gatewayUrl: canonicalRelayUrl,
+        connectionUrl: canonicalRelayUrl,
+        alreadyActive: true,
+        requiresAuth: true,
+        userAuthToken: authToken,
+        writable: directWaitResult?.writable ?? null,
+        expectedWriterActive: directWaitResult?.expectedWriterActive ?? null,
+        mirrorWarmReason: directMirrorWarmResult?.warmReason || null,
+        timestamp: new Date().toISOString()
+      });
+    }
 
     // Notify the desktop UI of success
     if (global.sendMessage) {
