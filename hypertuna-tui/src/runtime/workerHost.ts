@@ -40,6 +40,83 @@ function normalizeTimeout(timeoutMs: number): number {
   return Math.max(1_000, Math.min(Math.trunc(timeoutMs), 300_000))
 }
 
+function readJsonFile(filePath: string): unknown | null {
+  try {
+    const raw = readFileSync(filePath, 'utf8')
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
+function readInstalledPackageVersion(workerRoot: string, pkgName: string): string | null {
+  const packagePath = path.join(workerRoot, 'node_modules', pkgName, 'package.json')
+  const parsed = readJsonFile(packagePath)
+  if (!parsed || typeof parsed !== 'object') return null
+  const version = (parsed as { version?: unknown }).version
+  return typeof version === 'string' && version.trim() ? version.trim() : null
+}
+
+function readLockfilePackageVersion(workerRoot: string, pkgName: string): string | null {
+  const lockPath = path.join(workerRoot, 'package-lock.json')
+  const parsed = readJsonFile(lockPath)
+  if (!parsed || typeof parsed !== 'object') return null
+  const packages = (parsed as { packages?: unknown }).packages
+  if (!packages || typeof packages !== 'object') return null
+  const entry = (packages as Record<string, unknown>)[`node_modules/${pkgName}`]
+  if (!entry || typeof entry !== 'object') return null
+  const version = (entry as { version?: unknown }).version
+  return typeof version === 'string' && version.trim() ? version.trim() : null
+}
+
+function detectWorkerDependencyCompatibilityIssue(workerRoot: string): string | null {
+  const hyperbeeIndex = path.join(workerRoot, 'node_modules', 'hyperbee', 'index.js')
+  if (!existsSync(hyperbeeIndex)) {
+    return `Worker dependency check failed: missing ${hyperbeeIndex}. Run: (cd ${workerRoot} && npm ci)`
+  }
+
+  const source = (() => {
+    try {
+      return readFileSync(hyperbeeIndex, 'utf8')
+    } catch {
+      return null
+    }
+  })()
+
+  if (!source) {
+    return `Worker dependency check failed: unable to read ${hyperbeeIndex}`
+  }
+
+  const installedHyperbee = readInstalledPackageVersion(workerRoot, 'hyperbee')
+  const lockHyperbee = readLockfilePackageVersion(workerRoot, 'hyperbee')
+  if (installedHyperbee && lockHyperbee && installedHyperbee !== lockHyperbee) {
+    return [
+      `Worker dependency mismatch detected (hyperbee installed=${installedHyperbee}, lockfile=${lockHyperbee}).`,
+      `Run: (cd ${workerRoot} && rm -rf node_modules && npm ci)`
+    ].join(' ')
+  }
+
+  const installedAutobase = readInstalledPackageVersion(workerRoot, 'autobase')
+  const lockAutobase = readLockfilePackageVersion(workerRoot, 'autobase')
+  if (installedAutobase && lockAutobase && installedAutobase !== lockAutobase) {
+    return [
+      `Worker dependency mismatch detected (autobase installed=${installedAutobase}, lockfile=${lockAutobase}).`,
+      `Run: (cd ${workerRoot} && rm -rf node_modules && npm ci)`
+    ].join(' ')
+  }
+
+  const installedHypercore = readInstalledPackageVersion(workerRoot, 'hypercore')
+  const lockHypercore = readLockfilePackageVersion(workerRoot, 'hypercore')
+  if (installedHypercore && lockHypercore && installedHypercore !== lockHypercore) {
+    return [
+      `Worker dependency mismatch detected (hypercore installed=${installedHypercore}, lockfile=${lockHypercore}).`,
+      `Run: (cd ${workerRoot} && rm -rf node_modules && npm ci)`
+    ].join(' ')
+  }
+
+  return null
+}
+
 const STOP_WAIT_FOR_EXIT_MS = 8_000
 const STOP_SIGTERM_GRACE_MS = 4_000
 const STOP_SIGKILL_GRACE_MS = 1_500
@@ -122,6 +199,15 @@ export class WorkerHost {
         success: false,
         configSent: false,
         error: `Relay worker entry not found at ${workerEntry}`
+      }
+    }
+
+    const dependencyIssue = detectWorkerDependencyCompatibilityIssue(config.workerRoot)
+    if (dependencyIssue) {
+      return {
+        success: false,
+        configSent: false,
+        error: dependencyIssue
       }
     }
 

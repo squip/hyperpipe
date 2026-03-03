@@ -1,4 +1,5 @@
 import { SimplePool, type Event, type Filter } from 'nostr-tools'
+import WebSocket from 'ws'
 import { uniqueRelayUrls } from '../lib/nostr.js'
 
 export type LiveSubscription = {
@@ -10,6 +11,12 @@ export class NostrClient {
   private querySequence = 0
 
   constructor() {
+    // Node 20 and earlier may not expose a global WebSocket constructor.
+    // nostr-tools expects one to exist in non-browser environments.
+    if (typeof globalThis.WebSocket === 'undefined') {
+      ;(globalThis as unknown as { WebSocket?: typeof WebSocket }).WebSocket = WebSocket as unknown as typeof globalThis.WebSocket
+    }
+
     this.pool = new SimplePool({
       enableReconnect: true
     })

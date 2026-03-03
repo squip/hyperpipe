@@ -200,6 +200,8 @@ const JOIN_DISCOVERY_WINDOW_MS = resolveTimeoutEnvMs('JOIN_DISCOVERY_WINDOW_MS',
 const JOIN_PROBE_TIMEOUT_MS = resolveTimeoutEnvMs('JOIN_PROBE_TIMEOUT_MS', 1500, {
   minMs: 100
 })
+const JOIN_MAX_PROBE_CANDIDATES = 12
+const JOIN_RECENT_FAILURE_DEMOTE_MS = 10 * 60 * 1000
 const JOIN_EXECUTION_BUDGET_MS = resolveTimeoutEnvMs('JOIN_EXECUTION_BUDGET_MS', 44000, {
   minMs: 1000
 })
@@ -441,6 +443,88 @@ function normalizePeerKeyList(values = []) {
         .filter(Boolean)
     )
   )
+}
+
+function buildProbeCandidatePeers({
+  hostPeerKeys = [],
+  leaseReplicaPeerKeys = [],
+  topicPeerKeys = [],
+  capabilityByPeer = {},
+  maxCandidates = JOIN_MAX_PROBE_CANDIDATES
+} = {}) {
+  const now = Date.now()
+  const normalizedTopicPeers = normalizePeerKeyList(topicPeerKeys)
+  const topicSet = new Set(normalizedTopicPeers)
+  const merged = normalizePeerKeyList([
+    ...normalizedTopicPeers,
+    ...hostPeerKeys,
+    ...leaseReplicaPeerKeys
+  ])
+
+  const scored = merged.map((peerKey, sourceIndex) => {
+    const capability = capabilityByPeer && typeof capabilityByPeer === 'object'
+      ? capabilityByPeer[peerKey]
+      : null
+    const observedAt = Number.isFinite(capability?.observedAt) ? Number(capability.observedAt) : 0
+    const lastSuccessAt = Number.isFinite(capability?.lastSuccessAt) ? Number(capability.lastSuccessAt) : 0
+    const lastFailureAt = Number.isFinite(capability?.lastFailureAt) ? Number(capability.lastFailureAt) : 0
+    const hasRecentSuccess = lastSuccessAt > 0 && (now - lastSuccessAt) <= (15 * 60 * 1000)
+    const hasRecentFailure = (
+      lastFailureAt > 0
+      && (now - lastFailureAt) <= JOIN_RECENT_FAILURE_DEMOTE_MS
+      && (!lastSuccessAt || lastFailureAt >= lastSuccessAt)
+    )
+    const isTopicPeer = topicSet.has(peerKey)
+    let tier = 3
+    if (isTopicPeer) {
+      tier = 0
+    } else if (hasRecentSuccess) {
+      tier = 1
+    } else if (observedAt > 0) {
+      tier = 2
+    }
+    if (hasRecentFailure && !isTopicPeer && !hasRecentSuccess) {
+      tier += 2
+    }
+
+    return {
+      peerKey,
+      sourceIndex,
+      tier,
+      isTopicPeer,
+      hasRecentSuccess,
+      hasRecentFailure,
+      lastSuccessAt,
+      lastFailureAt,
+      observedAt,
+      rttMs: Number.isFinite(capability?.rttMs) ? Number(capability.rttMs) : Number.POSITIVE_INFINITY
+    }
+  })
+
+  scored.sort((left, right) => {
+    if (left.tier !== right.tier) return left.tier - right.tier
+    if (left.isTopicPeer !== right.isTopicPeer) return left.isTopicPeer ? -1 : 1
+    if (left.hasRecentSuccess !== right.hasRecentSuccess) return left.hasRecentSuccess ? -1 : 1
+    if (left.lastSuccessAt !== right.lastSuccessAt) return right.lastSuccessAt - left.lastSuccessAt
+    if (left.hasRecentFailure !== right.hasRecentFailure) return left.hasRecentFailure ? 1 : -1
+    if (left.rttMs !== right.rttMs) return left.rttMs - right.rttMs
+    if (left.observedAt !== right.observedAt) return right.observedAt - left.observedAt
+    return left.sourceIndex - right.sourceIndex
+  })
+
+  const limited = scored.slice(0, Math.max(1, Number(maxCandidates) || JOIN_MAX_PROBE_CANDIDATES))
+  return {
+    candidatePeers: limited.map((entry) => entry.peerKey),
+    diagnostics: limited.map((entry) => ({
+      peerKey: entry.peerKey,
+      tier: entry.tier,
+      topic: entry.isTopicPeer,
+      recentSuccess: entry.hasRecentSuccess,
+      recentFailure: entry.hasRecentFailure,
+      lastSuccessAt: entry.lastSuccessAt || null,
+      lastFailureAt: entry.lastFailureAt || null
+    }))
+  }
 }
 
 function normalizeGatewayMode(value) {
@@ -6123,11 +6207,11 @@ async function handleMessageObject(message) {
         const joinFlowStartedAt = Date.now()
         let joinBlindPeeringManager = null
         let joinRelayIdentifierForTracking = null
+        const joinDeadlineEnabled = Number.isFinite(JOIN_TOTAL_DEADLINE_MS)
         try {
           const joinDeadlineAt = Number.isFinite(JOIN_TOTAL_DEADLINE_MS)
             ? joinFlowStartedAt + Number(JOIN_TOTAL_DEADLINE_MS)
             : null
-          const joinDeadlineEnabled = Number.isFinite(joinDeadlineAt)
           const getRemainingJoinBudget = () => {
             if (!joinDeadlineEnabled) return Number.POSITIVE_INFINITY
             return joinDeadlineAt - Date.now()
@@ -6402,18 +6486,37 @@ async function handleMessageObject(message) {
           let selectedDirectCandidate = null
           let selectedJoinPathMode = null
           let selectedJoinPeerKey = null
+          let probeValidatedPeerKeys = []
           if (joinDirectDiscoveryV2 && relayServer?.probeJoinCapabilities) {
             const inviteePubkey = isHex64(config?.nostr_pubkey_hex)
               ? String(config.nostr_pubkey_hex).trim().toLowerCase()
               : null
-            const candidatePeers = normalizePeerKeyList([
-              ...hostPeers,
-              ...leaseReplicaPeerKeys
-            ]).slice(0, 12)
+            const capabilityByPeer = (
+              discoveryHints?.capabilities
+              && typeof discoveryHints.capabilities === 'object'
+            )
+              ? discoveryHints.capabilities
+              : {}
+            const {
+              candidatePeers,
+              diagnostics: candidateDiagnostics
+            } = buildProbeCandidatePeers({
+              hostPeerKeys: hostPeers,
+              leaseReplicaPeerKeys,
+              topicPeerKeys: topicDiscoveredPeerKeys,
+              capabilityByPeer,
+              maxCandidates: JOIN_MAX_PROBE_CANDIDATES
+            })
             const tokenHash = inviteToken
               ? computeLeaseTokenHash(joinRelayKey || discoveryHints?.relayKey || null, inviteToken)
               : null
             if (candidatePeers.length) {
+              console.log('[Worker] Join probe candidate order', {
+                publicIdentifier,
+                relayKey: previewValue(joinRelayKey, 16),
+                candidateCount: candidatePeers.length,
+                candidatePreview: candidateDiagnostics.slice(0, 6)
+              })
               const probeStartedAt = Date.now()
               const probeResults = await Promise.all(
                 candidatePeers.map(async (peerKey) => {
@@ -6497,6 +6600,11 @@ async function handleMessageObject(message) {
                   if (left.completedAt !== right.completedAt) return left.completedAt - right.completedAt
                   return left.rttMs - right.rttMs
                 })
+              probeValidatedPeerKeys = normalizePeerKeyList(
+                probeResults
+                  .filter((entry) => entry.success && entry.supported)
+                  .map((entry) => entry.peerKey)
+              )
               selectedDirectCandidate = sortedCandidates[0] || null
               sendMessage({
                 type: 'JOIN_PATH_SELECTED',
@@ -6724,6 +6832,31 @@ async function handleMessageObject(message) {
               gatewayErrorCode: gatewayBootstrapResult?.errorCode || null
             })
             throw new Error('no-writer-path: gateway-open-join-empty and no verified direct candidate')
+          }
+
+          const openJoinHasWriterMaterial = Boolean(
+            writerSecret
+            && (writerCore || writerCoreHex || autobaseLocal)
+          )
+          if (
+            joinDirectDiscoveryV2
+            && gatewayMode === 'auto'
+            && openJoin
+            && !inviteToken
+            && !selectedDirectCandidate?.peerKey
+            && !openJoinHasWriterMaterial
+          ) {
+            console.warn('[Worker] No writer path: no verified direct candidate and no gateway bootstrap material', {
+              publicIdentifier,
+              relayKey: previewValue(joinRelayKey, 16),
+              hostPeersCount: hostPeers.length,
+              leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
+              gatewayBootstrapStatus: gatewayBootstrapResult?.status || null,
+              gatewayBootstrapReason: gatewayBootstrapResult?.reason || null,
+              gatewayBootstrapError: gatewayBootstrapResult?.error || null,
+              gatewayBootstrapStatusCode: gatewayBootstrapResult?.statusCode || null
+            })
+            throw new Error('no-writer-path: open join missing verified direct candidate and gateway writer material')
           }
 
           if (
@@ -6959,13 +7092,33 @@ async function handleMessageObject(message) {
 
           if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
           if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
+          const validatedProbePeerSet = new Set(probeValidatedPeerKeys)
+          const discoveryHintHostPeersForStore = joinDirectDiscoveryV2
+            ? (
+              probeValidatedPeerKeys.length
+                ? normalizePeerKeyList([
+                  ...(selectedJoinPeerKey ? [selectedJoinPeerKey] : []),
+                  ...probeValidatedPeerKeys
+                ])
+                : undefined
+            )
+            : hostPeers
+          const discoveryHintLeaseReplicaPeersForStore = joinDirectDiscoveryV2
+            ? (
+              probeValidatedPeerKeys.length
+                ? normalizePeerKeyList(
+                  leaseReplicaPeerKeys.filter((peerKey) => validatedProbePeerSet.has(peerKey))
+                )
+                : undefined
+            )
+            : leaseReplicaPeerKeys
           if (joinRelayKey || publicIdentifier) {
             await upsertRelayDiscoveryHints({
               relayKey: joinRelayKey || null,
               publicIdentifier: publicIdentifier || null,
               discoveryTopic: discoveryTopic || undefined,
-              hostPeerKeys: hostPeers,
-              leaseReplicaPeerKeys,
+              hostPeerKeys: discoveryHintHostPeersForStore,
+              leaseReplicaPeerKeys: discoveryHintLeaseReplicaPeersForStore,
               writerIssuerPubkey: writerIssuerPubkey || undefined,
               observedAt: Date.now()
             }).catch(() => {})
@@ -7064,6 +7217,7 @@ async function handleMessageObject(message) {
             openJoin,
             isOpen,
             gatewayMode,
+            joinDirectDiscoveryV2,
             joinPathMode: selectedJoinPathMode || undefined,
             selectedDirectPeerKey: selectedJoinPeerKey || undefined,
             discoveryTopic: discoveryTopic || undefined,

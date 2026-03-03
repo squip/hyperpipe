@@ -1696,9 +1696,9 @@ function handlePeerConnection(stream, peerInfo) {
   const replicaInfo = gatewayServiceInstance?.getPublicGatewayReplicaInfo?.() || null;
 
   const handshakeInfo = {
-    role: 'gateway-replica',
+    role: 'relay-peer',
     isGateway: false,
-    gatewayReplica: true,
+    gatewayReplica: false,
     relayPublicKey: config?.swarmPublicKey,
     peerId: config?.swarmPublicKey,
     relayCount: healthState?.activeRelaysCount || 0,
@@ -1743,30 +1743,37 @@ function handlePeerConnection(stream, peerInfo) {
       isGateway: !!handshake?.isGateway,
       gatewayReplica: !!handshake?.gatewayReplica
     };
+    const knownGatewayKey = typeof config.gatewayPublicKey === 'string'
+      ? config.gatewayPublicKey.trim().toLowerCase()
+      : null;
+    const matchesKnownGatewayKey = !!(knownGatewayKey && publicKey.toLowerCase() === knownGatewayKey);
+    const handshakeClaimsGateway = !!(
+      handshake
+      && (
+        handshake.role === 'gateway'
+        || handshake.isGateway === true
+      )
+    );
     const isGatewayHandshake = handshake && (
-      handshake.role === 'gateway' ||
-      handshake.isGateway === true ||
-      handshake.role === 'gateway-replica' ||
-      handshake.gatewayReplica === true
+      matchesKnownGatewayKey
+      && handshakeClaimsGateway
     );
     console.log('[RelayServer] Gateway detection check:', {
       ...gatewayIndicators,
       isGatewayHandshake,
-      hasKnownGatewayKey: !!config.gatewayPublicKey,
-      matchesKnownGatewayKey: !!(config.gatewayPublicKey && publicKey.toLowerCase() === config.gatewayPublicKey.toLowerCase())
+      hasKnownGatewayKey: !!knownGatewayKey,
+      matchesKnownGatewayKey,
+      handshakeClaimsGateway
     });
 
     if (isGatewayHandshake) {
       console.log('[RelayServer] >>> GATEWAY IDENTIFIED FROM HANDSHAKE <<<');
-      if (!config.gatewayPublicKey) {
-        config.gatewayPublicKey = publicKey;
-      }
       setGatewayConnection(protocol, publicKey);
       
       // Start keepalive for gateway connection
       startKeepAlive(publicKey);
     }
-    else if (config.gatewayPublicKey && publicKey.toLowerCase() === config.gatewayPublicKey.toLowerCase()) {
+    else if (matchesKnownGatewayKey) {
       console.log('[RelayServer] >>> GATEWAY IDENTIFIED BY PUBLIC KEY <<<');
       setGatewayConnection(protocol, publicKey);
       
@@ -6097,6 +6104,7 @@ export async function startJoinAuthentication(options) {
     relayKey: inviteRelayKey = null,
     relayUrl: inviteRelayUrl = null,
     gatewayMode = 'auto',
+    joinDirectDiscoveryV2 = false,
     joinPathMode = null,
     selectedDirectPeerKey = null,
     openJoin = false,
@@ -6119,6 +6127,7 @@ export async function startJoinAuthentication(options) {
     typeof joinPathMode === 'string'
       ? joinPathMode.trim().toLowerCase()
       : null;
+  const directDiscoveryV2Enabled = joinDirectDiscoveryV2 === true;
   const closedLeaseDirectPath =
     normalizedJoinPathMode === 'closed-lease-direct'
     && !openJoin
@@ -6140,6 +6149,19 @@ export async function startJoinAuthentication(options) {
     && !closedLeaseDirectPath
     && !requestedDirectPeerKey
     && normalizedJoinPathMode !== 'direct-join';
+  const hasVerifiedDirectPathLock = Boolean(
+    requestedDirectPeerKey
+    || normalizedJoinPathMode === 'direct-join'
+    || normalizedJoinPathMode === 'direct-challenge'
+    || normalizedJoinPathMode === 'lease-claim'
+  );
+  const blockUnverifiedDirectLoop = Boolean(
+    directDiscoveryV2Enabled
+    && !hasVerifiedDirectPathLock
+    && !closedLeaseDirectPath
+    && !openGatewayBootstrapPath
+    && !closedInviteOfflineFallbackPath
+  );
   let resolvedCoreRefs = Array.isArray(coreRefs) ? [...coreRefs] : [];
   let resolvedWriterCoreRefs = Array.isArray(writerCoreRefs) ? writerCoreRefs.filter(Boolean) : [];
   const expectedCoreRef = normalizeCoreRefString(expectedWriterKey);
@@ -6248,6 +6270,7 @@ export async function startJoinAuthentication(options) {
     gatewayMode: normalizedGatewayMode,
     joinPathMode: normalizedJoinPathMode,
     selectedDirectPeerKey: requestedDirectPeerKey,
+    joinDirectDiscoveryV2: directDiscoveryV2Enabled,
     resolvedCoreRefsSource,
     resolvedCoreRefsCount: coreRefsForJoin.length,
     checkpointInJoinRefs
@@ -6367,6 +6390,14 @@ export async function startJoinAuthentication(options) {
         hasWriterCoreHex: !!writerCoreHex,
         hasAutobaseLocal: !!autobaseLocal
       });
+    } else if (blockUnverifiedDirectLoop) {
+      console.log('[RelayServer] Direct host dial suppressed (Direct Discovery v2 requires verified candidate lock)', {
+        publicIdentifier,
+        joinPathMode: normalizedJoinPathMode,
+        hostPeersSuppressed: hostPeers.length,
+        gatewayMode: normalizedGatewayMode
+      });
+      lastJoinError = new Error('no-verified-direct-candidate');
     } else {
       for (const hostPeerKey of hostPeers) {
         if (blindPeerKey && hostPeerKey === blindPeerKey) {

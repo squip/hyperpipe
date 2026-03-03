@@ -1366,6 +1366,26 @@ export class TuiController {
       this.log('error', lockMessage)
       return
     }
+    const dependencyConflict = this.hasRecentWorkerDependencyMismatchSignal()
+    if (dependencyConflict) {
+      const dependencyMessage =
+        'Worker dependency mismatch detected (Hyperbee/Autobase runtime incompatibility). Run npm ci in hypertuna-worker and restart.'
+      this.patchState({
+        lifecycle: 'error',
+        readinessMessage: dependencyMessage,
+        lastError: dependencyMessage,
+        workerRecoveryState: {
+          ...this.state.workerRecoveryState,
+          status: 'disabled',
+          attempt: nextAttempt,
+          nextDelayMs: 0,
+          lastExitCode: exitCode,
+          lastError: dependencyMessage
+        }
+      })
+      this.log('error', dependencyMessage)
+      return
+    }
     const delayMs = baseDelayMs
     this.patchState({
       workerRecoveryState: {
@@ -1587,6 +1607,16 @@ export class TuiController {
     )
   }
 
+  private isNonRetryableWorkerStartError(message: string): boolean {
+    const normalized = String(message || '').toLowerCase()
+    if (!normalized) return false
+    return (
+      normalized.includes('incompatible hypertuna-worker dependency graph detected')
+      || normalized.includes('worker dependency check failed')
+      || normalized.includes('setinflightrange')
+    )
+  }
+
   private async ensureWorkerReadyForOperation(reason: string): Promise<void> {
     const session = this.state.session
     if (!session) {
@@ -1619,6 +1649,10 @@ export class TuiController {
         }
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error)
+        if (this.isNonRetryableWorkerStartError(lastError)) {
+          this.log('error', `Worker start failed with non-retryable dependency/runtime error: ${lastError}`)
+          break
+        }
       }
 
       if (this.workerHost.isRunning() && this.state.lifecycle === 'ready') {
@@ -2501,6 +2535,22 @@ export class TuiController {
         normalized.includes('elocked')
         || normalized.includes('primary-key is locked')
         || (normalized.includes('file is locked') && normalized.includes('primary-key'))
+      )
+    })
+  }
+
+  private hasRecentWorkerDependencyMismatchSignal(): boolean {
+    const recentLines = [
+      ...this.workerStderrQueue.slice(-80),
+      ...this.state.workerStderr.slice(-160)
+    ]
+    if (!recentLines.length) return false
+    return recentLines.some((line) => {
+      const normalized = String(line || '').toLowerCase()
+      return (
+        normalized.includes("cannot read properties of undefined (reading 'setinflightrange')")
+        || normalized.includes('node_modules/hyperbee/index.js')
+        || normalized.includes('setinflightrange')
       )
     })
   }
