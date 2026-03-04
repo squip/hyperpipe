@@ -116,13 +116,18 @@ if [[ ! -d .git ]]; then
   exit 1
 fi
 
-git fetch origin --prune
+git fetch origin --prune "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
 
-if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
-  git switch "${BRANCH}"
-else
-  git switch -c "${BRANCH}" --track "origin/${BRANCH}"
+if ! git show-ref --verify --quiet "refs/remotes/origin/${BRANCH}"; then
+  echo "Remote branch not found on origin: ${BRANCH}" >&2
+  exit 1
 fi
+
+# Robust for single-branch clones: always recreate/reset local branch from
+# the explicit remote-tracking ref we just fetched.
+git checkout -B "${BRANCH}" "refs/remotes/origin/${BRANCH}"
+# Best effort: wire upstream for ergonomics.
+git branch --set-upstream-to "origin/${BRANCH}" "${BRANCH}" >/dev/null 2>&1 || true
 
 # Force exact parity with origin branch.
 git reset --hard "origin/${BRANCH}"
