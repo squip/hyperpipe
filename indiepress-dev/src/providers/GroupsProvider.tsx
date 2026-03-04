@@ -19,6 +19,7 @@ import {
   HYPERTUNA_IDENTIFIER_TAG,
   isHypertunaTaggedEvent,
   KIND_HYPERTUNA_RELAY,
+  normalizeGatewayOrigin,
   parseHypertunaRelayEvent30166
 } from '@/lib/hypertuna-group-events'
 import { TDraftEvent } from '@/types'
@@ -116,6 +117,7 @@ export type LeaveGroupResult = {
 }
 
 type TGroupMetadataDiscoveryHints = {
+  gatewayOrigin?: string | null
   discoveryTopic?: string | null
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
@@ -216,6 +218,7 @@ type TGroupsContext = {
       picture: string
       isPublic: boolean
       isOpen: boolean
+      gatewayOrigin: string | null
     }>,
     relay?: string
   ) => Promise<void>
@@ -251,6 +254,7 @@ type TGroupsContext = {
     isOpen: boolean
     picture?: string
     fileSharing?: boolean
+    gatewayOrigin?: string | null
   }) => Promise<{ groupId: string; relay: string }>
 }
 
@@ -347,6 +351,7 @@ const createProvisionalGroupMetadata = (args: {
   name?: string | null
   about?: string | null
   picture?: string | null
+  gatewayOrigin?: string | null
   isPublic?: boolean
   isOpen?: boolean
   createdAt?: number
@@ -356,10 +361,22 @@ const createProvisionalGroupMetadata = (args: {
   const name = typeof args.name === 'string' ? args.name.trim() : ''
   const about = typeof args.about === 'string' ? args.about.trim() : ''
   const picture = typeof args.picture === 'string' ? args.picture.trim() : ''
+  const rawGatewayRoute =
+    typeof args.gatewayOrigin === 'string'
+      ? args.gatewayOrigin.trim()
+      : args.gatewayOrigin === null
+        ? 'none'
+        : ''
+  const normalizedGatewayOrigin = normalizeGatewayOrigin(rawGatewayRoute)
+  const gatewayOrigin =
+    /^(none|null|disabled|direct-only)$/i.test(rawGatewayRoute)
+      ? 'none'
+      : normalizedGatewayOrigin
   const hasAnyMetadata =
     !!name ||
     !!about ||
     !!picture ||
+    !!gatewayOrigin ||
     typeof args.isPublic === 'boolean' ||
     typeof args.isOpen === 'boolean'
   if (!hasAnyMetadata) return null
@@ -375,6 +392,7 @@ const createProvisionalGroupMetadata = (args: {
   if (name) tags.push(['name', name])
   if (about) tags.push(['about', about])
   if (picture) tags.push(['picture', picture])
+  if (gatewayOrigin) tags.push(['gateway', gatewayOrigin])
   if (typeof args.isPublic === 'boolean') tags.push([args.isPublic ? 'public' : 'private'])
   if (typeof args.isOpen === 'boolean') tags.push([args.isOpen ? 'open' : 'closed'])
   const event = {
@@ -392,6 +410,7 @@ const createProvisionalGroupMetadata = (args: {
     name: name || groupId,
     about: about || undefined,
     picture: picture || undefined,
+    gatewayOrigin: gatewayOrigin || undefined,
     isPublic: typeof args.isPublic === 'boolean' ? args.isPublic : undefined,
     isOpen: typeof args.isOpen === 'boolean' ? args.isOpen : undefined,
     tags: [],
@@ -457,6 +476,7 @@ const buildInvitePayload = (args: {
   token: string
   relayUrl: string | null
   relayKey?: string | null
+  gatewayOrigin?: string | null
   discoveryTopic?: string | null
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
@@ -479,10 +499,22 @@ const buildInvitePayload = (args: {
     autobaseLocal?: string
     writerSecret?: string
   } | null
-}) => ({
+}) => {
+  const rawGatewayRoute =
+    typeof args.gatewayOrigin === 'string'
+      ? args.gatewayOrigin.trim()
+      : args.gatewayOrigin === null
+        ? 'none'
+        : ''
+  const gatewayOrigin =
+    /^(none|null|disabled|direct-only)$/i.test(rawGatewayRoute)
+      ? 'none'
+      : normalizeGatewayOrigin(rawGatewayRoute)
+  return {
   relayUrl: args.relayUrl,
   token: args.token,
   relayKey: args.relayKey ?? null,
+  ...(gatewayOrigin ? { gatewayOrigin } : {}),
   isPublic: args.meta?.isPublic !== false,
   groupName: args.groupName || args.meta?.name,
   groupPicture: args.groupPicture || args.meta?.picture || null,
@@ -502,11 +534,12 @@ const buildInvitePayload = (args: {
   writerCoreHex: args.writerInfo?.writerCoreHex || args.writerInfo?.autobaseLocal || null,
   autobaseLocal: args.writerInfo?.autobaseLocal || args.writerInfo?.writerCoreHex || null,
   writerSecret: args.writerInfo?.writerSecret || null
-})
+}}
 
 const buildOpenInvitePayload = (args: {
   relayUrl: string | null
   relayKey?: string | null
+  gatewayOrigin?: string | null
   discoveryTopic?: string | null
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
@@ -514,9 +547,21 @@ const buildOpenInvitePayload = (args: {
   groupName?: string
   groupPicture?: string
   authorizedMemberPubkeys?: string[]
-}) => ({
+}) => {
+  const rawGatewayRoute =
+    typeof args.gatewayOrigin === 'string'
+      ? args.gatewayOrigin.trim()
+      : args.gatewayOrigin === null
+        ? 'none'
+        : ''
+  const gatewayOrigin =
+    /^(none|null|disabled|direct-only)$/i.test(rawGatewayRoute)
+      ? 'none'
+      : normalizeGatewayOrigin(rawGatewayRoute)
+  return {
   relayUrl: args.relayUrl,
   relayKey: args.relayKey ?? null,
+  ...(gatewayOrigin ? { gatewayOrigin } : {}),
   discoveryTopic: args.discoveryTopic || null,
   hostPeerKeys: normalizePubkeyList(args.hostPeerKeys || []),
   leaseReplicaPeerKeys: normalizePubkeyList(args.leaseReplicaPeerKeys || []),
@@ -524,7 +569,7 @@ const buildOpenInvitePayload = (args: {
   groupName: args.groupName || null,
   groupPicture: args.groupPicture || null,
   authorizedMemberPubkeys: normalizePubkeyList(args.authorizedMemberPubkeys)
-})
+}}
 
 const extractRelayKeyFromUrl = (value?: string | null) => {
   if (!value) return null
@@ -734,6 +779,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       name?: string | null
       about?: string | null
       picture?: string | null
+      gatewayOrigin?: string | null
       isPublic?: boolean
       isOpen?: boolean
       createdAt?: number
@@ -752,6 +798,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         name: args.name,
         about: args.about,
         picture: args.picture,
+        gatewayOrigin: args.gatewayOrigin,
         isPublic: args.isPublic,
         isOpen: args.isOpen,
         createdAt: args.createdAt
@@ -778,6 +825,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             current.metadata.name === metadata.name &&
             (current.metadata.about || '') === (metadata.about || '') &&
             (current.metadata.picture || '') === (metadata.picture || '') &&
+            (current.metadata.gatewayOrigin || '') === (metadata.gatewayOrigin || '') &&
             current.metadata.isPublic === metadata.isPublic &&
             current.metadata.isOpen === metadata.isOpen
           ) {
@@ -1176,6 +1224,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let token: string | undefined
             let relayUrl: string | null | undefined
             let relayKey: string | null | undefined
+            let gatewayOrigin: string | null | undefined
             let groupName: string | undefined = invite.groupName || invite.name
             let groupPicture: string | undefined = invite.groupPicture
             let authorizedMemberPubkeys: string[] | undefined
@@ -1207,6 +1256,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 token = typeof payload.token === 'string' ? payload.token : undefined
                 relayUrl = typeof payload.relayUrl === 'string' ? payload.relayUrl : null
                 relayKey = typeof payload.relayKey === 'string' ? payload.relayKey : null
+                gatewayOrigin =
+                  typeof payload.gatewayOrigin === 'string' && payload.gatewayOrigin.trim()
+                    ? payload.gatewayOrigin.trim()
+                    : undefined
                 if (typeof payload.groupName === 'string') {
                   groupName = payload.groupName
                 } else if (typeof payload.name === 'string') {
@@ -1326,6 +1379,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               token,
               relayUrl,
               relayKey,
+              gatewayOrigin,
               fileSharing,
               isPublic,
               blindPeer,
@@ -1367,6 +1421,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           name: invite.groupName || invite.name,
           about: invite.about,
           picture: invite.groupPicture,
+          gatewayOrigin:
+            typeof invite.gatewayOrigin === 'string' && invite.gatewayOrigin.trim()
+              ? invite.gatewayOrigin.trim()
+              : undefined,
           isPublic: invite.isPublic,
           isOpen: invite.fileSharing,
           createdAt: invite.event?.created_at,
@@ -3437,7 +3495,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       isPublic,
       isOpen,
       picture,
-      fileSharing
+      fileSharing,
+      gatewayOrigin
     }: {
       name: string
       about?: string
@@ -3445,6 +3504,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       isOpen: boolean
       picture?: string
       fileSharing?: boolean
+      gatewayOrigin?: string | null
     }) => {
       if (!pubkey) throw new Error('Not logged in')
       const result = await createRelay({
@@ -3453,7 +3513,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         isPublic,
         isOpen,
         fileSharing,
-        picture
+        picture,
+        gatewayOrigin:
+          typeof gatewayOrigin === 'string'
+            ? gatewayOrigin
+            : gatewayOrigin === null
+              ? 'none'
+              : undefined
       })
       if (!result?.success) throw new Error(result?.error || 'Failed to create relay')
 
@@ -3475,12 +3541,19 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         typeof result.writerIssuerPubkey === 'string' && result.writerIssuerPubkey.trim()
           ? result.writerIssuerPubkey.trim()
           : null
+      const resolvedGatewayOrigin =
+        typeof result.gatewayOrigin === 'string' && result.gatewayOrigin.trim()
+          ? result.gatewayOrigin.trim()
+          : typeof gatewayOrigin === 'string' && gatewayOrigin.trim()
+            ? gatewayOrigin.trim()
+            : null
       upsertProvisionalGroupMetadata({
         groupId: publicIdentifier,
         relay: relayWsUrl,
         name,
         about,
         picture,
+        gatewayOrigin: resolvedGatewayOrigin,
         isPublic,
         isOpen,
         source: 'create'
@@ -3496,6 +3569,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           fileSharing,
           relayWsUrl,
           pictureTagUrl: picture,
+          gatewayOrigin: resolvedGatewayOrigin,
           discoveryTopic,
           hostPeerKeys,
           leaseReplicaPeerKeys,
@@ -3691,6 +3765,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         typeof metadataHints?.writerIssuerPubkey === 'string' && metadataHints.writerIssuerPubkey.trim()
           ? metadataHints.writerIssuerPubkey.trim()
           : null
+      const metadataGatewayOrigin =
+        typeof metadataHints?.gatewayOrigin === 'string' && metadataHints.gatewayOrigin.trim()
+          ? metadataHints.gatewayOrigin.trim()
+          : undefined
       if (!isOpenGroup && !inviteRelayKey) {
         console.warn('[GroupsProvider] Missing relayKey for closed invite payload', {
           groupId,
@@ -3804,6 +3882,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             ? buildOpenInvitePayload({
                 relayUrl: inviteRelayUrl,
                 relayKey: inviteRelayKey,
+                gatewayOrigin: metadataGatewayOrigin,
                 discoveryTopic,
                 hostPeerKeys,
                 leaseReplicaPeerKeys: metadataLeaseReplicaPeerKeys,
@@ -3816,6 +3895,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 token: token as string,
                 relayUrl: inviteRelayUrl,
                 relayKey: inviteRelayKey,
+                gatewayOrigin: metadataGatewayOrigin,
                 meta,
                 groupName: inviteName,
                 groupPicture: invitePicture,
@@ -4055,6 +4135,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         picture: string
         isPublic: boolean
         isOpen: boolean
+        gatewayOrigin: string | null
       }>,
       relay?: string
     ) => {
@@ -4076,6 +4157,36 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const name = baseTagValue(data.name)
       const about = baseTagValue(data.about)
       const picture = baseTagValue(data.picture)
+      const hasGatewayOriginInput = Object.prototype.hasOwnProperty.call(data, 'gatewayOrigin')
+      const gatewayOriginInput =
+        hasGatewayOriginInput
+          ? ((data as { gatewayOrigin?: string | null }).gatewayOrigin ?? null)
+          : undefined
+      const normalizedGatewayOrigin =
+        hasGatewayOriginInput
+          ? normalizeGatewayOrigin(
+              typeof gatewayOriginInput === 'string' ? gatewayOriginInput : gatewayOriginInput || null
+            )
+          : undefined
+      const gatewayExplicitNone =
+        hasGatewayOriginInput
+        && (
+          gatewayOriginInput === null
+          || (
+            typeof gatewayOriginInput === 'string'
+            && /^(none|null|disabled|direct-only)$/i.test(gatewayOriginInput.trim())
+          )
+        )
+
+      if (
+        hasGatewayOriginInput
+        && typeof gatewayOriginInput === 'string'
+        && gatewayOriginInput.trim()
+        && !normalizedGatewayOrigin
+        && !gatewayExplicitNone
+      ) {
+        throw new Error('Invalid gateway origin URL')
+      }
 
       if (name !== undefined) commandTags.push(['name', name])
       if (about !== undefined) commandTags.push(['about', about])
@@ -4118,6 +4229,36 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         const previousTags = Array.isArray(cachedMetadata?.event?.tags)
           ? (cachedMetadata?.event?.tags as string[][])
           : []
+        const existingTagKeys = new Set(metadataTags.map((tag) => `${tag[0]}:${tag[1] || ''}`))
+        const previousGatewayTag = previousTags.find(
+          (tag) => Array.isArray(tag) && tag[0] === 'gateway' && typeof tag[1] === 'string' && tag[1].trim()
+        )
+        if (hasGatewayOriginInput) {
+          const gatewayTagValue = gatewayExplicitNone
+            ? 'none'
+            : (normalizedGatewayOrigin || null)
+          if (gatewayTagValue) {
+            const key = `gateway:${gatewayTagValue}`
+            if (!existingTagKeys.has(key)) {
+              metadataTags.push(['gateway', gatewayTagValue])
+              existingTagKeys.add(key)
+            }
+          }
+        } else if (previousGatewayTag) {
+          const previousRawGateway = String(previousGatewayTag[1] || '').trim()
+          const previousGatewayOrigin = normalizeGatewayOrigin(previousRawGateway)
+          const previousGatewayTagValue =
+            /^(none|null|disabled|direct-only)$/i.test(previousRawGateway)
+              ? 'none'
+              : previousGatewayOrigin
+          if (previousGatewayTagValue) {
+            const key = `gateway:${previousGatewayTagValue}`
+            if (!existingTagKeys.has(key)) {
+              metadataTags.push(['gateway', previousGatewayTagValue])
+              existingTagKeys.add(key)
+            }
+          }
+        }
         if (nextIsPublic && nextIsOpen) {
           const discoveryTagNames = new Set([
             'hypertuna-topic',
@@ -4125,7 +4266,6 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             'hypertuna-writer-issuer',
             'hypertuna-lease-replica-peer'
           ])
-          const existingTagKeys = new Set(metadataTags.map((tag) => `${tag[0]}:${tag[1] || ''}`))
           for (const tag of previousTags) {
             if (!Array.isArray(tag) || !tag[0] || !tag[1]) continue
             if (!discoveryTagNames.has(tag[0])) continue
@@ -4151,12 +4291,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           throw new Error('No relay targets available to publish metadata snapshot')
         }
         await publish(metadataEvent, { specifiedRelayUrls: relayUrls })
+        const nextGatewayOrigin =
+          hasGatewayOriginInput
+            ? (gatewayExplicitNone ? 'none' : (normalizedGatewayOrigin || null))
+            : (cachedMetadata?.gatewayOrigin || null)
         upsertProvisionalGroupMetadata({
           groupId,
           relay: resolved || relay || undefined,
           name,
           about,
           picture,
+          gatewayOrigin: nextGatewayOrigin,
           isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : cachedMetadata?.isPublic,
           isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : cachedMetadata?.isOpen,
           source: 'update'
@@ -4177,7 +4322,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               about: about ?? g.about,
               picture: picture ?? g.picture,
               isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : g.isPublic,
-              isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : g.isOpen
+              isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : g.isOpen,
+              gatewayOrigin:
+                hasGatewayOriginInput
+                  ? (gatewayExplicitNone ? 'none' : (normalizedGatewayOrigin || null))
+                  : g.gatewayOrigin
             }
           })
         )

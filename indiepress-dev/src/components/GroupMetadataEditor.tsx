@@ -14,6 +14,7 @@ export type TGroupMetadataForm = {
   picture: string
   isPublic: boolean
   isOpen: boolean
+  gatewayOrigin?: string | null
 }
 
 export default function GroupMetadataEditor({
@@ -34,8 +35,11 @@ export default function GroupMetadataEditor({
     about: initial?.about ?? '',
     picture: initial?.picture ?? '',
     isPublic: initial?.isPublic ?? true,
-    isOpen: initial?.isOpen ?? true
+    isOpen: initial?.isOpen ?? true,
+    gatewayOrigin: initial?.gatewayOrigin
   })
+  const [gatewayMode, setGatewayMode] = useState<'preserve' | 'custom' | 'none'>('preserve')
+  const [gatewayInput, setGatewayInput] = useState<string>('')
   const [hasInteracted, setHasInteracted] = useState(false)
 
   const nextFormFromInitial = () => ({
@@ -43,19 +47,48 @@ export default function GroupMetadataEditor({
       about: initial?.about ?? '',
       picture: initial?.picture ?? '',
       isPublic: initial?.isPublic ?? true,
-      isOpen: initial?.isOpen ?? true
+      isOpen: initial?.isOpen ?? true,
+      gatewayOrigin: initial?.gatewayOrigin
     })
+
+  const syncGatewayInputsFromInitial = () => {
+    if (!Object.prototype.hasOwnProperty.call(initial || {}, 'gatewayOrigin')) {
+      setGatewayMode('preserve')
+      setGatewayInput('')
+      return
+    }
+    if (initial?.gatewayOrigin === null) {
+      setGatewayMode('none')
+      setGatewayInput('')
+      return
+    }
+    const gatewayOrigin = String(initial?.gatewayOrigin || '').trim()
+    if (/^(none|null|disabled|direct-only)$/i.test(gatewayOrigin)) {
+      setGatewayMode('none')
+      setGatewayInput('')
+      return
+    }
+    if (gatewayOrigin) {
+      setGatewayMode('custom')
+      setGatewayInput(gatewayOrigin)
+      return
+    }
+    setGatewayMode('preserve')
+    setGatewayInput('')
+  }
 
   useEffect(() => {
     if (!isOpen) return
     if (hasInteracted) return
     setForm(nextFormFromInitial())
+    syncGatewayInputsFromInitial()
   }, [initial, isOpen, hasInteracted])
 
   useEffect(() => {
     if (!isOpen) return
     setHasInteracted(false)
     setForm(nextFormFromInitial())
+    syncGatewayInputsFromInitial()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen])
 
@@ -164,11 +197,50 @@ export default function GroupMetadataEditor({
           }}
         />
       </div>
+      <div className="space-y-2">
+        <Label>Gateway route</Label>
+        <select
+          className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+          value={gatewayMode}
+          onChange={(event) => {
+            setHasInteracted(true)
+            setGatewayMode(event.target.value as 'preserve' | 'custom' | 'none')
+          }}
+        >
+          <option value="preserve">Preserve existing</option>
+          <option value="custom">Set gateway origin</option>
+          <option value="none">None (direct-only)</option>
+        </select>
+        {gatewayMode === 'custom' && (
+          <Input
+            value={gatewayInput}
+            onChange={(event) => {
+              setHasInteracted(true)
+              setGatewayInput(event.target.value)
+            }}
+            placeholder="https://gateway.example.com"
+          />
+        )}
+      </div>
       <div className="flex gap-2 justify-end">
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
-        <Button onClick={() => onSave(form)} disabled={saving}>
+        <Button
+          onClick={() =>
+            onSave({
+              ...form,
+              ...(gatewayMode === 'preserve'
+                ? {}
+                : {
+                    gatewayOrigin: gatewayMode === 'none'
+                      ? 'none'
+                      : gatewayInput.trim()
+                  })
+            })
+          }
+          disabled={saving}
+        >
           {saving ? 'Saving...' : 'Save'}
         </Button>
       </div>

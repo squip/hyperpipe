@@ -74,6 +74,7 @@ export class RelayService implements IRelayService {
     isOpen?: boolean
     fileSharing?: boolean
     picture?: string
+    gatewayOrigin?: string | null
   }): Promise<Record<string, unknown>> {
     let event: Record<string, unknown>
     try {
@@ -111,6 +112,7 @@ export class RelayService implements IRelayService {
     relayUrl?: string
     authToken?: string
     fileSharing?: boolean
+    gatewayOrigin?: string | null
   }): Promise<Record<string, unknown>> {
     const event = await this.sendAndWaitForEvent<Record<string, unknown>>(
       {
@@ -139,6 +141,7 @@ export class RelayService implements IRelayService {
     relayKey?: string
     relayUrl?: string
     gatewayMode?: 'auto' | 'disabled'
+    gatewayOrigin?: string | null
     discoveryTopic?: string | null
     hostPeerKeys?: string[]
     leaseReplicaPeerKeys?: string[]

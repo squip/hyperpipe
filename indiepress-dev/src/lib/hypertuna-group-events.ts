@@ -12,6 +12,22 @@ export const HYPERTUNA_TOPIC_TAG = 'hypertuna-topic'
 export const HYPERTUNA_HOST_PEER_TAG = 'hypertuna-host-peer'
 export const HYPERTUNA_WRITER_ISSUER_TAG = 'hypertuna-writer-issuer'
 export const HYPERTUNA_LEASE_REPLICA_PEER_TAG = 'hypertuna-lease-replica-peer'
+export const HYPERTUNA_GATEWAY_TAG = 'gateway'
+
+export function normalizeGatewayOrigin(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed || /^(none|null|disabled|direct-only)$/i.test(trimmed)) return null
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:'
+    if (parsed.protocol === 'wss:') parsed.protocol = 'https:'
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    return parsed.origin
+  } catch {
+    return null
+  }
+}
 
 export function getBaseRelayUrl(url: string): string {
   try {
@@ -58,6 +74,7 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   fileSharing?: boolean
   relayWsUrl: string
   pictureTagUrl?: string
+  gatewayOrigin?: string | null
   discoveryTopic?: string | null
   hostPeerKeys?: string[]
   writerIssuerPubkey?: string | null
@@ -102,6 +119,18 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
 
   if (args.pictureTagUrl) {
     metadataTags.push(['picture', args.pictureTagUrl, 'hypertuna:drive:pfp'])
+  }
+  const rawGatewayRoute =
+    typeof args.gatewayOrigin === 'string'
+      ? args.gatewayOrigin.trim()
+      : args.gatewayOrigin === null
+        ? 'none'
+        : ''
+  const normalizedGatewayOrigin = normalizeGatewayOrigin(rawGatewayRoute)
+  if (/^(none|null|disabled|direct-only)$/i.test(rawGatewayRoute)) {
+    metadataTags.push([HYPERTUNA_GATEWAY_TAG, 'none'])
+  } else if (normalizedGatewayOrigin) {
+    metadataTags.push([HYPERTUNA_GATEWAY_TAG, normalizedGatewayOrigin])
   }
   if (args.isPublic && args.isOpen) {
     if (typeof args.discoveryTopic === 'string' && args.discoveryTopic.trim()) {

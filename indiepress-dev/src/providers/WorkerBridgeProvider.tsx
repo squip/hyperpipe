@@ -138,6 +138,7 @@ type RelayCreateRequest = {
   isOpen?: boolean
   fileSharing?: boolean
   picture?: string
+  gatewayOrigin?: string | null
 }
 
 type RelayBootstrapPublishStatus = {
@@ -170,6 +171,7 @@ type RelayCreatedPayload = {
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
   writerIssuerPubkey?: string | null
+  gatewayOrigin?: string | null
 }
 
 type RefreshRelaySubscriptionsResult = {
@@ -231,6 +233,7 @@ type WorkerBridgeContextValue = {
       relayKey?: string | null
       relayUrl?: string | null
       gatewayMode?: 'auto' | 'disabled'
+      gatewayOrigin?: string | null
       discoveryTopic?: string | null
       hostPeerKeys?: string[]
       leaseReplicaPeerKeys?: string[]
@@ -636,6 +639,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         relayKey?: string | null
         relayUrl?: string | null
         gatewayMode?: 'auto' | 'disabled'
+        gatewayOrigin?: string | null
         discoveryTopic?: string | null
         hostPeerKeys?: string[]
         leaseReplicaPeerKeys?: string[]
@@ -739,6 +743,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         writerSecret: opts?.writerSecret,
         fastForward: opts?.fastForward || undefined,
         gatewayMode,
+        gatewayOrigin: opts?.gatewayOrigin || undefined,
         discoveryTopic: opts?.discoveryTopic || undefined,
         leaseReplicaPeerKeys: Array.isArray(opts?.leaseReplicaPeerKeys)
           ? opts.leaseReplicaPeerKeys

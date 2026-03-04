@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -8,6 +8,8 @@ import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useTranslation } from 'react-i18next'
 import { useGroups } from '@/providers/GroupsProvider'
+import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
+import { normalizeGatewayOrigin } from '@/lib/hypertuna-group-events'
 import { toast } from 'sonner'
 import Uploader from '@/components/PostEditor/Uploader'
 import { Upload, X } from 'lucide-react'
@@ -20,19 +22,66 @@ export default function GroupCreateDialog({
   onOpenChange: (open: boolean) => void
 }) {
   const { t } = useTranslation()
-  const { createHypertunaRelayGroup } = useGroups()
+  const { createHypertunaRelayGroup, discoveryGroups } = useGroups()
+  const { publicGatewayStatus } = useWorkerBridge()
   const [name, setName] = useState('')
   const [about, setAbout] = useState('')
   const [picture, setPicture] = useState('')
   const [isPublic, setIsPublic] = useState(true)
   const [isOpen, setIsOpen] = useState(true)
+  const [gatewaySelection, setGatewaySelection] = useState<'default' | 'custom' | 'none'>('default')
+  const [gatewayOriginInput, setGatewayOriginInput] = useState('')
   const [isSaving, setIsSaving] = useState(false)
+
+  const defaultGatewayOrigin = useMemo(
+    () => normalizeGatewayOrigin(publicGatewayStatus?.baseUrl || null),
+    [publicGatewayStatus?.baseUrl]
+  )
+
+  const discoveredGatewayOrigins = useMemo(() => {
+    const values = Array.isArray(discoveryGroups)
+      ? discoveryGroups
+        .map((entry) => normalizeGatewayOrigin(entry?.gatewayOrigin || null))
+        .filter((entry): entry is string => !!entry)
+      : []
+    return Array.from(new Set(values))
+  }, [discoveryGroups])
+
+  const gatewayOriginOptions = useMemo(() => {
+    return Array.from(
+      new Set([
+        ...(defaultGatewayOrigin ? [defaultGatewayOrigin] : []),
+        ...discoveredGatewayOrigins
+      ])
+    )
+  }, [defaultGatewayOrigin, discoveredGatewayOrigins])
+
+  useEffect(() => {
+    if (!open) return
+    if (!gatewayOriginInput && defaultGatewayOrigin) {
+      setGatewayOriginInput(defaultGatewayOrigin)
+    }
+  }, [defaultGatewayOrigin, gatewayOriginInput, open])
 
   const handleSave = async () => {
     if (!name.trim()) {
       toast.error(t('Please enter a group name'))
       return
     }
+    let selectedGatewayOrigin: string | null | undefined
+    if (gatewaySelection === 'none') {
+      selectedGatewayOrigin = 'none'
+    } else if (gatewaySelection === 'custom') {
+      const normalized = normalizeGatewayOrigin(gatewayOriginInput)
+      if (!normalized) {
+        toast.error(t('Please enter a valid gateway origin URL'))
+        return
+      }
+      selectedGatewayOrigin = normalized
+    } else {
+      selectedGatewayOrigin = defaultGatewayOrigin || undefined
+    }
+
     setIsSaving(true)
     try {
       await createHypertunaRelayGroup({
@@ -41,13 +90,16 @@ export default function GroupCreateDialog({
         isPublic,
         isOpen,
         picture: picture.trim() || undefined,
-        fileSharing: true
+        fileSharing: true,
+        gatewayOrigin: selectedGatewayOrigin
       })
       toast.success(t('Group created'), { duration: 2000 })
       onOpenChange(false)
       setName('')
       setAbout('')
       setPicture('')
+      setGatewaySelection('default')
+      setGatewayOriginInput(defaultGatewayOrigin || '')
     } catch (err) {
       toast.error(t('Failed to create group'))
       console.error(err)
@@ -146,6 +198,42 @@ export default function GroupCreateDialog({
               </div>
             </div>
             <Switch checked={isOpen} onCheckedChange={setIsOpen} />
+          </div>
+          <div className="space-y-2">
+            <Label>{t('Gateway Route')} ({t('optional')})</Label>
+            <select
+              className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              value={gatewaySelection}
+              onChange={(event) => setGatewaySelection(event.target.value as 'default' | 'custom' | 'none')}
+            >
+              <option value="default">
+                {defaultGatewayOrigin
+                  ? `${t('Default gateway')}: ${defaultGatewayOrigin}`
+                  : t('Default gateway (none configured)')}
+              </option>
+              <option value="custom">{t('Custom gateway origin')}</option>
+              <option value="none">{t('None (direct-only relay)')}</option>
+            </select>
+            {gatewaySelection === 'custom' && (
+              <>
+                <Input
+                  value={gatewayOriginInput}
+                  onChange={(event) => setGatewayOriginInput(event.target.value)}
+                  placeholder="https://gateway.example.com"
+                  list="group-gateway-origin-options"
+                />
+                <datalist id="group-gateway-origin-options">
+                  {gatewayOriginOptions.map((origin) => (
+                    <option key={origin} value={origin} />
+                  ))}
+                </datalist>
+              </>
+            )}
+            {gatewaySelection === 'none' && (
+              <div className="text-xs text-muted-foreground">
+                {t('Gateway-assisted routing is disabled for this relay.')}
+              </div>
+            )}
           </div>
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={() => onOpenChange(false)}>

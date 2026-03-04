@@ -1,4 +1,5 @@
 import type { Event } from 'nostr-tools'
+import { normalizeGatewayOrigin } from './hypertuna-group-events.js'
 
 export const PRIVATE_GROUP_LEAVE_SHADOW_NAMESPACE = 'ht-private-leave:v1'
 
@@ -35,6 +36,16 @@ export function parseGroupMetadataEvent(event: Event, relay?: string) {
   const picture = event.tags.find((tag) => tag[0] === 'picture')?.[1]
   const isPublic = event.tags.some((tag) => tag[0] === 'public')
   const isOpen = event.tags.some((tag) => tag[0] === 'open')
+  const rawGatewayOrigin = event.tags.find((tag) => tag[0] === 'gateway')?.[1] ?? null
+  const normalizedGatewayOrigin = normalizeGatewayOrigin(rawGatewayOrigin)
+  const gatewayOrigin =
+    normalizedGatewayOrigin
+    || (
+      typeof rawGatewayOrigin === 'string'
+      && /^(none|null|disabled|direct-only)$/i.test(rawGatewayOrigin.trim())
+        ? 'none'
+        : undefined
+    )
   const discoveryTopic = event.tags.find((tag) => tag[0] === 'hypertuna-topic')?.[1] ?? null
   const hostPeerKeys = event.tags
     .filter((tag) => tag[0] === 'hypertuna-host-peer' && tag[1])
@@ -52,6 +63,7 @@ export function parseGroupMetadataEvent(event: Event, relay?: string) {
     picture,
     isPublic,
     isOpen,
+    gatewayOrigin,
     discoveryTopic,
     hostPeerKeys,
     leaseReplicaPeerKeys,
@@ -67,6 +79,16 @@ export function parseGroupInviteEvent(event: Event, relay?: string) {
   const about = event.tags.find((tag) => tag[0] === 'about')?.[1]
   const isPublic = event.tags.some((tag) => tag[0] === 'public')
   const fileSharing = event.tags.some((tag) => tag[0] === 'file-sharing-on')
+  const rawGatewayOrigin = event.tags.find((tag) => tag[0] === 'gateway')?.[1] ?? null
+  const normalizedGatewayOrigin = normalizeGatewayOrigin(rawGatewayOrigin)
+  const gatewayOrigin =
+    normalizedGatewayOrigin
+    || (
+      typeof rawGatewayOrigin === 'string'
+      && /^(none|null|disabled|direct-only)$/i.test(rawGatewayOrigin.trim())
+        ? 'none'
+        : undefined
+    )
 
   return {
     id: event.id,
@@ -74,6 +96,7 @@ export function parseGroupInviteEvent(event: Event, relay?: string) {
     relay,
     groupName: name,
     groupPicture: picture,
+    gatewayOrigin,
     isPublic,
     fileSharing,
     about,

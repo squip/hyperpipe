@@ -7,10 +7,29 @@ export const KIND_GROUP_METADATA = 39000
 export const KIND_GROUP_ADMIN_LIST = 39001
 export const KIND_GROUP_MEMBER_LIST = 39002
 export const KIND_HYPERTUNA_RELAY = 30166
+export const HYPERTUNA_GATEWAY_TAG = 'gateway'
 export const HYPERTUNA_TOPIC_TAG = 'hypertuna-topic'
 export const HYPERTUNA_HOST_PEER_TAG = 'hypertuna-host-peer'
 export const HYPERTUNA_WRITER_ISSUER_TAG = 'hypertuna-writer-issuer'
 export const HYPERTUNA_LEASE_REPLICA_PEER_TAG = 'hypertuna-lease-replica-peer'
+
+export function normalizeGatewayOrigin(value: string | null | undefined): string | null {
+  if (!value || typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:'
+    if (parsed.protocol === 'wss:') parsed.protocol = 'https:'
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    parsed.pathname = ''
+    parsed.search = ''
+    parsed.hash = ''
+    return parsed.origin
+  } catch (_err) {
+    return null
+  }
+}
 
 export function getBaseRelayUrl(url: string): string {
   try {
@@ -51,6 +70,7 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   fileSharing?: boolean
   relayWsUrl: string
   pictureTagUrl?: string
+  gatewayOrigin?: string | null
   discoveryTopic?: string | null
   hostPeerKeys?: string[]
   writerIssuerPubkey?: string | null
@@ -88,6 +108,18 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
 
   if (args.pictureTagUrl) {
     metadataTags.push(['picture', args.pictureTagUrl, 'hypertuna:drive:pfp'])
+  }
+  const rawGatewayRoute =
+    typeof args.gatewayOrigin === 'string'
+      ? args.gatewayOrigin.trim()
+      : args.gatewayOrigin === null
+        ? 'none'
+        : ''
+  const normalizedGatewayOrigin = normalizeGatewayOrigin(rawGatewayRoute)
+  if (/^(none|null|disabled|direct-only)$/i.test(rawGatewayRoute)) {
+    metadataTags.push([HYPERTUNA_GATEWAY_TAG, 'none'])
+  } else if (normalizedGatewayOrigin) {
+    metadataTags.push([HYPERTUNA_GATEWAY_TAG, normalizedGatewayOrigin])
   }
   if (args.isPublic && args.isOpen) {
     if (typeof args.discoveryTopic === 'string' && args.discoveryTopic.trim()) {

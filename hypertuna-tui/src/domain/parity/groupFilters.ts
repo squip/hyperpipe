@@ -4,6 +4,7 @@ import { parseGroupIdentifier, parseGroupInviteEvent, parseGroupMetadataEvent } 
 import {
   getBaseRelayUrl,
   HYPERTUNA_IDENTIFIER_TAG,
+  normalizeGatewayOrigin,
   parseHypertunaRelayEvent30166
 } from '../../lib/hypertuna-group-events.js'
 
@@ -149,6 +150,14 @@ export function parseGroupInviteWithPayload(args: {
       : typeof payload.relay_key === 'string'
         ? payload.relay_key
         : null
+  const payloadGatewayRaw =
+    typeof payload.gatewayOrigin === 'string'
+      ? payload.gatewayOrigin
+      : typeof payload.gateway_origin === 'string'
+        ? payload.gateway_origin
+        : ''
+  const payloadGatewayOrigin = normalizeGatewayOrigin(payloadGatewayRaw)
+  const payloadGatewayExplicitNone = /^(none|null|disabled|direct-only)$/i.test(String(payloadGatewayRaw || '').trim())
   const token = typeof payload.token === 'string' ? payload.token : undefined
   const fileSharing = typeof payload.fileSharing === 'boolean' ? payload.fileSharing : parsed.fileSharing
   const isPublic = typeof payload.isPublic === 'boolean' ? payload.isPublic : parsed.isPublic
@@ -273,6 +282,9 @@ export function parseGroupInviteWithPayload(args: {
     relay,
     relayUrl: relayUrl || null,
     relayKey,
+    gatewayOrigin:
+      payloadGatewayOrigin
+      || (payloadGatewayExplicitNone ? 'none' : (parsed.gatewayOrigin || undefined)),
     groupName,
     groupPicture,
     name: groupName,

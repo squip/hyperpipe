@@ -12,6 +12,21 @@ import {
 
 export const PRIVATE_GROUP_LEAVE_SHADOW_NAMESPACE = 'ht-private-leave:v1'
 
+function normalizeGatewayOrigin(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed || /^(none|null|disabled|direct-only)$/i.test(trimmed)) return null
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:'
+    if (parsed.protocol === 'wss:') parsed.protocol = 'https:'
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    return parsed.origin
+  } catch {
+    return null
+  }
+}
+
 export function parseGroupIdentifier(rawId: string): TGroupIdentifier {
   if (rawId.includes("'")) {
     const [relay, groupId] = rawId.split("'")
@@ -33,6 +48,16 @@ export function parseGroupMetadataEvent(event: Event, relay?: string): TGroupMet
   const isPublic = event.tags.some((t) => t[0] === 'public')
   const isOpen = event.tags.some((t) => t[0] === 'open')
   const tags = event.tags.filter((t) => t[0] === 't' && t[1]).map((t) => t[1])
+  const rawGatewayOrigin = event.tags.find((t) => t[0] === 'gateway')?.[1] ?? null
+  const normalizedGatewayOrigin = normalizeGatewayOrigin(rawGatewayOrigin)
+  const gatewayOrigin =
+    normalizedGatewayOrigin
+    || (
+      typeof rawGatewayOrigin === 'string'
+      && /^(none|null|disabled|direct-only)$/i.test(rawGatewayOrigin.trim())
+        ? 'none'
+        : undefined
+    )
   const discoveryTopic = event.tags.find((t) => t[0] === 'hypertuna-topic')?.[1] ?? null
   const hostPeerKeys = event.tags
     .filter((t) => t[0] === 'hypertuna-host-peer' && t[1])
@@ -50,6 +75,7 @@ export function parseGroupMetadataEvent(event: Event, relay?: string): TGroupMet
     picture,
     isPublic,
     isOpen,
+    gatewayOrigin,
     discoveryTopic,
     hostPeerKeys,
     leaseReplicaPeerKeys,
@@ -164,6 +190,16 @@ export function parseGroupInviteEvent(event: Event, relay?: string): TGroupInvit
   const about = event.tags.find((t) => t[0] === 'about')?.[1]
   const isPublic = event.tags.some((t) => t[0] === 'public')
   const fileSharingOn = event.tags.some((t) => t[0] === 'file-sharing-on')
+  const rawGatewayOrigin = event.tags.find((t) => t[0] === 'gateway')?.[1] ?? null
+  const normalizedGatewayOrigin = normalizeGatewayOrigin(rawGatewayOrigin)
+  const gatewayOrigin =
+    normalizedGatewayOrigin
+    || (
+      typeof rawGatewayOrigin === 'string'
+      && /^(none|null|disabled|direct-only)$/i.test(rawGatewayOrigin.trim())
+        ? 'none'
+        : undefined
+    )
   return {
     groupId,
     relay,
@@ -173,6 +209,7 @@ export function parseGroupInviteEvent(event: Event, relay?: string): TGroupInvit
     about,
     isPublic,
     fileSharing: fileSharingOn,
+    gatewayOrigin,
     // Token is encrypted in content per requirements; decrypted elsewhere
     token: undefined,
     event

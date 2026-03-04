@@ -3812,6 +3812,7 @@ function buildCreateRelayBootstrapDraftEvents({
   fileSharing,
   relayWsUrl,
   picture,
+  gatewayOrigin = null,
   discoveryTopic = null,
   hostPeerKeys = [],
   writerIssuerPubkey = null,
@@ -3848,6 +3849,17 @@ function buildCreateRelayBootstrapDraftEvents({
     [fileSharingEnabled ? 'file-sharing-on' : 'file-sharing-off']
   ];
   if (pictureTag) metadataTags.push(['picture', pictureTag, 'hypertuna:drive:pfp']);
+  const rawGatewayRoute = typeof gatewayOrigin === 'string'
+    ? gatewayOrigin.trim()
+    : gatewayOrigin === null
+      ? 'none'
+      : '';
+  const normalizedGatewayOrigin = toHttpOrigin(rawGatewayRoute || null);
+  if (/^(none|null|disabled|direct-only)$/i.test(rawGatewayRoute)) {
+    metadataTags.push(['gateway', 'none']);
+  } else if (normalizedGatewayOrigin) {
+    metadataTags.push(['gateway', normalizedGatewayOrigin]);
+  }
 
   if (isPublic && isOpen) {
     const topic = typeof discoveryTopic === 'string' && discoveryTopic.trim()
@@ -4014,7 +4026,8 @@ async function publishCreateRelayBootstrapEvents({
   isPublic,
   isOpen,
   fileSharing,
-  picture
+  picture,
+  gatewayOrigin = null
 }) {
   const canonicalIdentifier = normalizeRelayIdentifier(publicIdentifier || relayKey || '');
   if (!canonicalIdentifier) {
@@ -4048,6 +4061,7 @@ async function publishCreateRelayBootstrapEvents({
     fileSharing,
     relayWsUrl,
     picture,
+    gatewayOrigin,
     discoveryTopic,
     hostPeerKeys,
     writerIssuerPubkey,
@@ -5736,7 +5750,8 @@ export async function createRelay(options) {
     isPublic = false,
     isOpen = false,
     fileSharing = true,
-    picture
+    picture,
+    gatewayOrigin = undefined
   } = options;
   console.log('[RelayServer] Creating relay via adapter:', {
     name,
@@ -5753,7 +5768,8 @@ export async function createRelay(options) {
     isPublic,
     isOpen,
     fileSharing,
-    config
+    config,
+    gatewayOrigin
   });
   
   if (result.success) {
@@ -5899,7 +5915,8 @@ export async function createRelay(options) {
         isPublic,
         isOpen,
         fileSharing,
-        picture
+        picture,
+        gatewayOrigin: gatewayOrigin ?? result?.profile?.gateway_origin ?? null
       });
       bootstrapPublish.status = bootstrapResult.ok ? 'success' : 'failed';
       bootstrapPublish.attempt = bootstrapResult.attempt || 0;
@@ -5932,6 +5949,11 @@ export async function createRelay(options) {
     result.hostPeerKeys = config?.swarmPublicKey ? [String(config.swarmPublicKey).toLowerCase()] : [];
     result.leaseReplicaPeerKeys = [...result.hostPeerKeys];
     result.writerIssuerPubkey = normalizeHex64(config?.nostr_pubkey_hex || null);
+    result.gatewayOrigin = toHttpOrigin(
+      gatewayOrigin
+      ?? result?.profile?.gateway_origin
+      ?? null
+    );
 
     await upsertRelayDiscoveryHints({
       relayKey: result.relayKey || null,
@@ -5971,6 +5993,11 @@ export async function joinRelay(options) {
       }
     }
     result.gatewayRegistration = registrationStatus;
+    result.gatewayOrigin = toHttpOrigin(
+      options?.gatewayOrigin
+      ?? result?.profile?.gateway_origin
+      ?? null
+    );
   }
   
   return result;

@@ -54,6 +54,21 @@ function guessContentType(fileName = '') {
   return 'application/octet-stream';
 }
 
+function normalizeHttpOrigin(candidate) {
+  if (!candidate || typeof candidate !== 'string') return null;
+  const trimmed = candidate.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:';
+    if (parsed.protocol === 'wss:') parsed.protocol = 'https:';
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    return parsed.origin;
+  } catch (_) {
+    return null;
+  }
+}
+
 class MessageQueue {
   constructor() {
     this.queue = [];
@@ -242,6 +257,7 @@ export class GatewayService extends EventEmitter {
     this.loggerBridge = null;
     this.publicGatewaySettings = this.#normalizePublicGatewayConfig(options.publicGateway);
     this.publicGatewayRegistrar = null;
+    this.publicGatewayRegistrarsByOrigin = new Map();
     this.openJoinPoolProvider = typeof options.openJoinPoolProvider === 'function'
       ? options.openJoinPoolProvider
       : null;
@@ -289,6 +305,9 @@ export class GatewayService extends EventEmitter {
     this.getCurrentPubkey = typeof options.getCurrentPubkey === 'function'
       ? options.getCurrentPubkey
       : () => options.currentPubkey || null;
+    this.resolveRelayGatewayRoute = typeof options.resolveRelayGatewayRoute === 'function'
+      ? options.resolveRelayGatewayRoute
+      : null;
 
     this.#configurePublicGateway();
   }
@@ -461,6 +480,65 @@ export class GatewayService extends EventEmitter {
     return trimmed.length ? trimmed : null;
   }
 
+  #getConfiguredGatewayOrigin() {
+    return normalizeHttpOrigin(this.publicGatewaySettings?.baseUrl || null);
+  }
+
+  #getRegistrarForOrigin(origin) {
+    const normalizedOrigin = normalizeHttpOrigin(origin);
+    if (!normalizedOrigin) {
+      return { registrar: null, origin: null, reason: 'missing-origin' };
+    }
+
+    const configuredOrigin = this.#getConfiguredGatewayOrigin();
+    if (
+      configuredOrigin
+      && normalizedOrigin === configuredOrigin
+      && this.publicGatewayRegistrar?.isEnabled?.()
+    ) {
+      return { registrar: this.publicGatewayRegistrar, origin: normalizedOrigin, reason: null };
+    }
+
+    const sharedSecret = String(this.publicGatewaySettings?.sharedSecret || '').trim();
+    if (!sharedSecret) {
+      return { registrar: null, origin: normalizedOrigin, reason: 'missing-shared-secret' };
+    }
+
+    let registrar = this.publicGatewayRegistrarsByOrigin.get(normalizedOrigin) || null;
+    if (!registrar?.isEnabled?.()) {
+      registrar = new PublicGatewayRegistrar({
+        baseUrl: normalizedOrigin,
+        sharedSecret,
+        logger: this.loggerBridge
+      });
+      this.publicGatewayRegistrarsByOrigin.set(normalizedOrigin, registrar);
+    }
+
+    return {
+      registrar: registrar?.isEnabled?.() ? registrar : null,
+      origin: normalizedOrigin,
+      reason: registrar?.isEnabled?.() ? null : 'registrar-disabled'
+    };
+  }
+
+  #resolveRegistrarForRoute(routeResolution) {
+    const explicitNone = routeResolution?.explicitNone === true;
+    if (explicitNone) {
+      return { registrar: null, origin: null, reason: 'route-disabled', explicitNone: true };
+    }
+
+    const routedOrigin = normalizeHttpOrigin(routeResolution?.origin || null);
+    const configuredOrigin = this.#getConfiguredGatewayOrigin();
+    const targetOrigin = routedOrigin || configuredOrigin || null;
+    const selected = this.#getRegistrarForOrigin(targetOrigin);
+    return {
+      registrar: selected.registrar,
+      origin: selected.origin,
+      reason: selected.reason,
+      explicitNone: false
+    };
+  }
+
   #configurePublicGateway() {
     const config = this.publicGatewaySettings || { enabled: false };
     const hasBaseUrl = !!(config.baseUrl && String(config.baseUrl).trim());
@@ -485,12 +563,18 @@ export class GatewayService extends EventEmitter {
       this.hyperbeeAdapter.logger = this.loggerBridge;
     }
 
+    this.publicGatewayRegistrarsByOrigin.clear();
+
     if (config.enabled && config.baseUrl && config.sharedSecret) {
       this.publicGatewayRegistrar = new PublicGatewayRegistrar({
         baseUrl: config.baseUrl,
         sharedSecret: config.sharedSecret,
         logger: this.loggerBridge
       });
+      const configuredOrigin = normalizeHttpOrigin(config.baseUrl || null);
+      if (configuredOrigin && this.publicGatewayRegistrar?.isEnabled?.()) {
+        this.publicGatewayRegistrarsByOrigin.set(configuredOrigin, this.publicGatewayRegistrar);
+      }
       this.publicGatewayWsBase = this.#computePublicGatewayWsBase(config.baseUrl);
     } else {
       this.publicGatewayRegistrar = null;
@@ -725,7 +809,21 @@ export class GatewayService extends EventEmitter {
   async #refreshRelayToken(relayKey, { force = false } = {}) {
     if (!relayKey) return;
     const state = this.publicGatewayRelayState.get(relayKey);
-    const isBridgeEnabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    let relayRouteResolution = null;
+    if (this.resolveRelayGatewayRoute) {
+      try {
+        relayRouteResolution = await this.resolveRelayGatewayRoute({
+          relayKey,
+          publicIdentifier: state?.metadata?.identifier || this.activeRelays.get(relayKey)?.metadata?.identifier || null
+        });
+      } catch (error) {
+        this.log('debug', `[PublicGateway] Failed resolving route for token refresh ${relayKey}: ${error?.message || error}`);
+      }
+    }
+    const registrarSelection = this.#resolveRegistrarForRoute(relayRouteResolution);
+    const registrar = registrarSelection.registrar;
+    const registrarOrigin = registrarSelection.origin;
+    const isBridgeEnabled = this.publicGatewaySettings?.enabled && registrar?.isEnabled?.();
     if (!isBridgeEnabled || !state || state.status !== 'registered') {
       this.#clearRelayToken(relayKey);
       this.#emitPublicGatewayStatus();
@@ -782,7 +880,7 @@ export class GatewayService extends EventEmitter {
 
     try {
       if (existing?.token && !tokenMismatch) {
-        const refreshed = await this.publicGatewayRegistrar.refreshGatewayToken(relayKey, {
+        const refreshed = await registrar.refreshGatewayToken(relayKey, {
           token: existing.token,
           ttlSeconds
         });
@@ -798,14 +896,18 @@ export class GatewayService extends EventEmitter {
         if (!gatewayPath) {
           gatewayPath = relayKey.includes(':') ? relayKey.replace(':', '/') : relayKey;
         }
-        const connectionUrl = `${this.publicGatewayWsBase}/${gatewayPath}?token=${encodeURIComponent(refreshed.token)}`;
+        const gatewayWsBase = this.#computePublicGatewayWsBase(registrarOrigin || this.publicGatewaySettings?.baseUrl || null);
+        if (!gatewayWsBase) {
+          throw new Error('Invalid public gateway base URL for token refresh');
+        }
+        const connectionUrl = `${gatewayWsBase}/${gatewayPath}?token=${encodeURIComponent(refreshed.token)}`;
 
         this.#recordRelayToken(relayKey, {
           token: refreshed.token,
           expiresAt,
           ttlSeconds,
           connectionUrl,
-          baseUrl: this.publicGatewaySettings.baseUrl,
+          baseUrl: registrarOrigin || this.publicGatewaySettings.baseUrl,
           issuedForPubkey: requestingPubkey,
           issuedAt: now,
           relayAuthToken: authToken,
@@ -815,7 +917,10 @@ export class GatewayService extends EventEmitter {
         return;
       }
 
-      await this.issuePublicGatewayToken(relayKey, { ttlSeconds });
+      await this.issuePublicGatewayToken(relayKey, {
+        ttlSeconds,
+        gatewayOrigin: registrarOrigin || undefined
+      });
     } catch (error) {
       this.log('warn', `[PublicGateway] Failed to refresh relay token for ${relayKey}: ${error.message}`);
       this.#scheduleRelayTokenRetry(relayKey);
@@ -1111,9 +1216,9 @@ export class GatewayService extends EventEmitter {
   }
 
   async #syncPublicGatewayRelay(relayKey, { forceTokenRefresh = false } = {}) {
-    const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    const bridgeEnabled = !!this.publicGatewaySettings?.enabled;
 
-    if (!enabled) {
+    if (!bridgeEnabled) {
       this.publicGatewayRelayState.delete(relayKey);
       this.#clearRelayToken(relayKey);
       await this.#unregisterPublicGatewayVirtualRelay(relayKey);
@@ -1137,6 +1242,54 @@ export class GatewayService extends EventEmitter {
     const peers = Array.from(relayData.peers || []);
     const metadata = relayData.metadata || {};
     const metadataCopy = metadata ? { ...metadata } : {};
+    let relayRouteResolution = null;
+    if (this.resolveRelayGatewayRoute) {
+      try {
+        relayRouteResolution = await this.resolveRelayGatewayRoute({
+          relayKey,
+          publicIdentifier: metadataCopy?.identifier || null
+        });
+      } catch (error) {
+        this.log('debug', `[PublicGateway] Failed resolving relay gateway route for ${relayKey}: ${error?.message || error}`);
+      }
+    }
+
+    if (relayRouteResolution?.explicitNone === true) {
+      this.publicGatewayRelayState.set(relayKey, {
+        relayKey,
+        status: 'route-disabled',
+        peerCount: peers.length,
+        lastSyncedAt: Date.now(),
+        message: 'Relay route is direct-only (gateway disabled per relay)',
+        metadata: metadataCopy,
+        peers,
+        blindPeer: this.blindPeerSummary || null,
+        relayCores: []
+      });
+      this.#clearRelayToken(relayKey);
+      this.#emitPublicGatewayStatus();
+      return;
+    }
+
+    const registrarSelection = this.#resolveRegistrarForRoute(relayRouteResolution);
+    const registrar = registrarSelection.registrar;
+    const registrarOrigin = registrarSelection.origin;
+    if (!registrar?.isEnabled?.()) {
+      this.publicGatewayRelayState.set(relayKey, {
+        relayKey,
+        status: 'route-unavailable',
+        peerCount: peers.length,
+        lastSyncedAt: Date.now(),
+        message: `Relay gateway route is unavailable (${registrarSelection.reason || 'no-registrar'})`,
+        metadata: metadataCopy,
+        peers,
+        blindPeer: this.blindPeerSummary || null,
+        relayCores: []
+      });
+      this.#clearRelayToken(relayKey);
+      this.#emitPublicGatewayStatus();
+      return;
+    }
 
     if (this.#isPublicGatewayRelayKey(relayKey)) {
       metadataCopy.identifier = metadataCopy.identifier || relayKey;
@@ -1197,7 +1350,7 @@ export class GatewayService extends EventEmitter {
           payload.relayCoresMode = 'merge';
         }
         try {
-          const registrationResult = await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
+          const registrationResult = await registrar.registerRelay(relayKey, payload);
           if (!registrationResult?.success) {
             throw new Error(registrationResult?.error || 'Registration rejected by gateway');
           }
@@ -1240,7 +1393,7 @@ export class GatewayService extends EventEmitter {
         return;
       }
       try {
-        await this.publicGatewayRegistrar.unregisterRelay(relayKey);
+        await registrar.unregisterRelay(relayKey);
         this.publicGatewayRelayState.set(relayKey, {
           relayKey,
           status: 'offline',
@@ -1289,7 +1442,7 @@ export class GatewayService extends EventEmitter {
     }
 
     try {
-      const registrationResult = await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
+      const registrationResult = await registrar.registerRelay(relayKey, payload);
       if (!registrationResult?.success) {
         throw new Error(registrationResult?.error || 'Registration rejected by gateway');
       }
@@ -1862,7 +2015,7 @@ export class GatewayService extends EventEmitter {
     }
 
     const config = this.publicGatewaySettings || {};
-    const enabled = !!(config.enabled && this.publicGatewayRegistrar?.isEnabled?.());
+    const enabled = !!config.enabled;
     const summary = this.blindPeerSummary;
     const defaultKeys = Array.isArray(config.blindPeerKeys) ? config.blindPeerKeys.filter(Boolean) : [];
     const manualKeys = Array.isArray(config.blindPeerManualKeys) ? config.blindPeerManualKeys.filter(Boolean) : [];
@@ -1968,13 +2121,6 @@ export class GatewayService extends EventEmitter {
         console.info('[PublicGateway] Open join pool sync skipped: missing provider', { relayKey });
         return;
       }
-      if (!this.publicGatewayRegistrar?.isEnabled?.()) {
-        console.info('[PublicGateway] Open join pool sync skipped: registrar disabled', {
-          relayKey,
-          enabled: !!this.publicGatewaySettings?.enabled
-        });
-        return;
-      }
       if (this.#isPublicGatewayRelayKey(relayKey)) {
         console.info('[PublicGateway] Open join pool sync skipped: public gateway relay', { relayKey });
         return;
@@ -2010,6 +2156,25 @@ export class GatewayService extends EventEmitter {
       }
 
       const metadataIdentifier = typeof metadata?.identifier === 'string' ? metadata.identifier : null;
+      let relayRouteResolution = null;
+      if (this.resolveRelayGatewayRoute) {
+        try {
+          relayRouteResolution = await this.resolveRelayGatewayRoute({
+            relayKey,
+            publicIdentifier: metadataIdentifier || null
+          });
+        } catch (error) {
+          this.log('debug', `[PublicGateway] Failed resolving route for open join pool relay=${relayKey}: ${error?.message || error}`);
+        }
+      }
+      const registrarSelection = this.#resolveRegistrarForRoute(relayRouteResolution);
+      const registrar = registrarSelection.registrar;
+      if (!registrar?.isEnabled?.()) {
+        this.log('warn', `[PublicGateway] Open join pool sync skipped: no registrar for relay=${relayKey}`, {
+          reason: registrarSelection.reason || 'unavailable'
+        });
+        return;
+      }
       const relayUrl = typeof metadata?.connectionUrl === 'string'
         ? metadata.connectionUrl
         : (typeof metadata?.relayUrl === 'string' ? metadata.relayUrl : null);
@@ -2089,7 +2254,7 @@ export class GatewayService extends EventEmitter {
         });
       };
 
-      let report = await this.publicGatewayRegistrar.updateOpenJoinPool(poolRelayKey, [], {
+      let report = await registrar.updateOpenJoinPool(poolRelayKey, [], {
         updatedAt: Date.now(),
         targetSize,
         publicIdentifier: poolPublicIdentifier || null,
@@ -2134,7 +2299,7 @@ export class GatewayService extends EventEmitter {
           return;
         }
         const updatedAt = provision.updatedAt || Date.now();
-        report = await this.publicGatewayRegistrar.updateOpenJoinPool(poolRelayKey, entries, {
+        report = await registrar.updateOpenJoinPool(poolRelayKey, entries, {
           updatedAt,
           targetSize,
           publicIdentifier: poolPublicIdentifier || null,
@@ -2170,7 +2335,7 @@ export class GatewayService extends EventEmitter {
 
   async #runOpenJoinPoolKeepWarm() {
     if (!this.isRunning) return;
-    if (!(this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.())) return;
+    if (!this.publicGatewaySettings?.enabled) return;
     const relayEntries = Array.from(this.activeRelays.entries());
     for (const [relayKey, relayData] of relayEntries) {
       if (this.#isPublicGatewayRelayKey(relayKey)) continue;
@@ -2185,7 +2350,7 @@ export class GatewayService extends EventEmitter {
       this.openJoinPoolSyncInterval = null;
     }
     if (!this.isRunning) return;
-    const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    const enabled = !!this.publicGatewaySettings?.enabled;
     const intervalMs = Number(this.publicGatewaySettings?.openJoinPoolSyncIntervalMs);
     if (!enabled || !Number.isFinite(intervalMs) || intervalMs <= 0) {
       this.log('debug', '[PublicGateway] Open join keep-warm disabled');
@@ -2204,7 +2369,7 @@ export class GatewayService extends EventEmitter {
   }
 
   async resyncPublicGateway() {
-    const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    const enabled = !!this.publicGatewaySettings?.enabled;
     if (!enabled) {
       this.publicGatewayRelayState.clear();
       this.#clearAllRelayTokens();
@@ -2240,7 +2405,7 @@ export class GatewayService extends EventEmitter {
     this.publicGatewaySettings = await this.#resolvePublicGatewayConfig(mergedConfig);
     this.#configurePublicGateway();
 
-    const isEnabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    const isEnabled = !!this.publicGatewaySettings?.enabled;
 
     if (isEnabled) {
       try {
@@ -2275,8 +2440,29 @@ export class GatewayService extends EventEmitter {
       throw new Error('relayKey is required');
     }
 
-    if (!this.publicGatewayRegistrar?.isEnabled?.() || !this.publicGatewaySettings?.enabled) {
+    if (!this.publicGatewaySettings?.enabled) {
       throw new Error('Public gateway bridge is disabled');
+    }
+
+    let relayRouteResolution = null;
+    const requestedOrigin = normalizeHttpOrigin(options?.gatewayOrigin || null);
+    if (requestedOrigin) {
+      relayRouteResolution = { origin: requestedOrigin };
+    } else if (this.resolveRelayGatewayRoute) {
+      try {
+        relayRouteResolution = await this.resolveRelayGatewayRoute({
+          relayKey,
+          publicIdentifier: this.activeRelays.get(relayKey)?.metadata?.identifier || null
+        });
+      } catch (error) {
+        this.log('debug', `[PublicGateway] Failed resolving route for token issue ${relayKey}: ${error?.message || error}`);
+      }
+    }
+    const registrarSelection = this.#resolveRegistrarForRoute(relayRouteResolution);
+    const registrar = registrarSelection.registrar;
+    const registrarOrigin = registrarSelection.origin;
+    if (!registrar?.isEnabled?.()) {
+      throw new Error(`Public gateway route unavailable (${registrarSelection.reason || 'no-registrar'})`);
     }
 
     const relayData = this.activeRelays.get(relayKey);
@@ -2303,7 +2489,7 @@ export class GatewayService extends EventEmitter {
 
     const issuedAt = Date.now();
 
-    const tokenResponse = await this.publicGatewayRegistrar.issueGatewayToken(relayKey, {
+    const tokenResponse = await registrar.issueGatewayToken(relayKey, {
       ttlSeconds,
       relayAuthToken,
       pubkey: requestingPubkey,
@@ -2327,11 +2513,12 @@ export class GatewayService extends EventEmitter {
       gatewayPath = relayKey.includes(':') ? relayKey.replace(':', '/') : relayKey;
     }
 
-    if (!this.publicGatewayWsBase) {
+    const gatewayWsBase = this.#computePublicGatewayWsBase(registrarOrigin || this.publicGatewaySettings?.baseUrl || null);
+    if (!gatewayWsBase) {
       throw new Error('Invalid public gateway base URL');
     }
 
-    const connectionUrl = `${this.publicGatewayWsBase}/${gatewayPath}?token=${encodeURIComponent(token)}`;
+    const connectionUrl = `${gatewayWsBase}/${gatewayPath}?token=${encodeURIComponent(token)}`;
 
     const logDetails = {
       relayKey,
@@ -2347,7 +2534,7 @@ export class GatewayService extends EventEmitter {
       expiresAt,
       ttlSeconds,
       connectionUrl,
-      baseUrl: this.publicGatewaySettings.baseUrl,
+      baseUrl: registrarOrigin || this.publicGatewaySettings.baseUrl,
       issuedForPubkey: requestingPubkey,
       issuedAt,
       relayAuthToken,
@@ -2362,7 +2549,7 @@ export class GatewayService extends EventEmitter {
       expiresAt,
       ttlSeconds,
       gatewayPath,
-      baseUrl: this.publicGatewaySettings.baseUrl,
+      baseUrl: registrarOrigin || this.publicGatewaySettings.baseUrl,
       issuedForPubkey: requestingPubkey,
       refreshAfter,
       sequence

@@ -64,6 +64,7 @@ type InviteRow = {
 }
 
 type TJoinFlowHintFields = {
+  gatewayOrigin?: string | null
   discoveryTopic?: string | null
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
@@ -774,6 +775,7 @@ const GroupsPage = forwardRef<
         relayKey,
         relayUrl,
         gatewayMode: joinGatewayModeForTests,
+        gatewayOrigin: inviteHints.gatewayOrigin || undefined,
         discoveryTopic: inviteHints.discoveryTopic || undefined,
         hostPeerKeys: inviteHints.hostPeerKeys || undefined,
         leaseReplicaPeerKeys: inviteHints.leaseReplicaPeerKeys || undefined,

@@ -3059,6 +3059,7 @@ export class TuiController {
     isOpen?: boolean
     fileSharing?: boolean
     picture?: string
+    gatewayOrigin?: string | null
   }): Promise<Record<string, unknown>> {
     return await this.runTask('Create relay', async () => {
       await this.ensureWorkerReadyForOperation('create relay')
@@ -3115,6 +3116,14 @@ export class TuiController {
       }
 
       if (publicIdentifier && !this.rawGroupDiscover.some((group) => group.id === publicIdentifier)) {
+        const resultGatewayOrigin =
+          typeof result.gatewayOrigin === 'string'
+            ? String(result.gatewayOrigin).trim()
+            : null
+        const requestedGatewayOrigin =
+          typeof input.gatewayOrigin === 'string'
+            ? String(input.gatewayOrigin).trim()
+            : null
         const provisional: GroupSummary = {
           id: publicIdentifier,
           relay: relayUrl || undefined,
@@ -3123,6 +3132,7 @@ export class TuiController {
           picture: input.picture || undefined,
           isPublic: typeof input.isPublic === 'boolean' ? input.isPublic : true,
           isOpen: typeof input.isOpen === 'boolean' ? input.isOpen : true,
+          gatewayOrigin: resultGatewayOrigin || requestedGatewayOrigin || null,
           adminPubkey: session?.pubkey || null,
           adminName: null,
           members: session?.pubkey ? [session.pubkey] : [],
@@ -3174,6 +3184,7 @@ export class TuiController {
     relayUrl?: string
     authToken?: string
     fileSharing?: boolean
+    gatewayOrigin?: string | null
   }): Promise<Record<string, unknown>> {
     return await this.runTask('Join relay', async () => {
       await this.ensureWorkerReadyForOperation('join relay')
@@ -3252,6 +3263,7 @@ export class TuiController {
     relayKey?: string
     relayUrl?: string
     gatewayMode?: 'auto' | 'disabled'
+    gatewayOrigin?: string | null
     discoveryTopic?: string | null
     hostPeerKeys?: string[]
     leaseReplicaPeerKeys?: string[]
@@ -3318,6 +3330,7 @@ export class TuiController {
         gatewayMode,
         relayKey,
         relayUrl,
+        gatewayOrigin: input.gatewayOrigin,
         hostPeers: hostPeers.length ? hostPeers : undefined,
         hostPeerKeys: hostPeers.length ? hostPeers : undefined
       })
@@ -3800,7 +3813,7 @@ export class TuiController {
 
   async acceptGroupInvite(
     inviteId: string,
-    options?: { gatewayMode?: 'auto' | 'disabled' }
+    options?: { gatewayMode?: 'auto' | 'disabled'; gatewayOrigin?: string | null }
   ): Promise<void> {
     await this.runTask('Accept group invite', async () => {
       const target = this.state.groupInvites.find((invite) => invite.id === inviteId)
@@ -3816,6 +3829,7 @@ export class TuiController {
         relayKey: target.relayKey || undefined,
         relayUrl: target.relayUrl || target.relay,
         gatewayMode,
+        gatewayOrigin: options?.gatewayOrigin || target.gatewayOrigin || undefined,
         discoveryTopic: target.discoveryTopic || undefined,
         hostPeerKeys: target.hostPeerKeys || undefined,
         leaseReplicaPeerKeys: target.leaseReplicaPeerKeys || undefined,
@@ -3931,6 +3945,9 @@ export class TuiController {
       const payload: Record<string, unknown> = {
         relayUrl,
         relayKey: relayKey || null,
+        ...(typeof selectedGroup?.gatewayOrigin === 'string' && selectedGroup.gatewayOrigin.trim()
+          ? { gatewayOrigin: selectedGroup.gatewayOrigin.trim() }
+          : {}),
         groupName: selectedGroup?.name || normalizedGroupId,
         groupPicture: selectedGroup?.picture || null,
         name: selectedGroup?.name || normalizedGroupId,
@@ -4059,6 +4076,9 @@ export class TuiController {
         : []
       const payloadWriterIssuerPubkey = typeof payloadInput.writerIssuerPubkey === 'string'
         ? payloadInput.writerIssuerPubkey.trim().toLowerCase()
+        : null
+      const payloadGatewayOrigin = typeof payloadInput.gatewayOrigin === 'string'
+        ? payloadInput.gatewayOrigin.trim()
         : null
       const isOpenGroup = input.token
         ? false
@@ -4206,6 +4226,7 @@ export class TuiController {
         ...payloadInput,
         relayUrl: resolvedRelayUrl,
         relayKey: resolvedRelayKey || payloadInput.relayKey || null,
+        ...(payloadGatewayOrigin ? { gatewayOrigin: payloadGatewayOrigin } : {}),
         discoveryTopic: discoveryTopic || null,
         hostPeerKeys: hostPeerKeys.length ? hostPeerKeys : undefined,
         leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : undefined,

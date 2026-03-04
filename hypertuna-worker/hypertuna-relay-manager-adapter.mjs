@@ -47,6 +47,21 @@ const relayMemberRemoves = new Map();
 const publicToKey = new Map();
 const keyToPublic = new Map();
 
+function normalizeGatewayOrigin(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed || /^(none|null|disabled|direct-only)$/i.test(trimmed)) return null;
+    try {
+        const parsed = new URL(trimmed);
+        if (parsed.protocol === 'ws:') parsed.protocol = 'http:';
+        if (parsed.protocol === 'wss:') parsed.protocol = 'https:';
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+        return parsed.origin;
+    } catch (_) {
+        return null;
+    }
+}
+
 function parseRelayMetadataEvent(event) {
     if (!event) return null;
 
@@ -61,6 +76,7 @@ function parseRelayMetadataEvent(event) {
         description: findTagValue('about'),
         avatarUrl: null,
         isPublic: null,
+        gatewayOrigin: normalizeGatewayOrigin(findTagValue('gateway')),
         createdAt: event.created_at || null,
         updatedAt: event.created_at ? event.created_at * 1000 : null,
         identifier: findTagValue('d') || null,
@@ -987,7 +1003,16 @@ async function ensureProfilesInitialized(userKey = null) {
  * @returns {Promise<Object>} - Result object with relay information
  */
 export async function createRelay(options = {}) {
-    const { name, description, isPublic = false, isOpen = false, storageDir, config } = options;
+    const {
+        name,
+        description,
+        isPublic = false,
+        isOpen = false,
+        storageDir,
+        config,
+        gatewayOrigin = undefined
+    } = options;
+    const normalizedGatewayOrigin = normalizeGatewayOrigin(gatewayOrigin);
     
     // Store config and user key globally if provided
     if (config) {
@@ -1052,6 +1077,7 @@ export async function createRelay(options = {}) {
             is_active: true,
             isPublic,
             isOpen,
+            gateway_origin: normalizedGatewayOrigin,
             auth_config: {
                 requiresAuth: true,
                 tokenProtected: true,
@@ -1182,6 +1208,7 @@ export async function createRelay(options = {}) {
             success: true,
             relayKey,
             publicIdentifier,
+            gatewayOrigin: normalizedGatewayOrigin,
             connectionUrl: baseUrl, // Base URL without token
             authToken: authToken, // Return the token separately
             relayUrl: authenticatedUrl, // Full authenticated URL
@@ -1250,6 +1277,7 @@ function emitRelayLoadingEvent({ relayKey, publicIdentifier = null, name = '' },
  * @returns {Promise<Object>} - Result object with relay information
  */
 export async function joinRelay(options = {}) {
+    const hasGatewayOriginInput = Object.prototype.hasOwnProperty.call(options, 'gatewayOrigin');
     const {
         relayKey,
         name,
@@ -1270,8 +1298,10 @@ export async function joinRelay(options = {}) {
         coreRefs = null,
         suppressInitMessage = false,
         useSharedCorestore = false,
-        corestore = null
+        corestore = null,
+        gatewayOrigin = undefined
     } = options;
+    const normalizedGatewayOrigin = normalizeGatewayOrigin(gatewayOrigin);
     
     // Store config globally if provided
     if (config) {
@@ -1617,10 +1647,14 @@ export async function joinRelay(options = {}) {
                 relay_storage: defaultStorageDir,
                 joined_at: new Date().toISOString(),
                 auto_connect: true,
-                is_active: true
+                is_active: true,
+                gateway_origin: hasGatewayOriginInput ? normalizedGatewayOrigin : null
             };
             if (typeof isOpen === 'boolean') {
                 profileInfo.isOpen = isOpen;
+            }
+            if (hasGatewayOriginInput) {
+                profileInfo.gateway_origin = normalizedGatewayOrigin;
             }
 
             profileInfo = applyJoinMetadata(profileInfo, {
@@ -1802,6 +1836,7 @@ export async function joinRelay(options = {}) {
             success: true,
             relayKey,
             publicIdentifier: profileInfo.public_identifier || null,
+            gatewayOrigin: profileInfo.gateway_origin || null,
             connectionUrl: returnConnectionUrl,
             profile: profileInfo,
             storageDir: defaultStorageDir
@@ -2613,6 +2648,7 @@ export async function getActiveRelays() {
         activeRelayList.push({
             relayKey: key,
             publicIdentifier: profile?.public_identifier || null,
+            gatewayOrigin: profile?.gateway_origin || null,
             peerCount,
             name: profile?.name || `Relay ${key.substring(0, 8)}`,
             description: profile?.description || '',
@@ -2642,6 +2678,7 @@ export async function getActiveRelays() {
         activeRelayList.push({
             relayKey,
             publicIdentifier: profile?.public_identifier || null,
+            gatewayOrigin: profile?.gateway_origin || null,
             peerCount: 0,
             name: profile?.name || `Relay ${relayKey.substring(0, 8)}`,
             description: profile?.description || '',

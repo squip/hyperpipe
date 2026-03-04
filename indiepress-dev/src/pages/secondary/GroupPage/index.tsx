@@ -72,6 +72,7 @@ import { registerClosedJoinSimulator } from '@/devtools/closedJoinSimulator'
 // import { registerJoinWorkflowSimulator } from '@/devtools/joinWorkflowSimulator'
 
 type TJoinFlowHintFields = {
+  gatewayOrigin?: string | null
   discoveryTopic?: string | null
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
@@ -1175,6 +1176,10 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         inviteHints.writerIssuerPubkey ||
         metadataHints.writerIssuerPubkey ||
         undefined
+      const gatewayOrigin =
+        inviteHints.gatewayOrigin ||
+        metadataHints.gatewayOrigin ||
+        undefined
       const discoveryTopic =
         inviteHints.discoveryTopic ||
         metadataHints.discoveryTopic ||
@@ -1215,6 +1220,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           relayKey,
           relayUrl: relayUrlForJoin,
           gatewayMode: joinGatewayModeForTests,
+          gatewayOrigin,
           discoveryTopic,
           hostPeerKeys: mergedHostPeerKeys.length ? mergedHostPeerKeys : undefined,
           leaseReplicaPeerKeys: mergedLeaseReplicaPeerKeys.length ? mergedLeaseReplicaPeerKeys : undefined,
@@ -1255,7 +1261,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             about: data.about ?? prev.metadata.about,
             picture: data.picture ?? prev.metadata.picture,
             isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : prev.metadata.isOpen,
-            isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : prev.metadata.isPublic
+            isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : prev.metadata.isPublic,
+            gatewayOrigin:
+              Object.prototype.hasOwnProperty.call(data, 'gatewayOrigin')
+                ? (data.gatewayOrigin ?? null)
+                : prev.metadata.gatewayOrigin
           }
         }
       })
@@ -2471,7 +2481,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
               about: detail?.metadata?.about,
               picture: detail?.metadata?.picture,
               isOpen: detail?.metadata?.isOpen,
-              isPublic: detail?.metadata?.isPublic
+              isPublic: detail?.metadata?.isPublic,
+              gatewayOrigin: detail?.metadata?.gatewayOrigin
             }}
             isOpen={isMetadataDialogOpen}
             onSave={handleSaveMetadata}

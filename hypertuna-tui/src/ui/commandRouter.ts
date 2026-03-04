@@ -103,6 +103,7 @@ export interface CommandController {
     isOpen?: boolean
     fileSharing?: boolean
     picture?: string
+    gatewayOrigin?: string | null
   }): Promise<Record<string, unknown>>
   joinRelay(input: {
     relayKey?: string
@@ -110,6 +111,7 @@ export interface CommandController {
     relayUrl?: string
     authToken?: string
     fileSharing?: boolean
+    gatewayOrigin?: string | null
   }): Promise<Record<string, unknown>>
   disconnectRelay(relayKey: string, publicIdentifier?: string): Promise<void>
   leaveGroup(input: {
@@ -126,6 +128,7 @@ export interface CommandController {
     relayKey?: string
     relayUrl?: string
     gatewayMode?: 'auto' | 'disabled'
+    gatewayOrigin?: string | null
     discoveryTopic?: string | null
     hostPeerKeys?: string[]
     leaseReplicaPeerKeys?: string[]
@@ -187,7 +190,7 @@ export interface CommandController {
   }): Promise<void>
   acceptGroupInvite(
     inviteId: string,
-    options?: { gatewayMode?: 'auto' | 'disabled' }
+    options?: { gatewayMode?: 'auto' | 'disabled'; gatewayOrigin?: string | null }
   ): Promise<void>
   dismissGroupInvite(inviteId: string): Promise<void>
   setGroupViewTab(tab: 'discover' | 'my'): Promise<void>
@@ -337,6 +340,65 @@ function parseGatewayModeFlag(args: string[]): 'auto' | 'disabled' | undefined {
   const value = String(args[index + 1] || '').trim().toLowerCase()
   if (value === 'auto' || value === 'disabled') return value
   throw new Error('Missing or invalid --gateway-mode value (expected auto|disabled)')
+}
+
+function parseGatewayRouteFlag(args: string[]): { gatewayOrigin?: string | null } {
+  let routeValue: string | null | undefined
+
+  const inlineOrigin = args
+    .find((arg) => arg.startsWith('--gateway-origin='))
+    ?.split('=')
+    ?.slice(1)
+    ?.join('=')
+    ?.trim()
+  if (typeof inlineOrigin === 'string' && inlineOrigin.length > 0) {
+    routeValue = inlineOrigin
+  }
+
+  const originIndex = args.indexOf('--gateway-origin')
+  if (originIndex >= 0) {
+    const value = String(args[originIndex + 1] || '').trim()
+    if (!value || value.startsWith('--')) {
+      throw new Error('Missing --gateway-origin value')
+    }
+    routeValue = value
+  }
+
+  const inlineGateway = args
+    .find((arg) => arg.startsWith('--gateway='))
+    ?.split('=')
+    ?.slice(1)
+    ?.join('=')
+    ?.trim()
+    ?.toLowerCase()
+  if (inlineGateway) {
+    if (inlineGateway === 'none') {
+      routeValue = 'none'
+    } else {
+      throw new Error('Invalid --gateway value (expected none)')
+    }
+  }
+
+  const gatewayIndex = args.indexOf('--gateway')
+  if (gatewayIndex >= 0) {
+    const value = String(args[gatewayIndex + 1] || '').trim().toLowerCase()
+    if (value === 'none') {
+      routeValue = 'none'
+    } else {
+      throw new Error('Missing or invalid --gateway value (expected none)')
+    }
+  }
+
+  if (typeof routeValue === 'undefined') return {}
+  if (routeValue === null) return { gatewayOrigin: 'none' }
+
+  const normalized = routeValue.trim()
+  if (!normalized) return {}
+  const lower = normalized.toLowerCase()
+  if (lower === 'none' || lower === 'disabled' || lower === 'off' || lower === 'null') {
+    return { gatewayOrigin: 'none' }
+  }
+  return { gatewayOrigin: normalized }
 }
 
 const NAV_ALIASES: Record<string, NavNodeId> = {
@@ -660,7 +722,7 @@ export async function executeCommand(
   if (cmd === 'help') {
     return {
       message:
-        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | relay refresh/create/join/disconnect/leave | group tab/refresh/invites/members/search/sort/filter/join-flow/request-invite/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept/dismiss | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/invite/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot | join flags: --gateway-mode auto|disabled'
+        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | relay refresh/create/join/disconnect/leave | group tab/refresh/invites/members/search/sort/filter/join-flow/request-invite/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept/dismiss | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/invite/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot | join flags: --gateway-mode auto|disabled --gateway-origin <url> --gateway none'
     }
   }
 
@@ -856,6 +918,7 @@ export async function executeCommand(
       const isPublic = args.includes('--public') || !args.includes('--private')
       const isOpen = args.includes('--open') || !args.includes('--closed')
       const fileSharing = args.includes('--file-sharing') ? true : args.includes('--no-file-sharing') ? false : true
+      const gatewayRoute = parseGatewayRouteFlag(args)
       await controller.createRelay({
         name,
         isPublic,
@@ -863,6 +926,9 @@ export async function executeCommand(
         fileSharing,
         description: args.includes('--desc')
           ? args.slice(args.indexOf('--desc') + 1).join(' ')
+          : undefined,
+        gatewayOrigin: Object.prototype.hasOwnProperty.call(gatewayRoute, 'gatewayOrigin')
+          ? gatewayRoute.gatewayOrigin
           : undefined
       })
       return { message: `Relay created: ${name}`, gotoNode: 'relays' }
@@ -871,6 +937,7 @@ export async function executeCommand(
     if (action === 'join') {
       let identifier: string | undefined = args[2]
       const token = args[3]
+      const gatewayRoute = parseGatewayRouteFlag(args)
       if (!identifier) {
         const selectedRelay = resolveSelectedRelay(context)
         identifier = selectedRelay?.publicIdentifier || selectedRelay?.relayKey
@@ -881,7 +948,10 @@ export async function executeCommand(
       await controller.joinRelay({
         relayKey: isRelayKey ? identifier.toLowerCase() : undefined,
         publicIdentifier: isRelayKey ? undefined : identifier,
-        authToken: token
+        authToken: token,
+        gatewayOrigin: Object.prototype.hasOwnProperty.call(gatewayRoute, 'gatewayOrigin')
+          ? gatewayRoute.gatewayOrigin
+          : undefined
       })
       return { message: `Join relay requested for ${identifier}`, gotoNode: 'relays' }
     }
@@ -910,6 +980,7 @@ export async function executeCommand(
       let publicIdentifier = args[2] && !args[2].startsWith('--') ? args[2] : undefined
       const token = args[3] && !args[3].startsWith('--') ? args[3] : undefined
       const gatewayMode = parseGatewayModeFlag(args)
+      const gatewayRoute = parseGatewayRouteFlag(args)
       if (!publicIdentifier) {
         const selectedGroup = resolveSelectedGroup(context)
         const selectedGroupInvite = resolveSelectedInvite(context)
@@ -924,7 +995,10 @@ export async function executeCommand(
         publicIdentifier,
         token,
         openJoin: args.includes('--open'),
-        gatewayMode
+        gatewayMode,
+        gatewayOrigin: Object.prototype.hasOwnProperty.call(gatewayRoute, 'gatewayOrigin')
+          ? gatewayRoute.gatewayOrigin
+          : undefined
       })
       return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }
@@ -1048,6 +1122,7 @@ export async function executeCommand(
       const selectedGroupInvite = resolveSelectedInvite(context)
       const candidate = args[2] && !args[2].startsWith('--') ? args[2] : undefined
       const gatewayMode = parseGatewayModeFlag(args)
+      const gatewayRoute = parseGatewayRouteFlag(args)
       let publicIdentifier: string | undefined
       let token: string | undefined
 
@@ -1066,7 +1141,10 @@ export async function executeCommand(
         publicIdentifier,
         token,
         openJoin: args.includes('--open'),
-        gatewayMode
+        gatewayMode,
+        gatewayOrigin: Object.prototype.hasOwnProperty.call(gatewayRoute, 'gatewayOrigin')
+          ? gatewayRoute.gatewayOrigin
+          : undefined
       })
       return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }
@@ -1139,12 +1217,23 @@ export async function executeCommand(
     if (action === 'invite-accept' || action === 'accept-invite') {
       let inviteId = args[2] && !args[2].startsWith('--') ? args[2] : undefined
       const gatewayMode = parseGatewayModeFlag(args)
+      const gatewayRoute = parseGatewayRouteFlag(args)
       if (!inviteId) {
         const selectedInvite = resolveSelectedInvite(context)
         if (selectedInvite?.kind === 'group') inviteId = selectedInvite.id
       }
       inviteId = requireArg(inviteId, 'inviteId')
-      await controller.acceptGroupInvite(inviteId, gatewayMode ? { gatewayMode } : undefined)
+      await controller.acceptGroupInvite(
+        inviteId,
+        gatewayMode || Object.prototype.hasOwnProperty.call(gatewayRoute, 'gatewayOrigin')
+          ? {
+              ...(gatewayMode ? { gatewayMode } : {}),
+              ...(Object.prototype.hasOwnProperty.call(gatewayRoute, 'gatewayOrigin')
+                ? { gatewayOrigin: gatewayRoute.gatewayOrigin }
+                : {})
+            }
+          : undefined
+      )
       return { message: `Group invite accepted ${inviteId}`, gotoNode: 'invites:group' }
     }
 
@@ -1256,6 +1345,7 @@ export async function executeCommand(
   if (cmd === 'invites') {
     const action = requireArg(args[1], 'invites action').toLowerCase()
     const gatewayMode = parseGatewayModeFlag(args)
+    const gatewayRoute = parseGatewayRouteFlag(args)
     if (action === 'refresh') {
       await Promise.all([controller.refreshInvites(), controller.refreshChats()])
       return { message: 'Invites refreshed', gotoNode: 'invites:group' }
@@ -1280,7 +1370,17 @@ export async function executeCommand(
     if (action === 'accept') {
       if (target === 'group') {
         const id = requireArg(resolveGroupInviteId(), 'inviteId')
-        await controller.acceptGroupInvite(id, gatewayMode ? { gatewayMode } : undefined)
+        await controller.acceptGroupInvite(
+          id,
+          gatewayMode || Object.prototype.hasOwnProperty.call(gatewayRoute, 'gatewayOrigin')
+            ? {
+                ...(gatewayMode ? { gatewayMode } : {}),
+                ...(Object.prototype.hasOwnProperty.call(gatewayRoute, 'gatewayOrigin')
+                  ? { gatewayOrigin: gatewayRoute.gatewayOrigin }
+                  : {})
+              }
+            : undefined
+        )
         return { message: `Accepted group invite ${id}`, gotoNode: 'invites:group' }
       }
       if (target === 'chat') {

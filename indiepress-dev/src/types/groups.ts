@@ -14,6 +14,7 @@ export type TGroupMetadata = {
   picture?: string
   isPublic?: boolean
   isOpen?: boolean
+  gatewayOrigin?: string | null
   discoveryTopic?: string | null
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
@@ -51,6 +52,7 @@ export type TGroupInvite = {
   isPublic?: boolean
   relayUrl?: string | null
   relayKey?: string | null
+  gatewayOrigin?: string | null
   writerCore?: string | null
   writerCoreHex?: string | null
   autobaseLocal?: string | null
