@@ -218,6 +218,8 @@ const JOIN_WRITABLE_BUDGET_MS = resolveTimeoutEnvMs('JOIN_WRITABLE_BUDGET_MS', 1
 })
 const JOIN_DIRECT_DISCOVERY_V2 = isEnvEnabled(process.env.JOIN_DIRECT_DISCOVERY_V2)
 const RELAY_SCOPED_GATEWAY_V1 = isEnvEnabled(process.env.RELAY_SCOPED_GATEWAY_V1)
+const GATEWAY_SCOPED_CREDENTIALS_V1 = isEnvEnabled(process.env.GATEWAY_SCOPED_CREDENTIALS_V1)
+const GATEWAY_CREATOR_POLICY_V1 = isEnvEnabled(process.env.GATEWAY_CREATOR_POLICY_V1)
 const JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT = isEnvEnabled(
   process.env.JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT
 )
@@ -245,6 +247,8 @@ const OPEN_JOIN_POOL_ENTRY_TTL_MS = (() => {
 console.info('[Worker] Join timing config', {
   joinDirectDiscoveryV2: JOIN_DIRECT_DISCOVERY_V2,
   relayScopedGatewayV1: RELAY_SCOPED_GATEWAY_V1,
+  gatewayScopedCredentialsV1: GATEWAY_SCOPED_CREDENTIALS_V1,
+  gatewayCreatorPolicyV1: GATEWAY_CREATOR_POLICY_V1,
   joinAllowOpenFallbackAfterDirectTimeout: JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT,
   joinTotalDeadlineMs: Number.isFinite(JOIN_TOTAL_DEADLINE_MS) ? JOIN_TOTAL_DEADLINE_MS : null,
   joinDeadlineDisabled: !Number.isFinite(JOIN_TOTAL_DEADLINE_MS),
@@ -2118,7 +2122,9 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
         isActive = true,
         isOpen,
         isHosted,
-        isJoined
+        isJoined,
+        admin_pubkey,
+        adminPubkey
       } = relay
 
       const isPublic = typeof relay.isPublic === 'boolean' ? relay.isPublic : isActive !== false
@@ -2133,6 +2139,15 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
         identifier: primaryIdentifier,
         name,
         description,
+        admin_pubkey: (
+          isHex64(admin_pubkey)
+            ? String(admin_pubkey).trim().toLowerCase()
+            : isHex64(adminPubkey)
+              ? String(adminPubkey).trim().toLowerCase()
+              : isHex64(config?.nostr_pubkey_hex)
+                ? String(config.nostr_pubkey_hex).trim().toLowerCase()
+                : null
+        ),
         gatewayPath: gatewayPath || normalizeGatewayPathFragment(primaryIdentifier),
         connectionUrl: effectiveConnectionUrl,
         isPublic,
@@ -3347,6 +3362,7 @@ async function startGatewayService(options = {}) {
     gatewayService = new GatewayService({
       publicGateway: publicGatewaySettings,
       getCurrentPubkey: () => config?.nostr_pubkey_hex || null,
+      getCurrentNsec: () => config?.nostr_nsec_hex || null,
       getOwnPeerPublicKey: () => config?.swarmPublicKey || deriveSwarmPublicKey(config),
       openJoinPoolProvider: ensureOpenJoinWriterPool,
       resolveRelayGatewayRoute: ({ relayKey = null, publicIdentifier = null } = {}) =>
@@ -3503,6 +3519,14 @@ async function startGatewayService(options = {}) {
       } catch (error) {
         console.warn('[Worker] Failed to reconcile blind peering manager from status update:', error?.message || error)
       }
+    })
+    gatewayService.on('gateway-telemetry', (entry) => {
+      if (!entry || typeof entry !== 'object') return
+      if (typeof entry.type !== 'string') return
+      sendMessage({
+        type: entry.type,
+        data: entry.data && typeof entry.data === 'object' ? entry.data : {}
+      })
     })
     if (pendingGatewayMetadataSync) {
       refreshGatewayRelayRegistry('gateway-service-initialized').catch((err) => {
@@ -5762,6 +5786,85 @@ async function handleMessageObject(message) {
       break
     }
 
+    case 'set-public-gateway-origin-secret': {
+      await ensurePublicGatewaySettingsLoaded()
+      try {
+        const origin = normalizeHttpOrigin(
+          message?.origin
+          || message?.gatewayOrigin
+          || message?.baseUrl
+          || null
+        )
+        const sharedSecret =
+          typeof message?.sharedSecret === 'string'
+            ? message.sharedSecret.trim()
+            : typeof message?.secret === 'string'
+              ? message.secret.trim()
+              : ''
+        if (!origin) {
+          throw new Error('set-public-gateway-origin-secret requires a valid origin')
+        }
+        if (!sharedSecret) {
+          throw new Error('set-public-gateway-origin-secret requires a non-empty sharedSecret')
+        }
+        const currentSecrets =
+          publicGatewaySettings?.sharedSecretsByOrigin
+          && typeof publicGatewaySettings.sharedSecretsByOrigin === 'object'
+            ? { ...publicGatewaySettings.sharedSecretsByOrigin }
+            : {}
+        currentSecrets[origin] = sharedSecret
+        const next = await updatePublicGatewaySettings({
+          sharedSecretsByOrigin: currentSecrets
+        })
+        publicGatewaySettings = next
+        if (gatewayService) {
+          await gatewayService.updatePublicGatewayConfig(next)
+          publicGatewayStatusCache = gatewayService.getPublicGatewayState()
+          sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
+        }
+        sendMessage({ type: 'public-gateway-config', config: next })
+      } catch (err) {
+        sendMessage({ type: 'public-gateway-error', message: err?.message || String(err) })
+      }
+      break
+    }
+
+    case 'remove-public-gateway-origin-secret': {
+      await ensurePublicGatewaySettingsLoaded()
+      try {
+        const origin = normalizeHttpOrigin(
+          message?.origin
+          || message?.gatewayOrigin
+          || message?.baseUrl
+          || null
+        )
+        if (!origin) {
+          throw new Error('remove-public-gateway-origin-secret requires a valid origin')
+        }
+        const currentSecrets =
+          publicGatewaySettings?.sharedSecretsByOrigin
+          && typeof publicGatewaySettings.sharedSecretsByOrigin === 'object'
+            ? { ...publicGatewaySettings.sharedSecretsByOrigin }
+            : {}
+        delete currentSecrets[origin]
+        const baseOrigin = normalizeHttpOrigin(publicGatewaySettings?.baseUrl || null)
+        const next = await updatePublicGatewaySettings({
+          sharedSecretsByOrigin: currentSecrets,
+          ...(baseOrigin === origin ? { sharedSecret: '' } : {})
+        })
+        publicGatewaySettings = next
+        if (gatewayService) {
+          await gatewayService.updatePublicGatewayConfig(next)
+          publicGatewayStatusCache = gatewayService.getPublicGatewayState()
+          sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
+        }
+        sendMessage({ type: 'public-gateway-config', config: next })
+      } catch (err) {
+        sendMessage({ type: 'public-gateway-error', message: err?.message || String(err) })
+      }
+      break
+    }
+
     case 'get-public-gateway-status': {
       if (gatewayService) {
         const state = gatewayService.getPublicGatewayState()
@@ -6628,6 +6731,9 @@ async function handleMessageObject(message) {
           let writerIssuerPubkey = isHex64(data.writerIssuerPubkey)
             ? String(data.writerIssuerPubkey).trim().toLowerCase()
             : null
+          let gatewayRelayCredential = data.gatewayRelayCredential && typeof data.gatewayRelayCredential === 'object'
+            ? data.gatewayRelayCredential
+            : null
           let writerLeaseEnvelope = data.writerLeaseEnvelope && typeof data.writerLeaseEnvelope === 'object'
             ? data.writerLeaseEnvelope
             : null
@@ -6765,6 +6871,26 @@ async function handleMessageObject(message) {
               isLegacyFallback: relayGatewayRoute?.isLegacyFallback === true
             }
           })
+          if (
+            GATEWAY_SCOPED_CREDENTIALS_V1
+            && gatewayService
+            && gatewayRelayCredential
+            && typeof gatewayRelayCredential === 'object'
+          ) {
+            const applyCredentialResult = await gatewayService.upsertRelayGatewayCredential({
+              envelope: gatewayRelayCredential,
+              relayKey: joinRelayKey || null,
+              publicIdentifier: publicIdentifier || null,
+              source: 'join-payload'
+            }).catch((error) => ({ status: 'error', reason: error?.message || String(error) }))
+            console.info('[Worker] Join payload gateway credential apply', {
+              publicIdentifier,
+              relayKey: previewValue(joinRelayKey, 16),
+              gatewayOrigin: joinGatewayOrigin || null,
+              status: applyCredentialResult?.status || 'unknown',
+              reason: applyCredentialResult?.reason || null
+            })
+          }
           if (gatewayMode === 'auto' && joinGatewayOrigins.length === 0) {
             sendMessage({
               type: 'RELAY_GATEWAY_STRICT_NO_FALLBACK',
@@ -6905,6 +7031,7 @@ async function handleMessageObject(message) {
             hostPeersCount: hostPeers.length,
             leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
             hasWriterLeaseEnvelope: !!writerLeaseEnvelope,
+            hasGatewayRelayCredential: !!gatewayRelayCredential,
             hasDiscoveryTopic: !!discoveryTopic,
             hasBlindPeer: !!blindPeer?.publicKey,
             coreRefsCount: coreRefs.length,
@@ -7625,6 +7752,7 @@ async function handleMessageObject(message) {
             relayUrlPresent: !!joinRelayUrl,
             hostPeersCount: hostPeers.length,
             hasBlindPeer: !!blindPeer?.publicKey,
+            hasGatewayRelayCredential: !!gatewayRelayCredential,
             coreRefsCount: coreRefs.length,
             coreRefsPreview: summarizeCoreRefs(coreRefs),
             writerCoreRefsCount: writerCoreRefs.length,
@@ -7711,6 +7839,7 @@ async function handleMessageObject(message) {
             leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : undefined,
             writerIssuerPubkey: writerIssuerPubkey || undefined,
             writerLeaseEnvelope: writerLeaseEnvelope || undefined,
+            gatewayRelayCredential: gatewayRelayCredential || undefined,
             relayKey: joinRelayKey || undefined,
             relayUrl: joinRelayUrl || undefined,
             blindPeer,
@@ -8007,6 +8136,24 @@ async function handleMessageObject(message) {
           result?.writerCoreHex || result?.autobaseLocal || result?.writerCore || null
         ])
         const fastForward = resolvedRelayKey ? buildFastForwardCheckpoint(resolvedRelayKey) : null
+        let gatewayRelayCredential = null
+        if (GATEWAY_SCOPED_CREDENTIALS_V1 && gatewayService && resolvedRelayKey) {
+          try {
+            const relayRoute = await resolveRelayGatewayRoute({
+              relayKey: resolvedRelayKey,
+              publicIdentifier: requestData.publicIdentifier || null,
+              reason: 'invite-provision',
+              allowLegacyFallback: true
+            })
+            gatewayRelayCredential = await gatewayService.getRelayGatewayCredential({
+              relayKey: resolvedRelayKey,
+              publicIdentifier: requestData.publicIdentifier || null,
+              gatewayOrigin: relayRoute?.origin || null
+            })
+          } catch (_) {
+            gatewayRelayCredential = null
+          }
+        }
         const normalizedInviteePubkey = isHex64(requestData?.inviteePubkey)
           ? String(requestData.inviteePubkey).trim().toLowerCase()
           : null
@@ -8095,6 +8242,7 @@ async function handleMessageObject(message) {
           poolKey: poolResult?.pool?.poolKey ? previewValue(poolResult.pool.poolKey, 16) : null,
           fastForward,
           writerLeaseEnvelope: writerLeaseEnvelope || null,
+          gatewayRelayCredential: gatewayRelayCredential || null,
           leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : null,
           writerIssuerPubkey: writerLeaseEnvelope?.issuerPubkey || null
         }
@@ -8106,6 +8254,7 @@ async function handleMessageObject(message) {
           source: poolResult?.entry ? 'writer-pool' : 'relay-provision',
           hasWriterSecret: !!result?.writerSecret,
           hasWriterLeaseEnvelope: !!writerLeaseEnvelope,
+          hasGatewayRelayCredential: !!gatewayRelayCredential,
           hasWriterCore: !!(result?.writerCore || result?.writerCoreHex || result?.autobaseLocal),
           poolAvailable: poolResult?.pool?.available ?? null,
           leaseReplicaPeerCount: Array.isArray(leaseReplicaPeerKeys) ? leaseReplicaPeerKeys.length : 0,

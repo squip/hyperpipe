@@ -1,5 +1,37 @@
 const VALID_SELECTION_MODES = new Set(['default', 'discovered', 'manual']);
 
+function normalizeHttpOrigin(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:';
+    if (parsed.protocol === 'wss:') parsed.protocol = 'https:';
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    parsed.pathname = '';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.origin;
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeSharedSecretsByOriginMap(value) {
+  if (!value || typeof value !== 'object') return {};
+  const entries = {};
+  for (const [rawOrigin, rawSecret] of Object.entries(value)) {
+    const origin = normalizeHttpOrigin(rawOrigin);
+    if (!origin) continue;
+    if (typeof rawSecret !== 'string') continue;
+    const sharedSecret = rawSecret.trim();
+    if (!sharedSecret) continue;
+    entries[origin] = sharedSecret;
+  }
+  return entries;
+}
+
 const DEFAULT_SETTINGS = Object.freeze({
   enabled: true,
   selectionMode: 'default',
@@ -7,6 +39,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   preferredBaseUrl: 'https://hypertuna.com',
   baseUrl: 'https://hypertuna.com',
   sharedSecret: '',
+  sharedSecretsByOrigin: {},
   delegateReqToPeers: false,
   blindPeerEnabled: false,
   blindPeerKeys: [],
@@ -82,6 +115,12 @@ function normalizeSettings(raw = {}) {
 
   if (typeof raw.sharedSecret === 'string') {
     normalized.sharedSecret = raw.sharedSecret.trim();
+  }
+
+  if (raw.sharedSecretsByOrigin && typeof raw.sharedSecretsByOrigin === 'object') {
+    normalized.sharedSecretsByOrigin = normalizeSharedSecretsByOriginMap(raw.sharedSecretsByOrigin);
+  } else if (raw.sharedSecrets && typeof raw.sharedSecrets === 'object') {
+    normalized.sharedSecretsByOrigin = normalizeSharedSecretsByOriginMap(raw.sharedSecrets);
   }
 
   if (typeof raw.delegateReqToPeers === 'boolean') {
@@ -290,6 +329,7 @@ function withDefaults(raw = {}) {
   }
 
   const hasLegacySecret = typeof normalized.sharedSecret === 'string' && normalized.sharedSecret.trim().length > 0;
+  merged.sharedSecretsByOrigin = normalizeSharedSecretsByOriginMap(merged.sharedSecretsByOrigin);
 
   if (!merged.selectionMode || !VALID_SELECTION_MODES.has(merged.selectionMode)) {
     if ((merged.baseUrl && merged.baseUrl !== DEFAULT_SETTINGS.baseUrl) || hasLegacySecret) {
@@ -325,6 +365,16 @@ function withDefaults(raw = {}) {
   }
 
   if (!merged.baseUrl) merged.baseUrl = DEFAULT_SETTINGS.baseUrl;
+  const baseOrigin = normalizeHttpOrigin(merged.baseUrl || merged.preferredBaseUrl || null);
+  if (baseOrigin) {
+    const mappedSecret = merged.sharedSecretsByOrigin[baseOrigin];
+    if (typeof mappedSecret === 'string' && mappedSecret.trim() && !merged.sharedSecret) {
+      merged.sharedSecret = mappedSecret.trim();
+    }
+    if (typeof merged.sharedSecret === 'string' && merged.sharedSecret.trim()) {
+      merged.sharedSecretsByOrigin[baseOrigin] = merged.sharedSecret.trim();
+    }
+  }
   if (!merged.sharedSecret) merged.sharedSecret = '';
   if (!Number.isFinite(merged.defaultTokenTtl) || merged.defaultTokenTtl <= 0) {
     merged.defaultTokenTtl = DEFAULT_SETTINGS.defaultTokenTtl;

@@ -187,6 +187,10 @@ export function parseGroupInviteWithPayload(args: {
     payload.writerLeaseEnvelope && typeof payload.writerLeaseEnvelope === 'object'
       ? payload.writerLeaseEnvelope as Record<string, unknown>
       : null
+  const gatewayRelayCredential =
+    payload.gatewayRelayCredential && typeof payload.gatewayRelayCredential === 'object'
+      ? payload.gatewayRelayCredential as Record<string, unknown>
+      : null
 
   const authorizedMemberPubkeysRaw = Array.isArray(payload.authorizedMemberPubkeys)
     ? payload.authorizedMemberPubkeys
@@ -296,6 +300,7 @@ export function parseGroupInviteWithPayload(args: {
     leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : undefined,
     writerIssuerPubkey,
     writerLeaseEnvelope,
+    gatewayRelayCredential,
     authorizedMemberPubkeys: authorizedMemberPubkeys.length ? authorizedMemberPubkeys : undefined,
     blindPeer,
     cores,

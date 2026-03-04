@@ -147,6 +147,7 @@ export class RelayService implements IRelayService {
     leaseReplicaPeerKeys?: string[]
     writerIssuerPubkey?: string | null
     writerLeaseEnvelope?: Record<string, unknown> | null
+    gatewayRelayCredential?: Record<string, unknown> | null
     openJoin?: boolean
     hostPeers?: string[]
     blindPeer?: {

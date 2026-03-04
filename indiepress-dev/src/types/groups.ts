@@ -75,6 +75,7 @@ export type TGroupInvite = {
   leaseReplicaPeerKeys?: string[]
   writerIssuerPubkey?: string | null
   writerLeaseEnvelope?: Record<string, unknown> | null
+  gatewayRelayCredential?: Record<string, unknown> | null
   token?: string
   event: Event
 }

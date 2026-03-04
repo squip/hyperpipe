@@ -6,16 +6,43 @@ import {
 } from '../../shared/auth/PublicGatewayTokens.mjs';
 
 class PublicGatewayRegistrar {
-  constructor({ baseUrl, sharedSecret, logger, fetchImpl = globalThis.fetch } = {}) {
+  constructor({
+    baseUrl,
+    sharedSecret = null,
+    bearerCredential = null,
+    logger,
+    fetchImpl = globalThis.fetch
+  } = {}) {
     this.baseUrl = baseUrl ? baseUrl.replace(/\/$/, '') : null;
-    this.sharedSecret = sharedSecret;
+    this.sharedSecret = typeof sharedSecret === 'string' && sharedSecret.trim()
+      ? sharedSecret.trim()
+      : null;
+    this.bearerCredential = (
+      bearerCredential
+      && typeof bearerCredential === 'object'
+      && typeof bearerCredential.token === 'string'
+      && bearerCredential.token.trim()
+    )
+      ? { ...bearerCredential, token: bearerCredential.token.trim() }
+      : null;
     this.fetch = fetchImpl;
     this.logger = logger || console;
-    this.enabled = Boolean(this.baseUrl && this.sharedSecret && typeof this.fetch === 'function');
+    this.authMode = this.bearerCredential?.token
+      ? 'bearer'
+      : (this.sharedSecret ? 'legacy-signature' : 'none');
+    this.enabled = Boolean(
+      this.baseUrl
+      && typeof this.fetch === 'function'
+      && (this.authMode === 'legacy-signature' || this.authMode === 'bearer')
+    );
   }
 
   isEnabled() {
     return this.enabled;
+  }
+
+  isBearerMode() {
+    return this.authMode === 'bearer' && !!this.bearerCredential?.token;
   }
 
   #classifyRelayKey(value) {
@@ -35,17 +62,16 @@ class PublicGatewayRegistrar {
     });
 
     const registration = createRelayRegistration(relayKey, payload);
-    const signature = createSignature(registration, this.sharedSecret);
-
-    const body = JSON.stringify({ registration, signature });
+    const bodyPayload = this.authMode === 'legacy-signature'
+      ? { registration, signature: createSignature(registration, this.sharedSecret) }
+      : { registration };
+    const body = JSON.stringify(bodyPayload);
     const url = new URL('/api/relays', this.baseUrl).toString();
 
     try {
       const response = await this.fetch(url, {
         method: 'POST',
-        headers: {
-          'content-type': 'application/json'
-        },
+        headers: this.#buildHeaders({ 'content-type': 'application/json' }),
         body
       });
 
@@ -76,14 +102,14 @@ class PublicGatewayRegistrar {
   async unregisterRelay(relayKey) {
     if (!this.isEnabled()) return false;
     const url = new URL(`/api/relays/${encodeURIComponent(relayKey)}`, this.baseUrl).toString();
-    const signature = createSignature({ relayKey }, this.sharedSecret);
+    const signature = this.authMode === 'legacy-signature'
+      ? createSignature({ relayKey }, this.sharedSecret)
+      : null;
 
     try {
       const response = await this.fetch(url, {
         method: 'DELETE',
-        headers: {
-          'x-signature': signature
-        }
+        headers: this.#buildHeaders(signature ? { 'x-signature': signature } : {})
       });
       if (!response.ok) {
         this.logger.warn?.('Public gateway unregister failed', { relayKey, status: response.status });
@@ -195,7 +221,7 @@ class PublicGatewayRegistrar {
     const url = new URL(path, this.baseUrl).toString();
     const response = await this.fetch(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: this.#buildHeaders({ 'content-type': 'application/json' }),
       body: JSON.stringify(body)
     });
     if (!response.ok) {
@@ -210,9 +236,88 @@ class PublicGatewayRegistrar {
   }
 
   async #signedPayload(payload) {
-    if (!this.sharedSecret) throw new Error('Shared secret not configured');
-    const signature = createSignature(payload, this.sharedSecret);
-    return { payload, signature };
+    if (this.authMode === 'legacy-signature') {
+      if (!this.sharedSecret) throw new Error('Shared secret not configured');
+      const signature = createSignature(payload, this.sharedSecret);
+      return { payload, signature };
+    }
+    if (this.authMode === 'bearer') {
+      return { payload };
+    }
+    throw new Error('Public gateway registrar auth mode unavailable');
+  }
+
+  async bootstrapCreatorCredential({
+    signAuthEvent,
+    creatorPubkey = null,
+    origin = null
+  } = {}) {
+    if (!this.baseUrl || typeof this.fetch !== 'function') {
+      throw new Error('Public gateway registrar base URL unavailable');
+    }
+    if (typeof signAuthEvent !== 'function') {
+      throw new Error('signAuthEvent callback is required');
+    }
+    const challengeUrl = new URL('/api/gateway/auth/challenge', this.baseUrl).toString();
+    const challengeResponse = await this.fetch(challengeUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        origin: origin || this.baseUrl
+      })
+    });
+    if (!challengeResponse.ok) {
+      const text = await challengeResponse.text().catch(() => '');
+      throw new Error(text || `challenge status ${challengeResponse.status}`);
+    }
+    const challengeData = await challengeResponse.json().catch(() => null);
+    if (!challengeData || typeof challengeData !== 'object') {
+      throw new Error('invalid challenge payload');
+    }
+    const challenge = typeof challengeData.challenge === 'string' ? challengeData.challenge : null;
+    const nonce = typeof challengeData.nonce === 'string' ? challengeData.nonce : null;
+    if (!challenge || !nonce) {
+      throw new Error('challenge missing');
+    }
+    const authEvent = await signAuthEvent({
+      challenge: nonce,
+      origin: origin || this.baseUrl,
+      purpose: 'gateway-auth-redeem',
+      pubkey: creatorPubkey || null
+    });
+    const redeemUrl = new URL('/api/gateway/auth/redeem', this.baseUrl).toString();
+    const redeemResponse = await this.fetch(redeemUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        challenge,
+        authEvent
+      })
+    });
+    if (!redeemResponse.ok) {
+      const text = await redeemResponse.text().catch(() => '');
+      throw new Error(text || `redeem status ${redeemResponse.status}`);
+    }
+    const redeemData = await redeemResponse.json().catch(() => null);
+    const credential =
+      redeemData?.credential && typeof redeemData.credential === 'object'
+        ? redeemData.credential
+        : null;
+    if (!credential || typeof credential.token !== 'string' || !credential.token.trim()) {
+      throw new Error('gateway credential missing from redeem response');
+    }
+    return {
+      success: true,
+      credential
+    };
+  }
+
+  #buildHeaders(extra = {}) {
+    const headers = { ...(extra || {}) };
+    if (this.isBearerMode()) {
+      headers.authorization = `Bearer ${this.bearerCredential.token}`;
+    }
+    return headers;
   }
 }
 

@@ -3269,6 +3269,7 @@ export class TuiController {
     leaseReplicaPeerKeys?: string[]
     writerIssuerPubkey?: string | null
     writerLeaseEnvelope?: Record<string, unknown> | null
+    gatewayRelayCredential?: Record<string, unknown> | null
     openJoin?: boolean
     hostPeers?: string[]
     blindPeer?: {
@@ -3835,6 +3836,7 @@ export class TuiController {
         leaseReplicaPeerKeys: target.leaseReplicaPeerKeys || undefined,
         writerIssuerPubkey: target.writerIssuerPubkey || undefined,
         writerLeaseEnvelope: target.writerLeaseEnvelope || undefined,
+        gatewayRelayCredential: target.gatewayRelayCredential || undefined,
         fileSharing: target.fileSharing,
         openJoin: !target.token && target.fileSharing !== false,
         blindPeer: target.blindPeer || undefined,
@@ -4168,6 +4170,10 @@ export class TuiController {
         writerProvision?.writerLeaseEnvelope && typeof writerProvision.writerLeaseEnvelope === 'object'
           ? writerProvision.writerLeaseEnvelope as Record<string, unknown>
           : null
+      const gatewayRelayCredential =
+        writerProvision?.gatewayRelayCredential && typeof writerProvision.gatewayRelayCredential === 'object'
+          ? writerProvision.gatewayRelayCredential as Record<string, unknown>
+          : null
       const writerIssuerPubkey = typeof writerProvision?.writerIssuerPubkey === 'string'
         ? writerProvision.writerIssuerPubkey
         : payloadWriterIssuerPubkey
@@ -4232,6 +4238,7 @@ export class TuiController {
         leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : undefined,
         writerIssuerPubkey: writerIssuerPubkey || null,
         writerLeaseEnvelope: writerLeaseEnvelope || null,
+        gatewayRelayCredential: gatewayRelayCredential || null,
         token: inviteToken || null,
         writerCore: writerCore || payloadInput.writerCore || null,
         writerCoreHex: writerCoreHex || payloadInput.writerCoreHex || payloadInput.writer_core_hex || null,

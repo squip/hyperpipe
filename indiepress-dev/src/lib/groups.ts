@@ -27,6 +27,20 @@ function normalizeGatewayOrigin(value: string | null | undefined): string | null
   }
 }
 
+function extractCanonicalGatewayTagValue(tags: string[][]): string | undefined {
+  for (const tag of tags || []) {
+    if (!Array.isArray(tag) || tag[0] !== 'gateway') continue
+    const rawValue = typeof tag[1] === 'string' ? tag[1].trim() : ''
+    if (!rawValue) continue
+    if (/^(none|null|disabled|direct-only)$/i.test(rawValue)) {
+      return 'none'
+    }
+    const normalized = normalizeGatewayOrigin(rawValue)
+    if (normalized) return normalized
+  }
+  return undefined
+}
+
 export function parseGroupIdentifier(rawId: string): TGroupIdentifier {
   if (rawId.includes("'")) {
     const [relay, groupId] = rawId.split("'")
@@ -48,16 +62,7 @@ export function parseGroupMetadataEvent(event: Event, relay?: string): TGroupMet
   const isPublic = event.tags.some((t) => t[0] === 'public')
   const isOpen = event.tags.some((t) => t[0] === 'open')
   const tags = event.tags.filter((t) => t[0] === 't' && t[1]).map((t) => t[1])
-  const rawGatewayOrigin = event.tags.find((t) => t[0] === 'gateway')?.[1] ?? null
-  const normalizedGatewayOrigin = normalizeGatewayOrigin(rawGatewayOrigin)
-  const gatewayOrigin =
-    normalizedGatewayOrigin
-    || (
-      typeof rawGatewayOrigin === 'string'
-      && /^(none|null|disabled|direct-only)$/i.test(rawGatewayOrigin.trim())
-        ? 'none'
-        : undefined
-    )
+  const gatewayOrigin = extractCanonicalGatewayTagValue(event.tags as string[][])
   const discoveryTopic = event.tags.find((t) => t[0] === 'hypertuna-topic')?.[1] ?? null
   const hostPeerKeys = event.tags
     .filter((t) => t[0] === 'hypertuna-host-peer' && t[1])
@@ -190,16 +195,7 @@ export function parseGroupInviteEvent(event: Event, relay?: string): TGroupInvit
   const about = event.tags.find((t) => t[0] === 'about')?.[1]
   const isPublic = event.tags.some((t) => t[0] === 'public')
   const fileSharingOn = event.tags.some((t) => t[0] === 'file-sharing-on')
-  const rawGatewayOrigin = event.tags.find((t) => t[0] === 'gateway')?.[1] ?? null
-  const normalizedGatewayOrigin = normalizeGatewayOrigin(rawGatewayOrigin)
-  const gatewayOrigin =
-    normalizedGatewayOrigin
-    || (
-      typeof rawGatewayOrigin === 'string'
-      && /^(none|null|disabled|direct-only)$/i.test(rawGatewayOrigin.trim())
-        ? 'none'
-        : undefined
-    )
+  const gatewayOrigin = extractCanonicalGatewayTagValue(event.tags as string[][])
   return {
     groupId,
     relay,

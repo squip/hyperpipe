@@ -239,6 +239,7 @@ type WorkerBridgeContextValue = {
       leaseReplicaPeerKeys?: string[]
       writerIssuerPubkey?: string | null
       writerLeaseEnvelope?: Record<string, unknown> | null
+      gatewayRelayCredential?: Record<string, unknown> | null
       blindPeer?: {
         publicKey?: string | null
         encryptionKey?: string | null
@@ -645,6 +646,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         leaseReplicaPeerKeys?: string[]
         writerIssuerPubkey?: string | null
         writerLeaseEnvelope?: Record<string, unknown> | null
+        gatewayRelayCredential?: Record<string, unknown> | null
         blindPeer?: {
           publicKey?: string | null
           encryptionKey?: string | null
@@ -749,7 +751,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           ? opts.leaseReplicaPeerKeys
           : undefined,
         writerIssuerPubkey: opts?.writerIssuerPubkey || undefined,
-        writerLeaseEnvelope: opts?.writerLeaseEnvelope || undefined
+        writerLeaseEnvelope: opts?.writerLeaseEnvelope || undefined,
+        gatewayRelayCredential: opts?.gatewayRelayCredential || undefined
       }
       if (mergedHostPeers.length) {
         data.hostPeers = mergedHostPeers

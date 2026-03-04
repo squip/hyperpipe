@@ -482,6 +482,7 @@ const buildInvitePayload = (args: {
   leaseReplicaPeerKeys?: string[]
   writerIssuerPubkey?: string | null
   writerLeaseEnvelope?: Record<string, unknown> | null
+  gatewayRelayCredential?: Record<string, unknown> | null
   meta?: TGroupMetadata | null
   groupName?: string
   groupPicture?: string
@@ -529,6 +530,7 @@ const buildInvitePayload = (args: {
   leaseReplicaPeerKeys: normalizePubkeyList(args.leaseReplicaPeerKeys || []),
   writerIssuerPubkey: args.writerIssuerPubkey || null,
   writerLeaseEnvelope: args.writerLeaseEnvelope || null,
+  gatewayRelayCredential: args.gatewayRelayCredential || null,
   fastForward: args.fastForward ?? null,
   writerCore: args.writerInfo?.writerCore || null,
   writerCoreHex: args.writerInfo?.writerCoreHex || args.writerInfo?.autobaseLocal || null,
@@ -1237,6 +1239,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let leaseReplicaPeerKeys: string[] | undefined
             let writerIssuerPubkey: string | null | undefined
             let writerLeaseEnvelope: Record<string, unknown> | null | undefined
+            let gatewayRelayCredential: Record<string, unknown> | null | undefined
             let writerCore: string | null | undefined
             let writerCoreHex: string | null | undefined
             let autobaseLocal: string | null | undefined
@@ -1300,6 +1303,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 }
                 if (payload.writerLeaseEnvelope && typeof payload.writerLeaseEnvelope === 'object') {
                   writerLeaseEnvelope = payload.writerLeaseEnvelope as Record<string, unknown>
+                }
+                if (payload.gatewayRelayCredential && typeof payload.gatewayRelayCredential === 'object') {
+                  gatewayRelayCredential = payload.gatewayRelayCredential as Record<string, unknown>
                 }
                 if (typeof payload.writerCore === 'string') {
                   writerCore = payload.writerCore
@@ -1389,6 +1395,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               leaseReplicaPeerKeys,
               writerIssuerPubkey,
               writerLeaseEnvelope,
+              gatewayRelayCredential,
               writerCore,
               writerCoreHex,
               autobaseLocal,
@@ -3805,6 +3812,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 (res as any).writerLeaseEnvelope && typeof (res as any).writerLeaseEnvelope === 'object'
                   ? (res as any).writerLeaseEnvelope
                   : null,
+              gatewayRelayCredential:
+                (res as any).gatewayRelayCredential && typeof (res as any).gatewayRelayCredential === 'object'
+                  ? (res as any).gatewayRelayCredential
+                  : null,
               leaseReplicaPeerKeys: Array.isArray((res as any).leaseReplicaPeerKeys)
                 ? (res as any).leaseReplicaPeerKeys
                 : [],
@@ -3848,6 +3859,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           writerSecret?: string
           poolCoreRefs?: string[]
           writerLeaseEnvelope?: Record<string, unknown> | null
+          gatewayRelayCredential?: Record<string, unknown> | null
           leaseReplicaPeerKeys?: string[]
           writerIssuerPubkey?: string | null
         } | null
@@ -3910,6 +3922,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                   : metadataLeaseReplicaPeerKeys,
                 writerIssuerPubkey: writerInfo?.writerIssuerPubkey || metadataWriterIssuerPubkey,
                 writerLeaseEnvelope: writerInfo?.writerLeaseEnvelope || null,
+                gatewayRelayCredential: writerInfo?.gatewayRelayCredential || null,
                 mirrorMetadata: inviteMirrorMetadata,
                 writerInfo,
                 fastForward: writerInfo?.fastForward || null
@@ -4230,9 +4243,19 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           ? (cachedMetadata?.event?.tags as string[][])
           : []
         const existingTagKeys = new Set(metadataTags.map((tag) => `${tag[0]}:${tag[1] || ''}`))
-        const previousGatewayTag = previousTags.find(
-          (tag) => Array.isArray(tag) && tag[0] === 'gateway' && typeof tag[1] === 'string' && tag[1].trim()
-        )
+        const previousGatewayTagValue = (() => {
+          for (const tag of previousTags) {
+            if (!Array.isArray(tag) || tag[0] !== 'gateway' || typeof tag[1] !== 'string') continue
+            const rawValue = tag[1].trim()
+            if (!rawValue) continue
+            if (/^(none|null|disabled|direct-only)$/i.test(rawValue)) {
+              return 'none'
+            }
+            const normalized = normalizeGatewayOrigin(rawValue)
+            if (normalized) return normalized
+          }
+          return null
+        })()
         if (hasGatewayOriginInput) {
           const gatewayTagValue = gatewayExplicitNone
             ? 'none'
@@ -4244,20 +4267,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               existingTagKeys.add(key)
             }
           }
-        } else if (previousGatewayTag) {
-          const previousRawGateway = String(previousGatewayTag[1] || '').trim()
-          const previousGatewayOrigin = normalizeGatewayOrigin(previousRawGateway)
-          const previousGatewayTagValue =
-            /^(none|null|disabled|direct-only)$/i.test(previousRawGateway)
-              ? 'none'
-              : previousGatewayOrigin
-          if (previousGatewayTagValue) {
-            const key = `gateway:${previousGatewayTagValue}`
+        } else if (previousGatewayTagValue) {
+          const key = `gateway:${previousGatewayTagValue}`
             if (!existingTagKeys.has(key)) {
               metadataTags.push(['gateway', previousGatewayTagValue])
               existingTagKeys.add(key)
             }
-          }
         }
         if (nextIsPublic && nextIsOpen) {
           const discoveryTagNames = new Set([

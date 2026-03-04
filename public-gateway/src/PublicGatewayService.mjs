@@ -47,6 +47,8 @@ import HyperbeeRelayHost from './relay/HyperbeeRelayHost.mjs';
 import RelayWebsocketController from './relay/RelayWebsocketController.mjs';
 import RelayDispatcherService from './relay/RelayDispatcherService.mjs';
 import RelayTokenService from './relay/RelayTokenService.mjs';
+import GatewayPolicyService from './GatewayPolicyService.mjs';
+import GatewayCredentialService, { parseBearerToken } from './GatewayCredentialService.mjs';
 import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGatewayHyperbeeAdapter.mjs';
 import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hyperbeeReplicationChannel.mjs';
 import BlindPeerService from './blind-peer/BlindPeerService.mjs';
@@ -84,6 +86,32 @@ class PublicGatewayService {
     this.tlsOptions = tlsOptions;
     this.registrationStore = registrationStore || new MemoryRegistrationStore(config.registration?.cacheTtlSeconds);
     this.sharedSecret = config.registration?.sharedSecret || null;
+    this.policyConfig = config.policy || {};
+    this.credentialsConfig = config.credentials || {};
+    this.creatorPolicyEnabled = this.policyConfig?.enabled === true;
+    this.scopedCredentialsEnabled = this.credentialsConfig?.enabled === true;
+    this.gatewayPolicy = new GatewayPolicyService({
+      config: this.policyConfig,
+      logger: this.logger
+    });
+    this.gatewayCredentialService = null;
+    if (this.scopedCredentialsEnabled) {
+      const issuerSecret = this.credentialsConfig?.issuerSecret || this.sharedSecret || null;
+      if (issuerSecret) {
+        this.gatewayCredentialService = new GatewayCredentialService({
+          rootSecret: issuerSecret,
+          logger: this.logger,
+          challengeTtlMs: this.credentialsConfig?.challengeTtlMs,
+          creatorCredentialTtlMs: this.credentialsConfig?.creatorCredentialTtlMs,
+          relayCredentialTtlMs: this.credentialsConfig?.relayCredentialTtlMs
+        });
+      } else {
+        this.logger?.warn?.('[PublicGateway] Scoped credentials enabled but issuer secret missing; disabling scoped credentials');
+        this.scopedCredentialsEnabled = false;
+      }
+    }
+    this.relayCredentialVersions = new Map();
+    this.creatorCredentialVersions = new Map();
     this.openJoinConfig = this.#normalizeOpenJoinConfig(config?.openJoin);
     this.openJoinChallenges = new Map();
     this.openJoinLeaseLocks = new Set();
@@ -430,6 +458,9 @@ class PublicGatewayService {
       res.json({ status: 'ok' });
     });
 
+    app.post('/api/gateway/auth/challenge', (req, res) => this.#handleGatewayAuthChallenge(req, res));
+    app.post('/api/gateway/auth/redeem', (req, res) => this.#handleGatewayAuthRedeem(req, res));
+
     if (this.#shouldExposeSecretEndpoint()) {
       app.get(this.secretEndpointPath, (req, res) => this.#handleSecretRequest(req, res));
     }
@@ -659,6 +690,11 @@ class PublicGatewayService {
 
   #isHexRelayKey(value) {
     return typeof value === 'string' && /^[0-9a-fA-F]{64}$/.test(value);
+  }
+
+  #normalizeRelayKey(value) {
+    if (!this.#isHexRelayKey(value)) return null;
+    return String(value).trim().toLowerCase();
   }
 
   async #resolveRelayAlias(identifier) {
@@ -3130,13 +3166,267 @@ class PublicGatewayService {
     }
   }
 
+  #normalizeCreatorPubkey(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/i.test(trimmed)) return null;
+    return trimmed;
+  }
+
+  #extractCreatorPubkeyFromRegistration(registration) {
+    if (!registration || typeof registration !== 'object') return null;
+    const metadata = registration?.metadata && typeof registration.metadata === 'object'
+      ? registration.metadata
+      : {};
+    return this.#normalizeCreatorPubkey(
+      metadata.admin_pubkey
+      || metadata.adminPubkey
+      || registration?.admin_pubkey
+      || registration?.adminPubkey
+      || null
+    );
+  }
+
+  #getCreatorCredentialVersion(pubkey) {
+    const normalized = this.#normalizeCreatorPubkey(pubkey);
+    if (!normalized) return 1;
+    return this.creatorCredentialVersions.get(normalized) || 1;
+  }
+
+  #getRelayCredentialVersion(relayKey) {
+    const normalized = this.#normalizeRelayKey(relayKey);
+    if (!normalized) return 1;
+    return this.relayCredentialVersions.get(normalized) || 1;
+  }
+
+  #setRelayCreator(relayKey, creatorPubkey) {
+    const normalizedRelayKey = this.#normalizeRelayKey(relayKey);
+    const normalizedCreator = this.#normalizeCreatorPubkey(creatorPubkey);
+    if (!normalizedRelayKey || !normalizedCreator) return;
+    this.gatewayPolicy.noteRelayCreator(normalizedRelayKey, normalizedCreator);
+    if (!this.relayCredentialVersions.has(normalizedRelayKey)) {
+      this.relayCredentialVersions.set(normalizedRelayKey, 1);
+    }
+    if (!this.creatorCredentialVersions.has(normalizedCreator)) {
+      this.creatorCredentialVersions.set(normalizedCreator, 1);
+    }
+  }
+
+  #bumpCreatorCredentialVersion(pubkey) {
+    const normalized = this.#normalizeCreatorPubkey(pubkey);
+    if (!normalized) return null;
+    const next = this.#getCreatorCredentialVersion(normalized) + 1;
+    this.creatorCredentialVersions.set(normalized, next);
+    return next;
+  }
+
+  #bumpRelayCredentialVersion(relayKey) {
+    const normalizedRelayKey = this.#normalizeRelayKey(relayKey);
+    if (!normalizedRelayKey) return null;
+    const next = this.#getRelayCredentialVersion(normalizedRelayKey) + 1;
+    this.relayCredentialVersions.set(normalizedRelayKey, next);
+    return next;
+  }
+
+  async #purgeCreatorRelayData(creatorPubkey, reason = 'creator-banned') {
+    const normalizedCreator = this.#normalizeCreatorPubkey(creatorPubkey);
+    if (!normalizedCreator) return { removed: 0 };
+    const listed = typeof this.registrationStore?.listRelays === 'function'
+      ? await this.registrationStore.listRelays()
+      : [];
+    const relays = Array.isArray(listed) ? listed : [];
+    let removed = 0;
+    for (const relay of relays) {
+      const relayKey = this.#normalizeRelayKey(relay?.relayKey);
+      const record = relay?.record && typeof relay.record === 'object' ? relay.record : {};
+      const creator = this.#normalizeCreatorPubkey(
+        record?.metadata?.admin_pubkey
+        || record?.metadata?.adminPubkey
+        || this.gatewayPolicy.getRelayCreator(relayKey)
+      );
+      if (!relayKey || creator !== normalizedCreator) continue;
+      try {
+        await this.registrationStore.removeRelay(relayKey);
+        this.gatewayPolicy.removeRelay(relayKey);
+        this.#bumpRelayCredentialVersion(relayKey);
+        removed += 1;
+      } catch (error) {
+        this.logger?.warn?.('[PublicGateway] Failed to purge relay during creator purge', {
+          relayKey,
+          creatorPubkey: normalizedCreator,
+          reason,
+          error: error?.message || error
+        });
+      }
+    }
+    this.#bumpCreatorCredentialVersion(normalizedCreator);
+    return { removed };
+  }
+
+  #verifyCredentialVersion(credentialPayload) {
+    if (!credentialPayload || typeof credentialPayload !== 'object') {
+      return { ok: false, reason: 'missing-credential-payload' };
+    }
+    const scope = credentialPayload.scope;
+    if (scope === 'creator') {
+      const expected = this.#getCreatorCredentialVersion(credentialPayload.creatorPubkey);
+      if (expected !== credentialPayload.credentialVersion) {
+        return { ok: false, reason: 'creator-credential-version-mismatch' };
+      }
+      return { ok: true };
+    }
+    if (scope === 'relay') {
+      const expected = this.#getRelayCredentialVersion(credentialPayload.relayKey);
+      if (expected !== credentialPayload.credentialVersion) {
+        return { ok: false, reason: 'relay-credential-version-mismatch' };
+      }
+      return { ok: true };
+    }
+    return { ok: false, reason: 'unsupported-credential-scope' };
+  }
+
+  async #authorizePrivilegedRequest(req, {
+    payload,
+    signature,
+    relayKey = null,
+    requiredScopes = ['creator', 'relay'],
+    allowLegacy = true
+  } = {}) {
+    const normalizedRelayKey = this.#normalizeRelayKey(relayKey || payload?.relayKey || null);
+    const authorizationHeader = req?.headers?.authorization || req?.headers?.Authorization || null;
+    if (this.scopedCredentialsEnabled && this.gatewayCredentialService) {
+      const bearerToken = parseBearerToken(authorizationHeader);
+      if (bearerToken) {
+        const verified = this.gatewayCredentialService.verifyToken(bearerToken, {
+          origin: this.config?.publicBaseUrl || null
+        });
+        if (!verified?.ok) {
+          if (allowLegacy && this.#verifySignedPayload(payload, signature)) {
+            return { ok: true, mode: 'legacy', credential: null, creatorPubkey: null };
+          }
+          return { ok: false, status: 401, error: verified?.reason || 'invalid-credential-token' };
+        }
+        const payloadScope = verified?.payload?.scope || null;
+        if (
+          payloadScope === 'relay'
+          && normalizedRelayKey
+          && this.#normalizeRelayKey(verified?.payload?.relayKey || null) !== normalizedRelayKey
+        ) {
+          if (allowLegacy && this.#verifySignedPayload(payload, signature)) {
+            return { ok: true, mode: 'legacy', credential: null, creatorPubkey: null };
+          }
+          return { ok: false, status: 401, error: 'credential-relay-mismatch' };
+        }
+        if (Array.isArray(requiredScopes) && requiredScopes.length && !requiredScopes.includes(payloadScope)) {
+          if (allowLegacy && this.#verifySignedPayload(payload, signature)) {
+            return { ok: true, mode: 'legacy', credential: null, creatorPubkey: null };
+          }
+          return { ok: false, status: 403, error: 'credential-scope-denied' };
+        }
+        const versionCheck = this.#verifyCredentialVersion(verified.payload);
+        if (!versionCheck.ok) {
+          if (allowLegacy && this.#verifySignedPayload(payload, signature)) {
+            return { ok: true, mode: 'legacy', credential: null, creatorPubkey: null };
+          }
+          return { ok: false, status: 401, error: versionCheck.reason || 'credential-version-invalid' };
+        }
+        const creatorPubkey = this.#normalizeCreatorPubkey(verified?.payload?.creatorPubkey || null);
+        if (this.creatorPolicyEnabled && creatorPubkey && this.gatewayPolicy.isBanned(creatorPubkey)) {
+          if (allowLegacy && this.#verifySignedPayload(payload, signature)) {
+            return { ok: true, mode: 'legacy', credential: null, creatorPubkey: null };
+          }
+          return { ok: false, status: 403, error: 'creator-banned' };
+        }
+        return {
+          ok: true,
+          mode: 'credential',
+          credential: verified.payload,
+          creatorPubkey
+        };
+      }
+    }
+
+    if (allowLegacy && this.#verifySignedPayload(payload, signature)) {
+      return { ok: true, mode: 'legacy', credential: null, creatorPubkey: null };
+    }
+
+    return { ok: false, status: 401, error: 'invalid-signature-or-credential' };
+  }
+
+  async #handleGatewayAuthChallenge(req, res) {
+    if (!this.scopedCredentialsEnabled || !this.gatewayCredentialService) {
+      return res.status(503).json({ error: 'scoped-credentials-disabled' });
+    }
+    try {
+      const challenge = this.gatewayCredentialService.issueChallenge({
+        origin: req?.body?.origin || this.config?.publicBaseUrl || null,
+        purpose: 'gateway-auth-redeem'
+      });
+      return res.json(challenge);
+    } catch (error) {
+      return res.status(400).json({ error: error?.message || 'challenge-failed' });
+    }
+  }
+
+  async #handleGatewayAuthRedeem(req, res) {
+    if (!this.scopedCredentialsEnabled || !this.gatewayCredentialService) {
+      return res.status(503).json({ error: 'scoped-credentials-disabled' });
+    }
+    const challengeId = typeof req?.body?.challenge === 'string' ? req.body.challenge.trim() : null;
+    const authEvent = req?.body?.authEvent && typeof req.body.authEvent === 'object'
+      ? req.body.authEvent
+      : (req?.body?.event && typeof req.body.event === 'object' ? req.body.event : null);
+    if (!challengeId || !authEvent) {
+      return res.status(400).json({ error: 'challenge and authEvent are required' });
+    }
+    const challenge = this.gatewayCredentialService.consumeChallenge(challengeId);
+    if (!challenge) {
+      return res.status(401).json({ error: 'invalid-challenge' });
+    }
+    const authVerification = await this.#verifyOpenJoinAuthEvent(authEvent, {
+      challenge: challenge.nonce,
+      relayKey: null,
+      publicIdentifier: null,
+      purpose: challenge.purpose || 'gateway-auth-redeem'
+    });
+    if (!authVerification?.ok || !authVerification?.pubkey) {
+      return res.status(401).json({ error: authVerification?.error || 'auth-invalid' });
+    }
+    const creatorPubkey = this.#normalizeCreatorPubkey(authVerification.pubkey);
+    const policyDecision = this.gatewayPolicy.canIssueCreatorCredential({ creatorPubkey });
+    if (!policyDecision.allowed) {
+      if (policyDecision.reason === 'creator-banned' && creatorPubkey) {
+        await this.#purgeCreatorRelayData(creatorPubkey, 'creator-banned');
+      }
+      return res.status(403).json({ error: policyDecision.reason || 'policy-denied' });
+    }
+    const credentialVersion = this.#getCreatorCredentialVersion(creatorPubkey);
+    const credential = this.gatewayCredentialService.issueCreatorCredential({
+      origin: challenge.origin || this.config?.publicBaseUrl || null,
+      creatorPubkey,
+      credentialVersion
+    });
+    return res.json({
+      status: 'ok',
+      creatorPubkey,
+      credential
+    });
+  }
+
   async #handleTokenIssue(req, res) {
     if (!this.tokenService) {
       return res.status(503).json({ error: 'Token service disabled' });
     }
     const { payload, signature } = req.body || {};
-    if (!this.#verifySignedPayload(payload, signature)) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    const auth = await this.#authorizePrivilegedRequest(req, {
+      payload,
+      signature,
+      relayKey: payload?.relayKey || null,
+      requiredScopes: ['creator', 'relay'],
+      allowLegacy: true
+    });
+    if (!auth.ok) {
+      return res.status(auth.status || 401).json({ error: auth.error || 'unauthorized' });
     }
 
     const relayKey = payload?.relayKey;
@@ -3175,8 +3465,15 @@ class PublicGatewayService {
       return res.status(503).json({ error: 'Token service disabled' });
     }
     const { payload, signature } = req.body || {};
-    if (!this.#verifySignedPayload(payload, signature)) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    const auth = await this.#authorizePrivilegedRequest(req, {
+      payload,
+      signature,
+      relayKey: payload?.relayKey || null,
+      requiredScopes: ['creator', 'relay'],
+      allowLegacy: true
+    });
+    if (!auth.ok) {
+      return res.status(auth.status || 401).json({ error: auth.error || 'unauthorized' });
     }
 
     const relayKey = payload?.relayKey;
@@ -3213,8 +3510,15 @@ class PublicGatewayService {
       return res.status(503).json({ error: 'Token service disabled' });
     }
     const { payload, signature } = req.body || {};
-    if (!this.#verifySignedPayload(payload, signature)) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    const auth = await this.#authorizePrivilegedRequest(req, {
+      payload,
+      signature,
+      relayKey: payload?.relayKey || null,
+      requiredScopes: ['creator', 'relay'],
+      allowLegacy: true
+    });
+    if (!auth.ok) {
+      return res.status(auth.status || 401).json({ error: auth.error || 'unauthorized' });
     }
 
     const relayKey = payload?.relayKey;
@@ -3673,13 +3977,13 @@ class PublicGatewayService {
   }
 
   async #handleRelayRegistration(req, res) {
-    if (!this.sharedSecret) {
+    if (!this.sharedSecret && !this.scopedCredentialsEnabled) {
       return res.status(503).json({ error: 'Registration disabled' });
     }
 
     const { registration, signature } = req.body || {};
-    if (!registration || !signature) {
-      return res.status(400).json({ error: 'Missing registration payload or signature' });
+    if (!registration || typeof registration !== 'object') {
+      return res.status(400).json({ error: 'Missing registration payload' });
     }
 
     if (!registration.relayKey) {
@@ -3696,9 +4000,27 @@ class PublicGatewayService {
           }))
       : null;
 
-    const valid = verifySignature(registration, signature, this.sharedSecret);
-    if (!valid) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    const auth = await this.#authorizePrivilegedRequest(req, {
+      payload: registration,
+      signature,
+      relayKey: registration.relayKey,
+      requiredScopes: ['creator', 'relay'],
+      allowLegacy: true
+    });
+    if (!auth.ok) {
+      return res.status(auth.status || 401).json({ error: auth.error || 'unauthorized' });
+    }
+
+    const credentialCreatorPubkey = this.#normalizeCreatorPubkey(auth?.creatorPubkey || auth?.credential?.creatorPubkey || null);
+    const registrationCreatorPubkey = this.#extractCreatorPubkeyFromRegistration(registration);
+    // Credential-bound creator identity must win over client-supplied metadata for closed-gateway inheritance.
+    const creatorPubkey = credentialCreatorPubkey || registrationCreatorPubkey || null;
+    const policyDecision = this.gatewayPolicy.canRegisterRelay({ creatorPubkey });
+    if (!policyDecision.allowed) {
+      if (policyDecision.reason === 'creator-banned' && creatorPubkey) {
+        await this.#purgeCreatorRelayData(creatorPubkey, 'creator-banned');
+      }
+      return res.status(403).json({ error: policyDecision.reason || 'policy-denied' });
     }
 
     try {
@@ -3728,6 +4050,9 @@ class PublicGatewayService {
         registration.relayKey,
         this.#buildMirrorMetadataPayload(stamped, registration.relayKey)
       );
+      if (creatorPubkey) {
+        this.#setRelayCreator(registration.relayKey, creatorPubkey);
+      }
       this.#storeRelayAliases(registration.relayKey, stamped).catch((error) => {
         this.logger?.warn?.({
           relayKey: registration.relayKey,
@@ -3736,9 +4061,22 @@ class PublicGatewayService {
       });
       this.logger.info?.({ relayKey: registration.relayKey, relayKeyType }, 'Relay registration accepted');
       const hyperbeeInfo = this.#getRelayHostInfo();
+      const gatewayRelayCredential = (
+        this.scopedCredentialsEnabled
+        && this.gatewayCredentialService
+        && creatorPubkey
+      )
+        ? this.gatewayCredentialService.issueRelayCredential({
+          origin: this.config?.publicBaseUrl || null,
+          relayKey: registration.relayKey,
+          creatorPubkey,
+          credentialVersion: this.#getRelayCredentialVersion(registration.relayKey)
+        })
+        : null;
       return res.json({
         status: 'ok',
-        hyperbee: hyperbeeInfo
+        hyperbee: hyperbeeInfo,
+        gatewayRelayCredential: gatewayRelayCredential || undefined
       });
     } catch (error) {
       this.logger.error?.({ relayKey: registration.relayKey, error: error.message }, 'Failed to persist relay registration');
@@ -3747,7 +4085,7 @@ class PublicGatewayService {
   }
 
   async #handleRelayDeletion(req, res) {
-    if (!this.sharedSecret) {
+    if (!this.sharedSecret && !this.scopedCredentialsEnabled) {
       return res.status(503).json({ error: 'Registration disabled' });
     }
 
@@ -3757,17 +4095,21 @@ class PublicGatewayService {
     }
 
     const signature = req.headers['x-signature'];
-    if (!signature) {
-      return res.status(401).json({ error: 'Missing signature' });
-    }
-
-    const valid = verifySignature({ relayKey }, signature, this.sharedSecret);
-    if (!valid) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    const auth = await this.#authorizePrivilegedRequest(req, {
+      payload: { relayKey },
+      signature,
+      relayKey,
+      requiredScopes: ['creator', 'relay'],
+      allowLegacy: true
+    });
+    if (!auth.ok) {
+      return res.status(auth.status || 401).json({ error: auth.error || 'unauthorized' });
     }
 
     try {
       await this.registrationStore.removeRelay(relayKey);
+      this.gatewayPolicy.removeRelay(relayKey);
+      this.#bumpRelayCredentialVersion(relayKey);
       this.logger.info?.({ relayKey }, 'Relay unregistered');
       return res.json({ status: 'ok' });
     } catch (error) {
@@ -3898,13 +4240,20 @@ class PublicGatewayService {
     if (!this.openJoinConfig?.enabled) {
       return res.status(503).json({ error: 'open-join-disabled' });
     }
-    if (!this.sharedSecret) {
+    if (!this.sharedSecret && !this.scopedCredentialsEnabled) {
       return res.status(503).json({ error: 'registration-disabled' });
     }
 
     const { payload, signature } = req.body || {};
-    if (!this.#verifySignedPayload(payload, signature)) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    const auth = await this.#authorizePrivilegedRequest(req, {
+      payload,
+      signature,
+      relayKey: payload?.relayKey || req.params?.relayKey || null,
+      requiredScopes: ['creator', 'relay'],
+      allowLegacy: true
+    });
+    if (!auth.ok) {
+      return res.status(auth.status || 401).json({ error: auth.error || 'unauthorized' });
     }
 
     const relayKey = payload?.relayKey || req.params?.relayKey;

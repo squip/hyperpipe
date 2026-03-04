@@ -13,6 +13,23 @@ function parseEnvNumber(name, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function parseCsvEnvList(value) {
+  if (!value) return [];
+  const source = Array.isArray(value)
+    ? value
+    : String(value)
+      .split(',');
+  const out = [];
+  const seen = new Set();
+  for (const entry of source) {
+    const trimmed = String(entry || '').trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+}
+
 const DEFAULT_CONFIG = {
   host: '0.0.0.0',
   port: Number(process.env.PORT) || 4430,
@@ -94,6 +111,19 @@ const DEFAULT_CONFIG = {
     challengeTtlMs: Number(process.env.GATEWAY_OPEN_JOIN_CHALLENGE_TTL_MS) || (2 * 60 * 1000),
     authWindowSeconds: Number(process.env.GATEWAY_OPEN_JOIN_AUTH_WINDOW || 300),
     maxPoolSize: Number(process.env.GATEWAY_OPEN_JOIN_MAX_POOL || 100)
+  },
+  policy: {
+    enabled: process.env.GATEWAY_CREATOR_POLICY_V1 === 'true',
+    mode: process.env.GATEWAY_POLICY_MODE || 'open',
+    allowList: parseCsvEnvList(process.env.GATEWAY_POLICY_ALLOW_LIST || process.env.GATEWAY_POLICY_ALLOWLIST || ''),
+    banList: parseCsvEnvList(process.env.GATEWAY_POLICY_BAN_LIST || process.env.GATEWAY_POLICY_BANLIST || '')
+  },
+  credentials: {
+    enabled: process.env.GATEWAY_SCOPED_CREDENTIALS_V1 === 'true',
+    issuerSecret: process.env.GATEWAY_CREDENTIAL_ISSUER_SECRET || null,
+    challengeTtlMs: parseEnvNumber('GATEWAY_CREDENTIAL_CHALLENGE_TTL_MS', 2 * 60 * 1000),
+    creatorCredentialTtlMs: parseEnvNumber('GATEWAY_CREATOR_CREDENTIAL_TTL_MS', 30 * 24 * 60 * 60 * 1000),
+    relayCredentialTtlMs: parseEnvNumber('GATEWAY_RELAY_CREDENTIAL_TTL_MS', 0)
   }
 };
 
@@ -154,11 +184,23 @@ function loadConfig(overrides = {}) {
     openJoin: {
       ...DEFAULT_CONFIG.openJoin,
       ...(overrides.openJoin || {})
+    },
+    policy: {
+      ...DEFAULT_CONFIG.policy,
+      ...(overrides.policy || {})
+    },
+    credentials: {
+      ...DEFAULT_CONFIG.credentials,
+      ...(overrides.credentials || {})
     }
   };
 
   if (!merged.publicBaseUrl) {
     throw new Error('Gateway requires a publicBaseUrl configuration value');
+  }
+
+  if (!merged.credentials?.issuerSecret && merged.registration?.sharedSecret) {
+    merged.credentials.issuerSecret = merged.registration.sharedSecret;
   }
 
   if (!merged.registration?.sharedSecret) {

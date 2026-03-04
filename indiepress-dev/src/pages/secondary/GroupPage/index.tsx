@@ -78,6 +78,7 @@ type TJoinFlowHintFields = {
   leaseReplicaPeerKeys?: string[]
   writerIssuerPubkey?: string | null
   writerLeaseEnvelope?: Record<string, unknown> | null
+  gatewayRelayCredential?: Record<string, unknown> | null
 }
 
 const RELAY_SUBSCRIPTION_REFRESH_NO_CLIENT_RETRY_ATTEMPTS = 6
@@ -1226,6 +1227,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           leaseReplicaPeerKeys: mergedLeaseReplicaPeerKeys.length ? mergedLeaseReplicaPeerKeys : undefined,
           writerIssuerPubkey,
           writerLeaseEnvelope: inviteHints.writerLeaseEnvelope || undefined,
+          gatewayRelayCredential: inviteHints.gatewayRelayCredential || undefined,
           blindPeer: inviteData?.blindPeer,
           cores: inviteData?.cores,
           writerCore: inviteData?.writerCore,
