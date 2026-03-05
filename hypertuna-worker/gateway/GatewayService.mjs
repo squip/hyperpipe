@@ -20,11 +20,6 @@ import PublicGatewayRegistrar from './PublicGatewayRegistrar.mjs';
 import PublicGatewayDiscoveryClient from './PublicGatewayDiscoveryClient.mjs';
 import PublicGatewayRelayClient from './PublicGatewayRelayClient.mjs';
 import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGatewayHyperbeeAdapter.mjs';
-import PublicGatewayVirtualRelayManager from './PublicGatewayVirtualRelayManager.mjs';
-import {
-  registerVirtualRelay,
-  unregisterVirtualRelay
-} from '../hypertuna-relay-manager-adapter.mjs';
 import { activeRelays as relayManagerMap } from '../hypertuna-relay-manager-adapter.mjs';
 import { getRelayAuthStore } from '../relay-auth-store.mjs';
 import { updatePublicGatewaySettings } from '../../shared/config/PublicGatewaySettings.mjs';
@@ -1303,9 +1298,6 @@ export class GatewayService extends EventEmitter {
             discoveryKey: registrationResult.hyperbee.discoveryKey
           });
           this.hyperbeeAdapter?.setRelayClient(this.publicGatewayRelayClient);
-          if (this.publicGatewayVirtualRelayManager) {
-            this.publicGatewayVirtualRelayManager.setHyperbeeAdapter(this.hyperbeeAdapter);
-          }
           for (const protocol of this.gatewayProtocols.values()) {
             this.publicGatewayRelayClient.attachProtocol(protocol);
           }
@@ -3399,48 +3391,14 @@ export class GatewayService extends EventEmitter {
   }
 
   async #registerPublicGatewayVirtualRelay(metadata = {}) {
-    const relayKey = this.#getPublicGatewayRelayKey();
-    if (!relayKey) return;
-
-    if (!this.publicGatewayVirtualRelayManager) {
-      this.publicGatewayVirtualRelayManager = new PublicGatewayVirtualRelayManager({
-        identifier: relayKey,
-        hyperbeeAdapter: this.hyperbeeAdapter,
-        logger: this.loggerBridge || console
-      });
-    } else {
-      this.publicGatewayVirtualRelayManager.setHyperbeeAdapter(this.hyperbeeAdapter);
-      if (this.loggerBridge) {
-        this.publicGatewayVirtualRelayManager.logger = this.loggerBridge;
-      }
-    }
-
-    registerVirtualRelay(relayKey, this.publicGatewayVirtualRelayManager, {
-      publicIdentifier: relayKey,
-      metadata,
-      logger: this.loggerBridge || console
-    });
-
-    try {
-      const stats = await this.publicGatewayVirtualRelayManager.getReplicaStats();
-      this.log('info', `[PublicGateway] Virtual relay registered for ${relayKey} (lag=${stats.lag}, downloaded=${stats.downloaded})`);
-    } catch (error) {
-      this.log('debug', `[PublicGateway] Virtual relay stats unavailable for ${relayKey}: ${error.message}`);
-    }
+    void metadata;
+    this.publicGatewayVirtualRelayManager = null;
+    this.log('debug', '[PublicGateway] Virtual relay registration disabled');
   }
 
   async #unregisterPublicGatewayVirtualRelay(relayKey = PUBLIC_GATEWAY_RELAY_KEY) {
-    if (!relayKey) return;
-
-    await unregisterVirtualRelay(relayKey, {
-      publicIdentifier: relayKey,
-      logger: this.loggerBridge || console
-    });
-
-    if (this.publicGatewayVirtualRelayManager) {
-      this.publicGatewayVirtualRelayManager = null;
-      this.log('info', `[PublicGateway] Virtual relay unregistered for ${relayKey}`);
-    }
+    void relayKey;
+    this.publicGatewayVirtualRelayManager = null;
   }
 
   _ensureRelayAvatarUrl(url, identifier) {

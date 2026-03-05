@@ -11,6 +11,20 @@ import {
 } from '@/types/groups'
 
 export const PRIVATE_GROUP_LEAVE_SHADOW_NAMESPACE = 'ht-private-leave:v1'
+const HYPERTUNA_GATEWAY_ID_TAG = 'hypertuna-gateway-id'
+const HYPERTUNA_GATEWAY_ORIGIN_TAG = 'hypertuna-gateway-origin'
+const HYPERTUNA_DIRECT_JOIN_ONLY_TAG = 'hypertuna-direct-join-only'
+
+function normalizeHttpOrigin(value?: string | null): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null
+  try {
+    const parsed = new URL(value.trim())
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    return parsed.origin
+  } catch {
+    return null
+  }
+}
 
 export function parseGroupIdentifier(rawId: string): TGroupIdentifier {
   if (rawId.includes("'")) {
@@ -41,6 +55,13 @@ export function parseGroupMetadataEvent(event: Event, relay?: string): TGroupMet
     .filter((t) => t[0] === 'hypertuna-lease-replica-peer' && t[1])
     .map((t) => t[1])
   const writerIssuerPubkey = event.tags.find((t) => t[0] === 'hypertuna-writer-issuer')?.[1] ?? null
+  const gatewayId = event.tags.find((t) => t[0] === HYPERTUNA_GATEWAY_ID_TAG)?.[1] ?? null
+  const gatewayOrigin = normalizeHttpOrigin(
+    event.tags.find((t) => t[0] === HYPERTUNA_GATEWAY_ORIGIN_TAG)?.[1] ?? null
+  )
+  const directJoinOnly = event.tags.some(
+    (t) => t[0] === HYPERTUNA_DIRECT_JOIN_ONLY_TAG && (t[1] === '1' || t[1] === 'true')
+  )
 
   return {
     id: d,
@@ -51,6 +72,9 @@ export function parseGroupMetadataEvent(event: Event, relay?: string): TGroupMet
     isPublic,
     isOpen,
     discoveryTopic,
+    gatewayId: gatewayId ? gatewayId.toLowerCase() : null,
+    gatewayOrigin,
+    directJoinOnly,
     hostPeerKeys,
     leaseReplicaPeerKeys,
     writerIssuerPubkey,
@@ -164,9 +188,19 @@ export function parseGroupInviteEvent(event: Event, relay?: string): TGroupInvit
   const about = event.tags.find((t) => t[0] === 'about')?.[1]
   const isPublic = event.tags.some((t) => t[0] === 'public')
   const fileSharingOn = event.tags.some((t) => t[0] === 'file-sharing-on')
+  const gatewayId = event.tags.find((t) => t[0] === HYPERTUNA_GATEWAY_ID_TAG)?.[1] ?? null
+  const gatewayOrigin = normalizeHttpOrigin(
+    event.tags.find((t) => t[0] === HYPERTUNA_GATEWAY_ORIGIN_TAG)?.[1] ?? null
+  )
+  const directJoinOnly = event.tags.some(
+    (t) => t[0] === HYPERTUNA_DIRECT_JOIN_ONLY_TAG && (t[1] === '1' || t[1] === 'true')
+  )
   return {
     groupId,
     relay,
+    gatewayId: gatewayId ? gatewayId.toLowerCase() : null,
+    gatewayOrigin,
+    directJoinOnly,
     groupName: name,
     groupPicture: picture,
     name,

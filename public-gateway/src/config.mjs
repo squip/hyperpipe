@@ -2,6 +2,12 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 const LEGACY_PUBLIC_GATEWAY_PATH = 'public-gateway/hyperbee';
+const DEFAULT_NOSTR_DISCOVERY_RELAYS = [
+  'wss://relay.damus.io/',
+  'wss://relay.primal.net/',
+  'wss://nos.lol/',
+  'wss://hypertuna.com/relay'
+];
 
 const DEFAULT_BLIND_PEER_MAX_BYTES = 25 * 1024 ** 3;
 const DEFAULT_OPEN_JOIN_POOL_ENTRY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -11,6 +17,16 @@ function parseEnvNumber(name, fallback) {
   if (raw === undefined || raw === null || raw === '') return fallback;
   const parsed = Number(raw);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseCsvList(input, fallback = []) {
+  if (typeof input !== 'string' || !input.trim()) {
+    return Array.isArray(fallback) ? [...fallback] : [];
+  }
+  return input
+    .split(',')
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
 }
 
 const DEFAULT_CONFIG = {
@@ -52,7 +68,14 @@ const DEFAULT_CONFIG = {
     refreshIntervalMs: Number(process.env.GATEWAY_DISCOVERY_REFRESH_MS || 30000),
     secretPath: process.env.GATEWAY_DISCOVERY_SECRET_PATH || '/.well-known/hypertuna-gateway-secret',
     sharedSecretVersion: process.env.GATEWAY_DISCOVERY_SECRET_VERSION || '',
-    protocolVersion: Number(process.env.GATEWAY_DISCOVERY_PROTOCOL_VERSION || 1)
+    protocolVersion: Number(process.env.GATEWAY_DISCOVERY_PROTOCOL_VERSION || 1),
+    nostrEnabled: process.env.GATEWAY_NOSTR_DISCOVERY_ENABLED !== 'false',
+    nostrRelayUrls: parseCsvList(
+      process.env.GATEWAY_NOSTR_DISCOVERY_RELAYS,
+      DEFAULT_NOSTR_DISCOVERY_RELAYS
+    ),
+    nostrPublishIntervalMs: Number(process.env.GATEWAY_NOSTR_DISCOVERY_REFRESH_MS || process.env.GATEWAY_DISCOVERY_REFRESH_MS || 30000),
+    nostrKeySeed: process.env.GATEWAY_NOSTR_DISCOVERY_KEY_SEED || null
   },
   relay: {
     storageDir: process.env.GATEWAY_RELAY_STORAGE || null,

@@ -13,6 +13,9 @@ test('blind peer defaults disabled with sane limits', () => {
 
 test('blind peer overrides are normalised', () => {
   const config = loadConfig({
+    registration: {
+      relayGcAfterMs: 0
+    },
     blindPeer: {
       enabled: true,
       storageDir: '/tmp/blind-peer',
@@ -35,6 +38,9 @@ test('blind peer overrides are normalised', () => {
 
 test('blind peer negative values fall back to defaults', () => {
   const config = loadConfig({
+    registration: {
+      relayGcAfterMs: 0
+    },
     blindPeer: {
       enabled: true,
       maxBytes: -5,

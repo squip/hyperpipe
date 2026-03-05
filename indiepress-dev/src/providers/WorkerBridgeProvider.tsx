@@ -18,7 +18,6 @@ import {
   RelayEntry
 } from '@/services/electron-ipc.service'
 import { isElectron } from '@/lib/platform'
-import { readJoinGatewayModeForTesting } from '@/lib/join-gateway-mode'
 import { useNostr } from '@/providers/NostrProvider'
 
 type WorkerStatusPhase =
@@ -138,6 +137,9 @@ type RelayCreateRequest = {
   isOpen?: boolean
   fileSharing?: boolean
   picture?: string
+  gatewayOrigin?: string | null
+  gatewayId?: string | null
+  directJoinOnly?: boolean
 }
 
 type RelayBootstrapPublishStatus = {
@@ -230,7 +232,9 @@ type WorkerBridgeContextValue = {
       token?: string
       relayKey?: string | null
       relayUrl?: string | null
-      gatewayMode?: 'auto' | 'disabled'
+      gatewayOrigin?: string | null
+      gatewayId?: string | null
+      directJoinOnly?: boolean
       discoveryTopic?: string | null
       hostPeerKeys?: string[]
       leaseReplicaPeerKeys?: string[]
@@ -635,7 +639,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         token?: string
         relayKey?: string | null
         relayUrl?: string | null
-        gatewayMode?: 'auto' | 'disabled'
+        gatewayOrigin?: string | null
+        gatewayId?: string | null
+        directJoinOnly?: boolean
         discoveryTopic?: string | null
         hostPeerKeys?: string[]
         leaseReplicaPeerKeys?: string[]
@@ -682,20 +688,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         await startWorkerInternal({ resetRestartAttempts: false })
       }
 
-      const requestedGatewayMode = opts?.gatewayMode === 'disabled' ? 'disabled' : 'auto'
-      const gatewayModeOverride =
-        process.env.NODE_ENV === 'development'
-          ? readJoinGatewayModeForTesting()
-          : null
-      const gatewayMode = gatewayModeOverride || requestedGatewayMode
-      if (gatewayModeOverride && gatewayModeOverride !== requestedGatewayMode) {
-        console.info('[WorkerBridge] Applying test join gateway mode override', {
-          publicIdentifier: identifier,
-          requestedGatewayMode,
-          gatewayModeOverride
-        })
-      }
-      if (gatewayMode === 'auto') {
+      const directJoinOnly = opts?.directJoinOnly === true
+      if (!directJoinOnly) {
         if (!gatewayStatus?.running) {
           await electronIpc.sendToWorker({ type: 'start-gateway', options: {} }).catch(() => {})
         }
@@ -705,7 +699,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       const fileSharing = opts?.fileSharing !== false
 
       let hostPeers: string[] | undefined
-      if (gatewayMode === 'auto') {
+      if (!directJoinOnly) {
         try {
           const peerRelayMap = gatewayStatus?.peerRelayMap
           const entry =
@@ -731,6 +725,9 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         token: opts?.token,
         relayKey: opts?.relayKey || undefined,
         relayUrl: opts?.relayUrl || undefined,
+        gatewayOrigin: opts?.gatewayOrigin || undefined,
+        gatewayId: opts?.gatewayId || undefined,
+        directJoinOnly,
         blindPeer: opts?.blindPeer,
         cores: opts?.cores,
         writerCore: opts?.writerCore,
@@ -738,7 +735,6 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         autobaseLocal: opts?.autobaseLocal,
         writerSecret: opts?.writerSecret,
         fastForward: opts?.fastForward || undefined,
-        gatewayMode,
         discoveryTopic: opts?.discoveryTopic || undefined,
         leaseReplicaPeerKeys: Array.isArray(opts?.leaseReplicaPeerKeys)
           ? opts.leaseReplicaPeerKeys

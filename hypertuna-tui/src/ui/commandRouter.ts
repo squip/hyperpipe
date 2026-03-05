@@ -24,6 +24,9 @@ type GeneratedAccount = {
 type SelectedGroupRef = {
   id: string
   relay?: string | null
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
 }
 
 type SelectedGroupInviteRef = {
@@ -32,6 +35,9 @@ type SelectedGroupInviteRef = {
   groupId: string
   relay?: string | null
   token?: string | null
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
 }
 
 type SelectedChatInviteRef = {
@@ -103,6 +109,9 @@ export interface CommandController {
     isOpen?: boolean
     fileSharing?: boolean
     picture?: string
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
   }): Promise<Record<string, unknown>>
   joinRelay(input: {
     relayKey?: string
@@ -110,6 +119,9 @@ export interface CommandController {
     relayUrl?: string
     authToken?: string
     fileSharing?: boolean
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
   }): Promise<Record<string, unknown>>
   disconnectRelay(relayKey: string, publicIdentifier?: string): Promise<void>
   leaveGroup(input: {
@@ -125,7 +137,9 @@ export interface CommandController {
     token?: string
     relayKey?: string
     relayUrl?: string
-    gatewayMode?: 'auto' | 'disabled'
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
     discoveryTopic?: string | null
     hostPeerKeys?: string[]
     leaseReplicaPeerKeys?: string[]
@@ -186,8 +200,7 @@ export interface CommandController {
     token: string
   }): Promise<void>
   acceptGroupInvite(
-    inviteId: string,
-    options?: { gatewayMode?: 'auto' | 'disabled' }
+    inviteId: string
   ): Promise<void>
   dismissGroupInvite(inviteId: string): Promise<void>
   setGroupViewTab(tab: 'discover' | 'my'): Promise<void>
@@ -317,26 +330,6 @@ function looksLikeGroupIdentifier(value: string): boolean {
   if (normalized.includes(':')) return true
   if (normalized.startsWith('npub')) return true
   return isHex64(normalized)
-}
-
-function parseGatewayModeFlag(args: string[]): 'auto' | 'disabled' | undefined {
-  const inline = args
-    .find((arg) => arg.startsWith('--gateway-mode='))
-    ?.split('=')
-    ?.slice(1)
-    ?.join('=')
-    ?.trim()
-    ?.toLowerCase()
-  if (inline) {
-    if (inline === 'auto' || inline === 'disabled') return inline
-    throw new Error('Invalid --gateway-mode value (expected auto|disabled)')
-  }
-
-  const index = args.indexOf('--gateway-mode')
-  if (index < 0) return undefined
-  const value = String(args[index + 1] || '').trim().toLowerCase()
-  if (value === 'auto' || value === 'disabled') return value
-  throw new Error('Missing or invalid --gateway-mode value (expected auto|disabled)')
 }
 
 const NAV_ALIASES: Record<string, NavNodeId> = {
@@ -660,7 +653,7 @@ export async function executeCommand(
   if (cmd === 'help') {
     return {
       message:
-        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | relay refresh/create/join/disconnect/leave | group tab/refresh/invites/members/search/sort/filter/join-flow/request-invite/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept/dismiss | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/invite/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot | join flags: --gateway-mode auto|disabled'
+        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | relay refresh/create/join/disconnect/leave | group tab/refresh/invites/members/search/sort/filter/join-flow/request-invite/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept/dismiss | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/invite/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot'
     }
   }
 
@@ -908,15 +901,24 @@ export async function executeCommand(
 
     if (action === 'join-flow') {
       let publicIdentifier = args[2] && !args[2].startsWith('--') ? args[2] : undefined
-      const token = args[3] && !args[3].startsWith('--') ? args[3] : undefined
-      const gatewayMode = parseGatewayModeFlag(args)
+      let token = args[3] && !args[3].startsWith('--') ? args[3] : undefined
+      let gatewayOrigin: string | null | undefined
+      let gatewayId: string | null | undefined
+      let directJoinOnly: boolean | undefined
       if (!publicIdentifier) {
         const selectedGroup = resolveSelectedGroup(context)
         const selectedGroupInvite = resolveSelectedInvite(context)
         if (selectedGroup?.id) {
           publicIdentifier = selectedGroup.id
+          gatewayOrigin = selectedGroup.gatewayOrigin
+          gatewayId = selectedGroup.gatewayId
+          directJoinOnly = selectedGroup.directJoinOnly === true
         } else if (selectedGroupInvite?.kind === 'group') {
           publicIdentifier = selectedGroupInvite.groupId
+          token = token || selectedGroupInvite.token || undefined
+          gatewayOrigin = selectedGroupInvite.gatewayOrigin
+          gatewayId = selectedGroupInvite.gatewayId
+          directJoinOnly = selectedGroupInvite.directJoinOnly === true
         }
       }
       publicIdentifier = requireArg(publicIdentifier, 'publicIdentifier')
@@ -924,7 +926,9 @@ export async function executeCommand(
         publicIdentifier,
         token,
         openJoin: args.includes('--open'),
-        gatewayMode
+        gatewayOrigin,
+        gatewayId,
+        directJoinOnly
       })
       return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }
@@ -1047,9 +1051,11 @@ export async function executeCommand(
       const selectedGroup = resolveSelectedGroup(context)
       const selectedGroupInvite = resolveSelectedInvite(context)
       const candidate = args[2] && !args[2].startsWith('--') ? args[2] : undefined
-      const gatewayMode = parseGatewayModeFlag(args)
       let publicIdentifier: string | undefined
       let token: string | undefined
+      let gatewayOrigin: string | null | undefined
+      let gatewayId: string | null | undefined
+      let directJoinOnly: boolean | undefined
 
       if (candidate && looksLikeGroupIdentifier(candidate)) {
         publicIdentifier = candidate
@@ -1058,6 +1064,17 @@ export async function executeCommand(
         publicIdentifier = selectedGroup?.id
           || (selectedGroupInvite?.kind === 'group' ? selectedGroupInvite.groupId : undefined)
         if (candidate && !candidate.startsWith('--')) token = candidate
+        if (selectedGroup?.id) {
+          gatewayOrigin = selectedGroup.gatewayOrigin
+          gatewayId = selectedGroup.gatewayId
+          directJoinOnly = selectedGroup.directJoinOnly === true
+        }
+        if (selectedGroupInvite?.kind === 'group') {
+          token = token || selectedGroupInvite.token || undefined
+          gatewayOrigin = selectedGroupInvite.gatewayOrigin
+          gatewayId = selectedGroupInvite.gatewayId
+          directJoinOnly = selectedGroupInvite.directJoinOnly === true
+        }
       }
 
       publicIdentifier = requireArg(publicIdentifier, 'publicIdentifier')
@@ -1066,7 +1083,9 @@ export async function executeCommand(
         publicIdentifier,
         token,
         openJoin: args.includes('--open'),
-        gatewayMode
+        gatewayOrigin,
+        gatewayId,
+        directJoinOnly
       })
       return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }
@@ -1138,13 +1157,12 @@ export async function executeCommand(
 
     if (action === 'invite-accept' || action === 'accept-invite') {
       let inviteId = args[2] && !args[2].startsWith('--') ? args[2] : undefined
-      const gatewayMode = parseGatewayModeFlag(args)
       if (!inviteId) {
         const selectedInvite = resolveSelectedInvite(context)
         if (selectedInvite?.kind === 'group') inviteId = selectedInvite.id
       }
       inviteId = requireArg(inviteId, 'inviteId')
-      await controller.acceptGroupInvite(inviteId, gatewayMode ? { gatewayMode } : undefined)
+      await controller.acceptGroupInvite(inviteId)
       return { message: `Group invite accepted ${inviteId}`, gotoNode: 'invites:group' }
     }
 
@@ -1255,7 +1273,6 @@ export async function executeCommand(
 
   if (cmd === 'invites') {
     const action = requireArg(args[1], 'invites action').toLowerCase()
-    const gatewayMode = parseGatewayModeFlag(args)
     if (action === 'refresh') {
       await Promise.all([controller.refreshInvites(), controller.refreshChats()])
       return { message: 'Invites refreshed', gotoNode: 'invites:group' }
@@ -1280,7 +1297,7 @@ export async function executeCommand(
     if (action === 'accept') {
       if (target === 'group') {
         const id = requireArg(resolveGroupInviteId(), 'inviteId')
-        await controller.acceptGroupInvite(id, gatewayMode ? { gatewayMode } : undefined)
+        await controller.acceptGroupInvite(id)
         return { message: `Accepted group invite ${id}`, gotoNode: 'invites:group' }
       }
       if (target === 'chat') {

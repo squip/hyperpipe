@@ -30,13 +30,6 @@ import GroupFilesList from '@/components/GroupFilesList'
 import { BIG_RELAY_URLS } from '@/constants'
 import { buildPrivateGroupLeaveShadowRef, parseGroupIdentifier } from '@/lib/groups'
 import { getBaseRelayUrl } from '@/lib/hypertuna-group-events'
-import {
-  JOIN_GATEWAY_MODE_TEST_OVERRIDE_KEY,
-  isJoinGatewayModeTestToggleVisible,
-  readJoinGatewayModeForTesting,
-  TJoinGatewayMode,
-  writeJoinGatewayModeForTesting
-} from '@/lib/join-gateway-mode'
 import client from '@/services/client.service'
 import relayMembershipService from '@/services/relay-membership.service'
 import { useSecondaryPage } from '@/PageManager'
@@ -73,6 +66,9 @@ import { registerClosedJoinSimulator } from '@/devtools/closedJoinSimulator'
 
 type TJoinFlowHintFields = {
   discoveryTopic?: string | null
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
   writerIssuerPubkey?: string | null
@@ -479,9 +475,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   } | null>(null)
   const [joinRelayRefreshNonce, setJoinRelayRefreshNonce] = useState(0)
   const [closedJoinRequestPending, setClosedJoinRequestPending] = useState(false)
-  const [joinGatewayModeForTests, setJoinGatewayModeForTests] = useState<TJoinGatewayMode>(
-    () => readJoinGatewayModeForTesting()
-  )
   const { profiles: inviteProfiles, isFetching: isSearchingInvites } = useSearchProfiles(
     inviteSearch,
     8
@@ -508,30 +501,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const lastWritableRefreshKeyRef = useRef<string | null>(null)
   const hydrateCursorResetKeyRef = useRef<string | null>(null)
   const relaySubscriptionRefreshThrottleRef = useRef<Map<string, number>>(new Map())
-
-  useEffect(() => {
-    if (!isJoinGatewayModeTestToggleVisible()) return
-    const onStorage = (event: StorageEvent) => {
-      if (event.key === null || event.key === JOIN_GATEWAY_MODE_TEST_OVERRIDE_KEY) {
-        setJoinGatewayModeForTests(readJoinGatewayModeForTesting())
-      }
-    }
-    window.addEventListener('storage', onStorage)
-    return () => {
-      window.removeEventListener('storage', onStorage)
-    }
-  }, [])
-
-  const toggleJoinGatewayModeForTests = React.useCallback(() => {
-    const next: TJoinGatewayMode = joinGatewayModeForTests === 'disabled' ? 'auto' : 'disabled'
-    writeJoinGatewayModeForTesting(next)
-    setJoinGatewayModeForTests(next)
-    toast.message(
-      next === 'disabled'
-        ? 'Join gateway mode: disabled (test override)'
-        : 'Join gateway mode: auto (default)'
-    )
-  }, [joinGatewayModeForTests])
 
   const requestRelaySubscriptionRefresh = React.useCallback(
     ({
@@ -1214,7 +1183,21 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           token: inviteToken,
           relayKey,
           relayUrl: relayUrlForJoin,
-          gatewayMode: joinGatewayModeForTests,
+          gatewayId:
+            inviteHints.gatewayId
+            || inviteData?.gatewayId
+            || metadataHints.gatewayId
+            || undefined,
+          gatewayOrigin:
+            inviteHints.gatewayOrigin
+            || inviteData?.gatewayOrigin
+            || metadataHints.gatewayOrigin
+            || undefined,
+          directJoinOnly:
+            inviteHints.directJoinOnly === true
+            || inviteData?.directJoinOnly === true
+            || metadataHints.directJoinOnly === true
+            || undefined,
           discoveryTopic,
           hostPeerKeys: mergedHostPeerKeys.length ? mergedHostPeerKeys : undefined,
           leaseReplicaPeerKeys: mergedLeaseReplicaPeerKeys.length ? mergedLeaseReplicaPeerKeys : undefined,
@@ -2202,20 +2185,6 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                 <div className="text-xs text-muted-foreground">
                   Hypertuna join flow: <span className="capitalize">{joinFlow.phase}</span>
                   {joinFlow.error ? ` — ${joinFlow.error}` : ''}
-                </div>
-              )}
-              {isJoinGatewayModeTestToggleVisible() && (
-                <div className="flex items-center justify-between rounded-md border border-dashed px-2 py-1 text-xs text-muted-foreground">
-                  <span>Test join gateway mode</span>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-7 px-2 text-xs"
-                    onClick={toggleJoinGatewayModeForTests}
-                  >
-                    {joinGatewayModeForTests === 'disabled' ? 'disabled' : 'auto'}
-                  </Button>
                 </div>
               )}
             </CardContent>

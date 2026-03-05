@@ -109,6 +109,13 @@ import {
   upsertRelayDiscoveryHints
 } from './relay-discovery-store.mjs'
 import {
+  configureRelayGatewayMapStore,
+  getRelayGatewayRoute,
+  pruneRelayGatewayMapStore,
+  removeRelayGatewayRoute,
+  upsertRelayGatewayRoute
+} from './relay-gateway-map-store.mjs'
+import {
   configureRelayLeaseReplicaStore,
   pruneRelayLeaseReplicaStore,
   upsertRelayLeaseEnvelope
@@ -267,6 +274,7 @@ global.userConfig = {
 configureRelayCoreRefsStore({ storageBase: defaultStorageDir, logger: console })
 configureRelayWriterPoolStore({ storageBase: defaultStorageDir, logger: console })
 configureRelayDiscoveryStore({ storageBase: defaultStorageDir, logger: console })
+configureRelayGatewayMapStore({ storageBase: defaultStorageDir, logger: console })
 configureRelayLeaseReplicaStore({ storageBase: defaultStorageDir, logger: console })
 
 const relayMirrorSubscriptions = new Map()
@@ -1262,6 +1270,125 @@ function collectPublicGatewayOrigins() {
   return Array.from(origins)
 }
 
+function normalizeGatewayId(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim().toLowerCase()
+  return trimmed.length ? trimmed : null
+}
+
+function normalizeGatewayRouteInput(data = {}) {
+  if (!data || typeof data !== 'object') {
+    return {
+      hasExplicitRoute: false,
+      gatewayOrigin: null,
+      gatewayId: null,
+      directJoinOnly: false
+    }
+  }
+  const gatewayOrigin = normalizeHttpOrigin(
+    data.gatewayOrigin
+    || data.publicGatewayOrigin
+    || data.assignedGatewayOrigin
+    || data.gatewayBaseUrl
+    || null
+  )
+  const gatewayId = normalizeGatewayId(data.gatewayId || data.assignedGatewayId || null)
+  const directJoinOnly = data.directJoinOnly === true || data.gatewayDirectJoinOnly === true
+  return {
+    hasExplicitRoute: Boolean(gatewayOrigin || gatewayId || directJoinOnly),
+    gatewayOrigin,
+    gatewayId,
+    directJoinOnly
+  }
+}
+
+function normalizeRelayIdentifierForRoute(relayIdentifier) {
+  const relayKey = normalizeRelayKeyHex(relayIdentifier) || null
+  const publicIdentifier =
+    relayKey
+      ? null
+      : (typeof relayIdentifier === 'string' && relayIdentifier.trim()
+        ? relayIdentifier.trim()
+        : null)
+  return { relayKey, publicIdentifier }
+}
+
+async function resolveRelayGatewayRouting({
+  relayIdentifier = null,
+  relayKey = null,
+  publicIdentifier = null,
+  origins = null,
+  allowFallback = false
+} = {}) {
+  const explicitOrigins = Array.from(
+    new Set(
+      (Array.isArray(origins) ? origins : [])
+        .map((origin) => normalizeHttpOrigin(origin))
+        .filter(Boolean)
+    )
+  )
+  if (explicitOrigins.length) {
+    return {
+      origins: explicitOrigins,
+      directJoinOnly: false,
+      route: null,
+      source: 'explicit'
+    }
+  }
+
+  let normalizedRelayKey = normalizeRelayKeyHex(relayKey)
+  let normalizedPublicIdentifier =
+    typeof publicIdentifier === 'string' && publicIdentifier.trim()
+      ? publicIdentifier.trim()
+      : null
+
+  if ((!normalizedRelayKey && !normalizedPublicIdentifier) && relayIdentifier) {
+    const normalized = normalizeRelayIdentifierForRoute(relayIdentifier)
+    normalizedRelayKey = normalized.relayKey
+    normalizedPublicIdentifier = normalized.publicIdentifier
+  }
+
+  const route = await getRelayGatewayRoute({
+    relayKey: normalizedRelayKey || null,
+    publicIdentifier: normalizedPublicIdentifier || null
+  }).catch(() => null)
+
+  if (route?.directJoinOnly) {
+    return {
+      origins: [],
+      directJoinOnly: true,
+      route,
+      source: 'route'
+    }
+  }
+
+  const mappedOrigin = normalizeHttpOrigin(route?.gatewayOrigin || null)
+  if (mappedOrigin) {
+    return {
+      origins: [mappedOrigin],
+      directJoinOnly: false,
+      route,
+      source: 'route'
+    }
+  }
+
+  if (allowFallback) {
+    return {
+      origins: collectPublicGatewayOrigins(),
+      directJoinOnly: false,
+      route: null,
+      source: 'fallback'
+    }
+  }
+
+  return {
+    origins: [],
+    directJoinOnly: false,
+    route: route || null,
+    source: 'unassigned'
+  }
+}
+
 async function ensureConversationFileIndex(storageRoot = null) {
   if (conversationFileIndex) return conversationFileIndex
   const basePath =
@@ -2163,7 +2290,23 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
     return { status: 'skipped', reason: 'nostr-pubkey-derivation-failed' }
   }
 
-  const originList = Array.isArray(origins) && origins.length ? origins : collectPublicGatewayOrigins()
+  const routing = await resolveRelayGatewayRouting({
+    relayIdentifier,
+    origins,
+    allowFallback: false
+  })
+  if (routing.directJoinOnly) {
+    return { status: 'skipped', reason: 'direct-join-only' }
+  }
+  const originList = routing.origins
+  if (!originList.length) {
+    return {
+      status: 'error',
+      reason: 'gateway-unassigned',
+      errorCode: 'gateway-unassigned',
+      error: 'No relay-scoped gateway mapping found'
+    }
+  }
   const encodedRelay = encodeURIComponent(relayIdentifier)
   let lastError = null
 
@@ -2341,7 +2484,24 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
     return { status: 'skipped', reason: 'fetch-unavailable' }
   }
 
-  const originList = Array.isArray(origins) && origins.length ? origins : collectPublicGatewayOrigins()
+  const routing = await resolveRelayGatewayRouting({
+    relayIdentifier,
+    origins,
+    allowFallback: false
+  })
+  if (routing.directJoinOnly) {
+    return { status: 'skipped', reason: 'direct-join-only' }
+  }
+  const originList = routing.origins
+  if (!originList.length) {
+    return {
+      status: 'error',
+      reason: 'gateway-unassigned',
+      errorCode: 'gateway-unassigned',
+      statusCode: null,
+      error: 'No relay-scoped gateway mapping found'
+    }
+  }
   console.log('[Worker] Open join bootstrap start', {
     relayIdentifier,
     relayIdentifierType: describeRelayIdentifierType(relayIdentifier),
@@ -2560,7 +2720,24 @@ async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mi
     return { status: 'skipped', reason: 'fetch-unavailable' }
   }
 
-  const originList = Array.isArray(origins) && origins.length ? origins : collectPublicGatewayOrigins()
+  const routing = await resolveRelayGatewayRouting({
+    relayIdentifier: relayKey,
+    relayKey,
+    origins,
+    allowFallback: false
+  })
+  if (routing.directJoinOnly) {
+    return { status: 'skipped', reason: 'direct-join-only' }
+  }
+  const originList = routing.origins
+  if (!originList.length) {
+    return {
+      status: 'error',
+      reason: 'gateway-unassigned',
+      errorCode: 'gateway-unassigned',
+      error: new Error('No relay-scoped gateway mapping found')
+    }
+  }
   const encodedRelay = encodeURIComponent(relayKey)
   let lastError = null
 
@@ -2626,7 +2803,23 @@ async function fetchAndApplyRelayMirrorMetadata({
     return { status: 'skipped', reason: 'missing-relay-key' }
   }
   await ensurePublicGatewaySettingsLoaded()
-  const originList = Array.isArray(origins) && origins.length ? origins : collectPublicGatewayOrigins()
+  const routing = await resolveRelayGatewayRouting({
+    relayIdentifier: relayKey || publicIdentifier || null,
+    relayKey,
+    publicIdentifier,
+    origins,
+    allowFallback: false
+  })
+  if (!routing.origins.length) {
+    return {
+      status: 'error',
+      reason: routing.directJoinOnly ? 'direct-join-only' : 'gateway-unassigned',
+      error: routing.directJoinOnly
+        ? null
+        : 'No relay-scoped gateway mapping found'
+    }
+  }
+  const originList = routing.origins
   const mirrorResult = await fetchRelayMirrorMetadata(relayKey, { origins: originList, reason })
   if (mirrorResult.status !== 'ok') {
     return {
@@ -2788,7 +2981,6 @@ async function refreshRelayMirrorMetadata(reason = 'periodic') {
     await ensurePublicGatewaySettingsLoaded()
     const startedAt = Date.now()
     lastMirrorMetadataRefreshAt = startedAt
-    const originList = collectPublicGatewayOrigins()
 
     try {
       await refreshGatewayRelayRegistry(`${reason}-mirror-registry`)
@@ -2815,7 +3007,7 @@ async function refreshRelayMirrorMetadata(reason = 'periodic') {
 
     for (const relayKey of relayKeys) {
       const publicIdentifier = keyToPublic.get(relayKey) || null
-      const mirrorResult = await fetchRelayMirrorMetadata(relayKey, { origins: originList, reason })
+      const mirrorResult = await fetchRelayMirrorMetadata(relayKey, { reason })
       if (mirrorResult.status !== 'ok') {
         summary.failed += 1
         continue
@@ -5596,7 +5788,15 @@ async function handleMessageObject(message) {
 	          console.warn('[Worker] upload-file: could not resolve relayKey for identifier', identifier)
 	        }
 	        const localUrl = buildLocalDriveFileUrl(localRelayBaseUrl, identifier, fileId)
-	        const gatewayOrigins = isConversationScope ? [] : collectPublicGatewayOrigins()
+          const routing = isConversationScope
+            ? { origins: [], directJoinOnly: false }
+            : await resolveRelayGatewayRouting({
+              relayIdentifier: resolvedRelayKey || identifier || null,
+              relayKey: resolvedRelayKey || null,
+              publicIdentifier: /^[a-fA-F0-9]{64}$/.test(String(identifier || '')) ? null : String(identifier || ''),
+              allowFallback: false
+            })
+	        const gatewayOrigins = isConversationScope || routing.directJoinOnly ? [] : routing.origins
 	        const gatewayUrls = gatewayOrigins
 	          .map((origin) => buildLocalDriveFileUrl(origin, identifier, fileId))
 	          .filter(Boolean)
@@ -5869,7 +6069,30 @@ async function handleMessageObject(message) {
         const requestId = extractMessageRequestId(message)
       if (relayServer) {
         try {
-          const result = await relayServer.createRelay(message.data)
+          const requestData = (message && typeof message === 'object' ? message.data : null) || {}
+          const gatewayRouteInput = normalizeGatewayRouteInput(requestData)
+          const result = await relayServer.createRelay(requestData)
+          const resultRelayKey = normalizeRelayKeyHex(result?.relayKey || null)
+          const resultPublicIdentifier =
+            typeof result?.publicIdentifier === 'string' && result.publicIdentifier.trim()
+              ? result.publicIdentifier.trim()
+              : null
+          if (gatewayRouteInput.hasExplicitRoute && (resultRelayKey || resultPublicIdentifier)) {
+            await upsertRelayGatewayRoute({
+              relayKey: resultRelayKey,
+              publicIdentifier: resultPublicIdentifier,
+              gatewayOrigin: gatewayRouteInput.gatewayOrigin,
+              gatewayId: gatewayRouteInput.gatewayId,
+              directJoinOnly: gatewayRouteInput.directJoinOnly,
+              source: 'create-relay'
+            }).catch((error) => {
+              console.warn('[Worker] Failed to persist relay gateway route for create-relay', {
+                relayKey: resultRelayKey,
+                publicIdentifier: resultPublicIdentifier,
+                error: error?.message || error
+              })
+            })
+          }
           relayMembers.set(result.relayKey, result.profile?.members || [])
           await ensureRelayFolder(result.profile?.public_identifier || result.relayKey)
           await applyPendingAuthUpdates(updateRelayAuthToken, result.relayKey, result.profile?.public_identifier)
@@ -5941,7 +6164,30 @@ async function handleMessageObject(message) {
         const requestId = extractMessageRequestId(message)
       if (relayServer) {
         try {
-          const result = await relayServer.joinRelay(message.data)
+          const requestData = (message && typeof message === 'object' ? message.data : null) || {}
+          const gatewayRouteInput = normalizeGatewayRouteInput(requestData)
+          const result = await relayServer.joinRelay(requestData)
+          const resultRelayKey = normalizeRelayKeyHex(result?.relayKey || null)
+          const resultPublicIdentifier =
+            typeof result?.publicIdentifier === 'string' && result.publicIdentifier.trim()
+              ? result.publicIdentifier.trim()
+              : null
+          if (gatewayRouteInput.hasExplicitRoute && (resultRelayKey || resultPublicIdentifier)) {
+            await upsertRelayGatewayRoute({
+              relayKey: resultRelayKey,
+              publicIdentifier: resultPublicIdentifier,
+              gatewayOrigin: gatewayRouteInput.gatewayOrigin,
+              gatewayId: gatewayRouteInput.gatewayId,
+              directJoinOnly: gatewayRouteInput.directJoinOnly,
+              source: 'join-relay'
+            }).catch((error) => {
+              console.warn('[Worker] Failed to persist relay gateway route for join-relay', {
+                relayKey: resultRelayKey,
+                publicIdentifier: resultPublicIdentifier,
+                error: error?.message || error
+              })
+            })
+          }
           relayMembers.set(result.relayKey, result.profile?.members || [])
           await ensureRelayFolder(result.profile?.public_identifier || result.relayKey)
           await applyPendingAuthUpdates(updateRelayAuthToken, result.relayKey, result.profile?.public_identifier)
@@ -6170,6 +6416,10 @@ async function handleMessageObject(message) {
           })
           removeRelayMapping(resolvedRelayKey, resolvedPublicIdentifier || null)
         }
+        await removeRelayGatewayRoute({
+          relayKey: resolvedRelayKey || null,
+          publicIdentifier: resolvedPublicIdentifier || null
+        }).catch(() => {})
 
         await emitRelayUpdateSnapshot('leave-group')
 
@@ -6225,7 +6475,10 @@ async function handleMessageObject(message) {
             return remaining
           }
           const joinDirectDiscoveryV2 = isJoinDirectDiscoveryV2Enabled()
-          const gatewayMode = normalizeGatewayMode(data.gatewayMode)
+          const gatewayRouteInput = normalizeGatewayRouteInput(data)
+          let gatewayMode = gatewayRouteInput.directJoinOnly ? 'disabled' : 'auto'
+          let assignedGatewayOrigin = gatewayRouteInput.gatewayOrigin || null
+          let assignedGatewayId = gatewayRouteInput.gatewayId || null
           const explicitHostPeers = normalizePeerKeyList([
             ...(Array.isArray(data.hostPeers) ? data.hostPeers : []),
             ...(Array.isArray(data.hostPeerKeys) ? data.hostPeerKeys : [])
@@ -6256,6 +6509,33 @@ async function handleMessageObject(message) {
             null
           let autobaseLocal = data.autobaseLocal || data.autobase_local || null
           let fastForward = data.fastForward || data.fast_forward || null
+          if (gatewayRouteInput.hasExplicitRoute && (joinRelayKey || publicIdentifier)) {
+            await upsertRelayGatewayRoute({
+              relayKey: joinRelayKey || null,
+              publicIdentifier: publicIdentifier || null,
+              gatewayOrigin: gatewayRouteInput.gatewayOrigin,
+              gatewayId: gatewayRouteInput.gatewayId,
+              directJoinOnly: gatewayRouteInput.directJoinOnly,
+              source: 'join-flow-input'
+            }).catch(() => {})
+          }
+          const storedGatewayRoute = await getRelayGatewayRoute({
+            relayKey: joinRelayKey || null,
+            publicIdentifier: publicIdentifier || null
+          }).catch(() => null)
+          if (!assignedGatewayOrigin) {
+            assignedGatewayOrigin = normalizeHttpOrigin(storedGatewayRoute?.gatewayOrigin || null)
+          }
+          if (!assignedGatewayId) {
+            assignedGatewayId = normalizeGatewayId(storedGatewayRoute?.gatewayId || null)
+          }
+          if (!gatewayRouteInput.directJoinOnly && storedGatewayRoute?.directJoinOnly === true) {
+            gatewayMode = 'disabled'
+          }
+          const gatewayOrigins =
+            gatewayMode === 'disabled'
+              ? []
+              : (assignedGatewayOrigin ? [assignedGatewayOrigin] : [])
           if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
           if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
           const writerCoreKey = writerCoreHex || autobaseLocal || writerCore || null
@@ -6263,6 +6543,7 @@ async function handleMessageObject(message) {
             writerCoreRefs = mergeCoreRefLists(writerCoreRefs, [writerCoreKey])
           }
           await pruneRelayDiscoveryStore().catch(() => {})
+          await pruneRelayGatewayMapStore().catch(() => {})
           await pruneRelayLeaseReplicaStore().catch(() => {})
           if (writerLeaseEnvelope && typeof writerLeaseEnvelope === 'object') {
             if (!writerCore && typeof writerLeaseEnvelope.writerCore === 'string') {
@@ -6359,7 +6640,10 @@ async function handleMessageObject(message) {
           const gatewayBootstrapPromise = shouldStartOpenBootstrap
             ? (async () => {
               await ensurePublicGatewaySettingsLoaded()
-              return fetchOpenJoinBootstrap(relayIdentifierForGateway, { reason: 'open-join-race' })
+              return fetchOpenJoinBootstrap(relayIdentifierForGateway, {
+                origins: gatewayOrigins,
+                reason: 'open-join-race'
+              })
             })()
               .then((result) => {
                 gatewayBootstrapResult = result
@@ -6377,7 +6661,10 @@ async function handleMessageObject(message) {
           const gatewayMirrorPromise = shouldStartMirrorLookup
             ? (async () => {
               await ensurePublicGatewaySettingsLoaded()
-              return fetchRelayMirrorMetadata(relayIdentifierForGateway, { reason: 'join-flow-race' })
+              return fetchRelayMirrorMetadata(relayIdentifierForGateway, {
+                origins: gatewayOrigins,
+                reason: 'join-flow-race'
+              })
             })()
             : null
 
@@ -6442,6 +6729,8 @@ async function handleMessageObject(message) {
             openJoin,
             isOpen,
             gatewayMode,
+            gatewayOrigin: assignedGatewayOrigin,
+            gatewayId: assignedGatewayId,
             joinDirectDiscoveryV2,
             hasInviteToken: !!inviteToken,
             relayKey: previewValue(joinRelayKey, 16),
@@ -6466,6 +6755,8 @@ async function handleMessageObject(message) {
               publicIdentifier,
               relayKey: joinRelayKey || null,
               gatewayMode,
+              gatewayOrigin: assignedGatewayOrigin,
+              gatewayId: assignedGatewayId,
               hostPeersCount: hostPeers.length,
               leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
               hasDiscoveryTopic: !!discoveryTopic,
@@ -6764,14 +7055,17 @@ async function handleMessageObject(message) {
                 }
 
                 if (!bootstrapResult && !gatewayBootstrapPromise && !selectedDirectCandidate) {
-                  bootstrapResult = await withTimeout(
-                    (async () => {
-                      await ensurePublicGatewaySettingsLoaded()
-                      return fetchOpenJoinBootstrap(relayIdentifier, { reason: 'open-join' })
-                    })(),
-                    bootstrapTimeoutMs,
-                    'Open join bootstrap timeout'
-                  )
+                    bootstrapResult = await withTimeout(
+                      (async () => {
+                        await ensurePublicGatewaySettingsLoaded()
+                        return fetchOpenJoinBootstrap(relayIdentifier, {
+                          origins: gatewayOrigins,
+                          reason: 'open-join'
+                        })
+                      })(),
+                      bootstrapTimeoutMs,
+                      'Open join bootstrap timeout'
+                    )
                 }
                 if (bootstrapResult) {
                   gatewayBootstrapResult = bootstrapResult
@@ -6885,7 +7179,10 @@ async function handleMessageObject(message) {
                   : await withTimeout(
                     (async () => {
                       await ensurePublicGatewaySettingsLoaded()
-                      return fetchRelayMirrorMetadata(relayIdentifier, { reason: 'join-flow' })
+                      return fetchRelayMirrorMetadata(relayIdentifier, {
+                        origins: gatewayOrigins,
+                        reason: 'join-flow'
+                      })
                     })(),
                     Math.max(500, Math.min(BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS + 2000, getRemainingJoinBudget())),
                     'Mirror metadata timeout'
@@ -7151,6 +7448,16 @@ async function handleMessageObject(message) {
             hasFastForward: !!fastForward,
             gatewayMode
           })
+          if ((joinRelayKey || publicIdentifier) && (assignedGatewayOrigin || assignedGatewayId || gatewayMode === 'disabled')) {
+            await upsertRelayGatewayRoute({
+              relayKey: joinRelayKey || null,
+              publicIdentifier: publicIdentifier || null,
+              gatewayOrigin: assignedGatewayOrigin,
+              gatewayId: assignedGatewayId,
+              directJoinOnly: gatewayMode === 'disabled',
+              source: 'join-flow-resolved'
+            }).catch(() => {})
+          }
           const hasClosedWriterMaterial = Boolean(
             writerSecret
             || writerLeaseEnvelope?.writerSecret
@@ -7331,7 +7638,10 @@ async function handleMessageObject(message) {
                     recoveryBootstrapResult = await withTimeout(
                       (async () => {
                         await ensurePublicGatewaySettingsLoaded()
-                        return fetchOpenJoinBootstrap(relayIdentifier, { reason: 'open-join-recovery' })
+                        return fetchOpenJoinBootstrap(relayIdentifier, {
+                          origins: gatewayOrigins,
+                          reason: 'open-join-recovery'
+                        })
                       })(),
                       recoveryTimeoutMs,
                       'Open join bootstrap recovery fetch timeout'

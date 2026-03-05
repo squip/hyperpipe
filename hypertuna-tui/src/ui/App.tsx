@@ -2068,6 +2068,9 @@ export function App({
           await controller.startJoinFlow({
             publicIdentifier: group.id,
             relayUrl: group.relay || undefined,
+            gatewayOrigin: group.gatewayOrigin || undefined,
+            gatewayId: group.gatewayId || undefined,
+            directJoinOnly: group.directJoinOnly === true,
             openJoin: group.isPublic !== false && group.isOpen !== false
           })
           await Promise.all([

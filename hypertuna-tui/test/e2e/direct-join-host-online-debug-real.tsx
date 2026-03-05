@@ -453,7 +453,7 @@ async function main(): Promise<void> {
       relayUrl: discovered.relay || hostGroup.relay || undefined,
       isOpen: true,
       openJoin: true,
-      gatewayMode,
+      directJoinOnly: gatewayMode === 'disabled',
       discoveryTopic,
       hostPeerKeys,
       leaseReplicaPeerKeys,

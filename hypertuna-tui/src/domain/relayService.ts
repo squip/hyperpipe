@@ -138,7 +138,9 @@ export class RelayService implements IRelayService {
     token?: string
     relayKey?: string
     relayUrl?: string
-    gatewayMode?: 'auto' | 'disabled'
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
     discoveryTopic?: string | null
     hostPeerKeys?: string[]
     leaseReplicaPeerKeys?: string[]

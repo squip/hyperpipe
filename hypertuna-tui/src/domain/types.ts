@@ -66,6 +66,9 @@ export type GroupSummary = {
   picture?: string
   isPublic?: boolean
   isOpen?: boolean
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
   discoveryTopic?: string | null
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
@@ -83,6 +86,9 @@ export type GroupInvite = {
   id: string
   groupId: string
   relay?: string
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
   relayUrl?: string | null
   relayKey?: string | null
   groupName?: string
@@ -391,6 +397,9 @@ export interface RelayService {
     isOpen?: boolean
     fileSharing?: boolean
     picture?: string
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
   }): Promise<Record<string, unknown>>
   joinRelay(input: {
     relayKey?: string
@@ -398,6 +407,9 @@ export interface RelayService {
     relayUrl?: string
     authToken?: string
     fileSharing?: boolean
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
   }): Promise<Record<string, unknown>>
   startJoinFlow(input: {
     publicIdentifier: string
@@ -406,7 +418,9 @@ export interface RelayService {
     token?: string
     relayKey?: string
     relayUrl?: string
-    gatewayMode?: 'auto' | 'disabled'
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
     discoveryTopic?: string | null
     hostPeerKeys?: string[]
     leaseReplicaPeerKeys?: string[]

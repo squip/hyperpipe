@@ -7,13 +7,6 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
-import {
-  JOIN_GATEWAY_MODE_TEST_OVERRIDE_KEY,
-  isJoinGatewayModeTestToggleVisible,
-  readJoinGatewayModeForTesting,
-  TJoinGatewayMode,
-  writeJoinGatewayModeForTesting
-} from '@/lib/join-gateway-mode'
 import { toGroup } from '@/lib/link'
 import { usePrimaryPage, useSecondaryPage } from '@/PageManager'
 import { useFetchProfile } from '@/hooks'
@@ -65,6 +58,9 @@ type InviteRow = {
 
 type TJoinFlowHintFields = {
   discoveryTopic?: string | null
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
   writerIssuerPubkey?: string | null
@@ -237,9 +233,6 @@ const GroupsPage = forwardRef<
   const [tab, setTab] = useState<TTab>(initialTab || 'discover')
   const [search, setSearch] = useState('')
   const [showCreate, setShowCreate] = useState(false)
-  const [joinGatewayModeForTests, setJoinGatewayModeForTests] = useState<TJoinGatewayMode>(
-    () => readJoinGatewayModeForTesting()
-  )
   const [joiningInviteId, setJoiningInviteId] = useState<string | null>(null)
   const [discoverSort, setDiscoverSort] = useState<GroupSortState>({ key: 'members', direction: 'desc' })
   const [mySort, setMySort] = useState<GroupSortState>({ key: 'createdAt', direction: 'desc' })
@@ -256,30 +249,6 @@ const GroupsPage = forwardRef<
     if (!initialTab) return
     setTab(initialTab)
   }, [initialTab, tabRequestId])
-
-  useEffect(() => {
-    if (!isJoinGatewayModeTestToggleVisible()) return
-    const onStorage = (event: StorageEvent) => {
-      if (event.key === null || event.key === JOIN_GATEWAY_MODE_TEST_OVERRIDE_KEY) {
-        setJoinGatewayModeForTests(readJoinGatewayModeForTesting())
-      }
-    }
-    window.addEventListener('storage', onStorage)
-    return () => {
-      window.removeEventListener('storage', onStorage)
-    }
-  }, [])
-
-  const toggleJoinGatewayModeForTests = useCallback(() => {
-    const next: TJoinGatewayMode = joinGatewayModeForTests === 'disabled' ? 'auto' : 'disabled'
-    writeJoinGatewayModeForTesting(next)
-    setJoinGatewayModeForTests(next)
-    toast.message(
-      next === 'disabled'
-        ? 'Join gateway mode: disabled (test override)'
-        : 'Join gateway mode: auto (default)'
-    )
-  }, [joinGatewayModeForTests])
 
   const resolveGroupMeta = useCallback(
     (groupId: string, relay?: string) => {
@@ -773,7 +742,12 @@ const GroupsPage = forwardRef<
         token: inv.token,
         relayKey,
         relayUrl,
-        gatewayMode: joinGatewayModeForTests,
+        gatewayId: inviteHints.gatewayId || inv.gatewayId || undefined,
+        gatewayOrigin: inviteHints.gatewayOrigin || inv.gatewayOrigin || undefined,
+        directJoinOnly:
+          inviteHints.directJoinOnly === true
+          || inv.directJoinOnly === true
+          || undefined,
         discoveryTopic: inviteHints.discoveryTopic || undefined,
         hostPeerKeys: inviteHints.hostPeerKeys || undefined,
         leaseReplicaPeerKeys: inviteHints.leaseReplicaPeerKeys || undefined,
@@ -1280,17 +1254,6 @@ const GroupsPage = forwardRef<
             onChange={(event) => setSearch(event.target.value)}
             className="flex-1"
           />
-          {isJoinGatewayModeTestToggleVisible() && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="whitespace-nowrap"
-              onClick={toggleJoinGatewayModeForTests}
-            >
-              Join gateway: {joinGatewayModeForTests}
-            </Button>
-          )}
           <Button variant="ghost" size="icon" onClick={() => refreshDiscovery()}>
             <Loader2 className="w-4 h-4" />
           </Button>

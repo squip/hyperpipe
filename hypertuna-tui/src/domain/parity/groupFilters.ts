@@ -149,6 +149,31 @@ export function parseGroupInviteWithPayload(args: {
       : typeof payload.relay_key === 'string'
         ? payload.relay_key
         : null
+  const gatewayId =
+    typeof payload.gatewayId === 'string'
+      ? payload.gatewayId.trim().toLowerCase()
+      : typeof payload.gateway_id === 'string'
+        ? payload.gateway_id.trim().toLowerCase()
+        : parsed.gatewayId || null
+  const normalizeHttpOrigin = (value: unknown): string | null => {
+    if (typeof value !== 'string' || !value.trim()) return null
+    try {
+      const parsed = new URL(value.trim())
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+      return parsed.origin
+    } catch {
+      return null
+    }
+  }
+  const gatewayOrigin =
+    normalizeHttpOrigin(payload.gatewayOrigin)
+    || normalizeHttpOrigin(payload.gateway_origin)
+    || parsed.gatewayOrigin
+    || null
+  const directJoinOnly =
+    payload.directJoinOnly === true
+    || payload.gatewayDirectJoinOnly === true
+    || parsed.directJoinOnly === true
   const token = typeof payload.token === 'string' ? payload.token : undefined
   const fileSharing = typeof payload.fileSharing === 'boolean' ? payload.fileSharing : parsed.fileSharing
   const isPublic = typeof payload.isPublic === 'boolean' ? payload.isPublic : parsed.isPublic
@@ -273,6 +298,9 @@ export function parseGroupInviteWithPayload(args: {
     relay,
     relayUrl: relayUrl || null,
     relayKey,
+    gatewayId,
+    gatewayOrigin,
+    directJoinOnly,
     groupName,
     groupPicture,
     name: groupName,

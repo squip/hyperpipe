@@ -15,6 +15,9 @@ export type TGroupMetadata = {
   isPublic?: boolean
   isOpen?: boolean
   discoveryTopic?: string | null
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
   writerIssuerPubkey?: string | null
@@ -42,6 +45,9 @@ export type TGroupRoles = {
 export type TGroupInvite = {
   groupId: string
   relay?: string
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
   groupName?: string
   groupPicture?: string
   name?: string

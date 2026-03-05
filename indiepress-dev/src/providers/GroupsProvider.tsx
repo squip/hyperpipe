@@ -17,6 +17,9 @@ import {
   buildHypertunaDiscoveryDraftEvents,
   getBaseRelayUrl,
   HYPERTUNA_IDENTIFIER_TAG,
+  HYPERTUNA_GATEWAY_ID_TAG,
+  HYPERTUNA_GATEWAY_ORIGIN_TAG,
+  HYPERTUNA_DIRECT_JOIN_ONLY_TAG,
   isHypertunaTaggedEvent,
   KIND_HYPERTUNA_RELAY,
   parseHypertunaRelayEvent30166
@@ -117,6 +120,9 @@ export type LeaveGroupResult = {
 
 type TGroupMetadataDiscoveryHints = {
   discoveryTopic?: string | null
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
   writerIssuerPubkey?: string | null
@@ -251,6 +257,9 @@ type TGroupsContext = {
     isOpen: boolean
     picture?: string
     fileSharing?: boolean
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
   }) => Promise<{ groupId: string; relay: string }>
 }
 
@@ -349,6 +358,9 @@ const createProvisionalGroupMetadata = (args: {
   picture?: string | null
   isPublic?: boolean
   isOpen?: boolean
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
   createdAt?: number
 }): TGroupMetadata | null => {
   const groupId = String(args.groupId || '').trim()
@@ -377,6 +389,11 @@ const createProvisionalGroupMetadata = (args: {
   if (picture) tags.push(['picture', picture])
   if (typeof args.isPublic === 'boolean') tags.push([args.isPublic ? 'public' : 'private'])
   if (typeof args.isOpen === 'boolean') tags.push([args.isOpen ? 'open' : 'closed'])
+  const gatewayId = typeof args.gatewayId === 'string' ? args.gatewayId.trim().toLowerCase() : ''
+  const gatewayOrigin = normalizeHttpOrigin(args.gatewayOrigin || null)
+  if (gatewayId) tags.push([HYPERTUNA_GATEWAY_ID_TAG, gatewayId])
+  if (gatewayOrigin) tags.push([HYPERTUNA_GATEWAY_ORIGIN_TAG, gatewayOrigin])
+  if (args.directJoinOnly === true) tags.push([HYPERTUNA_DIRECT_JOIN_ONLY_TAG, '1'])
   const event = {
     id: `provisional:${groupId}:${createdAt}`,
     pubkey: '',
@@ -394,6 +411,9 @@ const createProvisionalGroupMetadata = (args: {
     picture: picture || undefined,
     isPublic: typeof args.isPublic === 'boolean' ? args.isPublic : undefined,
     isOpen: typeof args.isOpen === 'boolean' ? args.isOpen : undefined,
+    gatewayId: gatewayId || null,
+    gatewayOrigin,
+    directJoinOnly: args.directJoinOnly === true,
     tags: [],
     event
   }
@@ -437,6 +457,17 @@ const isLoopbackRelayUrl = (relayUrl?: string | null): boolean => {
   }
 }
 
+const normalizeHttpOrigin = (value?: string | null): string | null => {
+  if (typeof value !== 'string' || !value.trim()) return null
+  try {
+    const parsed = new URL(value.trim())
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    return parsed.origin
+  } catch (_err) {
+    return null
+  }
+}
+
 const areSameMemberLists = (left: string[], right: string[]) =>
   left.length === right.length && left.every((value, idx) => value === right[idx])
 
@@ -457,6 +488,9 @@ const buildInvitePayload = (args: {
   token: string
   relayUrl: string | null
   relayKey?: string | null
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
   discoveryTopic?: string | null
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
@@ -483,6 +517,9 @@ const buildInvitePayload = (args: {
   relayUrl: args.relayUrl,
   token: args.token,
   relayKey: args.relayKey ?? null,
+  gatewayId: args.gatewayId ?? null,
+  gatewayOrigin: args.gatewayOrigin ?? null,
+  directJoinOnly: args.directJoinOnly === true,
   isPublic: args.meta?.isPublic !== false,
   groupName: args.groupName || args.meta?.name,
   groupPicture: args.groupPicture || args.meta?.picture || null,
@@ -507,6 +544,9 @@ const buildInvitePayload = (args: {
 const buildOpenInvitePayload = (args: {
   relayUrl: string | null
   relayKey?: string | null
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
   discoveryTopic?: string | null
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
@@ -517,6 +557,9 @@ const buildOpenInvitePayload = (args: {
 }) => ({
   relayUrl: args.relayUrl,
   relayKey: args.relayKey ?? null,
+  gatewayId: args.gatewayId ?? null,
+  gatewayOrigin: args.gatewayOrigin ?? null,
+  directJoinOnly: args.directJoinOnly === true,
   discoveryTopic: args.discoveryTopic || null,
   hostPeerKeys: normalizePubkeyList(args.hostPeerKeys || []),
   leaseReplicaPeerKeys: normalizePubkeyList(args.leaseReplicaPeerKeys || []),
@@ -736,6 +779,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       picture?: string | null
       isPublic?: boolean
       isOpen?: boolean
+      gatewayId?: string | null
+      gatewayOrigin?: string | null
+      directJoinOnly?: boolean
       createdAt?: number
       source: ProvisionalGroupMetadataEntry['source']
     }) => {
@@ -754,6 +800,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         picture: args.picture,
         isPublic: args.isPublic,
         isOpen: args.isOpen,
+        gatewayId: args.gatewayId,
+        gatewayOrigin: args.gatewayOrigin,
+        directJoinOnly: args.directJoinOnly,
         createdAt: args.createdAt
       })
       if (!metadata) return
@@ -779,7 +828,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             (current.metadata.about || '') === (metadata.about || '') &&
             (current.metadata.picture || '') === (metadata.picture || '') &&
             current.metadata.isPublic === metadata.isPublic &&
-            current.metadata.isOpen === metadata.isOpen
+            current.metadata.isOpen === metadata.isOpen &&
+            (current.metadata.gatewayId || null) === (metadata.gatewayId || null) &&
+            (current.metadata.gatewayOrigin || null) === (metadata.gatewayOrigin || null) &&
+            current.metadata.directJoinOnly === metadata.directJoinOnly
           ) {
             return
           }
@@ -1131,6 +1183,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             picture: matchedInvite.groupPicture,
             isPublic: matchedInvite.isPublic,
             isOpen: matchedInvite.fileSharing,
+            gatewayId: matchedInvite.gatewayId,
+            gatewayOrigin: matchedInvite.gatewayOrigin,
+            directJoinOnly: matchedInvite.directJoinOnly,
             createdAt: matchedInvite.event?.created_at,
             source: 'invite'
           })
@@ -1176,6 +1231,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let token: string | undefined
             let relayUrl: string | null | undefined
             let relayKey: string | null | undefined
+            let gatewayId: string | null | undefined = invite.gatewayId || null
+            let gatewayOrigin: string | null | undefined = invite.gatewayOrigin || null
+            let directJoinOnly: boolean | undefined = invite.directJoinOnly === true
             let groupName: string | undefined = invite.groupName || invite.name
             let groupPicture: string | undefined = invite.groupPicture
             let authorizedMemberPubkeys: string[] | undefined
@@ -1207,6 +1265,20 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 token = typeof payload.token === 'string' ? payload.token : undefined
                 relayUrl = typeof payload.relayUrl === 'string' ? payload.relayUrl : null
                 relayKey = typeof payload.relayKey === 'string' ? payload.relayKey : null
+                if (typeof payload.gatewayId === 'string') {
+                  gatewayId = payload.gatewayId.trim().toLowerCase() || null
+                } else if (typeof payload.gateway_id === 'string') {
+                  gatewayId = payload.gateway_id.trim().toLowerCase() || null
+                }
+                const payloadGatewayOrigin =
+                  normalizeHttpOrigin(typeof payload.gatewayOrigin === 'string' ? payload.gatewayOrigin : null)
+                  || normalizeHttpOrigin(typeof payload.gateway_origin === 'string' ? payload.gateway_origin : null)
+                if (payloadGatewayOrigin) {
+                  gatewayOrigin = payloadGatewayOrigin
+                }
+                if (payload.directJoinOnly === true || payload.gatewayDirectJoinOnly === true) {
+                  directJoinOnly = true
+                }
                 if (typeof payload.groupName === 'string') {
                   groupName = payload.groupName
                 } else if (typeof payload.name === 'string') {
@@ -1326,6 +1398,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               token,
               relayUrl,
               relayKey,
+              gatewayId,
+              gatewayOrigin,
+              directJoinOnly,
               fileSharing,
               isPublic,
               blindPeer,
@@ -1369,6 +1444,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           picture: invite.groupPicture,
           isPublic: invite.isPublic,
           isOpen: invite.fileSharing,
+          gatewayId: invite.gatewayId,
+          gatewayOrigin: invite.gatewayOrigin,
+          directJoinOnly: invite.directJoinOnly,
           createdAt: invite.event?.created_at,
           source: 'invite'
         })
@@ -2017,6 +2095,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           picture: metadata.picture,
           isPublic: metadata.isPublic,
           isOpen: metadata.isOpen,
+          gatewayId: metadata.gatewayId,
+          gatewayOrigin: metadata.gatewayOrigin,
+          directJoinOnly: metadata.directJoinOnly,
           createdAt: metadata.event?.created_at,
           source: 'update'
         })
@@ -3104,6 +3185,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             picture: metadata.picture,
             isPublic: metadata.isPublic,
             isOpen: metadata.isOpen,
+            gatewayId: metadata.gatewayId,
+            gatewayOrigin: metadata.gatewayOrigin,
+            directJoinOnly: metadata.directJoinOnly,
             createdAt: metadata.event?.created_at,
             source: 'update'
           })
@@ -3437,7 +3521,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       isPublic,
       isOpen,
       picture,
-      fileSharing
+      fileSharing,
+      gatewayOrigin,
+      gatewayId,
+      directJoinOnly
     }: {
       name: string
       about?: string
@@ -3445,15 +3532,27 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       isOpen: boolean
       picture?: string
       fileSharing?: boolean
+      gatewayOrigin?: string | null
+      gatewayId?: string | null
+      directJoinOnly?: boolean
     }) => {
       if (!pubkey) throw new Error('Not logged in')
+      const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin || null)
+      const normalizedGatewayId =
+        typeof gatewayId === 'string' && gatewayId.trim()
+          ? gatewayId.trim().toLowerCase()
+          : null
+      const normalizedDirectJoinOnly = directJoinOnly === true
       const result = await createRelay({
         name,
         description: about || undefined,
         isPublic,
         isOpen,
         fileSharing,
-        picture
+        picture,
+        gatewayOrigin: normalizedGatewayOrigin,
+        gatewayId: normalizedGatewayId,
+        directJoinOnly: normalizedDirectJoinOnly
       })
       if (!result?.success) throw new Error(result?.error || 'Failed to create relay')
 
@@ -3483,6 +3582,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         picture,
         isPublic,
         isOpen,
+        gatewayId: normalizedGatewayId,
+        gatewayOrigin: normalizedGatewayOrigin,
+        directJoinOnly: normalizedDirectJoinOnly,
         source: 'create'
       })
 
@@ -3496,6 +3598,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           fileSharing,
           relayWsUrl,
           pictureTagUrl: picture,
+          gatewayOrigin: normalizedGatewayOrigin,
+          gatewayId: normalizedGatewayId,
+          directJoinOnly: normalizedDirectJoinOnly,
           discoveryTopic,
           hostPeerKeys,
           leaseReplicaPeerKeys,
@@ -3673,6 +3778,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const inviteRelayUrl = getBaseRelayUrl(resolved || relay || '') || resolved || relay || null
       const inviteRelayKey = relayEntry?.relayKey || extractRelayKeyFromUrl(inviteRelayUrl) || null
       const metadataHints = meta as (TGroupMetadata & TGroupMetadataDiscoveryHints) | null
+      const gatewayId =
+        typeof metadataHints?.gatewayId === 'string' && metadataHints.gatewayId.trim()
+          ? metadataHints.gatewayId.trim().toLowerCase()
+          : null
+      const gatewayOrigin = normalizeHttpOrigin(metadataHints?.gatewayOrigin || null)
+      const directJoinOnly = metadataHints?.directJoinOnly === true
       const discoveryTopic =
         typeof metadataHints?.discoveryTopic === 'string' && metadataHints.discoveryTopic.trim()
           ? metadataHints.discoveryTopic.trim()
@@ -3804,6 +3915,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             ? buildOpenInvitePayload({
                 relayUrl: inviteRelayUrl,
                 relayKey: inviteRelayKey,
+                gatewayId,
+                gatewayOrigin,
+                directJoinOnly,
                 discoveryTopic,
                 hostPeerKeys,
                 leaseReplicaPeerKeys: metadataLeaseReplicaPeerKeys,
@@ -3816,6 +3930,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 token: token as string,
                 relayUrl: inviteRelayUrl,
                 relayKey: inviteRelayKey,
+                gatewayId,
+                gatewayOrigin,
+                directJoinOnly,
                 meta,
                 groupName: inviteName,
                 groupPicture: invitePicture,
@@ -3860,6 +3977,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           if (inviteName) inviteTags.push(['name', inviteName])
           if (inviteAbout) inviteTags.push(['about', inviteAbout])
           if (invitePicture) inviteTags.push(['picture', invitePicture])
+          if (gatewayId) inviteTags.push([HYPERTUNA_GATEWAY_ID_TAG, gatewayId])
+          if (gatewayOrigin) inviteTags.push([HYPERTUNA_GATEWAY_ORIGIN_TAG, gatewayOrigin])
+          if (directJoinOnly) inviteTags.push([HYPERTUNA_DIRECT_JOIN_ONLY_TAG, '1'])
           inviteTags.push([resolvedIsOpen === false ? 'file-sharing-off' : 'file-sharing-on'])
 
           if (!isOpenGroup && token) {
@@ -4123,7 +4243,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             'hypertuna-topic',
             'hypertuna-host-peer',
             'hypertuna-writer-issuer',
-            'hypertuna-lease-replica-peer'
+            'hypertuna-lease-replica-peer',
+            HYPERTUNA_GATEWAY_ID_TAG,
+            HYPERTUNA_GATEWAY_ORIGIN_TAG,
+            HYPERTUNA_DIRECT_JOIN_ONLY_TAG
           ])
           const existingTagKeys = new Set(metadataTags.map((tag) => `${tag[0]}:${tag[1] || ''}`))
           for (const tag of previousTags) {
@@ -4159,6 +4282,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           picture,
           isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : cachedMetadata?.isPublic,
           isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : cachedMetadata?.isOpen,
+          gatewayId: cachedMetadata?.gatewayId || null,
+          gatewayOrigin: cachedMetadata?.gatewayOrigin || null,
+          directJoinOnly: cachedMetadata?.directJoinOnly === true,
           source: 'update'
         })
 

@@ -11,6 +11,9 @@ export const HYPERTUNA_TOPIC_TAG = 'hypertuna-topic'
 export const HYPERTUNA_HOST_PEER_TAG = 'hypertuna-host-peer'
 export const HYPERTUNA_WRITER_ISSUER_TAG = 'hypertuna-writer-issuer'
 export const HYPERTUNA_LEASE_REPLICA_PEER_TAG = 'hypertuna-lease-replica-peer'
+export const HYPERTUNA_GATEWAY_ID_TAG = 'hypertuna-gateway-id'
+export const HYPERTUNA_GATEWAY_ORIGIN_TAG = 'hypertuna-gateway-origin'
+export const HYPERTUNA_DIRECT_JOIN_ONLY_TAG = 'hypertuna-direct-join-only'
 
 export function getBaseRelayUrl(url: string): string {
   try {
@@ -19,6 +22,17 @@ export function getBaseRelayUrl(url: string): string {
     return parsed.toString().replace(/\?$/, '')
   } catch {
     return String(url || '').split('?')[0]
+  }
+}
+
+function normalizeHttpOrigin(value?: string | null): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null
+  try {
+    const parsed = new URL(value.trim())
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    return parsed.origin
+  } catch {
+    return null
   }
 }
 
@@ -55,6 +69,9 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   hostPeerKeys?: string[]
   writerIssuerPubkey?: string | null
   leaseReplicaPeerKeys?: string[]
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
 }): { groupCreateEvent: EventTemplate; metadataEvent: EventTemplate; hypertunaEvent: EventTemplate } {
   const now = Math.floor(Date.now() / 1000)
   const fileSharingEnabled = args.fileSharing !== false
@@ -88,6 +105,17 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
 
   if (args.pictureTagUrl) {
     metadataTags.push(['picture', args.pictureTagUrl, 'hypertuna:drive:pfp'])
+  }
+  const gatewayId = typeof args.gatewayId === 'string' ? args.gatewayId.trim().toLowerCase() : ''
+  const gatewayOrigin = normalizeHttpOrigin(args.gatewayOrigin || null)
+  if (gatewayId) {
+    metadataTags.push([HYPERTUNA_GATEWAY_ID_TAG, gatewayId])
+  }
+  if (gatewayOrigin) {
+    metadataTags.push([HYPERTUNA_GATEWAY_ORIGIN_TAG, gatewayOrigin])
+  }
+  if (args.directJoinOnly === true) {
+    metadataTags.push([HYPERTUNA_DIRECT_JOIN_ONLY_TAG, '1'])
   }
   if (args.isPublic && args.isOpen) {
     if (typeof args.discoveryTopic === 'string' && args.discoveryTopic.trim()) {

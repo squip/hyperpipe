@@ -3059,6 +3059,9 @@ export class TuiController {
     isOpen?: boolean
     fileSharing?: boolean
     picture?: string
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
   }): Promise<Record<string, unknown>> {
     return await this.runTask('Create relay', async () => {
       await this.ensureWorkerReadyForOperation('create relay')
@@ -3174,6 +3177,9 @@ export class TuiController {
     relayUrl?: string
     authToken?: string
     fileSharing?: boolean
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
   }): Promise<Record<string, unknown>> {
     return await this.runTask('Join relay', async () => {
       await this.ensureWorkerReadyForOperation('join relay')
@@ -3251,7 +3257,9 @@ export class TuiController {
     token?: string
     relayKey?: string
     relayUrl?: string
-    gatewayMode?: 'auto' | 'disabled'
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
     discoveryTopic?: string | null
     hostPeerKeys?: string[]
     leaseReplicaPeerKeys?: string[]
@@ -3282,9 +3290,9 @@ export class TuiController {
   }): Promise<void> {
     await this.runTask('Start join flow', async () => {
       await this.ensureWorkerReadyForOperation('start join flow')
-      const gatewayMode: 'auto' | 'disabled' = input.gatewayMode === 'disabled' ? 'disabled' : 'auto'
+      const directJoinOnly = input.directJoinOnly === true
 
-      if (gatewayMode === 'auto') {
+      if (!directJoinOnly) {
         await this.ensureGatewayParityReady({
           reason: 'start-join-flow',
           refreshPublicGateway: true
@@ -3304,7 +3312,7 @@ export class TuiController {
       const hostPeers = Array.from(new Set([
         ...(Array.isArray(input.hostPeers) ? input.hostPeers : []).map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean),
         ...(Array.isArray(input.hostPeerKeys) ? input.hostPeerKeys : []).map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean),
-        ...(gatewayMode === 'auto'
+        ...(!directJoinOnly
           ? this.resolveGatewayHostPeers({
               publicIdentifier: normalizedIdentifier,
               relayKey: relayKey || null,
@@ -3315,7 +3323,7 @@ export class TuiController {
 
       await this.relayService.startJoinFlow({
         ...input,
-        gatewayMode,
+        directJoinOnly,
         relayKey,
         relayUrl,
         hostPeers: hostPeers.length ? hostPeers : undefined,
@@ -3798,24 +3806,21 @@ export class TuiController {
     }, { dedupeKey: 'refresh:group-invites', retries: 0 })
   }
 
-  async acceptGroupInvite(
-    inviteId: string,
-    options?: { gatewayMode?: 'auto' | 'disabled' }
-  ): Promise<void> {
+  async acceptGroupInvite(inviteId: string): Promise<void> {
     await this.runTask('Accept group invite', async () => {
       const target = this.state.groupInvites.find((invite) => invite.id === inviteId)
       if (!target) {
         throw new Error(`Group invite not found: ${inviteId}`)
       }
 
-      const gatewayMode: 'auto' | 'disabled' = options?.gatewayMode === 'disabled' ? 'disabled' : 'auto'
-
       await this.startJoinFlow({
         publicIdentifier: target.groupId,
         token: target.token,
         relayKey: target.relayKey || undefined,
         relayUrl: target.relayUrl || target.relay,
-        gatewayMode,
+        gatewayOrigin: target.gatewayOrigin || undefined,
+        gatewayId: target.gatewayId || undefined,
+        directJoinOnly: target.directJoinOnly === true,
         discoveryTopic: target.discoveryTopic || undefined,
         hostPeerKeys: target.hostPeerKeys || undefined,
         leaseReplicaPeerKeys: target.leaseReplicaPeerKeys || undefined,
