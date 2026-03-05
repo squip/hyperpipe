@@ -202,12 +202,16 @@ export class WorkerHost {
       }
     }
 
-    const dependencyIssue = detectWorkerDependencyCompatibilityIssue(config.workerRoot)
-    if (dependencyIssue) {
-      return {
-        success: false,
-        configSent: false,
-        error: dependencyIssue
+    const defaultWorkerEntry = path.join(config.workerRoot, 'index.js')
+    const shouldCheckDependencies = path.resolve(workerEntry) === path.resolve(defaultWorkerEntry)
+    if (shouldCheckDependencies) {
+      const dependencyIssue = detectWorkerDependencyCompatibilityIssue(config.workerRoot)
+      if (dependencyIssue) {
+        return {
+          success: false,
+          configSent: false,
+          error: dependencyIssue
+        }
       }
     }
 

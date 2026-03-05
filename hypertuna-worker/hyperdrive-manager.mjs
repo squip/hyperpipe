@@ -96,6 +96,36 @@ function setTimeoutEvict (key, ttlMs) {
   return timer
 }
 
+async function withJoinTimeout (promise, timeoutMs = 8000) {
+  const ms = Number.isFinite(timeoutMs) ? Math.max(250, Math.trunc(timeoutMs)) : 8000
+  let timeoutId = null
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeoutId = scheduleTimeout(() => reject(new Error(`topic-join-timeout:${ms}`)), ms)
+      })
+    ])
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId)
+  }
+}
+
+async function withReadTimeout (promise, timeoutMs = 10000) {
+  const ms = Number.isFinite(timeoutMs) ? Math.max(250, Math.trunc(timeoutMs)) : 10000
+  let timeoutId = null
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeoutId = scheduleTimeout(() => reject(new Error(`drive-read-timeout:${ms}`)), ms)
+      })
+    ])
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId)
+  }
+}
+
 export function getCorestore() {
   return store
 }
@@ -749,17 +779,44 @@ export async function deleteRelayFilesByIdentifierPrefix (identifier) {
 }
 
 export async function fetchFileFromDrive(driveKey, identifier, fileHash) {
+  const normalizedDriveKey = ensureHexKey(driveKey)
+  const path = relayFilePath(identifier, fileHash)
+  if (drive && normalizedDriveKey && localDriveKeyHex && normalizedDriveKey === localDriveKeyHex) {
+    let local = await drive.get(path, { wait: false }).catch(() => null)
+    if (!local) {
+      local = await withReadTimeout(drive.get(path), 5000).catch(() => null)
+    }
+    return local || null
+  }
+
   const remote = new Hyperdrive(store, driveKey)
   await remote.ready()
+  let release = null
   try {
     // Join the remote drive topic (cached) to discover peers holding it
     const done = remote.findingPeers()
-    const release = await acquireRemoteTopic(remote)
+    try {
+      release = await withJoinTimeout(acquireRemoteTopic(remote), 8000)
+    } catch (error) {
+      console.warn('[Fetch] remote topic join timeout, continuing without join lock', {
+        remoteKey: driveKey,
+        error: error?.message || error
+      })
+    }
     console.log(`[Fetch] join topic remoteKey=${driveKey} dkey=${b4a.toString(remote.discoveryKey, 'hex')} ident=/${normalizeIdentifier(identifier)} file=${fileHash}`)
     done()
-    const path = relayFilePath(identifier, fileHash)
     const t0 = Date.now()
-    const buf = await remote.get(path)
+    let buf = await remote.get(path, { wait: false }).catch(() => null)
+    if (!buf) {
+      buf = await withReadTimeout(remote.get(path), 10000).catch((error) => {
+        console.warn('[Fetch] remote.get timed out', {
+          path,
+          remoteKey: driveKey,
+          error: error?.message || error
+        })
+        return null
+      })
+    }
     console.log(`[Fetch] remote.get path=${path} found=${!!buf} bytes=${buf?.length || 0} ms=${Date.now() - t0}`)
     return buf || null
   } catch (_) {
@@ -781,11 +838,28 @@ export async function fetchPfpFileFromDrive(driveKey, owner, fileHash) {
   let release = null
   try {
     const done = remote.findingPeers()
-    release = await acquireRemoteTopic(remote)
+    try {
+      release = await withJoinTimeout(acquireRemoteTopic(remote), 8000)
+    } catch (error) {
+      console.warn('[FetchPfp] remote topic join timeout, continuing without join lock', {
+        remoteKey: driveKey,
+        error: error?.message || error
+      })
+    }
     done()
     const path = buildPfpFilePath(owner, fileHash)
     const t0 = Date.now()
-    const buf = await remote.get(path)
+    let buf = await remote.get(path, { wait: false }).catch(() => null)
+    if (!buf) {
+      buf = await withReadTimeout(remote.get(path), 10000).catch((error) => {
+        console.warn('[FetchPfp] remote.get timed out', {
+          path,
+          remoteKey: driveKey,
+          error: error?.message || error
+        })
+        return null
+      })
+    }
     console.log(`[FetchPfp] remote.get path=${path} found=${!!buf} bytes=${buf?.length || 0} ms=${Date.now() - t0}`)
     return buf || null
   } catch (err) {
@@ -811,7 +885,14 @@ export async function mirrorPfpDrive(remoteKeyHex) {
       return
     }
     const done = remote.findingPeers()
-    release = await acquireRemoteTopic(remote)
+    try {
+      release = await withJoinTimeout(acquireRemoteTopic(remote), 8000)
+    } catch (error) {
+      console.warn('[PfpMirror] remote topic join timeout, continuing without join lock', {
+        remoteKey: remoteKeyHex,
+        error: error?.message || error
+      })
+    }
     done()
     const mirror = remote.mirror(pfpDrive, {
       prune: false,
