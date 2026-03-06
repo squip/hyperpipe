@@ -242,13 +242,15 @@ type BlindPeerSeed = {
 async function writeWorkerGatewaySettings(
   storageDir: string,
   gatewayOrigin: string,
-  blindPeer: BlindPeerSeed | null = null
+  blindPeer: BlindPeerSeed | null = null,
+  sharedSecret: string | null = null
 ): Promise<void> {
   const origin = normalizeHttpOrigin(gatewayOrigin)
   const parsed = new URL(origin)
   const wsProtocol = getWsProtocolFromHttpOrigin(origin)
   const blindPeerKey = (blindPeer?.publicKey || '').trim() || null
   const blindPeerEncryptionKey = (blindPeer?.encryptionKey || '').trim() || null
+  const gatewaySharedSecret = typeof sharedSecret === 'string' ? sharedSecret.trim() : ''
 
   await fs.mkdir(storageDir, { recursive: true })
   await fs.writeFile(
@@ -267,6 +269,7 @@ async function writeWorkerGatewaySettings(
       selectionMode: 'manual',
       preferredBaseUrl: origin,
       baseUrl: origin,
+      sharedSecret: gatewaySharedSecret,
       delegateReqToPeers: false,
       blindPeerEnabled: blindPeer?.enabled === true && !!blindPeerKey,
       blindPeerKeys: blindPeerKey ? [blindPeerKey] : [],
@@ -310,6 +313,72 @@ async function fetchGatewayBlindPeerSeed(gatewayOrigin: string): Promise<BlindPe
   } catch {
     return null
   }
+}
+
+type GatewayMirrorProbe = {
+  identifier: string
+  relayKey: string | null
+  coreRefsCount: number
+}
+
+async function fetchGatewayMirrorMetadata(
+  gatewayOrigin: string,
+  relayIdentifier: string
+): Promise<GatewayMirrorProbe | null> {
+  const normalizedIdentifier = typeof relayIdentifier === 'string' ? relayIdentifier.trim() : ''
+  if (!normalizedIdentifier) return null
+  try {
+    const response = await fetch(
+      `${gatewayOrigin}/api/relays/${encodeURIComponent(normalizedIdentifier)}/mirror`
+    )
+    if (!response.ok) return null
+    const payload = await response.json() as {
+      relayKey?: string | null
+      relay_key?: string | null
+      cores?: unknown[]
+    }
+    const relayKey =
+      typeof payload?.relayKey === 'string'
+        ? payload.relayKey
+        : (typeof payload?.relay_key === 'string' ? payload.relay_key : null)
+    const coreRefsCount = Array.isArray(payload?.cores) ? payload.cores.length : 0
+    return {
+      identifier: normalizedIdentifier,
+      relayKey: relayKey ? relayKey.trim() : null,
+      coreRefsCount
+    }
+  } catch {
+    return null
+  }
+}
+
+async function waitForGatewayMirrorReady(
+  gatewayOrigin: string,
+  relayIdentifiers: Array<string | null | undefined>,
+  timeoutMs = 120_000
+): Promise<GatewayMirrorProbe> {
+  const candidates = Array.from(
+    new Set(
+      relayIdentifiers
+        .map((entry) => String(entry || '').trim())
+        .filter(Boolean)
+    )
+  )
+  if (!candidates.length) {
+    throw new Error('gateway-mirror-preflight-missing-identifiers')
+  }
+
+  return await waitFor<GatewayMirrorProbe>(
+    `gateway mirror readiness (${candidates.join(', ')})`,
+    async () => {
+      for (const candidate of candidates) {
+        const probe = await fetchGatewayMirrorMetadata(gatewayOrigin, candidate)
+        if (probe) return probe
+      }
+      return null
+    },
+    { timeoutMs, intervalMs: 1_500 }
+  )
 }
 
 function isRelayWritable(entry: RelayEntry | null | undefined): boolean {
@@ -452,7 +521,8 @@ async function main(): Promise<void> {
       'skip-docker': { type: 'string' },
       'keep-docker': { type: 'string' },
       'dry-run': { type: 'string' },
-      'gateway-policy-mode': { type: 'string' }
+      'gateway-policy-mode': { type: 'string' },
+      'routing-only': { type: 'string' }
     }
   })
 
@@ -465,6 +535,7 @@ async function main(): Promise<void> {
   const skipDocker = parseBoolean(parsed.values['skip-docker'], false)
   const keepDocker = parseBoolean(parsed.values['keep-docker'], false)
   const dryRun = parseBoolean(parsed.values['dry-run'], false)
+  const routingOnly = parseBoolean(parsed.values['routing-only'], false)
   const preferredGatewayPort = Number.parseInt(parsed.values['gateway-port'] || '4430', 10)
   const gatewayPolicyMode = String(parsed.values['gateway-policy-mode'] || 'closed').trim().toLowerCase() === 'open'
     ? 'open'
@@ -622,10 +693,15 @@ async function main(): Promise<void> {
     await joiner.selectAccount(joinerAccount.pubkey)
     await joiner.unlockCurrentAccount()
 
+    const gatewayRegistrationSecret = `e2e-registration-secret-${runId}`
+    process.env.PUBLIC_GATEWAY_ENABLED = 'true'
+    process.env.PUBLIC_GATEWAY_URL = gatewayOrigin
+    process.env.PUBLIC_GATEWAY_SECRET = gatewayRegistrationSecret
+
     const env = [
       `E2E_GATEWAY_HOST_PORT=${gatewayHostPort}`,
       `E2E_GATEWAY_PUBLIC_URL=${gatewayOrigin}`,
-      `E2E_GATEWAY_SECRET=e2e-registration-secret-${runId}`,
+      `E2E_GATEWAY_SECRET=${gatewayRegistrationSecret}`,
       `E2E_REDIS_PREFIX=e2e:relay-scoped-cred:${runId}:`,
       `E2E_FLAG_SCOPED_CREDENTIALS=${process.env.GATEWAY_SCOPED_CREDENTIALS_V1 || 'true'}`,
       `E2E_FLAG_CREATOR_POLICY=${process.env.GATEWAY_CREATOR_POLICY_V1 || 'true'}`,
@@ -680,8 +756,8 @@ async function main(): Promise<void> {
 
       logProgress('pre-seed per-worker gateway settings')
       await Promise.all([
-        writeWorkerGatewaySettings(hostStorage, gatewayOrigin, blindPeerSeed),
-        writeWorkerGatewaySettings(joinerStorage, gatewayOrigin, blindPeerSeed)
+        writeWorkerGatewaySettings(hostStorage, gatewayOrigin, blindPeerSeed, gatewayRegistrationSecret),
+        writeWorkerGatewaySettings(joinerStorage, gatewayOrigin, blindPeerSeed, gatewayRegistrationSecret)
       ])
 
       logProgress(`start workers host=${short(hostAccount.pubkey)} joiner=${short(joinerAccount.pubkey)}`)
@@ -752,7 +828,7 @@ async function main(): Promise<void> {
         throw new Error(`host-create-relay-unstable: ${hostCreateFatal}`)
       }
 
-      await waitFor<RelayEntry>(
+      const hostCreatedRelay = await waitFor<RelayEntry>(
         'host created relay writable',
         async () => {
           await host.refreshRelays()
@@ -797,6 +873,77 @@ async function main(): Promise<void> {
       }
       if (!invite.relayKey || !/^[a-f0-9]{64}$/i.test(String(invite.relayKey))) {
         throw new Error('invalid-closed-invite-missing-relay-key')
+      }
+
+      logProgress('gateway mirror preflight for invite relay')
+      const mirrorProbe = await waitForGatewayMirrorReady(
+        gatewayOrigin,
+        [invite.relayKey, hostCreatedRelay.relayKey, group.id],
+        120_000
+      )
+      logProgress(
+        `gateway mirror ready identifier=${mirrorProbe.identifier} `
+        + `relayKey=${short(mirrorProbe.relayKey, 16)} cores=${mirrorProbe.coreRefsCount}`
+      )
+
+      if (routingOnly) {
+        summary = {
+          generatedAt: nowIso(),
+          baseDir,
+          elapsedMs: Date.now() - startedAt,
+          gatewayOrigin,
+          docker: {
+            enabled: !skipDocker,
+            projectName: composeProjectName,
+            composeFile,
+            envFile,
+            hostPort: gatewayHostPort
+          },
+          host: {
+            pubkey: hostAccount.pubkey,
+            stoppedBeforeJoin: false
+          },
+          joiner: {
+            pubkey: joinerAccount.pubkey,
+            selectedPathMode,
+            selectedPathPeer,
+            relayKey: null,
+            writable: false,
+            readyForReq: false,
+            connectionUrl: null
+          },
+          invite: {
+            id: invite.id,
+            hasToken: Boolean(invite.token),
+            hasWriterSecret: Boolean(invite.writerSecret),
+            hasWriterLeaseEnvelope: Boolean(invite.writerLeaseEnvelope),
+            hasGatewayRelayCredential: inviteHasGatewayCredential,
+            gatewayOrigin: invite.gatewayOrigin || null
+          },
+          telemetry: {
+            sawGatewayCall,
+            sawGatewayCallFailed,
+            sawStrictNoFallback,
+            gatewayCallOrigins: Array.from(gatewayCallOrigins),
+            routePreflightHostOk,
+            routePreflightJoinerOk
+          },
+          files: {
+            hostWorkerLog: hostLogFile,
+            joinerWorkerLog: joinerLogFile,
+            timelineLog: timelineLogFile
+          },
+          result: {
+            ok: Boolean(
+              routePreflightHostOk
+              && routePreflightJoinerOk
+              && inviteHasGatewayCredential
+              && mirrorProbe?.relayKey
+            ),
+            reason: 'routing-preflight-pass'
+          }
+        }
+        return
       }
 
       logProgress('stop host before join')
