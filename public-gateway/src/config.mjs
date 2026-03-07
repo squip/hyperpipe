@@ -104,6 +104,7 @@ const DEFAULT_CONFIG = {
   blindPeer: {
     enabled: process.env.GATEWAY_BLINDPEER_ENABLED === 'true',
     storageDir: process.env.GATEWAY_BLINDPEER_STORAGE || null,
+    port: parseEnvNumber('GATEWAY_BLINDPEER_PORT', 0),
     maxBytes: Number(process.env.GATEWAY_BLINDPEER_MAX_BYTES) || DEFAULT_BLIND_PEER_MAX_BYTES,
     gcIntervalMs: Number(process.env.GATEWAY_BLINDPEER_GC_INTERVAL_MS) || 300000,
     dedupeBatchSize: Number(process.env.GATEWAY_BLINDPEER_DEDUPE_BATCH) || 100,
@@ -268,9 +269,15 @@ function normalizeBlindPeerSettings(settings = {}) {
     return Number.isFinite(num) && num > 0 ? Math.trunc(num) : fallback;
   };
 
+  const toOptionalPort = (value) => {
+    const num = Number(value);
+    return Number.isFinite(num) && num > 0 ? Math.trunc(num) : 0;
+  };
+
   return {
     enabled: !!settings.enabled,
     storageDir: sanitizePath(settings.storageDir),
+    port: toOptionalPort(settings.port),
     maxBytes: toPositiveInt(settings.maxBytes, DEFAULT_BLIND_PEER_MAX_BYTES),
     gcIntervalMs: toPositiveInt(settings.gcIntervalMs, 300000),
     dedupeBatchSize: toPositiveInt(settings.dedupeBatchSize, 100),

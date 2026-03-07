@@ -197,6 +197,13 @@ const BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS = 8000
 const OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores'
+const JOIN_TRACE_ID_HEADER = 'x-hypertuna-join-trace-id'
+const JOIN_TRACE_ATTEMPT_ID_HEADER = 'x-hypertuna-join-attempt-id'
+const JOIN_TRACE_REQUEST_ID_HEADER = 'x-hypertuna-worker-request-id'
+const JOIN_TRACE_RELAY_IDENTIFIER_HEADER = 'x-hypertuna-relay-identifier'
+const JOIN_TRACE_ROUTE_HEADER = 'x-hypertuna-trace-route'
+const JOIN_TRACE_PURPOSE_HEADER = 'x-hypertuna-trace-purpose'
+const GATEWAY_REQUEST_ID_HEADER = 'x-hypertuna-gateway-request-id'
 const JOIN_TOTAL_DEADLINE_MS = resolveTimeoutEnvMs('JOIN_TOTAL_DEADLINE_MS', 60000, {
   minMs: 1000,
   allowDisable: true
@@ -292,6 +299,8 @@ let lastMirrorMetadataRefreshAt = 0
 let mirrorMetadataRefreshInFlight = null
 const openJoinContexts = new Map()
 const pendingOpenJoinReauth = new Map()
+const joinFlowAttemptState = new Map()
+const JOIN_FLOW_ATTEMPT_STATE_TTL_MS = 5 * 60 * 1000
 const OPEN_JOIN_REAUTH_MIN_INTERVAL_MS = 30000
 const OPEN_JOIN_POOL_REFRESH_MS = 30 * 60 * 1000
 const CLOSED_JOIN_POOL_TARGET_SIZE = 10
@@ -304,8 +313,105 @@ const closedJoinWriterPoolLocks = new Set()
 const RELAY_SUBSCRIPTION_REFRESH_MIN_INTERVAL_MS = 1500
 const RELAY_SUBSCRIPTION_REFRESH_CACHE_TTL_MS = 60 * 1000
 const RELAY_SUBSCRIPTION_REFRESH_MAX_TRACKED = 512
+const RELAY_MIRROR_UPDATE_DEBOUNCE_MS = 750
+const RELAY_MIRROR_UPDATE_MIN_INTERVAL_MS = 2000
 const relaySubscriptionRefreshRecent = new Map()
 const relaySubscriptionRefreshInFlight = new Map()
+
+function normalizeJoinAttemptIdentifier(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  const relayKey = normalizeRelayKeyHex(trimmed)
+  if (relayKey) return relayKey
+  return trimmed
+}
+
+function pruneJoinFlowAttemptState(now = Date.now()) {
+  for (const [identifier, entry] of joinFlowAttemptState.entries()) {
+    if (!entry || !Number.isFinite(entry.updatedAt) || (now - entry.updatedAt) > JOIN_FLOW_ATTEMPT_STATE_TTL_MS) {
+      joinFlowAttemptState.delete(identifier)
+    }
+  }
+}
+
+function beginJoinFlowAttempt(publicIdentifier, attemptId, source = 'unknown') {
+  const identifier = normalizeJoinAttemptIdentifier(publicIdentifier)
+  const normalizedAttemptId =
+    typeof attemptId === 'string' && attemptId.trim()
+      ? attemptId.trim()
+      : null
+  if (!identifier || !normalizedAttemptId) return null
+  pruneJoinFlowAttemptState()
+  joinFlowAttemptState.set(identifier, {
+    attemptId: normalizedAttemptId,
+    status: 'in-progress',
+    source,
+    updatedAt: Date.now(),
+    error: null
+  })
+  return identifier
+}
+
+function markJoinFlowAttemptState(identifier, attemptId, status, error = null) {
+  const normalizedIdentifier = normalizeJoinAttemptIdentifier(identifier)
+  const normalizedAttemptId =
+    typeof attemptId === 'string' && attemptId.trim()
+      ? attemptId.trim()
+      : null
+  if (!normalizedIdentifier || !normalizedAttemptId) return
+  const current = joinFlowAttemptState.get(normalizedIdentifier)
+  if (!current || current.attemptId !== normalizedAttemptId) return
+  current.status = status
+  current.error = error || null
+  current.updatedAt = Date.now()
+  joinFlowAttemptState.set(normalizedIdentifier, current)
+}
+
+function shouldSuppressJoinAuthSuccess(message) {
+  if (!message || typeof message !== 'object') return false
+  if (message.type !== 'join-auth-success') return false
+
+  pruneJoinFlowAttemptState()
+  const data = message.data && typeof message.data === 'object' ? message.data : {}
+  const identifier = normalizeJoinAttemptIdentifier(data.publicIdentifier || null)
+  if (!identifier) return false
+  const entry = joinFlowAttemptState.get(identifier)
+  if (!entry) return false
+
+  const attemptId =
+    typeof data.joinAttemptId === 'string' && data.joinAttemptId.trim()
+      ? data.joinAttemptId.trim()
+      : null
+
+  if (attemptId && entry.attemptId && attemptId !== entry.attemptId) {
+    console.warn('[Worker] Suppressing stale join-auth-success (attempt mismatch)', {
+      publicIdentifier: identifier,
+      expectedAttemptId: entry.attemptId,
+      actualAttemptId: attemptId,
+      status: entry.status,
+      provisional: data.provisional === true
+    })
+    return true
+  }
+
+  const terminalFailure = entry.status === 'failed'
+  if (terminalFailure && (!attemptId || attemptId === entry.attemptId)) {
+    console.warn('[Worker] Suppressing stale join-auth-success after terminal join failure', {
+      publicIdentifier: identifier,
+      attemptId: attemptId || null,
+      expectedAttemptId: entry.attemptId,
+      provisional: data.provisional === true,
+      priorError: entry.error || null
+    })
+    return true
+  }
+
+  if (attemptId && attemptId === entry.attemptId) {
+    markJoinFlowAttemptState(identifier, attemptId, 'succeeded')
+  }
+  return false
+}
 
 function resolveClosedJoinPoolEntryTtlMs(config) {
   const fromConfig =
@@ -855,7 +961,14 @@ async function ensureRelayWritersFromCoreRefs(relayManager, coreRefs, reason = '
   if (!normalized.length) {
     return { status: 'skipped', reason: 'no-core-refs' }
   }
-  if (relay.writable === false) {
+  const reasonText = typeof reason === 'string' ? reason : ''
+  const reasonLower = reasonText.toLowerCase()
+  const allowUnwritableAttempt = reasonLower.includes('join')
+    || reasonLower.includes('lease')
+    || reasonLower.includes('bootstrap')
+    || reasonLower.startsWith('queued-')
+  const startedUnwritable = relay.writable === false
+  if (startedUnwritable && !allowUnwritableAttempt) {
     const relayKey = resolveRelayKey(relayManager)
     const queued = queueRelayWriterRefs(relayKey, normalized, reason)
     if (queued) {
@@ -877,13 +990,22 @@ async function ensureRelayWritersFromCoreRefs(relayManager, coreRefs, reason = '
       totalQueued: queued?.totalQueued ?? normalized.length
     }
   }
+  if (startedUnwritable && allowUnwritableAttempt) {
+    console.log('[Worker] Attempting writer sync while relay is not writable', {
+      relayKey: resolveRelayKey(relayManager),
+      reason,
+      refs: normalized.length
+    })
+  }
 
-  const skipPreUpdateWait = typeof reason === 'string'
-    && (reason.startsWith('queued-') || reason === 'queued-writers')
+  const skipPreUpdateWait = startedUnwritable
+    || (typeof reason === 'string'
+      && (reason.startsWith('queued-') || reason === 'queued-writers'))
   if (skipPreUpdateWait) {
-    console.log('[Worker] Skipping pre-wait relay.update for queued writer sync', {
+    console.log('[Worker] Skipping pre-wait relay.update before writer sync', {
       relayKey: relayManager?.bootstrap || null,
-      reason
+      reason,
+      startedUnwritable
     })
   } else {
     try {
@@ -923,6 +1045,7 @@ async function ensureRelayWritersFromCoreRefs(relayManager, coreRefs, reason = '
 
   const addWriterSlowThresholdMs = 2000
   const addWriterDurations = []
+  const deferredRefs = []
 
   for (const ref of normalized) {
     const decoded = decodeCoreRef(ref)
@@ -952,6 +1075,20 @@ async function ensureRelayWritersFromCoreRefs(relayManager, coreRefs, reason = '
     } catch (error) {
       const elapsedMs = Date.now() - addStart
       addWriterDurations.push({ writer: writerHex.slice(0, 16), elapsedMs, error: error?.message || error })
+      const message = String(error?.message || error || '')
+      const shouldDefer = /read[- ]?only|not writable|autobase is closing|closing/i.test(message)
+      if (shouldDefer) {
+        summary.skipped += 1
+        deferredRefs.push(ref)
+        console.log('[Worker] Deferred writer add until writable', {
+          relayKey: relayManager?.bootstrap || null,
+          writer: writerHex.slice(0, 16),
+          reason,
+          elapsedMs,
+          error: message
+        })
+        continue
+      }
       summary.failed += 1
       console.warn('[Worker] Failed to add writer from mirror core refs', {
         relayKey: relayManager?.bootstrap || null,
@@ -978,12 +1115,34 @@ async function ensureRelayWritersFromCoreRefs(relayManager, coreRefs, reason = '
     }))
   }
 
+  if (deferredRefs.length) {
+    const relayKey = resolveRelayKey(relayManager)
+    const queued = queueRelayWriterRefs(relayKey, deferredRefs, reason)
+    if (queued) {
+      attachRelayWriterQueueWatcher(relayKey, relayManager)
+      summary.status = summary.added > 0 ? 'partial' : 'queued'
+      summary.queued = queued.queued
+      summary.totalQueued = queued.totalQueued
+      console.log('[Worker] Queued deferred writer refs after addWriter attempts', {
+        relayKey,
+        reason,
+        deferred: deferredRefs.length,
+        queued: queued.queued,
+        totalQueued: queued.totalQueued
+      })
+    }
+  }
+
   if (summary.added && typeof relay.update === 'function') {
     try {
       const updateStart = Date.now()
-      let mode = 'wait'
+      let mode = startedUnwritable ? 'no-wait' : 'wait'
       try {
-        await relay.update({ wait: true })
+        if (startedUnwritable) {
+          await relay.update()
+        } else {
+          await relay.update({ wait: true })
+        }
       } catch (_) {
         mode = 'no-wait'
         await relay.update()
@@ -1480,11 +1639,114 @@ function previewValue(value, limit = 16) {
   return text.length > limit ? text.slice(0, limit) : text
 }
 
+function normalizeJoinTraceToken(value, maxLength = 192) {
+  if (value === null || value === undefined) return null
+  const text = String(value).trim()
+  if (!text) return null
+  return text.slice(0, maxLength)
+}
+
+function withJoinTraceContext(traceContext = null, overrides = {}) {
+  const base = traceContext && typeof traceContext === 'object' ? traceContext : {}
+  const merged = {
+    ...base,
+    ...overrides
+  }
+  const traceId =
+    normalizeJoinTraceToken(merged.traceId)
+    || normalizeJoinTraceToken(merged.joinAttemptId)
+    || normalizeJoinTraceToken(merged.requestId)
+    || `jt-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`
+
+  return {
+    traceId,
+    joinAttemptId: normalizeJoinTraceToken(merged.joinAttemptId),
+    requestId: normalizeJoinTraceToken(merged.requestId),
+    relayIdentifier: normalizeJoinTraceToken(merged.relayIdentifier, 256),
+    route: normalizeJoinTraceToken(merged.route, 96),
+    purpose: normalizeJoinTraceToken(merged.purpose, 96),
+    source: normalizeJoinTraceToken(merged.source, 64) || 'worker'
+  }
+}
+
+function buildJoinTraceHeaders(traceContext = null, {
+  relayIdentifier = null,
+  route = null,
+  purpose = null
+} = {}) {
+  const trace = withJoinTraceContext(traceContext, {
+    relayIdentifier: relayIdentifier ?? traceContext?.relayIdentifier ?? null,
+    route: route ?? traceContext?.route ?? null,
+    purpose: purpose ?? traceContext?.purpose ?? null
+  })
+  const headers = {
+    [JOIN_TRACE_ID_HEADER]: trace.traceId,
+    [JOIN_TRACE_ROUTE_HEADER]: trace.route || 'unknown'
+  }
+  if (trace.joinAttemptId) headers[JOIN_TRACE_ATTEMPT_ID_HEADER] = trace.joinAttemptId
+  if (trace.requestId) headers[JOIN_TRACE_REQUEST_ID_HEADER] = trace.requestId
+  if (trace.relayIdentifier) headers[JOIN_TRACE_RELAY_IDENTIFIER_HEADER] = trace.relayIdentifier
+  if (trace.purpose) headers[JOIN_TRACE_PURPOSE_HEADER] = trace.purpose
+  return { trace, headers }
+}
+
+function readGatewayTraceHeaders(response) {
+  try {
+    if (!response?.headers || typeof response.headers.get !== 'function') {
+      return {
+        traceId: null,
+        gatewayRequestId: null
+      }
+    }
+    return {
+      traceId: normalizeJoinTraceToken(response.headers.get(JOIN_TRACE_ID_HEADER)),
+      gatewayRequestId: normalizeJoinTraceToken(response.headers.get(GATEWAY_REQUEST_ID_HEADER))
+    }
+  } catch (_) {
+    return {
+      traceId: null,
+      gatewayRequestId: null
+    }
+  }
+}
+
+function emitJoinGatewayTrace(stage, traceContext = null, data = {}, level = 'info') {
+  const trace = withJoinTraceContext(traceContext)
+  const payload = {
+    stage,
+    ts: Date.now(),
+    traceId: trace.traceId,
+    joinAttemptId: trace.joinAttemptId || null,
+    requestId: trace.requestId || null,
+    relayIdentifier: trace.relayIdentifier || null,
+    route: trace.route || null,
+    purpose: trace.purpose || null,
+    source: trace.source || 'worker',
+    ...data
+  }
+  if (level === 'error') {
+    console.error('[Worker][GatewayTrace]', payload)
+  } else if (level === 'warn') {
+    console.warn('[Worker][GatewayTrace]', payload)
+  } else {
+    console.log('[Worker][GatewayTrace]', payload)
+  }
+  try {
+    sendMessage({
+      type: 'JOIN_GATEWAY_TRACE',
+      data: payload
+    })
+  } catch (_) {}
+  return trace
+}
+
 function summarizeOpenJoinEntries(entries = [], limit = 3) {
   if (!Array.isArray(entries) || entries.length === 0) return []
   return entries.slice(0, limit).map((entry) => ({
     writerCore: previewValue(entry?.writerCore, 16),
     writerCoreHex: previewValue(entry?.writerCoreHex || entry?.autobaseLocal, 16),
+    writerLeaseId: previewValue(entry?.writerLeaseId, 24),
+    writerCommitCheckpoint: summarizeWriterCommitCheckpoint(entry?.writerCommitCheckpoint || null),
     issuedAt: entry?.issuedAt ?? null,
     expiresAt: entry?.expiresAt ?? null
   }))
@@ -1493,6 +1755,95 @@ function summarizeOpenJoinEntries(entries = [], limit = 3) {
 function summarizeCoreRefs(coreRefs = [], limit = 3) {
   if (!Array.isArray(coreRefs) || coreRefs.length === 0) return []
   return coreRefs.slice(0, limit).map((ref) => previewValue(ref, 16))
+}
+
+function normalizeWriterLeaseId(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed.length ? trimmed : null
+}
+
+function normalizeWriterCommitCheckpoint(input = null) {
+  if (!input || typeof input !== 'object') return null
+  const systemKey = normalizeCoreRef(input.systemKey || input.system_key || null)
+  const writerCore = normalizeCoreRef(input.writerCore || input.writer_core || null)
+  const activeWritersHash = typeof input.activeWritersHash === 'string'
+    ? input.activeWritersHash
+    : (typeof input.active_writers_hash === 'string' ? input.active_writers_hash : null)
+  const activeWritersCountRaw =
+    Number.isFinite(input.activeWritersCount)
+      ? Number(input.activeWritersCount)
+      : Number.isFinite(input.active_writers_count)
+        ? Number(input.active_writers_count)
+        : null
+  const systemSignedLengthRaw =
+    Number.isFinite(input.systemSignedLength)
+      ? Number(input.systemSignedLength)
+      : Number.isFinite(input.system_signed_length)
+        ? Number(input.system_signed_length)
+        : null
+  const systemLengthRaw =
+    Number.isFinite(input.systemLength)
+      ? Number(input.systemLength)
+      : Number.isFinite(input.system_length)
+        ? Number(input.system_length)
+        : null
+  const viewVersionRaw =
+    Number.isFinite(input.viewVersion)
+      ? Number(input.viewVersion)
+      : Number.isFinite(input.view_version)
+        ? Number(input.view_version)
+        : null
+  const recordedAtRaw =
+    Number.isFinite(input.recordedAt)
+      ? Number(input.recordedAt)
+      : Number.isFinite(input.recorded_at)
+        ? Number(input.recorded_at)
+        : null
+  const checkpoint = {
+    relayKey: normalizeRelayKeyHex(input.relayKey || input.relay_key || null) || null,
+    systemKey: systemKey || null,
+    systemLength: Number.isFinite(systemLengthRaw) ? Math.trunc(systemLengthRaw) : null,
+    systemSignedLength: Number.isFinite(systemSignedLengthRaw) ? Math.trunc(systemSignedLengthRaw) : null,
+    viewVersion: Number.isFinite(viewVersionRaw) ? Math.trunc(viewVersionRaw) : null,
+    activeWritersHash: activeWritersHash || null,
+    activeWritersCount: Number.isFinite(activeWritersCountRaw) ? Math.max(0, Math.trunc(activeWritersCountRaw)) : null,
+    writerCore: writerCore || null,
+    recordedAt: Number.isFinite(recordedAtRaw) ? Math.trunc(recordedAtRaw) : null
+  }
+  if (
+    !checkpoint.systemKey
+    && checkpoint.systemLength === null
+    && checkpoint.systemSignedLength === null
+    && checkpoint.viewVersion === null
+    && !checkpoint.activeWritersHash
+    && checkpoint.activeWritersCount === null
+    && !checkpoint.writerCore
+  ) {
+    return null
+  }
+  return checkpoint
+}
+
+function summarizeWriterCommitCheckpoint(checkpoint = null) {
+  const normalized = normalizeWriterCommitCheckpoint(checkpoint)
+  if (!normalized) {
+    return {
+      hasCheckpoint: false
+    }
+  }
+  return {
+    hasCheckpoint: true,
+    relayKey: previewValue(normalized.relayKey, 16),
+    systemKey: previewValue(normalized.systemKey, 16),
+    systemLength: normalized.systemLength,
+    systemSignedLength: normalized.systemSignedLength,
+    viewVersion: normalized.viewVersion,
+    activeWritersCount: normalized.activeWritersCount,
+    activeWritersHash: previewValue(normalized.activeWritersHash, 16),
+    writerCore: previewValue(normalized.writerCore, 16),
+    recordedAt: normalized.recordedAt
+  }
 }
 
 function buildFastForwardCheckpoint(relayKey) {
@@ -1514,7 +1865,9 @@ function buildFastForwardCheckpoint(relayKey) {
     key: keyRef,
     length,
     signedLength,
-    source: 'system-core'
+    source: 'system-core',
+    proofSource: 'system-core',
+    proofAuthoritative: false
   }
 }
 
@@ -1673,6 +2026,8 @@ async function ensureOpenJoinWriterPool({
       const writerCore = provision?.writerCore || null
       const writerCoreHex = provision?.writerCoreHex || provision?.autobaseLocal || null
       const writerSecret = provision?.writerSecret || null
+      const writerLeaseId = normalizeWriterLeaseId(provision?.writerLeaseId || null)
+      const writerCommitCheckpoint = normalizeWriterCommitCheckpoint(provision?.writerCommitCheckpoint || null)
       if (!writerCore || !writerSecret) continue
       const issuedAt = Date.now()
       const entry = {
@@ -1680,6 +2035,8 @@ async function ensureOpenJoinWriterPool({
         writerCoreHex,
         autobaseLocal: writerCoreHex,
         writerSecret,
+        writerLeaseId,
+        writerCommitCheckpoint,
         issuedAt
       }
       if (Number.isFinite(OPEN_JOIN_POOL_ENTRY_TTL_MS)) {
@@ -1742,6 +2099,8 @@ function summarizeClosedJoinEntries(entries = [], limit = 3) {
   return entries.slice(0, limit).map((entry) => ({
     writerCore: previewValue(entry?.writerCore, 16),
     writerCoreHex: previewValue(entry?.writerCoreHex || entry?.autobaseLocal, 16),
+    writerLeaseId: previewValue(entry?.writerLeaseId, 24),
+    writerCommitCheckpoint: summarizeWriterCommitCheckpoint(entry?.writerCommitCheckpoint || null),
     issuedAt: entry?.issuedAt ?? null,
     expiresAt: entry?.expiresAt ?? null
   }))
@@ -1912,6 +2271,8 @@ async function ensureClosedJoinWriterPool({
       const writerCore = provision?.writerCore || null
       const writerCoreHex = provision?.writerCoreHex || provision?.autobaseLocal || null
       const writerSecret = provision?.writerSecret || null
+      const writerLeaseId = normalizeWriterLeaseId(provision?.writerLeaseId || null)
+      const writerCommitCheckpoint = normalizeWriterCommitCheckpoint(provision?.writerCommitCheckpoint || null)
       if (!writerCore || !writerSecret) continue
       const issuedAt = Date.now()
       const expiresAt = issuedAt + CLOSED_JOIN_POOL_ENTRY_TTL_MS
@@ -1920,6 +2281,8 @@ async function ensureClosedJoinWriterPool({
         writerCoreHex,
         autobaseLocal: writerCoreHex,
         writerSecret,
+        writerLeaseId,
+        writerCommitCheckpoint,
         issuedAt,
         expiresAt
       }
@@ -2033,12 +2396,16 @@ async function claimClosedJoinWriterPoolEntry({
   }
 }
 
-async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
+async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null, options = {}) {
   if (!relayServer?.getActiveRelays) {
     return { entries: [], relayCount: 0 }
   }
 
   try {
+    const blindPeeringPublicKey = typeof options?.blindPeeringPublicKey === 'string'
+      ? options.blindPeeringPublicKey.trim()
+      : ''
+    const relayBlindPeeringKey = blindPeeringPublicKey || null
     const activeRelays = Array.isArray(precomputedRelays)
       ? precomputedRelays
       : await relayServer.getActiveRelays()
@@ -2078,7 +2445,8 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
         isOpen: isOpen === true,
         isHosted: isHosted === true ? true : isHosted === false ? false : undefined,
         isJoined: isJoined === true ? true : isJoined === false ? false : undefined,
-        metadataUpdatedAt: createdAt || null
+        metadataUpdatedAt: createdAt || null,
+        blindPeeringPublicKey: relayBlindPeeringKey || undefined
       }
 
       const aliasSet = new Set()
@@ -2109,6 +2477,7 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null) {
           isHosted: isHosted === true ? true : isHosted === false ? false : undefined,
           isJoined: isJoined === true ? true : isJoined === false ? false : undefined,
           metadataUpdatedAt: createdAt || null,
+          blindPeeringPublicKey: relayBlindPeeringKey || undefined,
           pathAliases: gatewayPath ? [gatewayPath] : []
         }
         entries.push(aliasMetadata)
@@ -2134,12 +2503,19 @@ async function syncGatewayPeerMetadata(reason = 'unspecified', options = {}) {
 
   try {
     const { relays: precomputedRelays } = options
-    const { entries, relayCount } = await buildGatewayRelayMetadataSnapshot(precomputedRelays)
+    const manager = await ensureBlindPeeringManager().catch(() => null)
+    const blindPeeringPublicKey = typeof manager?.getLocalBlindPeerPublicKey === 'function'
+      ? manager.getLocalBlindPeerPublicKey()
+      : null
+    const { entries, relayCount } = await buildGatewayRelayMetadataSnapshot(precomputedRelays, {
+      blindPeeringPublicKey
+    })
 
     await gatewayService.registerPeerMetadata({
       publicKey: config.swarmPublicKey,
       nostrPubkeyHex: config.nostr_pubkey_hex,
       pfpDriveKey: config.pfpDriveKey,
+      blindPeeringPublicKey: blindPeeringPublicKey || undefined,
       mode: 'hyperswarm',
       address: config.proxy_server_address || `${gatewayOptions.hostname || '127.0.0.1'}:${gatewayOptions.port || 8443}`,
       relays: entries
@@ -2150,7 +2526,8 @@ async function syncGatewayPeerMetadata(reason = 'unspecified', options = {}) {
       owner: config.nostr_pubkey_hex.slice(0, 8),
       pfpDriveKey: config.pfpDriveKey.slice(0, 8),
       relayCount,
-      aliasEntries: Math.max(entries.length - relayCount, 0)
+      aliasEntries: Math.max(entries.length - relayCount, 0),
+      blindPeeringPublicKey: previewValue(blindPeeringPublicKey, 16)
     })
   } catch (error) {
     pendingGatewayMetadataSync = true
@@ -2208,7 +2585,11 @@ async function refreshGatewayRelayRegistry(reason = 'gateway-refresh', options =
   }
 }
 
-async function fetchOpenJoinChallenge(relayIdentifier, { origin, purpose = null } = {}) {
+async function fetchOpenJoinChallenge(relayIdentifier, {
+  origin,
+  purpose = null,
+  traceContext = null
+} = {}) {
   if (!relayIdentifier) {
     return { status: 'skipped', reason: 'missing-relay-identifier' }
   }
@@ -2223,33 +2604,98 @@ async function fetchOpenJoinChallenge(relayIdentifier, { origin, purpose = null 
   const encodedRelay = encodeURIComponent(relayIdentifier)
   const query = purpose ? `?purpose=${encodeURIComponent(purpose)}` : ''
   const url = `${base}/api/relays/${encodedRelay}/open-join/challenge${query}`
+  const { trace, headers: traceHeaders } = buildJoinTraceHeaders(traceContext, {
+    relayIdentifier,
+    route: 'open-join/challenge',
+    purpose
+  })
+  emitJoinGatewayTrace('open-join-challenge-dispatch', trace, {
+    relayIdentifier,
+    gatewayOrigin: base,
+    purpose: purpose || null
+  })
   const controller = typeof AbortController === 'function' ? new AbortController() : null
   const timer = controller
     ? setTimeout(() => controller.abort(), OPEN_JOIN_APPEND_CORES_TIMEOUT_MS)
     : null
   try {
-    const response = await fetchImpl(url, { signal: controller?.signal })
+    const response = await fetchImpl(url, {
+      signal: controller?.signal,
+      headers: traceHeaders
+    })
+    const responseTrace = readGatewayTraceHeaders(response)
     if (!response.ok) {
       let body = null
       try {
         body = await response.text()
       } catch (_) {}
+      emitJoinGatewayTrace('open-join-challenge-response', trace, {
+        relayIdentifier,
+        gatewayOrigin: base,
+        status: 'error',
+        statusCode: response.status,
+        gatewayTraceId: responseTrace.traceId || null,
+        gatewayRequestId: responseTrace.gatewayRequestId || null,
+        responseBodyPreview: body ? body.slice(0, 200) : null
+      }, 'warn')
       return {
         status: 'error',
         reason: `challenge status ${response.status}`,
         origin: base,
-        body: body ? body.slice(0, 200) : null
+        body: body ? body.slice(0, 200) : null,
+        traceId: trace.traceId,
+        gatewayTraceId: responseTrace.traceId || null,
+        gatewayRequestId: responseTrace.gatewayRequestId || null
       }
     }
     const data = await response.json().catch(() => null)
     if (!data || typeof data !== 'object') {
+      emitJoinGatewayTrace('open-join-challenge-response', trace, {
+        relayIdentifier,
+        gatewayOrigin: base,
+        status: 'error',
+        reason: 'challenge-invalid-payload',
+        gatewayTraceId: responseTrace.traceId || null,
+        gatewayRequestId: responseTrace.gatewayRequestId || null
+      }, 'warn')
       return { status: 'error', reason: 'challenge invalid payload', origin: base }
     }
     if (!data?.challenge) {
+      emitJoinGatewayTrace('open-join-challenge-response', trace, {
+        relayIdentifier,
+        gatewayOrigin: base,
+        status: 'error',
+        reason: 'challenge-missing',
+        gatewayTraceId: responseTrace.traceId || null,
+        gatewayRequestId: responseTrace.gatewayRequestId || null
+      }, 'warn')
       return { status: 'error', reason: 'challenge missing', origin: base }
     }
-    return { status: 'ok', origin: base, data }
+    emitJoinGatewayTrace('open-join-challenge-response', trace, {
+      relayIdentifier,
+      gatewayOrigin: base,
+      status: 'ok',
+      challengePrefix: previewValue(data?.challenge, 12),
+      expiresAt: data?.expiresAt || null,
+      gatewayTraceId: responseTrace.traceId || null,
+      gatewayRequestId: responseTrace.gatewayRequestId || null
+    })
+    return {
+      status: 'ok',
+      origin: base,
+      data,
+      traceId: trace.traceId,
+      gatewayTraceId: responseTrace.traceId || null,
+      gatewayRequestId: responseTrace.gatewayRequestId || null
+    }
   } catch (error) {
+    emitJoinGatewayTrace('open-join-challenge-response', trace, {
+      relayIdentifier,
+      gatewayOrigin: base,
+      status: 'error',
+      reason: 'challenge-exception',
+      error: error?.message || String(error)
+    }, 'warn')
     return { status: 'error', reason: error?.message || 'challenge failed', origin: base }
   } finally {
     if (timer) clearTimeout(timer)
@@ -2260,7 +2706,8 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
   publicIdentifier = null,
   cores = [],
   origins = null,
-  reason = 'open-join-append-cores'
+  reason = 'open-join-append-cores',
+  traceContext = null
 } = {}) {
   if (!relayIdentifier) {
     return { status: 'skipped', reason: 'missing-relay-identifier' }
@@ -2272,6 +2719,11 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
   if (typeof fetchImpl !== 'function') {
     return { status: 'skipped', reason: 'fetch-unavailable' }
   }
+  const trace = withJoinTraceContext(traceContext, {
+    relayIdentifier,
+    route: 'open-join/append-cores',
+    purpose: OPEN_JOIN_APPEND_CORES_PURPOSE
+  })
 
   const normalizedEntries = Array.isArray(cores)
     ? cores.map((entry) => normalizeOpenJoinCoreEntry(entry)).filter(Boolean)
@@ -2295,11 +2747,33 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
     origins,
     allowFallback: false
   })
+  emitJoinGatewayTrace('open-join-append-routing', trace, {
+    relayIdentifier,
+    status: routing.directJoinOnly
+      ? 'skipped'
+      : (Array.isArray(routing.origins) && routing.origins.length ? 'ok' : 'error'),
+    directJoinOnly: routing.directJoinOnly === true,
+    origins: Array.isArray(routing.origins) ? routing.origins : [],
+    reason
+  }, routing.directJoinOnly ? 'warn' : 'info')
   if (routing.directJoinOnly) {
+    emitJoinGatewayStage('open-join-append', 'routing', {
+      status: 'skipped',
+      relayIdentifier,
+      reason: 'direct-join-only',
+      traceContext: trace
+    })
     return { status: 'skipped', reason: 'direct-join-only' }
   }
   const originList = routing.origins
   if (!originList.length) {
+    emitJoinGatewayStage('open-join-append', 'routing', {
+      status: 'error',
+      relayIdentifier,
+      reason: 'gateway-unassigned',
+      errorCode: 'gateway-unassigned',
+      traceContext: trace
+    })
     return {
       status: 'error',
       reason: 'gateway-unassigned',
@@ -2313,12 +2787,27 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
   for (const origin of originList) {
     if (!origin) continue
     const base = origin.replace(/\/$/, '')
+    emitJoinGatewayStage('open-join-append', 'challenge-request', {
+      status: 'attempt',
+      relayIdentifier,
+      gatewayOrigin: base,
+      reason,
+      traceContext: trace
+    })
     const challengeResult = await fetchOpenJoinChallenge(relayIdentifier, {
       origin: base,
-      purpose: OPEN_JOIN_APPEND_CORES_PURPOSE
+      purpose: OPEN_JOIN_APPEND_CORES_PURPOSE,
+      traceContext: trace
     })
     if (!challengeResult || challengeResult.status !== 'ok') {
       lastError = new Error(challengeResult?.reason || 'challenge failed')
+      emitJoinGatewayStage('open-join-append', 'challenge-response', {
+        status: 'error',
+        relayIdentifier,
+        gatewayOrigin: base,
+        reason: challengeResult?.reason || 'challenge-failed',
+        traceContext: trace
+      })
       console.warn('[Worker] Open join append challenge failed', {
         relayIdentifier,
         origin: base,
@@ -2330,8 +2819,21 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
     const challenge = challengeData?.challenge || null
     if (!challenge) {
       lastError = new Error('challenge missing')
+      emitJoinGatewayStage('open-join-append', 'challenge-response', {
+        status: 'error',
+        relayIdentifier,
+        gatewayOrigin: base,
+        reason: 'challenge-missing',
+        traceContext: trace
+      })
       continue
     }
+    emitJoinGatewayStage('open-join-append', 'challenge-response', {
+      status: 'ok',
+      relayIdentifier,
+      gatewayOrigin: base,
+      traceContext: trace
+    })
     const resolvedPublicIdentifier = publicIdentifier || challengeData?.publicIdentifier || relayIdentifier
     const tags = [
       ['relay', base],
@@ -2371,6 +2873,11 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
     }
 
     const appendUrl = `${base}/api/relays/${encodedRelay}/open-join/append-cores`
+    const { headers: traceHeaders } = buildJoinTraceHeaders(trace, {
+      relayIdentifier,
+      route: 'open-join/append-cores',
+      purpose: OPEN_JOIN_APPEND_CORES_PURPOSE
+    })
     const payload = {
       authEvent,
       cores: normalizedEntries
@@ -2382,18 +2889,47 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
       ? setTimeout(() => controller.abort(), OPEN_JOIN_APPEND_CORES_TIMEOUT_MS)
       : null
     try {
+      emitJoinGatewayStage('open-join-append', 'request', {
+        status: 'attempt',
+        relayIdentifier,
+        gatewayOrigin: base,
+        reason,
+        traceContext: trace
+      })
       const response = await fetchImpl(appendUrl, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          ...traceHeaders
+        },
         body: JSON.stringify(payload),
         signal: controller?.signal
       })
+      const responseTrace = readGatewayTraceHeaders(response)
       if (!response.ok) {
         let body = null
         try {
           body = await response.text()
         } catch (_) {}
         lastError = new Error(`open-join-append status ${response.status}`)
+        emitJoinGatewayStage('open-join-append', 'response', {
+          status: 'error',
+          relayIdentifier,
+          gatewayOrigin: base,
+          reason: 'open-join-append-status-error',
+          statusCode: response.status,
+          traceContext: trace
+        })
+        emitJoinGatewayTrace('open-join-append-response', trace, {
+          relayIdentifier,
+          gatewayOrigin: base,
+          status: 'error',
+          statusCode: response.status,
+          error: `open-join-append status ${response.status}`,
+          responseBodyPreview: body ? body.slice(0, 200) : null,
+          gatewayTraceId: responseTrace.traceId || null,
+          gatewayRequestId: responseTrace.gatewayRequestId || null
+        }, 'warn')
         console.warn('[Worker] Open join append request failed', {
           relayIdentifier,
           origin: base,
@@ -2405,12 +2941,36 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
       const data = await response.json().catch(() => null)
       if (!data || typeof data !== 'object') {
         lastError = new Error('open-join-append invalid payload')
+        emitJoinGatewayStage('open-join-append', 'response', {
+          status: 'error',
+          relayIdentifier,
+          gatewayOrigin: base,
+          reason: 'open-join-append-invalid-payload',
+          traceContext: trace
+        })
         console.warn('[Worker] Open join append response invalid payload', {
           relayIdentifier,
           origin: base
         })
         continue
       }
+      emitJoinGatewayStage('open-join-append', 'response', {
+        status: 'ok',
+        relayIdentifier,
+        gatewayOrigin: base,
+        traceContext: trace
+      })
+      emitJoinGatewayTrace('open-join-append-response', trace, {
+        relayIdentifier,
+        gatewayOrigin: base,
+        status: 'ok',
+        added: data?.added ?? null,
+        ignored: data?.ignored ?? null,
+        rejected: data?.rejected ?? null,
+        total: data?.total ?? null,
+        gatewayTraceId: responseTrace.traceId || null,
+        gatewayRequestId: responseTrace.gatewayRequestId || null
+      })
       console.log('[Worker] Open join append response', {
         relayIdentifier,
         origin: base,
@@ -2422,6 +2982,21 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
       return { status: 'ok', origin: base, data }
     } catch (error) {
       lastError = error
+      emitJoinGatewayStage('open-join-append', 'response', {
+        status: 'error',
+        relayIdentifier,
+        gatewayOrigin: base,
+        reason: 'open-join-append-exception',
+        error: error?.message || String(error),
+        traceContext: trace
+      })
+      emitJoinGatewayTrace('open-join-append-response', trace, {
+        relayIdentifier,
+        gatewayOrigin: base,
+        status: 'error',
+        reason: 'open-join-append-exception',
+        error: error?.message || String(error)
+      }, 'warn')
       console.warn('[Worker] Open join append request threw', {
         relayIdentifier,
         origin: base,
@@ -2432,6 +3007,13 @@ async function submitOpenJoinAppendCores(relayIdentifier, {
     }
   }
 
+  emitJoinGatewayStage('open-join-append', 'final', {
+    status: 'error',
+    relayIdentifier,
+    reason: reason || 'open-join-append-failed',
+    error: lastError?.message || String(lastError || 'open-join-append-failed'),
+    traceContext: trace
+  })
   return {
     status: 'error',
     reason: reason || 'open-join-append-failed',
@@ -2443,7 +3025,8 @@ async function appendOpenJoinMirrorCores({
   relayKey,
   publicIdentifier = null,
   relayManager = null,
-  reason = 'open-join-append'
+  reason = 'open-join-append',
+  traceContext = null
 } = {}) {
   const relayIdentifier = relayKey || publicIdentifier
   if (!relayIdentifier) {
@@ -2468,11 +3051,51 @@ async function appendOpenJoinMirrorCores({
   return submitOpenJoinAppendCores(relayIdentifier, {
     publicIdentifier: publicIdentifier || manager?.publicIdentifier || null,
     cores: coreEntries,
-    reason
+    reason,
+    traceContext
   })
 }
 
-async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason = 'open-join' } = {}) {
+function emitJoinGatewayStage(route, stage, data = {}) {
+  const traceInput = data && typeof data === 'object' ? data.traceContext || null : null
+  const payload = {
+    ...(data && typeof data === 'object' ? data : {})
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'traceContext')) {
+    delete payload.traceContext
+  }
+  if (traceInput) {
+    const trace = withJoinTraceContext(traceInput, {
+      route: route || traceInput?.route || null,
+      relayIdentifier:
+        payload.relayIdentifier
+        || payload.relayKey
+        || payload.publicIdentifier
+        || traceInput?.relayIdentifier
+        || null
+    })
+    payload.traceId = trace.traceId
+    payload.joinAttemptId = trace.joinAttemptId || null
+    payload.requestId = trace.requestId || null
+  }
+  try {
+    sendMessage({
+      type: 'JOIN_GATEWAY_STAGE',
+      data: {
+        route,
+        stage,
+        ts: Date.now(),
+        ...payload
+      }
+    })
+  } catch (_) {}
+}
+
+async function fetchOpenJoinBootstrap(relayIdentifier, {
+  origins = null,
+  reason = 'open-join',
+  traceContext = null
+} = {}) {
   if (!relayIdentifier) {
     return { status: 'skipped', reason: 'missing-relay-identifier' }
   }
@@ -2483,6 +3106,10 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
   if (typeof fetchImpl !== 'function') {
     return { status: 'skipped', reason: 'fetch-unavailable' }
   }
+  const trace = withJoinTraceContext(traceContext, {
+    relayIdentifier,
+    route: 'open-join/bootstrap'
+  })
 
   const routing = await resolveRelayGatewayRouting({
     relayIdentifier,
@@ -2490,10 +3117,34 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
     allowFallback: false
   })
   if (routing.directJoinOnly) {
+    emitJoinGatewayStage('open-join', 'routing', {
+      status: 'skipped',
+      relayIdentifier,
+      reason: 'direct-join-only',
+      traceContext: trace
+    })
+    emitJoinGatewayTrace('open-join-routing', trace, {
+      relayIdentifier,
+      status: 'skipped',
+      reason: 'direct-join-only'
+    }, 'warn')
     return { status: 'skipped', reason: 'direct-join-only' }
   }
   const originList = routing.origins
   if (!originList.length) {
+    emitJoinGatewayStage('open-join', 'routing', {
+      status: 'error',
+      relayIdentifier,
+      reason: 'gateway-unassigned',
+      errorCode: 'gateway-unassigned',
+      traceContext: trace
+    })
+    emitJoinGatewayTrace('open-join-routing', trace, {
+      relayIdentifier,
+      status: 'error',
+      reason: 'gateway-unassigned',
+      errorCode: 'gateway-unassigned'
+    }, 'warn')
     return {
       status: 'error',
       reason: 'gateway-unassigned',
@@ -2502,11 +3153,25 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
       error: 'No relay-scoped gateway mapping found'
     }
   }
+  emitJoinGatewayStage('open-join', 'routing', {
+    status: 'ok',
+    relayIdentifier,
+    origins: originList,
+    reason,
+    traceContext: trace
+  })
+  emitJoinGatewayTrace('open-join-routing', trace, {
+    relayIdentifier,
+    status: 'ok',
+    origins: originList,
+    reason
+  })
   console.log('[Worker] Open join bootstrap start', {
     relayIdentifier,
     relayIdentifierType: describeRelayIdentifierType(relayIdentifier),
     origins: originList,
-    reason
+    reason,
+    traceId: trace.traceId
   })
   const encodedRelay = encodeURIComponent(relayIdentifier)
   let lastError = null
@@ -2536,13 +3201,33 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
   for (const origin of originList) {
     if (!origin) continue
     const base = origin.replace(/\/$/, '')
+    emitJoinGatewayStage('open-join', 'challenge-request', {
+      status: 'attempt',
+      relayIdentifier,
+      gatewayOrigin: base,
+      reason,
+      traceContext: trace
+    })
+    emitJoinGatewayTrace('open-join-challenge-dispatch', trace, {
+      relayIdentifier,
+      gatewayOrigin: base,
+      reason
+    })
+    const { headers: challengeTraceHeaders } = buildJoinTraceHeaders(trace, {
+      relayIdentifier,
+      route: 'open-join/challenge'
+    })
     const controller = typeof AbortController === 'function' ? new AbortController() : null
     const timer = controller
       ? setTimeout(() => controller.abort(), OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS)
       : null
     try {
       const challengeUrl = `${base}/api/relays/${encodedRelay}/open-join/challenge`
-      const challengeResponse = await fetchImpl(challengeUrl, { signal: controller?.signal })
+      const challengeResponse = await fetchImpl(challengeUrl, {
+        signal: controller?.signal,
+        headers: challengeTraceHeaders
+      })
+      const challengeResponseTrace = readGatewayTraceHeaders(challengeResponse)
       if (!challengeResponse.ok) {
         let body = null
         try {
@@ -2551,6 +3236,26 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
         const errorCode = parseGatewayErrorCode(body)
         lastStatusCode = challengeResponse.status
         lastErrorCode = errorCode || lastErrorCode
+        emitJoinGatewayStage('open-join', 'challenge-response', {
+          status: 'error',
+          relayIdentifier,
+          gatewayOrigin: base,
+          reason: 'challenge-failed',
+          statusCode: challengeResponse.status,
+          errorCode: errorCode || null,
+          traceContext: trace
+        })
+        emitJoinGatewayTrace('open-join-challenge-response', trace, {
+          relayIdentifier,
+          gatewayOrigin: base,
+          status: 'error',
+          reason: 'challenge-failed',
+          statusCode: challengeResponse.status,
+          errorCode: errorCode || null,
+          responseBodyPreview: body ? body.slice(0, 200) : null,
+          gatewayTraceId: challengeResponseTrace.traceId || null,
+          gatewayRequestId: challengeResponseTrace.gatewayRequestId || null
+        }, 'warn')
         console.warn('[Worker] Open join challenge failed', {
           relayIdentifier,
           origin: base,
@@ -2563,6 +3268,21 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
       }
       const challengeData = await challengeResponse.json().catch(() => null)
       if (!challengeData || typeof challengeData !== 'object') {
+        emitJoinGatewayStage('open-join', 'challenge-response', {
+          status: 'error',
+          relayIdentifier,
+          gatewayOrigin: base,
+          reason: 'challenge-invalid-payload',
+          traceContext: trace
+        })
+        emitJoinGatewayTrace('open-join-challenge-response', trace, {
+          relayIdentifier,
+          gatewayOrigin: base,
+          status: 'error',
+          reason: 'challenge-invalid-payload',
+          gatewayTraceId: challengeResponseTrace.traceId || null,
+          gatewayRequestId: challengeResponseTrace.gatewayRequestId || null
+        }, 'warn')
         console.warn('[Worker] Open join challenge invalid payload', {
           relayIdentifier,
           origin: base
@@ -2572,6 +3292,21 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
       }
       const challenge = challengeData?.challenge || null
       if (!challenge) {
+        emitJoinGatewayStage('open-join', 'challenge-response', {
+          status: 'error',
+          relayIdentifier,
+          gatewayOrigin: base,
+          reason: 'challenge-missing',
+          traceContext: trace
+        })
+        emitJoinGatewayTrace('open-join-challenge-response', trace, {
+          relayIdentifier,
+          gatewayOrigin: base,
+          status: 'error',
+          reason: 'challenge-missing',
+          gatewayTraceId: challengeResponseTrace.traceId || null,
+          gatewayRequestId: challengeResponseTrace.gatewayRequestId || null
+        }, 'warn')
         console.warn('[Worker] Open join challenge missing', {
           relayIdentifier,
           origin: base
@@ -2581,6 +3316,22 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
       }
 
       const publicIdentifier = challengeData?.publicIdentifier || relayIdentifier
+      emitJoinGatewayStage('open-join', 'challenge-response', {
+        status: 'ok',
+        relayIdentifier,
+        gatewayOrigin: base,
+        publicIdentifier: publicIdentifier || null,
+        traceContext: trace
+      })
+      emitJoinGatewayTrace('open-join-challenge-response', trace, {
+        relayIdentifier,
+        gatewayOrigin: base,
+        status: 'ok',
+        publicIdentifier,
+        expiresAt: challengeData?.expiresAt || null,
+        gatewayTraceId: challengeResponseTrace.traceId || null,
+        gatewayRequestId: challengeResponseTrace.gatewayRequestId || null
+      })
       console.log('[Worker] Open join challenge ok', {
         relayIdentifier,
         origin: base,
@@ -2624,6 +3375,21 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
           sigPrefix: authEvent?.sig ? String(authEvent.sig).slice(0, 12) : null
         })
       }
+      emitJoinGatewayStage('open-join', 'auth-event', {
+        status: authVerified === false ? 'error' : 'ok',
+        relayIdentifier,
+        gatewayOrigin: base,
+        verified: authVerified,
+        traceContext: trace
+      })
+      emitJoinGatewayTrace('open-join-auth-event', trace, {
+        relayIdentifier,
+        gatewayOrigin: base,
+        status: authVerified === false ? 'error' : 'ok',
+        verified: authVerified,
+        authEventId: previewValue(authEvent?.id, 16),
+        authPubkey: previewValue(authEvent?.pubkey, 16)
+      }, authVerified === false ? 'warn' : 'info')
       console.log('[Worker] Open join auth event signed', {
         relayIdentifier,
         origin: base,
@@ -2635,31 +3401,106 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
       })
 
       const joinUrl = `${base}/api/relays/${encodedRelay}/open-join`
+      const { headers: joinTraceHeaders } = buildJoinTraceHeaders(trace, {
+        relayIdentifier,
+        route: 'open-join/request'
+      })
+      emitJoinGatewayStage('open-join', 'request', {
+        status: 'attempt',
+        relayIdentifier,
+        gatewayOrigin: base,
+        traceContext: trace
+      })
       const joinResponse = await fetchImpl(joinUrl, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          ...joinTraceHeaders
+        },
         body: JSON.stringify({ authEvent })
       })
+      const joinResponseTrace = readGatewayTraceHeaders(joinResponse)
       if (!joinResponse.ok) {
         let body = null
+        let bodyJson = null
         try {
           body = await joinResponse.text()
         } catch (_) {}
+        if (body) {
+          try {
+            bodyJson = JSON.parse(body)
+          } catch (_) {}
+        }
         const errorCode = parseGatewayErrorCode(body)
+        const writerDurabilityAtServe = bodyJson?.writerDurabilityAtServe ?? bodyJson?.writer_durability_at_serve ?? null
+        const writerDurabilityReason = bodyJson?.writerDurabilityReason || bodyJson?.writer_durability_reason || null
+        const writerDurabilityProofSource = bodyJson?.writerDurabilityProofSource
+          || bodyJson?.writer_durability_proof_source
+          || null
+        const writerDurabilityProofAuthoritative =
+          bodyJson?.writerDurabilityProofAuthoritative === true
+          || bodyJson?.writer_durability_proof_authoritative === true
         lastStatusCode = joinResponse.status
         lastErrorCode = errorCode || lastErrorCode
+        emitJoinGatewayStage('open-join', 'response', {
+          status: 'error',
+          relayIdentifier,
+          gatewayOrigin: base,
+          reason: 'open-join-request-failed',
+          statusCode: joinResponse.status,
+          errorCode: errorCode || null,
+          writerDurabilityAtServe,
+          writerDurabilityReason,
+          writerDurabilityProofSource,
+          writerDurabilityProofAuthoritative,
+          traceContext: trace
+        })
+        emitJoinGatewayTrace('open-join-response', trace, {
+          relayIdentifier,
+          gatewayOrigin: base,
+          status: 'error',
+          reason: 'open-join-request-failed',
+          statusCode: joinResponse.status,
+          errorCode: errorCode || null,
+          responseBodyPreview: body ? body.slice(0, 200) : null,
+          writerDurabilityAtServe,
+          writerDurabilityReason,
+          writerDurabilityProofSource,
+          writerDurabilityProofAuthoritative,
+          gatewayTraceId: joinResponseTrace.traceId || null,
+          gatewayRequestId: joinResponseTrace.gatewayRequestId || null
+        }, 'warn')
         console.warn('[Worker] Open join request failed', {
           relayIdentifier,
           origin: base,
           status: joinResponse.status,
           body: body ? body.slice(0, 200) : null,
-          errorCode
+          errorCode,
+          writerDurabilityAtServe,
+          writerDurabilityReason,
+          writerDurabilityProofSource,
+          writerDurabilityProofAuthoritative
         })
         lastError = new Error(`open-join status ${joinResponse.status}`)
         continue
       }
       const data = await joinResponse.json().catch(() => null)
       if (!data || typeof data !== 'object') {
+        emitJoinGatewayStage('open-join', 'response', {
+          status: 'error',
+          relayIdentifier,
+          gatewayOrigin: base,
+          reason: 'open-join-invalid-payload',
+          traceContext: trace
+        })
+        emitJoinGatewayTrace('open-join-response', trace, {
+          relayIdentifier,
+          gatewayOrigin: base,
+          status: 'error',
+          reason: 'open-join-invalid-payload',
+          gatewayTraceId: joinResponseTrace.traceId || null,
+          gatewayRequestId: joinResponseTrace.gatewayRequestId || null
+        }, 'warn')
         console.warn('[Worker] Open join response invalid payload', {
           relayIdentifier,
           origin: base
@@ -2668,21 +3509,91 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
         continue
       }
       const dataBlindPeer = data.blindPeer || data.blind_peer || null
+      const writerLeaseId = normalizeWriterLeaseId(data.writerLeaseId || data.writer_lease_id || null)
+      const writerCommitCheckpoint = normalizeWriterCommitCheckpoint(
+        data.writerCommitCheckpoint || data.writer_commit_checkpoint || null
+      )
+      const writerDurabilityAtServe = data.writerDurabilityAtServe ?? data.writer_durability_at_serve ?? null
+      const writerDurabilityReason = data.writerDurabilityReason || data.writer_durability_reason || null
+      const writerDurabilityProofSource = data.writerDurabilityProofSource
+        || data.writer_durability_proof_source
+        || null
+      const writerDurabilityProofAuthoritative =
+        data.writerDurabilityProofAuthoritative === true
+        || data.writer_durability_proof_authoritative === true
+      emitJoinGatewayStage('open-join', 'response', {
+        status: 'ok',
+        relayIdentifier,
+        gatewayOrigin: base,
+        relayKeyPrefix: previewValue(data.relayKey || data.relay_key, 16),
+        hasWriterCore: !!(data.writerCore || data.writer_core),
+        hasWriterCoreHex: !!(data.writerCoreHex || data.writer_core_hex),
+        writerCorePrefix: previewValue(data.writerCore || data.writer_core, 16),
+        writerCoreHexPrefix: previewValue(
+          data.writerCoreHex || data.writer_core_hex || data.autobaseLocal || data.autobase_local,
+          16
+        ),
+        hasWriterSecret: !!(data.writerSecret || data.writer_secret),
+        hasWriterLeaseId: !!writerLeaseId,
+        writerLeaseId: writerLeaseId || null,
+        writerLeaseIdPrefix: previewValue(writerLeaseId, 24),
+        hasWriterCommitCheckpoint: !!writerCommitCheckpoint,
+        writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
+        writerDurabilityAtServe,
+        writerDurabilityReason,
+        writerDurabilityProofSource,
+        writerDurabilityProofAuthoritative,
+        hasBlindPeer: !!dataBlindPeer?.publicKey,
+        traceContext: trace
+      })
+      emitJoinGatewayTrace('open-join-response', trace, {
+        relayIdentifier,
+        gatewayOrigin: base,
+        status: 'ok',
+        relayKeyPrefix: previewValue(data.relayKey || data.relay_key, 16),
+        hasWriterCore: !!(data.writerCore || data.writer_core),
+        hasWriterCoreHex: !!(data.writerCoreHex || data.writer_core_hex),
+        writerCorePrefix: previewValue(data.writerCore || data.writer_core, 16),
+        writerCoreHexPrefix: previewValue(
+          data.writerCoreHex || data.writer_core_hex || data.autobaseLocal || data.autobase_local,
+          16
+        ),
+        writerSecretLen: (data.writerSecret || data.writer_secret)
+          ? String(data.writerSecret || data.writer_secret).length
+          : 0,
+        hasWriterLeaseId: !!writerLeaseId,
+        writerLeaseId: writerLeaseId || null,
+        writerLeaseIdPrefix: previewValue(writerLeaseId, 24),
+        hasWriterCommitCheckpoint: !!writerCommitCheckpoint,
+        writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
+        writerDurabilityAtServe,
+        writerDurabilityReason,
+        writerDurabilityProofSource,
+        writerDurabilityProofAuthoritative,
+        gatewayTraceId: joinResponseTrace.traceId || null,
+        gatewayRequestId: joinResponseTrace.gatewayRequestId || null
+      })
       console.log('[Worker] Open join bootstrap response', {
         relayIdentifier,
         origin: base,
         relayKey: previewValue(data.relayKey || data.relay_key, 16),
         relayKeyType: describeRelayIdentifierType(data.relayKey || data.relay_key),
         publicIdentifier: data.publicIdentifier || data.public_identifier || null,
-        hasWriterCore: !!data.writerCore,
+        hasWriterCore: !!(data.writerCore || data.writer_core),
         hasWriterCoreHex: !!(data.writerCoreHex || data.writer_core_hex),
         hasAutobaseLocal: !!(data.autobaseLocal || data.autobase_local),
-        writerCorePrefix: previewValue(data.writerCore, 16),
+        writerCorePrefix: previewValue(data.writerCore || data.writer_core, 16),
         writerCoreHexPrefix: previewValue(
           data.writerCoreHex || data.writer_core_hex || data.autobaseLocal || data.autobase_local,
           16
         ),
-        writerSecretLen: data.writerSecret ? String(data.writerSecret).length : 0,
+        writerSecretLen: (data.writerSecret || data.writer_secret) ? String(data.writerSecret || data.writer_secret).length : 0,
+        writerLeaseId: previewValue(writerLeaseId, 24),
+        writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
+        writerDurabilityAtServe,
+        writerDurabilityReason,
+        writerDurabilityProofSource,
+        writerDurabilityProofAuthoritative,
         coreRefsCount: Array.isArray(data.cores) ? data.cores.length : 0,
         blindPeerKey: previewValue(dataBlindPeer?.publicKey, 16),
         blindPeerHasEncryptionKey: !!dataBlindPeer?.encryptionKey,
@@ -2696,11 +3607,43 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
       }
     } catch (error) {
       lastError = error
+      emitJoinGatewayStage('open-join', 'exception', {
+        status: 'error',
+        relayIdentifier,
+        gatewayOrigin: base,
+        reason: 'open-join-exception',
+        error: error?.message || String(error),
+        traceContext: trace
+      })
+      emitJoinGatewayTrace('open-join-exception', trace, {
+        relayIdentifier,
+        gatewayOrigin: base,
+        status: 'error',
+        reason: 'open-join-exception',
+        error: error?.message || String(error)
+      }, 'warn')
     } finally {
       if (timer) clearTimeout(timer)
     }
   }
 
+  emitJoinGatewayStage('open-join', 'final', {
+    status: 'error',
+    relayIdentifier,
+    reason: reason || 'open-join-failed',
+    error: lastError?.message || String(lastError || 'open-join-failed'),
+    errorCode: lastErrorCode || null,
+    statusCode: Number.isFinite(lastStatusCode) ? lastStatusCode : null,
+    traceContext: trace
+  })
+  emitJoinGatewayTrace('open-join-final', trace, {
+    relayIdentifier,
+    status: 'error',
+    reason: reason || 'open-join-failed',
+    error: lastError?.message || String(lastError || 'open-join-failed'),
+    errorCode: lastErrorCode || null,
+    statusCode: Number.isFinite(lastStatusCode) ? lastStatusCode : null
+  }, 'warn')
   return {
     status: 'error',
     reason: reason || 'open-join-failed',
@@ -2710,7 +3653,11 @@ async function fetchOpenJoinBootstrap(relayIdentifier, { origins = null, reason 
   }
 }
 
-async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mirror-refresh' } = {}) {
+async function fetchRelayMirrorMetadata(relayKey, {
+  origins = null,
+  reason = 'mirror-refresh',
+  traceContext = null
+} = {}) {
   if (!relayKey) {
     return { status: 'skipped', reason: 'missing-relay-key' }
   }
@@ -2719,6 +3666,10 @@ async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mi
   if (typeof fetchImpl !== 'function') {
     return { status: 'skipped', reason: 'fetch-unavailable' }
   }
+  const trace = withJoinTraceContext(traceContext, {
+    relayIdentifier: relayKey,
+    route: 'mirror'
+  })
 
   const routing = await resolveRelayGatewayRouting({
     relayIdentifier: relayKey,
@@ -2727,10 +3678,34 @@ async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mi
     allowFallback: false
   })
   if (routing.directJoinOnly) {
+    emitJoinGatewayStage('mirror', 'routing', {
+      status: 'skipped',
+      relayKey,
+      reason: 'direct-join-only',
+      traceContext: trace
+    })
+    emitJoinGatewayTrace('mirror-routing', trace, {
+      relayKey,
+      status: 'skipped',
+      reason: 'direct-join-only'
+    }, 'warn')
     return { status: 'skipped', reason: 'direct-join-only' }
   }
   const originList = routing.origins
   if (!originList.length) {
+    emitJoinGatewayStage('mirror', 'routing', {
+      status: 'error',
+      relayKey,
+      reason: 'gateway-unassigned',
+      errorCode: 'gateway-unassigned',
+      traceContext: trace
+    })
+    emitJoinGatewayTrace('mirror-routing', trace, {
+      relayKey,
+      status: 'error',
+      reason: 'gateway-unassigned',
+      errorCode: 'gateway-unassigned'
+    }, 'warn')
     return {
       status: 'error',
       reason: 'gateway-unassigned',
@@ -2738,12 +3713,37 @@ async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mi
       error: new Error('No relay-scoped gateway mapping found')
     }
   }
+  emitJoinGatewayStage('mirror', 'routing', {
+    status: 'ok',
+    relayKey,
+    origins: originList,
+    reason,
+    traceContext: trace
+  })
+  emitJoinGatewayTrace('mirror-routing', trace, {
+    relayKey,
+    status: 'ok',
+    origins: originList,
+    reason
+  })
   const encodedRelay = encodeURIComponent(relayKey)
   let lastError = null
 
   for (const origin of originList) {
     if (!origin) continue
-    const url = `${origin.replace(/\/$/, '')}/api/relays/${encodedRelay}/mirror`
+    const base = origin.replace(/\/$/, '')
+    const url = `${base}/api/relays/${encodedRelay}/mirror`
+    const { headers: mirrorTraceHeaders } = buildJoinTraceHeaders(trace, {
+      relayIdentifier: relayKey,
+      route: 'mirror/request'
+    })
+    emitJoinGatewayStage('mirror', 'request', {
+      status: 'attempt',
+      relayKey,
+      gatewayOrigin: base,
+      reason,
+      traceContext: trace
+    })
     const controller = typeof AbortController === 'function' ? new AbortController() : null
     const timer = controller
       ? setTimeout(() => controller.abort(), BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS)
@@ -2753,37 +3753,121 @@ async function fetchRelayMirrorMetadata(relayKey, { origins = null, reason = 'mi
         relayKey,
         relayKeyType,
         origin,
-        reason
+        reason,
+        traceId: trace.traceId
       })
-      const response = await fetchImpl(url, { signal: controller?.signal })
+      const response = await fetchImpl(url, {
+        signal: controller?.signal,
+        headers: mirrorTraceHeaders
+      })
+      const responseTrace = readGatewayTraceHeaders(response)
       if (!response.ok) {
+        emitJoinGatewayStage('mirror', 'response', {
+          status: 'error',
+          relayKey,
+          gatewayOrigin: base,
+          reason: 'mirror-status-error',
+          statusCode: response.status,
+          traceContext: trace
+        })
+        emitJoinGatewayTrace('mirror-response', trace, {
+          relayKey,
+          gatewayOrigin: base,
+          status: 'error',
+          reason: 'mirror-status-error',
+          statusCode: response.status,
+          gatewayTraceId: responseTrace.traceId || null,
+          gatewayRequestId: responseTrace.gatewayRequestId || null
+        }, 'warn')
         lastError = new Error(`status ${response.status}`)
         continue
       }
       const data = await response.json().catch(() => null)
       if (!data || typeof data !== 'object') {
+        emitJoinGatewayStage('mirror', 'response', {
+          status: 'error',
+          relayKey,
+          gatewayOrigin: base,
+          reason: 'mirror-invalid-payload',
+          traceContext: trace
+        })
+        emitJoinGatewayTrace('mirror-response', trace, {
+          relayKey,
+          gatewayOrigin: base,
+          status: 'error',
+          reason: 'mirror-invalid-payload',
+          gatewayTraceId: responseTrace.traceId || null,
+          gatewayRequestId: responseTrace.gatewayRequestId || null
+        }, 'warn')
         lastError = new Error('invalid-payload')
         continue
       }
       const mirrorBlindPeer = data.blindPeer || data.blind_peer || null
+      emitJoinGatewayStage('mirror', 'response', {
+        status: 'ok',
+        relayKey,
+        gatewayOrigin: base,
+        hasBlindPeer: !!mirrorBlindPeer?.publicKey,
+        coreRefsCount: Array.isArray(data.cores) ? data.cores.length : 0,
+        traceContext: trace
+      })
+      emitJoinGatewayTrace('mirror-response', trace, {
+        relayKey,
+        gatewayOrigin: base,
+        status: 'ok',
+        resolvedRelayKey: previewValue(data.relayKey || data.relay_key, 16),
+        publicIdentifier: data.publicIdentifier || data.public_identifier || null,
+        coreRefsCount: Array.isArray(data.cores) ? data.cores.length : 0,
+        hasBlindPeer: !!mirrorBlindPeer?.publicKey,
+        gatewayTraceId: responseTrace.traceId || null,
+        gatewayRequestId: responseTrace.gatewayRequestId || null
+      })
       console.log('[Worker] Mirror metadata response', {
         relayKey,
-        origin,
+        origin: base,
         resolvedRelayKey: previewValue(data.relayKey || data.relay_key, 16),
         publicIdentifier: data.publicIdentifier || data.public_identifier || null,
         coreRefsCount: Array.isArray(data.cores) ? data.cores.length : 0,
         blindPeerKey: previewValue(mirrorBlindPeer?.publicKey, 16),
         blindPeerHasEncryptionKey: !!mirrorBlindPeer?.encryptionKey
       })
-      return { status: 'ok', origin, data }
+      return { status: 'ok', origin: base, data }
     } catch (error) {
       lastError = error
+      emitJoinGatewayStage('mirror', 'response', {
+        status: 'error',
+        relayKey,
+        gatewayOrigin: base,
+        reason: 'mirror-exception',
+        error: error?.message || String(error),
+        traceContext: trace
+      })
+      emitJoinGatewayTrace('mirror-response', trace, {
+        relayKey,
+        gatewayOrigin: base,
+        status: 'error',
+        reason: 'mirror-exception',
+        error: error?.message || String(error)
+      }, 'warn')
     } finally {
       if (timer) clearTimeout(timer)
     }
   }
 
   if (lastError) {
+    emitJoinGatewayStage('mirror', 'final', {
+      status: 'error',
+      relayKey,
+      reason: 'mirror-unavailable',
+      error: lastError?.message || String(lastError),
+      traceContext: trace
+    })
+    emitJoinGatewayTrace('mirror-final', trace, {
+      relayKey,
+      status: 'error',
+      reason: 'mirror-unavailable',
+      error: lastError?.message || String(lastError)
+    }, 'warn')
     console.warn('[Worker] Mirror metadata fetch failed', {
       relayKey,
       reason,
@@ -2797,7 +3881,8 @@ async function fetchAndApplyRelayMirrorMetadata({
   relayKey,
   publicIdentifier = null,
   reason = 'auto-connect',
-  origins = null
+  origins = null,
+  traceContext = null
 } = {}) {
   if (!relayKey) {
     return { status: 'skipped', reason: 'missing-relay-key' }
@@ -2820,7 +3905,11 @@ async function fetchAndApplyRelayMirrorMetadata({
     }
   }
   const originList = routing.origins
-  const mirrorResult = await fetchRelayMirrorMetadata(relayKey, { origins: originList, reason })
+  const mirrorResult = await fetchRelayMirrorMetadata(relayKey, {
+    origins: originList,
+    reason,
+    traceContext
+  })
   if (mirrorResult.status !== 'ok') {
     return {
       status: 'error',
@@ -3007,7 +4096,15 @@ async function refreshRelayMirrorMetadata(reason = 'periodic') {
 
     for (const relayKey of relayKeys) {
       const publicIdentifier = keyToPublic.get(relayKey) || null
-      const mirrorResult = await fetchRelayMirrorMetadata(relayKey, { reason })
+      const mirrorResult = await fetchRelayMirrorMetadata(relayKey, {
+        reason,
+        traceContext: withJoinTraceContext({
+          traceId: `mirror-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`,
+          relayIdentifier: relayKey,
+          route: 'mirror/periodic',
+          source: 'worker-mirror-refresh'
+        })
+      })
       if (mirrorResult.status !== 'ok') {
         summary.failed += 1
         continue
@@ -3092,8 +4189,16 @@ async function ensureBlindPeeringManager(runtime = {}) {
 
 async function seedBlindPeeringMirrors(manager) {
   if (!manager?.started) return
+  let mirroredRelays = 0
+  let mirroredDrives = 0
+  if (typeof manager.logTransportSnapshot === 'function') {
+    manager.logTransportSnapshot('seed-start', {
+      reason: 'seed-blind-peering-mirrors'
+    }, 'debug')
+  }
   const localDrive = getLocalDrive()
   if (config?.driveKey && localDrive) {
+    mirroredDrives += 1
     manager.ensureHyperdriveMirror({
       identifier: config.driveKey,
       driveKey: config.driveKey,
@@ -3103,6 +4208,7 @@ async function seedBlindPeeringMirrors(manager) {
   }
   const pfpDriveInstance = getPfpDrive()
   if (config?.pfpDriveKey && pfpDriveInstance) {
+    mirroredDrives += 1
     manager.ensureHyperdriveMirror({
       identifier: config.pfpDriveKey,
       driveKey: config.pfpDriveKey,
@@ -3113,6 +4219,7 @@ async function seedBlindPeeringMirrors(manager) {
   }
   for (const [relayKey, relayManager] of activeRelays.entries()) {
     if (!relayManager?.relay) continue
+    mirroredRelays += 1
     const storedCoreRefs = await resolveRelayMirrorCoreRefs(
       relayKey,
       relayManager?.publicIdentifier || null
@@ -3126,6 +4233,12 @@ async function seedBlindPeeringMirrors(manager) {
     })
     attachRelayMirrorHooks(relayKey, relayManager, manager)
   }
+  if (typeof manager.logTransportSnapshot === 'function') {
+    manager.logTransportSnapshot('seed-complete', {
+      mirroredRelays,
+      mirroredDrives
+    })
+  }
 }
 
 function attachRelayMirrorHooks(relayKey, relayManager, manager) {
@@ -3133,34 +4246,100 @@ function attachRelayMirrorHooks(relayKey, relayManager, manager) {
   const autobase = relayManager?.relay
   if (!autobase || typeof autobase.on !== 'function') return
   if (relayMirrorSubscriptions.has(autobase)) return
-  const handler = () => {
-    Promise.resolve(resolveRelayMirrorCoreRefs(
-      relayKey,
-      relayManager?.publicIdentifier || null
-    ))
-      .then((coreRefs) => {
-        manager.ensureRelayMirror({
-          relayKey,
-          publicIdentifier: relayManager?.publicIdentifier || null,
-          autobase,
-          coreRefs,
-          corestore: relayManager?.store || null
-        })
-        return manager.refreshFromBlindPeers('relay-update')
-          .then(() => manager.rehydrateMirrors({
-            reason: 'relay-update',
-            timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
-          }))
+  let timer = null
+  let inflight = false
+  let pending = false
+  let disposed = false
+  let lastRunAt = 0
+  let lastCoreFingerprint = null
+
+  const runSync = async () => {
+    if (disposed || !manager?.started) return
+    if (inflight) {
+      pending = true
+      return
+    }
+    inflight = true
+    try {
+      const coreRefs = await resolveRelayMirrorCoreRefs(
+        relayKey,
+        relayManager?.publicIdentifier || null
+      )
+      const normalizedRefs = Array.from(new Set(
+        (Array.isArray(coreRefs) ? coreRefs : [])
+          .filter((value) => typeof value === 'string' && value.trim().length > 0)
+      )).sort()
+      const fingerprint = normalizedRefs.join(',')
+      const refsChanged = fingerprint !== lastCoreFingerprint
+      const elapsedSinceLast = lastRunAt > 0 ? Date.now() - lastRunAt : Number.POSITIVE_INFINITY
+
+      manager.ensureRelayMirror({
+        relayKey,
+        publicIdentifier: relayManager?.publicIdentifier || null,
+        autobase,
+        coreRefs,
+        corestore: relayManager?.store || null
       })
-      .catch((error) => {
-        manager.logger?.warn?.('[BlindPeering] Relay update sync failed', {
+
+      if (!refsChanged && elapsedSinceLast < RELAY_MIRROR_UPDATE_MIN_INTERVAL_MS) {
+        manager.logger?.debug?.('[BlindPeering] Relay update sync throttled (no core-ref changes)', {
+          relayKey,
+          elapsedSinceLast,
+          minIntervalMs: RELAY_MIRROR_UPDATE_MIN_INTERVAL_MS
+        })
+      } else {
+        await manager.refreshFromBlindPeers('relay-update')
+        await manager.rehydrateMirrors({
+          reason: 'relay-update',
+          timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+        })
+        lastCoreFingerprint = fingerprint
+        lastRunAt = Date.now()
+      }
+    } catch (error) {
+      manager.logger?.warn?.('[BlindPeering] Relay update sync failed', {
+        relayKey,
+        err: error?.message || error
+      })
+    } finally {
+      inflight = false
+      if (pending && !disposed) {
+        pending = false
+        scheduleSync(0)
+      }
+    }
+  }
+
+  const scheduleSync = (delayMs = RELAY_MIRROR_UPDATE_DEBOUNCE_MS) => {
+    if (disposed || !manager?.started) return
+    pending = true
+    if (timer || inflight) return
+    const runDelay = Number.isFinite(delayMs) ? Math.max(0, Math.trunc(delayMs)) : RELAY_MIRROR_UPDATE_DEBOUNCE_MS
+    timer = setTimeout(() => {
+      timer = null
+      if (!pending || disposed) return
+      pending = false
+      runSync().catch((error) => {
+        manager.logger?.warn?.('[BlindPeering] Relay update sync scheduling failed', {
           relayKey,
           err: error?.message || error
         })
       })
+    }, runDelay)
+    timer.unref?.()
+  }
+
+  const handler = () => {
+    scheduleSync()
   }
   autobase.on('update', handler)
   relayMirrorSubscriptions.set(autobase, () => {
+    disposed = true
+    pending = false
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
     if (typeof autobase.off === 'function') {
       autobase.off('update', handler)
     } else if (typeof autobase.removeListener === 'function') {
@@ -3279,6 +4458,16 @@ async function startGatewayService(options = {}) {
           blindPeerMaxBytes: blindPeerState.maxBytes ?? previousSettings.blindPeerMaxBytes ?? null
         }
 
+        console.log('[Worker] Public gateway blind-peer status update', {
+          enabled: publicGatewaySettings.blindPeerEnabled === true,
+          running: summary?.running === true,
+          remoteKeys: remoteKeys.length,
+          manualKeys: manualKeys.length,
+          trackedCores: Number.isFinite(summary?.metadataTracked) ? Number(summary.metadataTracked) : null,
+          trustedPeerCount: Number.isFinite(summary?.trustedPeerCount) ? Number(summary.trustedPeerCount) : null,
+          publicKey: previewValue(summary?.publicKey, 16)
+        })
+
         const manager = await ensureBlindPeeringManager()
         manager.configure(publicGatewaySettings)
         manager.markTrustedMirrors(remoteKeys)
@@ -3295,26 +4484,45 @@ async function startGatewayService(options = {}) {
         const fingerprint = summary?.enabled
           ? `${summary.publicKey || ''}:${summary.encryptionKey || ''}:${summary.trustedPeerCount ?? remoteKeys.length}:${keysFingerprint}`
           : 'disabled'
+        const fingerprintChanged = fingerprint !== lastBlindPeerFingerprint
+        const dispatcherChanged = dispatcherFingerprint !== lastDispatcherAssignmentFingerprint
 
-          if (manager.enabled && !manager.started) {
-            await manager.start({
-              corestore: getCorestore(),
-              wakeup: null,
-              swarmKeyPair: deriveSwarmKeyPair(config)
+        if (manager.enabled && !manager.started) {
+          await manager.start({
+            corestore: getCorestore(),
+            wakeup: null,
+            swarmKeyPair: deriveSwarmKeyPair(config)
+          })
+          await seedBlindPeeringMirrors(manager)
+          await manager.refreshFromBlindPeers('status-sync')
+          await manager.rehydrateMirrors({
+            reason: 'status-sync',
+            timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+          })
+          if (typeof manager.logTransportSnapshot === 'function') {
+            manager.logTransportSnapshot('status-sync-started', {
+              fingerprint: previewValue(fingerprint, 24),
+              remoteKeys: remoteKeys.map((key) => previewValue(key, 16))
             })
-            await seedBlindPeeringMirrors(manager)
-            await manager.refreshFromBlindPeers('status-sync')
-            await manager.rehydrateMirrors({
-              reason: 'status-sync',
-              timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+          }
+          lastBlindPeerFingerprint = fingerprint
+          lastDispatcherAssignmentFingerprint = dispatcherFingerprint
+        } else if (manager.enabled && manager.started) {
+          if (fingerprintChanged) {
+            console.log('[Worker] Blind peering fingerprint changed', {
+              previous: previewValue(lastBlindPeerFingerprint, 24),
+              next: previewValue(fingerprint, 24),
+              remoteKeys: remoteKeys.map((key) => previewValue(key, 16)),
+              manualKeys: manualKeys.map((key) => previewValue(key, 16))
             })
             lastBlindPeerFingerprint = fingerprint
-            lastDispatcherAssignmentFingerprint = dispatcherFingerprint
-          } else if (manager.enabled && manager.started) {
-            if (fingerprint !== lastBlindPeerFingerprint) {
-              lastBlindPeerFingerprint = fingerprint
-              try {
-                await manager.refreshFromBlindPeers('status-sync')
+            try {
+              await seedBlindPeeringMirrors(manager)
+            } catch (seedErr) {
+              console.warn('[Worker] Blind peering mirror reseed failed (fingerprint update):', seedErr?.message || seedErr)
+            }
+            try {
+              await manager.refreshFromBlindPeers('status-sync')
             } catch (error) {
               console.warn('[Worker] Blind peering refresh failed on status update:', error?.message || error)
             }
@@ -3323,37 +4531,43 @@ async function startGatewayService(options = {}) {
               timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
             }).catch((error) => {
               console.warn('[Worker] Blind peering rehydration failed after status update:', error?.message || error)
+            })
+            if (typeof manager.logTransportSnapshot === 'function') {
+              manager.logTransportSnapshot('status-sync-fingerprint-change', {
+                fingerprint: previewValue(fingerprint, 24),
+                trackedCores: Number.isFinite(summary?.metadataTracked) ? Number(summary.metadataTracked) : null
               })
             }
-            if (dispatcherFingerprint !== lastDispatcherAssignmentFingerprint) {
-              lastDispatcherAssignmentFingerprint = dispatcherFingerprint
-              try {
-                await seedBlindPeeringMirrors(manager)
-              } catch (seedErr) {
-                console.warn('[Worker] Blind peering mirror seeding failed (dispatcher update):', seedErr?.message || seedErr)
-              }
-              try {
-                await manager.refreshFromBlindPeers('dispatcher-assignment')
-              } catch (refreshErr) {
-                console.warn('[Worker] Blind peering refresh failed on dispatcher update:', refreshErr?.message || refreshErr)
-              }
-              manager.rehydrateMirrors({
-                reason: 'dispatcher-assignment',
-                timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
-              }).catch((error) => {
-                console.warn('[Worker] Blind peering rehydration failed after dispatcher update:', error?.message || error)
-              })
-            }
-          } else if (!manager.enabled && manager.started) {
-            try {
-              await manager.clearAllMirrors({ reason: 'status-disabled' })
-            } catch (error) {
-              console.warn('[Worker] Failed to clear blind peering mirrors before shutdown:', error?.message || error)
-            }
-            await manager.stop()
-            lastBlindPeerFingerprint = fingerprint
-            lastDispatcherAssignmentFingerprint = dispatcherFingerprint
           }
+          if (dispatcherChanged) {
+            lastDispatcherAssignmentFingerprint = dispatcherFingerprint
+            try {
+              await seedBlindPeeringMirrors(manager)
+            } catch (seedErr) {
+              console.warn('[Worker] Blind peering mirror seeding failed (dispatcher update):', seedErr?.message || seedErr)
+            }
+            try {
+              await manager.refreshFromBlindPeers('dispatcher-assignment')
+            } catch (refreshErr) {
+              console.warn('[Worker] Blind peering refresh failed on dispatcher update:', refreshErr?.message || refreshErr)
+            }
+            manager.rehydrateMirrors({
+              reason: 'dispatcher-assignment',
+              timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS
+            }).catch((error) => {
+              console.warn('[Worker] Blind peering rehydration failed after dispatcher update:', error?.message || error)
+            })
+          }
+        } else if (!manager.enabled && manager.started) {
+          try {
+            await manager.clearAllMirrors({ reason: 'status-disabled' })
+          } catch (error) {
+            console.warn('[Worker] Failed to clear blind peering mirrors before shutdown:', error?.message || error)
+          }
+          await manager.stop()
+          lastBlindPeerFingerprint = fingerprint
+          lastDispatcherAssignmentFingerprint = dispatcherFingerprint
+        }
       } catch (error) {
         console.warn('[Worker] Failed to reconcile blind peering manager from status update:', error?.message || error)
       }
@@ -4041,6 +5255,7 @@ async function maybeReauthOpenJoins(status) {
 
 const sendMessage = (message) => {
   if (isShuttingDown) return
+  if (shouldSuppressJoinAuthSuccess(message)) return
 
   trackRegistrationStatus(message)
   trackOpenJoinReauthState(message)
@@ -6071,6 +7286,21 @@ async function handleMessageObject(message) {
         try {
           const requestData = (message && typeof message === 'object' ? message.data : null) || {}
           const gatewayRouteInput = normalizeGatewayRouteInput(requestData)
+          const provisionalRelayKey = normalizeRelayKeyHex(requestData?.relayKey || null)
+          const provisionalPublicIdentifier =
+            typeof requestData?.publicIdentifier === 'string' && requestData.publicIdentifier.trim()
+              ? requestData.publicIdentifier.trim()
+              : null
+          if (gatewayRouteInput.hasExplicitRoute && (provisionalRelayKey || provisionalPublicIdentifier)) {
+            await upsertRelayGatewayRoute({
+              relayKey: provisionalRelayKey || null,
+              publicIdentifier: provisionalPublicIdentifier || null,
+              gatewayOrigin: gatewayRouteInput.gatewayOrigin,
+              gatewayId: gatewayRouteInput.gatewayId,
+              directJoinOnly: gatewayRouteInput.directJoinOnly,
+              source: 'create-relay-input'
+            }).catch(() => {})
+          }
           const result = await relayServer.createRelay(requestData)
           const resultRelayKey = normalizeRelayKeyHex(result?.relayKey || null)
           const resultPublicIdentifier =
@@ -6166,6 +7396,21 @@ async function handleMessageObject(message) {
         try {
           const requestData = (message && typeof message === 'object' ? message.data : null) || {}
           const gatewayRouteInput = normalizeGatewayRouteInput(requestData)
+          const provisionalRelayKey = normalizeRelayKeyHex(requestData?.relayKey || null)
+          const provisionalPublicIdentifier =
+            typeof requestData?.publicIdentifier === 'string' && requestData.publicIdentifier.trim()
+              ? requestData.publicIdentifier.trim()
+              : null
+          if (gatewayRouteInput.hasExplicitRoute && (provisionalRelayKey || provisionalPublicIdentifier)) {
+            await upsertRelayGatewayRoute({
+              relayKey: provisionalRelayKey || null,
+              publicIdentifier: provisionalPublicIdentifier || null,
+              gatewayOrigin: gatewayRouteInput.gatewayOrigin,
+              gatewayId: gatewayRouteInput.gatewayId,
+              directJoinOnly: gatewayRouteInput.directJoinOnly,
+              source: 'join-relay-input'
+            }).catch(() => {})
+          }
           const result = await relayServer.joinRelay(requestData)
           const resultRelayKey = normalizeRelayKeyHex(result?.relayKey || null)
           const resultPublicIdentifier =
@@ -6455,6 +7700,30 @@ async function handleMessageObject(message) {
               : undefined
         const inviteToken = typeof data.token === 'string' ? data.token.trim() : null
         const joinFlowStartedAt = Date.now()
+        const joinAttemptId = `${joinFlowStartedAt}-${Math.random().toString(16).slice(2, 10)}`
+        const joinRequestId = normalizeJoinTraceToken(
+          (typeof message?.requestId === 'string' && message.requestId)
+          || (typeof data?.requestId === 'string' && data.requestId)
+          || null
+        )
+        let joinGatewayTraceContext = withJoinTraceContext({
+          traceId: joinAttemptId,
+          joinAttemptId,
+          requestId: joinRequestId,
+          relayIdentifier: publicIdentifier || null,
+          route: 'start-join-flow',
+          source: 'worker-join-flow'
+        })
+        emitJoinGatewayTrace('join-flow-start', joinGatewayTraceContext, {
+          publicIdentifier,
+          openJoin,
+          hasInviteToken: !!inviteToken
+        })
+        const joinAttemptIdentifier = beginJoinFlowAttempt(
+          publicIdentifier,
+          joinAttemptId,
+          'start-join-flow'
+        )
         let joinBlindPeeringManager = null
         let joinRelayIdentifierForTracking = null
         const joinDeadlineEnabled = Number.isFinite(JOIN_TOTAL_DEADLINE_MS)
@@ -6494,13 +7763,19 @@ async function handleMessageObject(message) {
           let writerLeaseEnvelope = data.writerLeaseEnvelope && typeof data.writerLeaseEnvelope === 'object'
             ? data.writerLeaseEnvelope
             : null
+          let writerLeaseId = normalizeWriterLeaseId(
+            data.writerLeaseId || data.writer_lease_id || writerLeaseEnvelope?.leaseId || null
+          )
+          let writerCommitCheckpoint = normalizeWriterCommitCheckpoint(
+            data.writerCommitCheckpoint || data.writer_commit_checkpoint || null
+          )
           let coreRefs = Array.isArray(data.cores) ? normalizeCoreRefList(data.cores) : []
           let writerCoreRefs = Array.isArray(data.cores) ? normalizeMirrorWriterCoreRefs(data.cores) : []
           let blindPeer = sanitizeBlindPeerMeta(data.blindPeer)
           let joinRelayKey = normalizeRelayKeyHex(data.relayKey)
           let joinRelayUrl = data.relayUrl || null
-          let writerCore = data.writerCore || null
-          let writerSecret = data.writerSecret || null
+          let writerCore = data.writerCore || data.writer_core || null
+          let writerSecret = data.writerSecret || data.writer_secret || null
           let writerCoreHex =
             data.writerCoreHex ||
             data.writer_core_hex ||
@@ -6509,6 +7784,9 @@ async function handleMessageObject(message) {
             null
           let autobaseLocal = data.autobaseLocal || data.autobase_local || null
           let fastForward = data.fastForward || data.fast_forward || null
+          joinGatewayTraceContext = withJoinTraceContext(joinGatewayTraceContext, {
+            relayIdentifier: joinRelayKey || publicIdentifier || null
+          })
           if (gatewayRouteInput.hasExplicitRoute && (joinRelayKey || publicIdentifier)) {
             await upsertRelayGatewayRoute({
               relayKey: joinRelayKey || null,
@@ -6546,8 +7824,11 @@ async function handleMessageObject(message) {
           await pruneRelayGatewayMapStore().catch(() => {})
           await pruneRelayLeaseReplicaStore().catch(() => {})
           if (writerLeaseEnvelope && typeof writerLeaseEnvelope === 'object') {
-            if (!writerCore && typeof writerLeaseEnvelope.writerCore === 'string') {
-              writerCore = writerLeaseEnvelope.writerCore
+            if (!writerLeaseId && typeof writerLeaseEnvelope.leaseId === 'string') {
+              writerLeaseId = normalizeWriterLeaseId(writerLeaseEnvelope.leaseId)
+            }
+            if (!writerCore && typeof (writerLeaseEnvelope.writerCore || writerLeaseEnvelope.writer_core) === 'string') {
+              writerCore = writerLeaseEnvelope.writerCore || writerLeaseEnvelope.writer_core
             }
             if (!writerCoreHex && typeof writerLeaseEnvelope.writerCoreHex === 'string') {
               writerCoreHex = writerLeaseEnvelope.writerCoreHex
@@ -6555,8 +7836,16 @@ async function handleMessageObject(message) {
             if (!autobaseLocal && typeof writerLeaseEnvelope.autobaseLocal === 'string') {
               autobaseLocal = writerLeaseEnvelope.autobaseLocal
             }
-            if (!writerSecret && typeof writerLeaseEnvelope.writerSecret === 'string') {
-              writerSecret = writerLeaseEnvelope.writerSecret
+            if (!writerSecret && typeof (writerLeaseEnvelope.writerSecret || writerLeaseEnvelope.writer_secret) === 'string') {
+              writerSecret = writerLeaseEnvelope.writerSecret || writerLeaseEnvelope.writer_secret
+            }
+            if (
+              !writerCommitCheckpoint
+              && (writerLeaseEnvelope.writerCommitCheckpoint || writerLeaseEnvelope.writer_commit_checkpoint)
+            ) {
+              writerCommitCheckpoint = normalizeWriterCommitCheckpoint(
+                writerLeaseEnvelope.writerCommitCheckpoint || writerLeaseEnvelope.writer_commit_checkpoint
+              )
             }
             if (!fastForward && writerLeaseEnvelope.fastForward && typeof writerLeaseEnvelope.fastForward === 'object') {
               fastForward = writerLeaseEnvelope.fastForward
@@ -6642,7 +7931,11 @@ async function handleMessageObject(message) {
               await ensurePublicGatewaySettingsLoaded()
               return fetchOpenJoinBootstrap(relayIdentifierForGateway, {
                 origins: gatewayOrigins,
-                reason: 'open-join-race'
+                reason: 'open-join-race',
+                traceContext: withJoinTraceContext(joinGatewayTraceContext, {
+                  relayIdentifier: relayIdentifierForGateway,
+                  route: 'open-join/race'
+                })
               })
             })()
               .then((result) => {
@@ -6663,7 +7956,11 @@ async function handleMessageObject(message) {
               await ensurePublicGatewaySettingsLoaded()
               return fetchRelayMirrorMetadata(relayIdentifierForGateway, {
                 origins: gatewayOrigins,
-                reason: 'join-flow-race'
+                reason: 'join-flow-race',
+                traceContext: withJoinTraceContext(joinGatewayTraceContext, {
+                  relayIdentifier: relayIdentifierForGateway,
+                  route: 'mirror/race'
+                })
               })
             })()
             : null
@@ -6679,17 +7976,38 @@ async function handleMessageObject(message) {
             const bootstrapRelayKey = normalizeRelayKeyHex(
               bootstrapData.relayKey || bootstrapData.relay_key || null
             )
+            const bootstrapWriterLeaseId = normalizeWriterLeaseId(
+              bootstrapData.writerLeaseId || bootstrapData.writer_lease_id || null
+            )
+            const bootstrapWriterCommitCheckpoint = normalizeWriterCommitCheckpoint(
+              bootstrapData.writerCommitCheckpoint || bootstrapData.writer_commit_checkpoint || null
+            )
 
             if (!joinRelayKey && bootstrapRelayKey) joinRelayKey = bootstrapRelayKey
+            if (joinRelayKey || publicIdentifier) {
+              joinGatewayTraceContext = withJoinTraceContext(joinGatewayTraceContext, {
+                relayIdentifier: joinRelayKey || publicIdentifier || null
+              })
+            }
             if (!joinRelayUrl && bootstrapData.relayUrl) joinRelayUrl = String(bootstrapData.relayUrl)
-            if (!writerCore && bootstrapData.writerCore) writerCore = String(bootstrapData.writerCore)
+            if (!writerCore && (bootstrapData.writerCore || bootstrapData.writer_core)) {
+              writerCore = String(bootstrapData.writerCore || bootstrapData.writer_core)
+            }
             if (!writerCoreHex && (bootstrapData.writerCoreHex || bootstrapData.writer_core_hex)) {
               writerCoreHex = String(bootstrapData.writerCoreHex || bootstrapData.writer_core_hex)
             }
             if (!autobaseLocal && (bootstrapData.autobaseLocal || bootstrapData.autobase_local)) {
               autobaseLocal = String(bootstrapData.autobaseLocal || bootstrapData.autobase_local)
             }
-            if (!writerSecret && bootstrapData.writerSecret) writerSecret = String(bootstrapData.writerSecret)
+            if (!writerSecret && (bootstrapData.writerSecret || bootstrapData.writer_secret)) {
+              writerSecret = String(bootstrapData.writerSecret || bootstrapData.writer_secret)
+            }
+            if (!writerLeaseId && bootstrapWriterLeaseId) {
+              writerLeaseId = bootstrapWriterLeaseId
+            }
+            if (!writerCommitCheckpoint && bootstrapWriterCommitCheckpoint) {
+              writerCommitCheckpoint = bootstrapWriterCommitCheckpoint
+            }
             if (!blindPeer && bootstrapBlindPeer) blindPeer = bootstrapBlindPeer
             if (bootstrapCoreRefs.length) {
               coreRefs = mergeCoreRefLists(coreRefs, bootstrapCoreRefs)
@@ -6718,6 +8036,10 @@ async function handleMessageObject(message) {
               writerCorePrefix: previewValue(writerCore, 16),
               writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
               writerSecretLen: writerSecret ? String(writerSecret).length : 0,
+              writerLeaseId: previewValue(writerLeaseId, 24),
+              writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
+              writerDurabilityAtServe: bootstrapData.writerDurabilityAtServe ?? bootstrapData.writer_durability_at_serve ?? null,
+              writerDurabilityReason: bootstrapData.writerDurabilityReason || bootstrapData.writer_durability_reason || null,
               blindPeerKey: previewValue(blindPeer?.publicKey, 16),
               blindPeerHasEncryptionKey: !!blindPeer?.encryptionKey
             })
@@ -6747,7 +8069,23 @@ async function handleMessageObject(message) {
             writerCorePrefix: previewValue(writerCore, 16),
             writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
             writerSecretLen: writerSecret ? String(writerSecret).length : 0,
+            writerLeaseId: previewValue(writerLeaseId, 24),
+            writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
             hasFastForward: !!fastForward
+          })
+          emitJoinGatewayTrace('join-flow-input', joinGatewayTraceContext, {
+            publicIdentifier,
+            openJoin,
+            gatewayMode,
+            gatewayOrigin: assignedGatewayOrigin,
+            relayKey: previewValue(joinRelayKey, 16),
+            hostPeersCount: hostPeers.length,
+            hasBlindPeer: !!blindPeer?.publicKey,
+            coreRefsCount: coreRefs.length,
+            writerCoreRefsCount: writerCoreRefs.length,
+            hasWriterSecret: !!writerSecret,
+            writerLeaseId: previewValue(writerLeaseId, 24),
+            writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint)
           })
           sendMessage({
             type: 'JOIN_DISCOVERY_SOURCES',
@@ -6761,7 +8099,9 @@ async function handleMessageObject(message) {
               leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
               hasDiscoveryTopic: !!discoveryTopic,
               topicDiscoveredPeerCount: topicDiscoveredPeerKeys.length,
-              cachedCapabilityCount: Object.keys(discoveryHints?.capabilities || {}).length
+              cachedCapabilityCount: Object.keys(discoveryHints?.capabilities || {}).length,
+              writerLeaseId,
+              writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint)
             }
           })
 
@@ -6957,11 +8297,20 @@ async function handleMessageObject(message) {
                 && !envelopeExpired
               ) {
                 writerLeaseEnvelope = claimedEnvelope
+                writerLeaseId = normalizeWriterLeaseId(claimedEnvelope.leaseId || writerLeaseId)
                 writerCore = claimedEnvelope.writerCore || writerCore
                 writerCoreHex = claimedEnvelope.writerCoreHex || claimedEnvelope.autobaseLocal || writerCoreHex
                 autobaseLocal = claimedEnvelope.autobaseLocal || claimedEnvelope.writerCoreHex || autobaseLocal
-                writerSecret = claimedEnvelope.writerSecret || writerSecret
+                writerSecret = claimedEnvelope.writerSecret || claimedEnvelope.writer_secret || writerSecret
                 writerIssuerPubkey = claimedEnvelope.issuerPubkey || writerIssuerPubkey
+                if (
+                  !writerCommitCheckpoint
+                  && (claimedEnvelope.writerCommitCheckpoint || claimedEnvelope.writer_commit_checkpoint)
+                ) {
+                  writerCommitCheckpoint = normalizeWriterCommitCheckpoint(
+                    claimedEnvelope.writerCommitCheckpoint || claimedEnvelope.writer_commit_checkpoint
+                  )
+                }
                 const leaseCoreRefs = normalizeCoreRefList(
                   Array.isArray(claimedEnvelope.coreRefs)
                     ? claimedEnvelope.coreRefs
@@ -7060,7 +8409,11 @@ async function handleMessageObject(message) {
                         await ensurePublicGatewaySettingsLoaded()
                         return fetchOpenJoinBootstrap(relayIdentifier, {
                           origins: gatewayOrigins,
-                          reason: 'open-join'
+                          reason: 'open-join',
+                          traceContext: withJoinTraceContext(joinGatewayTraceContext, {
+                            relayIdentifier,
+                            route: 'open-join/primary'
+                          })
                         })
                       })(),
                       bootstrapTimeoutMs,
@@ -7181,7 +8534,11 @@ async function handleMessageObject(message) {
                       await ensurePublicGatewaySettingsLoaded()
                       return fetchRelayMirrorMetadata(relayIdentifier, {
                         origins: gatewayOrigins,
-                        reason: 'join-flow'
+                        reason: 'join-flow',
+                        traceContext: withJoinTraceContext(joinGatewayTraceContext, {
+                          relayIdentifier,
+                          route: 'mirror/join-flow'
+                        })
                       })
                     })(),
                     Math.max(500, Math.min(BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS + 2000, getRemainingJoinBudget())),
@@ -7196,6 +8553,11 @@ async function handleMessageObject(message) {
                     mirrorData.relayKey || mirrorData.relay_key || null
                   )
                   if (!joinRelayKey && mirrorRelayKey) joinRelayKey = mirrorRelayKey
+                  if (joinRelayKey || publicIdentifier) {
+                    joinGatewayTraceContext = withJoinTraceContext(joinGatewayTraceContext, {
+                      relayIdentifier: joinRelayKey || publicIdentifier || null
+                    })
+                  }
                   if (!blindPeer && mirrorBlindPeer) blindPeer = mirrorBlindPeer
                   if (!coreRefs.length && mirrorCoreRefs.length) coreRefs = mirrorCoreRefs
                   if (mirrorWriterCoreRefs.length) {
@@ -7208,7 +8570,17 @@ async function handleMessageObject(message) {
                   if (!autobaseLocal && (mirrorData.autobaseLocal || mirrorData.autobase_local)) {
                     autobaseLocal = String(mirrorData.autobaseLocal || mirrorData.autobase_local)
                   }
-                  if (!writerSecret && mirrorData.writerSecret) writerSecret = String(mirrorData.writerSecret)
+                  if (!writerSecret && (mirrorData.writerSecret || mirrorData.writer_secret)) {
+                    writerSecret = String(mirrorData.writerSecret || mirrorData.writer_secret)
+                  }
+                  if (!writerLeaseId && (mirrorData.writerLeaseId || mirrorData.writer_lease_id)) {
+                    writerLeaseId = normalizeWriterLeaseId(mirrorData.writerLeaseId || mirrorData.writer_lease_id)
+                  }
+                  if (!writerCommitCheckpoint && (mirrorData.writerCommitCheckpoint || mirrorData.writer_commit_checkpoint)) {
+                    writerCommitCheckpoint = normalizeWriterCommitCheckpoint(
+                      mirrorData.writerCommitCheckpoint || mirrorData.writer_commit_checkpoint
+                    )
+                  }
                   if (openJoin && publicIdentifier) {
                     recordOpenJoinContext({
                       publicIdentifier,
@@ -7229,6 +8601,8 @@ async function handleMessageObject(message) {
                     hasAutobaseLocal: !!autobaseLocal,
                     origin: mirrorResult?.origin || null,
                     writerSecretLen: writerSecret ? String(writerSecret).length : 0,
+                    writerLeaseId: previewValue(writerLeaseId, 24),
+                    writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
                     blindPeerKey: previewValue(blindPeer?.publicKey, 16),
                     blindPeerHasEncryptionKey: !!blindPeer?.encryptionKey
                   })
@@ -7445,8 +8819,26 @@ async function handleMessageObject(message) {
             writerCorePrefix: previewValue(writerCore, 16),
             writerCoreHexPrefix: previewValue(writerCoreHex || autobaseLocal, 16),
             writerSecretLen: writerSecret ? String(writerSecret).length : 0,
+            writerLeaseId: previewValue(writerLeaseId, 24),
+            writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
             hasFastForward: !!fastForward,
             gatewayMode
+          })
+          emitJoinGatewayTrace('join-flow-resolved', joinGatewayTraceContext, {
+            publicIdentifier,
+            openJoin,
+            gatewayMode,
+            relayKey: previewValue(joinRelayKey, 16),
+            relayUrlPresent: !!joinRelayUrl,
+            hostPeersCount: hostPeers.length,
+            hasBlindPeer: !!blindPeer?.publicKey,
+            coreRefsCount: coreRefs.length,
+            writerCoreRefsCount: writerCoreRefs.length,
+            hasWriterSecret: !!writerSecret,
+            writerLeaseId: previewValue(writerLeaseId, 24),
+            writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
+            selectedPathMode: selectedJoinPathMode || null,
+            selectedPathPeer: selectedJoinPeerKey || null
           })
           if ((joinRelayKey || publicIdentifier) && (assignedGatewayOrigin || assignedGatewayId || gatewayMode === 'disabled')) {
             await upsertRelayGatewayRoute({
@@ -7517,34 +8909,47 @@ async function handleMessageObject(message) {
           }
           const joinAuthHostPeers = closedInviteOfflineFallback ? [] : hostPeers
 
-          const buildJoinAuthPayload = (overrides = {}) => ({
-            ...data,
-            publicIdentifier,
-            fileSharing,
-            openJoin,
-            isOpen,
-            gatewayMode,
-            joinDirectDiscoveryV2,
-            joinPathMode: selectedJoinPathMode || undefined,
-            selectedDirectPeerKey: selectedJoinPeerKey || undefined,
-            discoveryTopic: discoveryTopic || undefined,
-            hostPeerKeys: joinAuthHostPeers,
-            leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : undefined,
-            writerIssuerPubkey: writerIssuerPubkey || undefined,
-            writerLeaseEnvelope: writerLeaseEnvelope || undefined,
-            relayKey: joinRelayKey || undefined,
-            relayUrl: joinRelayUrl || undefined,
-            blindPeer,
-            hostPeers: joinAuthHostPeers,
-            coreRefs,
-            writerCoreRefs,
-            writerCore,
-            writerCoreHex,
-            autobaseLocal,
-            writerSecret,
-            fastForward,
-            ...overrides
-          })
+          const buildJoinAuthPayload = (overrides = {}) => {
+            const writableWaitBudgetMs = joinDeadlineEnabled
+              ? Math.max(1000, Math.min(45000, getRemainingJoinBudget() - 2500))
+              : null
+            return {
+              ...data,
+              publicIdentifier,
+              fileSharing,
+              openJoin,
+              isOpen,
+              gatewayMode,
+              joinDirectDiscoveryV2,
+              joinPathMode: selectedJoinPathMode || undefined,
+              selectedDirectPeerKey: selectedJoinPeerKey || undefined,
+              discoveryTopic: discoveryTopic || undefined,
+              hostPeerKeys: joinAuthHostPeers,
+              leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : undefined,
+              writerIssuerPubkey: writerIssuerPubkey || undefined,
+              writerLeaseEnvelope: writerLeaseEnvelope || undefined,
+              relayKey: joinRelayKey || undefined,
+              relayUrl: joinRelayUrl || undefined,
+              blindPeer,
+              hostPeers: joinAuthHostPeers,
+              coreRefs,
+              writerCoreRefs,
+              writerCore,
+              writerCoreHex,
+              autobaseLocal,
+              writerSecret,
+              writerLeaseId,
+              writerCommitCheckpoint,
+              fastForward,
+              joinAttemptId,
+              joinTraceId: joinGatewayTraceContext?.traceId || joinAttemptId,
+              joinRequestId: joinGatewayTraceContext?.requestId || null,
+              joinWritableTimeoutMs: Number.isFinite(writableWaitBudgetMs)
+                ? writableWaitBudgetMs
+                : undefined,
+              ...overrides
+            }
+          }
 
           const runStartJoinAuthentication = async (payload) => {
             if (!joinDeadlineEnabled) {
@@ -7640,7 +9045,11 @@ async function handleMessageObject(message) {
                         await ensurePublicGatewaySettingsLoaded()
                         return fetchOpenJoinBootstrap(relayIdentifier, {
                           origins: gatewayOrigins,
-                          reason: 'open-join-recovery'
+                          reason: 'open-join-recovery',
+                          traceContext: withJoinTraceContext(joinGatewayTraceContext, {
+                            relayIdentifier,
+                            route: 'open-join/recovery'
+                          })
                         })
                       })(),
                       recoveryTimeoutMs,
@@ -7689,6 +9098,16 @@ async function handleMessageObject(message) {
           if (joinAuthResult?.ok === false) {
             throw new Error(joinAuthResult?.error || 'join-auth-failed')
           }
+          if (joinAttemptIdentifier) {
+            markJoinFlowAttemptState(joinAttemptIdentifier, joinAttemptId, 'succeeded')
+          }
+          emitJoinGatewayTrace('join-flow-success', joinGatewayTraceContext, {
+            publicIdentifier,
+            relayKey: previewValue(joinRelayKey, 16),
+            selectedPathMode: selectedJoinPathMode || null,
+            selectedPathPeer: selectedJoinPeerKey || null,
+            elapsedMs: Date.now() - joinFlowStartedAt
+          })
           sendMessage({
             type: 'JOIN_WRITABLE_DEADLINE_RESULT',
             data: {
@@ -7713,6 +9132,17 @@ async function handleMessageObject(message) {
           }
         } catch (err) {
           const errorMessage = err?.message || String(err)
+          if (joinAttemptIdentifier) {
+            markJoinFlowAttemptState(joinAttemptIdentifier, joinAttemptId, 'failed', errorMessage)
+          }
+          emitJoinGatewayTrace('join-flow-failure', joinGatewayTraceContext, {
+            publicIdentifier,
+            relayKey: previewValue(joinRelayKey, 16),
+            selectedPathMode: selectedJoinPathMode || null,
+            selectedPathPeer: selectedJoinPeerKey || null,
+            error: errorMessage,
+            elapsedMs: Date.now() - joinFlowStartedAt
+          }, 'error')
           const failureReason =
             typeof errorMessage === 'string' && errorMessage.includes('no-writer-path')
               ? 'no-writer-path'
@@ -7853,6 +9283,7 @@ async function handleMessageObject(message) {
               autobaseLocal: result?.autobaseLocal || result?.writerCoreHex || null,
               writerSecret: result?.writerSecret || null,
               coreRefs: leaseCoreRefs,
+              writerCommitCheckpoint: result?.writerCommitCheckpoint || null,
               fastForward
             })
             await upsertRelayLeaseEnvelope({
@@ -8451,6 +9882,37 @@ process.on('SIGTERM', () => {
 })
 process.on('SIGINT', () => {
   void handleShutdownSignal('SIGINT')
+})
+
+function shouldSuppressShutdownClosingError(error) {
+  if (!isShuttingDown) return false
+  const message = String(error?.message || error || '')
+  if (!/closing/i.test(message)) return false
+  const stack = typeof error?.stack === 'string' ? error.stack : ''
+  return /blind-peering|blind-peer/i.test(stack)
+}
+
+function handleUnhandledRuntimeError(reason, error) {
+  if (shouldSuppressShutdownClosingError(error)) {
+    console.warn(`[Worker] Suppressed ${reason} during shutdown`, {
+      message: error?.message || String(error || '')
+    })
+    return
+  }
+
+  console.error(`[Worker] Unhandled ${reason}:`, error)
+  if (!isShuttingDown) {
+    void shutdownAndExit(1, reason)
+  }
+}
+
+process.on('unhandledRejection', (reason) => {
+  const error = reason instanceof Error ? reason : new Error(String(reason))
+  handleUnhandledRuntimeError('unhandled-rejection', error)
+})
+
+process.on('uncaughtException', (error) => {
+  handleUnhandledRuntimeError('uncaught-exception', error)
 })
 
 if (pearRuntime?.teardown) {

@@ -165,6 +165,23 @@ class PublicGatewayRegistrar {
         : entry?.autobaseLocal
           ? String(entry.autobaseLocal).slice(0, 16)
           : null,
+      writerLeaseId: entry?.writerLeaseId ? String(entry.writerLeaseId).slice(0, 24) : null,
+      writerCommitCheckpoint: entry?.writerCommitCheckpoint && typeof entry.writerCommitCheckpoint === 'object'
+        ? {
+            systemKey: entry.writerCommitCheckpoint.systemKey
+              ? String(entry.writerCommitCheckpoint.systemKey).slice(0, 16)
+              : null,
+            systemSignedLength: Number.isFinite(entry.writerCommitCheckpoint.systemSignedLength)
+              ? Number(entry.writerCommitCheckpoint.systemSignedLength)
+              : null,
+            viewVersion: Number.isFinite(entry.writerCommitCheckpoint.viewVersion)
+              ? Number(entry.writerCommitCheckpoint.viewVersion)
+              : null,
+            activeWritersHash: entry.writerCommitCheckpoint.activeWritersHash
+              ? String(entry.writerCommitCheckpoint.activeWritersHash).slice(0, 16)
+              : null
+          }
+        : null,
       expiresAt: entry?.expiresAt ?? null
     }));
     this.logger?.info?.('[PublicGateway] Open join pool update request', {

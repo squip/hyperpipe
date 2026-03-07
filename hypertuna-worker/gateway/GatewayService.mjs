@@ -1944,6 +1944,19 @@ export class GatewayService extends EventEmitter {
       return entries.slice(0, limit).map((entry) => ({
         writerCore: previewValue(entry?.writerCore, 16),
         writerCoreHex: previewValue(entry?.writerCoreHex || entry?.autobaseLocal, 16),
+        writerLeaseId: previewValue(entry?.writerLeaseId, 24),
+        writerCommitCheckpoint: entry?.writerCommitCheckpoint && typeof entry.writerCommitCheckpoint === 'object'
+          ? {
+              systemKey: previewValue(entry.writerCommitCheckpoint.systemKey, 16),
+              systemSignedLength: Number.isFinite(entry.writerCommitCheckpoint.systemSignedLength)
+                ? Number(entry.writerCommitCheckpoint.systemSignedLength)
+                : null,
+              viewVersion: Number.isFinite(entry.writerCommitCheckpoint.viewVersion)
+                ? Number(entry.writerCommitCheckpoint.viewVersion)
+                : null,
+              activeWritersHash: previewValue(entry.writerCommitCheckpoint.activeWritersHash, 16)
+            }
+          : null,
         issuedAt: entry?.issuedAt ?? null,
         expiresAt: entry?.expiresAt ?? null
       }));
@@ -2918,6 +2931,9 @@ export class GatewayService extends EventEmitter {
   async registerPeerMetadata(data = {}, options = {}) {
     const { skipConnect = false, source = 'unknown' } = options;
     const { publicKey, relays, mode = 'hyperswarm', address } = data;
+    const topLevelBlindPeeringKey = typeof data.blindPeeringPublicKey === 'string'
+      ? data.blindPeeringPublicKey.trim()
+      : (typeof data.blind_peering_public_key === 'string' ? data.blind_peering_public_key.trim() : null);
 
     if (!publicKey) {
       throw new Error('Public key is required');
@@ -2952,6 +2968,9 @@ export class GatewayService extends EventEmitter {
 
     peer.nostrPubkeyHex = nostrPubkeyHex || previousOwner || null;
     peer.pfpDriveKey = pfpDriveKey || previousDriveKey || null;
+    if (topLevelBlindPeeringKey) {
+      peer.blindPeeringPublicKey = topLevelBlindPeeringKey;
+    }
 
     this.log('debug', `[PublicGateway] registerPeerMetadata update ${publicKey.slice(0, 8)} owner=${peer.nostrPubkeyHex ? peer.nostrPubkeyHex.slice(0, 8) : 'none'} pfpDrive=${peer.pfpDriveKey ? peer.pfpDriveKey.slice(0, 8) : 'none'}`);
 
@@ -2999,6 +3018,14 @@ export class GatewayService extends EventEmitter {
         }
         if (relayObj.description !== undefined && relayObj.description !== prevMetadata.description) {
           nextMetadata.description = relayObj.description;
+        }
+        const relayBlindPeeringKey = typeof relayObj.blindPeeringPublicKey === 'string'
+          ? relayObj.blindPeeringPublicKey.trim()
+          : (typeof relayObj.blind_peering_public_key === 'string' ? relayObj.blind_peering_public_key.trim() : null);
+        if (relayBlindPeeringKey) {
+          nextMetadata.blindPeeringPublicKey = relayBlindPeeringKey;
+        } else if (topLevelBlindPeeringKey) {
+          nextMetadata.blindPeeringPublicKey = topLevelBlindPeeringKey;
         }
         if (relayObj.avatarUrl !== undefined) {
           if (relayObj.avatarUrl) {

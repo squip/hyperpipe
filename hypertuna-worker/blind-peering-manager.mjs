@@ -96,6 +96,13 @@ function describeCorestore(store) {
   };
 }
 
+function previewValue(value, length = 16) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  return text.length > length ? text.slice(0, length) : text;
+}
+
 export default class BlindPeeringManager extends EventEmitter {
   constructor({ logger, settingsProvider } = {}) {
     super();
@@ -148,6 +155,9 @@ export default class BlindPeeringManager extends EventEmitter {
       lastResult: null,
       lastCompletedAt: null
     };
+    this.blindPeerDiagnosticsInstalled = false;
+    this.instrumentedBlindPeerClients = new WeakSet();
+    this.instrumentedBlindPeerStreams = new WeakSet();
   }
 
   configure(settings) {
@@ -219,6 +229,7 @@ export default class BlindPeeringManager extends EventEmitter {
       mirrors: Array.from(this.trustedMirrors),
       pick: 2
     });
+    this.#installBlindPeerDiagnostics();
 
     await this.#loadMetadata();
 
@@ -234,6 +245,10 @@ export default class BlindPeeringManager extends EventEmitter {
       blindPeerKey,
       blindPeerKeyHex,
       swarmPublicKeyHex
+    });
+    this.logTransportSnapshot('manager-started', {
+      blindPeerKey: previewValue(blindPeerKey, 16),
+      swarmPublicKeyHex: previewValue(swarmPublicKeyHex, 16)
     });
     this.emit('started', this.getStatus());
     return true;
@@ -273,6 +288,7 @@ export default class BlindPeeringManager extends EventEmitter {
 
   markTrustedMirrors(peerKeys = []) {
     let updated = false;
+    const added = [];
     for (const key of peerKeys) {
       const sanitized = sanitizeKey(key);
       if (!sanitized) continue;
@@ -281,16 +297,22 @@ export default class BlindPeeringManager extends EventEmitter {
       }
       if (!this.trustedMirrors.has(sanitized)) {
         this.trustedMirrors.add(sanitized);
+        added.push(sanitized);
         updated = true;
       }
     }
     if (updated) {
       this.logger?.debug?.('[BlindPeering] Trusted mirrors updated', {
-        count: this.trustedMirrors.size
+        count: this.trustedMirrors.size,
+        added: added.map((key) => previewValue(key, 16))
       });
       if (this.blindPeering?.setKeys) {
         this.blindPeering.setKeys(Array.from(this.trustedMirrors));
       }
+      this.logTransportSnapshot('trusted-mirrors-updated', {
+        added: added.length,
+        addedPreview: added.slice(0, 3).map((key) => previewValue(key, 16))
+      });
       this.emit('trusted-peers-changed', Array.from(this.trustedMirrors));
     }
   }
@@ -461,7 +483,8 @@ export default class BlindPeeringManager extends EventEmitter {
       total: uniqueRefs.length,
       synced: 0,
       failed: 0,
-      connected: 0
+      connected: 0,
+      acknowledged: 0
     };
 
     const storeInfo = describeCorestore(targetStore);
@@ -473,6 +496,11 @@ export default class BlindPeeringManager extends EventEmitter {
       corestoreId: storeInfo.corestoreId,
       storagePath: storeInfo.storagePath
     });
+    this.logger?.debug?.('[BlindPeering] Relay core prefetch transport preflight', {
+      relayKey: summary.relayKey,
+      reason,
+      ...this.getTransportSnapshot({ limit: 3 })
+    });
 
     for (const ref of uniqueRefs) {
       const label = `${labelBase}:${ref.slice(0, 16)}`;
@@ -482,19 +510,36 @@ export default class BlindPeeringManager extends EventEmitter {
         continue;
       }
       try {
-        await this.blindPeering.addCore(core, core.key, {
+        const result = await this.blindPeering.addCore(core, core.key, {
           announce: false,
           priority: 2,
           pick: 2
         });
+        const acknowledgements = Array.isArray(result)
+          ? result.filter(Boolean).length
+          : (result ? 1 : 0);
+        if (acknowledgements <= 0) {
+          summary.failed += 1;
+          this.logger?.warn?.('[BlindPeering] Relay core mirror add yielded no remote acknowledgement', {
+            ref,
+            label,
+            reason,
+            resultType: Array.isArray(result) ? 'array' : typeof result,
+            resultLength: Array.isArray(result) ? result.length : null,
+            ...this.getTransportSnapshot({ limit: 3 })
+          });
+          continue;
+        }
         summary.connected += 1;
+        summary.acknowledged += acknowledgements;
       } catch (error) {
         summary.failed += 1;
         this.logger?.warn?.('[BlindPeering] Relay core mirror add failed', {
           ref,
           label,
           reason,
-          error: error?.message || error
+          error: error?.message || error,
+          ...this.getTransportSnapshot({ limit: 3 })
         });
         continue;
       }
@@ -513,6 +558,14 @@ export default class BlindPeeringManager extends EventEmitter {
       }
     }
 
+    if (summary.connected === 0 && uniqueRefs.length > 0) {
+      this.logger?.warn?.('[BlindPeering] Relay core prefetch completed without confirmed mirror acknowledgements', {
+        relayKey: summary.relayKey,
+        reason,
+        totalRefs: uniqueRefs.length,
+        ...this.getTransportSnapshot({ limit: 5 })
+      });
+    }
     this.logger?.info?.('[BlindPeering] Relay core prefetch complete', summary);
     return summary;
   }
@@ -1465,6 +1518,261 @@ export default class BlindPeeringManager extends EventEmitter {
         lastResult: this.rehydrationState.lastResult || null
       }
     };
+  }
+
+  getTransportSnapshot({ limit = 5 } = {}) {
+    const normalizedLimit = Number.isFinite(limit) && limit > 0 ? Math.trunc(limit) : 5;
+    const trustedMirrors = Array.from(this.trustedMirrors);
+    const handshakeMirrors = Array.from(this.handshakeMirrors);
+    const manualMirrors = Array.from(this.manualMirrors);
+    const targetEntries = Array.from(this.mirrorTargets.values());
+    const relayTargets = targetEntries.filter((entry) => entry?.type === 'relay').length;
+    const driveTargets = targetEntries.filter((entry) => entry?.type !== 'relay').length;
+
+    let swarmConnections = null;
+    try {
+      if (this.swarm?.connections && typeof this.swarm.connections.size === 'number') {
+        swarmConnections = this.swarm.connections.size;
+      } else if (Array.isArray(this.swarm?.connections)) {
+        swarmConnections = this.swarm.connections.length;
+      }
+    } catch (_) {
+      swarmConnections = null;
+    }
+
+    const monitorEntries = Array.from(this.coreTransferMonitors.values());
+    const monitorsWithPeers = monitorEntries.filter((entry) => {
+      const peers = entry?.lastState?.peers;
+      return Number.isFinite(peers) && peers > 0;
+    }).length;
+
+    const localBlindPeerPublicKey = this.getLocalBlindPeerPublicKey();
+    const blindPeerClients = this.#collectBlindPeerClientSummary({ limit: normalizedLimit });
+
+    return {
+      enabled: this.enabled,
+      started: this.started,
+      localBlindPeerPublicKey: localBlindPeerPublicKey || null,
+      trustedMirrorCount: trustedMirrors.length,
+      trustedMirrorsPreview: trustedMirrors.slice(0, normalizedLimit).map((key) => previewValue(key, 16)),
+      handshakeMirrorCount: handshakeMirrors.length,
+      handshakeMirrorsPreview: handshakeMirrors.slice(0, normalizedLimit).map((key) => previewValue(key, 16)),
+      manualMirrorCount: manualMirrors.length,
+      manualMirrorsPreview: manualMirrors.slice(0, normalizedLimit).map((key) => previewValue(key, 16)),
+      mirrorTargetCount: this.mirrorTargets.size,
+      relayTargetCount: relayTargets,
+      driveTargetCount: driveTargets,
+      coreTransferMonitorCount: monitorEntries.length,
+      coreTransferMonitorsWithPeers: monitorsWithPeers,
+      swarmConnections,
+      blindPeerClientCount: blindPeerClients.total,
+      blindPeerClientConnected: blindPeerClients.connected,
+      blindPeerClientStreams: blindPeerClients.withStream,
+      blindPeerClientPreview: blindPeerClients.entries
+    };
+  }
+
+  getLocalBlindPeerPublicKey() {
+    const keyBuffer = this.swarm?.dht?.defaultKeyPair?.publicKey || null;
+    return normalizeCoreKey(keyBuffer);
+  }
+
+  logTransportSnapshot(reason = 'manual', details = {}, level = 'info') {
+    const payload = {
+      reason,
+      ts: Date.now(),
+      ...this.getTransportSnapshot(),
+      ...(details && typeof details === 'object' ? details : {})
+    };
+    if (level === 'debug') {
+      this.logger?.debug?.('[BlindPeering] Transport snapshot', payload);
+    } else if (level === 'warn') {
+      this.logger?.warn?.('[BlindPeering] Transport snapshot', payload);
+    } else {
+      this.logger?.info?.('[BlindPeering] Transport snapshot', payload);
+    }
+    return payload;
+  }
+
+  #collectBlindPeerClientSummary({ limit = 5 } = {}) {
+    const entries = [];
+    const refs = this.blindPeering?.blindPeersByKey;
+    if (!refs || typeof refs.entries !== 'function') {
+      return { total: 0, connected: 0, withStream: 0, entries };
+    }
+
+    let connected = 0;
+    let withStream = 0;
+    for (const [id, ref] of refs.entries()) {
+      const peer = ref?.peer || null;
+      const stream = peer?.stream || null;
+      const streamOpen = !!(stream && !stream.destroyed && !stream.destroying);
+      const remoteFromPeer = normalizeCoreKey(peer?.remotePublicKey || null);
+      let remoteFromId = null;
+      if (!remoteFromPeer && typeof id === 'string' && /^[0-9a-f]+$/i.test(id) && id.length % 2 === 0) {
+        try {
+          remoteFromId = normalizeCoreKey(Buffer.from(id, 'hex'));
+        } catch (_) {
+          remoteFromId = null;
+        }
+      }
+
+      if (peer?.connected === true) connected += 1;
+      if (streamOpen) withStream += 1;
+
+      entries.push({
+        remoteMirror: previewValue(remoteFromPeer || remoteFromId || id, 16),
+        connected: peer?.connected === true,
+        rpcClosed: typeof peer?.rpc?.closed === 'boolean' ? peer.rpc.closed : null,
+        streamOpen,
+        streamRemote: previewValue(normalizeCoreKey(stream?.remotePublicKey || null), 16),
+        refs: Number.isFinite(ref?.refs) ? ref.refs : null,
+        cores: ref?.cores && typeof ref.cores.size === 'number' ? ref.cores.size : null,
+        gc: Number.isFinite(ref?.gc) ? ref.gc : null,
+        uploaded: Number.isFinite(ref?.uploaded) ? ref.uploaded : null
+      });
+    }
+
+    const normalizedLimit = Number.isFinite(limit) && limit > 0 ? Math.trunc(limit) : 5;
+    return {
+      total: entries.length,
+      connected,
+      withStream,
+      entries: entries.slice(0, normalizedLimit)
+    };
+  }
+
+  #installBlindPeerDiagnostics() {
+    if (!this.blindPeering) return;
+    if (this.blindPeerDiagnosticsInstalled) return;
+    if (typeof this.blindPeering._getBlindPeer !== 'function') return;
+
+    const originalGetBlindPeer = this.blindPeering._getBlindPeer.bind(this.blindPeering);
+    this.blindPeering._getBlindPeer = (mirrorKey) => {
+      const ref = originalGetBlindPeer(mirrorKey);
+      this.#attachBlindPeerClientDiagnostics(ref, mirrorKey);
+      return ref;
+    };
+
+    const existing = this.blindPeering?.blindPeersByKey;
+    if (existing && typeof existing.values === 'function') {
+      for (const ref of existing.values()) {
+        this.#attachBlindPeerClientDiagnostics(ref, null);
+      }
+    }
+
+    this.blindPeerDiagnosticsInstalled = true;
+  }
+
+  #attachBlindPeerClientDiagnostics(ref, mirrorKey = null) {
+    const peer = ref?.peer || null;
+    if (!peer || this.instrumentedBlindPeerClients.has(peer)) return;
+    this.instrumentedBlindPeerClients.add(peer);
+
+    const remoteMirror = previewValue(
+      normalizeCoreKey(peer.remotePublicKey || mirrorKey || null),
+      16
+    );
+
+    this.logger?.debug?.('[BlindPeering] Mirror client diagnostics attached', {
+      mirror: remoteMirror || null
+    });
+
+    if (typeof peer.connect === 'function' && !peer.__ht_connect_instrumented) {
+      const originalConnect = peer.connect.bind(peer);
+      peer.connect = async (...args) => {
+        const startedAt = Date.now();
+        this.logger?.debug?.('[BlindPeering] Mirror client connect attempt', {
+          mirror: remoteMirror || null,
+          connected: peer.connected === true
+        });
+        try {
+          const result = await originalConnect(...args);
+          this.logger?.debug?.('[BlindPeering] Mirror client connect resolved', {
+            mirror: remoteMirror || null,
+            connected: peer.connected === true,
+            elapsedMs: Math.max(0, Date.now() - startedAt)
+          });
+          return result;
+        } catch (error) {
+          this.logger?.warn?.('[BlindPeering] Mirror client connect rejected', {
+            mirror: remoteMirror || null,
+            elapsedMs: Math.max(0, Date.now() - startedAt),
+            err: error?.message || error
+          });
+          throw error;
+        }
+      };
+      peer.__ht_connect_instrumented = true;
+    }
+
+    if (typeof peer.on === 'function') {
+      peer.on('stream', (stream) => {
+        this.#attachBlindPeerStreamDiagnostics(stream, {
+          mirror: remoteMirror || null,
+          peer
+        });
+      });
+    }
+
+    this.#attachBlindPeerStreamDiagnostics(peer.stream || null, {
+      mirror: remoteMirror || null,
+      peer
+    });
+  }
+
+  #attachBlindPeerStreamDiagnostics(stream, { mirror = null, peer = null } = {}) {
+    if (!stream || this.instrumentedBlindPeerStreams.has(stream)) return;
+    this.instrumentedBlindPeerStreams.add(stream);
+
+    const remote = previewValue(normalizeCoreKey(stream.remotePublicKey || null), 16);
+    const local = previewValue(normalizeCoreKey(stream.publicKey || null), 16);
+
+    this.logger?.debug?.('[BlindPeering] Mirror stream attached', {
+      mirror,
+      remote: remote || null,
+      local: local || null,
+      connected: peer?.connected === true
+    });
+
+    if (stream?.opened && typeof stream.opened.then === 'function') {
+      stream.opened.then(() => {
+        this.logger?.debug?.('[BlindPeering] Mirror stream opened', {
+          mirror,
+          remote: previewValue(normalizeCoreKey(stream.remotePublicKey || null), 16),
+          local: previewValue(normalizeCoreKey(stream.publicKey || null), 16),
+          connected: peer?.connected === true
+        });
+      }).catch((error) => {
+        this.logger?.warn?.('[BlindPeering] Mirror stream open failed', {
+          mirror,
+          remote: previewValue(normalizeCoreKey(stream.remotePublicKey || null), 16),
+          local: previewValue(normalizeCoreKey(stream.publicKey || null), 16),
+          err: error?.message || error,
+          connected: peer?.connected === true
+        });
+      });
+    }
+
+    if (typeof stream.on === 'function') {
+      stream.on('error', (error) => {
+        this.logger?.warn?.('[BlindPeering] Mirror stream error', {
+          mirror,
+          remote: previewValue(normalizeCoreKey(stream.remotePublicKey || null), 16),
+          local: previewValue(normalizeCoreKey(stream.publicKey || null), 16),
+          err: error?.message || error,
+          connected: peer?.connected === true
+        });
+      });
+      stream.on('close', () => {
+        this.logger?.debug?.('[BlindPeering] Mirror stream closed', {
+          mirror,
+          remote: previewValue(normalizeCoreKey(stream.remotePublicKey || null), 16),
+          local: previewValue(normalizeCoreKey(stream.publicKey || null), 16),
+          connected: peer?.connected === true
+        });
+      });
+    }
   }
 
   setMetadataPath(path) {

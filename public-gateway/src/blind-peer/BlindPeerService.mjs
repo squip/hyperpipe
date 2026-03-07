@@ -130,6 +130,11 @@ export default class BlindPeerService extends EventEmitter {
     this.mirrorStaleThresholdMs = Number.isFinite(readinessValue) && readinessValue > 0
       ? Math.trunc(readinessValue)
       : DEFAULT_MIRROR_STALE_THRESHOLD_MS;
+    this.mirrorLifecycleLogIntervalMs = Number.isFinite(this.config?.mirrorLifecycleLogIntervalMs)
+      && this.config.mirrorLifecycleLogIntervalMs >= 0
+      ? Math.trunc(this.config.mirrorLifecycleLogIntervalMs)
+      : 5000;
+    this.lastMirrorLifecycleLogAt = 0;
   }
 
   async initialize() {
@@ -519,6 +524,9 @@ export default class BlindPeerService extends EventEmitter {
       }),
       dispatcherAssignments: this.getDispatcherAssignmentsSnapshot(),
       config: {
+        port: Number.isFinite(this.config.port) && this.config.port > 0
+          ? Math.trunc(this.config.port)
+          : null,
         maxBytes: this.config.maxBytes,
         gcIntervalMs: this.config.gcIntervalMs,
         dedupeBatchSize: this.config.dedupeBatchSize,
@@ -1068,6 +1076,44 @@ export default class BlindPeerService extends EventEmitter {
     return removed;
   }
 
+  #collectMirrorLifecycleStats() {
+    const pending = this.blindPeer?.db?.coresUpdated;
+    const pendingUpdates = pending && typeof pending.size === 'number' ? pending.size : null;
+    return {
+      enabled: !!this.config?.enabled,
+      running: !!this.running,
+      trackedCores: this.coreMetadata.size,
+      trustedPeerCount: this.trustedPeers.size,
+      pendingUpdates
+    };
+  }
+
+  #shouldLogMirrorLifecycle(force = false) {
+    if (force) {
+      this.lastMirrorLifecycleLogAt = Date.now();
+      return true;
+    }
+    const interval = this.mirrorLifecycleLogIntervalMs;
+    if (!Number.isFinite(interval) || interval <= 0) {
+      this.lastMirrorLifecycleLogAt = Date.now();
+      return true;
+    }
+    const now = Date.now();
+    if ((now - this.lastMirrorLifecycleLogAt) < interval) return false;
+    this.lastMirrorLifecycleLogAt = now;
+    return true;
+  }
+
+  #logMirrorLifecycle(event, details = {}, { force = false } = {}) {
+    if (!this.#shouldLogMirrorLifecycle(force)) return;
+    this.logger?.info?.({
+      event,
+      ts: Date.now(),
+      ...this.#collectMirrorLifecycleStats(),
+      ...(details && typeof details === 'object' ? details : {})
+    }, '[BlindPeer] Mirror lifecycle');
+  }
+
   #onBlindPeerAddCore(record, stream, context = {}) {
     if (!record?.key) return;
     const ownerPeerKey = stream?.remotePublicKey ? toKeyString(stream.remotePublicKey) : null;
@@ -1092,6 +1138,15 @@ export default class BlindPeerService extends EventEmitter {
         sourceEvent: context?.event || null
       }, '[BlindPeer] Mirror recorded');
     }
+
+    this.#logMirrorLifecycle('add-core', {
+      key: toKeyString(record.key),
+      ownerPeerKey,
+      identifier,
+      announce: record?.announce === true,
+      priority: record?.priority ?? null,
+      sourceEvent: context?.event || null
+    });
 
     this.emit('mirror-added', {
       coreKey: toKeyString(record.key),
@@ -1118,6 +1173,12 @@ export default class BlindPeerService extends EventEmitter {
         existing: info?.existing ?? null
       }, '[BlindPeer] Mirror removed');
     }
+
+    this.#logMirrorLifecycle('delete-core', {
+      key: keyStr,
+      ownerPeerKey: stream?.remotePublicKey ? toKeyString(stream.remotePublicKey) : null,
+      existing: info?.existing ?? null
+    });
 
     this.emit('mirror-removed', {
       coreKey: keyStr,
@@ -1295,6 +1356,98 @@ export default class BlindPeerService extends EventEmitter {
     return result;
   }
 
+  async getCoreFastForwardProof(coreKey, { staleThresholdMs = null } = {}) {
+    if (!coreKey || !this.blindPeer?.db) return null;
+    const decoded = decodeKey(coreKey);
+    const normalizedKey = toKeyString(decoded || coreKey);
+    if (!decoded || !normalizedKey) return null;
+
+    const resolvePendingRecord = () => {
+      const pendingMap = this.blindPeer?.db?.coresUpdated;
+      if (!pendingMap || typeof pendingMap.values !== 'function') return null;
+      for (const pending of pendingMap.values()) {
+        if (!pending || typeof pending !== 'object') continue;
+        const pendingKey = toKeyString(pending.key);
+        if (pendingKey !== normalizedKey) continue;
+        return {
+          key: pending.key || decoded,
+          length: Number.isFinite(pending.length) ? pending.length : null,
+          updated: Date.now(),
+          active: Date.now()
+        };
+      }
+      return null;
+    };
+
+    let record = null;
+    try {
+      if (typeof this.blindPeer.db.getCoreRecord === 'function') {
+        record = await this.blindPeer.db.getCoreRecord(decoded);
+      } else if (typeof this.blindPeer.db.get === 'function') {
+        record = await this.blindPeer.db.get('@blind-peer/cores', { key: decoded });
+      }
+    } catch (error) {
+      this.logger?.debug?.({
+        key: normalizedKey,
+        err: error?.message || error
+      }, '[BlindPeer] Failed to resolve core fast-forward proof');
+      return null;
+    }
+
+    if (!record || typeof record !== 'object') {
+      record = resolvePendingRecord();
+    }
+    if (!record || typeof record !== 'object') {
+      this.#logMirrorLifecycle('fast-forward-proof-missing', {
+        key: normalizedKey,
+        reason: 'missing-core-record'
+      }, { force: true });
+      return null;
+    }
+
+    const pending = resolvePendingRecord();
+    if (pending && Number.isFinite(pending.length)) {
+      const persistedLength = Number.isFinite(record.length) ? Number(record.length) : null;
+      if (!Number.isFinite(persistedLength) || pending.length > persistedLength) {
+        record = {
+          ...record,
+          length: pending.length,
+          updated: pending.updated || record.updated || null,
+          active: pending.active || record.active || null
+        };
+      }
+    }
+    const length = Number.isFinite(record.length) ? Math.trunc(record.length) : null;
+    const updatedAt = Number.isFinite(record.updated) ? Math.trunc(record.updated) : null;
+    const activeAt = Number.isFinite(record.active) ? Math.trunc(record.active) : null;
+    const referenceTs = updatedAt || activeAt || null;
+    const now = Date.now();
+    const lagMs = referenceTs ? Math.max(0, now - referenceTs) : null;
+    const thresholdValue = Number.isFinite(staleThresholdMs) && staleThresholdMs > 0
+      ? Math.trunc(staleThresholdMs)
+      : this.mirrorStaleThresholdMs;
+    const healthy = lagMs === null ? false : lagMs <= thresholdValue;
+
+    const proof = {
+      key: toKeyString(record.key || decoded) || normalizedKey,
+      length,
+      signedLength: length,
+      observedAt: updatedAt,
+      activeAt,
+      lagMs,
+      healthy,
+      proofSource: 'blind-peer-mirror',
+      proofAuthoritative: true
+    };
+    this.logger?.debug?.({
+      key: proof.key,
+      signedLength: proof.signedLength,
+      lagMs: proof.lagMs,
+      healthy: proof.healthy
+    }, '[BlindPeer] Core fast-forward proof resolved');
+    return proof;
+  }
+
   getMirrorReadinessSnapshot({ includeCores = false, limit = 50, staleThresholdMs } = {}) {
     const now = Date.now();
     const thresholdValue = Number.isFinite(staleThresholdMs) && staleThresholdMs > 0
@@ -1436,12 +1589,17 @@ export default class BlindPeerService extends EventEmitter {
     if (this.blindPeer) return this.blindPeer;
     const BlindPeer = await loadBlindPeerModule();
     const storage = await this.#ensureStorageDir();
-
-    this.blindPeer = new BlindPeer(storage, {
+    const requestedPort = Number(this.config.port);
+    const blindPeerOptions = {
       maxBytes: this.config.maxBytes,
       enableGc: true,
       trustedPubKeys: Array.from(this.trustedPeers)
-    });
+    };
+    if (Number.isFinite(requestedPort) && requestedPort > 0) {
+      blindPeerOptions.port = Math.trunc(requestedPort);
+    }
+
+    this.blindPeer = new BlindPeer(storage, blindPeerOptions);
 
     this.blindPeer.on('add-core', (record, _isTrusted, stream) => {
       this.#onBlindPeerAddCore(record, stream, { event: 'add-core' });

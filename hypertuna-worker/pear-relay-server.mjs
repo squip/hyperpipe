@@ -78,6 +78,9 @@ import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/
 const PUBLIC_GATEWAY_REPLICA_IDENTIFIER = 'public-gateway:hyperbee';
 const { DEFAULT_NAMESPACE } = hypercoreCaps;
 const HYPERTUNA_IDENTIFIER_TAG = 'hypertuna:relay';
+const HYPERTUNA_GATEWAY_ID_TAG = 'hypertuna-gateway-id';
+const HYPERTUNA_GATEWAY_ORIGIN_TAG = 'hypertuna-gateway-origin';
+const HYPERTUNA_DIRECT_JOIN_ONLY_TAG = 'hypertuna-direct-join-only';
 const KIND_GROUP_CREATE = 9007;
 const KIND_GROUP_METADATA = 39000;
 const KIND_GROUP_ADMIN_LIST = 39001;
@@ -108,6 +111,25 @@ function normalizePubkeyHex(value) {
   const trimmed = value.trim();
   if (!trimmed || !/^[0-9a-fA-F]{64}$/.test(trimmed)) return null;
   return trimmed.toLowerCase();
+}
+
+function normalizeGatewayId(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().toLowerCase();
+  return trimmed.length ? trimmed : null;
+}
+
+function normalizeHttpOrigin(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    return parsed.origin;
+  } catch (_) {
+    return null;
+  }
 }
 
 function normalizeAuthTokenValue(value) {
@@ -1178,6 +1200,22 @@ function normalizeFastForwardForEnvelope(fastForward) {
   return normalized;
 }
 
+function normalizeWriterCommitCheckpointForEnvelope(checkpoint) {
+  const normalized = normalizeWriterCommitCheckpoint(checkpoint);
+  if (!normalized) return null;
+  return {
+    relayKey: normalized.relayKey || null,
+    systemKey: normalized.systemKey || null,
+    systemLength: Number.isFinite(normalized.systemLength) ? Number(normalized.systemLength) : null,
+    systemSignedLength: Number.isFinite(normalized.systemSignedLength) ? Number(normalized.systemSignedLength) : null,
+    viewVersion: Number.isFinite(normalized.viewVersion) ? Number(normalized.viewVersion) : null,
+    activeWritersHash: typeof normalized.activeWritersHash === 'string' ? normalized.activeWritersHash : null,
+    activeWritersCount: Number.isFinite(normalized.activeWritersCount) ? Number(normalized.activeWritersCount) : null,
+    writerCore: typeof normalized.writerCore === 'string' ? normalized.writerCore : null,
+    recordedAt: Number.isFinite(normalized.recordedAt) ? Number(normalized.recordedAt) : null
+  };
+}
+
 function canonicalizeWriterLeaseEnvelopePayload(input) {
   if (!input || typeof input !== 'object') return null;
   const version = Number(input.version);
@@ -1198,6 +1236,9 @@ function canonicalizeWriterLeaseEnvelopePayload(input) {
   const issuerSwarmPeerKey = normalizeHex64(input.issuerSwarmPeerKey);
   const coreRefs = normalizeCoreRefsForEnvelope(input.coreRefs);
   const fastForward = normalizeFastForwardForEnvelope(input.fastForward);
+  const writerCommitCheckpoint = normalizeWriterCommitCheckpointForEnvelope(
+    input.writerCommitCheckpoint || input.writer_commit_checkpoint || null
+  );
 
   if (!leaseId || !relayKey || !publicIdentifier || !inviteePubkey) return null;
   if (!tokenHash || !writerCore || !writerSecret) return null;
@@ -1217,6 +1258,7 @@ function canonicalizeWriterLeaseEnvelopePayload(input) {
     writerSecret,
     coreRefs,
     fastForward,
+    writerCommitCheckpoint: writerCommitCheckpoint || undefined,
     issuedAt,
     expiresAt,
     issuerPubkey,
@@ -1238,6 +1280,9 @@ function serializeWriterLeaseEnvelopePayload(payload) {
     writerSecret: payload.writerSecret,
     coreRefs: Array.isArray(payload.coreRefs) ? payload.coreRefs : [],
     fastForward: payload.fastForward || null,
+    ...(payload.writerCommitCheckpoint
+      ? { writerCommitCheckpoint: payload.writerCommitCheckpoint }
+      : {}),
     issuedAt: payload.issuedAt,
     expiresAt: payload.expiresAt,
     issuerPubkey: payload.issuerPubkey,
@@ -1294,6 +1339,7 @@ export async function createSignedWriterLeaseEnvelope(input = {}) {
     writerSecret: input.writerSecret,
     coreRefs: input.coreRefs || [],
     fastForward: input.fastForward || null,
+    writerCommitCheckpoint: input.writerCommitCheckpoint || input.writer_commit_checkpoint || null,
     issuedAt: now,
     expiresAt,
     issuerPubkey,
@@ -3815,7 +3861,10 @@ function buildCreateRelayBootstrapDraftEvents({
   discoveryTopic = null,
   hostPeerKeys = [],
   writerIssuerPubkey = null,
-  leaseReplicaPeerKeys = []
+  leaseReplicaPeerKeys = [],
+  gatewayOrigin = null,
+  gatewayId = null,
+  directJoinOnly = false
 }) {
   const canonicalIdentifier = normalizeRelayIdentifier(publicIdentifier);
   const now = Math.floor(Date.now() / 1000);
@@ -3823,6 +3872,9 @@ function buildCreateRelayBootstrapDraftEvents({
   const about = description ? String(description) : '';
   const fileSharingEnabled = fileSharing !== false;
   const pictureTag = typeof picture === 'string' && picture.trim() ? picture.trim() : null;
+  const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin);
+  const normalizedGatewayId = normalizeGatewayId(gatewayId);
+  const directJoinOnlyEnabled = directJoinOnly === true;
 
   const groupTags = [
     ['h', canonicalIdentifier],
@@ -3848,6 +3900,9 @@ function buildCreateRelayBootstrapDraftEvents({
     [fileSharingEnabled ? 'file-sharing-on' : 'file-sharing-off']
   ];
   if (pictureTag) metadataTags.push(['picture', pictureTag, 'hypertuna:drive:pfp']);
+  if (normalizedGatewayId) metadataTags.push([HYPERTUNA_GATEWAY_ID_TAG, normalizedGatewayId]);
+  if (normalizedGatewayOrigin) metadataTags.push([HYPERTUNA_GATEWAY_ORIGIN_TAG, normalizedGatewayOrigin]);
+  if (directJoinOnlyEnabled) metadataTags.push([HYPERTUNA_DIRECT_JOIN_ONLY_TAG, '1']);
 
   if (isPublic && isOpen) {
     const topic = typeof discoveryTopic === 'string' && discoveryTopic.trim()
@@ -4014,7 +4069,10 @@ async function publishCreateRelayBootstrapEvents({
   isPublic,
   isOpen,
   fileSharing,
-  picture
+  picture,
+  gatewayOrigin = null,
+  gatewayId = null,
+  directJoinOnly = false
 }) {
   const canonicalIdentifier = normalizeRelayIdentifier(publicIdentifier || relayKey || '');
   if (!canonicalIdentifier) {
@@ -4048,6 +4106,9 @@ async function publishCreateRelayBootstrapEvents({
     fileSharing,
     relayWsUrl,
     picture,
+    gatewayOrigin,
+    gatewayId,
+    directJoinOnly,
     discoveryTopic,
     hostPeerKeys,
     writerIssuerPubkey,
@@ -4240,6 +4301,138 @@ function sampleActiveWriterKeys(relay, limit = 4) {
     if (sample.length >= limit) break;
   }
   return sample;
+}
+
+function normalizeWriterLeaseId(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length ? trimmed : null;
+}
+
+function collectActiveWriterCoreRefs(relay) {
+  const writers = relay?.activeWriters;
+  if (!writers || typeof writers[Symbol.iterator] !== 'function') {
+    return [];
+  }
+  const refs = [];
+  const seen = new Set();
+  for (const writer of writers) {
+    const keyCandidate = writer?.core?.key || writer?.key || writer;
+    const normalized = normalizeCoreRef(keyCandidate);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    refs.push(normalized);
+  }
+  refs.sort();
+  return refs;
+}
+
+function normalizeWriterCommitCheckpoint(input = null) {
+  if (!input || typeof input !== 'object') return null;
+  const systemKey = normalizeCoreRef(input.systemKey || input.system_key || null);
+  const writerCore = normalizeCoreRef(input.writerCore || input.writer_core || null);
+  const activeWritersHash = typeof input.activeWritersHash === 'string'
+    ? input.activeWritersHash
+    : (typeof input.active_writers_hash === 'string' ? input.active_writers_hash : null);
+  const activeWritersCountRaw =
+    Number.isFinite(input.activeWritersCount)
+      ? Number(input.activeWritersCount)
+      : Number.isFinite(input.active_writers_count)
+        ? Number(input.active_writers_count)
+        : null;
+  const systemSignedLengthRaw =
+    Number.isFinite(input.systemSignedLength)
+      ? Number(input.systemSignedLength)
+      : Number.isFinite(input.system_signed_length)
+        ? Number(input.system_signed_length)
+        : null;
+  const systemLengthRaw =
+    Number.isFinite(input.systemLength)
+      ? Number(input.systemLength)
+      : Number.isFinite(input.system_length)
+        ? Number(input.system_length)
+        : null;
+  const viewVersionRaw =
+    Number.isFinite(input.viewVersion)
+      ? Number(input.viewVersion)
+      : Number.isFinite(input.view_version)
+        ? Number(input.view_version)
+        : null;
+  const recordedAtRaw =
+    Number.isFinite(input.recordedAt)
+      ? Number(input.recordedAt)
+      : Number.isFinite(input.recorded_at)
+        ? Number(input.recorded_at)
+        : null;
+  const checkpoint = {
+    relayKey: normalizeRelayKeyHex(input.relayKey || input.relay_key || null) || null,
+    systemKey: systemKey || null,
+    systemLength: Number.isFinite(systemLengthRaw) ? Math.trunc(systemLengthRaw) : null,
+    systemSignedLength: Number.isFinite(systemSignedLengthRaw) ? Math.trunc(systemSignedLengthRaw) : null,
+    viewVersion: Number.isFinite(viewVersionRaw) ? Math.trunc(viewVersionRaw) : null,
+    activeWritersHash: activeWritersHash || null,
+    activeWritersCount: Number.isFinite(activeWritersCountRaw) ? Math.max(0, Math.trunc(activeWritersCountRaw)) : null,
+    writerCore: writerCore || null,
+    recordedAt: Number.isFinite(recordedAtRaw) ? Math.trunc(recordedAtRaw) : null
+  };
+  if (
+    !checkpoint.systemKey
+    && checkpoint.systemLength === null
+    && checkpoint.systemSignedLength === null
+    && checkpoint.viewVersion === null
+    && !checkpoint.activeWritersHash
+    && checkpoint.activeWritersCount === null
+    && !checkpoint.writerCore
+  ) {
+    return null;
+  }
+  return checkpoint;
+}
+
+function summarizeWriterCommitCheckpoint(checkpoint = null) {
+  const normalized = normalizeWriterCommitCheckpoint(checkpoint);
+  if (!normalized) {
+    return {
+      hasCheckpoint: false
+    };
+  }
+  return {
+    hasCheckpoint: true,
+    relayKey: normalized.relayKey ? normalized.relayKey.slice(0, 16) : null,
+    systemKey: normalized.systemKey ? normalized.systemKey.slice(0, 16) : null,
+    systemLength: normalized.systemLength,
+    systemSignedLength: normalized.systemSignedLength,
+    viewVersion: normalized.viewVersion,
+    activeWritersCount: normalized.activeWritersCount,
+    activeWritersHash: normalized.activeWritersHash ? normalized.activeWritersHash.slice(0, 16) : null,
+    writerCore: normalized.writerCore ? normalized.writerCore.slice(0, 16) : null,
+    recordedAt: normalized.recordedAt
+  };
+}
+
+function buildWriterCommitCheckpoint(relay, {
+  relayKey = null,
+  writerCore = null
+} = {}) {
+  if (!relay) return null;
+  const systemCore = relay?.system?.core || null;
+  const systemKey = normalizeCoreRef(systemCore?.key || null);
+  const activeWriterRefs = collectActiveWriterCoreRefs(relay);
+  const activeWritersHash = activeWriterRefs.length
+    ? sha256Hex(JSON.stringify(activeWriterRefs))
+    : null;
+  const checkpoint = {
+    relayKey: normalizeRelayKeyHex(relayKey) || null,
+    systemKey: systemKey || null,
+    systemLength: Number.isFinite(systemCore?.length) ? Math.trunc(systemCore.length) : null,
+    systemSignedLength: Number.isFinite(systemCore?.signedLength) ? Math.trunc(systemCore.signedLength) : null,
+    viewVersion: Number.isFinite(relay?.view?.version) ? Math.trunc(relay.view.version) : null,
+    activeWritersHash,
+    activeWritersCount: activeWriterRefs.length,
+    writerCore: normalizeCoreRef(writerCore),
+    recordedAt: Date.now()
+  };
+  return normalizeWriterCommitCheckpoint(checkpoint);
 }
 
 function collectRelayUpdateStats(relay) {
@@ -4891,13 +5084,113 @@ function startRelayUpdateProgressLogger({ relay, relayKey, reason, intervalMs = 
   };
 }
 
+function emitJoinCheckpointTrace(phase, data = {}) {
+  const payload = {
+    phase,
+    ts: Date.now(),
+    ...(data && typeof data === 'object' ? data : {})
+  };
+  console.log('[RelayServer][JoinCheckpoint]', payload);
+  try {
+    if (global.sendMessage) {
+      global.sendMessage({
+        type: 'JOIN_CHECKPOINT_TRACE',
+        data: payload
+      });
+    }
+  } catch (_) {}
+}
+
+function emitWriterActivationPrewaitTrace({
+  relayKey = null,
+  publicIdentifier = null,
+  mode = null,
+  reason = null,
+  expectedWriterKey = null,
+  joinTraceId = null,
+  joinAttemptId = null,
+  joinRequestId = null,
+  writerLeaseId = null,
+  writerCommitCheckpoint = null,
+  fastForward = null
+} = {}) {
+  const relay = relayKey ? activeRelays.get(relayKey)?.relay || null : null;
+  const normalizedLeaseId = normalizeWriterLeaseId(writerLeaseId);
+  const checkpointSummary = summarizeWriterCommitCheckpoint(writerCommitCheckpoint);
+  const fastForwardKey = normalizeCoreRef(fastForward?.key || fastForward?.checkpointKey || null);
+  const fastForwardSignedLength = Number.isFinite(fastForward?.signedLength)
+    ? Math.trunc(fastForward.signedLength)
+    : (Number.isFinite(fastForward?.length) ? Math.trunc(fastForward.length) : null);
+  const gate = collectRelayGateSnapshot(relay);
+  const progress = collectRelayProgressSnapshot(relay);
+  emitJoinCheckpointTrace('writer-activation-prewait', {
+    joinTraceId: typeof joinTraceId === 'string' ? joinTraceId : null,
+    joinAttemptId: typeof joinAttemptId === 'string' ? joinAttemptId : null,
+    joinRequestId: typeof joinRequestId === 'string' ? joinRequestId : null,
+    relayKey,
+    publicIdentifier,
+    mode,
+    reason,
+    expectedWriter: previewWriterKey(normalizeWriterKey(expectedWriterKey)),
+    writerLeaseId: normalizedLeaseId,
+    writerCommitCheckpoint: checkpointSummary,
+    fastForwardKey: fastForwardKey ? fastForwardKey.slice(0, 16) : null,
+    fastForwardSignedLength,
+    gate,
+    progress: {
+      writable: progress?.writable ?? null,
+      activeWriters: progress?.activeWriters ?? null,
+      view: progress?.view || null,
+      local: progress?.local || null,
+      writers: progress?.writers || null
+    }
+  });
+}
+
+function classifyWriterActivationBlock(snapshot = {}) {
+  if (!snapshot || typeof snapshot !== 'object') return 'unknown';
+  if (snapshot.writable === true) return 'none';
+  if (snapshot.expectedWriter && snapshot.expectedWriterActive === false) {
+    if (snapshot.localKey && snapshot.localKey === snapshot.expectedWriter) {
+      return 'local-writer-not-active';
+    }
+    return 'expected-writer-not-active';
+  }
+  if (typeof snapshot.activeWriters === 'number' && snapshot.activeWriters <= 0) {
+    return 'no-active-writers';
+  }
+  if (snapshot.localKey && Array.isArray(snapshot.writerSample) && !snapshot.writerSample.includes(snapshot.localKey)) {
+    return 'local-writer-missing-from-active-set';
+  }
+  return 'unknown';
+}
+
+function summarizeWriterActivationDiagnostics(relay, snapshot = {}) {
+  const gateSnapshot = collectRelayGateSnapshot(relay);
+  const progress = collectRelayProgressSnapshot(relay);
+  return {
+    blockReason: classifyWriterActivationBlock(snapshot),
+    gate: gateSnapshot,
+    progress: {
+      writable: progress?.writable ?? null,
+      activeWriters: progress?.activeWriters ?? null,
+      view: progress?.view || null,
+      local: progress?.local || null,
+      autobase: progress?.autobase || null,
+      writers: progress?.writers || null
+    }
+  };
+}
+
 async function waitForRelayWriterActivation(options = {}) {
   const {
     relayKey,
     expectedWriterKey = null,
     timeoutMs = 10000,
     reason = 'unknown',
-    pollMs = 500
+    pollMs = 500,
+    writerLeaseId = null,
+    writerCommitCheckpoint = null
   } = options;
   if (!relayKey) return { ok: false, reason, relayKey: null };
 
@@ -4905,16 +5198,31 @@ async function waitForRelayWriterActivation(options = {}) {
   const relayManager = activeRelays.get(relayKey);
   if (!relayManager?.relay) {
     console.warn('[RelayServer] waitForRelayWriterActivation: relay manager missing', { relayKey, reason });
+    emitJoinCheckpointTrace('writer-activation-missing-relay', {
+      relayKey,
+      reason
+    });
     return { ok: false, reason, relayKey };
   }
 
   const relay = relayManager.relay;
   const expectedKey = normalizeWriterKey(expectedWriterKey);
   const expectedHex = previewWriterKey(expectedKey);
+  const normalizedWriterLeaseId = normalizeWriterLeaseId(writerLeaseId);
+  const writerCommitCheckpointSummary = summarizeWriterCommitCheckpoint(writerCommitCheckpoint);
   const start = Date.now();
   let timeoutId = null;
   let pollId = null;
   let lastSnapshot = null;
+  emitJoinCheckpointTrace('writer-activation-start', {
+    relayKey,
+    reason,
+    expectedWriter: expectedHex,
+    timeoutMs,
+    pollMs,
+    writerLeaseId: normalizedWriterLeaseId,
+    writerCommitCheckpoint: writerCommitCheckpointSummary
+  });
 
   if (typeof relay.ready === 'function') {
     try {
@@ -4992,6 +5300,13 @@ async function waitForRelayWriterActivation(options = {}) {
       const snap = snapshot(context);
       logState(snap);
       if (isReady(snap)) {
+        const diagnostics = summarizeWriterActivationDiagnostics(relay, snap);
+        emitJoinCheckpointTrace('writer-activation-ready', {
+          ...snap,
+          ...diagnostics,
+          writerLeaseId: normalizedWriterLeaseId,
+          writerCommitCheckpoint: writerCommitCheckpointSummary
+        });
         console.log(`[RelayServer] waitForRelayWriterActivation resolved on ${context}`, snap);
         cleanup({ ok: true, ...snap });
         return true;
@@ -5010,12 +5325,25 @@ async function waitForRelayWriterActivation(options = {}) {
 
     timeoutId = setTimeout(() => {
       const snap = snapshot('timeout');
+      const diagnostics = summarizeWriterActivationDiagnostics(relay, snap);
       if (isReady(snap)) {
         console.warn('[RelayServer] waitForRelayWriterActivation timeout but ready', snap);
+        emitJoinCheckpointTrace('writer-activation-timeout-ready', {
+          ...snap,
+          ...diagnostics,
+          writerLeaseId: normalizedWriterLeaseId,
+          writerCommitCheckpoint: writerCommitCheckpointSummary
+        });
         cleanup({ ok: true, timeout: true, ...snap });
         return;
       }
       console.warn('[RelayServer] waitForRelayWriterActivation timeout', snap);
+      emitJoinCheckpointTrace('writer-activation-timeout', {
+        ...snap,
+        ...diagnostics,
+        writerLeaseId: normalizedWriterLeaseId,
+        writerCommitCheckpoint: writerCommitCheckpointSummary
+      });
       cleanup({ ok: false, timeout: true, ...snap });
     }, timeoutMs);
 
@@ -5736,15 +6064,24 @@ export async function createRelay(options) {
     isPublic = false,
     isOpen = false,
     fileSharing = true,
-    picture
+    picture,
+    gatewayOrigin = null,
+    gatewayId = null,
+    directJoinOnly = false
   } = options;
+  const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin);
+  const normalizedGatewayId = normalizeGatewayId(gatewayId);
+  const relayDirectJoinOnly = directJoinOnly === true;
   console.log('[RelayServer] Creating relay via adapter:', {
     name,
     description,
     isPublic,
     isOpen,
     fileSharing,
-    hasPicture: typeof picture === 'string' && !!picture.trim()
+    hasPicture: typeof picture === 'string' && !!picture.trim(),
+    gatewayOrigin: normalizedGatewayOrigin,
+    gatewayId: normalizedGatewayId,
+    directJoinOnly: relayDirectJoinOnly
   });
 
   const result = await createRelayManager({
@@ -5757,6 +6094,9 @@ export async function createRelay(options) {
   });
   
   if (result.success) {
+    result.gatewayOrigin = normalizedGatewayOrigin;
+    result.gatewayId = normalizedGatewayId;
+    result.directJoinOnly = relayDirectJoinOnly;
     // This is now the single source of truth for token generation on creation.
     await updateHealthState();
     
@@ -5899,7 +6239,10 @@ export async function createRelay(options) {
         isPublic,
         isOpen,
         fileSharing,
-        picture
+        picture,
+        gatewayOrigin: normalizedGatewayOrigin,
+        gatewayId: normalizedGatewayId,
+        directJoinOnly: relayDirectJoinOnly
       });
       bootstrapPublish.status = bootstrapResult.ok ? 'success' : 'failed';
       bootstrapPublish.attempt = bootstrapResult.attempt || 0;
@@ -6113,16 +6456,67 @@ export async function startJoinAuthentication(options) {
     writerSecret = null,
     writerCoreHex = null,
     autobaseLocal = null,
+    writerLeaseId = null,
+    writerCommitCheckpoint = null,
     coreRefs = [],
     writerCoreRefs = [],
-    fastForward = null
+    fastForward = null,
+    joinAttemptId = null,
+    joinTraceId = null,
+    joinRequestId = null,
+    joinWritableTimeoutMs = null
   } = options;
   const expectedWriter = resolveExpectedWriterKey({ writerCoreHex, autobaseLocal, writerCore });
   const expectedWriterKey = expectedWriter.expectedWriterKey;
   const expectedWriterSource = expectedWriter.source;
   const expectedWriterKeyHex = resolveWriterKeyHex(expectedWriterKey);
+  const normalizedWriterLeaseId = normalizeWriterLeaseId(
+    writerLeaseId || options?.writerLeaseEnvelope?.leaseId || null
+  );
+  const normalizedWriterCommitCheckpoint = normalizeWriterCommitCheckpoint(
+    writerCommitCheckpoint
+      || options?.writerLeaseEnvelope?.writerCommitCheckpoint
+      || options?.writerLeaseEnvelope?.writer_commit_checkpoint
+      || null
+  );
+  const requiresClosedJoinCheckpoint = Boolean(
+    !openJoin
+    && !!inviteToken
+    && (writerSecret || expectedWriterKey || writerCore || writerCoreHex || autobaseLocal)
+  );
+  if (requiresClosedJoinCheckpoint && !normalizedWriterCommitCheckpoint) {
+    emitJoinCheckpointTrace('writer-checkpoint-missing', {
+      publicIdentifier,
+      relayKey: normalizeRelayKeyHex(inviteRelayKey) || inviteRelayKey || null,
+      joinTraceId: typeof joinTraceId === 'string' ? joinTraceId : null,
+      joinAttemptId: typeof joinAttemptId === 'string' ? joinAttemptId : null,
+      joinRequestId: typeof joinRequestId === 'string' ? joinRequestId : null,
+      mode: 'invite-fallback',
+      reason: 'closed-join-requires-checkpoint',
+      hasWriterSecret: !!writerSecret,
+      expectedWriter: previewWriterKey(expectedWriterKey),
+      writerLeaseId: normalizedWriterLeaseId ? normalizedWriterLeaseId.slice(0, 24) : null
+    });
+    throw new Error('writer-checkpoint-missing: closed join requires writer commit checkpoint');
+  }
   const normalizedGatewayMode = normalizeGatewayMode(gatewayMode);
   const gatewayDisabled = normalizedGatewayMode === 'disabled';
+  const scopedJoinAttemptId =
+    typeof joinAttemptId === 'string' && joinAttemptId.trim().length
+      ? joinAttemptId.trim()
+      : null;
+  const scopedJoinTraceId =
+    typeof joinTraceId === 'string' && joinTraceId.trim().length
+      ? joinTraceId.trim()
+      : scopedJoinAttemptId;
+  const scopedJoinRequestId =
+    typeof joinRequestId === 'string' && joinRequestId.trim().length
+      ? joinRequestId.trim()
+      : null;
+  const resolvedJoinWritableTimeoutMs =
+    Number.isFinite(joinWritableTimeoutMs) && Number(joinWritableTimeoutMs) > 0
+      ? Math.max(1000, Math.floor(Number(joinWritableTimeoutMs)))
+      : BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS;
   const normalizedJoinPathMode =
     typeof joinPathMode === 'string'
       ? joinPathMode.trim().toLowerCase()
@@ -6254,10 +6648,17 @@ export async function startJoinAuthentication(options) {
   writerCoreRefsForJoin = Array.from(new Set(writerCoreRefsForJoin));
   console.log('[RelayServer] startJoinAuthentication payload', {
     publicIdentifier,
+    joinAttemptId: scopedJoinAttemptId,
+    joinTraceId: scopedJoinTraceId,
+    joinRequestId: scopedJoinRequestId,
+    joinWritableTimeoutMs: resolvedJoinWritableTimeoutMs,
     hasWriterSecret: !!writerSecret,
     hasWriterCore: !!writerCore,
     hasWriterCoreHex: !!writerCoreHex,
     hasAutobaseLocal: !!autobaseLocal,
+    hasWriterLeaseId: !!normalizedWriterLeaseId,
+    writerLeaseId: normalizedWriterLeaseId ? normalizedWriterLeaseId.slice(0, 24) : null,
+    writerCommitCheckpoint: summarizeWriterCommitCheckpoint(normalizedWriterCommitCheckpoint),
     hasFastForward: !!fastForward,
     expectedWriterSource,
     expectedWriterKeyHex,
@@ -6275,8 +6676,23 @@ export async function startJoinAuthentication(options) {
     resolvedCoreRefsCount: coreRefsForJoin.length,
     checkpointInJoinRefs
   });
+  emitJoinCheckpointTrace('join-auth-start', {
+    publicIdentifier,
+    joinAttemptId: scopedJoinAttemptId,
+    joinTraceId: scopedJoinTraceId,
+    joinRequestId: scopedJoinRequestId,
+    gatewayMode: normalizedGatewayMode,
+    openJoin,
+    hasInviteToken: !!inviteToken,
+    expectedWriterSource,
+    expectedWriterKeyHex,
+    writerLeaseId: normalizedWriterLeaseId,
+    writerCommitCheckpoint: summarizeWriterCommitCheckpoint(normalizedWriterCommitCheckpoint)
+  });
   console.log('[RelayServer][WriterMaterial] Join auth writer material', {
     publicIdentifier,
+    writerLeaseId: normalizedWriterLeaseId,
+    writerCommitCheckpoint: summarizeWriterCommitCheckpoint(normalizedWriterCommitCheckpoint),
     writerCore,
     writerSecret,
     writerCoreHex,
@@ -6305,7 +6721,10 @@ export async function startJoinAuthentication(options) {
         type: 'join-auth-error',
         data: {
           publicIdentifier,
-          error: errorMsg
+          error: errorMsg,
+          joinAttemptId: scopedJoinAttemptId,
+          joinTraceId: scopedJoinTraceId,
+          joinRequestId: scopedJoinRequestId
         }
       });
     }
@@ -6340,7 +6759,10 @@ export async function startJoinAuthentication(options) {
         type: 'join-auth-progress',
         data: {
           publicIdentifier,
-          status: 'request'
+          status: 'request',
+          joinAttemptId: scopedJoinAttemptId,
+          joinTraceId: scopedJoinTraceId,
+          joinRequestId: scopedJoinRequestId
         }
       });
     }
@@ -6664,6 +7086,19 @@ export async function startJoinAuthentication(options) {
         const hasBypassWriterMaterial = Boolean(writerSecret && (expectedWriterKey || writerCore || writerCoreHex));
         const relayAlreadyWritable = relayManager?.relay?.writable === true;
         const canBypassWait = hasBypassWriterMaterial && relayAlreadyWritable;
+        emitWriterActivationPrewaitTrace({
+          relayKey: fallbackRelayKey,
+          publicIdentifier,
+          mode: inviteFallbackMode,
+          reason: inviteFallbackReason,
+          expectedWriterKey,
+          joinTraceId: scopedJoinTraceId,
+          joinAttemptId: scopedJoinAttemptId,
+          joinRequestId: scopedJoinRequestId,
+          writerLeaseId: normalizedWriterLeaseId,
+          writerCommitCheckpoint: normalizedWriterCommitCheckpoint,
+          fastForward
+        });
         if (canBypassWait) {
           let expectedWriterActive = null;
           try {
@@ -6698,8 +7133,10 @@ export async function startJoinAuthentication(options) {
           relayWaitResult = await waitForRelayWriterActivation({
             relayKey: fallbackRelayKey,
             expectedWriterKey,
-            timeoutMs: BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS,
-            reason: inviteFallbackReason
+            timeoutMs: resolvedJoinWritableTimeoutMs,
+            reason: inviteFallbackReason,
+            writerLeaseId: normalizedWriterLeaseId,
+            writerCommitCheckpoint: normalizedWriterCommitCheckpoint
           });
         }
         console.log('[RelayServer] Invite fallback writer wait result', {
@@ -6709,6 +7146,19 @@ export async function startJoinAuthentication(options) {
           expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
           elapsedMs: relayWaitResult?.elapsedMs ?? null,
           bypassed: relayWaitResult?.bypassed ?? false
+        });
+        emitJoinCheckpointTrace('writer-activation-result', {
+          joinTraceId: scopedJoinTraceId,
+          joinAttemptId: scopedJoinAttemptId,
+          relayKey: fallbackRelayKey,
+          publicIdentifier,
+          mode: inviteFallbackMode,
+          writerLeaseId: normalizedWriterLeaseId,
+          writerCommitCheckpoint: summarizeWriterCommitCheckpoint(normalizedWriterCommitCheckpoint),
+          ok: relayWaitResult?.ok ?? null,
+          writable: relayWaitResult?.writable ?? null,
+          expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
+          elapsedMs: relayWaitResult?.elapsedMs ?? null
         });
         const identifierPath = publicIdentifier
           ? publicIdentifier.replace(':', '/')
@@ -6895,7 +7345,10 @@ export async function startJoinAuthentication(options) {
               relayUrl: inviteRelayUrl || null,
               hostPeer: inviteFallbackHostPeer,
               mode: inviteFallbackMode,
-              provisional: false
+              provisional: false,
+              joinAttemptId: scopedJoinAttemptId,
+              joinTraceId: scopedJoinTraceId,
+              joinRequestId: scopedJoinRequestId
             }
           });
         }
@@ -6982,11 +7435,26 @@ export async function startJoinAuthentication(options) {
 
         await updateRelayAuthToken(fallbackRelayKey, userPubkey, provisionalToken);
 
+        emitWriterActivationPrewaitTrace({
+          relayKey: fallbackRelayKey,
+          publicIdentifier,
+          mode: 'open-offline',
+          reason: 'open-offline',
+          expectedWriterKey,
+          joinTraceId: scopedJoinTraceId,
+          joinAttemptId: scopedJoinAttemptId,
+          joinRequestId: scopedJoinRequestId,
+          writerLeaseId: normalizedWriterLeaseId,
+          writerCommitCheckpoint: normalizedWriterCommitCheckpoint,
+          fastForward
+        });
         const relayWaitResult = await waitForRelayWriterActivation({
           relayKey: fallbackRelayKey,
           expectedWriterKey,
-          timeoutMs: BLIND_PEER_JOIN_WRITABLE_TIMEOUT_MS,
-          reason: 'open-offline'
+          timeoutMs: resolvedJoinWritableTimeoutMs,
+          reason: 'open-offline',
+          writerLeaseId: normalizedWriterLeaseId,
+          writerCommitCheckpoint: normalizedWriterCommitCheckpoint
         });
         console.log('[RelayServer] Open join offline writer wait result', {
           relayKey: fallbackRelayKey,
@@ -6995,7 +7463,19 @@ export async function startJoinAuthentication(options) {
           expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
           elapsedMs: relayWaitResult?.elapsedMs ?? null
         });
-
+        emitJoinCheckpointTrace('writer-activation-result', {
+          joinTraceId: scopedJoinTraceId,
+          joinAttemptId: scopedJoinAttemptId,
+          relayKey: fallbackRelayKey,
+          publicIdentifier,
+          mode: 'open-offline',
+          writerLeaseId: normalizedWriterLeaseId,
+          writerCommitCheckpoint: summarizeWriterCommitCheckpoint(normalizedWriterCommitCheckpoint),
+          ok: relayWaitResult?.ok ?? null,
+          writable: relayWaitResult?.writable ?? null,
+          expectedWriterActive: relayWaitResult?.expectedWriterActive ?? null,
+          elapsedMs: relayWaitResult?.elapsedMs ?? null
+        });
         const identifierPath = publicIdentifier
           ? publicIdentifier.replace(':', '/')
           : fallbackRelayKey;
@@ -7103,20 +7583,23 @@ export async function startJoinAuthentication(options) {
           });
         }
 
-        if (global.sendMessage) {
-          global.sendMessage({
-            type: 'join-auth-success',
-            data: {
-              publicIdentifier,
-              relayKey: fallbackRelayKey,
-              authToken: provisionalToken,
-              relayUrl: resolvedRelayUrl || null,
-              hostPeer: blindPeerKey || null,
-              mode: 'open-offline',
-              provisional: true
-            }
-          });
-        }
+      if (global.sendMessage) {
+        global.sendMessage({
+          type: 'join-auth-success',
+          data: {
+            publicIdentifier,
+            relayKey: fallbackRelayKey,
+            authToken: provisionalToken,
+            relayUrl: resolvedRelayUrl || null,
+            hostPeer: blindPeerKey || null,
+            mode: 'open-offline',
+            provisional: true,
+            joinAttemptId: scopedJoinAttemptId,
+            joinTraceId: scopedJoinTraceId,
+            joinRequestId: scopedJoinRequestId
+          }
+        });
+      }
         return {
           ok: true,
           mode: 'open-offline',
@@ -7143,7 +7626,13 @@ export async function startJoinAuthentication(options) {
     if (global.sendMessage) {
       global.sendMessage({
         type: 'join-auth-progress',
-        data: { publicIdentifier, status: 'verify' }
+        data: {
+          publicIdentifier,
+          status: 'verify',
+          joinAttemptId: scopedJoinAttemptId,
+          joinTraceId: scopedJoinTraceId,
+          joinRequestId: scopedJoinRequestId
+        }
       });
     }
 
@@ -7218,7 +7707,13 @@ export async function startJoinAuthentication(options) {
     if (global.sendMessage) {
       global.sendMessage({
         type: 'join-auth-progress',
-        data: { publicIdentifier, status: 'complete' }
+        data: {
+          publicIdentifier,
+          status: 'complete',
+          joinAttemptId: scopedJoinAttemptId,
+          joinTraceId: scopedJoinTraceId,
+          joinRequestId: scopedJoinRequestId
+        }
       });
     }
 
@@ -7331,14 +7826,42 @@ export async function startJoinAuthentication(options) {
 
     // Wait for the relay to become writable or the expected writer to activate before announcing membership.
     // In gateway-disabled open-join mode, completion is blocked until writable to avoid false "success".
+    emitWriterActivationPrewaitTrace({
+      relayKey,
+      publicIdentifier: finalIdentifier,
+      mode: 'direct-join',
+      reason: 'direct-join',
+      expectedWriterKey: finalExpectedWriterKey,
+      joinTraceId: scopedJoinTraceId,
+      joinAttemptId: scopedJoinAttemptId,
+      joinRequestId: scopedJoinRequestId,
+      writerLeaseId: normalizedWriterLeaseId,
+      writerCommitCheckpoint: normalizedWriterCommitCheckpoint,
+      fastForward
+    });
     let directWaitResult = await waitForRelayWriterActivation({
       relayKey,
       expectedWriterKey: finalExpectedWriterKey,
       timeoutMs: DIRECT_JOIN_WRITABLE_TIMEOUT_MS,
-      reason: 'direct-join'
+      reason: 'direct-join',
+      writerLeaseId: normalizedWriterLeaseId,
+      writerCommitCheckpoint: normalizedWriterCommitCheckpoint
     });
     console.log('[RelayServer] Direct join writer wait result', {
       relayKey,
+      ok: directWaitResult?.ok ?? null,
+      writable: directWaitResult?.writable ?? null,
+      expectedWriterActive: directWaitResult?.expectedWriterActive ?? null,
+      elapsedMs: directWaitResult?.elapsedMs ?? null
+    });
+    emitJoinCheckpointTrace('writer-activation-result', {
+      joinTraceId: scopedJoinTraceId,
+      joinAttemptId: scopedJoinAttemptId,
+      relayKey,
+      publicIdentifier: finalIdentifier,
+      mode: 'direct-join',
+      writerLeaseId: normalizedWriterLeaseId,
+      writerCommitCheckpoint: summarizeWriterCommitCheckpoint(normalizedWriterCommitCheckpoint),
       ok: directWaitResult?.ok ?? null,
       writable: directWaitResult?.writable ?? null,
       expectedWriterActive: directWaitResult?.expectedWriterActive ?? null,
@@ -7353,14 +7876,42 @@ export async function startJoinAuthentication(options) {
         writable: directWaitResult?.writable ?? null,
         expectedWriterActive: directWaitResult?.expectedWriterActive ?? null
       });
+      emitWriterActivationPrewaitTrace({
+        relayKey,
+        publicIdentifier: finalIdentifier,
+        mode: 'direct-join-finalize',
+        reason: 'direct-join-finalize',
+        expectedWriterKey: finalExpectedWriterKey,
+        joinTraceId: scopedJoinTraceId,
+        joinAttemptId: scopedJoinAttemptId,
+        joinRequestId: scopedJoinRequestId,
+        writerLeaseId: normalizedWriterLeaseId,
+        writerCommitCheckpoint: normalizedWriterCommitCheckpoint,
+        fastForward
+      });
       directWaitResult = await waitForRelayWriterActivation({
         relayKey,
         expectedWriterKey: finalExpectedWriterKey,
         timeoutMs: LATE_WRITER_RECOVERY_TIMEOUT_MS,
-        reason: 'direct-join-finalize'
+        reason: 'direct-join-finalize',
+        writerLeaseId: normalizedWriterLeaseId,
+        writerCommitCheckpoint: normalizedWriterCommitCheckpoint
       });
       console.log('[RelayServer] Direct join finalize writable wait result', {
         relayKey,
+        ok: directWaitResult?.ok ?? null,
+        writable: directWaitResult?.writable ?? null,
+        expectedWriterActive: directWaitResult?.expectedWriterActive ?? null,
+        elapsedMs: directWaitResult?.elapsedMs ?? null
+      });
+      emitJoinCheckpointTrace('writer-activation-result', {
+        joinTraceId: scopedJoinTraceId,
+        joinAttemptId: scopedJoinAttemptId,
+        relayKey,
+        publicIdentifier: finalIdentifier,
+        mode: 'direct-join-finalize',
+        writerLeaseId: normalizedWriterLeaseId,
+        writerCommitCheckpoint: summarizeWriterCommitCheckpoint(normalizedWriterCommitCheckpoint),
         ok: directWaitResult?.ok ?? null,
         writable: directWaitResult?.writable ?? null,
         expectedWriterActive: directWaitResult?.expectedWriterActive ?? null,
@@ -7497,7 +8048,10 @@ export async function startJoinAuthentication(options) {
           relayUrl: canonicalRelayUrl,
           hostPeer: selectedPeerKey,
           mode: 'direct-join',
-          provisional: false
+          provisional: false,
+          joinAttemptId: scopedJoinAttemptId,
+          joinTraceId: scopedJoinTraceId,
+          joinRequestId: scopedJoinRequestId
         }
       });
     }
@@ -7515,6 +8069,8 @@ export async function startJoinAuthentication(options) {
     const errorMessage = error?.message || String(error);
     const errorCode = error?.code === 'auth-token-owner-mismatch'
       ? 'auth-token-owner-mismatch'
+      : /writer-checkpoint-missing/i.test(errorMessage)
+        ? 'writer-checkpoint-missing'
       : /timeout/i.test(errorMessage)
         ? 'request-timeout'
         : /closed-join-pending/i.test(errorMessage)
@@ -7526,7 +8082,10 @@ export async function startJoinAuthentication(options) {
         type: 'join-auth-error',
         data: {
           publicIdentifier,
-          error: errorMessage
+          error: errorMessage,
+          joinAttemptId: scopedJoinAttemptId,
+          joinTraceId: scopedJoinTraceId,
+          joinRequestId: scopedJoinRequestId
         }
       });
     }
@@ -7570,9 +8129,11 @@ export async function provisionWriterForInvitee(options = {}) {
   const writerSigner = HypercoreId.encode(keyPair.publicKey);
   const writerSecret = b4a.toString(keyPair.secretKey, 'hex');
   const writerHex = b4a.toString(keyPair.publicKey, 'hex');
+  const writerLeaseId = `wl-${nodeCrypto.randomUUID()}`;
   let writerCore = writerSigner;
   let writerCoreHex = null;
   let writerCoreId = null;
+  let writerCommitCheckpoint = null;
   let coreKeyMatchesSigner = null;
   let corestoreId = null;
   let corestorePath = null;
@@ -7672,6 +8233,17 @@ export async function provisionWriterForInvitee(options = {}) {
     });
   }
 
+  writerCommitCheckpoint = buildWriterCommitCheckpoint(relayManager.relay, {
+    relayKey: resolvedRelayKey,
+    writerCore: writerCoreHex || writerCore
+  });
+  console.log('[RelayServer] Invite writer commit checkpoint', {
+    relayKey: resolvedRelayKey,
+    trace: inviteTraceId || null,
+    writerLeaseId,
+    checkpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint)
+  });
+
   try {
     const persistRefsStartedAt = Date.now();
     const relayIdentifier = publicIdentifier || relayManager?.publicIdentifier || null;
@@ -7713,6 +8285,8 @@ export async function provisionWriterForInvitee(options = {}) {
 
   console.log('[RelayServer][WriterMaterial] Invite writer material', {
     relayKey: resolvedRelayKey,
+    writerLeaseId,
+    writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
     writerCore,
     writerCoreHex,
     writerCoreId,
@@ -7743,6 +8317,8 @@ export async function provisionWriterForInvitee(options = {}) {
 
   return {
     relayKey: resolvedRelayKey,
+    writerLeaseId,
+    writerCommitCheckpoint,
     writerCore,
     writerCoreHex,
     autobaseLocal: writerCoreHex,

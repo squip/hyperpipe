@@ -3126,6 +3126,13 @@ export class TuiController {
           picture: input.picture || undefined,
           isPublic: typeof input.isPublic === 'boolean' ? input.isPublic : true,
           isOpen: typeof input.isOpen === 'boolean' ? input.isOpen : true,
+          gatewayOrigin: typeof input.gatewayOrigin === 'string' && input.gatewayOrigin.trim()
+            ? input.gatewayOrigin.trim()
+            : null,
+          gatewayId: typeof input.gatewayId === 'string' && input.gatewayId.trim()
+            ? input.gatewayId.trim().toLowerCase()
+            : null,
+          directJoinOnly: input.directJoinOnly === true,
           adminPubkey: session?.pubkey || null,
           adminName: null,
           members: session?.pubkey ? [session.pubkey] : [],

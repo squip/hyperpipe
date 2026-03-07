@@ -35,11 +35,28 @@ function normalizeEntry(entry) {
   const writerCoreHex = typeof entry.writerCoreHex === 'string' ? entry.writerCoreHex : null;
   const autobaseLocal = typeof entry.autobaseLocal === 'string' ? entry.autobaseLocal : null;
   const writerSecret = typeof entry.writerSecret === 'string' ? entry.writerSecret : null;
+  const writerLeaseId = typeof entry.writerLeaseId === 'string' ? entry.writerLeaseId : null;
+  const rawCheckpoint = entry.writerCommitCheckpoint && typeof entry.writerCommitCheckpoint === 'object'
+    ? entry.writerCommitCheckpoint
+    : null;
+  const writerCommitCheckpoint = rawCheckpoint
+    ? {
+        relayKey: typeof rawCheckpoint.relayKey === 'string' ? rawCheckpoint.relayKey : null,
+        systemKey: typeof rawCheckpoint.systemKey === 'string' ? rawCheckpoint.systemKey : null,
+        systemLength: Number.isFinite(rawCheckpoint.systemLength) ? Math.trunc(rawCheckpoint.systemLength) : null,
+        systemSignedLength: Number.isFinite(rawCheckpoint.systemSignedLength) ? Math.trunc(rawCheckpoint.systemSignedLength) : null,
+        viewVersion: Number.isFinite(rawCheckpoint.viewVersion) ? Math.trunc(rawCheckpoint.viewVersion) : null,
+        activeWritersHash: typeof rawCheckpoint.activeWritersHash === 'string' ? rawCheckpoint.activeWritersHash : null,
+        activeWritersCount: Number.isFinite(rawCheckpoint.activeWritersCount) ? Math.max(0, Math.trunc(rawCheckpoint.activeWritersCount)) : null,
+        writerCore: typeof rawCheckpoint.writerCore === 'string' ? rawCheckpoint.writerCore : null,
+        recordedAt: Number.isFinite(rawCheckpoint.recordedAt) ? Math.trunc(rawCheckpoint.recordedAt) : null
+      }
+    : null;
   const issuedAt = Number.isFinite(entry.issuedAt) ? entry.issuedAt : null;
   const expiresAt = Number.isFinite(entry.expiresAt) ? entry.expiresAt : null;
   if (!writerCore && !writerCoreHex && !autobaseLocal) return null;
   if (!writerSecret) return null;
-  return {
+  const normalized = {
     writerCore,
     writerCoreHex,
     autobaseLocal,
@@ -47,6 +64,9 @@ function normalizeEntry(entry) {
     issuedAt,
     expiresAt
   };
+  if (writerLeaseId) normalized.writerLeaseId = writerLeaseId;
+  if (writerCommitCheckpoint) normalized.writerCommitCheckpoint = writerCommitCheckpoint;
+  return normalized;
 }
 
 export function pruneWriterPoolEntries(entries = [], now = Date.now()) {

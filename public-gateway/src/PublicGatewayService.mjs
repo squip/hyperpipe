@@ -54,6 +54,20 @@ import BlindPeerReplicaManager from './blind-peer/BlindPeerReplicaManager.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores';
+const JOIN_TRACE_ID_HEADER = 'x-hypertuna-join-trace-id';
+const JOIN_TRACE_ATTEMPT_ID_HEADER = 'x-hypertuna-join-attempt-id';
+const JOIN_TRACE_REQUEST_ID_HEADER = 'x-hypertuna-worker-request-id';
+const JOIN_TRACE_RELAY_IDENTIFIER_HEADER = 'x-hypertuna-relay-identifier';
+const JOIN_TRACE_ROUTE_HEADER = 'x-hypertuna-trace-route';
+const JOIN_TRACE_PURPOSE_HEADER = 'x-hypertuna-trace-purpose';
+const GATEWAY_REQUEST_ID_HEADER = 'x-hypertuna-gateway-request-id';
+const AUTHORITATIVE_MIRROR_FAST_FORWARD_SOURCES = new Set([
+  'blind-peer-mirror',
+  'blind-peer-rehydrated',
+  'mirror-store-authoritative',
+  'gateway-mirror-authoritative',
+  'blind-peer-cache-authoritative'
+]);
 
 function safeString(value) {
   if (typeof value === 'string') return value;
@@ -75,6 +89,258 @@ function hexToBytes(hex) {
     bytes[i] = parseInt(normalized.slice(i * 2, i * 2 + 2), 16);
   }
   return bytes;
+}
+
+function normalizeCoreRefString(value) {
+  if (!value) return null;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    const decoded = HypercoreId.decode(trimmed);
+    return HypercoreId.encode(decoded);
+  } catch (_) {
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+      try {
+        return HypercoreId.encode(Buffer.from(trimmed, 'hex'));
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+function normalizeBlindPeeringPeerKey(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    const decoded = HypercoreId.decode(trimmed);
+    return HypercoreId.encode(decoded);
+  } catch (_) {
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+      try {
+        return HypercoreId.encode(Buffer.from(trimmed, 'hex'));
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+function normalizeWriterLeaseId(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length ? trimmed : null;
+}
+
+function normalizeWriterCommitCheckpoint(input = null) {
+  if (!input || typeof input !== 'object') return null;
+  const systemKey = normalizeCoreRefString(input.systemKey || input.system_key || null);
+  const writerCore = normalizeCoreRefString(input.writerCore || input.writer_core || null);
+  const activeWritersHash = typeof input.activeWritersHash === 'string'
+    ? input.activeWritersHash
+    : (typeof input.active_writers_hash === 'string' ? input.active_writers_hash : null);
+  const activeWritersCountRaw =
+    Number.isFinite(input.activeWritersCount)
+      ? Number(input.activeWritersCount)
+      : Number.isFinite(input.active_writers_count)
+        ? Number(input.active_writers_count)
+        : null;
+  const systemSignedLengthRaw =
+    Number.isFinite(input.systemSignedLength)
+      ? Number(input.systemSignedLength)
+      : Number.isFinite(input.system_signed_length)
+        ? Number(input.system_signed_length)
+        : null;
+  const systemLengthRaw =
+    Number.isFinite(input.systemLength)
+      ? Number(input.systemLength)
+      : Number.isFinite(input.system_length)
+        ? Number(input.system_length)
+        : null;
+  const viewVersionRaw =
+    Number.isFinite(input.viewVersion)
+      ? Number(input.viewVersion)
+      : Number.isFinite(input.view_version)
+        ? Number(input.view_version)
+        : null;
+  const recordedAtRaw =
+    Number.isFinite(input.recordedAt)
+      ? Number(input.recordedAt)
+      : Number.isFinite(input.recorded_at)
+        ? Number(input.recorded_at)
+        : null;
+  const checkpoint = {
+    relayKey: typeof input.relayKey === 'string' ? input.relayKey : (typeof input.relay_key === 'string' ? input.relay_key : null),
+    systemKey: systemKey || null,
+    systemLength: Number.isFinite(systemLengthRaw) ? Math.trunc(systemLengthRaw) : null,
+    systemSignedLength: Number.isFinite(systemSignedLengthRaw) ? Math.trunc(systemSignedLengthRaw) : null,
+    viewVersion: Number.isFinite(viewVersionRaw) ? Math.trunc(viewVersionRaw) : null,
+    activeWritersHash: activeWritersHash || null,
+    activeWritersCount: Number.isFinite(activeWritersCountRaw) ? Math.max(0, Math.trunc(activeWritersCountRaw)) : null,
+    writerCore: writerCore || null,
+    recordedAt: Number.isFinite(recordedAtRaw) ? Math.trunc(recordedAtRaw) : null
+  };
+  if (
+    !checkpoint.systemKey
+    && checkpoint.systemLength === null
+    && checkpoint.systemSignedLength === null
+    && checkpoint.viewVersion === null
+    && !checkpoint.activeWritersHash
+    && checkpoint.activeWritersCount === null
+    && !checkpoint.writerCore
+  ) {
+    return null;
+  }
+  return checkpoint;
+}
+
+function summarizeWriterCommitCheckpoint(checkpoint = null) {
+  const normalized = normalizeWriterCommitCheckpoint(checkpoint);
+  if (!normalized) {
+    return {
+      hasCheckpoint: false
+    };
+  }
+  return {
+    hasCheckpoint: true,
+    relayKey: normalized.relayKey ? String(normalized.relayKey).slice(0, 16) : null,
+    systemKey: normalized.systemKey ? normalized.systemKey.slice(0, 16) : null,
+    systemLength: normalized.systemLength,
+    systemSignedLength: normalized.systemSignedLength,
+    viewVersion: normalized.viewVersion,
+    activeWritersCount: normalized.activeWritersCount,
+    activeWritersHash: normalized.activeWritersHash ? normalized.activeWritersHash.slice(0, 16) : null,
+    writerCore: normalized.writerCore ? normalized.writerCore.slice(0, 16) : null,
+    recordedAt: normalized.recordedAt
+  };
+}
+
+function normalizeFastForwardSource(source = null) {
+  if (typeof source !== 'string') return null;
+  const normalized = source.trim().toLowerCase();
+  return normalized.length ? normalized : null;
+}
+
+function isAuthoritativeFastForwardSource(source = null) {
+  const normalized = normalizeFastForwardSource(source);
+  if (!normalized) return false;
+  return AUTHORITATIVE_MIRROR_FAST_FORWARD_SOURCES.has(normalized);
+}
+
+function resolveMirrorFastForwardProof(mirrorFastForward = null, options = {}) {
+  const source = normalizeFastForwardSource(
+    options?.proofSource
+    || options?.mirrorProofSource
+    || mirrorFastForward?.proofSource
+    || mirrorFastForward?.source
+    || null
+  );
+  const authoritative =
+    options?.proofAuthoritative === true
+    || options?.mirrorProofAuthoritative === true
+    || mirrorFastForward?.proofAuthoritative === true
+    || mirrorFastForward?.authoritative === true
+    || isAuthoritativeFastForwardSource(source);
+  return { source, authoritative };
+}
+
+function evaluateWriterCheckpointDurability(leaseCheckpoint = null, mirrorFastForward = null, options = {}) {
+  const normalizedLease = normalizeWriterCommitCheckpoint(leaseCheckpoint);
+  const proof = resolveMirrorFastForwardProof(mirrorFastForward, options);
+  const mirrorKey = normalizeCoreRefString(mirrorFastForward?.key || mirrorFastForward?.checkpointKey || null);
+  const mirrorSignedLength = Number.isFinite(mirrorFastForward?.signedLength)
+    ? Math.trunc(mirrorFastForward.signedLength)
+    : (Number.isFinite(mirrorFastForward?.length) ? Math.trunc(mirrorFastForward.length) : null);
+  const mirrorLength = Number.isFinite(mirrorFastForward?.length)
+    ? Math.trunc(mirrorFastForward.length)
+    : null;
+  if (!normalizedLease) {
+    return {
+      durableAtServe: null,
+      reason: 'missing-lease-checkpoint',
+      lease: summarizeWriterCommitCheckpoint(null),
+      mirror: {
+        key: mirrorKey ? mirrorKey.slice(0, 16) : null,
+        signedLength: mirrorSignedLength,
+        length: mirrorLength,
+        proofSource: proof.source,
+        proofAuthoritative: proof.authoritative
+      }
+    };
+  }
+  if (!mirrorFastForward || typeof mirrorFastForward !== 'object') {
+    return {
+      durableAtServe: false,
+      reason: 'missing-mirror-fast-forward',
+      lease: summarizeWriterCommitCheckpoint(normalizedLease),
+      mirror: {
+        key: null,
+        signedLength: null,
+        length: null,
+        proofSource: proof.source,
+        proofAuthoritative: proof.authoritative
+      }
+    };
+  }
+  if (normalizedLease.systemKey && mirrorKey && normalizedLease.systemKey !== mirrorKey) {
+    return {
+      durableAtServe: false,
+      reason: 'system-key-mismatch',
+      lease: summarizeWriterCommitCheckpoint(normalizedLease),
+      mirror: {
+        key: mirrorKey.slice(0, 16),
+        signedLength: mirrorSignedLength,
+        length: mirrorLength,
+        proofSource: proof.source,
+        proofAuthoritative: proof.authoritative
+      }
+    };
+  }
+  if (!proof.authoritative) {
+    return {
+      durableAtServe: false,
+      reason: 'mirror-proof-not-authoritative',
+      lease: summarizeWriterCommitCheckpoint(normalizedLease),
+      mirror: {
+        key: mirrorKey ? mirrorKey.slice(0, 16) : null,
+        signedLength: mirrorSignedLength,
+        length: mirrorLength,
+        proofSource: proof.source,
+        proofAuthoritative: proof.authoritative
+      }
+    };
+  }
+  if (Number.isFinite(normalizedLease.systemSignedLength) && Number.isFinite(mirrorSignedLength)) {
+    const durableAtServe = mirrorSignedLength >= normalizedLease.systemSignedLength;
+    return {
+      durableAtServe,
+      reason: durableAtServe ? 'mirror-covers-lease-signed-length' : 'mirror-behind-lease-signed-length',
+      lease: summarizeWriterCommitCheckpoint(normalizedLease),
+      mirror: {
+        key: mirrorKey ? mirrorKey.slice(0, 16) : null,
+        signedLength: mirrorSignedLength,
+        length: mirrorLength,
+        proofSource: proof.source,
+        proofAuthoritative: proof.authoritative
+      }
+    };
+  }
+  return {
+    durableAtServe: null,
+    reason: 'insufficient-checkpoint-data',
+    lease: summarizeWriterCommitCheckpoint(normalizedLease),
+    mirror: {
+      key: mirrorKey ? mirrorKey.slice(0, 16) : null,
+      signedLength: mirrorSignedLength,
+      length: mirrorLength,
+      proofSource: proof.source,
+      proofAuthoritative: proof.authoritative
+    }
+  };
 }
 
 class PublicGatewayService {
@@ -218,6 +484,106 @@ class PublicGatewayService {
       this.dispatcher.on('acknowledge', acknowledgeListener);
       this.dispatcher.on('failure', failureListener);
     }
+  }
+
+  #normalizeTraceValue(value, maxLength = 192) {
+    if (value === null || value === undefined) return null;
+    const text = String(value).trim();
+    if (!text) return null;
+    return text.slice(0, maxLength);
+  }
+
+  #readTraceHeader(req, headerName) {
+    const raw = req?.headers?.[headerName];
+    if (Array.isArray(raw)) {
+      return this.#normalizeTraceValue(raw[0]);
+    }
+    return this.#normalizeTraceValue(raw);
+  }
+
+  #ensureRequestTrace(req, res, overrides = {}) {
+    if (req && req.__hypertunaTrace && typeof req.__hypertunaTrace === 'object') {
+      const existing = req.__hypertunaTrace;
+      const merged = {
+        ...existing,
+        ...overrides
+      };
+      req.__hypertunaTrace = merged;
+      return merged;
+    }
+
+    const traceId =
+      this.#normalizeTraceValue(overrides.traceId)
+      || this.#readTraceHeader(req, JOIN_TRACE_ID_HEADER)
+      || `gw-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`;
+    const gatewayRequestId = this.#normalizeTraceValue(
+      overrides.gatewayRequestId
+      || randomBytes(5).toString('hex')
+    );
+    const trace = {
+      traceId,
+      gatewayRequestId,
+      joinAttemptId:
+        this.#normalizeTraceValue(overrides.joinAttemptId)
+        || this.#readTraceHeader(req, JOIN_TRACE_ATTEMPT_ID_HEADER),
+      workerRequestId:
+        this.#normalizeTraceValue(overrides.workerRequestId)
+        || this.#readTraceHeader(req, JOIN_TRACE_REQUEST_ID_HEADER),
+      relayIdentifier:
+        this.#normalizeTraceValue(overrides.relayIdentifier, 256)
+        || this.#normalizeTraceValue(req?.params?.relayKey, 256)
+        || this.#readTraceHeader(req, JOIN_TRACE_RELAY_IDENTIFIER_HEADER),
+      route:
+        this.#normalizeTraceValue(overrides.route, 96)
+        || this.#readTraceHeader(req, JOIN_TRACE_ROUTE_HEADER)
+        || this.#normalizeTraceValue(req?.path, 96),
+      purpose:
+        this.#normalizeTraceValue(overrides.purpose, 96)
+        || this.#readTraceHeader(req, JOIN_TRACE_PURPOSE_HEADER),
+      method: this.#normalizeTraceValue(req?.method, 16) || null,
+      path: this.#normalizeTraceValue(req?.path, 256) || null
+    };
+
+    if (req) req.__hypertunaTrace = trace;
+    if (res && typeof res.setHeader === 'function') {
+      try {
+        res.setHeader(JOIN_TRACE_ID_HEADER, trace.traceId);
+      } catch (_) {}
+      try {
+        res.setHeader(GATEWAY_REQUEST_ID_HEADER, trace.gatewayRequestId);
+      } catch (_) {}
+    }
+    return trace;
+  }
+
+  #traceSummary(trace) {
+    const source = trace && typeof trace === 'object' ? trace : {};
+    return {
+      traceId: source.traceId || null,
+      gatewayRequestId: source.gatewayRequestId || null,
+      joinAttemptId: source.joinAttemptId || null,
+      workerRequestId: source.workerRequestId || null,
+      relayIdentifier: source.relayIdentifier || null,
+      route: source.route || null
+    };
+  }
+
+  #logJoinTrace(level = 'info', event, trace = null, details = {}) {
+    const payload = {
+      event,
+      ts: Date.now(),
+      ...this.#traceSummary(trace),
+      ...(details && typeof details === 'object' ? details : {})
+    };
+    if (level === 'error') {
+      this.logger?.error?.(payload, '[PublicGateway][JoinTrace]');
+      return;
+    }
+    if (level === 'warn') {
+      this.logger?.warn?.(payload, '[PublicGateway][JoinTrace]');
+      return;
+    }
+    this.logger?.info?.(payload, '[PublicGateway][JoinTrace]');
   }
 
   async init() {
@@ -409,6 +775,10 @@ class PublicGatewayService {
       crossOriginResourcePolicy: { policy: 'cross-origin' }
     }));
     app.use(express.json({ limit: '256kb' }));
+    app.use((req, res, next) => {
+      this.#ensureRequestTrace(req, res);
+      next();
+    });
 
     if (this.config.rateLimit?.enabled) {
       app.use(rateLimit({
@@ -918,11 +1288,23 @@ class PublicGatewayService {
     const blindPeerInfo = this.blindPeerService?.getAnnouncementInfo?.();
     const cores = Array.isArray(record?.relayCores) ? record.relayCores : [];
     const fastForward = record?.metadata?.fastForward || record?.metadata?.fast_forward || null;
+    const fastForwardSource = fastForward
+      ? normalizeFastForwardSource(fastForward?.proofSource || fastForward?.source || 'registration-metadata')
+      : null;
+    const fastForwardAuthoritative = fastForward
+      ? (
+        fastForward?.proofAuthoritative === true
+        || fastForward?.authoritative === true
+        || isAuthoritativeFastForwardSource(fastForwardSource)
+      )
+      : false;
     return {
       relayKey,
       publicIdentifier: record?.metadata?.identifier || relayKey,
       cores,
       fastForward,
+      fastForwardSource,
+      fastForwardAuthoritative,
       blindPeer: blindPeerInfo && blindPeerInfo.enabled
         ? {
             publicKey: blindPeerInfo.publicKey || null,
@@ -949,11 +1331,23 @@ class PublicGatewayService {
     const publicIdentifier = pool?.publicIdentifier || metadata?.identifier || relayKey;
     const relayUrl = pool?.relayUrl || metadata?.relayUrl || metadata?.connectionUrl || null;
     const fastForward = metadata?.fastForward || metadata?.fast_forward || null;
+    const fastForwardSource = fastForward
+      ? normalizeFastForwardSource(fastForward?.proofSource || fastForward?.source || 'open-join-pool-metadata')
+      : null;
+    const fastForwardAuthoritative = fastForward
+      ? (
+        fastForward?.proofAuthoritative === true
+        || fastForward?.authoritative === true
+        || isAuthoritativeFastForwardSource(fastForwardSource)
+      )
+      : false;
     return {
       relayKey,
       publicIdentifier: publicIdentifier || relayKey,
       cores: relayCores,
       fastForward,
+      fastForwardSource,
+      fastForwardAuthoritative,
       relayUrl,
       blindPeer: blindPeerInfo && blindPeerInfo.enabled
         ? {
@@ -962,6 +1356,87 @@ class PublicGatewayService {
             maxBytes: blindPeerInfo.maxBytes ?? null
           }
         : { enabled: false }
+    };
+  }
+
+  async #applyAuthoritativeMirrorFastForwardProof(relayKey, writerCommitCheckpoint = null, mirrorPayload = null) {
+    if (!mirrorPayload || typeof mirrorPayload !== 'object') return mirrorPayload;
+    if (!this.blindPeerService?.getCoreFastForwardProof) return mirrorPayload;
+
+    const checkpoint = normalizeWriterCommitCheckpoint(writerCommitCheckpoint);
+    const currentFastForward = mirrorPayload?.fastForward && typeof mirrorPayload.fastForward === 'object'
+      ? { ...mirrorPayload.fastForward }
+      : null;
+    const checkpointKey = checkpoint?.systemKey || null;
+    const fallbackKey = normalizeCoreRefString(
+      currentFastForward?.key || currentFastForward?.checkpointKey || null
+    );
+    const targetKey = checkpointKey || fallbackKey || null;
+    if (!targetKey) {
+      this.logger?.debug?.('[PublicGateway] Mirror fast-forward proof skipped: no target key', {
+        relayKey,
+        hasCheckpoint: !!checkpoint,
+        hasFastForward: !!currentFastForward
+      });
+      return mirrorPayload;
+    }
+
+    let proof = null;
+    try {
+      proof = await this.blindPeerService.getCoreFastForwardProof(targetKey);
+    } catch (error) {
+      this.logger?.debug?.('[PublicGateway] Failed to resolve authoritative mirror fast-forward proof', {
+        relayKey,
+        coreKey: targetKey ? targetKey.slice(0, 16) : null,
+        err: error?.message || error
+      });
+      return mirrorPayload;
+    }
+    if (!proof || typeof proof !== 'object') {
+      this.logger?.info?.('[PublicGateway] Mirror fast-forward proof unavailable', {
+        relayKey,
+        coreKey: targetKey ? targetKey.slice(0, 16) : null,
+        proofSource: mirrorPayload?.fastForwardSource || null
+      });
+      return mirrorPayload;
+    }
+
+    const proofKey = normalizeCoreRefString(proof.key || targetKey);
+    const proofLength = Number.isFinite(proof.length) ? Math.trunc(proof.length) : null;
+    const proofSignedLength = Number.isFinite(proof.signedLength)
+      ? Math.trunc(proof.signedLength)
+      : proofLength;
+    const proofSource = normalizeFastForwardSource(proof.proofSource || 'blind-peer-mirror');
+    const proofAuthoritative =
+      proof.proofAuthoritative === true
+      || isAuthoritativeFastForwardSource(proofSource);
+
+    const nextFastForward = {
+      ...(currentFastForward || {}),
+      key: proofKey || targetKey,
+      checkpointKey: proofKey || targetKey,
+      length: proofLength,
+      signedLength: proofSignedLength,
+      proofSource: proofSource || null,
+      proofAuthoritative
+    };
+    if (Number.isFinite(proof.observedAt)) nextFastForward.observedAt = Math.trunc(proof.observedAt);
+    if (Number.isFinite(proof.activeAt)) nextFastForward.activeAt = Math.trunc(proof.activeAt);
+    if (Number.isFinite(proof.lagMs)) nextFastForward.lagMs = Math.trunc(proof.lagMs);
+    this.logger?.info?.('[PublicGateway] Mirror fast-forward proof applied', {
+      relayKey,
+      coreKey: (proofKey || targetKey || '').slice(0, 16) || null,
+      signedLength: proofSignedLength,
+      length: proofLength,
+      proofSource,
+      proofAuthoritative
+    });
+
+    return {
+      ...mirrorPayload,
+      fastForward: nextFastForward,
+      fastForwardSource: proofSource || mirrorPayload.fastForwardSource || null,
+      fastForwardAuthoritative: proofAuthoritative
     };
   }
 
@@ -1107,43 +1582,68 @@ class PublicGatewayService {
     return { merged, added, ignored, trimmed };
   }
 
-  async #verifyOpenJoinAuthEvent(event, { challenge, relayKey, publicIdentifier, purpose } = {}) {
+  async #verifyOpenJoinAuthEvent(event, {
+    challenge,
+    relayKey,
+    publicIdentifier,
+    purpose,
+    trace = null
+  } = {}) {
+    const fail = (errorCode, details = {}) => {
+      this.#logJoinTrace('warn', 'open-join-auth-verify', trace, {
+        status: 'error',
+        error: errorCode,
+        relayKey,
+        publicIdentifier,
+        ...details
+      });
+      return { ok: false, error: errorCode };
+    };
     if (!event || typeof event !== 'object') {
-      return { ok: false, error: 'missing-auth-event' };
+      return fail('missing-auth-event');
     }
 
     const createdAt = Number(event.created_at);
     if (!Number.isFinite(createdAt)) {
-      return { ok: false, error: 'missing-created-at' };
+      return fail('missing-created-at');
     }
 
     const now = Math.floor(Date.now() / 1000);
     const maxSkew = this.openJoinConfig?.authWindowSeconds || 300;
     if (Math.abs(now - createdAt) > maxSkew) {
-      return { ok: false, error: 'auth-event-expired' };
+      return fail('auth-event-expired', { createdAt, now, maxSkew });
     }
 
     if (event.kind !== 22242) {
-      return { ok: false, error: 'invalid-auth-kind' };
+      return fail('invalid-auth-kind', { kind: event.kind });
     }
 
     const pubkey = typeof event.pubkey === 'string' ? event.pubkey : null;
     const sig = typeof event.sig === 'string' ? event.sig : null;
     if (!pubkey || !sig) {
-      return { ok: false, error: 'missing-auth-signature' };
+      return fail('missing-auth-signature', {
+        hasPubkey: !!pubkey,
+        hasSig: !!sig
+      });
     }
 
     const tags = Array.isArray(event.tags) ? event.tags : [];
     const challengeTag = this.#extractTagValue(tags, 'challenge');
     if (!challengeTag || challengeTag !== challenge) {
-      return { ok: false, error: 'challenge-mismatch' };
+      return fail('challenge-mismatch', {
+        challengePrefix: challenge ? String(challenge).slice(0, 12) : null,
+        challengeTagPrefix: challengeTag ? String(challengeTag).slice(0, 12) : null
+      });
     }
 
     const expectedPurpose = typeof purpose === 'string' && purpose.trim() ? purpose.trim() : null;
     if (expectedPurpose) {
       const purposeTag = this.#extractTagValue(tags, 'purpose');
       if (!purposeTag || purposeTag !== expectedPurpose) {
-        return { ok: false, error: 'purpose-mismatch' };
+        return fail('purpose-mismatch', {
+          expectedPurpose,
+          purposeTag: purposeTag || null
+        });
       }
     }
 
@@ -1152,12 +1652,19 @@ class PublicGatewayService {
     const expectedWs = this.wsBaseUrl || null;
     const relayMatch = relayTags.some((value) => value === expectedRelay || value === expectedWs);
     if (!relayMatch) {
-      return { ok: false, error: 'relay-tag-missing' };
+      return fail('relay-tag-missing', {
+        relayTags: relayTags.slice(0, 4),
+        expectedRelay,
+        expectedWs
+      });
     }
 
     const hTag = this.#extractTagValue(tags, 'h');
     if (publicIdentifier && hTag && hTag !== publicIdentifier) {
-      return { ok: false, error: 'identifier-mismatch' };
+      return fail('identifier-mismatch', {
+        publicIdentifier,
+        hTag
+      });
     }
 
     const serialized = JSON.stringify([
@@ -1170,7 +1677,10 @@ class PublicGatewayService {
     ]);
     const computedId = createHash('sha256').update(serialized).digest('hex');
     if (event.id && event.id !== computedId) {
-      return { ok: false, error: 'auth-event-id-mismatch' };
+      return fail('auth-event-id-mismatch', {
+        eventIdPrefix: String(event.id).slice(0, 12),
+        computedIdPrefix: computedId.slice(0, 12)
+      });
     }
 
     if (!schnorr?.verify) {
@@ -1178,7 +1688,7 @@ class PublicGatewayService {
         relayKey,
         publicIdentifier
       });
-      return { ok: false, error: 'auth-signature-invalid' };
+      return fail('auth-signature-invalid', { reason: 'schnorr-verify-unavailable' });
     }
 
     const sigBytes = typeof sig === 'string' ? hexToBytes(sig) : sig;
@@ -1192,7 +1702,12 @@ class PublicGatewayService {
         sigLength: typeof sig === 'string' ? sig.length : null,
         idPrefix: computedId ? computedId.slice(0, 12) : null
       });
-      return { ok: false, error: 'auth-signature-invalid' };
+      return fail('auth-signature-invalid', {
+        reason: 'signature-decode-failed',
+        pubkeyPrefix: pubkey ? pubkey.slice(0, 12) : null,
+        sigLength: typeof sig === 'string' ? sig.length : null,
+        idPrefix: computedId ? computedId.slice(0, 12) : null
+      });
     }
 
     try {
@@ -1204,7 +1719,11 @@ class PublicGatewayService {
           pubkeyPrefix: pubkey ? pubkey.slice(0, 12) : null,
           idPrefix: computedId ? computedId.slice(0, 12) : null
         });
-        return { ok: false, error: 'auth-signature-invalid' };
+        return fail('auth-signature-invalid', {
+          reason: 'signature-invalid',
+          pubkeyPrefix: pubkey ? pubkey.slice(0, 12) : null,
+          idPrefix: computedId ? computedId.slice(0, 12) : null
+        });
       }
     } catch (error) {
       this.logger?.warn?.('[PublicGateway] Open join auth signature verify error', {
@@ -1212,9 +1731,18 @@ class PublicGatewayService {
         publicIdentifier,
         error: error?.message || error
       });
-      return { ok: false, error: 'auth-signature-invalid' };
+      return fail('auth-signature-invalid', {
+        reason: 'signature-verify-error',
+        err: error?.message || error
+      });
     }
-
+    this.#logJoinTrace('info', 'open-join-auth-verify', trace, {
+      status: 'ok',
+      relayKey,
+      publicIdentifier,
+      pubkeyPrefix: pubkey ? pubkey.slice(0, 12) : null,
+      idPrefix: computedId ? computedId.slice(0, 12) : null
+    });
     return { ok: true, pubkey };
   }
 
@@ -3367,8 +3895,13 @@ class PublicGatewayService {
     this.peerMetadata.set(peerKey, peerEntry);
     this.#markPeerReachable(peerKey, { timestamp: now });
 
+    const payloadBlindPeeringKey = normalizeBlindPeeringPeerKey(
+      payload?.blindPeeringPublicKey
+      || payload?.blind_peering_public_key
+      || null
+    );
     const rawPeerKey = this.#getPeerRawKey(peerKey);
-    const trustedInput = rawPeerKey || peerKey;
+    const trustedInput = payloadBlindPeeringKey || rawPeerKey || peerKey;
     if (!trustedInput) {
       this.logger?.warn?.('[PublicGateway] Unable to add trusted peer (no key resolved)', {
         peer: peerKey,
@@ -3377,7 +3910,10 @@ class PublicGatewayService {
     } else {
       this.logger?.info?.('[PublicGateway] Registering trusted peer', {
         peer: peerKey,
-        usedRawKey: Buffer.isBuffer(trustedInput)
+        usedRawKey: Buffer.isBuffer(trustedInput),
+        trustedSource: payloadBlindPeeringKey
+          ? 'payload-blind-peering-key'
+          : (rawPeerKey ? 'raw-peer-key' : 'peer-key')
       });
       this.blindPeerService?.addTrustedPeer(trustedInput);
     }
@@ -3632,8 +4168,15 @@ class PublicGatewayService {
     });
     this.#syncSessionsWithRelay(relayKey, stamped);
     this.#markPeerReachable(peerKey, { relayKey, timestamp: now });
+    const relayBlindPeeringKey = normalizeBlindPeeringPeerKey(
+      relayPayload?.blindPeeringPublicKey
+      || relayPayload?.blind_peering_public_key
+      || relayPayload?.metadata?.blindPeeringPublicKey
+      || relayPayload?.metadata?.blind_peering_public_key
+      || null
+    );
     const rawPeerKey = this.#getPeerRawKey(peerKey);
-    const trustedInput = rawPeerKey || peerKey;
+    const trustedInput = relayBlindPeeringKey || rawPeerKey || peerKey;
     if (!trustedInput) {
       this.logger?.warn?.('[PublicGateway] Unable to trust relay peer (missing key)', {
         peer: peerKey,
@@ -3643,7 +4186,10 @@ class PublicGatewayService {
       this.logger?.info?.('[PublicGateway] Trusting relay peer for registration record', {
         peer: peerKey,
         relayKey,
-        usedRawKey: Buffer.isBuffer(trustedInput)
+        usedRawKey: Buffer.isBuffer(trustedInput),
+        trustedSource: relayBlindPeeringKey
+          ? 'relay-metadata-blind-peering-key'
+          : (rawPeerKey ? 'raw-peer-key' : 'peer-key')
       });
       this.blindPeerService?.addTrustedPeer(trustedInput);
     }
@@ -3699,6 +4245,22 @@ class PublicGatewayService {
     const valid = verifySignature(registration, signature, this.sharedSecret);
     if (!valid) {
       return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const registrationBlindPeeringKey = normalizeBlindPeeringPeerKey(
+      registration?.metadata?.blindPeeringPublicKey
+      || registration?.metadata?.blind_peering_public_key
+      || registration?.blindPeeringPublicKey
+      || registration?.blind_peering_public_key
+      || null
+    );
+    if (registrationBlindPeeringKey) {
+      this.logger?.info?.('[PublicGateway] Trusting blind peering key from relay registration', {
+        relayKey: registration.relayKey,
+        relayKeyType,
+        blindPeeringPublicKey: registrationBlindPeeringKey.slice(0, 16)
+      });
+      this.blindPeerService?.addTrustedPeer(registrationBlindPeeringKey);
     }
 
     try {
@@ -3778,9 +4340,24 @@ class PublicGatewayService {
 
   async #handleRelayMirrorMetadata(req, res) {
     const identifier = req.params?.relayKey;
+    const trace = this.#ensureRequestTrace(req, res, {
+      route: 'mirror',
+      relayIdentifier: identifier || null
+    });
+    const fail = (statusCode, errorCode, level = 'warn', extra = {}) => {
+      this.#logJoinTrace(level, 'mirror-response', trace, {
+        statusCode,
+        error: errorCode,
+        ...extra
+      });
+      return res.status(statusCode).json({ error: errorCode });
+    };
     if (!identifier) {
-      return res.status(400).json({ error: 'relayKey is required' });
+      return fail(400, 'relayKey is required', 'warn');
     }
+    this.#logJoinTrace('info', 'mirror-request', trace, {
+      identifier
+    });
     try {
       const trimmedIdentifier = typeof identifier === 'string' ? identifier.trim() : null;
       const identifierType = this.#isHexRelayKey(trimmedIdentifier)
@@ -3811,13 +4388,25 @@ class PublicGatewayService {
             poolRelayKey || trimmedIdentifier
           );
           if (poolPayload) {
+            const enrichedPoolPayload = await this.#applyAuthoritativeMirrorFastForwardProof(
+              poolRelayKey || trimmedIdentifier,
+              null,
+              poolPayload
+            );
             this.logger?.info?.('[PublicGateway] Mirror metadata resolved from open join pool', {
               identifier: trimmedIdentifier,
               relayKey: poolRelayKey || trimmedIdentifier,
-              coreCount: Array.isArray(poolPayload.cores) ? poolPayload.cores.length : 0
+              coreCount: Array.isArray(enrichedPoolPayload?.cores) ? enrichedPoolPayload.cores.length : 0
             });
-            await this.#storeMirrorMetadataPayload(poolRelayKey || trimmedIdentifier, poolPayload);
-            return res.json(poolPayload);
+            await this.#storeMirrorMetadataPayload(poolRelayKey || trimmedIdentifier, enrichedPoolPayload);
+            this.#logJoinTrace('info', 'mirror-response', trace, {
+              statusCode: 200,
+              relayKey: poolRelayKey || trimmedIdentifier || null,
+              publicIdentifier: enrichedPoolPayload?.publicIdentifier || null,
+              coreCount: Array.isArray(enrichedPoolPayload?.cores) ? enrichedPoolPayload.cores.length : 0,
+              source: 'open-join-pool'
+            });
+            return res.json(enrichedPoolPayload);
           }
         }
 
@@ -3844,7 +4433,7 @@ class PublicGatewayService {
             (resolved?.record?.metadata?.identifier ?? null) ||
             trimmedIdentifier ||
             canonicalRelayKey;
-          const payload = {
+          let payload = {
             ...cached,
             relayKey: canonicalRelayKey || cached.relayKey || trimmedIdentifier || null,
             publicIdentifier,
@@ -3856,6 +4445,11 @@ class PublicGatewayService {
                 }
               : (cached.blindPeer || { enabled: false })
           };
+          payload = await this.#applyAuthoritativeMirrorFastForwardProof(
+            canonicalRelayKey || relayKey || cached.relayKey || trimmedIdentifier,
+            null,
+            payload
+          );
           this.logger?.info?.('[PublicGateway] Mirror metadata resolved from cache', {
             identifier: trimmedIdentifier,
             relayKey: payload.relayKey,
@@ -3865,17 +4459,31 @@ class PublicGatewayService {
           });
           const storeKey = canonicalRelayKey || relayKey || cached.relayKey || trimmedIdentifier;
           await this.#storeMirrorMetadataPayload(storeKey, payload);
+          this.#logJoinTrace('info', 'mirror-response', trace, {
+            statusCode: 200,
+            relayKey: payload.relayKey || null,
+            publicIdentifier: payload.publicIdentifier || null,
+            coreCount: Array.isArray(payload.cores) ? payload.cores.length : 0,
+            source: 'cache'
+          });
           return res.json(payload);
         }
         this.logger?.info?.('[PublicGateway] Mirror metadata not found', {
           identifier: trimmedIdentifier
         });
-        return res.status(404).json({ error: 'relay-not-found' });
+        return fail(404, 'relay-not-found', 'warn', {
+          identifier: trimmedIdentifier
+        });
       }
-      const payload = this.#buildMirrorMetadataPayload(record, relayKey || trimmedIdentifier);
+      let payload = this.#buildMirrorMetadataPayload(record, relayKey || trimmedIdentifier);
       if (relayKey) {
         payload.relayKey = relayKey;
       }
+      payload = await this.#applyAuthoritativeMirrorFastForwardProof(
+        relayKey || trimmedIdentifier,
+        null,
+        payload
+      );
       this.logger?.info?.('[PublicGateway] Mirror metadata resolved from registration', {
         identifier: trimmedIdentifier,
         relayKey: payload.relayKey || relayKey || trimmedIdentifier,
@@ -3884,37 +4492,64 @@ class PublicGatewayService {
         blindPeerEnabled: !!payload.blindPeer?.publicKey || payload.blindPeer?.enabled === true
       });
       await this.#storeMirrorMetadataPayload(relayKey || trimmedIdentifier, payload);
+      this.#logJoinTrace('info', 'mirror-response', trace, {
+        statusCode: 200,
+        relayKey: payload.relayKey || relayKey || trimmedIdentifier || null,
+        publicIdentifier: payload.publicIdentifier || null,
+        coreCount: Array.isArray(payload.cores) ? payload.cores.length : 0,
+        source: 'registration'
+      });
       return res.json(payload);
     } catch (error) {
       this.logger?.warn?.('[PublicGateway] Failed to fetch relay mirror metadata', {
         relayKey: identifier,
         err: error?.message || error
       });
-      return res.status(500).json({ error: 'relay-mirror-metadata-unavailable' });
+      return fail(500, 'relay-mirror-metadata-unavailable', 'error', {
+        identifier,
+        err: error?.message || error
+      });
     }
   }
 
   async #handleOpenJoinPoolUpdate(req, res) {
+    const trace = this.#ensureRequestTrace(req, res, {
+      route: 'open-join/pool-update',
+      relayIdentifier: req.params?.relayKey || req.body?.payload?.relayKey || null
+    });
+    const fail = (statusCode, errorCode, level = 'warn', extra = {}) => {
+      this.#logJoinTrace(level, 'open-join-pool-update-response', trace, {
+        statusCode,
+        error: errorCode,
+        ...extra
+      });
+      return res.status(statusCode).json({ error: errorCode });
+    };
     if (!this.openJoinConfig?.enabled) {
-      return res.status(503).json({ error: 'open-join-disabled' });
+      return fail(503, 'open-join-disabled', 'warn');
     }
     if (!this.sharedSecret) {
-      return res.status(503).json({ error: 'registration-disabled' });
+      return fail(503, 'registration-disabled', 'warn');
     }
 
     const { payload, signature } = req.body || {};
     if (!this.#verifySignedPayload(payload, signature)) {
-      return res.status(401).json({ error: 'Invalid signature' });
+      return fail(401, 'Invalid signature', 'warn');
     }
 
     const relayKey = payload?.relayKey || req.params?.relayKey;
     if (!relayKey) {
-      return res.status(400).json({ error: 'relayKey is required' });
+      return fail(400, 'relayKey is required', 'warn');
     }
     const relayKeyType = this.#isHexRelayKey(relayKey) ? 'hex' : 'alias';
     this.logger?.info?.('[PublicGateway] Open join pool update request', {
       relayKey,
       relayKeyType
+    });
+    this.#logJoinTrace('info', 'open-join-pool-update-request', trace, {
+      relayKey,
+      relayKeyType,
+      payloadEntries: Array.isArray(payload?.entries) ? payload.entries.length : 0
     });
 
     const payloadMetadata = payload?.metadata && typeof payload.metadata === 'object'
@@ -3939,11 +4574,15 @@ class PublicGatewayService {
       : null;
 
     if (!record && payloadMetadata?.isOpen !== true) {
-      return res.status(404).json({ error: 'relay-not-found' });
+      return fail(404, 'relay-not-found', 'warn', {
+        relayKey
+      });
     }
 
     if (record && !this.#isOpenJoinAllowed(record)) {
-      return res.status(409).json({ error: 'relay-not-open' });
+      return fail(409, 'relay-not-open', 'warn', {
+        relayKey
+      });
     }
 
     const entriesRaw = Array.isArray(payload?.entries) ? payload.entries : [];
@@ -4015,10 +4654,18 @@ class PublicGatewayService {
       const autobaseLocal = typeof entry.autobaseLocal === 'string'
         ? entry.autobaseLocal
         : (typeof entry.autobase_local === 'string' ? entry.autobase_local : null);
+      const writerLeaseId = normalizeWriterLeaseId(
+        entry.writerLeaseId || entry.writer_lease_id || null
+      );
+      const writerCommitCheckpoint = normalizeWriterCommitCheckpoint(
+        entry.writerCommitCheckpoint || entry.writer_commit_checkpoint || null
+      );
       const normalized = { writerCore, writerSecret, issuedAt };
       if (hasExplicitExpiresAt) normalized.expiresAt = expiresAt;
       if (writerCoreHex) normalized.writerCoreHex = writerCoreHex;
       if (autobaseLocal) normalized.autobaseLocal = autobaseLocal;
+      if (writerLeaseId) normalized.writerLeaseId = writerLeaseId;
+      if (writerCommitCheckpoint) normalized.writerCommitCheckpoint = writerCommitCheckpoint;
       return normalized;
     };
 
@@ -4046,6 +4693,8 @@ class PublicGatewayService {
       existing: existingCount,
       incoming: incomingCount,
       rejected: rejectedCount,
+      incomingWithLeaseId: incomingEntries.filter((entry) => typeof entry?.writerLeaseId === 'string').length,
+      incomingWithCheckpoint: incomingEntries.filter((entry) => !!entry?.writerCommitCheckpoint).length,
       publicIdentifier: poolPublicIdentifier || null,
       relayUrl: poolRelayUrl || null,
       relayCores: poolRelayCores.length,
@@ -4083,6 +4732,10 @@ class PublicGatewayService {
       const mergedEntry = { ...current };
       if (!mergedEntry.writerCoreHex && entry.writerCoreHex) mergedEntry.writerCoreHex = entry.writerCoreHex;
       if (!mergedEntry.autobaseLocal && entry.autobaseLocal) mergedEntry.autobaseLocal = entry.autobaseLocal;
+      if (!mergedEntry.writerLeaseId && entry.writerLeaseId) mergedEntry.writerLeaseId = entry.writerLeaseId;
+      if (!mergedEntry.writerCommitCheckpoint && entry.writerCommitCheckpoint) {
+        mergedEntry.writerCommitCheckpoint = entry.writerCommitCheckpoint;
+      }
       merged.set(entry.writerCore, mergedEntry);
     };
 
@@ -4150,6 +4803,15 @@ class PublicGatewayService {
       relayCores: poolRelayCores.length,
       aliases: poolAliases.length
     });
+    this.#logJoinTrace('info', 'open-join-pool-update-response', trace, {
+      statusCode: 200,
+      relayKey,
+      received: entriesRaw.length,
+      stored: incomingEntries.length,
+      total,
+      targetSize,
+      needed
+    });
 
     return res.json({
       status: 'ok',
@@ -4162,30 +4824,47 @@ class PublicGatewayService {
   }
 
   async #handleOpenJoinChallenge(req, res) {
+    const trace = this.#ensureRequestTrace(req, res, {
+      route: 'open-join/challenge',
+      relayIdentifier: req.params?.relayKey || null,
+      purpose: typeof req.query?.purpose === 'string' ? req.query.purpose : null
+    });
+    const fail = (statusCode, errorCode, level = 'warn', extra = {}) => {
+      this.#logJoinTrace(level, 'open-join-challenge-response', trace, {
+        statusCode,
+        error: errorCode,
+        ...extra
+      });
+      return res.status(statusCode).json({ error: errorCode });
+    };
     if (!this.openJoinConfig?.enabled) {
-      return res.status(503).json({ error: 'open-join-disabled' });
+      return fail(503, 'open-join-disabled', 'warn');
     }
     const identifier = req.params?.relayKey;
     if (!identifier) {
-      return res.status(400).json({ error: 'relayKey is required' });
+      return fail(400, 'relayKey is required', 'warn');
     }
     const rawPurpose = typeof req.query?.purpose === 'string' ? req.query.purpose.trim() : null;
     const purpose = rawPurpose || null;
     if (purpose && purpose !== OPEN_JOIN_APPEND_CORES_PURPOSE) {
-      return res.status(400).json({ error: 'invalid-purpose' });
+      return fail(400, 'invalid-purpose', 'warn', { purpose });
     }
+    this.#logJoinTrace('info', 'open-join-challenge-request', trace, {
+      identifier,
+      purpose
+    });
 
     try {
       const resolved = await this.#resolveOpenJoinTarget(identifier);
       if (!resolved) {
-        return res.status(404).json({ error: 'relay-not-found' });
+        return fail(404, 'relay-not-found', 'warn', { identifier, purpose });
       }
       const { relayKey, record, pool } = resolved;
       const relayKeyType = this.#isHexRelayKey(relayKey) ? 'hex' : 'alias';
       const identifierType = this.#isHexRelayKey(identifier) ? 'hex' : 'alias';
       const isAllowed = record ? this.#isOpenJoinAllowed(record) : this.#isOpenJoinPoolAllowed(pool);
       if (!isAllowed) {
-        return res.status(403).json({ error: 'relay-not-open' });
+        return fail(403, 'relay-not-open', 'warn', { identifier, relayKey, purpose });
       }
       if (purpose !== OPEN_JOIN_APPEND_CORES_PURPOSE) {
         let poolSnapshot = pool;
@@ -4212,7 +4891,14 @@ class PublicGatewayService {
             poolEntriesValid,
             depletion
           });
-          return res.status(409).json({ error: 'open-join-empty' });
+          return fail(409, 'open-join-empty', 'warn', {
+            relayKey,
+            identifier,
+            purpose,
+            poolEntriesTotal,
+            poolEntriesValid,
+            depletion
+          });
         }
       }
 
@@ -4235,6 +4921,14 @@ class PublicGatewayService {
         poolTtlSeconds,
         poolEntryTtlMs: this.openJoinConfig?.poolEntryTtlMs ?? null
       });
+      this.#logJoinTrace('info', 'open-join-challenge-response', trace, {
+        statusCode: 200,
+        relayKey,
+        publicIdentifier,
+        purpose,
+        challengePrefix: challenge ? challenge.slice(0, 12) : null,
+        expiresAt
+      });
       return res.json({
         relayKey,
         publicIdentifier,
@@ -4248,45 +4942,69 @@ class PublicGatewayService {
         identifier,
         err: error?.message || error
       });
-      return res.status(500).json({ error: 'open-join-challenge-unavailable' });
+      return fail(500, 'open-join-challenge-unavailable', 'error', {
+        identifier,
+        purpose,
+        err: error?.message || error
+      });
     }
   }
 
   async #handleOpenJoinRequest(req, res) {
+    const trace = this.#ensureRequestTrace(req, res, {
+      route: 'open-join/request',
+      relayIdentifier: req.params?.relayKey || null
+    });
+    const fail = (statusCode, errorCode, level = 'warn', extra = {}) => {
+      this.#logJoinTrace(level, 'open-join-response', trace, {
+        statusCode,
+        error: errorCode,
+        ...extra
+      });
+      return res.status(statusCode).json({ error: errorCode });
+    };
     if (!this.openJoinConfig?.enabled) {
-      return res.status(503).json({ error: 'open-join-disabled' });
+      return fail(503, 'open-join-disabled', 'warn');
     }
 
     const identifier = req.params?.relayKey;
     if (!identifier) {
-      return res.status(400).json({ error: 'relayKey is required' });
+      return fail(400, 'relayKey is required', 'warn');
     }
 
     const authEvent = req.body?.authEvent || req.body?.event || null;
     if (!authEvent || typeof authEvent !== 'object') {
-      return res.status(400).json({ error: 'missing-auth-event' });
+      return fail(400, 'missing-auth-event', 'warn');
     }
+    this.#logJoinTrace('info', 'open-join-request', trace, {
+      identifier,
+      authEventId: typeof authEvent?.id === 'string' ? authEvent.id.slice(0, 16) : null,
+      authPubkey: typeof authEvent?.pubkey === 'string' ? authEvent.pubkey.slice(0, 16) : null
+    });
 
     try {
       const resolved = await this.#resolveOpenJoinTarget(identifier);
       if (!resolved) {
-        return res.status(404).json({ error: 'relay-not-found' });
+        return fail(404, 'relay-not-found', 'warn', { identifier });
       }
       const { relayKey, record, pool } = resolved;
       const relayKeyType = this.#isHexRelayKey(relayKey) ? 'hex' : 'alias';
       const identifierType = this.#isHexRelayKey(identifier) ? 'hex' : 'alias';
       const isAllowed = record ? this.#isOpenJoinAllowed(record) : this.#isOpenJoinPoolAllowed(pool);
       if (!isAllowed) {
-        return res.status(403).json({ error: 'relay-not-open' });
+        return fail(403, 'relay-not-open', 'warn', { relayKey, identifierType });
       }
 
       const challengeTag = this.#extractTagValue(authEvent.tags, 'challenge');
       if (!challengeTag) {
-        return res.status(400).json({ error: 'missing-challenge' });
+        return fail(400, 'missing-challenge', 'warn', { relayKey });
       }
       const challengeEntry = this.#consumeOpenJoinChallenge(challengeTag, relayKey);
       if (!challengeEntry) {
-        return res.status(401).json({ error: 'invalid-challenge' });
+        return fail(401, 'invalid-challenge', 'warn', {
+          relayKey,
+          challengePrefix: challengeTag.slice(0, 12)
+        });
       }
 
       const publicIdentifier =
@@ -4298,10 +5016,14 @@ class PublicGatewayService {
       const verification = await this.#verifyOpenJoinAuthEvent(authEvent, {
         challenge: challengeTag,
         relayKey,
-        publicIdentifier
+        publicIdentifier,
+        trace
       });
       if (!verification.ok) {
-        return res.status(401).json({ error: verification.error || 'auth-invalid' });
+        return fail(401, verification.error || 'auth-invalid', 'warn', {
+          relayKey,
+          publicIdentifier
+        });
       }
 
       let poolBefore = null;
@@ -4320,7 +5042,11 @@ class PublicGatewayService {
           publicIdentifier,
           poolBefore: poolBeforeCount
         });
-        return res.status(429).json({ error: 'open-join-busy' });
+        return fail(429, 'open-join-busy', 'warn', {
+          relayKey,
+          publicIdentifier,
+          poolBefore: poolBeforeCount
+        });
       }
       this.openJoinLeaseLocks.add(relayKey);
       let lease = null;
@@ -4350,18 +5076,96 @@ class PublicGatewayService {
           poolAfter: poolAfterCount,
           depletion
         });
-        return res.status(409).json({ error: 'open-join-empty' });
+        return fail(409, 'open-join-empty', 'warn', {
+          relayKey,
+          publicIdentifier,
+          poolBefore: poolBeforeCount,
+          poolAfter: poolAfterCount,
+          depletion
+        });
       }
 
-      const mirrorPayload = record
-        ? this.#buildOpenJoinMirrorPayload(record, relayKey)
-        : this.#buildOpenJoinMirrorPayloadFromPool(pool, relayKey);
       const writerCoreHex = typeof lease.writerCoreHex === 'string'
         ? lease.writerCoreHex
         : (typeof lease.writer_core_hex === 'string' ? lease.writer_core_hex : null);
       const autobaseLocal = typeof lease.autobaseLocal === 'string'
         ? lease.autobaseLocal
         : (typeof lease.autobase_local === 'string' ? lease.autobase_local : null);
+      const writerLeaseId = normalizeWriterLeaseId(
+        lease.writerLeaseId || lease.writer_lease_id || null
+      );
+      const writerCommitCheckpoint = normalizeWriterCommitCheckpoint(
+        lease.writerCommitCheckpoint || lease.writer_commit_checkpoint || null
+      );
+      let mirrorPayload = record
+        ? this.#buildOpenJoinMirrorPayload(record, relayKey)
+        : this.#buildOpenJoinMirrorPayloadFromPool(pool, relayKey);
+      mirrorPayload = await this.#applyAuthoritativeMirrorFastForwardProof(
+        relayKey,
+        writerCommitCheckpoint,
+        mirrorPayload
+      );
+      const mirrorFastForwardSource = typeof mirrorPayload?.fastForwardSource === 'string'
+        ? mirrorPayload.fastForwardSource
+        : (record ? 'registration-metadata' : 'open-join-pool-metadata');
+      const mirrorFastForwardAuthoritative =
+        mirrorPayload?.fastForwardAuthoritative === true
+        || mirrorPayload?.fastForward?.proofAuthoritative === true
+        || mirrorPayload?.fastForward?.authoritative === true;
+      const durability = evaluateWriterCheckpointDurability(
+        writerCommitCheckpoint,
+        mirrorPayload?.fastForward || null,
+        {
+          proofSource: mirrorFastForwardSource,
+          proofAuthoritative: mirrorFastForwardAuthoritative
+        }
+      );
+      if (durability.durableAtServe !== true) {
+        const durabilityErrorCode = durability.reason === 'missing-mirror-fast-forward'
+          ? 'open-join-durability-proof-missing'
+          : durability.reason === 'mirror-proof-not-authoritative'
+            ? 'open-join-durability-proof-unverified'
+            : durability.reason === 'mirror-behind-lease-signed-length'
+              ? 'open-join-mirror-behind-lease'
+              : 'open-join-non-durable-lease';
+        this.logger?.warn?.('[PublicGateway] Open join lease rejected: non-durable proof', {
+          relayKey,
+          relayKeyType,
+          identifierType,
+          publicIdentifier,
+          source: record ? 'registration' : 'pool',
+          poolBefore: poolBeforeCount,
+          poolAfter: poolAfterCount,
+          writerLeaseId: writerLeaseId ? writerLeaseId.slice(0, 24) : null,
+          writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
+          writerDurabilityAtServe: durability.durableAtServe,
+          writerDurabilityReason: durability.reason,
+          writerDurabilityMirror: durability.mirror || null
+        });
+        this.#logJoinTrace('warn', 'open-join-response', trace, {
+          statusCode: 409,
+          error: durabilityErrorCode,
+          relayKey,
+          publicIdentifier,
+          source: record ? 'registration' : 'pool',
+          poolBefore: poolBeforeCount,
+          poolAfter: poolAfterCount,
+          writerLeaseId: writerLeaseId ? writerLeaseId.slice(0, 24) : null,
+          writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
+          writerDurabilityAtServe: durability.durableAtServe,
+          writerDurabilityReason: durability.reason,
+          writerDurabilityProofSource: durability?.mirror?.proofSource || null,
+          writerDurabilityProofAuthoritative: durability?.mirror?.proofAuthoritative === true,
+          writerDurabilityMirror: durability.mirror || null
+        });
+        return res.status(409).json({
+          error: durabilityErrorCode,
+          writerDurabilityAtServe: durability.durableAtServe,
+          writerDurabilityReason: durability.reason,
+          writerDurabilityProofSource: durability?.mirror?.proofSource || null,
+          writerDurabilityProofAuthoritative: durability?.mirror?.proofAuthoritative === true
+        });
+      }
       const resolvedAutobaseLocal = autobaseLocal || writerCoreHex || null;
       this.logger?.info?.('[PublicGateway] Open join lease issued', {
         relayKey,
@@ -4373,6 +5177,30 @@ class PublicGatewayService {
         poolAfter: poolAfterCount,
         writerCore: lease.writerCore ? lease.writerCore.slice(0, 16) : null,
         writerCoreHex: writerCoreHex ? String(writerCoreHex).slice(0, 16) : null,
+        writerLeaseId: writerLeaseId ? writerLeaseId.slice(0, 24) : null,
+        writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
+        writerDurabilityAtServe: durability.durableAtServe,
+        writerDurabilityReason: durability.reason,
+        writerDurabilityProofSource: durability?.mirror?.proofSource || null,
+        writerDurabilityProofAuthoritative: durability?.mirror?.proofAuthoritative === true,
+        issuedAt: lease.issuedAt || null,
+        expiresAt: lease.expiresAt || null
+      });
+      this.#logJoinTrace('info', 'open-join-response', trace, {
+        statusCode: 200,
+        relayKey,
+        publicIdentifier,
+        source: record ? 'registration' : 'pool',
+        poolBefore: poolBeforeCount,
+        poolAfter: poolAfterCount,
+        writerCore: lease.writerCore ? lease.writerCore.slice(0, 16) : null,
+        writerCoreHex: writerCoreHex ? String(writerCoreHex).slice(0, 16) : null,
+        writerLeaseId: writerLeaseId ? writerLeaseId.slice(0, 24) : null,
+        writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
+        writerDurabilityAtServe: durability.durableAtServe,
+        writerDurabilityReason: durability.reason,
+        writerDurabilityProofSource: durability?.mirror?.proofSource || null,
+        writerDurabilityProofAuthoritative: durability?.mirror?.proofAuthoritative === true,
         issuedAt: lease.issuedAt || null,
         expiresAt: lease.expiresAt || null
       });
@@ -4383,6 +5211,12 @@ class PublicGatewayService {
         writerCoreHex,
         autobaseLocal: resolvedAutobaseLocal,
         writerSecret: lease.writerSecret,
+        writerLeaseId,
+        writerCommitCheckpoint,
+        writerDurabilityAtServe: durability.durableAtServe,
+        writerDurabilityReason: durability.reason,
+        writerDurabilityProofSource: durability?.mirror?.proofSource || null,
+        writerDurabilityProofAuthoritative: durability?.mirror?.proofAuthoritative === true,
         issuedAt: lease.issuedAt || null,
         expiresAt: lease.expiresAt || null,
         ...(mirrorPayload || {})
@@ -4392,23 +5226,39 @@ class PublicGatewayService {
         identifier,
         err: error?.message || error
       });
-      return res.status(500).json({ error: 'open-join-failed' });
+      return fail(500, 'open-join-failed', 'error', {
+        identifier,
+        err: error?.message || error
+      });
     }
   }
 
   async #handleOpenJoinAppendCores(req, res) {
+    const trace = this.#ensureRequestTrace(req, res, {
+      route: 'open-join/append-cores',
+      relayIdentifier: req.params?.relayKey || null,
+      purpose: OPEN_JOIN_APPEND_CORES_PURPOSE
+    });
+    const fail = (statusCode, errorCode, level = 'warn', extra = {}) => {
+      this.#logJoinTrace(level, 'open-join-append-response', trace, {
+        statusCode,
+        error: errorCode,
+        ...extra
+      });
+      return res.status(statusCode).json({ error: errorCode });
+    };
     if (!this.openJoinConfig?.enabled) {
-      return res.status(503).json({ error: 'open-join-disabled' });
+      return fail(503, 'open-join-disabled', 'warn');
     }
 
     const identifier = req.params?.relayKey;
     if (!identifier) {
-      return res.status(400).json({ error: 'relayKey is required' });
+      return fail(400, 'relayKey is required', 'warn');
     }
 
     const authEvent = req.body?.authEvent || req.body?.event || null;
     if (!authEvent || typeof authEvent !== 'object') {
-      return res.status(400).json({ error: 'missing-auth-event' });
+      return fail(400, 'missing-auth-event', 'warn');
     }
 
     const rawCores = Array.isArray(req.body?.cores)
@@ -4418,23 +5268,34 @@ class PublicGatewayService {
     const normalized = this.#normalizeOpenJoinCoreEntries(rawCores, { maxEntries: maxAppend });
     const rejected = normalized.rejected + normalized.truncated;
     if (!normalized.entries.length) {
+      this.#logJoinTrace('warn', 'open-join-append-response', trace, {
+        statusCode: 400,
+        error: 'missing-cores',
+        rejected
+      });
       return res.status(400).json({ error: 'missing-cores', rejected });
     }
+    this.#logJoinTrace('info', 'open-join-append-request', trace, {
+      identifier,
+      received: rawCores.length,
+      normalized: normalized.entries.length,
+      rejected
+    });
 
     try {
       const resolved = await this.#resolveOpenJoinTarget(identifier);
       if (!resolved) {
-        return res.status(404).json({ error: 'relay-not-found' });
+        return fail(404, 'relay-not-found', 'warn', { identifier });
       }
       const { relayKey, record, pool } = resolved;
       const isAllowed = record ? this.#isOpenJoinAllowed(record) : this.#isOpenJoinPoolAllowed(pool);
       if (!isAllowed) {
-        return res.status(403).json({ error: 'relay-not-open' });
+        return fail(403, 'relay-not-open', 'warn', { relayKey, identifier });
       }
 
       const challengeTag = this.#extractTagValue(authEvent.tags, 'challenge');
       if (!challengeTag) {
-        return res.status(400).json({ error: 'missing-challenge' });
+        return fail(400, 'missing-challenge', 'warn', { relayKey });
       }
       const challengeEntry = this.#consumeOpenJoinChallenge(
         challengeTag,
@@ -4442,7 +5303,10 @@ class PublicGatewayService {
         OPEN_JOIN_APPEND_CORES_PURPOSE
       );
       if (!challengeEntry) {
-        return res.status(401).json({ error: 'invalid-challenge' });
+        return fail(401, 'invalid-challenge', 'warn', {
+          relayKey,
+          challengePrefix: challengeTag.slice(0, 12)
+        });
       }
 
       const publicIdentifier =
@@ -4455,15 +5319,19 @@ class PublicGatewayService {
         challenge: challengeTag,
         relayKey,
         publicIdentifier,
-        purpose: OPEN_JOIN_APPEND_CORES_PURPOSE
+        purpose: OPEN_JOIN_APPEND_CORES_PURPOSE,
+        trace
       });
       if (!verification.ok) {
-        return res.status(401).json({ error: verification.error || 'auth-invalid' });
+        return fail(401, verification.error || 'auth-invalid', 'warn', {
+          relayKey,
+          publicIdentifier
+        });
       }
 
       const poolRecord = pool || await this.registrationStore.getOpenJoinPool?.(relayKey);
       if (!poolRecord) {
-        return res.status(409).json({ error: 'open-join-pool-unavailable' });
+        return fail(409, 'open-join-pool-unavailable', 'warn', { relayKey, publicIdentifier });
       }
 
       const existingCores = Array.isArray(poolRecord.relayCores) ? poolRecord.relayCores : [];
@@ -4501,6 +5369,17 @@ class PublicGatewayService {
         trimmed: mergeResult.trimmed,
         total: mergeResult.merged.length
       });
+      this.#logJoinTrace('info', 'open-join-append-response', trace, {
+        statusCode: 200,
+        relayKey,
+        publicIdentifier,
+        received: rawCores.length,
+        added: mergeResult.added,
+        ignored: mergeResult.ignored,
+        rejected,
+        trimmed: mergeResult.trimmed,
+        total: mergeResult.merged.length
+      });
 
       return res.json({
         status: 'ok',
@@ -4518,7 +5397,10 @@ class PublicGatewayService {
         identifier,
         err: error?.message || error
       });
-      return res.status(500).json({ error: 'open-join-append-failed' });
+      return fail(500, 'open-join-append-failed', 'error', {
+        identifier,
+        err: error?.message || error
+      });
     }
   }
 
@@ -4534,13 +5416,64 @@ class PublicGatewayService {
     return { relayKey, token };
   }
 
+  async #validateLegacyRelayAuthToken(token, relayKey, source = 'unknown') {
+    const candidate = typeof token === 'string' ? token.trim() : '';
+    if (!candidate || candidate.includes('.') || candidate.length < 24) {
+      return null;
+    }
+    if (typeof this.registrationStore?.getTokenMetadata !== 'function') {
+      return null;
+    }
+
+    try {
+      const metadata = await this.registrationStore.getTokenMetadata(relayKey);
+      const expected = typeof metadata?.relayAuthToken === 'string' ? metadata.relayAuthToken.trim() : '';
+      if (!expected || expected !== candidate) {
+        return null;
+      }
+
+      this.logger?.info?.({
+        relayKey,
+        source,
+        tokenLength: candidate.length
+      }, 'Accepted legacy relay auth token for websocket session');
+
+      return {
+        payload: {
+          relayKey,
+          relayAuthToken: candidate,
+          scope: metadata?.scope || 'relay-access',
+          legacyRelayAuth: true
+        },
+        relayAuthToken: candidate,
+        pubkey: metadata?.pubkey || null,
+        scope: metadata?.scope || 'relay-access'
+      };
+    } catch (error) {
+      this.logger?.debug?.({
+        relayKey,
+        source,
+        error: error?.message || error
+      }, 'Legacy relay auth token fallback lookup failed');
+      return null;
+    }
+  }
+
   async #validateToken(token, relayKey) {
+    const tokenShape = typeof token === 'string'
+      ? (token.includes('.') ? 'client-token' : 'relay-auth-token')
+      : 'unknown';
     if (this.tokenService) {
       try {
         return await this.tokenService.verifyToken(token, relayKey);
       } catch (error) {
+        const legacyFallback = await this.#validateLegacyRelayAuthToken(token, relayKey, 'token-service');
+        if (legacyFallback) {
+          return legacyFallback;
+        }
         this.logger.warn?.({
           relayKey,
+          tokenShape,
           error: error?.message || error
         }, 'Token verification failed');
         return null;
@@ -4549,6 +5482,10 @@ class PublicGatewayService {
 
     const payload = verifyClientToken(token, this.sharedSecret);
     if (!payload) {
+      const legacyFallback = await this.#validateLegacyRelayAuthToken(token, relayKey, 'direct-verify');
+      if (legacyFallback) {
+        return legacyFallback;
+      }
       this.logger.warn?.({ relayKey }, 'Token verification failed - signature mismatch');
       return null;
     }
