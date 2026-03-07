@@ -54,6 +54,7 @@ export function installStdoutLogRotation({
   const rotateEveryMs = toInt(rotateMs, 24 * 60 * 60 * 1000);
   const keepForMs = toInt(retentionMs, 7 * 24 * 60 * 60 * 1000);
   const filePrefix = (typeof prefix === 'string' && prefix.trim()) ? prefix.trim() : 'public-gateway';
+  const maxBufferedChunks = 5000;
 
   let stream = null;
   let streamOpenedAt = 0;
@@ -61,6 +62,7 @@ export function installStdoutLogRotation({
   let initPromise = null;
   let writeHookInstalled = false;
   let timer = null;
+  let pendingChunks = [];
 
   const openStream = async () => {
     await mkdir(baseDir, { recursive: true });
@@ -72,13 +74,26 @@ export function installStdoutLogRotation({
   };
 
   const ensureReady = async () => {
-    if (initialized) return;
+    if (initialized && stream) return;
     if (!initPromise) {
       initPromise = (async () => {
         await openStream();
         initialized = true;
+        if (pendingChunks.length && stream) {
+          const buffered = pendingChunks;
+          pendingChunks = [];
+          for (const chunk of buffered) {
+            try {
+              stream.write(chunk);
+            } catch {
+              // Ignore logging failures to avoid impacting runtime.
+            }
+          }
+        }
       })().catch(() => {
         initialized = false;
+      }).finally(() => {
+        initPromise = null;
       });
     }
     await initPromise;
@@ -96,7 +111,13 @@ export function installStdoutLogRotation({
   };
 
   const tee = (chunk) => {
-    if (!stream) return;
+    if (!chunk) return;
+    if (!stream) {
+      if (pendingChunks.length >= maxBufferedChunks) pendingChunks.shift();
+      pendingChunks.push(chunk);
+      ensureReady().catch(() => {});
+      return;
+    }
     try {
       if (typeof chunk === 'string') {
         stream.write(chunk);
@@ -108,9 +129,7 @@ export function installStdoutLogRotation({
     }
   };
 
-  ensureReady().then(() => {
-    if (!initialized || writeHookInstalled) return;
-
+  if (!writeHookInstalled) {
     const stdoutWrite = process.stdout.write.bind(process.stdout);
     const stderrWrite = process.stderr.write.bind(process.stderr);
 
@@ -123,12 +142,14 @@ export function installStdoutLogRotation({
       return stderrWrite(chunk, encoding, cb);
     };
     writeHookInstalled = true;
+  }
 
-    timer = setInterval(() => {
-      maybeRotate().catch(() => {});
-    }, Math.max(1000, Math.min(rotateEveryMs, 60 * 1000)));
-    timer.unref?.();
-  }).catch(() => {});
+  ensureReady().catch(() => {});
+
+  timer = setInterval(() => {
+    maybeRotate().catch(() => {});
+  }, Math.max(1000, Math.min(rotateEveryMs, 60 * 1000)));
+  timer.unref?.();
 
   const shutdown = () => {
     if (timer) {
@@ -149,4 +170,3 @@ export function installStdoutLogRotation({
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
 }
-
