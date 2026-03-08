@@ -76,6 +76,7 @@ import { getFile, getPfpFile } from './hyperdrive-manager.mjs';
 import { loadGatewaySettings, getCachedGatewaySettings } from '../shared/config/GatewaySettings.mjs';
 
 const PUBLIC_GATEWAY_REPLICA_IDENTIFIER = 'public-gateway:hyperbee';
+const PUBLIC_GATEWAY_VIRTUAL_RELAY_ENABLED = false;
 const { DEFAULT_NAMESPACE } = hypercoreCaps;
 const HYPERTUNA_IDENTIFIER_TAG = 'hypertuna:relay';
 const HYPERTUNA_GATEWAY_ID_TAG = 'hypertuna-gateway-id';
@@ -237,6 +238,7 @@ let connectedPeers = new Map(); // Track all connected peers
 const relayClientConnections = new Map(); // relayKey -> Map(clientId -> { connectionKey, updatedAt })
 
 function shouldSuppressMissingRelayLog(identifier) {
+  if (identifier === PUBLIC_GATEWAY_REPLICA_IDENTIFIER) return true;
   return relayServerShuttingDown && identifier === PUBLIC_GATEWAY_REPLICA_IDENTIFIER;
 }
 
@@ -639,6 +641,11 @@ const LATE_WRITER_RECOVERY_TIMEOUT_MS = resolveTimeoutEnvMs(
   'LATE_WRITER_RECOVERY_TIMEOUT_MS',
   180000,
   { minMs: 1000 }
+);
+const GATEWAY_REGISTRATION_REQUEST_TIMEOUT_MS = resolveTimeoutEnvMs(
+  'GATEWAY_REGISTRATION_REQUEST_TIMEOUT_MS',
+  12000,
+  { minMs: 500 }
 );
 const WRITER_LEASE_SYNC_RATE_LIMIT_MAX = 24;
 const WRITER_LEASE_SYNC_RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -5655,7 +5662,11 @@ function updateMetrics(success = true) {
 
 // Register with gateway using Hyperswarm
 async function registerWithGateway(relayProfileInfo = null, options = {}) {
-  const { skipQueue = false } = options || {};
+  const {
+    skipQueue = false,
+    requestTimeoutMs = GATEWAY_REGISTRATION_REQUEST_TIMEOUT_MS,
+    reason = 'unspecified'
+  } = options || {};
 
   console.log('[RelayServer] ========================================');
   console.log('[RelayServer] GATEWAY REGISTRATION ATTEMPT (Hyperswarm)');
@@ -5775,7 +5786,7 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     const replicaInfo = gatewayServiceInstance?.getPublicGatewayReplicaInfo?.();
     const replicaStateEntry = publicGatewayState?.relays?.[PUBLIC_GATEWAY_REPLICA_IDENTIFIER] || null;
 
-    if (replicaInfo || replicaStateEntry) {
+    if (PUBLIC_GATEWAY_VIRTUAL_RELAY_ENABLED && (replicaInfo || replicaStateEntry)) {
       const metadata = (replicaStateEntry && replicaStateEntry.metadata) || {};
       const normalizePath = (value) => {
         if (!value || typeof value !== 'string') return null;
@@ -5862,7 +5873,7 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
       pfpDriveKey: config.pfpDriveKey || null
     };
 
-    if (replicaInfo) {
+    if (PUBLIC_GATEWAY_VIRTUAL_RELAY_ENABLED && replicaInfo) {
       registrationData.gatewayReplica = {
         hyperbeeKey: replicaInfo.hyperbeeKey || null,
         discoveryKey: replicaInfo.discoveryKey || null,
@@ -5945,14 +5956,23 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
       relayCount: registrationData.relays.length,
       address: registrationData.address,
       hasNewRelay: !!registrationData.newRelay,
-      mode: registrationData.mode
+      mode: registrationData.mode,
+      reason,
+      requestTimeoutMs
+    });
+    console.log('[RelayServer][Checkpoint] create-register-start', {
+      reason,
+      relayKey: relayProfileInfo?.relay_key || null,
+      publicIdentifier: relayProfileInfo?.public_identifier || null,
+      requestTimeoutMs
     });
 
     const response = await gatewayConnection.sendRequest({
       method: 'POST',
       path: '/gateway/register',
       headers: { 'content-type': 'application/json' },
-      body: b4a.from(JSON.stringify(registrationData))
+      body: b4a.from(JSON.stringify(registrationData)),
+      timeoutMs: requestTimeoutMs
     });
 
     if (response.statusCode !== 200) {
@@ -5970,6 +5990,12 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     }
 
     console.log('[RelayServer] Gateway registration acknowledged:', ack || { statusCode: response.statusCode });
+    console.log('[RelayServer][Checkpoint] create-register-ack', {
+      reason,
+      relayKey: relayProfileInfo?.relay_key || null,
+      publicIdentifier: relayProfileInfo?.public_identifier || null,
+      statusCode: response.statusCode
+    });
 
     if (ack && ack.subnetHash) {
       config.subnetHash = ack.subnetHash;
@@ -6030,7 +6056,21 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     console.log('[RelayServer] ========================================');
     return { acknowledged: true, ack };
   } catch (error) {
-    console.error('[RelayServer] Gateway registration via Hyperswarm FAILED:', error.message);
+    const errorMessage = error?.message || String(error);
+    const timeoutLike = /timeout/i.test(errorMessage);
+    if (timeoutLike && !error?.code) {
+      error.code = 'gateway-registration-timeout';
+    }
+    if (error?.code === 'gateway-registration-timeout') {
+      console.warn('[RelayServer][Checkpoint] create-register-timeout', {
+        reason,
+        relayKey: relayProfileInfo?.relay_key || null,
+        publicIdentifier: relayProfileInfo?.public_identifier || null,
+        requestTimeoutMs,
+        error: errorMessage
+      });
+    }
+    console.error('[RelayServer] Gateway registration via Hyperswarm FAILED:', errorMessage);
     if (!skipQueue) {
       pendingRegistrations.push(relayProfileInfo || null);
       console.log('[RelayServer] Registration re-queued due to failure', {
@@ -6044,7 +6084,7 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
           type: 'relay-registration-failed',
           relayKey: relayProfileInfo.relay_key || null,
           publicIdentifier: relayProfileInfo.public_identifier || null,
-          error: error.message
+          error: errorMessage
         });
       }
     } catch (notifyError) {
@@ -6143,13 +6183,27 @@ export async function createRelay(options) {
     // ALWAYS register with gateway via Hyperswarm if enabled
     let registrationStatus = 'disabled';
     if (config.registerWithGateway) {
+      console.log('[RelayServer][Checkpoint] create-register-attempt', {
+        relayKey: result.relayKey,
+        publicIdentifier: result.publicIdentifier || null,
+        requestTimeoutMs: GATEWAY_REGISTRATION_REQUEST_TIMEOUT_MS
+      });
       try {
-        await registerWithGateway(result.profile);
-        registrationStatus = 'success';
+        const registrationResult = await registerWithGateway(result.profile, {
+          reason: 'create-relay',
+          requestTimeoutMs: GATEWAY_REGISTRATION_REQUEST_TIMEOUT_MS
+        });
+        registrationStatus = registrationResult?.queued ? 'queued' : 'success';
       } catch (regError) {
-        registrationStatus = 'failed';
-        result.registrationError = regError.message;
+        registrationStatus = regError?.code === 'gateway-registration-timeout' ? 'timeout' : 'failed';
+        result.registrationError = regError?.message || String(regError);
       }
+      console.log('[RelayServer][Checkpoint] create-register-result', {
+        relayKey: result.relayKey,
+        publicIdentifier: result.publicIdentifier || null,
+        gatewayRegistration: registrationStatus,
+        registrationError: result.registrationError || null
+      });
     }
     result.gatewayRegistration = registrationStatus;
 
@@ -6285,6 +6339,14 @@ export async function createRelay(options) {
       writerIssuerPubkey: result.writerIssuerPubkey || undefined,
       observedAt: Date.now()
     }).catch(() => {});
+
+    console.log('[RelayServer][Checkpoint] create-return', {
+      relayKey: result.relayKey,
+      publicIdentifier: result.publicIdentifier || null,
+      gatewayRegistration: result.gatewayRegistration || null,
+      registrationError: result.registrationError || null,
+      writable: result.writable ?? null
+    });
   }
   
   return result;
@@ -6306,11 +6368,14 @@ export async function joinRelay(options) {
     let registrationStatus = 'disabled';
     if (config.registerWithGateway) {
       try {
-        await registerWithGateway(result.profile);
-        registrationStatus = 'success';
+        const registrationResult = await registerWithGateway(result.profile, {
+          reason: 'join-relay',
+          requestTimeoutMs: GATEWAY_REGISTRATION_REQUEST_TIMEOUT_MS
+        });
+        registrationStatus = registrationResult?.queued ? 'queued' : 'success';
       } catch (regError) {
-        registrationStatus = 'failed';
-        result.registrationError = regError.message;
+        registrationStatus = regError?.code === 'gateway-registration-timeout' ? 'timeout' : 'failed';
+        result.registrationError = regError?.message || String(regError);
       }
     }
     result.gatewayRegistration = registrationStatus;

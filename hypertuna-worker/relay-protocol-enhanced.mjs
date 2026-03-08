@@ -310,6 +310,12 @@ export class RelayProtocol extends EventEmitter {
   // Send an HTTP-like request
   async sendRequest(request) {
     const id = this.requestId++;
+    const hasOverrideTimeout =
+      request && Object.prototype.hasOwnProperty.call(request, 'timeoutMs');
+    const overrideTimeoutRaw = hasOverrideTimeout ? Number(request.timeoutMs) : null;
+    const effectiveTimeoutMs = hasOverrideTimeout
+      ? (Number.isFinite(overrideTimeoutRaw) && overrideTimeoutRaw > 0 ? Math.floor(overrideTimeoutRaw) : null)
+      : REQUEST_TIMEOUT;
     const message = {
       id,
       method: request.method || 'GET',
@@ -319,11 +325,11 @@ export class RelayProtocol extends EventEmitter {
     };
     
     return new Promise((resolve, reject) => {
-      const timeout = Number.isFinite(REQUEST_TIMEOUT) && REQUEST_TIMEOUT > 0
+      const timeout = Number.isFinite(effectiveTimeoutMs) && effectiveTimeoutMs > 0
         ? setTimeout(() => {
           this.requests.delete(id);
           reject(new Error('Request timeout'));
-        }, REQUEST_TIMEOUT)
+        }, effectiveTimeoutMs)
         : null;
       if (timeout?.unref) timeout.unref();
       

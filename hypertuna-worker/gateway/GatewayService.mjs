@@ -32,6 +32,7 @@ const DEFAULT_PORT = 8443;
 const PUBLIC_GATEWAY_RELAY_KEY = 'public-gateway:hyperbee';
 const PUBLIC_GATEWAY_RELAY_PATH = 'relay';
 const PUBLIC_GATEWAY_RELAY_PATH_ALIASES = ['public-gateway/hyperbee'];
+const PUBLIC_GATEWAY_VIRTUAL_RELAY_ENABLED = false;
 
 function guessContentType(fileName = '') {
   const lower = typeof fileName === 'string' ? fileName.toLowerCase() : '';
@@ -1537,9 +1538,9 @@ export class GatewayService extends EventEmitter {
     const replicaInfo = this.getPublicGatewayReplicaInfo();
 
     const payload = {
-      role: 'gateway-replica',
+      role: PUBLIC_GATEWAY_VIRTUAL_RELAY_ENABLED ? 'gateway-replica' : 'relay-peer',
       isGateway: false,
-      gatewayReplica: true,
+      gatewayReplica: PUBLIC_GATEWAY_VIRTUAL_RELAY_ENABLED,
       peerId,
       relayCount,
       delegateReqToPeers: !!this.publicGatewaySettings?.delegateReqToPeers,
@@ -1903,6 +1904,9 @@ export class GatewayService extends EventEmitter {
   }
 
   getPublicGatewayReplicaInfo() {
+    if (!PUBLIC_GATEWAY_VIRTUAL_RELAY_ENABLED) {
+      return null;
+    }
     const snapshot = this.publicGatewayRelayClient?.getReplicaSnapshot?.() || null;
     const telemetry = this.publicGatewayReplicaMetrics ? { ...this.publicGatewayReplicaMetrics } : null;
     if (!snapshot) {
@@ -3275,6 +3279,7 @@ export class GatewayService extends EventEmitter {
   }
 
   #getPublicGatewayRelayKey() {
+    if (!PUBLIC_GATEWAY_VIRTUAL_RELAY_ENABLED) return null;
     if (!this.publicGatewaySettings?.enabled) return null;
     return PUBLIC_GATEWAY_RELAY_KEY;
   }
@@ -3320,6 +3325,9 @@ export class GatewayService extends EventEmitter {
   }
 
   #ensurePublicGatewayRelayEntry({ hyperbee } = {}) {
+    if (!PUBLIC_GATEWAY_VIRTUAL_RELAY_ENABLED) {
+      return;
+    }
     const relayKey = this.#getPublicGatewayRelayKey();
     const resolvedRelay = this.publicGatewaySettings?.resolvedGatewayRelay;
     if (!relayKey || !resolvedRelay?.hyperbeeKey) {

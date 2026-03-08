@@ -1461,6 +1461,133 @@ function normalizeGatewayRouteInput(data = {}) {
   }
 }
 
+function normalizeRoutePublicIdentifier(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed.length ? trimmed : null
+}
+
+function extractRelayRouteIdentity(payload = null) {
+  const source = payload && typeof payload === 'object' ? payload : {}
+  const profile = source?.profile && typeof source.profile === 'object' ? source.profile : {}
+
+  const relayKeyCandidates = [
+    ['relayKey', source.relayKey],
+    ['relay_key', source.relay_key],
+    ['profile.relayKey', profile.relayKey],
+    ['profile.relay_key', profile.relay_key]
+  ]
+  let relayKey = null
+  let relayKeySource = null
+  for (const [candidateSource, candidateValue] of relayKeyCandidates) {
+    const normalized = normalizeRelayKeyHex(candidateValue || null)
+    if (!normalized) continue
+    relayKey = normalized
+    relayKeySource = candidateSource
+    break
+  }
+
+  const publicIdentifierCandidates = [
+    ['publicIdentifier', source.publicIdentifier],
+    ['public_identifier', source.public_identifier],
+    ['profile.publicIdentifier', profile.publicIdentifier],
+    ['profile.public_identifier', profile.public_identifier]
+  ]
+  let publicIdentifier = null
+  let publicIdentifierSource = null
+  for (const [candidateSource, candidateValue] of publicIdentifierCandidates) {
+    const normalized = normalizeRoutePublicIdentifier(candidateValue)
+    if (!normalized) continue
+    publicIdentifier = normalized
+    publicIdentifierSource = candidateSource
+    break
+  }
+
+  return {
+    relayKey,
+    publicIdentifier,
+    relayKeySource,
+    publicIdentifierSource
+  }
+}
+
+async function upsertRelayGatewayRouteWithReadback({
+  relayKey = null,
+  publicIdentifier = null,
+  gatewayOrigin = null,
+  gatewayId = null,
+  directJoinOnly = false,
+  source = 'unknown',
+  observedAt = Date.now()
+} = {}) {
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey || null) || null
+  const normalizedPublicIdentifier = normalizeRoutePublicIdentifier(publicIdentifier)
+  const expectedOrigin = normalizeHttpOrigin(gatewayOrigin)
+  const expectedGatewayId = normalizeGatewayId(gatewayId)
+  const expectedDirectJoinOnly = directJoinOnly === true
+
+  if (!normalizedRelayKey && !normalizedPublicIdentifier) {
+    return {
+      ok: false,
+      reason: 'missing-identity',
+      expected: {
+        gatewayOrigin: expectedOrigin,
+        gatewayId: expectedGatewayId,
+        directJoinOnly: expectedDirectJoinOnly
+      },
+      actual: null
+    }
+  }
+
+  await upsertRelayGatewayRoute({
+    relayKey: normalizedRelayKey,
+    publicIdentifier: normalizedPublicIdentifier,
+    gatewayOrigin: expectedOrigin,
+    gatewayId: expectedGatewayId,
+    directJoinOnly: expectedDirectJoinOnly,
+    source,
+    observedAt
+  })
+
+  const route = await getRelayGatewayRoute({
+    relayKey: normalizedRelayKey,
+    publicIdentifier: normalizedPublicIdentifier
+  }).catch(() => null)
+
+  const actualOrigin = normalizeHttpOrigin(route?.gatewayOrigin || null)
+  const actualGatewayId = normalizeGatewayId(route?.gatewayId || null)
+  const actualDirectJoinOnly = route?.directJoinOnly === true
+  const hasAssignedRoute = Boolean(actualOrigin || actualGatewayId || actualDirectJoinOnly)
+  const matchesOrigin = expectedOrigin ? expectedOrigin === actualOrigin : actualOrigin === null
+  const matchesGatewayId = expectedGatewayId ? expectedGatewayId === actualGatewayId : actualGatewayId === null
+  const matchesDirectJoinOnly = actualDirectJoinOnly === expectedDirectJoinOnly
+  const ok = hasAssignedRoute && matchesOrigin && matchesGatewayId && matchesDirectJoinOnly
+
+  let reason = null
+  if (!hasAssignedRoute) reason = 'missing-route'
+  else if (!matchesOrigin) reason = 'origin-mismatch'
+  else if (!matchesGatewayId) reason = 'gateway-id-mismatch'
+  else if (!matchesDirectJoinOnly) reason = 'direct-join-only-mismatch'
+
+  return {
+    ok,
+    reason,
+    expected: {
+      gatewayOrigin: expectedOrigin,
+      gatewayId: expectedGatewayId,
+      directJoinOnly: expectedDirectJoinOnly
+    },
+    actual: {
+      relayKey: normalizedRelayKey,
+      publicIdentifier: normalizedPublicIdentifier,
+      gatewayOrigin: actualOrigin,
+      gatewayId: actualGatewayId,
+      directJoinOnly: actualDirectJoinOnly
+    },
+    route
+  }
+}
+
 function normalizeRelayIdentifierForRoute(relayIdentifier) {
   const relayKey = normalizeRelayKeyHex(relayIdentifier) || null
   const publicIdentifier =
@@ -7286,42 +7413,70 @@ async function handleMessageObject(message) {
         try {
           const requestData = (message && typeof message === 'object' ? message.data : null) || {}
           const gatewayRouteInput = normalizeGatewayRouteInput(requestData)
-          const provisionalRelayKey = normalizeRelayKeyHex(requestData?.relayKey || null)
-          const provisionalPublicIdentifier =
-            typeof requestData?.publicIdentifier === 'string' && requestData.publicIdentifier.trim()
-              ? requestData.publicIdentifier.trim()
-              : null
-          if (gatewayRouteInput.hasExplicitRoute && (provisionalRelayKey || provisionalPublicIdentifier)) {
-            await upsertRelayGatewayRoute({
-              relayKey: provisionalRelayKey || null,
-              publicIdentifier: provisionalPublicIdentifier || null,
+          const provisionalRouteIdentity = extractRelayRouteIdentity(requestData)
+          if (
+            gatewayRouteInput.hasExplicitRoute
+            && (provisionalRouteIdentity.relayKey || provisionalRouteIdentity.publicIdentifier)
+          ) {
+            const provisionalRouteAssignment = await upsertRelayGatewayRouteWithReadback({
+              relayKey: provisionalRouteIdentity.relayKey,
+              publicIdentifier: provisionalRouteIdentity.publicIdentifier,
               gatewayOrigin: gatewayRouteInput.gatewayOrigin,
               gatewayId: gatewayRouteInput.gatewayId,
               directJoinOnly: gatewayRouteInput.directJoinOnly,
               source: 'create-relay-input'
-            }).catch(() => {})
+            }).catch(() => null)
+            console.info('[Worker] create-relay input route upsert/readback', {
+              requestId: requestId || null,
+              relayKey: provisionalRouteIdentity.relayKey,
+              publicIdentifier: provisionalRouteIdentity.publicIdentifier,
+              relayKeySource: provisionalRouteIdentity.relayKeySource,
+              publicIdentifierSource: provisionalRouteIdentity.publicIdentifierSource,
+              ok: provisionalRouteAssignment?.ok ?? null,
+              reason: provisionalRouteAssignment?.reason || null,
+              expected: provisionalRouteAssignment?.expected || null,
+              actual: provisionalRouteAssignment?.actual || null
+            })
           }
           const result = await relayServer.createRelay(requestData)
-          const resultRelayKey = normalizeRelayKeyHex(result?.relayKey || null)
-          const resultPublicIdentifier =
-            typeof result?.publicIdentifier === 'string' && result.publicIdentifier.trim()
-              ? result.publicIdentifier.trim()
-              : null
-          if (gatewayRouteInput.hasExplicitRoute && (resultRelayKey || resultPublicIdentifier)) {
-            await upsertRelayGatewayRoute({
-              relayKey: resultRelayKey,
-              publicIdentifier: resultPublicIdentifier,
+          const createSucceeded = result?.success !== false
+          const resultRouteIdentity = extractRelayRouteIdentity(result)
+          console.info('[Worker] create-relay result route identity', {
+            requestId: requestId || null,
+            success: createSucceeded,
+            relayKey: resultRouteIdentity.relayKey,
+            publicIdentifier: resultRouteIdentity.publicIdentifier,
+            relayKeySource: resultRouteIdentity.relayKeySource,
+            publicIdentifierSource: resultRouteIdentity.publicIdentifierSource
+          })
+          if (gatewayRouteInput.hasExplicitRoute && createSucceeded) {
+            const routeAssignment = await upsertRelayGatewayRouteWithReadback({
+              relayKey: resultRouteIdentity.relayKey,
+              publicIdentifier: resultRouteIdentity.publicIdentifier,
               gatewayOrigin: gatewayRouteInput.gatewayOrigin,
               gatewayId: gatewayRouteInput.gatewayId,
               directJoinOnly: gatewayRouteInput.directJoinOnly,
               source: 'create-relay'
-            }).catch((error) => {
-              console.warn('[Worker] Failed to persist relay gateway route for create-relay', {
-                relayKey: resultRelayKey,
-                publicIdentifier: resultPublicIdentifier,
-                error: error?.message || error
-              })
             })
+            console.info('[Worker] create-relay route upsert/readback', {
+              requestId: requestId || null,
+              relayKey: resultRouteIdentity.relayKey,
+              publicIdentifier: resultRouteIdentity.publicIdentifier,
+              relayKeySource: resultRouteIdentity.relayKeySource,
+              publicIdentifierSource: resultRouteIdentity.publicIdentifierSource,
+              ok: routeAssignment.ok,
+              reason: routeAssignment.reason || null,
+              expected: routeAssignment.expected,
+              actual: routeAssignment.actual
+            })
+            if (!routeAssignment.ok) {
+              const failureReason = routeAssignment.reason || 'missing-route'
+              const routeError = new Error(
+                `create-relay gateway route assignment missing (${failureReason})`
+              )
+              routeError.code = 'create-route-assignment-missing'
+              throw routeError
+            }
           }
           relayMembers.set(result.relayKey, result.profile?.members || [])
           await ensureRelayFolder(result.profile?.public_identifier || result.relayKey)
@@ -7342,7 +7497,7 @@ async function handleMessageObject(message) {
             }
           })
 
-          if (result.gatewayRegistration === 'failed') {
+          if (result.gatewayRegistration === 'failed' || result.gatewayRegistration === 'timeout') {
             sendMessage({
               type: 'relay-registration-failed',
               relayKey: result.relayKey,
