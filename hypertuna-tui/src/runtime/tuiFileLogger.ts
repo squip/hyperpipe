@@ -25,6 +25,10 @@ let logStream: WriteStream | null = null
 let logFilePath: string | null = null
 let consoleMirroringInstalled = false
 let streamBroken = false
+let stdioCaptureStream: WriteStream | null = null
+let stdioCapturePath: string | null = null
+let stdioCaptureInstalled = false
+let stdioCaptureBroken = false
 
 const originalConsole: Pick<typeof console, 'debug' | 'info' | 'log' | 'warn' | 'error'> = {
   debug: console.debug.bind(console),
@@ -33,6 +37,8 @@ const originalConsole: Pick<typeof console, 'debug' | 'info' | 'log' | 'warn' | 
   warn: console.warn.bind(console),
   error: console.error.bind(console)
 }
+const originalStdoutWrite = process.stdout.write.bind(process.stdout)
+const originalStderrWrite = process.stderr.write.bind(process.stderr)
 
 function toMessage(value: unknown): string {
   if (typeof value === 'string') return value
@@ -71,30 +77,91 @@ function safeStringify(value: unknown): string {
   })
 }
 
+function writeInternalStderr(message: string): void {
+  try {
+    originalStderrWrite(message)
+  } catch {
+    // best effort
+  }
+}
+
 function writeLine(entry: FileLogEntry): void {
   if (!logStream || streamBroken) return
   try {
     logStream.write(`${safeStringify(entry)}\n`)
   } catch (error) {
     streamBroken = true
-    process.stderr.write(`[TUI Logger] Failed to write log line: ${toMessage(error)}\n`)
+    writeInternalStderr(`[TUI Logger] Failed to write log line: ${toMessage(error)}\n`)
   }
 }
 
-function resolveLogPathFromEnv(): string | null {
-  const raw = process.env.TUI_LOG_FILE
+function resolveAbsolutePathFromEnv(variable: string): string | null {
+  const raw = process.env[variable]
   if (!raw || !raw.trim()) return null
   const trimmed = raw.trim()
   if (!path.isAbsolute(trimmed)) {
-    process.stderr.write(`[TUI Logger] Ignoring TUI_LOG_FILE because it is not an absolute path: ${trimmed}\n`)
+    writeInternalStderr(`[TUI Logger] Ignoring ${variable} because it is not an absolute path: ${trimmed}\n`)
     return null
   }
   return trimmed
 }
 
+function resolveLogPathFromEnv(): string | null {
+  return resolveAbsolutePathFromEnv('TUI_LOG_FILE')
+}
+
+function resolveStdioCapturePathFromEnv(): string | null {
+  const primary = resolveAbsolutePathFromEnv('TUI_STDIO_LOG_FILE')
+  if (primary) return primary
+  return resolveAbsolutePathFromEnv('TUI_STDOUT_LOG_FILE')
+}
+
 function mapConsoleLevel(method: keyof Pick<typeof console, 'debug' | 'info' | 'log' | 'warn' | 'error'>): FileLogLevel {
   if (method === 'log') return 'info'
   return method
+}
+
+function invokeOriginalWrite(
+  originalWrite: typeof process.stdout.write,
+  chunk: unknown,
+  encoding?: unknown,
+  callback?: unknown
+): boolean {
+  if (typeof encoding === 'function') {
+    return originalWrite(chunk as never, encoding as never)
+  }
+  if (typeof callback === 'function') {
+    return originalWrite(chunk as never, encoding as never, callback as never)
+  }
+  if (typeof encoding !== 'undefined') {
+    return originalWrite(chunk as never, encoding as never)
+  }
+  return originalWrite(chunk as never)
+}
+
+function toStdioText(chunk: unknown, encoding?: unknown): string {
+  if (typeof chunk === 'string') return chunk
+  if (Buffer.isBuffer(chunk)) {
+    const resolvedEncoding = typeof encoding === 'string' && Buffer.isEncoding(encoding) ? encoding : 'utf8'
+    return chunk.toString(resolvedEncoding)
+  }
+  if (chunk instanceof Uint8Array) {
+    const resolvedEncoding = typeof encoding === 'string' && Buffer.isEncoding(encoding) ? encoding : 'utf8'
+    return Buffer.from(chunk).toString(resolvedEncoding)
+  }
+  return String(chunk)
+}
+
+function writeStdioCapture(source: 'stdout' | 'stderr', chunk: unknown, encoding?: unknown): void {
+  if (!stdioCaptureStream || stdioCaptureBroken) return
+  try {
+    const text = toStdioText(chunk, encoding)
+    if (!text) return
+    stdioCaptureStream.write(text)
+  } catch (error) {
+    stdioCaptureBroken = true
+    writeInternalStderr(`[TUI Logger] Failed to write ${source} capture: ${toMessage(error)}\n`)
+  }
 }
 
 export function initializeTuiFileLogger(): string | null {
@@ -110,12 +177,12 @@ export function initializeTuiFileLogger(): string | null {
     streamBroken = false
     logStream.on('error', (error) => {
       streamBroken = true
-      process.stderr.write(`[TUI Logger] Log stream error: ${toMessage(error)}\n`)
+      writeInternalStderr(`[TUI Logger] Log stream error: ${toMessage(error)}\n`)
     })
     writeTuiFileLog('info', 'logger', 'TUI file logging initialized', { path: resolvedPath })
     return resolvedPath
   } catch (error) {
-    process.stderr.write(`[TUI Logger] Failed to initialize log file (${resolvedPath}): ${toMessage(error)}\n`)
+    writeInternalStderr(`[TUI Logger] Failed to initialize log file (${resolvedPath}): ${toMessage(error)}\n`)
     logStream = null
     logFilePath = null
     streamBroken = false
@@ -149,6 +216,49 @@ export function mirrorConsoleToTuiFileLogger(): void {
   }
 }
 
+export function initializeTuiStdioCapture(): string | null {
+  if (stdioCaptureStream) return stdioCapturePath
+  const resolvedPath = resolveStdioCapturePathFromEnv()
+  if (!resolvedPath) return null
+
+  try {
+    mkdirSync(path.dirname(resolvedPath), { recursive: true })
+    stdioCaptureStream = createWriteStream(resolvedPath, { flags: 'a' })
+    stdioCapturePath = resolvedPath
+    stdioCaptureBroken = false
+
+    stdioCaptureStream.on('error', (error) => {
+      stdioCaptureBroken = true
+      writeInternalStderr(`[TUI Logger] STDIO capture stream error: ${toMessage(error)}\n`)
+    })
+
+    if (!stdioCaptureInstalled) {
+      const stdoutCapture = ((chunk: unknown, encoding?: unknown, callback?: unknown): boolean => {
+        writeStdioCapture('stdout', chunk, encoding)
+        return invokeOriginalWrite(originalStdoutWrite, chunk, encoding, callback)
+      }) as typeof process.stdout.write
+
+      const stderrCapture = ((chunk: unknown, encoding?: unknown, callback?: unknown): boolean => {
+        writeStdioCapture('stderr', chunk, encoding)
+        return invokeOriginalWrite(originalStderrWrite, chunk, encoding, callback)
+      }) as typeof process.stderr.write
+
+      process.stdout.write = stdoutCapture
+      process.stderr.write = stderrCapture
+      stdioCaptureInstalled = true
+    }
+
+    writeTuiFileLog('info', 'logger', 'TUI stdio capture initialized', { path: resolvedPath })
+    return resolvedPath
+  } catch (error) {
+    writeInternalStderr(`[TUI Logger] Failed to initialize stdio capture (${resolvedPath}): ${toMessage(error)}\n`)
+    stdioCaptureStream = null
+    stdioCapturePath = null
+    stdioCaptureBroken = false
+    return null
+  }
+}
+
 export async function closeTuiFileLogger(): Promise<void> {
   if (!logStream) return
   const stream = logStream
@@ -163,6 +273,30 @@ export async function closeTuiFileLogger(): Promise<void> {
   consoleMirroringInstalled = false
   streamBroken = false
   if (finalPath) {
-    process.stderr.write(`[TUI Logger] Closed log file: ${finalPath}\n`)
+    writeInternalStderr(`[TUI Logger] Closed log file: ${finalPath}\n`)
+  }
+}
+
+export async function closeTuiStdioCapture(): Promise<void> {
+  if (stdioCaptureInstalled) {
+    process.stdout.write = originalStdoutWrite as typeof process.stdout.write
+    process.stderr.write = originalStderrWrite as typeof process.stderr.write
+    stdioCaptureInstalled = false
+  }
+
+  if (!stdioCaptureStream) return
+
+  const stream = stdioCaptureStream
+  stdioCaptureStream = null
+  const finalPath = stdioCapturePath
+  stdioCapturePath = null
+
+  await new Promise<void>((resolve) => {
+    stream.end(() => resolve())
+  })
+
+  stdioCaptureBroken = false
+  if (finalPath) {
+    writeInternalStderr(`[TUI Logger] Closed stdio capture file: ${finalPath}\n`)
   }
 }

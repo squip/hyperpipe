@@ -34,6 +34,12 @@ TUI_LOG_FILE=/var/log/hypertuna/tui.log npm run start
 
 Each line is a JSON object with fields like `ts`, `level`, `source`, `message`, and `pid`, including mirrored `worker.stdout` / `worker.stderr` entries.
 
+Set `TUI_STDIO_LOG_FILE` to an absolute path to capture raw terminal stdout/stderr output (the same stream you normally see on screen).
+
+```bash
+TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
+```
+
 ## Navigation
 
 - `Tab`: cycle focus `Left Tree -> Center List -> Right Top -> Right Bottom`

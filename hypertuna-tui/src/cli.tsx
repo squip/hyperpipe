@@ -7,7 +7,9 @@ import { App } from './ui/App.js'
 import type { LogLevel, } from './domain/types.js'
 import { resolveDesktopParityStorageDir } from './storage/defaultStorageDir.js'
 import {
+  closeTuiStdioCapture,
   closeTuiFileLogger,
+  initializeTuiStdioCapture,
   initializeTuiFileLogger,
   mirrorConsoleToTuiFileLogger,
   writeTuiFileLog
@@ -71,6 +73,10 @@ if (logFilePath) {
   mirrorConsoleToTuiFileLogger()
   writeTuiFileLog('info', 'cli', 'Structured file logging enabled', { path: logFilePath })
 }
+const stdioCapturePath = initializeTuiStdioCapture()
+if (stdioCapturePath) {
+  writeTuiFileLog('info', 'cli', 'STDIO capture enabled', { path: stdioCapturePath })
+}
 
 const app = render(
   React.createElement(App, {
@@ -100,7 +106,7 @@ function shutdown(exitCode = 0): void {
     // best effort
   }
   setTimeout(() => {
-    closeTuiFileLogger()
+    Promise.allSettled([closeTuiFileLogger(), closeTuiStdioCapture()])
       .catch(() => {})
       .finally(() => {
         process.exit(exitCode)

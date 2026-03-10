@@ -1412,7 +1412,7 @@ function parseRequestBodyJson(request) {
   }
 }
 
-async function waitForPeerProtocol(publicKey, timeoutMs = 20000) {
+async function waitForPeerProtocol(publicKey, timeoutMs = 20000, reason = 'unspecified') {
   const decodePeerKey = (key) => {
     if (!key) return null;
     const trimmed = String(key).trim();
@@ -1433,12 +1433,41 @@ async function waitForPeerProtocol(publicKey, timeoutMs = 20000) {
 
   const keyBuffer = decodePeerKey(publicKey);
   const normalized = keyBuffer ? keyBuffer.toString('hex') : String(publicKey || '').trim().toLowerCase();
+  const buildConnectionSnapshot = () => {
+    const keys = Array.from(connectedPeers.keys());
+    return {
+      connectedPeers: keys.length,
+      connectedPreview: keys.slice(0, 8).map((entry) => String(entry || '').slice(0, 16)),
+      targetConnected: connectedPeers.has(normalized),
+      pendingForTarget: (pendingPeerProtocols.get(normalized) || []).length
+    };
+  };
+  console.log('[RelayServer][waitForPeerProtocol] wait-start', {
+    reason,
+    peerKey: normalized.slice(0, 16),
+    timeoutMs,
+    ...buildConnectionSnapshot()
+  });
   const existing = connectedPeers.get(normalized);
   if (existing?.protocol && existing.protocol.channel && !existing.protocol.channel.closed) {
+    console.log('[RelayServer][waitForPeerProtocol] wait-hit-existing', {
+      reason,
+      peerKey: normalized.slice(0, 16),
+      timeoutMs,
+      ...buildConnectionSnapshot()
+    });
     return existing.protocol;
   }
 
+  const hadJoinHandle = peerJoinHandles.has(normalized);
   ensurePeerJoinHandle(normalized);
+  console.log('[RelayServer][waitForPeerProtocol] join-handle-ensured', {
+    reason,
+    peerKey: normalized.slice(0, 16),
+    timeoutMs,
+    hadJoinHandle,
+    ...buildConnectionSnapshot()
+  });
 
   return new Promise((resolve, reject) => {
     const pending = pendingPeerProtocols.get(normalized) || [];
@@ -1450,16 +1479,35 @@ async function waitForPeerProtocol(publicKey, timeoutMs = 20000) {
       } else {
         pendingPeerProtocols.delete(normalized);
       }
+      console.warn('[RelayServer][waitForPeerProtocol] wait-timeout', {
+        reason,
+        peerKey: normalized.slice(0, 16),
+        timeoutMs,
+        ...buildConnectionSnapshot()
+      });
       reject(new Error('Timed out waiting for peer connection'));
     }, timeoutMs);
 
     const pendingEntry = {
       resolve(protocol) {
         clearTimeout(timeout);
+        console.log('[RelayServer][waitForPeerProtocol] wait-resolved', {
+          reason,
+          peerKey: normalized.slice(0, 16),
+          timeoutMs,
+          ...buildConnectionSnapshot()
+        });
         resolve(protocol);
       },
       reject(err) {
         clearTimeout(timeout);
+        console.warn('[RelayServer][waitForPeerProtocol] wait-rejected', {
+          reason,
+          peerKey: normalized.slice(0, 16),
+          timeoutMs,
+          error: err?.message || String(err),
+          ...buildConnectionSnapshot()
+        });
         reject(err);
       }
     };
@@ -1551,12 +1599,25 @@ export async function probeJoinCapabilities({
     ? nonce.trim()
     : nodeCrypto.randomUUID();
   const startedAt = Date.now();
+  console.log('[RelayServer] probeJoinCapabilities start', {
+    peerKey: normalizedPeerKey.slice(0, 16),
+    publicIdentifier: normalizedIdentifier,
+    timeoutMs,
+    hasInviteePubkey: !!normalizeHex64(inviteePubkey),
+    hasTokenHash: typeof tokenHash === 'string' && tokenHash.length > 0
+  });
   try {
     const protocol = await withOperationTimeout(
-      waitForPeerProtocol(normalizedPeerKey, timeoutMs),
+      waitForPeerProtocol(normalizedPeerKey, timeoutMs, 'probe-join-capabilities'),
       timeoutMs,
       'wait-peer'
     );
+    console.log('[RelayServer] probeJoinCapabilities peer-ready', {
+      peerKey: normalizedPeerKey.slice(0, 16),
+      publicIdentifier: normalizedIdentifier,
+      timeoutMs,
+      elapsedMs: Date.now() - startedAt
+    });
     const responseRaw = await withOperationTimeout(
       protocol.sendRequest({
         method: 'POST',
@@ -1573,6 +1634,12 @@ export async function probeJoinCapabilities({
     );
     const statusCode = Number(responseRaw?.statusCode || 0) || null;
     const parsed = parseJsonBody(responseRaw?.body) || {};
+    console.log('[RelayServer] probeJoinCapabilities response', {
+      peerKey: normalizedPeerKey.slice(0, 16),
+      publicIdentifier: normalizedIdentifier,
+      statusCode: statusCode || 200,
+      elapsedMs: Date.now() - startedAt
+    });
     if ((statusCode || 200) >= 400) {
       return {
         success: false,
@@ -1600,6 +1667,13 @@ export async function probeJoinCapabilities({
       data: parsed
     };
   } catch (error) {
+    console.warn('[RelayServer] probeJoinCapabilities failed', {
+      peerKey: normalizedPeerKey.slice(0, 16),
+      publicIdentifier: normalizedIdentifier,
+      timeoutMs,
+      elapsedMs: Date.now() - startedAt,
+      error: error?.message || String(error)
+    });
     return {
       success: false,
       supported: false,
@@ -1623,7 +1697,7 @@ export async function syncWriterLeaseToPeer({
   }
   try {
     const protocol = await withOperationTimeout(
-      waitForPeerProtocol(normalizedPeerKey, timeoutMs),
+      waitForPeerProtocol(normalizedPeerKey, timeoutMs, 'sync-writer-lease'),
       timeoutMs,
       'wait-peer'
     );
@@ -1687,7 +1761,7 @@ export async function claimWriterLeaseFromPeer({
   }
   try {
     const protocol = await withOperationTimeout(
-      waitForPeerProtocol(normalizedPeerKey, timeoutMs),
+      waitForPeerProtocol(normalizedPeerKey, timeoutMs, 'claim-writer-lease'),
       timeoutMs,
       'wait-peer'
     );
@@ -2402,6 +2476,19 @@ function setupProtocolHandlers(protocol) {
     const canDirectChallenge = relayActive && writable && !isClosed;
     const canProvisionOpenWriter = canDirectChallenge;
     const canStoreLeaseReplica = relayActive && writable;
+    console.log('[RelayServer] join-capabilities request', {
+      identifier: normalizeRelayIdentifier(rawIdentifier || ''),
+      relayKey: runtime?.relayKey || null,
+      publicIdentifier: runtime?.publicIdentifier || null,
+      relayActive,
+      writable,
+      isClosed,
+      hasInviteePubkey: !!inviteePubkey,
+      hasTokenHash: typeof tokenHash === 'string' && tokenHash.length > 0,
+      sourcePeerKey: typeof request?.headers?.['x-source-peer-key'] === 'string'
+        ? String(request.headers['x-source-peer-key']).slice(0, 16)
+        : null
+    });
 
     let hasMatchingLease = false;
     let leaseExpiresAt = null;
@@ -2417,6 +2504,11 @@ function setupProtocolHandlers(protocol) {
     }
 
     if (!relayActive && !runtime?.profile) {
+      console.warn('[RelayServer] join-capabilities relay-not-found', {
+        identifier: normalizeRelayIdentifier(rawIdentifier || ''),
+        relayKey: runtime?.relayKey || null,
+        publicIdentifier: runtime?.publicIdentifier || null
+      });
       updateMetrics(false);
       return {
         statusCode: 404,
@@ -2441,6 +2533,16 @@ function setupProtocolHandlers(protocol) {
       leaseExpiresAt,
       observedAt
     };
+    console.log('[RelayServer] join-capabilities response', {
+      identifier: response.publicIdentifier || normalizeRelayIdentifier(rawIdentifier || ''),
+      relayKey: response.relayKey,
+      writable: response.writable,
+      canDirectChallenge: response.canDirectChallenge,
+      canProvisionOpenWriter: response.canProvisionOpenWriter,
+      hasMatchingLease: response.hasMatchingLease,
+      canStoreLeaseReplica: response.canStoreLeaseReplica,
+      leaseExpiresAt: response.leaseExpiresAt
+    });
 
     await recordRelayCapabilityProbe({
       relayKey: response.relayKey,
@@ -6893,7 +6995,7 @@ export async function startJoinAuthentication(options) {
         }
         try {
           console.log(`[RelayServer] Attempting direct join via peer ${hostPeerKey.substring(0, 8)}...`);
-          const protocol = await waitForPeerProtocol(hostPeerKey, 20000);
+          const protocol = await waitForPeerProtocol(hostPeerKey, 20000, 'direct-join-handshake');
           const joinResponse = await protocol.sendRequest({
             method: 'POST',
             path: `/post/join/${publicIdentifier}`,
