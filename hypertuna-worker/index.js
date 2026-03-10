@@ -5982,8 +5982,20 @@ async function addAuthInfoToRelays(relays) {
         ? profile.public_identifier.replace(':', '/')
         : r.relayKey
 
-      const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`
-      const connectionUrl = token ? `${baseUrl}?token=${token}` : baseUrl
+      const proxyBaseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`
+      const proxyConnectionUrl = token ? `${proxyBaseUrl}?token=${token}` : proxyBaseUrl
+      const existingConnectionUrl =
+        typeof r?.connectionUrl === 'string' && r.connectionUrl.trim()
+          ? r.connectionUrl.trim()
+          : null
+      const hostedOrJoinedRelay = r?.isHosted === true || r?.isJoined === true
+      const preferDirectRelayUrl = hostedOrJoinedRelay && !!existingConnectionUrl
+      const connectionUrl = preferDirectRelayUrl
+        ? existingConnectionUrl
+        : (existingConnectionUrl || proxyConnectionUrl)
+      const connectionUrlSource = preferDirectRelayUrl
+        ? 'direct-relay-url'
+        : (existingConnectionUrl ? 'existing-relay-url' : 'gateway-proxy-url')
       const requiresAuth = profile.auth_config?.requiresAuth || false
       const writable = r?.writable === true
       let tokenPresent = !!token
@@ -6000,6 +6012,8 @@ async function addAuthInfoToRelays(relays) {
       console.log('[Worker][addAuthInfoToRelays]', {
         relayKey: r.relayKey,
         publicIdentifier: profile.public_identifier || null,
+        isHosted: r?.isHosted === true,
+        isJoined: r?.isJoined === true,
         requiresAuth,
         writable,
         readyForReq,
@@ -6007,6 +6021,9 @@ async function addAuthInfoToRelays(relays) {
         fromLegacyToken: !!(profile.auth_tokens && profile.auth_tokens[config.nostr_pubkey_hex]),
         fromStoreToken: !!tokenFromStore,
         tokenApplied: !!token,
+        connectionUrlSource,
+        existingConnectionUrl,
+        proxyConnectionUrl,
         connectionUrl,
         userAuthToken: token
       })

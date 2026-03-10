@@ -3374,15 +3374,22 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     async ({
       groupId,
       relayUrl,
+      directRelayUrl,
       maxAttempts = 6,
       delayMs = 450
     }: {
       groupId: string
       relayUrl: string
+      directRelayUrl?: string
       maxAttempts?: number
       delayMs?: number
     }) => {
-      const targetRelayUrl = resolveRelayUrl(relayUrl) || relayUrl
+      const primaryRelayUrl = resolveRelayUrl(relayUrl) || relayUrl
+      const fallbackDirectRelayUrl = getBaseRelayUrl(directRelayUrl || relayUrl)
+      const candidateRelayUrls = Array.from(
+        new Set([primaryRelayUrl, fallbackDirectRelayUrl].filter((value): value is string => !!value))
+      )
+      let lastTriedRelayUrl = primaryRelayUrl
       const state = {
         metadataFound: false,
         membersFound: false,
@@ -3393,44 +3400,50 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       }
 
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-        try {
-          const [
-            metadataByD,
-            metadataByH,
-            adminsByD,
-            adminsByH,
-            membersByD,
-            membersByH,
-            groupCreateByH,
-            hypertunaByH
-          ] = await Promise.all([
-            client.fetchEvents([targetRelayUrl], { kinds: [39000], '#d': [groupId], limit: 1 }),
-            client.fetchEvents([targetRelayUrl], { kinds: [39000], '#h': [groupId], limit: 1 }),
-            client.fetchEvents([targetRelayUrl], { kinds: [39001], '#d': [groupId], limit: 1 }),
-            client.fetchEvents([targetRelayUrl], { kinds: [39001], '#h': [groupId], limit: 1 }),
-            client.fetchEvents([targetRelayUrl], { kinds: [39002], '#d': [groupId], limit: 1 }),
-            client.fetchEvents([targetRelayUrl], { kinds: [39002], '#h': [groupId], limit: 1 }),
-            client.fetchEvents([targetRelayUrl], { kinds: [9007], '#h': [groupId], limit: 1 }),
-            client.fetchEvents([targetRelayUrl], { kinds: [30166], '#h': [groupId], limit: 1 })
-          ])
+        for (let candidateIndex = 0; candidateIndex < candidateRelayUrls.length; candidateIndex += 1) {
+          const targetRelayUrl = candidateRelayUrls[candidateIndex]
+          lastTriedRelayUrl = targetRelayUrl
+          try {
+            const [
+              metadataByD,
+              metadataByH,
+              adminsByD,
+              adminsByH,
+              membersByD,
+              membersByH,
+              groupCreateByH,
+              hypertunaByH
+            ] = await Promise.all([
+              client.fetchEvents([targetRelayUrl], { kinds: [39000], '#d': [groupId], limit: 1 }),
+              client.fetchEvents([targetRelayUrl], { kinds: [39000], '#h': [groupId], limit: 1 }),
+              client.fetchEvents([targetRelayUrl], { kinds: [39001], '#d': [groupId], limit: 1 }),
+              client.fetchEvents([targetRelayUrl], { kinds: [39001], '#h': [groupId], limit: 1 }),
+              client.fetchEvents([targetRelayUrl], { kinds: [39002], '#d': [groupId], limit: 1 }),
+              client.fetchEvents([targetRelayUrl], { kinds: [39002], '#h': [groupId], limit: 1 }),
+              client.fetchEvents([targetRelayUrl], { kinds: [9007], '#h': [groupId], limit: 1 }),
+              client.fetchEvents([targetRelayUrl], { kinds: [30166], '#h': [groupId], limit: 1 })
+            ])
 
-          state.metadataFound = metadataByD.length > 0 || metadataByH.length > 0
-          state.adminsFound = adminsByD.length > 0 || adminsByH.length > 0
-          state.membersFound = membersByD.length > 0 || membersByH.length > 0
-          state.groupCreateFound = groupCreateByH.length > 0
-          state.hypertunaFound = hypertunaByH.length > 0
-          state.error = null
+            state.metadataFound = metadataByD.length > 0 || metadataByH.length > 0
+            state.adminsFound = adminsByD.length > 0 || adminsByH.length > 0
+            state.membersFound = membersByD.length > 0 || membersByH.length > 0
+            state.groupCreateFound = groupCreateByH.length > 0
+            state.hypertunaFound = hypertunaByH.length > 0
+            state.error = null
 
-          if (state.metadataFound && state.membersFound) {
-            return {
-              ok: true,
-              relayUrl: targetRelayUrl,
-              attempt: attempt + 1,
-              ...state
+            if (state.metadataFound && state.membersFound) {
+              return {
+                ok: true,
+                relayUrl: targetRelayUrl,
+                attempt: attempt + 1,
+                usedDirectFallback: candidateIndex > 0,
+                attemptedRelayUrls: candidateRelayUrls,
+                ...state
+              }
             }
+          } catch (err) {
+            state.error = err instanceof Error ? err.message : String(err)
           }
-        } catch (err) {
-          state.error = err instanceof Error ? err.message : String(err)
         }
 
         if (attempt < maxAttempts - 1) {
@@ -3440,8 +3453,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       return {
         ok: false,
-        relayUrl: targetRelayUrl,
+        relayUrl: lastTriedRelayUrl,
         attempt: maxAttempts,
+        usedDirectFallback: false,
+        attemptedRelayUrls: candidateRelayUrls,
         ...state
       }
     },
@@ -3483,6 +3498,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           const verify = await verifyGroupRelayBootstrapState({
             groupId,
             relayUrl: targetRelayUrl,
+            directRelayUrl: fallbackRelayUrl,
             maxAttempts: 4,
             delayMs: 300
           })
@@ -3631,8 +3647,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       const workerBootstrap = result?.bootstrapPublish
       const workerBootstrapRelayUrl =
-        resolveRelayUrl(workerBootstrap?.relayWsUrl || authenticatedRelayUrl) ||
-        authenticatedRelayUrl
+        workerBootstrap?.relayWsUrl || authenticatedRelayUrl
       console.info('[GroupsProvider] create bootstrap worker status', {
         groupId: publicIdentifier,
         relayKey,
@@ -3645,13 +3660,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       console.info('[GroupsProvider] create bootstrap verify start', {
         groupId: publicIdentifier,
         relayKey,
-        relayUrl: workerBootstrapRelayUrl
+        relayUrl: workerBootstrapRelayUrl,
+        directRelayUrl: relayWsUrl
       })
 
       let bootstrapRelayUrl = workerBootstrapRelayUrl
       const workerVerification = await verifyGroupRelayBootstrapState({
         groupId: publicIdentifier,
         relayUrl: workerBootstrapRelayUrl,
+        directRelayUrl: relayWsUrl,
         maxAttempts: workerBootstrap?.status === 'success' ? 8 : 4,
         delayMs: 450
       })
@@ -3667,7 +3684,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             verifyAttempt: workerVerification.attempt,
             metadataFound: workerVerification.metadataFound,
             membersFound: workerVerification.membersFound,
-            verifyError: workerVerification.error
+            verifyError: workerVerification.error,
+            usedDirectFallback: workerVerification.usedDirectFallback === true,
+            attemptedRelayUrls: workerVerification.attemptedRelayUrls || []
           }
         )
         bootstrapRelayUrl = await publishBootstrapEventsToGroupRelay({
@@ -3682,7 +3701,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         groupId: publicIdentifier,
         relayKey,
         relayUrl: bootstrapRelayUrl,
-        source: workerVerification.ok ? 'worker' : 'renderer-fallback',
+        source: workerVerification.ok
+          ? (workerVerification.usedDirectFallback ? 'worker-direct-fallback' : 'worker')
+          : 'renderer-fallback',
         metadataFound: workerVerification.metadataFound,
         membersFound: workerVerification.membersFound,
         adminsFound: workerVerification.adminsFound
