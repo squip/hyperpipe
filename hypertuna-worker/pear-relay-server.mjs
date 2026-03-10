@@ -235,6 +235,8 @@ let gatewayConnection = null;
 let relayServerShuttingDown = false;
 let pendingRegistrations = []; // Queue registrations until gateway connects
 let connectedPeers = new Map(); // Track all connected peers
+const connectedPeerAliasToTransport = new Map(); // canonical peer key -> transport peer key
+const connectedPeerTransportToAliases = new Map(); // transport peer key -> canonical aliases
 const relayClientConnections = new Map(); // relayKey -> Map(clientId -> { connectionKey, updatedAt })
 
 function shouldSuppressMissingRelayLog(identifier) {
@@ -1166,6 +1168,78 @@ function normalizeHex64(value) {
   return String(value).trim().toLowerCase();
 }
 
+function setConnectedPeerAlias(transportPeerKey, aliasPeerKey) {
+  const normalizedTransport = normalizeHex64(transportPeerKey);
+  const normalizedAlias = normalizeHex64(aliasPeerKey);
+  if (!normalizedTransport || !normalizedAlias || normalizedTransport === normalizedAlias) return false;
+  connectedPeerAliasToTransport.set(normalizedAlias, normalizedTransport);
+  let aliasSet = connectedPeerTransportToAliases.get(normalizedTransport);
+  if (!aliasSet) {
+    aliasSet = new Set();
+    connectedPeerTransportToAliases.set(normalizedTransport, aliasSet);
+  }
+  aliasSet.add(normalizedAlias);
+  return true;
+}
+
+function clearConnectedPeerAliasesForTransport(transportPeerKey) {
+  const normalizedTransport = normalizeHex64(transportPeerKey);
+  if (!normalizedTransport) return;
+  const aliases = connectedPeerTransportToAliases.get(normalizedTransport);
+  if (aliases && aliases.size) {
+    for (const alias of aliases) {
+      if (connectedPeerAliasToTransport.get(alias) === normalizedTransport) {
+        connectedPeerAliasToTransport.delete(alias);
+      }
+    }
+  }
+  connectedPeerTransportToAliases.delete(normalizedTransport);
+}
+
+function resolveConnectedTransportPeerKey(peerKey) {
+  const normalized = normalizeHex64(peerKey);
+  if (!normalized) return null;
+  if (connectedPeers.has(normalized)) return normalized;
+  const aliasTarget = connectedPeerAliasToTransport.get(normalized) || null;
+  if (aliasTarget && connectedPeers.has(aliasTarget)) return aliasTarget;
+  return null;
+}
+
+function collectPendingPeerProtocolEntries(keys = []) {
+  const entries = new Set();
+  for (const rawKey of keys) {
+    const key = normalizeHex64(rawKey);
+    if (!key) continue;
+    const pending = pendingPeerProtocols.get(key);
+    if (!pending || !pending.length) continue;
+    pendingPeerProtocols.delete(key);
+    for (const entry of pending) entries.add(entry);
+  }
+  return Array.from(entries);
+}
+
+function resolvePendingPeerProtocolsForKeys(keys = [], protocol = null) {
+  const entries = collectPendingPeerProtocolEntries(keys);
+  for (const entry of entries) {
+    try {
+      entry.resolve(protocol);
+    } catch (err) {
+      console.warn('[RelayServer] Failed to resolve pending peer protocol:', err?.message || err);
+    }
+  }
+  return entries.length;
+}
+
+function rejectPendingPeerProtocolsForKeys(keys = [], error = null) {
+  const entries = collectPendingPeerProtocolEntries(keys);
+  for (const entry of entries) {
+    try {
+      entry.reject(error || new Error('Peer connection closed'));
+    } catch (_) {}
+  }
+  return entries.length;
+}
+
 function normalizeCoreRefsForEnvelope(coreRefs) {
   if (!Array.isArray(coreRefs)) return undefined;
   const normalized = [];
@@ -1433,13 +1507,20 @@ async function waitForPeerProtocol(publicKey, timeoutMs = 20000, reason = 'unspe
 
   const keyBuffer = decodePeerKey(publicKey);
   const normalized = keyBuffer ? keyBuffer.toString('hex') : String(publicKey || '').trim().toLowerCase();
+  const resolveTargetKey = () => resolveConnectedTransportPeerKey(normalized) || normalized;
   const buildConnectionSnapshot = () => {
     const keys = Array.from(connectedPeers.keys());
+    const targetKey = resolveTargetKey();
+    const aliasTarget = connectedPeerAliasToTransport.get(normalized) || null;
     return {
       connectedPeers: keys.length,
       connectedPreview: keys.slice(0, 8).map((entry) => String(entry || '').slice(0, 16)),
-      targetConnected: connectedPeers.has(normalized),
-      pendingForTarget: (pendingPeerProtocols.get(normalized) || []).length
+      targetConnected: connectedPeers.has(targetKey),
+      pendingForTarget: (pendingPeerProtocols.get(targetKey) || []).length,
+      pendingForRequested: (pendingPeerProtocols.get(normalized) || []).length,
+      requestedPeerKey: normalized.slice(0, 16),
+      resolvedPeerKey: targetKey.slice(0, 16),
+      aliasLinked: !!aliasTarget
     };
   };
   console.log('[RelayServer][waitForPeerProtocol] wait-start', {
@@ -1448,7 +1529,8 @@ async function waitForPeerProtocol(publicKey, timeoutMs = 20000, reason = 'unspe
     timeoutMs,
     ...buildConnectionSnapshot()
   });
-  const existing = connectedPeers.get(normalized);
+  const targetKey = resolveTargetKey();
+  const existing = connectedPeers.get(targetKey) || connectedPeers.get(normalized);
   if (existing?.protocol && existing.protocol.channel && !existing.protocol.channel.closed) {
     console.log('[RelayServer][waitForPeerProtocol] wait-hit-existing', {
       reason,
@@ -1470,14 +1552,16 @@ async function waitForPeerProtocol(publicKey, timeoutMs = 20000, reason = 'unspe
   });
 
   return new Promise((resolve, reject) => {
-    const pending = pendingPeerProtocols.get(normalized) || [];
+    const pendingKeys = Array.from(new Set([normalized, targetKey].filter(Boolean)));
     const timeout = setTimeout(() => {
-      const list = pendingPeerProtocols.get(normalized) || [];
-      const filtered = list.filter(entry => entry !== pendingEntry);
-      if (filtered.length) {
-        pendingPeerProtocols.set(normalized, filtered);
-      } else {
-        pendingPeerProtocols.delete(normalized);
+      for (const key of pendingKeys) {
+        const list = pendingPeerProtocols.get(key) || [];
+        const filtered = list.filter(entry => entry !== pendingEntry);
+        if (filtered.length) {
+          pendingPeerProtocols.set(key, filtered);
+        } else {
+          pendingPeerProtocols.delete(key);
+        }
       }
       console.warn('[RelayServer][waitForPeerProtocol] wait-timeout', {
         reason,
@@ -1512,8 +1596,11 @@ async function waitForPeerProtocol(publicKey, timeoutMs = 20000, reason = 'unspe
       }
     };
 
-    pending.push(pendingEntry);
-    pendingPeerProtocols.set(normalized, pending);
+    for (const key of pendingKeys) {
+      const pending = pendingPeerProtocols.get(key) || [];
+      pending.push(pendingEntry);
+      pendingPeerProtocols.set(key, pending);
+    }
   });
 }
 
@@ -1566,8 +1653,9 @@ export async function discoverPeersOnTopic({
       .map((value) => normalizeHex64(value))
       .filter(Boolean);
     const newlyConnected = connectedKeys.filter((value) => !before.has(value));
-    const ordered = [...newlyConnected, ...connectedKeys.filter((value) => !newlyConnected.includes(value))];
-    return Array.from(new Set(ordered)).slice(0, peerCap);
+    // Return only peers discovered during this topic window.
+    // Returning all connected peers causes ambient peers to be misclassified as topic candidates.
+    return Array.from(new Set(newlyConnected)).slice(0, peerCap);
   } finally {
     try {
       joinHandle.destroy();
@@ -1577,13 +1665,40 @@ export async function discoverPeersOnTopic({
   }
 }
 
+export function getConnectedPeerKeys({ maxPeers = 64 } = {}) {
+  const cap = Math.max(1, Number.isFinite(maxPeers) ? Number(maxPeers) : 64);
+  return Array.from(connectedPeers.keys())
+    .map((value) => normalizeHex64(value))
+    .filter(Boolean)
+    .slice(0, cap);
+}
+
+export function resolveConnectedPeerKey(peerKey) {
+  return resolveConnectedTransportPeerKey(peerKey);
+}
+
+export function getCanonicalPeerKeyForConnected(peerKey) {
+  const transportKey = resolveConnectedTransportPeerKey(peerKey);
+  if (!transportKey) return null;
+  const peer = connectedPeers.get(transportKey);
+  if (peer?.canonicalPeerKey && isHex64(peer.canonicalPeerKey)) {
+    return String(peer.canonicalPeerKey).trim().toLowerCase();
+  }
+  const aliases = connectedPeerTransportToAliases.get(transportKey);
+  if (aliases && aliases.size) {
+    return Array.from(aliases).find((value) => isHex64(value)) || null;
+  }
+  return transportKey;
+}
+
 export async function probeJoinCapabilities({
   peerKey,
   publicIdentifier,
   inviteePubkey = null,
   tokenHash = null,
   timeoutMs = 1500,
-  nonce = null
+  nonce = null,
+  joinAttemptId = null
 } = {}) {
   const normalizedPeerKey = normalizeHex64(peerKey);
   const normalizedIdentifier = normalizeRelayIdentifier(publicIdentifier || '');
@@ -1598,8 +1713,14 @@ export async function probeJoinCapabilities({
   const requestNonce = typeof nonce === 'string' && nonce.trim()
     ? nonce.trim()
     : nodeCrypto.randomUUID();
+  const probeId = requestNonce;
+  const joinAttemptIdValue = typeof joinAttemptId === 'string' && joinAttemptId.trim()
+    ? joinAttemptId.trim()
+    : null;
   const startedAt = Date.now();
   console.log('[RelayServer] probeJoinCapabilities start', {
+    probeId,
+    joinAttemptId: joinAttemptIdValue,
     peerKey: normalizedPeerKey.slice(0, 16),
     publicIdentifier: normalizedIdentifier,
     timeoutMs,
@@ -1622,11 +1743,16 @@ export async function probeJoinCapabilities({
       protocol.sendRequest({
         method: 'POST',
         path: `/post/join-capabilities/${normalizedIdentifier}`,
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'x-join-probe-id': probeId,
+          ...(joinAttemptIdValue ? { 'x-join-attempt-id': joinAttemptIdValue } : {})
+        },
         body: Buffer.from(JSON.stringify({
           nonce: requestNonce,
           inviteePubkey: normalizeHex64(inviteePubkey) || null,
-          tokenHash: typeof tokenHash === 'string' ? tokenHash.trim().toLowerCase() : null
+          tokenHash: typeof tokenHash === 'string' ? tokenHash.trim().toLowerCase() : null,
+          probeId
         }))
       }),
       timeoutMs,
@@ -1635,6 +1761,8 @@ export async function probeJoinCapabilities({
     const statusCode = Number(responseRaw?.statusCode || 0) || null;
     const parsed = parseJsonBody(responseRaw?.body) || {};
     console.log('[RelayServer] probeJoinCapabilities response', {
+      probeId,
+      joinAttemptId: joinAttemptIdValue,
       peerKey: normalizedPeerKey.slice(0, 16),
       publicIdentifier: normalizedIdentifier,
       statusCode: statusCode || 200,
@@ -1645,6 +1773,7 @@ export async function probeJoinCapabilities({
         success: false,
         supported: statusCode !== 404,
         statusCode,
+        probeId,
         rttMs: Date.now() - startedAt,
         error: typeof parsed?.error === 'string' ? parsed.error : `status-${statusCode}`
       };
@@ -1655,6 +1784,7 @@ export async function probeJoinCapabilities({
         success: false,
         supported: true,
         statusCode: statusCode || 200,
+        probeId,
         rttMs: Date.now() - startedAt,
         error: 'nonce-mismatch'
       };
@@ -1663,11 +1793,14 @@ export async function probeJoinCapabilities({
       success: true,
       supported: true,
       statusCode: statusCode || 200,
+      probeId,
       rttMs: Date.now() - startedAt,
       data: parsed
     };
   } catch (error) {
     console.warn('[RelayServer] probeJoinCapabilities failed', {
+      probeId,
+      joinAttemptId: joinAttemptIdValue,
       peerKey: normalizedPeerKey.slice(0, 16),
       publicIdentifier: normalizedIdentifier,
       timeoutMs,
@@ -1678,6 +1811,7 @@ export async function probeJoinCapabilities({
       success: false,
       supported: false,
       statusCode: null,
+      probeId,
       rttMs: Date.now() - startedAt,
       error: error?.message || String(error)
     };
@@ -1807,6 +1941,9 @@ function handlePeerConnection(stream, peerInfo) {
   const publicKey = peerInfo.publicKey.toString('hex');
   const normalizedKey = publicKey.toLowerCase();
   console.log('[RelayServer] Setting up protocol for peer:', publicKey);
+  if (connectedPeers.has(normalizedKey)) {
+    clearConnectedPeerAliasesForTransport(normalizedKey);
+  }
   
   // Track the peer
   connectedPeers.set(normalizedKey, {
@@ -1816,7 +1953,8 @@ function handlePeerConnection(stream, peerInfo) {
     identified: false,
     stream: stream, // Keep reference to stream
     keepAliveInterval: null, // Add keepalive tracking
-    publicKey
+    publicKey,
+    canonicalPeerKey: null
   });
   
   const gatewayServiceInstance = global.gatewayService || null;
@@ -1909,19 +2047,28 @@ function handlePeerConnection(stream, peerInfo) {
     } else {
       console.log('[RelayServer] Regular peer connection (not gateway)');
     }
+
+    const canonicalPeerKey = normalizeHex64(
+      handshake?.peerId
+      || handshake?.relayPublicKey
+      || null
+    );
+    if (canonicalPeerKey && canonicalPeerKey !== normalizedKey) {
+      setConnectedPeerAlias(normalizedKey, canonicalPeerKey);
+    }
+    const openPeer = connectedPeers.get(normalizedKey);
+    if (openPeer) {
+      openPeer.canonicalPeerKey = canonicalPeerKey || normalizedKey;
+      connectedPeers.set(normalizedKey, openPeer);
+    }
     console.log('[RelayServer] ----------------------------------------');
 
-    const pending = pendingPeerProtocols.get(normalizedKey);
-    if (pending && pending.length) {
-      pendingPeerProtocols.delete(normalizedKey);
-      for (const entry of pending) {
-        try {
-          entry.resolve(protocol);
-        } catch (err) {
-          console.warn('[RelayServer] Failed to resolve pending peer protocol:', err.message);
-        }
-      }
-    }
+    const aliasKeys = connectedPeerTransportToAliases.get(normalizedKey);
+    const keysToResolve = [
+      normalizedKey,
+      ...(aliasKeys ? Array.from(aliasKeys) : [])
+    ];
+    resolvePendingPeerProtocolsForKeys(keysToResolve, protocol);
   });
   
   protocol.on('close', () => {
@@ -1937,16 +2084,13 @@ function handlePeerConnection(stream, peerInfo) {
     
     // Remove from connected peers
     connectedPeers.delete(normalizedKey);
-
-    const pending = pendingPeerProtocols.get(normalizedKey);
-    if (pending && pending.length) {
-      pendingPeerProtocols.delete(normalizedKey);
-      for (const entry of pending) {
-        try {
-          entry.reject(new Error('Peer connection closed'));
-        } catch (_) {}
-      }
-    }
+    const aliasKeys = connectedPeerTransportToAliases.get(normalizedKey);
+    const keysToReject = [
+      normalizedKey,
+      ...(aliasKeys ? Array.from(aliasKeys) : [])
+    ];
+    clearConnectedPeerAliasesForTransport(normalizedKey);
+    rejectPendingPeerProtocolsForKeys(keysToReject, new Error('Peer connection closed'));
 
     if (gatewayConnection === protocol) {
       console.log('[RelayServer] >>> GATEWAY CONNECTION LOST <<<');
@@ -2460,10 +2604,19 @@ function setupProtocolHandlers(protocol) {
     const rawIdentifier = request.params.identifier;
     const runtime = await resolveRelayRuntimeForIdentifier(rawIdentifier);
     const body = parseRequestBodyJson(request);
+    const probeIdHeader = typeof request?.headers?.['x-join-probe-id'] === 'string'
+      ? String(request.headers['x-join-probe-id']).trim()
+      : '';
+    const joinAttemptIdHeader = typeof request?.headers?.['x-join-attempt-id'] === 'string'
+      ? String(request.headers['x-join-attempt-id']).trim()
+      : '';
+    const probeIdBody = typeof body.probeId === 'string' ? body.probeId.trim() : '';
     const nonce =
       (typeof body.nonce === 'string' && body.nonce.trim())
       || (typeof request?.query?.nonce === 'string' && request.query.nonce.trim())
       || nodeCrypto.randomUUID();
+    const probeId = probeIdHeader || probeIdBody || nonce;
+    const joinAttemptId = joinAttemptIdHeader || null;
     const inviteePubkey = normalizeHex64(
       body.inviteePubkey || request?.query?.inviteePubkey || null
     );
@@ -2477,6 +2630,8 @@ function setupProtocolHandlers(protocol) {
     const canProvisionOpenWriter = canDirectChallenge;
     const canStoreLeaseReplica = relayActive && writable;
     console.log('[RelayServer] join-capabilities request', {
+      probeId,
+      joinAttemptId,
       identifier: normalizeRelayIdentifier(rawIdentifier || ''),
       relayKey: runtime?.relayKey || null,
       publicIdentifier: runtime?.publicIdentifier || null,
@@ -2513,8 +2668,10 @@ function setupProtocolHandlers(protocol) {
       return {
         statusCode: 404,
         headers: { 'content-type': 'application/json' },
-        body: b4a.from(JSON.stringify({
+      body: b4a.from(JSON.stringify({
           error: 'Relay not found',
+          probeId,
+          joinAttemptId,
           nonce,
           observedAt
         }))
@@ -2522,6 +2679,8 @@ function setupProtocolHandlers(protocol) {
     }
 
     const response = {
+      probeId,
+      joinAttemptId,
       nonce,
       relayKey: runtime?.relayKey || null,
       publicIdentifier: runtime?.publicIdentifier || normalizeRelayIdentifier(rawIdentifier),
@@ -2534,6 +2693,8 @@ function setupProtocolHandlers(protocol) {
       observedAt
     };
     console.log('[RelayServer] join-capabilities response', {
+      probeId,
+      joinAttemptId,
       identifier: response.publicIdentifier || normalizeRelayIdentifier(rawIdentifier || ''),
       relayKey: response.relayKey,
       writable: response.writable,

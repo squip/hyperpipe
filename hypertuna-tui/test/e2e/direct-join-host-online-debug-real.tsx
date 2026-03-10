@@ -68,6 +68,22 @@ function dedupeLower(input: Array<string | null | undefined>): string[] {
   )
 }
 
+function normalizeHttpOrigin(input: string | null | undefined): string | null {
+  const raw = String(input || '').trim()
+  if (!raw) return null
+  try {
+    const parsed = new URL(raw)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    const isDefaultPort =
+      (parsed.protocol === 'http:' && parsed.port === '80')
+      || (parsed.protocol === 'https:' && parsed.port === '443')
+    const portPart = parsed.port && !isDefaultPort ? `:${parsed.port}` : ''
+    return `${parsed.protocol}//${parsed.hostname}${portPart}`
+  } catch {
+    return null
+  }
+}
+
 function isRelayWritable(entry: RelayEntry | null | undefined): boolean {
   if (!entry) return false
   return entry.writable !== false && entry.readyForReq !== false
@@ -395,13 +411,23 @@ async function main(): Promise<void> {
     ])
 
     const relayName = `direct-host-online-${Date.now().toString(36)}`
+    const configuredGatewayOrigin = normalizeHttpOrigin(
+      process.env.DIRECT_JOIN_TEST_GATEWAY_ORIGIN
+      || process.env.PUBLIC_GATEWAY_URL
+      || null
+    )
+    if (gatewayMode === 'auto' && !configuredGatewayOrigin) {
+      throw new Error('Set DIRECT_JOIN_TEST_GATEWAY_ORIGIN or PUBLIC_GATEWAY_URL for --gateway-mode auto')
+    }
     logProgress(`host: create relay ${relayName}`)
     await host.createRelay({
       name: relayName,
       description: 'targeted direct-join host-online debug',
       isPublic: true,
       isOpen: true,
-      fileSharing: true
+      fileSharing: true,
+      directJoinOnly: gatewayMode === 'disabled',
+      gatewayOrigin: gatewayMode === 'auto' ? configuredGatewayOrigin : null
     })
 
     const hostGroup = await waitFor<GroupSummary>(

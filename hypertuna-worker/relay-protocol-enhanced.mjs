@@ -25,6 +25,28 @@ function resolveRequestTimeoutMs() {
 
 const REQUEST_TIMEOUT = resolveRequestTimeoutMs();
 
+function isJoinCapabilitiesPath(path) {
+  return typeof path === 'string' && path.startsWith('/post/join-capabilities/');
+}
+
+function normalizeHeaderString(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function extractJoinProbeMeta(path, headers = {}) {
+  if (!isJoinCapabilitiesPath(path)) return null;
+  const headerProbeId =
+    normalizeHeaderString(headers['x-join-probe-id'])
+    || normalizeHeaderString(headers['X-Join-Probe-Id']);
+  const headerJoinAttemptId =
+    normalizeHeaderString(headers['x-join-attempt-id'])
+    || normalizeHeaderString(headers['X-Join-Attempt-Id']);
+  return {
+    probeId: headerProbeId,
+    joinAttemptId: headerJoinAttemptId
+  };
+}
+
 // Custom encoding for HTTP-like messages
 const httpMessageEncoding = {
   preencode(state, m) {
@@ -197,8 +219,22 @@ export class RelayProtocol extends EventEmitter {
     }
     
     if (!handled) {
-      // Emit as generic request if no handler found
-      this.emit('request', request);
+      if (this.listenerCount('request') > 0) {
+        // Emit as generic request if no route handler found.
+        this.emit('request', request);
+        return;
+      }
+      // Fail fast for unhandled requests so callers do not hang until timeout.
+      this.sendResponse({
+        id: request.id,
+        statusCode: 404,
+        headers: { 'content-type': 'application/json' },
+        body: b4a.from(JSON.stringify({
+          error: 'not-found',
+          method: request.method,
+          path: request.path
+        }))
+      });
     }
   }
   
@@ -264,6 +300,16 @@ export class RelayProtocol extends EventEmitter {
         headers: message.headers || {},
         body: message.body ? b4a.from(message.body) : b4a.alloc(0)
       };
+      if (request.joinProbeMeta || isJoinCapabilitiesPath(request.path)) {
+        console.log('[RelayProtocol] join-capabilities response', {
+          id: message.id,
+          method: request.method,
+          path: request.path,
+          statusCode: response.statusCode,
+          probeId: request.joinProbeMeta?.probeId || null,
+          joinAttemptId: request.joinProbeMeta?.joinAttemptId || null
+        });
+      }
       
       request.resolve(response);
     }
@@ -323,17 +369,44 @@ export class RelayProtocol extends EventEmitter {
       headers: request.headers || {},
       body: request.body ? Array.from(request.body) : null
     };
+    const joinProbeMeta = extractJoinProbeMeta(message.path, message.headers || {});
+    if (joinProbeMeta) {
+      console.log('[RelayProtocol] join-capabilities request', {
+        id,
+        method: message.method,
+        path: message.path,
+        probeId: joinProbeMeta.probeId || null,
+        joinAttemptId: joinProbeMeta.joinAttemptId || null
+      });
+    }
     
     return new Promise((resolve, reject) => {
       const timeout = Number.isFinite(effectiveTimeoutMs) && effectiveTimeoutMs > 0
         ? setTimeout(() => {
           this.requests.delete(id);
+          if (joinProbeMeta || isJoinCapabilitiesPath(message.path)) {
+            console.warn('[RelayProtocol] join-capabilities request timeout', {
+              id,
+              method: message.method,
+              path: message.path,
+              timeoutMs: effectiveTimeoutMs,
+              probeId: joinProbeMeta?.probeId || null,
+              joinAttemptId: joinProbeMeta?.joinAttemptId || null
+            });
+          }
           reject(new Error('Request timeout'));
         }, effectiveTimeoutMs)
         : null;
       if (timeout?.unref) timeout.unref();
       
-      this.requests.set(id, { resolve, reject, timeout });
+      this.requests.set(id, {
+        resolve,
+        reject,
+        timeout,
+        method: message.method,
+        path: message.path,
+        joinProbeMeta
+      });
       
       try {
         this.channel.messages[0].send(message);

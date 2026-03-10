@@ -559,20 +559,59 @@ function normalizePeerKeyList(values = []) {
   )
 }
 
+function filterPeerKeyList(values = [], { excludePeerKey = null, canonicalResolver = null } = {}) {
+  const normalized = normalizePeerKeyList(values)
+  const excluded = normalizePeerKey(excludePeerKey)
+  if (!excluded) return normalized
+  return normalized.filter((peerKey) => {
+    if (peerKey === excluded) return false
+    if (typeof canonicalResolver !== 'function') return true
+    try {
+      const canonicalPeerKey = normalizePeerKey(canonicalResolver(peerKey))
+      if (canonicalPeerKey && canonicalPeerKey === excluded) {
+        return false
+      }
+    } catch (_) {}
+    return true
+  })
+}
+
+function remapPeerKeyList(values = [], resolver = null) {
+  const normalized = normalizePeerKeyList(values)
+  if (typeof resolver !== 'function') return normalized
+  return normalizePeerKeyList(
+    normalized.map((peerKey) => {
+      try {
+        return resolver(peerKey) || peerKey
+      } catch (_) {
+        return peerKey
+      }
+    })
+  )
+}
+
 function buildProbeCandidatePeers({
   hostPeerKeys = [],
   leaseReplicaPeerKeys = [],
   topicPeerKeys = [],
+  ambientPeerKeys = [],
   capabilityByPeer = {},
   maxCandidates = JOIN_MAX_PROBE_CANDIDATES
 } = {}) {
   const now = Date.now()
+  const normalizedHostPeers = normalizePeerKeyList(hostPeerKeys)
+  const normalizedLeasePeers = normalizePeerKeyList(leaseReplicaPeerKeys)
   const normalizedTopicPeers = normalizePeerKeyList(topicPeerKeys)
+  const normalizedAmbientPeers = normalizePeerKeyList(ambientPeerKeys)
+  const hostSet = new Set(normalizedHostPeers)
+  const leaseSet = new Set(normalizedLeasePeers)
   const topicSet = new Set(normalizedTopicPeers)
+  const ambientSet = new Set(normalizedAmbientPeers)
   const merged = normalizePeerKeyList([
+    ...normalizedHostPeers,
+    ...normalizedLeasePeers,
     ...normalizedTopicPeers,
-    ...hostPeerKeys,
-    ...leaseReplicaPeerKeys
+    ...normalizedAmbientPeers
   ])
 
   const scored = merged.map((peerKey, sourceIndex) => {
@@ -588,16 +627,29 @@ function buildProbeCandidatePeers({
       && (now - lastFailureAt) <= JOIN_RECENT_FAILURE_DEMOTE_MS
       && (!lastSuccessAt || lastFailureAt >= lastSuccessAt)
     )
+    const isHostPeer = hostSet.has(peerKey)
+    const isLeasePeer = leaseSet.has(peerKey)
     const isTopicPeer = topicSet.has(peerKey)
-    let tier = 3
-    if (isTopicPeer) {
-      tier = 0
-    } else if (hasRecentSuccess) {
-      tier = 1
-    } else if (observedAt > 0) {
-      tier = 2
+    const isAmbientPeer = ambientSet.has(peerKey)
+    let source = 'ambient'
+    let sourcePriority = 3
+    if (isHostPeer) {
+      source = 'host'
+      sourcePriority = 0
+    } else if (isLeasePeer) {
+      source = 'lease-replica'
+      sourcePriority = 1
+    } else if (isTopicPeer) {
+      source = 'topic'
+      sourcePriority = 2
     }
-    if (hasRecentFailure && !isTopicPeer && !hasRecentSuccess) {
+    let tier = sourcePriority
+    if (hasRecentSuccess && !isHostPeer) {
+      tier = Math.max(0, tier - 1)
+    } else if (observedAt > 0 && !isHostPeer) {
+      tier = Math.max(0, tier)
+    }
+    if (hasRecentFailure && !isHostPeer && !hasRecentSuccess) {
       tier += 2
     }
 
@@ -605,7 +657,12 @@ function buildProbeCandidatePeers({
       peerKey,
       sourceIndex,
       tier,
+      source,
+      sourcePriority,
+      isHostPeer,
+      isLeasePeer,
       isTopicPeer,
+      isAmbientPeer,
       hasRecentSuccess,
       hasRecentFailure,
       lastSuccessAt,
@@ -617,7 +674,7 @@ function buildProbeCandidatePeers({
 
   scored.sort((left, right) => {
     if (left.tier !== right.tier) return left.tier - right.tier
-    if (left.isTopicPeer !== right.isTopicPeer) return left.isTopicPeer ? -1 : 1
+    if (left.sourcePriority !== right.sourcePriority) return left.sourcePriority - right.sourcePriority
     if (left.hasRecentSuccess !== right.hasRecentSuccess) return left.hasRecentSuccess ? -1 : 1
     if (left.lastSuccessAt !== right.lastSuccessAt) return right.lastSuccessAt - left.lastSuccessAt
     if (left.hasRecentFailure !== right.hasRecentFailure) return left.hasRecentFailure ? 1 : -1
@@ -632,7 +689,12 @@ function buildProbeCandidatePeers({
     diagnostics: limited.map((entry) => ({
       peerKey: entry.peerKey,
       tier: entry.tier,
+      source: entry.source,
+      sourcePriority: entry.sourcePriority,
+      host: entry.isHostPeer,
+      leaseReplica: entry.isLeasePeer,
       topic: entry.isTopicPeer,
+      ambient: entry.isAmbientPeer,
       recentSuccess: entry.hasRecentSuccess,
       recentFailure: entry.hasRecentFailure,
       lastSuccessAt: entry.lastSuccessAt || null,
@@ -7931,6 +7993,7 @@ async function handleMessageObject(message) {
           let writerCoreRefs = Array.isArray(data.cores) ? normalizeMirrorWriterCoreRefs(data.cores) : []
           let blindPeer = sanitizeBlindPeerMeta(data.blindPeer)
           joinRelayKey = normalizeRelayKeyHex(data.relayKey)
+          const localSwarmPeerKey = normalizePeerKey(config?.swarmPublicKey || null)
           let joinRelayUrl = data.relayUrl || null
           let writerCore = data.writerCore || data.writer_core || null
           let writerSecret = data.writerSecret || data.writer_secret || null
@@ -8036,6 +8099,26 @@ async function handleMessageObject(message) {
             ...leaseReplicaPeerKeys,
             ...(discoveryHints?.leaseReplicaPeerKeys || [])
           ])
+          const gatewayStatusIdentifier = publicIdentifier || joinRelayKey || null
+          if (gatewayMode === 'auto' && gatewayStatusIdentifier) {
+            const gatewayStatusHostPeers = resolveHostPeersFromGatewayStatus(
+              getGatewayStatus(),
+              gatewayStatusIdentifier
+            )
+            if (gatewayStatusHostPeers.length) {
+              hostPeers = normalizePeerKeyList([
+                ...hostPeers,
+                ...gatewayStatusHostPeers
+              ])
+              console.log('[Worker] Join flow merged gateway status host peers', {
+                publicIdentifier,
+                relayKey: previewValue(joinRelayKey, 16),
+                identifier: gatewayStatusIdentifier,
+                mergedHostPeerCount: hostPeers.length,
+                gatewayStatusHostPeerCount: gatewayStatusHostPeers.length
+              })
+            }
+          }
           if (!discoveryTopic && discoveryHints?.discoveryTopic) {
             discoveryTopic = discoveryHints.discoveryTopic
           }
@@ -8067,9 +8150,51 @@ async function handleMessageObject(message) {
               })
             }
           }
-          if (topicDiscoveredPeerKeys.length) {
-            hostPeers = normalizePeerKeyList([...hostPeers, ...topicDiscoveredPeerKeys])
-          }
+          let ambientConnectedPeerKeys = (
+            joinDirectDiscoveryV2
+            && typeof relayServer?.getConnectedPeerKeys === 'function'
+          )
+            ? normalizePeerKeyList(
+              relayServer.getConnectedPeerKeys({
+                maxPeers: Math.max(12, JOIN_MAX_PROBE_CANDIDATES * 2)
+              }) || []
+            )
+            : []
+          const connectedPeerResolver = typeof relayServer?.resolveConnectedPeerKey === 'function'
+            ? (peerKey) => relayServer.resolveConnectedPeerKey(peerKey)
+            : null
+          const connectedPeerCanonicalResolver =
+            typeof relayServer?.getCanonicalPeerKeyForConnected === 'function'
+              ? (peerKey) => relayServer.getCanonicalPeerKeyForConnected(peerKey)
+              : null
+          hostPeers = remapPeerKeyList(
+            filterPeerKeyList(hostPeers, {
+              excludePeerKey: localSwarmPeerKey,
+              canonicalResolver: connectedPeerCanonicalResolver
+            }),
+            connectedPeerResolver
+          )
+          leaseReplicaPeerKeys = remapPeerKeyList(
+            filterPeerKeyList(leaseReplicaPeerKeys, {
+              excludePeerKey: localSwarmPeerKey,
+              canonicalResolver: connectedPeerCanonicalResolver
+            }),
+            connectedPeerResolver
+          )
+          topicDiscoveredPeerKeys = remapPeerKeyList(
+            filterPeerKeyList(topicDiscoveredPeerKeys, {
+              excludePeerKey: localSwarmPeerKey,
+              canonicalResolver: connectedPeerCanonicalResolver
+            }),
+            connectedPeerResolver
+          )
+          ambientConnectedPeerKeys = remapPeerKeyList(
+            filterPeerKeyList(ambientConnectedPeerKeys, {
+              excludePeerKey: localSwarmPeerKey,
+              canonicalResolver: connectedPeerCanonicalResolver
+            }),
+            connectedPeerResolver
+          )
 
           const relayIdentifierForGateway = joinRelayKey || publicIdentifier || null
           const shouldStartOpenBootstrap =
@@ -8257,6 +8382,7 @@ async function handleMessageObject(message) {
               leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
               hasDiscoveryTopic: !!discoveryTopic,
               topicDiscoveredPeerCount: topicDiscoveredPeerKeys.length,
+              ambientConnectedPeerCount: ambientConnectedPeerKeys.length,
               cachedCapabilityCount: Object.keys(discoveryHints?.capabilities || {}).length,
               writerLeaseId,
               writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint)
@@ -8293,9 +8419,13 @@ async function handleMessageObject(message) {
               hostPeerKeys: hostPeers,
               leaseReplicaPeerKeys,
               topicPeerKeys: topicDiscoveredPeerKeys,
+              ambientPeerKeys: ambientConnectedPeerKeys,
               capabilityByPeer,
               maxCandidates: JOIN_MAX_PROBE_CANDIDATES
             })
+            const candidateDiagnosticsByPeer = new Map(
+              candidateDiagnostics.map((entry) => [entry.peerKey, entry])
+            )
             const tokenHash = inviteToken
               ? computeLeaseTokenHash(joinRelayKey || discoveryHints?.relayKey || null, inviteToken)
               : null
@@ -8304,28 +8434,70 @@ async function handleMessageObject(message) {
                 publicIdentifier,
                 relayKey: previewValue(joinRelayKey, 16),
                 candidateCount: candidatePeers.length,
+                routeHostPeerCount: hostPeers.length,
+                leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
+                topicDiscoveredPeerCount: topicDiscoveredPeerKeys.length,
+                ambientConnectedPeerCount: ambientConnectedPeerKeys.length,
                 candidatePreview: candidateDiagnostics.slice(0, 6)
               })
               const probeStartedAt = Date.now()
               const probeResults = await Promise.all(
                 candidatePeers.map(async (peerKey) => {
                   const startedAt = Date.now()
-                  const probe = await withTimeout(
-                    relayServer.probeJoinCapabilities({
-                      peerKey,
+                  const candidateDiagnostic = candidateDiagnosticsByPeer.get(peerKey) || null
+                  const runProbeAttempt = async (attempt = 0) => {
+                    const timeoutMs = attempt === 0
+                      ? JOIN_PROBE_TIMEOUT_MS
+                      : Math.max(JOIN_PROBE_TIMEOUT_MS + 1000, JOIN_PROBE_TIMEOUT_MS * 2)
+                    const probe = await withTimeout(
+                      relayServer.probeJoinCapabilities({
+                        peerKey,
+                        publicIdentifier,
+                        inviteePubkey,
+                        tokenHash,
+                        timeoutMs,
+                        joinAttemptId
+                      }),
+                      timeoutMs + 350,
+                      `Capability probe timeout (${peerKey.slice(0, 8)})`
+                    ).catch((error) => ({
+                      success: false,
+                      supported: false,
+                      statusCode: null,
+                      error: error?.message || String(error)
+                    }))
+                    return { probe, timeoutMs }
+                  }
+                  let probeAttempt = 1
+                  let attemptResult = await runProbeAttempt(0)
+                  let probe = attemptResult.probe
+                  const timeoutError = String(probe?.error || '').toLowerCase()
+                  const candidateConnected = typeof relayServer?.resolveConnectedPeerKey === 'function'
+                    ? !!relayServer.resolveConnectedPeerKey(peerKey)
+                    : ambientConnectedPeerKeys.includes(peerKey)
+                  const shouldRetryTimeoutProbe = (
+                    probe?.success !== true
+                    && candidateConnected
+                    && /timeout|timed out|probe-request timeout|capability probe timeout/.test(timeoutError)
+                    && (
+                      candidateDiagnostic?.host === true
+                      || candidateDiagnostic?.leaseReplica === true
+                      || candidateDiagnostic?.topic === true
+                      || candidateDiagnostic?.ambient === true
+                    )
+                  )
+                  if (shouldRetryTimeoutProbe) {
+                    probeAttempt = 2
+                    console.warn('[Worker] Join probe retry', {
                       publicIdentifier,
-                      inviteePubkey,
-                      tokenHash,
-                      timeoutMs: JOIN_PROBE_TIMEOUT_MS
-                    }),
-                    JOIN_PROBE_TIMEOUT_MS + 250,
-                    `Capability probe timeout (${peerKey.slice(0, 8)})`
-                  ).catch((error) => ({
-                    success: false,
-                    supported: false,
-                    statusCode: null,
-                    error: error?.message || String(error)
-                  }))
+                      relayKey: previewValue(joinRelayKey, 16),
+                      peerKey: previewValue(peerKey, 16),
+                      source: candidateDiagnostic?.source || null,
+                      initialError: probe?.error || null
+                    })
+                    attemptResult = await runProbeAttempt(1)
+                    probe = attemptResult.probe
+                  }
                   const completedAt = Date.now()
                   const data = probe?.data && typeof probe.data === 'object' ? probe.data : {}
                   const mode = data?.canDirectChallenge === true
@@ -8344,8 +8516,18 @@ async function handleMessageObject(message) {
                     supported: probe?.supported !== false,
                     statusCode: probe?.statusCode || null,
                     error: probe?.error || null,
+                    probeId: probe?.probeId || data?.probeId || null,
                     rttMs: Number.isFinite(probe?.rttMs) ? Number(probe.rttMs) : (completedAt - startedAt),
+                    probeAttempt,
                     completedAt,
+                    source: candidateDiagnostic?.source || null,
+                    sourcePriority: Number.isFinite(candidateDiagnostic?.sourcePriority)
+                      ? Number(candidateDiagnostic.sourcePriority)
+                      : 99,
+                    host: candidateDiagnostic?.host === true,
+                    leaseReplica: candidateDiagnostic?.leaseReplica === true,
+                    topic: candidateDiagnostic?.topic === true,
+                    ambient: candidateDiagnostic?.ambient === true,
                     mode,
                     writerGuaranteed,
                     data
@@ -8360,6 +8542,14 @@ async function handleMessageObject(message) {
                       rttMs: payload.rttMs,
                       mode,
                       writerGuaranteed,
+                      source: payload.source,
+                      sourcePriority: payload.sourcePriority,
+                      host: payload.host,
+                      leaseReplica: payload.leaseReplica,
+                      topic: payload.topic,
+                      ambient: payload.ambient,
+                      probeId: payload.probeId,
+                      probeAttempt,
                       statusCode: payload.statusCode,
                       error: payload.error
                     }
@@ -8370,10 +8560,18 @@ async function handleMessageObject(message) {
                     peerKey: previewValue(peerKey, 16),
                     success: payload.success,
                     supported: payload.supported,
+                    source: payload.source,
+                    sourcePriority: payload.sourcePriority,
+                    host: payload.host,
+                    leaseReplica: payload.leaseReplica,
+                    topic: payload.topic,
+                    ambient: payload.ambient,
                     mode: payload.mode,
                     writerGuaranteed: payload.writerGuaranteed,
                     statusCode: payload.statusCode || null,
                     error: payload.error || null,
+                    probeId: payload.probeId || null,
+                    probeAttempt: payload.probeAttempt,
                     rttMs: payload.rttMs
                   })
                   await recordRelayCapabilityProbe({
@@ -8395,9 +8593,37 @@ async function handleMessageObject(message) {
                 })
               )
               const windowElapsed = Date.now() - probeStartedAt
+              const routeHostPeers = normalizePeerKeyList(hostPeers)
+              const routeHostProbeResults = probeResults.filter((entry) => entry.host === true)
+              const routeHostSuccessCount = routeHostProbeResults.filter(
+                (entry) => entry.success && entry.supported
+              ).length
+              const onlyNonRouteCandidatesProbed =
+                routeHostPeers.length > 0
+                && routeHostProbeResults.length === 0
+                && probeResults.length > 0
+              const routeHostsUnreachable =
+                routeHostProbeResults.length > 0
+                && routeHostSuccessCount === 0
+              if (onlyNonRouteCandidatesProbed || routeHostsUnreachable) {
+                const routeHostProbeSet = new Set(routeHostProbeResults.map((entry) => entry.peerKey))
+                const routeHostsNotProbed = routeHostPeers.filter((peerKey) => !routeHostProbeSet.has(peerKey))
+                console.warn('[Worker] Join probe route-host gap detected', {
+                  publicIdentifier,
+                  relayKey: previewValue(joinRelayKey, 16),
+                  routeHostPeerCount: routeHostPeers.length,
+                  routeHostProbedCount: routeHostProbeResults.length,
+                  routeHostSuccessCount,
+                  routeHostsNotProbed: routeHostsNotProbed.slice(0, 6),
+                  selectedRouteHostSource: routeHostProbeResults[0]?.source || null
+                })
+              }
               const sortedCandidates = probeResults
                 .filter((entry) => entry.writerGuaranteed && entry.success && entry.supported && entry.mode)
                 .sort((left, right) => {
+                  if ((left.sourcePriority ?? 99) !== (right.sourcePriority ?? 99)) {
+                    return (left.sourcePriority ?? 99) - (right.sourcePriority ?? 99)
+                  }
                   if (left.completedAt !== right.completedAt) return left.completedAt - right.completedAt
                   return left.rttMs - right.rttMs
                 })
@@ -8413,6 +8639,11 @@ async function handleMessageObject(message) {
                   publicIdentifier,
                   mode: selectedDirectCandidate?.mode || null,
                   peerKey: selectedDirectCandidate?.peerKey || null,
+                  source: selectedDirectCandidate?.source || null,
+                  sourcePriority: Number.isFinite(selectedDirectCandidate?.sourcePriority)
+                    ? Number(selectedDirectCandidate.sourcePriority)
+                    : null,
+                  probeId: selectedDirectCandidate?.probeId || null,
                   gatewayMode,
                   candidates: candidatePeers.length,
                   discoveryWindowMs: JOIN_DISCOVERY_WINDOW_MS,
@@ -8421,7 +8652,14 @@ async function handleMessageObject(message) {
               })
             }
 
-            if (selectedDirectCandidate?.mode === 'lease-claim' && relayServer?.claimWriterLeaseFromPeer) {
+	            const selectedDirectCanonicalPeerKey = selectedDirectCandidate?.peerKey
+	              ? (
+	                typeof relayServer?.getCanonicalPeerKeyForConnected === 'function'
+	                  ? (relayServer.getCanonicalPeerKeyForConnected(selectedDirectCandidate.peerKey) || selectedDirectCandidate.peerKey)
+	                  : selectedDirectCandidate.peerKey
+	              )
+	              : null
+	            if (selectedDirectCandidate?.mode === 'lease-claim' && relayServer?.claimWriterLeaseFromPeer) {
               ensureJoinBudget('lease-claim', 500)
               const inviteePubkeyNormalized = isHex64(config?.nostr_pubkey_hex)
                 ? String(config.nostr_pubkey_hex).trim().toLowerCase()
@@ -8493,40 +8731,40 @@ async function handleMessageObject(message) {
                 if (!fastForward && claimedEnvelope.fastForward && typeof claimedEnvelope.fastForward === 'object') {
                   fastForward = claimedEnvelope.fastForward
                 }
-                hostPeers = normalizePeerKeyList([
-                  selectedDirectCandidate.peerKey,
-                  ...hostPeers
-                ])
-                selectedJoinPathMode = 'closed-lease-direct'
-                selectedJoinPeerKey = selectedDirectCandidate.peerKey
-                sendMessage({
-                  type: 'JOIN_WRITER_SOURCE',
-                  data: {
-                    publicIdentifier,
-                    source: 'lease-claim',
-                    peerKey: selectedDirectCandidate.peerKey,
-                    writerIssuerPubkey: writerIssuerPubkey || null
-                  }
-                })
-                await upsertRelayLeaseEnvelope({
-                  envelope: claimedEnvelope,
-                  relayKey: joinRelayKey || claimedEnvelope?.relayKey || null,
-                  publicIdentifier: publicIdentifier || claimedEnvelope?.publicIdentifier || null,
-                  sourcePeerKey: selectedDirectCandidate.peerKey
-                }).catch(() => {})
+	                hostPeers = normalizePeerKeyList([
+	                  selectedDirectCanonicalPeerKey || selectedDirectCandidate.peerKey,
+	                  ...hostPeers
+	                ])
+	                selectedJoinPathMode = 'closed-lease-direct'
+	                selectedJoinPeerKey = selectedDirectCanonicalPeerKey || selectedDirectCandidate.peerKey
+	                sendMessage({
+	                  type: 'JOIN_WRITER_SOURCE',
+	                  data: {
+	                    publicIdentifier,
+	                    source: 'lease-claim',
+	                    peerKey: selectedDirectCanonicalPeerKey || selectedDirectCandidate.peerKey,
+	                    writerIssuerPubkey: writerIssuerPubkey || null
+	                  }
+	                })
+	                await upsertRelayLeaseEnvelope({
+	                  envelope: claimedEnvelope,
+	                  relayKey: joinRelayKey || claimedEnvelope?.relayKey || null,
+	                  publicIdentifier: publicIdentifier || claimedEnvelope?.publicIdentifier || null,
+	                  sourcePeerKey: selectedDirectCanonicalPeerKey || selectedDirectCandidate.peerKey
+	                }).catch(() => {})
               } else {
                 selectedDirectCandidate = null
                 selectedJoinPathMode = null
-                selectedJoinPeerKey = null
-              }
-            } else if (selectedDirectCandidate?.peerKey) {
-              hostPeers = [selectedDirectCandidate.peerKey]
-              selectedJoinPathMode =
-                selectedDirectCandidate.mode === 'direct-challenge'
-                  ? 'direct-join'
-                  : selectedDirectCandidate.mode
-              selectedJoinPeerKey = selectedDirectCandidate.peerKey
-            }
+	                selectedJoinPeerKey = null
+	              }
+	            } else if (selectedDirectCandidate?.peerKey) {
+	              hostPeers = [selectedDirectCanonicalPeerKey || selectedDirectCandidate.peerKey]
+	              selectedJoinPathMode =
+	                selectedDirectCandidate.mode === 'direct-challenge'
+	                  ? 'direct-join'
+	                  : selectedDirectCandidate.mode
+	              selectedJoinPeerKey = selectedDirectCanonicalPeerKey || selectedDirectCandidate.peerKey
+	            }
 
             if (
               !selectedDirectCandidate
@@ -8655,21 +8893,30 @@ async function handleMessageObject(message) {
             writerSecret
             && (writerCore || writerCoreHex || autobaseLocal)
           )
-          if (
-            joinDirectDiscoveryV2
-            && gatewayMode === 'auto'
-            && openJoin
-            && !inviteToken
-            && !selectedDirectCandidate?.peerKey
-            && !openJoinHasWriterMaterial
-          ) {
-            console.warn('[Worker] No writer path: no verified direct candidate and no gateway bootstrap material', {
-              publicIdentifier,
-              relayKey: previewValue(joinRelayKey, 16),
-              hostPeersCount: hostPeers.length,
-              leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
-              gatewayBootstrapStatus: gatewayBootstrapResult?.status || null,
-              gatewayBootstrapReason: gatewayBootstrapResult?.reason || null,
+	          if (
+	            joinDirectDiscoveryV2
+	            && gatewayMode === 'auto'
+	            && openJoin
+	            && !inviteToken
+	            && !selectedDirectCandidate?.peerKey
+	            && !openJoinHasWriterMaterial
+	          ) {
+	            const routeHostResolution = explicitHostPeers.slice(0, 8).map((peerKey) => ({
+	              peerKey,
+	              resolvedPeerKey: typeof relayServer?.resolveConnectedPeerKey === 'function'
+	                ? relayServer.resolveConnectedPeerKey(peerKey)
+	                : null
+	            }))
+	            console.warn('[Worker] No writer path: no verified direct candidate and no gateway bootstrap material', {
+	              publicIdentifier,
+	              relayKey: previewValue(joinRelayKey, 16),
+	              localPeerKey: previewValue(localSwarmPeerKey, 16),
+	              originalRouteHostPeerCount: explicitHostPeers.length,
+	              routeHostResolution,
+	              hostPeersCount: hostPeers.length,
+	              leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
+	              gatewayBootstrapStatus: gatewayBootstrapResult?.status || null,
+	              gatewayBootstrapReason: gatewayBootstrapResult?.reason || null,
               gatewayBootstrapError: gatewayBootstrapResult?.error || null,
               gatewayBootstrapStatusCode: gatewayBootstrapResult?.statusCode || null
             })
@@ -8889,11 +9136,32 @@ async function handleMessageObject(message) {
             }
           }
 
-          if (gatewayMode === 'auto' && !hostPeers.length) {
-            hostPeers = resolveHostPeersFromGatewayStatus(getGatewayStatus(), publicIdentifier)
-          }
-          hostPeers = normalizePeerKeyList(hostPeers)
-          leaseReplicaPeerKeys = normalizePeerKeyList(leaseReplicaPeerKeys)
+	          if (gatewayMode === 'auto') {
+	            const gatewayStatusHosts = resolveHostPeersFromGatewayStatus(
+	              getGatewayStatus(),
+	              publicIdentifier || joinRelayKey || null
+	            )
+	            if (gatewayStatusHosts.length) {
+	              hostPeers = normalizePeerKeyList([
+	                ...hostPeers,
+	                ...gatewayStatusHosts
+	              ])
+	            }
+	          }
+	          hostPeers = remapPeerKeyList(
+	            filterPeerKeyList(hostPeers, {
+	              excludePeerKey: localSwarmPeerKey,
+	              canonicalResolver: connectedPeerCanonicalResolver
+	            }),
+	            connectedPeerResolver
+	          )
+	          leaseReplicaPeerKeys = remapPeerKeyList(
+	            filterPeerKeyList(leaseReplicaPeerKeys, {
+	              excludePeerKey: localSwarmPeerKey,
+	              canonicalResolver: connectedPeerCanonicalResolver
+	            }),
+	            connectedPeerResolver
+	          )
 
           const canUseGatewayOpenBootstrapPath = Boolean(
             joinDirectDiscoveryV2
@@ -8931,19 +9199,25 @@ async function handleMessageObject(message) {
             })
           }
 
-          if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
-          if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
-          const validatedProbePeerSet = new Set(probeValidatedPeerKeys)
-          const discoveryHintHostPeersForStore = joinDirectDiscoveryV2
-            ? (
-              probeValidatedPeerKeys.length
-                ? normalizePeerKeyList([
-                  ...(selectedJoinPeerKey ? [selectedJoinPeerKey] : []),
-                  ...probeValidatedPeerKeys
-                ])
-                : undefined
-            )
-            : hostPeers
+	          if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
+	          if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
+	          const validatedProbePeerSet = new Set(probeValidatedPeerKeys)
+	          const canonicalProbeValidatedPeerKeys = remapPeerKeyList(
+	            probeValidatedPeerKeys,
+	            typeof relayServer?.getCanonicalPeerKeyForConnected === 'function'
+	              ? (peerKey) => relayServer.getCanonicalPeerKeyForConnected(peerKey)
+	              : null
+	          )
+	          const discoveryHintHostPeersForStore = joinDirectDiscoveryV2
+	            ? (
+	              canonicalProbeValidatedPeerKeys.length
+	                ? normalizePeerKeyList([
+	                  ...(selectedJoinPeerKey ? [selectedJoinPeerKey] : []),
+	                  ...canonicalProbeValidatedPeerKeys
+	                ])
+	                : undefined
+	            )
+	            : hostPeers
           const discoveryHintLeaseReplicaPeersForStore = joinDirectDiscoveryV2
             ? (
               probeValidatedPeerKeys.length

@@ -3152,6 +3152,14 @@ export class GatewayService extends EventEmitter {
     this.emit('status', this.getStatus());
 
     const connectAndCheck = async () => {
+      const ownPeerKey = typeof this.ownPeerPublicKey === 'string' ? this.ownPeerPublicKey.trim().toLowerCase() : null;
+      const targetPeerKey = typeof publicKey === 'string' ? publicKey.trim().toLowerCase() : null;
+      if (ownPeerKey && targetPeerKey && ownPeerKey === targetPeerKey) {
+        this.log('debug', `[PublicGateway] Skipping self connect for ${targetPeerKey.slice(0, 8)} (${source})`);
+        peer.status = 'connected';
+        this.emit('status', this.getStatus());
+        return;
+      }
       try {
         await this.connectionPool.getConnection(publicKey, {
           reason: 'peer-register-connect',
@@ -4022,6 +4030,15 @@ export class GatewayService extends EventEmitter {
     if (!connData || !healthyPeer) {
       throw new Error('Missing connection context for peer forwarding');
     }
+    const ownPeerKey = typeof this.ownPeerPublicKey === 'string'
+      ? this.ownPeerPublicKey.trim().toLowerCase()
+      : null;
+    const targetPeerKey = typeof healthyPeer.publicKey === 'string'
+      ? healthyPeer.publicKey.trim().toLowerCase()
+      : null;
+    if (ownPeerKey && targetPeerKey && ownPeerKey === targetPeerKey) {
+      throw new Error('self-peer-forward-blocked');
+    }
 
     const outboundMessage = typeof rawMessage === 'string' ? rawMessage : rawMessage?.toString?.() ?? '';
     const authToken = this.#resolveConnectionAuthToken(connData, identifier);
@@ -4252,7 +4269,13 @@ export class GatewayService extends EventEmitter {
     const relay = this.activeRelays.get(identifier);
     if (!relay) return null;
 
-    const peerKeys = Array.from(relay.peers);
+    const ownPeerKey = typeof this.ownPeerPublicKey === 'string'
+      ? this.ownPeerPublicKey.trim().toLowerCase()
+      : null;
+    const peerKeys = Array.from(relay.peers)
+      .map((value) => (typeof value === 'string' ? value.trim().toLowerCase() : ''))
+      .filter(Boolean)
+      .filter((value) => !ownPeerKey || value !== ownPeerKey);
     if (!peerKeys.length) return null;
 
     for (const publicKey of peerKeys) {
