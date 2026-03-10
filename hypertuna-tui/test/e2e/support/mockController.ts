@@ -7,6 +7,7 @@ import type {
   AccountSession,
   ChatConversation,
   ChatInvite,
+  DiscoveredGateway,
   FileActionStatus,
   FileFamilyCounts,
   FeedControls,
@@ -187,6 +188,7 @@ function emptyState(): ControllerState {
       write: []
     },
     gatewayPeerCounts: {},
+    discoveredGateways: [],
     feed: [],
     feedSource: defaultFeedSource(),
     activeFeedRelays: [],
@@ -281,6 +283,7 @@ function cloneState(state: ControllerState): ControllerState {
       write: [...state.relayListPreferences.write]
     },
     gatewayPeerCounts: { ...state.gatewayPeerCounts },
+    discoveredGateways: state.discoveredGateways.map((entry) => ({ ...entry })),
     feed: [...state.feed],
     feedSource: { ...state.feedSource },
     activeFeedRelays: [...state.activeFeedRelays],
@@ -391,6 +394,7 @@ export class MockController implements AppController {
       bookmarks: state?.bookmarks || { event: null, eventIds: [] },
       relayListPreferences: state?.relayListPreferences || { read: [], write: [] },
       gatewayPeerCounts: state?.gatewayPeerCounts || {},
+      discoveredGateways: state?.discoveredGateways || [],
       feedSource: state?.feedSource || defaultFeedSource(),
       activeFeedRelays: state?.activeFeedRelays || [],
       feedControls: state?.feedControls || defaultFeedControls(),
@@ -474,6 +478,27 @@ export class MockController implements AppController {
       }
     ]
 
+    const discoveredGateways: DiscoveredGateway[] = [
+      {
+        gatewayId: 'gateway-main',
+        publicUrl: 'https://hypertuna.com',
+        displayName: 'Hypertuna Main',
+        region: 'us-west',
+        source: 'nostr:30078',
+        isExpired: false,
+        lastSeenAt: nowMs()
+      },
+      {
+        gatewayId: 'gateway-134',
+        publicUrl: 'http://134.199.238.230:4430',
+        displayName: 'Gateway 134',
+        region: 'us-east',
+        source: 'nostr:30078',
+        isExpired: false,
+        lastSeenAt: nowMs()
+      }
+    ]
+
     const invites: GroupInvite[] = [
       {
         id: 'invite-seed-1',
@@ -551,6 +576,7 @@ export class MockController implements AppController {
       lifecycle: 'ready',
       readinessMessage: 'Ready',
       relays,
+      discoveredGateways,
       feed,
       groups,
       myGroupList: [{ groupId: groups[0].id, relay: groups[0].relay }],
@@ -1141,6 +1167,24 @@ export class MockController implements AppController {
     }
   }
 
+  async refreshGatewayCatalog(_options?: { force?: boolean; timeoutMs?: number }): Promise<DiscoveredGateway[]> {
+    if (!this.state.discoveredGateways.length) {
+      const fallback: DiscoveredGateway[] = [
+        {
+          gatewayId: 'gateway-main',
+          publicUrl: 'https://hypertuna.com',
+          displayName: 'Hypertuna Main',
+          region: 'us-west',
+          source: 'nostr:30078',
+          isExpired: false,
+          lastSeenAt: nowMs()
+        }
+      ]
+      this.patch({ discoveredGateways: fallback })
+    }
+    return this.state.discoveredGateways.map((entry) => ({ ...entry }))
+  }
+
   async createRelay(input: {
     name: string
     description?: string
@@ -1148,7 +1192,57 @@ export class MockController implements AppController {
     isOpen?: boolean
     fileSharing?: boolean
     picture?: string
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
   }): Promise<Record<string, unknown>> {
+    const normalizeOrigin = (value: string | null | undefined): string | null => {
+      const trimmed = String(value || '').trim()
+      if (!trimmed) return null
+      try {
+        const parsed = new URL(trimmed)
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+        return parsed.origin
+      } catch {
+        return null
+      }
+    }
+
+    const directJoinOnly = input.directJoinOnly === true
+    let gatewayOrigin = normalizeOrigin(input.gatewayOrigin || null)
+    let gatewayId = String(input.gatewayId || '').trim().toLowerCase() || null
+    if (directJoinOnly) {
+      gatewayOrigin = null
+      gatewayId = null
+    }
+
+    if (!directJoinOnly && !gatewayOrigin && gatewayId) {
+      const gatewaySelector = gatewayId
+      const selectorIndex = /^\d+$/.test(gatewaySelector)
+        ? Number.parseInt(gatewaySelector, 10)
+        : -1
+      const discovered = this.state.discoveredGateways.find((entry, index) =>
+        entry.gatewayId === gatewaySelector
+        || (selectorIndex >= 0 && index === selectorIndex)
+      )
+      if (!discovered) {
+        throw new Error(`Gateway "${gatewayId}" not found in discovered catalog. Run "gateway refresh" and retry.`)
+      }
+      gatewayId = discovered.gatewayId
+      gatewayOrigin = discovered.publicUrl
+    }
+
+    if (!directJoinOnly && gatewayOrigin && !gatewayId) {
+      const discovered = this.state.discoveredGateways.find((entry) => entry.publicUrl === gatewayOrigin)
+      if (discovered) {
+        gatewayId = discovered.gatewayId
+      }
+    }
+
+    if (!directJoinOnly && !gatewayOrigin) {
+      throw new Error('Gateway origin is required unless direct-join-only is enabled')
+    }
+
     const relayKey = this.nextRelayKey(input.name)
     const publicIdentifier = `${shortPubkeySeed(input.name).slice(0, 8)}:${input.name}`
     const relay: RelayEntry = {
@@ -1168,6 +1262,9 @@ export class MockController implements AppController {
       picture: input.picture,
       isPublic: input.isPublic,
       isOpen: input.isOpen,
+      gatewayOrigin,
+      gatewayId,
+      directJoinOnly,
       adminPubkey: this.state.session?.pubkey || null,
       adminName: 'me',
       members: this.state.session ? [this.state.session.pubkey] : [],
@@ -1203,6 +1300,9 @@ export class MockController implements AppController {
     relayUrl?: string
     authToken?: string
     fileSharing?: boolean
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
   }): Promise<Record<string, unknown>> {
     const relayKey = input.relayKey || this.nextRelayKey(input.publicIdentifier || 'joined')
     const publicIdentifier = input.publicIdentifier || `${relayKey.slice(0, 8)}:joined`
@@ -1279,7 +1379,36 @@ export class MockController implements AppController {
     token?: string
     relayKey?: string
     relayUrl?: string
+    gatewayOrigin?: string | null
+    gatewayId?: string | null
+    directJoinOnly?: boolean
+    discoveryTopic?: string | null
+    hostPeerKeys?: string[]
+    leaseReplicaPeerKeys?: string[]
+    writerIssuerPubkey?: string | null
+    writerLeaseEnvelope?: Record<string, unknown> | null
     openJoin?: boolean
+    hostPeers?: string[]
+    blindPeer?: {
+      publicKey?: string | null
+      encryptionKey?: string | null
+      replicationTopic?: string | null
+      maxBytes?: number | null
+    } | null
+    cores?: Array<{
+      key: string
+      role?: string | null
+    }>
+    writerCore?: string | null
+    writerCoreHex?: string | null
+    autobaseLocal?: string | null
+    writerSecret?: string | null
+    fastForward?: {
+      key?: string | null
+      length?: number | null
+      signedLength?: number | null
+      timeoutMs?: number | null
+    } | null
   }): Promise<void> {
     this.state.logs.push({
       ts: nowMs(),

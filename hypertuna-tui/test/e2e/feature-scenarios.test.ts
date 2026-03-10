@@ -43,6 +43,41 @@ describe('TUI e2e feature scenarios', () => {
     ).toBe(false)
   })
 
+  it('supports relay create gateway flags and direct-join-only mode', async () => {
+    const controller = createController()
+    const gatewayList = await executeCommand(controller, 'gateway list')
+    expect(gatewayList.message).toContain('Discovered gateways:')
+    expect(gatewayList.message).toContain('gateway-134')
+
+    await executeCommand(
+      controller,
+      'relay create routed-group --public --closed --gateway-origin http://134.199.238.230:4430 --gateway-id gateway-134'
+    )
+    const routed = controller.getState().groups.find((group) => group.name === 'routed-group')
+    expect(routed).toBeTruthy()
+    expect(routed?.gatewayOrigin).toBe('http://134.199.238.230:4430')
+    expect(routed?.gatewayId).toBe('gateway-134')
+    expect(routed?.directJoinOnly).toBe(false)
+
+    await executeCommand(controller, 'relay create routed-by-id --gateway gateway-134')
+    const routedById = controller.getState().groups.find((group) => group.name === 'routed-by-id')
+    expect(routedById).toBeTruthy()
+    expect(routedById?.gatewayId).toBe('gateway-134')
+    expect(routedById?.gatewayOrigin).toBe('http://134.199.238.230:4430')
+    expect(routedById?.directJoinOnly).toBe(false)
+
+    await executeCommand(controller, 'relay create direct-group --direct-join-only')
+    const direct = controller.getState().groups.find((group) => group.name === 'direct-group')
+    expect(direct).toBeTruthy()
+    expect(direct?.directJoinOnly).toBe(true)
+    expect(direct?.gatewayOrigin || null).toBeNull()
+    expect(direct?.gatewayId || null).toBeNull()
+
+    await expect(
+      executeCommand(controller, 'relay create invalid-group --gateway-id gateway-only')
+    ).rejects.toThrow(/not found in discovered catalog/i)
+  })
+
   it('keeps note authoring commands for group workflows', async () => {
     const controller = createController()
     const seedNote = controller.getState().feed[0]

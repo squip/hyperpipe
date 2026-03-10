@@ -100,6 +100,15 @@ export interface CommandController {
   startWorker(): Promise<void>
   stopWorker(): Promise<void>
   restartWorker(): Promise<void>
+  refreshGatewayCatalog(options?: { force?: boolean; timeoutMs?: number }): Promise<Array<{
+    gatewayId: string
+    publicUrl: string
+    displayName?: string | null
+    region?: string | null
+    source?: string | null
+    isExpired?: boolean
+    lastSeenAt?: number | null
+  }>>
 
   refreshRelays(): Promise<void>
   createRelay(input: {
@@ -318,6 +327,23 @@ function requireArg(value: string | undefined, name: string): string {
     throw new Error(`Missing ${name}`)
   }
   return value
+}
+
+function normalizeHttpOrigin(value: string | null | undefined): string | null {
+  const trimmed = String(value || '').trim()
+  if (!trimmed) return null
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    return parsed.origin
+  } catch {
+    return null
+  }
+}
+
+function normalizeGatewayId(value: string | null | undefined): string | null {
+  const trimmed = String(value || '').trim().toLowerCase()
+  return trimmed || null
 }
 
 function isHex64(value: string): boolean {
@@ -653,7 +679,7 @@ export async function executeCommand(
   if (cmd === 'help') {
     return {
       message:
-        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | relay refresh/create/join/disconnect/leave | group tab/refresh/invites/members/search/sort/filter/join-flow/request-invite/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept/dismiss | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/invite/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot'
+        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | gateway list/refresh | relay refresh/create/join/disconnect/leave | group tab/refresh/invites/members/search/sort/filter/join-flow/request-invite/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept/dismiss | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/invite/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot'
     }
   }
 
@@ -836,6 +862,32 @@ export async function executeCommand(
     throw new Error(`Unknown worker action: ${action}`)
   }
 
+  if (cmd === 'gateway') {
+    const action = requireArg(args[1], 'gateway action').toLowerCase()
+    if (action === 'refresh') {
+      const gateways = await controller.refreshGatewayCatalog({ force: true })
+      if (!gateways.length) {
+        return { message: 'Gateway catalog refreshed (no discovered gateways)' }
+      }
+      return { message: `Gateway catalog refreshed (${gateways.length} discovered)` }
+    }
+    if (action === 'list') {
+      const gateways = await controller.refreshGatewayCatalog({ force: args.includes('--refresh') })
+      if (!gateways.length) {
+        return { message: 'No discovered gateways. Run `gateway refresh`.' }
+      }
+      const compact = gateways
+        .map((gateway, index) => {
+          const label = gateway.displayName ? `${gateway.displayName}` : gateway.gatewayId
+          const region = gateway.region ? ` (${gateway.region})` : ''
+          return `[${index}] ${label}${region} id=${gateway.gatewayId} origin=${gateway.publicUrl}`
+        })
+        .join(' | ')
+      return { message: `Discovered gateways: ${compact}` }
+    }
+    throw new Error(`Unknown gateway action: ${action}`)
+  }
+
   if (cmd === 'relay') {
     const action = requireArg(args[1], 'relay action').toLowerCase()
 
@@ -846,17 +898,110 @@ export async function executeCommand(
 
     if (action === 'create') {
       const name = requireArg(args[2], 'name')
-      const isPublic = args.includes('--public') || !args.includes('--private')
-      const isOpen = args.includes('--open') || !args.includes('--closed')
-      const fileSharing = args.includes('--file-sharing') ? true : args.includes('--no-file-sharing') ? false : true
+      let isPublic = args.includes('--public') || !args.includes('--private')
+      let isOpen = args.includes('--open') || !args.includes('--closed')
+      let fileSharing = args.includes('--file-sharing') ? true : args.includes('--no-file-sharing') ? false : true
+      let description: string | undefined
+      let gatewayOrigin: string | null = null
+      let gatewayId: string | null = null
+      let directJoinOnly = false
+      let directJoinOnlyExplicit = false
+
+      for (let index = 3; index < args.length; index += 1) {
+        const token = args[index]
+        if (!token.startsWith('--')) {
+          throw new Error(`Unknown relay create option: ${token}`)
+        }
+        if (token === '--public') {
+          isPublic = true
+          continue
+        }
+        if (token === '--private') {
+          isPublic = false
+          continue
+        }
+        if (token === '--open') {
+          isOpen = true
+          continue
+        }
+        if (token === '--closed') {
+          isOpen = false
+          continue
+        }
+        if (token === '--file-sharing') {
+          fileSharing = true
+          continue
+        }
+        if (token === '--no-file-sharing') {
+          fileSharing = false
+          continue
+        }
+        if (token === '--direct-join-only') {
+          directJoinOnly = true
+          directJoinOnlyExplicit = true
+          continue
+        }
+        if (token === '--gateway') {
+          const normalized = normalizeGatewayId(requireArg(args[index + 1], 'gateway id'))
+          if (!normalized) {
+            throw new Error('Invalid --gateway (expected gateway id or gateway index from `gateway list`)')
+          }
+          gatewayId = normalized
+          index += 1
+          continue
+        }
+        if (token === '--gateway-origin') {
+          const rawOrigin = requireArg(args[index + 1], 'gateway origin')
+          const normalized = normalizeHttpOrigin(rawOrigin)
+          if (!normalized) {
+            throw new Error('Invalid --gateway-origin (expected http(s)://...)')
+          }
+          gatewayOrigin = normalized
+          index += 1
+          continue
+        }
+        if (token === '--gateway-id') {
+          const normalized = normalizeGatewayId(requireArg(args[index + 1], 'gateway id'))
+          if (!normalized) {
+            throw new Error('Invalid --gateway-id')
+          }
+          gatewayId = normalized
+          index += 1
+          continue
+        }
+        if (token === '--desc') {
+          const parts: string[] = []
+          for (let partIndex = index + 1; partIndex < args.length; partIndex += 1) {
+            const part = args[partIndex]
+            if (part.startsWith('--')) break
+            parts.push(part)
+            index = partIndex
+          }
+          if (!parts.length) {
+            throw new Error('Missing description text after --desc')
+          }
+          description = parts.join(' ')
+          continue
+        }
+        throw new Error(`Unknown relay create option: ${token}`)
+      }
+
+      if (directJoinOnly && (gatewayOrigin || gatewayId)) {
+        throw new Error('--direct-join-only cannot be combined with --gateway/--gateway-id/--gateway-origin')
+      }
+      if (!directJoinOnlyExplicit && !gatewayOrigin && !gatewayId) {
+        directJoinOnly = true
+      }
+
       await controller.createRelay({
         name,
         isPublic,
         isOpen,
         fileSharing,
-        description: args.includes('--desc')
-          ? args.slice(args.indexOf('--desc') + 1).join(' ')
-          : undefined
+        description,
+        gatewayOrigin: directJoinOnly ? null : gatewayOrigin,
+        gatewayId: directJoinOnly ? null : gatewayId,
+        directJoinOnly
       })
       return { message: `Relay created: ${name}`, gotoNode: 'relays' }
     }

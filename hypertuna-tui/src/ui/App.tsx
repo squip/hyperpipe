@@ -96,6 +96,9 @@ type GroupCreateDraft = {
   about: string
   membership: 'open' | 'closed'
   visibility: 'public' | 'private'
+  directJoinOnly: boolean
+  gatewayOrigin: string
+  gatewayId: string
 }
 
 type ChatCreateDraft = {
@@ -128,6 +131,23 @@ function clamp(value: number, min: number, max: number): number {
 
 function isHex64(value: string | null | undefined): boolean {
   return /^[a-f0-9]{64}$/i.test(String(value || '').trim())
+}
+
+function normalizeHttpOrigin(value: string | null | undefined): string | null {
+  const trimmed = String(value || '').trim()
+  if (!trimmed) return null
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    return parsed.origin
+  } catch {
+    return null
+  }
+}
+
+function normalizeGatewayId(value: string | null | undefined): string | null {
+  const trimmed = String(value || '').trim().toLowerCase()
+  return trimmed || null
 }
 
 function shortText(value: string | null | undefined, max = 80): string {
@@ -540,6 +560,36 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
         data: { form: 'group-create', field: 'visibility', value: 'private' }
       },
       {
+        key: 'groups:create:direct-join-only',
+        label: 'direct-join-only',
+        kind: 'form-field',
+        data: { form: 'group-create', field: 'direct-join-only' }
+      },
+      {
+        key: 'groups:create:gateway-picker',
+        label: 'gateway picker',
+        kind: 'form-field',
+        data: { form: 'group-create', field: 'gateway-picker' }
+      },
+      {
+        key: 'groups:create:gateway-refresh',
+        label: 'refresh discovered gateways',
+        kind: 'form-field',
+        data: { form: 'group-create', field: 'gateway-refresh' }
+      },
+      {
+        key: 'groups:create:gateway-origin',
+        label: 'gateway origin',
+        kind: 'form-field',
+        data: { form: 'group-create', field: 'gateway-origin' }
+      },
+      {
+        key: 'groups:create:gateway-id',
+        label: 'gateway id (optional)',
+        kind: 'form-field',
+        data: { form: 'group-create', field: 'gateway-id' }
+      },
+      {
         key: 'groups:create:submit',
         label: 'create',
         kind: 'form-field',
@@ -787,7 +837,16 @@ function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: C
     ]
   }
   if (node === 'groups:create') {
-    return ['name: -', 'description: -', 'membership: open', 'visibility: public']
+    return [
+      'name: -',
+      'description: -',
+      'membership: open',
+      'visibility: public',
+      'direct-join-only: yes',
+      'gateway picker: collapsed',
+      'gateway origin: -',
+      'gateway id: -'
+    ]
   }
   if (node === 'chats:create') {
     return ['name: -', 'description: -', 'members: 0', 'relays: 0']
@@ -1176,8 +1235,12 @@ export function App({
     name: '',
     about: '',
     membership: 'open',
-    visibility: 'public'
+    visibility: 'public',
+    directJoinOnly: true,
+    gatewayOrigin: '',
+    gatewayId: ''
   })
+  const [groupGatewayPickerExpanded, setGroupGatewayPickerExpanded] = useState(false)
   const [chatCreateDraft, setChatCreateDraft] = useState<ChatCreateDraft>({
     name: '',
     description: '',
@@ -1298,8 +1361,12 @@ export function App({
       name: '',
       about: '',
       membership: 'open',
-      visibility: 'public'
+      visibility: 'public',
+      directJoinOnly: true,
+      gatewayOrigin: '',
+      gatewayId: ''
     })
+    setGroupGatewayPickerExpanded(false)
     setChatCreateDraft({
       name: '',
       description: '',
@@ -1313,6 +1380,12 @@ export function App({
     setInviteSendStatus('')
     closeFieldInput()
   }, [state, hydratedScopeKey])
+
+  useEffect(() => {
+    if (selectedNode !== 'groups:create' && groupGatewayPickerExpanded) {
+      setGroupGatewayPickerExpanded(false)
+    }
+  }, [selectedNode, groupGatewayPickerExpanded])
 
   const navRows = useMemo(() => {
     if (!state) return []
@@ -1353,7 +1426,38 @@ export function App({
     if (!state) return []
     const base = centerRowsForNode(state, selectedNode)
     if (selectedNode === 'groups:create') {
-      return base.map((row) => {
+      const discoveredGateways = state.discoveredGateways || []
+      const normalizedSelectedGatewayId = String(groupCreateDraft.gatewayId || '').trim().toLowerCase()
+      const normalizedSelectedGatewayOrigin = normalizeHttpOrigin(groupCreateDraft.gatewayOrigin) || null
+      const gatewaySelectionRows: CenterRow[] = discoveredGateways.length
+        ? discoveredGateways.map((gateway) => {
+            const checked =
+              (normalizedSelectedGatewayId && gateway.gatewayId === normalizedSelectedGatewayId)
+              || (!normalizedSelectedGatewayId && normalizedSelectedGatewayOrigin === gateway.publicUrl)
+            const title = gateway.displayName || gateway.gatewayId
+            const region = gateway.region ? ` (${gateway.region})` : ''
+            return {
+              key: `groups:create:gateway-option:${gateway.gatewayId}`,
+              label: `  ${checked ? '[x]' : '[ ]'} ${shortText(title, 24)}${region} - ${gateway.publicUrl}`,
+              kind: 'form-option',
+              data: {
+                form: 'group-create',
+                field: 'gateway-option',
+                gatewayId: gateway.gatewayId,
+                gatewayOrigin: gateway.publicUrl
+              }
+            }
+          })
+        : [
+            {
+              key: 'groups:create:gateway-option:none',
+              label: '  no discovered gateways (use refresh)',
+              kind: 'form-field',
+              data: { form: 'group-create', field: 'gateway-option-empty' }
+            }
+          ]
+
+      const mapped = base.map((row) => {
         if (row.key === 'groups:create:name') {
           return {
             ...row,
@@ -1402,8 +1506,47 @@ export function App({
             label: `  ${groupCreateDraft.visibility === 'private' ? '[x]' : '[ ]'} private`
           }
         }
+        if (row.key === 'groups:create:direct-join-only') {
+          return {
+            ...row,
+            label: `direct-join-only: ${groupCreateDraft.directJoinOnly ? 'yes' : 'no'}`
+          }
+        }
+        if (row.key === 'groups:create:gateway-picker') {
+          return {
+            ...row,
+            label:
+              `gateway picker: ${groupGatewayPickerExpanded ? 'expanded' : 'collapsed'}`
+              + ` (${discoveredGateways.length} discovered)`
+          }
+        }
+        if (row.key === 'groups:create:gateway-refresh') {
+          return {
+            ...row,
+            label: 'refresh discovered gateways'
+          }
+        }
+        if (row.key === 'groups:create:gateway-origin') {
+          return {
+            ...row,
+            label: `gateway origin: ${groupCreateDraft.gatewayOrigin || '-'}`
+          }
+        }
+        if (row.key === 'groups:create:gateway-id') {
+          return {
+            ...row,
+            label: `gateway id: ${groupCreateDraft.gatewayId || '-'}`
+          }
+        }
         return row
       })
+      if (groupGatewayPickerExpanded) {
+        const pickerIndex = mapped.findIndex((row) => row.key === 'groups:create:gateway-picker')
+        if (pickerIndex >= 0) {
+          mapped.splice(pickerIndex + 1, 0, ...gatewaySelectionRows)
+        }
+      }
+      return mapped
     }
     if (selectedNode === 'chats:create') {
       return base.map((row) => {
@@ -1444,7 +1587,7 @@ export function App({
       })
     }
     return base
-  }, [state, selectedNode, groupCreateDraft, chatCreateDraft])
+  }, [state, selectedNode, groupCreateDraft, chatCreateDraft, groupGatewayPickerExpanded])
 
   const selectedNodeViewport = useMemo(() => {
     const current = nodeViewport[selectedNode] || { cursor: 0, offset: 0 }
@@ -1474,11 +1617,20 @@ export function App({
   const rightTopActionsRows = useMemo(() => {
     if (!state) return []
     if (selectedNode === 'groups:create') {
+      const normalizedGatewayId = String(groupCreateDraft.gatewayId || '').trim().toLowerCase()
+      const selectedGateway = normalizedGatewayId
+        ? state.discoveredGateways.find((gateway) => gateway.gatewayId === normalizedGatewayId) || null
+        : null
       return [
         `name: ${groupCreateDraft.name || '-'}`,
         `description: ${groupCreateDraft.about || '-'}`,
         `membership: ${groupCreateDraft.membership}`,
-        `visibility: ${groupCreateDraft.visibility}`
+        `visibility: ${groupCreateDraft.visibility}`,
+        `direct-join-only: ${groupCreateDraft.directJoinOnly ? 'yes' : 'no'}`,
+        `gateway picker: ${groupGatewayPickerExpanded ? 'expanded' : 'collapsed'} (${state.discoveredGateways.length})`,
+        `selected gateway: ${selectedGateway?.displayName || selectedGateway?.gatewayId || '-'}`,
+        `gateway origin: ${groupCreateDraft.gatewayOrigin || '-'}`,
+        `gateway id: ${groupCreateDraft.gatewayId || '-'}`
       ]
     }
     if (selectedNode === 'chats:create') {
@@ -1490,7 +1642,7 @@ export function App({
       ]
     }
     return rightTopActions(state, selectedNode, selectedCenterRow)
-  }, [state, selectedNode, selectedCenterRow, groupCreateDraft, chatCreateDraft])
+  }, [state, selectedNode, selectedCenterRow, groupCreateDraft, chatCreateDraft, groupGatewayPickerExpanded])
 
   const rightTopIndex = useMemo(() => {
     const raw = rightTopSelectionByNode[selectedNode] || 0
@@ -1806,6 +1958,20 @@ export function App({
         setGroupCreateDraft((previous) => ({ ...previous, name: value.trim() }))
       } else if (context.field === 'about') {
         setGroupCreateDraft((previous) => ({ ...previous, about: value.trim() }))
+      } else if (context.field === 'gateway-origin') {
+        const next = value.trim()
+        setGroupCreateDraft((previous) => ({
+          ...previous,
+          gatewayOrigin: next,
+          directJoinOnly: next ? false : previous.directJoinOnly
+        }))
+      } else if (context.field === 'gateway-id') {
+        const next = value.trim().toLowerCase()
+        setGroupCreateDraft((previous) => ({
+          ...previous,
+          gatewayId: next,
+          directJoinOnly: next ? false : previous.directJoinOnly
+        }))
       }
       return
     }
@@ -1860,6 +2026,19 @@ export function App({
       setPaneActionMessage('Group name is required')
       return
     }
+    const directJoinOnly = groupCreateDraft.directJoinOnly === true
+    const rawGatewayOrigin = String(groupCreateDraft.gatewayOrigin || '').trim()
+    const rawGatewayId = String(groupCreateDraft.gatewayId || '').trim()
+    const normalizedGatewayOrigin = normalizeHttpOrigin(groupCreateDraft.gatewayOrigin)
+    const normalizedGatewayId = normalizeGatewayId(groupCreateDraft.gatewayId)
+    if (!directJoinOnly && !rawGatewayOrigin && !rawGatewayId) {
+      setPaneActionMessage('Select a gateway from the picker or enable direct-join-only')
+      return
+    }
+    if (!directJoinOnly && rawGatewayOrigin && !normalizedGatewayOrigin) {
+      setPaneActionMessage('Gateway origin must be a valid http(s) URL')
+      return
+    }
     try {
       setPaneActionMessage('Creating group…')
       const result = await controller.createRelay({
@@ -1867,7 +2046,10 @@ export function App({
         description: String(groupCreateDraft.about || '').trim() || undefined,
         isOpen: groupCreateDraft.membership === 'open',
         isPublic: groupCreateDraft.visibility === 'public',
-        fileSharing: true
+        fileSharing: true,
+        gatewayOrigin: directJoinOnly ? null : normalizedGatewayOrigin,
+        gatewayId: directJoinOnly ? null : normalizedGatewayId,
+        directJoinOnly
       })
       await Promise.all([
         controller.refreshGroups(),
@@ -1879,8 +2061,12 @@ export function App({
         name: '',
         about: '',
         membership: 'open',
-        visibility: 'public'
+        visibility: 'public',
+        directJoinOnly: true,
+        gatewayOrigin: '',
+        gatewayId: ''
       })
+      setGroupGatewayPickerExpanded(false)
     } catch (error) {
       setPaneActionMessage(error instanceof Error ? error.message : String(error))
     }
@@ -1917,6 +2103,7 @@ export function App({
 
   const handleFormCenterEnter = async (): Promise<void> => {
     if (!selectedCenterRow) return
+    const controller = controllerRef.current
     if (selectedNode === 'groups:create') {
       if (selectedCenterRow.key === 'groups:create:name') {
         openFieldInput('groups:create', 'name', 'Group name', groupCreateDraft.name)
@@ -1954,6 +2141,61 @@ export function App({
       }
       if (selectedCenterRow.key === 'groups:create:visibility:private') {
         setGroupCreateDraft((previous) => ({ ...previous, visibility: 'private' }))
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:direct-join-only') {
+        setGroupCreateDraft((previous) => ({
+          ...previous,
+          directJoinOnly: !previous.directJoinOnly,
+          ...(!previous.directJoinOnly
+            ? {
+                gatewayOrigin: '',
+                gatewayId: ''
+              }
+            : {})
+        }))
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:gateway-picker') {
+        setGroupGatewayPickerExpanded((previous) => !previous)
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:gateway-refresh') {
+        if (!controller) return
+        try {
+          setPaneActionMessage('Refreshing gateway catalog…')
+          const gateways = await controller.refreshGatewayCatalog({ force: true })
+          setPaneActionMessage(`Gateway catalog refreshed (${gateways.length} discovered)`)
+          setGroupGatewayPickerExpanded(true)
+        } catch (error) {
+          setPaneActionMessage(error instanceof Error ? error.message : String(error))
+        }
+        return
+      }
+      if (selectedCenterRow.key.startsWith('groups:create:gateway-option:')) {
+        const selectedGateway = selectedCenterRow.data as {
+          gatewayId?: string
+          gatewayOrigin?: string
+        } | null
+        const selectedGatewayId = String(selectedGateway?.gatewayId || '').trim().toLowerCase()
+        const selectedGatewayOrigin = String(selectedGateway?.gatewayOrigin || '').trim()
+        if (selectedGatewayId && selectedGatewayOrigin) {
+          setGroupCreateDraft((previous) => ({
+            ...previous,
+            directJoinOnly: false,
+            gatewayId: selectedGatewayId,
+            gatewayOrigin: selectedGatewayOrigin
+          }))
+          setPaneActionMessage(`Selected gateway ${selectedGatewayId}`)
+        }
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:gateway-origin') {
+        openFieldInput('groups:create', 'gateway-origin', 'Gateway origin (http/https)', groupCreateDraft.gatewayOrigin)
+        return
+      }
+      if (selectedCenterRow.key === 'groups:create:gateway-id') {
+        openFieldInput('groups:create', 'gateway-id', 'Gateway ID (optional)', groupCreateDraft.gatewayId)
         return
       }
       if (selectedCenterRow.key === 'groups:create:submit') {

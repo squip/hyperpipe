@@ -58,6 +58,16 @@ export type RelayListPreferences = {
   write: string[]
 }
 
+export type DiscoveredGateway = {
+  gatewayId: string
+  publicUrl: string
+  displayName?: string | null
+  region?: string | null
+  source?: string | null
+  isExpired?: boolean
+  lastSeenAt?: number | null
+}
+
 export type GroupSummary = {
   id: string
   relay?: string

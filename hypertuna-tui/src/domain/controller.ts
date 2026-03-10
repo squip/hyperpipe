@@ -11,6 +11,7 @@ import type {
   ChatViewTab,
   ChatConversation,
   ChatInvite,
+  DiscoveredGateway,
   FeedControls,
   FeedSortKey,
   FeedItem,
@@ -127,6 +128,7 @@ export type ControllerState = {
   relays: RelayEntry[]
   relayListPreferences: RelayListPreferences
   gatewayPeerCounts: Record<string, number>
+  discoveredGateways: DiscoveredGateway[]
   feed: FeedItem[]
   feedSource: FeedSourceState
   activeFeedRelays: string[]
@@ -474,6 +476,7 @@ export class TuiController {
       write: []
     },
     gatewayPeerCounts: {},
+    discoveredGateways: [],
     feed: [],
     feedSource: defaultFeedSourceState(),
     activeFeedRelays: [],
@@ -592,6 +595,7 @@ export class TuiController {
         write: [...this.state.relayListPreferences.write]
       },
       gatewayPeerCounts: { ...this.state.gatewayPeerCounts },
+      discoveredGateways: this.state.discoveredGateways.map((gateway) => ({ ...gateway })),
       feed: [...this.state.feed],
       feedSource: { ...this.state.feedSource },
       activeFeedRelays: [...this.state.activeFeedRelays],
@@ -1081,6 +1085,15 @@ export class TuiController {
           if (this.rawGroupDiscover.length > 0) {
             this.syncGroupView()
           }
+          return
+        }
+
+        if (event.type === 'public-gateway-status') {
+          const state = (event as { state?: unknown }).state
+          const discoveredGateways = this.parseDiscoveredGateways(
+            (state as { discoveredGateways?: unknown } | null | undefined)?.discoveredGateways
+          )
+          this.patchState({ discoveredGateways })
           return
         }
 
@@ -2422,6 +2435,103 @@ export class TuiController {
     return output
   }
 
+  private parseDiscoveredGateways(input: unknown): DiscoveredGateway[] {
+    if (!Array.isArray(input)) return []
+    const byId = new Map<string, DiscoveredGateway>()
+    const normalizeOrigin = (value: unknown): string | null => {
+      if (typeof value !== 'string') return null
+      const trimmed = value.trim()
+      if (!trimmed) return null
+      try {
+        const parsed = new URL(trimmed)
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+        return parsed.origin
+      } catch {
+        return null
+      }
+    }
+
+    for (const row of input) {
+      if (!row || typeof row !== 'object') continue
+      const source = row as Record<string, unknown>
+      const gatewayId = typeof source.gatewayId === 'string'
+        ? source.gatewayId.trim().toLowerCase()
+        : ''
+      const publicUrl = normalizeOrigin(source.publicUrl || source.gatewayOrigin || null)
+      if (!gatewayId || !publicUrl) continue
+      const item: DiscoveredGateway = {
+        gatewayId,
+        publicUrl,
+        displayName: typeof source.displayName === 'string' ? source.displayName.trim() || null : null,
+        region: typeof source.region === 'string' ? source.region.trim() || null : null,
+        source: typeof source.source === 'string' ? source.source.trim() || null : null,
+        isExpired: source.isExpired === true,
+        lastSeenAt: Number.isFinite(Number(source.lastSeenAt)) ? Number(source.lastSeenAt) : null
+      }
+      const previous = byId.get(gatewayId)
+      if (!previous) {
+        byId.set(gatewayId, item)
+        continue
+      }
+      const prevSeen = Number(previous.lastSeenAt || 0)
+      const nextSeen = Number(item.lastSeenAt || 0)
+      if (nextSeen >= prevSeen) {
+        byId.set(gatewayId, item)
+      }
+    }
+
+    return Array.from(byId.values())
+      .filter((item) => item.isExpired !== true)
+      .sort((left, right) => {
+        const byName = String(left.displayName || left.gatewayId).localeCompare(String(right.displayName || right.gatewayId))
+        if (byName !== 0) return byName
+        return String(left.publicUrl).localeCompare(String(right.publicUrl))
+      })
+  }
+
+  private findDiscoveredGateway(gatewaySelector: string | null | undefined): DiscoveredGateway | null {
+    const selector = String(gatewaySelector || '').trim()
+    if (!selector) return null
+    const normalized = selector.toLowerCase()
+    const directId = this.state.discoveredGateways.find((gateway) => gateway.gatewayId === normalized)
+    if (directId) return directId
+    if (/^\d+$/.test(selector)) {
+      const index = Number.parseInt(selector, 10)
+      if (Number.isFinite(index) && index >= 0 && index < this.state.discoveredGateways.length) {
+        return this.state.discoveredGateways[index] || null
+      }
+    }
+    return null
+  }
+
+  async refreshGatewayCatalog(options?: { force?: boolean; timeoutMs?: number }): Promise<DiscoveredGateway[]> {
+    if (!this.workerHost.isRunning()) {
+      return this.state.discoveredGateways
+    }
+
+    const timeoutMs = Number.isFinite(options?.timeoutMs) ? Number(options?.timeoutMs) : 4_500
+    if (options?.force) {
+      await this.workerHost.send({ type: 'refresh-public-gateway-all' }).catch(() => {})
+    }
+    await this.workerHost.send({ type: 'get-public-gateway-status' }).catch(() => {})
+
+    try {
+      const event = await waitForWorkerEvent(
+        this.workerHost,
+        (msg) => msg.type === 'public-gateway-status',
+        timeoutMs
+      )
+      const state = (event as { state?: unknown }).state
+      const discoveredGateways = this.parseDiscoveredGateways(
+        (state as { discoveredGateways?: unknown } | null | undefined)?.discoveredGateways
+      )
+      this.patchState({ discoveredGateways })
+      return discoveredGateways
+    } catch {
+      return this.state.discoveredGateways
+    }
+  }
+
   private resolveGatewayHostPeers(args: {
     publicIdentifier?: string | null
     relayKey?: string | null
@@ -2512,10 +2622,10 @@ export class TuiController {
       await this.refreshGatewayStatusSnapshot(8_000)
     }
 
-    await this.workerHost.send({ type: 'get-public-gateway-status' }).catch(() => {})
-    if (args?.refreshPublicGateway) {
-      await this.workerHost.send({ type: 'refresh-public-gateway-all' }).catch(() => {})
-    }
+    await this.refreshGatewayCatalog({
+      force: args?.refreshPublicGateway === true,
+      timeoutMs: 4_500
+    }).catch(() => {})
   }
 
   private isNonFatalWorkerError(message: string): boolean {
@@ -3065,6 +3175,17 @@ export class TuiController {
   }): Promise<Record<string, unknown>> {
     return await this.runTask('Create relay', async () => {
       await this.ensureWorkerReadyForOperation('create relay')
+      const normalizeHttpOrigin = (value: string | null | undefined): string | null => {
+        const trimmed = String(value || '').trim()
+        if (!trimmed) return null
+        try {
+          const parsed = new URL(trimmed)
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+          return parsed.origin
+        } catch {
+          return null
+        }
+      }
 
       const knownRelayKeys = new Set(
         this.state.relays
@@ -3077,7 +3198,48 @@ export class TuiController {
         refreshPublicGateway: true
       }).catch(() => {})
 
-      const result = await this.relayService.createRelay(input)
+      const directJoinOnly = input.directJoinOnly === true
+      let resolvedGatewayOrigin = normalizeHttpOrigin(input.gatewayOrigin || null)
+      let resolvedGatewayId =
+        typeof input.gatewayId === 'string' && input.gatewayId.trim()
+          ? input.gatewayId.trim().toLowerCase()
+          : null
+
+      if (directJoinOnly) {
+        resolvedGatewayOrigin = null
+        resolvedGatewayId = null
+      }
+
+      if (!directJoinOnly && !resolvedGatewayOrigin && resolvedGatewayId) {
+        let selectedGateway = this.findDiscoveredGateway(resolvedGatewayId)
+        if (!selectedGateway) {
+          await this.refreshGatewayCatalog({ force: true, timeoutMs: 5_000 }).catch(() => {})
+          selectedGateway = this.findDiscoveredGateway(resolvedGatewayId)
+        }
+        if (!selectedGateway) {
+          throw new Error(`Gateway "${resolvedGatewayId}" not found in discovered catalog. Run "gateway refresh" and retry.`)
+        }
+        resolvedGatewayId = selectedGateway.gatewayId
+        resolvedGatewayOrigin = selectedGateway.publicUrl
+      }
+
+      if (!directJoinOnly && resolvedGatewayOrigin && !resolvedGatewayId) {
+        const matchedByOrigin = this.state.discoveredGateways.find((gateway) => gateway.publicUrl === resolvedGatewayOrigin)
+        if (matchedByOrigin) {
+          resolvedGatewayId = matchedByOrigin.gatewayId
+        }
+      }
+
+      if (!directJoinOnly && !resolvedGatewayOrigin) {
+        throw new Error('Gateway origin is required unless direct-join-only is enabled')
+      }
+
+      const result = await this.relayService.createRelay({
+        ...input,
+        gatewayOrigin: resolvedGatewayOrigin,
+        gatewayId: resolvedGatewayId,
+        directJoinOnly
+      })
       const session = this.state.session
       let publicIdentifier = String(result.publicIdentifier || '').trim()
       let relayUrl = this.resolveRelayUrl(String(result.relayUrl || '')) || String(result.relayUrl || '').trim() || null
@@ -3126,13 +3288,9 @@ export class TuiController {
           picture: input.picture || undefined,
           isPublic: typeof input.isPublic === 'boolean' ? input.isPublic : true,
           isOpen: typeof input.isOpen === 'boolean' ? input.isOpen : true,
-          gatewayOrigin: typeof input.gatewayOrigin === 'string' && input.gatewayOrigin.trim()
-            ? input.gatewayOrigin.trim()
-            : null,
-          gatewayId: typeof input.gatewayId === 'string' && input.gatewayId.trim()
-            ? input.gatewayId.trim().toLowerCase()
-            : null,
-          directJoinOnly: input.directJoinOnly === true,
+          gatewayOrigin: resolvedGatewayOrigin,
+          gatewayId: resolvedGatewayId,
+          directJoinOnly,
           adminPubkey: session?.pubkey || null,
           adminName: null,
           members: session?.pubkey ? [session.pubkey] : [],

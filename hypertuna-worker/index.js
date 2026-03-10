@@ -7881,6 +7881,9 @@ async function handleMessageObject(message) {
         )
         let joinBlindPeeringManager = null
         let joinRelayIdentifierForTracking = null
+        let joinRelayKey = null
+        let selectedJoinPathMode = null
+        let selectedJoinPeerKey = null
         const joinDeadlineEnabled = Number.isFinite(JOIN_TOTAL_DEADLINE_MS)
         try {
           const joinDeadlineAt = Number.isFinite(JOIN_TOTAL_DEADLINE_MS)
@@ -7927,7 +7930,7 @@ async function handleMessageObject(message) {
           let coreRefs = Array.isArray(data.cores) ? normalizeCoreRefList(data.cores) : []
           let writerCoreRefs = Array.isArray(data.cores) ? normalizeMirrorWriterCoreRefs(data.cores) : []
           let blindPeer = sanitizeBlindPeerMeta(data.blindPeer)
-          let joinRelayKey = normalizeRelayKeyHex(data.relayKey)
+          joinRelayKey = normalizeRelayKeyHex(data.relayKey)
           let joinRelayUrl = data.relayUrl || null
           let writerCore = data.writerCore || data.writer_core || null
           let writerSecret = data.writerSecret || data.writer_secret || null
@@ -8270,8 +8273,8 @@ async function handleMessageObject(message) {
           }
 
           let selectedDirectCandidate = null
-          let selectedJoinPathMode = null
-          let selectedJoinPeerKey = null
+          selectedJoinPathMode = null
+          selectedJoinPeerKey = null
           let probeValidatedPeerKeys = []
           if (joinDirectDiscoveryV2 && relayServer?.probeJoinCapabilities) {
             const inviteePubkey = isHex64(config?.nostr_pubkey_hex)
@@ -8360,6 +8363,18 @@ async function handleMessageObject(message) {
                       statusCode: payload.statusCode,
                       error: payload.error
                     }
+                  })
+                  console.log('[Worker] Join probe candidate result', {
+                    publicIdentifier,
+                    relayKey: previewValue(joinRelayKey, 16),
+                    peerKey: previewValue(peerKey, 16),
+                    success: payload.success,
+                    supported: payload.supported,
+                    mode: payload.mode,
+                    writerGuaranteed: payload.writerGuaranteed,
+                    statusCode: payload.statusCode || null,
+                    error: payload.error || null,
+                    rttMs: payload.rttMs
                   })
                   await recordRelayCapabilityProbe({
                     relayKey: joinRelayKey || null,
