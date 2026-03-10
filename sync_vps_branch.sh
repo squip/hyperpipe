@@ -19,12 +19,19 @@ Options:
                          (default: /home/squip/hypertuna-tui-direct-join-test/hypertuna-electron-dev-phase9)
   --node-version <ver>   Node version for nvm use on VPS (default: 23.11.0)
   --skip-install         Skip npm install/ci on VPS
+  --preserve-path <path> Preserve a remote repo path across sync (repeatable)
+                         Example:
+                           --preserve-path deploy/docker-compose.yml \
+                           --preserve-path public-gateway/src/utils/stdout-log-rotator.mjs
   --allow-unpushed       Allow syncing even if local HEAD != origin/<branch>
   -h, --help             Show this help
 
 Examples:
   ./sync_vps_branch.sh
   ./sync_vps_branch.sh --branch direct-join-integration-phase9
+  ./sync_vps_branch.sh --branch public-gateway-router-phase8 \
+    --preserve-path deploy/docker-compose.yml \
+    --preserve-path public-gateway/src/utils/stdout-log-rotator.mjs
   ./sync_vps_branch.sh --repo /home/squip/hypertuna-tui-direct-join-test/hypertuna-electron-dev
 USAGE
 }
@@ -35,6 +42,7 @@ NODE_VERSION="23.11.0"
 SKIP_INSTALL="0"
 ALLOW_UNPUSHED="0"
 BRANCH=""
+PRESERVE_PATHS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -57,6 +65,10 @@ while [[ $# -gt 0 ]]; do
     --skip-install)
       SKIP_INSTALL="1"
       shift
+      ;;
+    --preserve-path)
+      PRESERVE_PATHS+=("${2:-}")
+      shift 2
       ;;
     --allow-unpushed)
       ALLOW_UNPUSHED="1"
@@ -106,14 +118,54 @@ echo "== Remote sync =="
 echo "Host: ${HOST}"
 echo "Repo: ${REMOTE_REPO}"
 echo "Install deps: $([[ "${SKIP_INSTALL}" == "1" ]] && echo no || echo yes)"
+if [[ ${#PRESERVE_PATHS[@]} -gt 0 ]]; then
+  echo "Preserve paths (${#PRESERVE_PATHS[@]}):"
+  for preserve_path in "${PRESERVE_PATHS[@]}"; do
+    echo "  - ${preserve_path}"
+  done
+fi
 
-ssh "${HOST}" "REMOTE_REPO='${REMOTE_REPO}' BRANCH='${BRANCH}' NODE_VERSION='${NODE_VERSION}' SKIP_INSTALL='${SKIP_INSTALL}' bash -s" <<'REMOTE'
+ssh "${HOST}" bash -s -- "${REMOTE_REPO}" "${BRANCH}" "${NODE_VERSION}" "${SKIP_INSTALL}" "${PRESERVE_PATHS[@]}" <<'REMOTE'
 set -euo pipefail
+
+REMOTE_REPO="${1}"
+BRANCH="${2}"
+NODE_VERSION="${3}"
+SKIP_INSTALL="${4}"
+shift 4
+PRESERVE_PATHS=("$@")
 
 cd "${REMOTE_REPO}"
 if [[ ! -d .git ]]; then
   echo "Remote path is not a git repo: ${REMOTE_REPO}" >&2
   exit 1
+fi
+
+PRESERVE_STASH_REF=""
+if [[ ${#PRESERVE_PATHS[@]} -gt 0 ]]; then
+  echo "Preparing preserve stash for selected remote paths..."
+  for preserve_path in "${PRESERVE_PATHS[@]}"; do
+    echo "  - ${preserve_path}"
+  done
+
+  PRESERVE_STASH_MSG="sync-preserve:${BRANCH}:$(date +%s):$$"
+  set +e
+  STASH_OUTPUT="$(git stash push --include-untracked -m "${PRESERVE_STASH_MSG}" -- "${PRESERVE_PATHS[@]}" 2>&1)"
+  STASH_EXIT=$?
+  set -e
+
+  if [[ ${STASH_EXIT} -ne 0 ]]; then
+    echo "Failed to stash preserve paths." >&2
+    echo "${STASH_OUTPUT}" >&2
+    exit 1
+  fi
+
+  PRESERVE_STASH_REF="$(git stash list --format='%gd %gs' | awk -v msg="${PRESERVE_STASH_MSG}" '$0 ~ msg { print $1; exit }')"
+  if [[ -n "${PRESERVE_STASH_REF}" ]]; then
+    echo "Preserve stash created: ${PRESERVE_STASH_REF}"
+  else
+    echo "No local changes found for preserve paths."
+  fi
 fi
 
 git fetch origin --prune "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
@@ -132,6 +184,12 @@ git branch --set-upstream-to "origin/${BRANCH}" "${BRANCH}" >/dev/null 2>&1 || t
 # Force exact parity with origin branch.
 git reset --hard "origin/${BRANCH}"
 git clean -fd
+
+if [[ -n "${PRESERVE_STASH_REF}" ]]; then
+  echo "Restoring preserved paths from ${PRESERVE_STASH_REF}..."
+  git restore --source "${PRESERVE_STASH_REF}" -- "${PRESERVE_PATHS[@]}"
+  git stash drop "${PRESERVE_STASH_REF}" >/dev/null 2>&1 || true
+fi
 
 if [[ "${SKIP_INSTALL}" != "1" ]]; then
   if [[ -s "${HOME}/.nvm/nvm.sh" ]]; then
