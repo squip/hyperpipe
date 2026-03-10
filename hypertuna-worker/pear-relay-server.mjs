@@ -1168,6 +1168,10 @@ function normalizeHex64(value) {
   return String(value).trim().toLowerCase();
 }
 
+function getCanonicalLocalSwarmPeerKey() {
+  return normalizeHex64(config?.swarmPublicKey || null);
+}
+
 function setConnectedPeerAlias(transportPeerKey, aliasPeerKey) {
   const normalizedTransport = normalizeHex64(transportPeerKey);
   const normalizedAlias = normalizeHex64(aliasPeerKey);
@@ -4364,8 +4368,15 @@ async function publishCreateRelayBootstrapEvents({
 
   const relayWsUrl = `${buildGatewayWebsocketBase(config)}/${canonicalIdentifier.replace(':', '/')}`;
   const discoveryTopic = deriveRelayDiscoveryTopic(canonicalIdentifier);
-  const hostPeerKeys = config?.swarmPublicKey ? [config.swarmPublicKey] : [];
+  const canonicalLocalSwarmPeerKey = getCanonicalLocalSwarmPeerKey();
+  const hostPeerKeys = canonicalLocalSwarmPeerKey ? [canonicalLocalSwarmPeerKey] : [];
   const writerIssuerPubkey = config?.nostr_pubkey_hex || adminPubkey || null;
+  console.log('[RelayServer][Checkpoint] create-bootstrap-host-key-publish', {
+    relayIdentifier: canonicalIdentifier,
+    canonicalLocalSwarmPeerKey,
+    hostPeerKeysCount: hostPeerKeys.length,
+    hostPeerKeysPreview: hostPeerKeys.slice(0, 4)
+  });
   const drafts = buildCreateRelayBootstrapDraftEvents({
     publicIdentifier: canonicalIdentifier,
     adminPubkey,
@@ -6589,9 +6600,18 @@ export async function createRelay(options) {
 
     result.bootstrapPublish = bootstrapPublish;
     result.discoveryTopic = deriveRelayDiscoveryTopic(result.publicIdentifier || result.relayKey || null);
-    result.hostPeerKeys = config?.swarmPublicKey ? [String(config.swarmPublicKey).toLowerCase()] : [];
+    const canonicalLocalSwarmPeerKey = getCanonicalLocalSwarmPeerKey();
+    result.hostPeerKeys = canonicalLocalSwarmPeerKey ? [canonicalLocalSwarmPeerKey] : [];
     result.leaseReplicaPeerKeys = [...result.hostPeerKeys];
     result.writerIssuerPubkey = normalizeHex64(config?.nostr_pubkey_hex || null);
+    console.log('[RelayServer][Checkpoint] create-host-key-publisher-contract', {
+      relayKey: result.relayKey,
+      publicIdentifier: result.publicIdentifier || null,
+      canonicalLocalSwarmPeerKey,
+      hostPeerKeysCount: result.hostPeerKeys.length,
+      hostPeerKeysPreview: result.hostPeerKeys.slice(0, 4),
+      leaseReplicaPeerKeysCount: result.leaseReplicaPeerKeys.length
+    });
 
     await upsertRelayDiscoveryHints({
       relayKey: result.relayKey || null,

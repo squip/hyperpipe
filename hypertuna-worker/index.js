@@ -1573,6 +1573,81 @@ function extractRelayRouteIdentity(payload = null) {
   }
 }
 
+function extractCreateRelayPeerIdentity(payload = null, localSwarmPeerKey = null) {
+  const source = payload && typeof payload === 'object' ? payload : {}
+  const profile = source?.profile && typeof source.profile === 'object' ? source.profile : {}
+  const readPeerList = (value) => {
+    if (Array.isArray(value)) return normalizePeerKeyList(value)
+    if (typeof value === 'string') return normalizePeerKeyList([value])
+    return []
+  }
+  const hostPeerSources = [
+    ['hostPeerKeys', source.hostPeerKeys],
+    ['hostPeers', source.hostPeers],
+    ['host_peer_keys', source.host_peer_keys],
+    ['profile.hostPeerKeys', profile.hostPeerKeys],
+    ['profile.host_peer_keys', profile.host_peer_keys]
+  ]
+  const leaseReplicaSources = [
+    ['leaseReplicaPeerKeys', source.leaseReplicaPeerKeys],
+    ['lease_replica_peer_keys', source.lease_replica_peer_keys],
+    ['profile.leaseReplicaPeerKeys', profile.leaseReplicaPeerKeys],
+    ['profile.lease_replica_peer_keys', profile.lease_replica_peer_keys]
+  ]
+
+  const discoveredHostPeers = []
+  const discoveredLeaseReplicaPeers = []
+  const hostSourceSummary = []
+  const leaseSourceSummary = []
+  for (const [entrySource, value] of hostPeerSources) {
+    const peers = readPeerList(value)
+    if (!peers.length) continue
+    discoveredHostPeers.push(...peers)
+    hostSourceSummary.push({
+      source: entrySource,
+      count: peers.length,
+      preview: peers.slice(0, 4)
+    })
+  }
+  for (const [entrySource, value] of leaseReplicaSources) {
+    const peers = readPeerList(value)
+    if (!peers.length) continue
+    discoveredLeaseReplicaPeers.push(...peers)
+    leaseSourceSummary.push({
+      source: entrySource,
+      count: peers.length,
+      preview: peers.slice(0, 4)
+    })
+  }
+
+  const normalizedLocalSwarmPeerKey = normalizePeerKey(localSwarmPeerKey)
+  const hostPeerKeys = normalizePeerKeyList([
+    ...(normalizedLocalSwarmPeerKey ? [normalizedLocalSwarmPeerKey] : []),
+    ...discoveredHostPeers
+  ])
+  const leaseReplicaPeerKeys = normalizePeerKeyList([
+    ...(normalizedLocalSwarmPeerKey ? [normalizedLocalSwarmPeerKey] : []),
+    ...discoveredLeaseReplicaPeers
+  ])
+  const writerIssuerPubkey = normalizePeerKey(
+    source.writerIssuerPubkey
+    || source.writer_issuer_pubkey
+    || profile.writerIssuerPubkey
+    || profile.writer_issuer_pubkey
+    || null
+  )
+
+  return {
+    hostPeerKeys,
+    leaseReplicaPeerKeys,
+    writerIssuerPubkey,
+    hostSourceSummary,
+    leaseSourceSummary,
+    localSwarmPeerKey: normalizedLocalSwarmPeerKey,
+    hostContainsLocal: !normalizedLocalSwarmPeerKey || hostPeerKeys.includes(normalizedLocalSwarmPeerKey)
+  }
+}
+
 async function upsertRelayGatewayRouteWithReadback({
   relayKey = null,
   publicIdentifier = null,
@@ -7503,6 +7578,13 @@ async function handleMessageObject(message) {
           const result = await relayServer.createRelay(requestData)
           const createSucceeded = result?.success !== false
           const resultRouteIdentity = extractRelayRouteIdentity(result)
+          const localSwarmPeerKey = normalizePeerKey(config?.swarmPublicKey || null)
+          const createPeerIdentity = extractCreateRelayPeerIdentity(result, localSwarmPeerKey)
+          result.hostPeerKeys = createPeerIdentity.hostPeerKeys
+          result.leaseReplicaPeerKeys = createPeerIdentity.leaseReplicaPeerKeys
+          if (!result.writerIssuerPubkey && createPeerIdentity.writerIssuerPubkey) {
+            result.writerIssuerPubkey = createPeerIdentity.writerIssuerPubkey
+          }
           console.info('[Worker] create-relay result route identity', {
             requestId: requestId || null,
             success: createSucceeded,
@@ -7511,6 +7593,22 @@ async function handleMessageObject(message) {
             relayKeySource: resultRouteIdentity.relayKeySource,
             publicIdentifierSource: resultRouteIdentity.publicIdentifierSource
           })
+          console.info('[Worker][Checkpoint] create-host-key-publisher-contract', {
+            requestId: requestId || null,
+            relayKey: resultRouteIdentity.relayKey,
+            publicIdentifier: resultRouteIdentity.publicIdentifier,
+            localSwarmPeerKey: previewValue(createPeerIdentity.localSwarmPeerKey, 16),
+            hostPeerCount: createPeerIdentity.hostPeerKeys.length,
+            hostPeerPreview: createPeerIdentity.hostPeerKeys.slice(0, 6),
+            leaseReplicaPeerCount: createPeerIdentity.leaseReplicaPeerKeys.length,
+            leaseReplicaPeerPreview: createPeerIdentity.leaseReplicaPeerKeys.slice(0, 6),
+            hostContainsLocal: createPeerIdentity.hostContainsLocal,
+            hostSourceSummary: createPeerIdentity.hostSourceSummary,
+            leaseSourceSummary: createPeerIdentity.leaseSourceSummary
+          })
+          if (createSucceeded && localSwarmPeerKey && !createPeerIdentity.hostContainsLocal) {
+            throw new Error('create-relay host peer publisher contract violation: missing local swarm host peer')
+          }
           if (gatewayRouteInput.hasExplicitRoute && createSucceeded) {
             const routeAssignment = await upsertRelayGatewayRouteWithReadback({
               relayKey: resultRouteIdentity.relayKey,
@@ -7973,6 +8071,7 @@ async function handleMessageObject(message) {
             ...(Array.isArray(data.hostPeerKeys) ? data.hostPeerKeys : [])
           ])
           let hostPeers = explicitHostPeers
+          let metadataHostIdentityPeers = explicitHostPeers
           let leaseReplicaPeerKeys = normalizePeerKeyList(data.leaseReplicaPeerKeys || [])
           let discoveryTopic = typeof data.discoveryTopic === 'string' && data.discoveryTopic.trim()
             ? data.discoveryTopic.trim()
@@ -8088,12 +8187,42 @@ async function handleMessageObject(message) {
             discoveryTopic: null,
             hostPeerKeys: [],
             leaseReplicaPeerKeys: [],
-            writerIssuerPubkey: null,
-            capabilities: {}
-          }))
+              writerIssuerPubkey: null,
+              capabilities: {}
+            }))
+          const discoveryHintHostPeers = normalizePeerKeyList(discoveryHints?.hostPeerKeys || [])
+          metadataHostIdentityPeers = normalizePeerKeyList([
+            ...explicitHostPeers,
+            ...discoveryHintHostPeers
+          ])
+          console.info('[Worker][Checkpoint] join-host-key-parse', {
+            publicIdentifier,
+            relayKey: previewValue(joinRelayKey, 16),
+            localSwarmPeerKey: previewValue(localSwarmPeerKey, 16),
+            explicitHostPeerCount: explicitHostPeers.length,
+            explicitHostPeerPreview: explicitHostPeers.slice(0, 6),
+            discoveryHintHostPeerCount: discoveryHintHostPeers.length,
+            discoveryHintHostPeerPreview: discoveryHintHostPeers.slice(0, 6),
+            metadataHostIdentityCount: metadataHostIdentityPeers.length,
+            metadataHostIdentityPreview: metadataHostIdentityPeers.slice(0, 6),
+            leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
+            leaseReplicaPeerPreview: leaseReplicaPeerKeys.slice(0, 6),
+            discoveryTopic: previewValue(discoveryTopic, 16)
+          })
+          sendMessage({
+            type: 'JOIN_HOST_KEY_PARSE',
+            data: {
+              publicIdentifier,
+              relayKey: joinRelayKey || null,
+              explicitHostPeerCount: explicitHostPeers.length,
+              discoveryHintHostPeerCount: discoveryHintHostPeers.length,
+              metadataHostIdentityCount: metadataHostIdentityPeers.length,
+              leaseReplicaPeerCount: leaseReplicaPeerKeys.length
+            }
+          })
           hostPeers = normalizePeerKeyList([
             ...hostPeers,
-            ...(discoveryHints?.hostPeerKeys || [])
+            ...discoveryHintHostPeers
           ])
           leaseReplicaPeerKeys = normalizePeerKeyList([
             ...leaseReplicaPeerKeys,
@@ -8402,6 +8531,7 @@ async function handleMessageObject(message) {
           selectedJoinPathMode = null
           selectedJoinPeerKey = null
           let probeValidatedPeerKeys = []
+          let staleHostMetadataPrecheck = null
           if (joinDirectDiscoveryV2 && relayServer?.probeJoinCapabilities) {
             const inviteePubkey = isHex64(config?.nostr_pubkey_hex)
               ? String(config.nostr_pubkey_hex).trim().toLowerCase()
@@ -8426,23 +8556,99 @@ async function handleMessageObject(message) {
             const candidateDiagnosticsByPeer = new Map(
               candidateDiagnostics.map((entry) => [entry.peerKey, entry])
             )
+            const metadataHostIdentitySet = new Set(metadataHostIdentityPeers)
+            const candidateCanonicalization = candidatePeers.map((peerKey) => {
+              const candidateDiagnostic = candidateDiagnosticsByPeer.get(peerKey) || null
+              const canonicalPeerKey = normalizePeerKey(
+                typeof relayServer?.getCanonicalPeerKeyForConnected === 'function'
+                  ? relayServer.getCanonicalPeerKeyForConnected(peerKey)
+                  : null
+              )
+              const directMatch = metadataHostIdentitySet.has(peerKey)
+              const canonicalMatch = canonicalPeerKey ? metadataHostIdentitySet.has(canonicalPeerKey) : false
+              const reject =
+                metadataHostIdentitySet.size > 0
+                && candidateDiagnostic?.host === true
+                && !directMatch
+                && !canonicalMatch
+              const rejectReason = reject
+                ? (canonicalPeerKey ? 'canonical-host-mismatch' : 'host-candidate-not-canonicalized')
+                : null
+              return {
+                peerKey,
+                source: candidateDiagnostic?.source || null,
+                host: candidateDiagnostic?.host === true,
+                leaseReplica: candidateDiagnostic?.leaseReplica === true,
+                topic: candidateDiagnostic?.topic === true,
+                ambient: candidateDiagnostic?.ambient === true,
+                canonicalPeerKey,
+                directMatch,
+                canonicalMatch,
+                reject,
+                rejectReason
+              }
+            })
+            const rejectedCandidateSet = new Set(
+              candidateCanonicalization
+                .filter((entry) => entry.reject)
+                .map((entry) => entry.peerKey)
+            )
+            const candidatePeersForProbe = candidatePeers.filter((peerKey) => !rejectedCandidateSet.has(peerKey))
+            const rejectedCandidatePreview = candidateCanonicalization
+              .filter((entry) => entry.reject)
+              .map((entry) => ({
+                peerKey: entry.peerKey,
+                source: entry.source,
+                canonicalPeerKey: entry.canonicalPeerKey,
+                rejectReason: entry.rejectReason
+              }))
+            console.info('[Worker][Checkpoint] join-candidate-canonicalization', {
+              publicIdentifier,
+              relayKey: previewValue(joinRelayKey, 16),
+              metadataHostIdentityCount: metadataHostIdentitySet.size,
+              candidateCount: candidatePeers.length,
+              acceptedCandidateCount: candidatePeersForProbe.length,
+              rejectedCandidateCount: rejectedCandidatePreview.length,
+              rejectedCandidatePreview: rejectedCandidatePreview.slice(0, 8)
+            })
+            if (rejectedCandidatePreview.length) {
+              sendMessage({
+                type: 'JOIN_CANDIDATE_CANONICALIZATION',
+                data: {
+                  publicIdentifier,
+                  relayKey: joinRelayKey || null,
+                  candidateCount: candidatePeers.length,
+                  acceptedCandidateCount: candidatePeersForProbe.length,
+                  rejectedCandidateCount: rejectedCandidatePreview.length
+                }
+              })
+            }
+            if (candidatePeers.length > 0 && candidatePeersForProbe.length === 0) {
+              staleHostMetadataPrecheck = {
+                reason: 'host-candidates-failed-canonicalization',
+                rejectedCandidatePreview: rejectedCandidatePreview.slice(0, 8),
+                metadataHostIdentityCount: metadataHostIdentitySet.size
+              }
+            }
             const tokenHash = inviteToken
               ? computeLeaseTokenHash(joinRelayKey || discoveryHints?.relayKey || null, inviteToken)
               : null
-            if (candidatePeers.length) {
+            if (candidatePeersForProbe.length) {
               console.log('[Worker] Join probe candidate order', {
                 publicIdentifier,
                 relayKey: previewValue(joinRelayKey, 16),
-                candidateCount: candidatePeers.length,
+                candidateCount: candidatePeersForProbe.length,
                 routeHostPeerCount: hostPeers.length,
                 leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
                 topicDiscoveredPeerCount: topicDiscoveredPeerKeys.length,
                 ambientConnectedPeerCount: ambientConnectedPeerKeys.length,
-                candidatePreview: candidateDiagnostics.slice(0, 6)
+                candidatePreview: candidateDiagnostics
+                  .filter((entry) => !rejectedCandidateSet.has(entry.peerKey))
+                  .slice(0, 6)
               })
               const probeStartedAt = Date.now()
               const probeResults = await Promise.all(
-                candidatePeers.map(async (peerKey) => {
+                candidatePeersForProbe.map(async (peerKey) => {
                   const startedAt = Date.now()
                   const candidateDiagnostic = candidateDiagnosticsByPeer.get(peerKey) || null
                   const runProbeAttempt = async (attempt = 0) => {
@@ -8645,7 +8851,7 @@ async function handleMessageObject(message) {
                     : null,
                   probeId: selectedDirectCandidate?.probeId || null,
                   gatewayMode,
-                  candidates: candidatePeers.length,
+                  candidates: candidatePeersForProbe.length,
                   discoveryWindowMs: JOIN_DISCOVERY_WINDOW_MS,
                   probeElapsedMs: windowElapsed
                 }
@@ -8893,6 +9099,32 @@ async function handleMessageObject(message) {
             writerSecret
             && (writerCore || writerCoreHex || autobaseLocal)
           )
+	          const gatewayBootstrapUnavailable = !(
+	            gatewayBootstrapResult?.status === 'ok'
+	            && gatewayBootstrapResult?.data
+	            && typeof gatewayBootstrapResult.data === 'object'
+	          )
+	          if (
+	            joinDirectDiscoveryV2
+	            && gatewayMode === 'auto'
+	            && openJoin
+	            && !inviteToken
+	            && !selectedDirectCandidate?.peerKey
+	            && !openJoinHasWriterMaterial
+	            && staleHostMetadataPrecheck
+	            && gatewayBootstrapUnavailable
+	          ) {
+	            console.warn('[Worker] Stale host metadata precheck blocked open join', {
+	              publicIdentifier,
+	              relayKey: previewValue(joinRelayKey, 16),
+	              staleReason: staleHostMetadataPrecheck.reason,
+	              metadataHostIdentityCount: staleHostMetadataPrecheck.metadataHostIdentityCount,
+	              rejectedCandidatePreview: staleHostMetadataPrecheck.rejectedCandidatePreview
+	            })
+	            throw new Error(
+	              'stale-host-metadata: open join host candidates failed canonical validation and gateway writer material is unavailable'
+	            )
+	          }
 	          if (
 	            joinDirectDiscoveryV2
 	            && gatewayMode === 'auto'
@@ -9588,7 +9820,9 @@ async function handleMessageObject(message) {
             elapsedMs: Date.now() - joinFlowStartedAt
           }, 'error')
           const failureReason =
-            typeof errorMessage === 'string' && errorMessage.includes('no-writer-path')
+            typeof errorMessage === 'string' && errorMessage.includes('stale-host-metadata')
+              ? 'stale-host-metadata'
+              : typeof errorMessage === 'string' && errorMessage.includes('no-writer-path')
               ? 'no-writer-path'
               : typeof errorMessage === 'string' && errorMessage.includes('join-deadline-exceeded')
                 ? 'deadline-exceeded'
