@@ -2310,6 +2310,17 @@ export class GatewayService extends EventEmitter {
             mirror: summarizeMirrorFastForward(durabilityGate.fastForward),
             error: durabilityGate.error || null
           });
+          console.warn('[Worker][JOIN_CHECKPOINT_TRACE] open-join-pool-durability-blocked', {
+            relayKey: poolRelayKey,
+            status: durabilityGate.status,
+            reason: durabilityGate.reason || null,
+            target: durabilityGate.target
+              ? summarizeDurabilityCheckpoint(durabilityGate.target)
+              : null,
+            checkpoint: durabilityGate.checkpoint || null,
+            mirror: summarizeMirrorFastForward(durabilityGate.fastForward),
+            error: durabilityGate.error || null
+          });
           this.log('warn', `[Worker][JOIN_CHECKPOINT_TRACE] open-join-pool-durability-blocked relay=${poolRelayKey}`, {
             relayKey: poolRelayKey,
             status: durabilityGate.status,
