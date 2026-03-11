@@ -7,6 +7,7 @@ const DEFAULT_STORAGE_SUBDIR = 'blind-peer-data';
 const DEFAULT_MIRROR_STALE_THRESHOLD_MS = 10 * 60 * 1000;
 const DEFAULT_PROOF_TARGET_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_PROOF_TELEMETRY_LOG_INTERVAL_MS = 1500;
+const DEFAULT_PROOF_PROGRESS_STAGNATION_MS = 20 * 1000;
 
 async function loadBlindPeerModule() {
   const mod = await import('blind-peer');
@@ -144,6 +145,10 @@ export default class BlindPeerService extends EventEmitter {
       && this.config.proofTelemetryLogIntervalMs >= 0
       ? Math.trunc(this.config.proofTelemetryLogIntervalMs)
       : DEFAULT_PROOF_TELEMETRY_LOG_INTERVAL_MS;
+    this.proofProgressStagnationMs = Number.isFinite(this.config?.proofProgressStagnationMs)
+      && this.config.proofProgressStagnationMs >= 0
+      ? Math.trunc(this.config.proofProgressStagnationMs)
+      : DEFAULT_PROOF_PROGRESS_STAGNATION_MS;
     this.proofTargetTelemetry = new Map();
   }
 
@@ -1163,6 +1168,126 @@ export default class BlindPeerService extends EventEmitter {
     return summary;
   }
 
+  #safeNumber(value) {
+    return Number.isFinite(value) ? Math.trunc(value) : null;
+  }
+
+  #safeDelta(nextValue, prevValue) {
+    if (!Number.isFinite(nextValue) || !Number.isFinite(prevValue)) return null;
+    return Math.trunc(nextValue) - Math.trunc(prevValue);
+  }
+
+  #summarizeTrackerSessions(tracker) {
+    if (!tracker || typeof tracker !== 'object') return null;
+    const summarizeCollection = (value) => {
+      if (Array.isArray(value)) return value.length;
+      if (value && Number.isFinite(value.size)) return Math.trunc(value.size);
+      return null;
+    };
+    const peerPreview = [];
+    const maybePeers = [];
+    if (Array.isArray(tracker.peers)) {
+      maybePeers.push(...tracker.peers);
+    } else if (tracker.peers && typeof tracker.peers.values === 'function') {
+      for (const peer of tracker.peers.values()) maybePeers.push(peer);
+    }
+    for (const peer of maybePeers) {
+      const peerKey = sanitizePeerKey(
+        peer?.remotePublicKey
+        || peer?.stream?.remotePublicKey
+        || peer?.noiseStream?.remotePublicKey
+        || null
+      );
+      if (peerKey) peerPreview.push(peerKey.slice(0, 16));
+      if (peerPreview.length >= 8) break;
+    }
+    return {
+      peers: summarizeCollection(tracker.peers),
+      sessions: summarizeCollection(tracker.sessions),
+      streams: summarizeCollection(tracker.streams),
+      channels: summarizeCollection(tracker.channels),
+      inflight: this.#safeNumber(tracker.inflight),
+      requests: this.#safeNumber(tracker.requests),
+      peerPreview: peerPreview.length ? peerPreview : []
+    };
+  }
+
+  #updateProofProgress(normalizedKey, telemetry = null) {
+    if (!normalizedKey || !telemetry) return null;
+    const tracked = this.#getTrackedProofTarget(normalizedKey);
+    if (!tracked) return null;
+    const now = Date.now();
+    const state = telemetry?.tracker?.state || null;
+    const wakeup = telemetry?.wakeup || null;
+    const sample = {
+      ts: now,
+      length: this.#safeNumber(state?.length),
+      contiguousLength: this.#safeNumber(state?.contiguousLength),
+      signedLength: this.#safeNumber(state?.signedLength),
+      downloaded: this.#safeNumber(state?.downloaded),
+      peers: this.#safeNumber(state?.peers),
+      wakeupSessions: this.#safeNumber(wakeup?.sessions),
+      wakeupPeers: this.#safeNumber(wakeup?.peers),
+      proofSignedLength: this.#safeNumber(telemetry?.proofSignedLength),
+      dbLength: this.#safeNumber(telemetry?.dbLength)
+    };
+
+    const previous = tracked.lastProgressSample || null;
+    const firstObservedAt = Number.isFinite(tracked.firstProgressObservedAt)
+      ? tracked.firstProgressObservedAt
+      : now;
+    const progressed =
+      this.#safeDelta(sample.length, previous?.length) > 0
+      || this.#safeDelta(sample.contiguousLength, previous?.contiguousLength) > 0
+      || this.#safeDelta(sample.signedLength, previous?.signedLength) > 0
+      || this.#safeDelta(sample.downloaded, previous?.downloaded) > 0
+      || this.#safeDelta(sample.wakeupSessions, previous?.wakeupSessions) > 0
+      || this.#safeDelta(sample.wakeupPeers, previous?.wakeupPeers) > 0
+      || this.#safeDelta(sample.proofSignedLength, previous?.proofSignedLength) > 0
+      || this.#safeDelta(sample.dbLength, previous?.dbLength) > 0;
+
+    const lastAdvanceAt = progressed
+      ? now
+      : (Number.isFinite(tracked.lastProgressAdvanceAt) ? tracked.lastProgressAdvanceAt : now);
+    const stagnantForMs = Math.max(0, now - lastAdvanceAt);
+    const stagnant = Number.isFinite(this.proofProgressStagnationMs)
+      && this.proofProgressStagnationMs > 0
+      && stagnantForMs >= this.proofProgressStagnationMs;
+
+    const samples = Number.isFinite(tracked.progressSampleCount)
+      ? Math.max(1, Math.trunc(tracked.progressSampleCount) + 1)
+      : 1;
+
+    tracked.firstProgressObservedAt = firstObservedAt;
+    tracked.lastProgressObservedAt = now;
+    tracked.lastProgressAdvanceAt = lastAdvanceAt;
+    tracked.progressSampleCount = samples;
+    tracked.lastProgressSample = sample;
+    this.proofTargetTelemetry.set(normalizedKey, tracked);
+
+    return {
+      firstObservedAt,
+      lastObservedAt: now,
+      lastAdvanceAt,
+      stagnantForMs,
+      stagnant,
+      progressed,
+      sampleCount: samples,
+      current: sample,
+      delta: {
+        length: this.#safeDelta(sample.length, previous?.length),
+        contiguousLength: this.#safeDelta(sample.contiguousLength, previous?.contiguousLength),
+        signedLength: this.#safeDelta(sample.signedLength, previous?.signedLength),
+        downloaded: this.#safeDelta(sample.downloaded, previous?.downloaded),
+        peers: this.#safeDelta(sample.peers, previous?.peers),
+        wakeupSessions: this.#safeDelta(sample.wakeupSessions, previous?.wakeupSessions),
+        wakeupPeers: this.#safeDelta(sample.wakeupPeers, previous?.wakeupPeers),
+        proofSignedLength: this.#safeDelta(sample.proofSignedLength, previous?.proofSignedLength),
+        dbLength: this.#safeDelta(sample.dbLength, previous?.dbLength)
+      }
+    };
+  }
+
   #findActiveTrackerForCore(normalizedKey) {
     if (!normalizedKey) return null;
     const activeReplication = this.blindPeer?.activeReplication;
@@ -1327,6 +1452,7 @@ export default class BlindPeerService extends EventEmitter {
     const tracker = trackerMatch?.tracker || null;
     const trackerCore = tracker?.core || null;
     const trackerState = this.#summarizeCoreRuntime(trackerCore);
+    const trackerSessions = this.#summarizeTrackerSessions(tracker);
     const wakeup = this.#collectWakeupSessionSummary(trackerCore?.discoveryKey || null);
     const dbLength = Number.isFinite(record?.length) ? Math.trunc(record.length) : null;
     const pendingLength = Number.isFinite(pending?.length) ? Math.trunc(pending.length) : null;
@@ -1386,6 +1512,7 @@ export default class BlindPeerService extends EventEmitter {
         recordBytesAllocated: Number.isFinite(tracker?.record?.bytesAllocated)
           ? Math.trunc(tracker.record.bytesAllocated)
           : null,
+        sessions: trackerSessions,
         state: trackerState
       },
       wakeup,
@@ -1415,6 +1542,8 @@ export default class BlindPeerService extends EventEmitter {
       error
     });
     if (!telemetry) return;
+    const progress = this.#updateProofProgress(normalizedKey, telemetry);
+    if (progress) telemetry.progress = progress;
     if (!this.#shouldLogProofTelemetry(normalizedKey, telemetry)) return;
     const tracked = this.#getTrackedProofTarget(normalizedKey);
     this.logger?.info?.({
@@ -1429,12 +1558,20 @@ export default class BlindPeerService extends EventEmitter {
     if (!key) return;
     const tracked = this.#getTrackedProofTarget(key);
     if (!tracked) return;
+    const keyState = this.#summarizeCoreRuntime(core);
+    const progress = this.#updateProofProgress(key, {
+      tracker: { state: keyState },
+      wakeup: this.#collectWakeupSessionSummary(core?.discoveryKey || null),
+      proofSignedLength: Number.isFinite(record?.length) ? Math.trunc(record.length) : null,
+      dbLength: Number.isFinite(record?.length) ? Math.trunc(record.length) : null
+    });
     this.logger?.info?.({
       key,
       targetSignedLength: Number.isFinite(tracked.targetSignedLength) ? tracked.targetSignedLength : null,
-      state: this.#summarizeCoreRuntime(core),
+      state: keyState,
       recordLength: Number.isFinite(record?.length) ? Math.trunc(record.length) : null,
       recordBytesAllocated: Number.isFinite(record?.bytesAllocated) ? Math.trunc(record.bytesAllocated) : null,
+      progress,
       trackedContexts: tracked?.contexts ? Array.from(tracked.contexts).slice(0, 6) : [],
       relayKey: tracked?.relayKey || null
     }, '[BlindPeer] Target core activity');
@@ -1445,10 +1582,18 @@ export default class BlindPeerService extends EventEmitter {
     if (!key) return;
     const tracked = this.#getTrackedProofTarget(key);
     if (!tracked) return;
+    const keyState = this.#summarizeCoreRuntime(core);
+    const progress = this.#updateProofProgress(key, {
+      tracker: { state: keyState },
+      wakeup: this.#collectWakeupSessionSummary(core?.discoveryKey || null),
+      proofSignedLength: Number.isFinite(core?.signedLength) ? Math.trunc(core.signedLength) : null,
+      dbLength: null
+    });
     this.logger?.info?.({
       key,
       targetSignedLength: Number.isFinite(tracked.targetSignedLength) ? tracked.targetSignedLength : null,
-      state: this.#summarizeCoreRuntime(core),
+      state: keyState,
+      progress,
       trackedContexts: tracked?.contexts ? Array.from(tracked.contexts).slice(0, 6) : [],
       relayKey: tracked?.relayKey || null
     }, '[BlindPeer] Target core fully downloaded');
