@@ -1383,7 +1383,17 @@ class PublicGatewayService {
 
     let proof = null;
     try {
-      proof = await this.blindPeerService.getCoreFastForwardProof(targetKey);
+      proof = await this.blindPeerService.getCoreFastForwardProof(targetKey, {
+        targetSignedLength: Number.isFinite(checkpoint?.systemSignedLength)
+          ? Math.trunc(checkpoint.systemSignedLength)
+          : null,
+        includeReplicationTelemetry: true,
+        context: {
+          route: 'mirror-fast-forward-proof',
+          source: 'relay-mirror-metadata',
+          relayKey
+        }
+      });
     } catch (error) {
       this.logger?.debug?.('[PublicGateway] Failed to resolve authoritative mirror fast-forward proof', {
         relayKey,

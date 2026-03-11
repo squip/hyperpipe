@@ -5,6 +5,8 @@ import HypercoreId from 'hypercore-id-encoding';
 
 const DEFAULT_STORAGE_SUBDIR = 'blind-peer-data';
 const DEFAULT_MIRROR_STALE_THRESHOLD_MS = 10 * 60 * 1000;
+const DEFAULT_PROOF_TARGET_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_PROOF_TELEMETRY_LOG_INTERVAL_MS = 1500;
 
 async function loadBlindPeerModule() {
   const mod = await import('blind-peer');
@@ -135,6 +137,14 @@ export default class BlindPeerService extends EventEmitter {
       ? Math.trunc(this.config.mirrorLifecycleLogIntervalMs)
       : 5000;
     this.lastMirrorLifecycleLogAt = 0;
+    this.proofTargetTtlMs = Number.isFinite(this.config?.proofTargetTtlMs) && this.config.proofTargetTtlMs > 0
+      ? Math.trunc(this.config.proofTargetTtlMs)
+      : DEFAULT_PROOF_TARGET_TTL_MS;
+    this.proofTelemetryLogIntervalMs = Number.isFinite(this.config?.proofTelemetryLogIntervalMs)
+      && this.config.proofTelemetryLogIntervalMs >= 0
+      ? Math.trunc(this.config.proofTelemetryLogIntervalMs)
+      : DEFAULT_PROOF_TELEMETRY_LOG_INTERVAL_MS;
+    this.proofTargetTelemetry = new Map();
   }
 
   async initialize() {
@@ -198,6 +208,7 @@ export default class BlindPeerService extends EventEmitter {
     this.blindPeer = null;
     this.#updateMetrics();
     this.metrics.setActive?.(0);
+    this.proofTargetTelemetry.clear();
     for (const timer of this.dispatcherAssignmentTimers.values()) {
       clearTimeout(timer);
     }
@@ -1114,6 +1125,322 @@ export default class BlindPeerService extends EventEmitter {
     }, '[BlindPeer] Mirror lifecycle');
   }
 
+  #summarizeCoreRuntime(core) {
+    if (!core || typeof core !== 'object') return null;
+    const summary = {
+      key: toKeyString(core.key) || null,
+      discoveryKey: toKeyString(core.discoveryKey) || null,
+      length: Number.isFinite(core.length) ? Math.trunc(core.length) : null,
+      contiguousLength: Number.isFinite(core.contiguousLength) ? Math.trunc(core.contiguousLength) : null,
+      remoteLength: Number.isFinite(core.remoteLength) ? Math.trunc(core.remoteLength) : null,
+      signedLength: Number.isFinite(core.signedLength) ? Math.trunc(core.signedLength) : null,
+      downloaded: Number.isFinite(core.downloaded) ? Math.trunc(core.downloaded) : null,
+      uploaded: Number.isFinite(core.uploaded) ? Math.trunc(core.uploaded) : null,
+      byteLength: Number.isFinite(core.byteLength) ? Math.trunc(core.byteLength) : null,
+      writable: typeof core.writable === 'boolean' ? core.writable : null,
+      readable: typeof core.readable === 'boolean' ? core.readable : null,
+      opened: typeof core.opened === 'boolean' ? core.opened : null,
+      closed: typeof core.closed === 'boolean' ? core.closed : null
+    };
+    let peers = null;
+    if (Number.isFinite(core.peerCount)) {
+      peers = Math.trunc(core.peerCount);
+    } else if (Array.isArray(core.peers)) {
+      peers = core.peers.length;
+    } else if (core.peers && Number.isFinite(core.peers.size)) {
+      peers = Math.trunc(core.peers.size);
+    }
+    summary.peers = peers;
+    if (Array.isArray(core.peers)) {
+      const peerPreview = [];
+      for (const peer of core.peers) {
+        const peerKey = sanitizePeerKey(peer?.remotePublicKey || peer?.stream?.remotePublicKey || null);
+        if (peerKey) peerPreview.push(peerKey.slice(0, 16));
+        if (peerPreview.length >= 8) break;
+      }
+      if (peerPreview.length) summary.peerPreview = peerPreview;
+    }
+    return summary;
+  }
+
+  #findActiveTrackerForCore(normalizedKey) {
+    if (!normalizedKey) return null;
+    const activeReplication = this.blindPeer?.activeReplication;
+    if (!activeReplication || typeof activeReplication.entries !== 'function') return null;
+    for (const [trackerId, tracker] of activeReplication.entries()) {
+      const trackerKey = toKeyString(tracker?.core?.key || tracker?.record?.key || null);
+      if (trackerKey !== normalizedKey) continue;
+      return { trackerId, tracker };
+    }
+    return null;
+  }
+
+  #collectWakeupSessionSummary(discoveryKey) {
+    const wakeup = this.blindPeer?.wakeup;
+    if (!wakeup || typeof wakeup.getSessions !== 'function') return null;
+    if (!discoveryKey) return null;
+    let sessions = [];
+    try {
+      sessions = wakeup.getSessions(null, { discoveryKey }) || [];
+    } catch (error) {
+      this.logger?.debug?.({
+        err: error?.message || error
+      }, '[BlindPeer] Failed to collect wakeup sessions for core');
+      return null;
+    }
+    const uniquePeerKeys = new Set();
+    const sessionPreview = [];
+    for (const session of sessions.slice(0, 4)) {
+      const peers = Array.isArray(session?.peers) ? session.peers : [];
+      const peerPreview = [];
+      for (const peer of peers) {
+        const peerKey = sanitizePeerKey(peer?.stream?.remotePublicKey || null);
+        if (!peerKey) continue;
+        uniquePeerKeys.add(peerKey);
+        if (peerPreview.length < 6) peerPreview.push(peerKey.slice(0, 16));
+      }
+      sessionPreview.push({
+        peers: peers.length,
+        peerPreview
+      });
+    }
+    return {
+      sessions: sessions.length,
+      peers: uniquePeerKeys.size,
+      peerPreview: Array.from(uniquePeerKeys).slice(0, 8).map((value) => value.slice(0, 16)),
+      sessionPreview
+    };
+  }
+
+  #pruneProofTargetTelemetry() {
+    const ttlMs = this.proofTargetTtlMs;
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0) return;
+    const cutoff = Date.now() - ttlMs;
+    for (const [key, entry] of this.proofTargetTelemetry.entries()) {
+      if (!entry || !Number.isFinite(entry.lastSeenAt) || entry.lastSeenAt < cutoff) {
+        this.proofTargetTelemetry.delete(key);
+      }
+    }
+  }
+
+  #trackProofTarget(coreKey, { targetSignedLength = null, context = null } = {}) {
+    if (!coreKey) return null;
+    this.#pruneProofTargetTelemetry();
+    const now = Date.now();
+    const key = toKeyString(coreKey);
+    if (!key) return null;
+    const nextTarget = Number.isFinite(targetSignedLength) ? Math.max(0, Math.trunc(targetSignedLength)) : null;
+    const existing = this.proofTargetTelemetry.get(key) || {
+      key,
+      contexts: new Set(),
+      lastLogAt: 0,
+      lastSignature: null
+    };
+    existing.lastSeenAt = now;
+    if (Number.isFinite(nextTarget)) {
+      existing.targetSignedLength = nextTarget;
+    } else if (!Number.isFinite(existing.targetSignedLength)) {
+      existing.targetSignedLength = null;
+    }
+    if (context && typeof context === 'object') {
+      const contextValues = [
+        typeof context.route === 'string' ? context.route : null,
+        typeof context.source === 'string' ? context.source : null,
+        typeof context.relayKey === 'string' ? context.relayKey : null
+      ];
+      for (const value of contextValues) {
+        if (!value || !value.trim()) continue;
+        existing.contexts.add(value.trim());
+      }
+      if (typeof context.relayKey === 'string' && context.relayKey.trim()) {
+        existing.relayKey = context.relayKey.trim();
+      }
+    }
+    this.proofTargetTelemetry.set(key, existing);
+    return existing;
+  }
+
+  #getTrackedProofTarget(coreKey) {
+    const key = toKeyString(coreKey);
+    if (!key) return null;
+    this.#pruneProofTargetTelemetry();
+    return this.proofTargetTelemetry.get(key) || null;
+  }
+
+  #buildProofTelemetrySignature(telemetry) {
+    const trackerState = telemetry?.tracker?.state || null;
+    const wakeup = telemetry?.wakeup || null;
+    const fields = [
+      telemetry?.proofSignedLength ?? null,
+      telemetry?.proofLength ?? null,
+      telemetry?.dbLength ?? null,
+      telemetry?.pendingLength ?? null,
+      telemetry?.targetSignedLength ?? null,
+      telemetry?.targetGap ?? null,
+      trackerState?.length ?? null,
+      trackerState?.contiguousLength ?? null,
+      trackerState?.remoteLength ?? null,
+      trackerState?.signedLength ?? null,
+      trackerState?.downloaded ?? null,
+      trackerState?.peers ?? null,
+      wakeup?.sessions ?? null,
+      wakeup?.peers ?? null
+    ];
+    return JSON.stringify(fields);
+  }
+
+  #shouldLogProofTelemetry(coreKey, telemetry) {
+    const key = toKeyString(coreKey);
+    if (!key) return false;
+    const entry = this.proofTargetTelemetry.get(key) || this.#trackProofTarget(key);
+    if (!entry) return true;
+    const now = Date.now();
+    const signature = this.#buildProofTelemetrySignature(telemetry);
+    const signatureChanged = entry.lastSignature !== signature;
+    const interval = this.proofTelemetryLogIntervalMs;
+    const intervalElapsed = !Number.isFinite(interval) || interval <= 0
+      || !Number.isFinite(entry.lastLogAt)
+      || (now - entry.lastLogAt) >= interval;
+    if (!signatureChanged && !intervalElapsed) return false;
+    entry.lastSignature = signature;
+    entry.lastLogAt = now;
+    this.proofTargetTelemetry.set(key, entry);
+    return true;
+  }
+
+  #collectCoreProofTelemetry({
+    normalizedKey,
+    record = null,
+    pending = null,
+    proof = null,
+    targetSignedLength = null,
+    context = null,
+    event = null,
+    error = null
+  } = {}) {
+    if (!normalizedKey) return null;
+    const trackerMatch = this.#findActiveTrackerForCore(normalizedKey);
+    const tracker = trackerMatch?.tracker || null;
+    const trackerCore = tracker?.core || null;
+    const trackerState = this.#summarizeCoreRuntime(trackerCore);
+    const wakeup = this.#collectWakeupSessionSummary(trackerCore?.discoveryKey || null);
+    const dbLength = Number.isFinite(record?.length) ? Math.trunc(record.length) : null;
+    const pendingLength = Number.isFinite(pending?.length) ? Math.trunc(pending.length) : null;
+    const proofLength = Number.isFinite(proof?.length) ? Math.trunc(proof.length) : null;
+    const proofSignedLength = Number.isFinite(proof?.signedLength)
+      ? Math.trunc(proof.signedLength)
+      : proofLength;
+    const targetGap = Number.isFinite(targetSignedLength) && Number.isFinite(proofSignedLength)
+      ? Math.max(0, Math.trunc(targetSignedLength) - proofSignedLength)
+      : null;
+    const activeReplicationCount = Number.isFinite(this.blindPeer?.activeReplication?.size)
+      ? Math.trunc(this.blindPeer.activeReplication.size)
+      : null;
+    let swarmConnections = null;
+    const connections = this.blindPeer?.swarm?.connections;
+    if (Array.isArray(connections)) {
+      swarmConnections = connections.length;
+    } else if (Number.isFinite(connections?.size)) {
+      swarmConnections = Math.trunc(connections.size);
+    }
+    return {
+      event: event || 'proof-check',
+      key: normalizedKey,
+      relayKey: typeof context?.relayKey === 'string' ? context.relayKey : null,
+      contextRoute: typeof context?.route === 'string' ? context.route : null,
+      contextSource: typeof context?.source === 'string' ? context.source : null,
+      targetSignedLength: Number.isFinite(targetSignedLength) ? Math.trunc(targetSignedLength) : null,
+      targetGap,
+      proofLength,
+      proofSignedLength,
+      proofLagMs: Number.isFinite(proof?.lagMs) ? Math.trunc(proof.lagMs) : null,
+      proofHealthy: proof?.healthy === true,
+      proofSource: proof?.proofSource || null,
+      proofAuthoritative: proof?.proofAuthoritative === true,
+      dbLength,
+      dbUpdatedAt: Number.isFinite(record?.updated) ? Math.trunc(record.updated) : null,
+      dbActiveAt: Number.isFinite(record?.active) ? Math.trunc(record.active) : null,
+      dbBytesAllocated: Number.isFinite(record?.bytesAllocated) ? Math.trunc(record.bytesAllocated) : null,
+      pendingLength,
+      pendingUpdatedAt: Number.isFinite(pending?.updated) ? Math.trunc(pending.updated) : null,
+      pendingActiveAt: Number.isFinite(pending?.active) ? Math.trunc(pending.active) : null,
+      activeReplicationCount,
+      swarmConnections,
+      tracker: {
+        found: !!tracker,
+        id: typeof trackerMatch?.trackerId === 'string' ? trackerMatch.trackerId : null,
+        recordLength: Number.isFinite(tracker?.record?.length) ? Math.trunc(tracker.record.length) : null,
+        recordBytesAllocated: Number.isFinite(tracker?.record?.bytesAllocated)
+          ? Math.trunc(tracker.record.bytesAllocated)
+          : null,
+        state: trackerState
+      },
+      wakeup,
+      error: error || null
+    };
+  }
+
+  #emitCoreProofTelemetry({
+    normalizedKey,
+    record = null,
+    pending = null,
+    proof = null,
+    targetSignedLength = null,
+    context = null,
+    event = null,
+    error = null
+  } = {}) {
+    if (!normalizedKey) return;
+    const telemetry = this.#collectCoreProofTelemetry({
+      normalizedKey,
+      record,
+      pending,
+      proof,
+      targetSignedLength,
+      context,
+      event,
+      error
+    });
+    if (!telemetry) return;
+    if (!this.#shouldLogProofTelemetry(normalizedKey, telemetry)) return;
+    const tracked = this.#getTrackedProofTarget(normalizedKey);
+    this.logger?.info?.({
+      ...telemetry,
+      trackedContexts: tracked?.contexts ? Array.from(tracked.contexts).slice(0, 6) : [],
+      trackedRelayKey: tracked?.relayKey || null
+    }, '[BlindPeer] Target core replication telemetry');
+  }
+
+  #onBlindPeerCoreActivity(core, record = null) {
+    const key = toKeyString(core?.key || record?.key);
+    if (!key) return;
+    const tracked = this.#getTrackedProofTarget(key);
+    if (!tracked) return;
+    this.logger?.info?.({
+      key,
+      targetSignedLength: Number.isFinite(tracked.targetSignedLength) ? tracked.targetSignedLength : null,
+      state: this.#summarizeCoreRuntime(core),
+      recordLength: Number.isFinite(record?.length) ? Math.trunc(record.length) : null,
+      recordBytesAllocated: Number.isFinite(record?.bytesAllocated) ? Math.trunc(record.bytesAllocated) : null,
+      trackedContexts: tracked?.contexts ? Array.from(tracked.contexts).slice(0, 6) : [],
+      relayKey: tracked?.relayKey || null
+    }, '[BlindPeer] Target core activity');
+  }
+
+  #onBlindPeerCoreDownloaded(core) {
+    const key = toKeyString(core?.key);
+    if (!key) return;
+    const tracked = this.#getTrackedProofTarget(key);
+    if (!tracked) return;
+    this.logger?.info?.({
+      key,
+      targetSignedLength: Number.isFinite(tracked.targetSignedLength) ? tracked.targetSignedLength : null,
+      state: this.#summarizeCoreRuntime(core),
+      trackedContexts: tracked?.contexts ? Array.from(tracked.contexts).slice(0, 6) : [],
+      relayKey: tracked?.relayKey || null
+    }, '[BlindPeer] Target core fully downloaded');
+  }
+
   #onBlindPeerAddCore(record, stream, context = {}) {
     if (!record?.key) return;
     const ownerPeerKey = stream?.remotePublicKey ? toKeyString(stream.remotePublicKey) : null;
@@ -1356,11 +1683,27 @@ export default class BlindPeerService extends EventEmitter {
     return result;
   }
 
-  async getCoreFastForwardProof(coreKey, { staleThresholdMs = null } = {}) {
+  async getCoreFastForwardProof(coreKey, {
+    staleThresholdMs = null,
+    targetSignedLength = null,
+    includeReplicationTelemetry = false,
+    context = null
+  } = {}) {
     if (!coreKey || !this.blindPeer?.db) return null;
     const decoded = decodeKey(coreKey);
     const normalizedKey = toKeyString(decoded || coreKey);
     if (!decoded || !normalizedKey) return null;
+    const parsedTargetSignedLength = Number(targetSignedLength);
+    const normalizedTargetSignedLength = Number.isFinite(parsedTargetSignedLength)
+      ? Math.max(0, Math.trunc(parsedTargetSignedLength))
+      : null;
+    const telemetryRequested = includeReplicationTelemetry === true || normalizedTargetSignedLength !== null;
+    if (telemetryRequested) {
+      this.#trackProofTarget(normalizedKey, {
+        targetSignedLength: normalizedTargetSignedLength,
+        context
+      });
+    }
 
     const resolvePendingRecord = () => {
       const pendingMap = this.blindPeer?.db?.coresUpdated;
@@ -1380,6 +1723,7 @@ export default class BlindPeerService extends EventEmitter {
     };
 
     let record = null;
+    let pending = null;
     try {
       if (typeof this.blindPeer.db.getCoreRecord === 'function') {
         record = await this.blindPeer.db.getCoreRecord(decoded);
@@ -1391,21 +1735,39 @@ export default class BlindPeerService extends EventEmitter {
         key: normalizedKey,
         err: error?.message || error
       }, '[BlindPeer] Failed to resolve core fast-forward proof');
+      if (telemetryRequested || this.#getTrackedProofTarget(normalizedKey)) {
+        this.#emitCoreProofTelemetry({
+          normalizedKey,
+          targetSignedLength: normalizedTargetSignedLength,
+          context,
+          event: 'fast-forward-proof-error',
+          error: error?.message || String(error)
+        });
+      }
       return null;
     }
 
+    pending = resolvePendingRecord();
     if (!record || typeof record !== 'object') {
-      record = resolvePendingRecord();
+      record = pending;
     }
     if (!record || typeof record !== 'object') {
       this.#logMirrorLifecycle('fast-forward-proof-missing', {
         key: normalizedKey,
         reason: 'missing-core-record'
       }, { force: true });
+      if (telemetryRequested || this.#getTrackedProofTarget(normalizedKey)) {
+        this.#emitCoreProofTelemetry({
+          normalizedKey,
+          pending,
+          targetSignedLength: normalizedTargetSignedLength,
+          context,
+          event: 'fast-forward-proof-missing'
+        });
+      }
       return null;
     }
 
-    const pending = resolvePendingRecord();
     if (pending && Number.isFinite(pending.length)) {
       const persistedLength = Number.isFinite(record.length) ? Number(record.length) : null;
       if (!Number.isFinite(persistedLength) || pending.length > persistedLength) {
@@ -1439,6 +1801,17 @@ export default class BlindPeerService extends EventEmitter {
       proofSource: 'blind-peer-mirror',
       proofAuthoritative: true
     };
+    if (telemetryRequested || this.#getTrackedProofTarget(normalizedKey)) {
+      this.#emitCoreProofTelemetry({
+        normalizedKey,
+        record,
+        pending,
+        proof,
+        targetSignedLength: normalizedTargetSignedLength,
+        context,
+        event: 'fast-forward-proof-resolved'
+      });
+    }
     this.logger?.debug?.({
       key: proof.key,
       signedLength: proof.signedLength,
@@ -1618,6 +1991,12 @@ export default class BlindPeerService extends EventEmitter {
         bytesCleared: stats?.bytesCleared ?? null
       }, '[BlindPeer] Underlying daemon GC completed');
       this.#updateMetrics();
+    });
+    this.blindPeer.on('core-activity', (core, record) => {
+      this.#onBlindPeerCoreActivity(core, record);
+    });
+    this.blindPeer.on('core-downloaded', (core) => {
+      this.#onBlindPeerCoreDownloaded(core);
     });
 
     if (typeof this.blindPeer.listen === 'function') {
