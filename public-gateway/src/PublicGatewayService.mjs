@@ -61,6 +61,9 @@ const JOIN_TRACE_RELAY_IDENTIFIER_HEADER = 'x-hypertuna-relay-identifier';
 const JOIN_TRACE_ROUTE_HEADER = 'x-hypertuna-trace-route';
 const JOIN_TRACE_PURPOSE_HEADER = 'x-hypertuna-trace-purpose';
 const GATEWAY_REQUEST_ID_HEADER = 'x-hypertuna-gateway-request-id';
+const MIRROR_PROOF_SEED_RETRY_MS = 5000;
+const MIRROR_PROOF_SEED_TTL_MS = 10 * 60 * 1000;
+const MIRROR_PROOF_SEED_CORE_LIMIT = 24;
 const AUTHORITATIVE_MIRROR_FAST_FORWARD_SOURCES = new Set([
   'blind-peer-mirror',
   'blind-peer-rehydrated',
@@ -429,6 +432,7 @@ class PublicGatewayService {
     this.peerMetadata = new Map();
     this.peerRawPublicKeys = new Map();
     this.peerHyperbeeReplications = new Map();
+    this.mirrorProofSeedAttempts = new Map();
     this.publicGatewayStatusUpdatedAt = null;
     this.blindPeerService = null;
     this.blindPeerReplicaManager = null;
@@ -1359,6 +1363,93 @@ class PublicGatewayService {
     };
   }
 
+  #collectNormalizedMirrorCoreKeys(mirrorPayload = null) {
+    const keys = new Set();
+    const cores = Array.isArray(mirrorPayload?.cores) ? mirrorPayload.cores : [];
+    for (const entry of cores) {
+      const rawKey = typeof entry === 'string'
+        ? entry
+        : (entry && typeof entry === 'object' ? entry.key : null);
+      const normalized = normalizeCoreRefString(rawKey);
+      if (!normalized) continue;
+      keys.add(normalized);
+      if (keys.size >= MIRROR_PROOF_SEED_CORE_LIMIT) break;
+    }
+    return Array.from(keys);
+  }
+
+  #pruneMirrorProofSeedAttempts(now = Date.now()) {
+    const cutoff = now - MIRROR_PROOF_SEED_TTL_MS;
+    for (const [key, lastAt] of this.mirrorProofSeedAttempts.entries()) {
+      if (!Number.isFinite(lastAt) || lastAt < cutoff) {
+        this.mirrorProofSeedAttempts.delete(key);
+      }
+    }
+  }
+
+  async #seedMirrorProofTargets(relayKey, targetKey, mirrorPayload = null) {
+    const normalizedTarget = normalizeCoreRefString(targetKey);
+    if (!normalizedTarget) return { attempted: false, reason: 'missing-target-key' };
+    if (!this.blindPeerService?.mirrorCore) return { attempted: false, reason: 'blind-peer-unavailable' };
+
+    const now = Date.now();
+    this.#pruneMirrorProofSeedAttempts(now);
+    const previousAttemptAt = this.mirrorProofSeedAttempts.get(normalizedTarget);
+    if (Number.isFinite(previousAttemptAt) && (now - previousAttemptAt) < MIRROR_PROOF_SEED_RETRY_MS) {
+      return {
+        attempted: false,
+        reason: 'throttled',
+        retryInMs: Math.max(0, MIRROR_PROOF_SEED_RETRY_MS - (now - previousAttemptAt))
+      };
+    }
+    this.mirrorProofSeedAttempts.set(normalizedTarget, now);
+
+    const payloadCoreKeys = this.#collectNormalizedMirrorCoreKeys(mirrorPayload);
+    const targetInPayload = payloadCoreKeys.includes(normalizedTarget);
+    const keysToSeed = [normalizedTarget];
+    if (!targetInPayload) {
+      for (const key of payloadCoreKeys) {
+        if (key === normalizedTarget) continue;
+        keysToSeed.push(key);
+        if (keysToSeed.length >= MIRROR_PROOF_SEED_CORE_LIMIT) break;
+      }
+    }
+
+    const keyPreview = (value) => (typeof value === 'string' && value.length > 16 ? value.slice(0, 16) : value);
+    let seededCount = 0;
+    const errors = [];
+    for (const key of keysToSeed) {
+      try {
+        await this.blindPeerService.mirrorCore(key, {
+          announce: false,
+          priority: 2,
+          metadata: {
+            type: 'relay',
+            identifier: relayKey || mirrorPayload?.publicIdentifier || null,
+            priority: 2,
+            announce: false
+          }
+        });
+        seededCount += 1;
+      } catch (error) {
+        errors.push({
+          key: keyPreview(key),
+          err: error?.message || String(error)
+        });
+      }
+    }
+
+    return {
+      attempted: true,
+      targetInPayload,
+      payloadCoreCount: payloadCoreKeys.length,
+      keysAttempted: keysToSeed.length,
+      seededCount,
+      errorCount: errors.length,
+      errors: errors.slice(0, 4)
+    };
+  }
+
   async #applyAuthoritativeMirrorFastForwardProof(relayKey, writerCommitCheckpoint = null, mirrorPayload = null) {
     if (!mirrorPayload || typeof mirrorPayload !== 'object') return mirrorPayload;
     if (!this.blindPeerService?.getCoreFastForwardProof) return mirrorPayload;
@@ -1372,6 +1463,8 @@ class PublicGatewayService {
       currentFastForward?.key || currentFastForward?.checkpointKey || null
     );
     const targetKey = checkpointKey || fallbackKey || null;
+    const mirrorCoreKeys = this.#collectNormalizedMirrorCoreKeys(mirrorPayload);
+    const targetInMirrorCores = !!targetKey && mirrorCoreKeys.includes(targetKey);
     if (!targetKey) {
       this.logger?.debug?.('[PublicGateway] Mirror fast-forward proof skipped: no target key', {
         relayKey,
@@ -1403,10 +1496,26 @@ class PublicGatewayService {
       return mirrorPayload;
     }
     if (!proof || typeof proof !== 'object') {
+      let seedResult = null;
+      try {
+        seedResult = await this.#seedMirrorProofTargets(relayKey, targetKey, mirrorPayload);
+      } catch (seedError) {
+        seedResult = {
+          attempted: true,
+          reason: 'seed-error',
+          err: seedError?.message || String(seedError)
+        };
+      }
       this.logger?.info?.('[PublicGateway] Mirror fast-forward proof unavailable', {
         relayKey,
         coreKey: targetKey ? targetKey.slice(0, 16) : null,
-        proofSource: mirrorPayload?.fastForwardSource || null
+        proofSource: mirrorPayload?.fastForwardSource || null,
+        targetInMirrorCores,
+        mirrorCoreCount: mirrorCoreKeys.length,
+        seedAttempted: seedResult?.attempted === true,
+        seedReason: seedResult?.reason || null,
+        seededCount: Number.isFinite(seedResult?.seededCount) ? seedResult.seededCount : null,
+        seedErrors: Number.isFinite(seedResult?.errorCount) ? seedResult.errorCount : null
       });
       return mirrorPayload;
     }

@@ -1319,6 +1319,10 @@ export default class BlindPeerService extends EventEmitter {
     error = null
   } = {}) {
     if (!normalizedKey) return null;
+    const metadataEntry = this.coreMetadata.get(normalizedKey) || null;
+    const metadataOwnerCount = metadataEntry?.owners instanceof Map
+      ? metadataEntry.owners.size
+      : null;
     const trackerMatch = this.#findActiveTrackerForCore(normalizedKey);
     const tracker = trackerMatch?.tracker || null;
     const trackerCore = tracker?.core || null;
@@ -1361,6 +1365,15 @@ export default class BlindPeerService extends EventEmitter {
       dbUpdatedAt: Number.isFinite(record?.updated) ? Math.trunc(record.updated) : null,
       dbActiveAt: Number.isFinite(record?.active) ? Math.trunc(record.active) : null,
       dbBytesAllocated: Number.isFinite(record?.bytesAllocated) ? Math.trunc(record.bytesAllocated) : null,
+      metadataTracked: !!metadataEntry,
+      metadataPrimaryIdentifier: metadataEntry?.primaryIdentifier || null,
+      metadataType: metadataEntry?.type || null,
+      metadataAnnounce: metadataEntry?.announce === true,
+      metadataPriority: Number.isFinite(metadataEntry?.priority) ? Math.trunc(metadataEntry.priority) : null,
+      metadataOwnerCount,
+      metadataLastActive: Number.isFinite(metadataEntry?.lastActive)
+        ? Math.trunc(metadataEntry.lastActive)
+        : null,
       pendingLength,
       pendingUpdatedAt: Number.isFinite(pending?.updated) ? Math.trunc(pending.updated) : null,
       pendingActiveAt: Number.isFinite(pending?.active) ? Math.trunc(pending.active) : null,
@@ -1752,9 +1765,13 @@ export default class BlindPeerService extends EventEmitter {
       record = pending;
     }
     if (!record || typeof record !== 'object') {
+      const metadataEntry = this.coreMetadata.get(normalizedKey) || null;
       this.#logMirrorLifecycle('fast-forward-proof-missing', {
         key: normalizedKey,
-        reason: 'missing-core-record'
+        reason: metadataEntry ? 'missing-core-record-with-metadata' : 'missing-core-record',
+        metadataTracked: !!metadataEntry,
+        metadataPrimaryIdentifier: metadataEntry?.primaryIdentifier || null,
+        metadataOwnerCount: metadataEntry?.owners instanceof Map ? metadataEntry.owners.size : null
       }, { force: true });
       if (telemetryRequested || this.#getTrackedProofTarget(normalizedKey)) {
         this.#emitCoreProofTelemetry({
