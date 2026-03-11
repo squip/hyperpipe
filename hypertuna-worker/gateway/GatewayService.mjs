@@ -33,6 +33,8 @@ const PUBLIC_GATEWAY_RELAY_KEY = 'public-gateway:hyperbee';
 const PUBLIC_GATEWAY_RELAY_PATH = 'relay';
 const PUBLIC_GATEWAY_RELAY_PATH_ALIASES = ['public-gateway/hyperbee'];
 const PUBLIC_GATEWAY_VIRTUAL_RELAY_ENABLED = false;
+const OPEN_JOIN_DURABILITY_WAIT_TIMEOUT_MS = 12000;
+const OPEN_JOIN_DURABILITY_WAIT_INTERVAL_MS = 350;
 
 function guessContentType(fileName = '') {
   const lower = typeof fileName === 'string' ? fileName.toLowerCase() : '';
@@ -187,6 +189,100 @@ class PeerHealthManager {
 
 function generateConnectionKey() {
   return crypto.randomBytes(16).toString('hex');
+}
+
+function normalizeCoreRefString(value) {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+      return HypercoreId.encode(HypercoreId.decode(trimmed));
+    } catch (_) {
+      if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+        try {
+          return HypercoreId.encode(Buffer.from(trimmed, 'hex'));
+        } catch (_) {
+          return null;
+        }
+      }
+      return null;
+    }
+  }
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    try {
+      return HypercoreId.encode(Buffer.from(value));
+    } catch (_) {
+      return null;
+    }
+  }
+  if (value && typeof value === 'object') {
+    return normalizeCoreRefString(value.key || value.core || null);
+  }
+  return null;
+}
+
+function normalizeWriterCommitCheckpointForDurability(input = null) {
+  if (!input || typeof input !== 'object') return null;
+  const systemKey = normalizeCoreRefString(input.systemKey || input.system_key || null);
+  const signedLengthRaw =
+    Number.isFinite(input.systemSignedLength)
+      ? Number(input.systemSignedLength)
+      : Number.isFinite(input.system_signed_length)
+        ? Number(input.system_signed_length)
+        : null;
+  const systemSignedLength = Number.isFinite(signedLengthRaw) ? Math.trunc(signedLengthRaw) : null;
+  if (!systemKey && systemSignedLength === null) return null;
+  return {
+    systemKey: systemKey || null,
+    systemSignedLength
+  };
+}
+
+function summarizeDurabilityCheckpoint(checkpoint = null) {
+  if (!checkpoint) return null;
+  return {
+    systemKey: checkpoint.systemKey ? checkpoint.systemKey.slice(0, 16) : null,
+    systemSignedLength: Number.isFinite(checkpoint.systemSignedLength)
+      ? checkpoint.systemSignedLength
+      : null
+  };
+}
+
+function summarizeMirrorFastForward(fastForward = null) {
+  if (!fastForward || typeof fastForward !== 'object') return null;
+  const key = normalizeCoreRefString(fastForward.key || fastForward.checkpointKey || null);
+  const signedLength = Number.isFinite(fastForward.signedLength)
+    ? Math.trunc(fastForward.signedLength)
+    : (Number.isFinite(fastForward.length) ? Math.trunc(fastForward.length) : null);
+  return {
+    key: key ? key.slice(0, 16) : null,
+    signedLength
+  };
+}
+
+function isCheckpointDurableAtMirror(checkpoint, fastForward = null) {
+  if (!checkpoint) return true;
+  if (!fastForward || typeof fastForward !== 'object') return false;
+  const mirrorKey = normalizeCoreRefString(fastForward.key || fastForward.checkpointKey || null);
+  const mirrorSignedLength = Number.isFinite(fastForward.signedLength)
+    ? Math.trunc(fastForward.signedLength)
+    : (Number.isFinite(fastForward.length) ? Math.trunc(fastForward.length) : null);
+  if (checkpoint.systemKey && mirrorKey && checkpoint.systemKey !== mirrorKey) {
+    return false;
+  }
+  if (!Number.isFinite(checkpoint.systemSignedLength)) {
+    return false;
+  }
+  if (!Number.isFinite(mirrorSignedLength)) {
+    return false;
+  }
+  return mirrorSignedLength >= checkpoint.systemSignedLength;
+}
+
+function delay(ms) {
+  const waitMs = Number.isFinite(ms) && ms > 0 ? Math.trunc(ms) : 0;
+  return new Promise((resolve) => setTimeout(resolve, waitMs));
 }
 
 export class GatewayService extends EventEmitter {
@@ -2142,6 +2238,29 @@ export class GatewayService extends EventEmitter {
           });
           return;
         }
+        const durabilityGate = await this.#waitForOpenJoinMirrorDurability(poolRelayKey, entries);
+        if (durabilityGate.status !== 'ready' && durabilityGate.status !== 'skipped') {
+          this.log('warn', `[PublicGateway] Open join pool durability gate blocked relay=${poolRelayKey}`, {
+            status: durabilityGate.status,
+            attempts: durabilityGate.attempts ?? null,
+            timeoutMs: durabilityGate.timeoutMs ?? null,
+            checkpoints: Array.isArray(durabilityGate.checkpoints)
+              ? durabilityGate.checkpoints.map((checkpoint) => summarizeDurabilityCheckpoint(checkpoint))
+              : null,
+            mirror: summarizeMirrorFastForward(durabilityGate.fastForward),
+            error: durabilityGate.error || null
+          });
+          return;
+        }
+        if (durabilityGate.status === 'ready') {
+          this.log('info', `[PublicGateway] Open join pool durability gate satisfied relay=${poolRelayKey}`, {
+            attempts: durabilityGate.attempts ?? null,
+            checkpoints: Array.isArray(durabilityGate.checkpoints)
+              ? durabilityGate.checkpoints.map((checkpoint) => summarizeDurabilityCheckpoint(checkpoint))
+              : null,
+            mirror: summarizeMirrorFastForward(durabilityGate.fastForward)
+          });
+        }
         const updatedAt = provision.updatedAt || Date.now();
         report = await this.publicGatewayRegistrar.updateOpenJoinPool(poolRelayKey, entries, {
           updatedAt,
@@ -2175,6 +2294,69 @@ export class GatewayService extends EventEmitter {
     } finally {
       this.openJoinPoolSyncLocks.delete(relayKey);
     }
+  }
+
+  async #waitForOpenJoinMirrorDurability(relayKey, entries = []) {
+    if (!relayKey) {
+      return { status: 'skipped', reason: 'missing-relay-key' };
+    }
+    if (!this.publicGatewayRegistrar?.isEnabled?.()) {
+      return { status: 'skipped', reason: 'registrar-disabled' };
+    }
+    if (!this.publicGatewayRegistrar?.getMirrorMetadata) {
+      return { status: 'skipped', reason: 'registrar-mirror-fetch-unavailable' };
+    }
+
+    const checkpoints = (Array.isArray(entries) ? entries : [])
+      .map((entry) => normalizeWriterCommitCheckpointForDurability(entry?.writerCommitCheckpoint || null))
+      .filter(Boolean);
+    if (!checkpoints.length) {
+      return { status: 'skipped', reason: 'missing-writer-checkpoints' };
+    }
+
+    const timeoutCandidate = Number(this.publicGatewaySettings?.openJoinDurabilityWaitTimeoutMs);
+    const intervalCandidate = Number(this.publicGatewaySettings?.openJoinDurabilityWaitIntervalMs);
+    const timeoutMs = Number.isFinite(timeoutCandidate) && timeoutCandidate > 0
+      ? Math.trunc(timeoutCandidate)
+      : OPEN_JOIN_DURABILITY_WAIT_TIMEOUT_MS;
+    const intervalMs = Number.isFinite(intervalCandidate) && intervalCandidate > 0
+      ? Math.trunc(intervalCandidate)
+      : OPEN_JOIN_DURABILITY_WAIT_INTERVAL_MS;
+
+    const startedAt = Date.now();
+    let attempts = 0;
+    let lastError = null;
+    let lastFastForward = null;
+
+    while ((Date.now() - startedAt) <= timeoutMs) {
+      attempts += 1;
+      try {
+        const mirrorPayload = await this.publicGatewayRegistrar.getMirrorMetadata(relayKey);
+        const fastForward = mirrorPayload?.fastForward || mirrorPayload?.fast_forward || null;
+        lastFastForward = fastForward || null;
+        const durable = checkpoints.every((checkpoint) => isCheckpointDurableAtMirror(checkpoint, fastForward));
+        if (durable) {
+          return {
+            status: 'ready',
+            attempts,
+            checkpoints,
+            fastForward
+          };
+        }
+      } catch (error) {
+        lastError = error?.message || String(error);
+      }
+      await delay(intervalMs);
+    }
+
+    return {
+      status: 'timeout',
+      attempts,
+      timeoutMs,
+      checkpoints,
+      fastForward: lastFastForward,
+      error: lastError
+    };
   }
 
   async #runOpenJoinPoolKeepWarm() {

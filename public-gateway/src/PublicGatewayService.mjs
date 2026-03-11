@@ -4823,6 +4823,85 @@ class PublicGatewayService {
     });
   }
 
+  async #requeueOpenJoinLease(relayKey, lease, { poolRecord = null, record = null } = {}) {
+    if (!relayKey || !lease || typeof lease !== 'object') return false;
+    if (!this.registrationStore?.storeOpenJoinPool) return false;
+
+    const writerCore = typeof lease.writerCore === 'string' ? lease.writerCore : null;
+    const writerSecret = typeof lease.writerSecret === 'string' ? lease.writerSecret : null;
+    if (!writerCore || !writerSecret) return false;
+
+    const now = Date.now();
+    const writerCoreHex = typeof lease.writerCoreHex === 'string'
+      ? lease.writerCoreHex
+      : (typeof lease.writer_core_hex === 'string' ? lease.writer_core_hex : null);
+    const autobaseLocal = typeof lease.autobaseLocal === 'string'
+      ? lease.autobaseLocal
+      : (typeof lease.autobase_local === 'string' ? lease.autobase_local : null);
+    const writerLeaseId = normalizeWriterLeaseId(
+      lease.writerLeaseId || lease.writer_lease_id || null
+    );
+    const writerCommitCheckpoint = normalizeWriterCommitCheckpoint(
+      lease.writerCommitCheckpoint || lease.writer_commit_checkpoint || null
+    );
+    const normalizedLease = {
+      writerCore,
+      writerSecret,
+      issuedAt: Number.isFinite(lease.issuedAt) ? Math.trunc(lease.issuedAt) : now
+    };
+    if (Number.isFinite(lease.expiresAt)) normalizedLease.expiresAt = Math.trunc(lease.expiresAt);
+    if (writerCoreHex) normalizedLease.writerCoreHex = writerCoreHex;
+    if (autobaseLocal) normalizedLease.autobaseLocal = autobaseLocal;
+    if (writerLeaseId) normalizedLease.writerLeaseId = writerLeaseId;
+    if (writerCommitCheckpoint) normalizedLease.writerCommitCheckpoint = writerCommitCheckpoint;
+
+    let currentPool = poolRecord && typeof poolRecord === 'object' ? poolRecord : null;
+    if (!currentPool && typeof this.registrationStore?.getOpenJoinPool === 'function') {
+      currentPool = await this.registrationStore.getOpenJoinPool(relayKey);
+    }
+
+    const existingEntries = Array.isArray(currentPool?.entries) ? currentPool.entries : [];
+    const requeuedEntries = [normalizedLease];
+    for (const entry of existingEntries) {
+      if (!entry || typeof entry !== 'object') continue;
+      if (typeof entry.writerCore !== 'string' || typeof entry.writerSecret !== 'string') continue;
+      if (entry.writerCore === writerCore) continue;
+      if (Number.isFinite(entry.expiresAt) && entry.expiresAt <= now) continue;
+      requeuedEntries.push(entry);
+    }
+
+    const metadata = currentPool?.metadata && typeof currentPool.metadata === 'object'
+      ? currentPool.metadata
+      : (record?.metadata && typeof record.metadata === 'object' ? record.metadata : null);
+    const publicIdentifier = currentPool?.publicIdentifier
+      || metadata?.identifier
+      || record?.metadata?.identifier
+      || null;
+    const relayUrl = currentPool?.relayUrl
+      || metadata?.relayUrl
+      || metadata?.connectionUrl
+      || record?.metadata?.connectionUrl
+      || null;
+    const relayCores = Array.isArray(currentPool?.relayCores)
+      ? currentPool.relayCores
+      : (Array.isArray(record?.relayCores) ? record.relayCores : []);
+    const aliases = Array.isArray(currentPool?.aliases) ? currentPool.aliases : [];
+
+    await this.registrationStore.storeOpenJoinPool(relayKey, {
+      entries: requeuedEntries,
+      updatedAt: now,
+      publicIdentifier,
+      relayUrl,
+      relayCores,
+      metadata,
+      aliases
+    });
+    if (aliases.length && typeof this.registrationStore?.storeOpenJoinAliases === 'function') {
+      await this.registrationStore.storeOpenJoinAliases(relayKey, aliases);
+    }
+    return true;
+  }
+
   async #handleOpenJoinChallenge(req, res) {
     const trace = this.#ensureRequestTrace(req, res, {
       route: 'open-join/challenge',
@@ -5121,6 +5200,18 @@ class PublicGatewayService {
         }
       );
       if (durability.durableAtServe !== true) {
+        let requeued = false;
+        try {
+          requeued = await this.#requeueOpenJoinLease(relayKey, lease, {
+            poolRecord: poolAfter || pool || null,
+            record: record || null
+          });
+        } catch (error) {
+          this.logger?.warn?.('[PublicGateway] Failed to requeue non-durable open join lease', {
+            relayKey,
+            err: error?.message || error
+          });
+        }
         const durabilityErrorCode = durability.reason === 'missing-mirror-fast-forward'
           ? 'open-join-durability-proof-missing'
           : durability.reason === 'mirror-proof-not-authoritative'
@@ -5136,6 +5227,7 @@ class PublicGatewayService {
           source: record ? 'registration' : 'pool',
           poolBefore: poolBeforeCount,
           poolAfter: poolAfterCount,
+          requeued,
           writerLeaseId: writerLeaseId ? writerLeaseId.slice(0, 24) : null,
           writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
           writerDurabilityAtServe: durability.durableAtServe,
@@ -5150,6 +5242,7 @@ class PublicGatewayService {
           source: record ? 'registration' : 'pool',
           poolBefore: poolBeforeCount,
           poolAfter: poolAfterCount,
+          requeued,
           writerLeaseId: writerLeaseId ? writerLeaseId.slice(0, 24) : null,
           writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
           writerDurabilityAtServe: durability.durableAtServe,

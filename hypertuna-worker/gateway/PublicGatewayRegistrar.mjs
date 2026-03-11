@@ -205,6 +205,27 @@ class PublicGatewayRegistrar {
     return response;
   }
 
+  async getMirrorMetadata(relayKey) {
+    if (!this.isEnabled()) return null;
+    if (!relayKey) throw new Error('relayKey is required');
+    const url = new URL(`/api/relays/${encodeURIComponent(relayKey)}/mirror`, this.baseUrl).toString();
+    const response = await this.fetch(url, {
+      method: 'GET',
+      headers: {
+        accept: 'application/json'
+      }
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || `Gateway responded with status ${response.status}`);
+    }
+    try {
+      return await response.json();
+    } catch (error) {
+      throw new Error(`Failed to parse gateway mirror response: ${error.message}`);
+    }
+  }
+
   async #postJson(path, body) {
     if (!this.isEnabled()) {
       throw new Error('Public gateway registrar not configured');
