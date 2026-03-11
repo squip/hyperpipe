@@ -688,6 +688,74 @@ function buildGatewayWebsocketBase(cfg = config) {
   return `${protocol}://${host}`;
 }
 
+export function updateRuntimeGatewayAddress({
+  proxyServerAddress = null,
+  proxyWebsocketProtocol = null,
+  gatewayUrl = null,
+  source = 'runtime'
+} = {}) {
+  if (!config || typeof config !== 'object') {
+    return { updated: false, reason: 'relay-server-not-initialized' };
+  }
+
+  const nextProxyServerAddress =
+    typeof proxyServerAddress === 'string' && proxyServerAddress.trim()
+      ? proxyServerAddress.trim()
+      : null;
+  const nextProxyWebsocketProtocol =
+    proxyWebsocketProtocol === 'ws' || proxyWebsocketProtocol === 'wss'
+      ? proxyWebsocketProtocol
+      : null;
+  const nextGatewayUrl =
+    typeof gatewayUrl === 'string' && gatewayUrl.trim()
+      ? gatewayUrl.trim()
+      : null;
+
+  const previous = {
+    proxy_server_address: config.proxy_server_address || null,
+    proxy_websocket_protocol: config.proxy_websocket_protocol || null,
+    gatewayUrl: config.gatewayUrl || null
+  };
+
+  let changed = false;
+  if (nextProxyServerAddress && nextProxyServerAddress !== config.proxy_server_address) {
+    config.proxy_server_address = nextProxyServerAddress;
+    changed = true;
+  }
+  if (nextProxyWebsocketProtocol && nextProxyWebsocketProtocol !== config.proxy_websocket_protocol) {
+    config.proxy_websocket_protocol = nextProxyWebsocketProtocol;
+    changed = true;
+  }
+  if (nextGatewayUrl && nextGatewayUrl !== config.gatewayUrl) {
+    config.gatewayUrl = nextGatewayUrl;
+    changed = true;
+  }
+
+  if (!changed) {
+    return { updated: false, reason: 'no-change', previous, current: previous };
+  }
+
+  const current = {
+    proxy_server_address: config.proxy_server_address || null,
+    proxy_websocket_protocol: config.proxy_websocket_protocol || null,
+    gatewayUrl: config.gatewayUrl || null
+  };
+  console.log('[RelayServer] Runtime gateway address updated', {
+    source,
+    previous,
+    current
+  });
+
+  saveConfig(config).catch((error) => {
+    console.warn('[RelayServer] Failed to persist runtime gateway address update', {
+      source,
+      error: error?.message || error
+    });
+  });
+
+  return { updated: true, previous, current };
+}
+
 function buildCanonicalRelayUrl(identifier, authToken = null, cfg = config) {
   const normalizedIdentifier = normalizeRelayIdentifier(identifier || '') || String(identifier || '').trim();
   if (!normalizedIdentifier) return null;

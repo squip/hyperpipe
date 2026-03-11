@@ -443,6 +443,54 @@ function buildGatewayWebsocketBase(config) {
   return `${protocol}://${host}`
 }
 
+function safeParseUrl(url) {
+  if (typeof url !== 'string' || !url.trim()) return null
+  try {
+    return new URL(url.trim())
+  } catch (_err) {
+    return null
+  }
+}
+
+function isLoopbackHostname(hostname) {
+  const normalized = String(hostname || '').trim().toLowerCase()
+  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1'
+}
+
+function shouldPreferDirectRelayUrl({
+  hostedOrJoinedRelay,
+  existingConnectionUrl,
+  proxyConnectionUrl
+}) {
+  if (!hostedOrJoinedRelay || !existingConnectionUrl) {
+    return { preferDirect: false, reason: 'not-hosted-or-missing-existing' }
+  }
+
+  const existingParsed = safeParseUrl(existingConnectionUrl)
+  if (!existingParsed) {
+    return { preferDirect: false, reason: 'existing-url-invalid' }
+  }
+
+  const proxyParsed = safeParseUrl(proxyConnectionUrl)
+  if (!proxyParsed) {
+    return { preferDirect: true, reason: 'proxy-url-invalid' }
+  }
+
+  const samePath = existingParsed.pathname === proxyParsed.pathname
+  const bothLoopback =
+    isLoopbackHostname(existingParsed.hostname) && isLoopbackHostname(proxyParsed.hostname)
+  const differentEndpoint =
+    existingParsed.hostname !== proxyParsed.hostname || existingParsed.port !== proxyParsed.port
+
+  // If both URLs target the same relay path but different local loopback endpoints,
+  // the existing URL is stale (typically pre-fallback port) and should not be preferred.
+  if (samePath && bothLoopback && differentEndpoint) {
+    return { preferDirect: false, reason: 'stale-loopback-endpoint-mismatch' }
+  }
+
+  return { preferDirect: true, reason: 'direct-url-valid' }
+}
+
 function deriveGatewayHostFromStatus(status) {
   try {
     const hostnameUrl = status?.urls?.hostname ? new URL(status.urls.hostname) : null
@@ -4683,6 +4731,18 @@ async function startGatewayService(options = {}) {
           config.proxy_server_address = proxyHost
           config.proxy_websocket_protocol = wsProtocol
         }
+        if (relayServer && typeof relayServer.updateRuntimeGatewayAddress === 'function') {
+          try {
+            relayServer.updateRuntimeGatewayAddress({
+              proxyServerAddress: proxyHost,
+              proxyWebsocketProtocol: wsProtocol,
+              gatewayUrl: httpUrl,
+              source: 'gateway-status-running'
+            })
+          } catch (error) {
+            console.warn('[Worker] Failed to sync runtime gateway address to relay server:', error?.message || error)
+          }
+        }
         if (!gatewaySettingsApplied) {
           try {
             await updateGatewaySettings({
@@ -5989,13 +6049,18 @@ async function addAuthInfoToRelays(relays) {
           ? r.connectionUrl.trim()
           : null
       const hostedOrJoinedRelay = r?.isHosted === true || r?.isJoined === true
-      const preferDirectRelayUrl = hostedOrJoinedRelay && !!existingConnectionUrl
+      const directRelayDecision = shouldPreferDirectRelayUrl({
+        hostedOrJoinedRelay,
+        existingConnectionUrl,
+        proxyConnectionUrl
+      })
+      const preferDirectRelayUrl = directRelayDecision.preferDirect
       const connectionUrl = preferDirectRelayUrl
         ? existingConnectionUrl
-        : (existingConnectionUrl || proxyConnectionUrl)
+        : (proxyConnectionUrl || existingConnectionUrl)
       const connectionUrlSource = preferDirectRelayUrl
         ? 'direct-relay-url'
-        : (existingConnectionUrl ? 'existing-relay-url' : 'gateway-proxy-url')
+        : (proxyConnectionUrl ? 'gateway-proxy-url' : (existingConnectionUrl ? 'existing-relay-url' : 'unavailable'))
       const requiresAuth = profile.auth_config?.requiresAuth || false
       const writable = r?.writable === true
       let tokenPresent = !!token
@@ -6021,6 +6086,7 @@ async function addAuthInfoToRelays(relays) {
         fromLegacyToken: !!(profile.auth_tokens && profile.auth_tokens[config.nostr_pubkey_hex]),
         fromStoreToken: !!tokenFromStore,
         tokenApplied: !!token,
+        directRelayReason: directRelayDecision.reason,
         connectionUrlSource,
         existingConnectionUrl,
         proxyConnectionUrl,
