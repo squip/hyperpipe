@@ -443,6 +443,36 @@ function buildGatewayWebsocketBase(config) {
   return `${protocol}://${host}`
 }
 
+function summarizeEndpointUrl(value) {
+  if (!value || typeof value !== 'string') {
+    return {
+      raw: value || null,
+      protocol: null,
+      hostname: null,
+      port: null,
+      pathname: null
+    }
+  }
+  try {
+    const parsed = new URL(value)
+    return {
+      raw: value,
+      protocol: parsed.protocol,
+      hostname: parsed.hostname || null,
+      port: parsed.port || null,
+      pathname: parsed.pathname || null
+    }
+  } catch (_error) {
+    return {
+      raw: value,
+      protocol: null,
+      hostname: null,
+      port: null,
+      pathname: null
+    }
+  }
+}
+
 function deriveGatewayHostFromStatus(status) {
   try {
     const hostnameUrl = status?.urls?.hostname ? new URL(status.urls.hostname) : null
@@ -497,6 +527,14 @@ function describeRelayIdentifierType(value) {
 function resolveRelayIdentifierPath(identifier) {
   if (!identifier || typeof identifier !== 'string') return null
   return identifier.includes(':') ? identifier.replace(':', '/') : identifier
+}
+
+function normalizeRelayIdentifierForMatch(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  const normalized = trimmed.includes('/') ? trimmed.replace('/', ':') : trimmed
+  return isHex64(normalized) ? normalized.toLowerCase() : normalized
 }
 
 function makeRelaySubscriptionRefreshKey({ relayKey = null, publicIdentifier = null } = {}) {
@@ -563,17 +601,30 @@ function buildProbeCandidatePeers({
   hostPeerKeys = [],
   leaseReplicaPeerKeys = [],
   topicPeerKeys = [],
+  authoritativeHostPeerKeys = [],
+  directJoinOnly = false,
   capabilityByPeer = {},
   maxCandidates = JOIN_MAX_PROBE_CANDIDATES
 } = {}) {
   const now = Date.now()
+  const normalizedAuthoritativeHostPeers = normalizePeerKeyList(authoritativeHostPeerKeys)
+  const authoritativeSet = new Set(normalizedAuthoritativeHostPeers)
+  const normalizedHostPeers = normalizePeerKeyList(hostPeerKeys)
+  const normalizedLeaseReplicaPeers = normalizePeerKeyList(leaseReplicaPeerKeys)
   const normalizedTopicPeers = normalizePeerKeyList(topicPeerKeys)
   const topicSet = new Set(normalizedTopicPeers)
-  const merged = normalizePeerKeyList([
-    ...normalizedTopicPeers,
-    ...hostPeerKeys,
-    ...leaseReplicaPeerKeys
-  ])
+  const merged = directJoinOnly
+    ? normalizePeerKeyList(
+      normalizedAuthoritativeHostPeers.length
+        ? normalizedAuthoritativeHostPeers
+        : normalizedHostPeers
+    )
+    : normalizePeerKeyList([
+      ...normalizedAuthoritativeHostPeers,
+      ...normalizedHostPeers,
+      ...normalizedLeaseReplicaPeers,
+      ...normalizedTopicPeers
+    ])
 
   const scored = merged.map((peerKey, sourceIndex) => {
     const capability = capabilityByPeer && typeof capabilityByPeer === 'object'
@@ -588,16 +639,19 @@ function buildProbeCandidatePeers({
       && (now - lastFailureAt) <= JOIN_RECENT_FAILURE_DEMOTE_MS
       && (!lastSuccessAt || lastFailureAt >= lastSuccessAt)
     )
+    const isAuthoritative = authoritativeSet.has(peerKey)
     const isTopicPeer = topicSet.has(peerKey)
-    let tier = 3
-    if (isTopicPeer) {
+    let tier = 4
+    if (isAuthoritative) {
       tier = 0
-    } else if (hasRecentSuccess) {
+    } else if (isTopicPeer) {
       tier = 1
-    } else if (observedAt > 0) {
+    } else if (hasRecentSuccess) {
       tier = 2
+    } else if (observedAt > 0) {
+      tier = 3
     }
-    if (hasRecentFailure && !isTopicPeer && !hasRecentSuccess) {
+    if (hasRecentFailure && !isAuthoritative && !isTopicPeer && !hasRecentSuccess) {
       tier += 2
     }
 
@@ -605,6 +659,7 @@ function buildProbeCandidatePeers({
       peerKey,
       sourceIndex,
       tier,
+      isAuthoritative,
       isTopicPeer,
       hasRecentSuccess,
       hasRecentFailure,
@@ -617,6 +672,7 @@ function buildProbeCandidatePeers({
 
   scored.sort((left, right) => {
     if (left.tier !== right.tier) return left.tier - right.tier
+    if (left.isAuthoritative !== right.isAuthoritative) return left.isAuthoritative ? -1 : 1
     if (left.isTopicPeer !== right.isTopicPeer) return left.isTopicPeer ? -1 : 1
     if (left.hasRecentSuccess !== right.hasRecentSuccess) return left.hasRecentSuccess ? -1 : 1
     if (left.lastSuccessAt !== right.lastSuccessAt) return right.lastSuccessAt - left.lastSuccessAt
@@ -632,6 +688,7 @@ function buildProbeCandidatePeers({
     diagnostics: limited.map((entry) => ({
       peerKey: entry.peerKey,
       tier: entry.tier,
+      authoritative: entry.isAuthoritative,
       topic: entry.isTopicPeer,
       recentSuccess: entry.hasRecentSuccess,
       recentFailure: entry.hasRecentFailure,
@@ -5789,10 +5846,12 @@ async function addAuthInfoToRelays(relays) {
   try {
     const profiles = await getAllRelayProfiles(global.userConfig?.userKey)
     const authStore = getRelayAuthStore()
+    const gatewayBase = buildGatewayWebsocketBase(config)
     return relays.map(r => {
       const profile = profiles.find(p => p.relay_key === r.relayKey) || {}
 
       let token = null
+      let tokenFromProfile = null
       if (profile.auth_config?.requiresAuth && config.nostr_pubkey_hex) {
         // Calculate authorized users from auth_adds and auth_removes
         // const { calculateAuthorizedUsers } = require('./hypertuna-relay-profile-manager-bare.mjs')
@@ -5805,10 +5864,12 @@ async function addAuthInfoToRelays(relays) {
           u => u.pubkey === config.nostr_pubkey_hex
         )
         token = userAuth?.token || null
+        tokenFromProfile = token
         
         if (!token && profile.auth_tokens && profile.auth_tokens[config.nostr_pubkey_hex]) {
           // Fallback to legacy auth_tokens if present
           token = profile.auth_tokens[config.nostr_pubkey_hex]
+          tokenFromProfile = token
         }
         
         if (token) {
@@ -5845,10 +5906,40 @@ async function addAuthInfoToRelays(relays) {
         ? profile.public_identifier.replace(':', '/')
         : r.relayKey
 
-      const baseUrl = `${buildGatewayWebsocketBase(config)}/${identifierPath}`
+      const existingConnectionUrl = typeof r?.connectionUrl === 'string' ? r.connectionUrl : null
+      let existingBaseUrl = null
+      let tokenFromExistingConnection = null
+      if (existingConnectionUrl) {
+        try {
+          const parsed = new URL(existingConnectionUrl)
+          tokenFromExistingConnection = parsed.searchParams.get('token') || null
+          parsed.searchParams.delete('token')
+          existingBaseUrl = parsed.toString().replace(/\?$/, '')
+        } catch (_error) {
+          const tokenMatch = existingConnectionUrl.match(/[?&]token=([^&]+)/)
+          if (tokenMatch) {
+            try {
+              tokenFromExistingConnection = decodeURIComponent(tokenMatch[1])
+            } catch (_decodeError) {
+              tokenFromExistingConnection = tokenMatch[1]
+            }
+          }
+          existingBaseUrl = existingConnectionUrl.split('?')[0]
+        }
+      }
+      if (!token && tokenFromExistingConnection) {
+        token = tokenFromExistingConnection
+      }
+
+      const isHostedRelay = r?.isHosted === true || !!profile?.created_at
+      const preferExistingHostedBase = isHostedRelay && !!existingBaseUrl
+      const baseUrl = preferExistingHostedBase ? existingBaseUrl : `${gatewayBase}/${identifierPath}`
       const connectionUrl = token ? `${baseUrl}?token=${token}` : baseUrl
       const requiresAuth = profile.auth_config?.requiresAuth || false
       const writable = r?.writable === true
+      const connectionUrlRewritten = Boolean(existingConnectionUrl && existingConnectionUrl !== connectionUrl)
+      const sourceConnectionSummary = summarizeEndpointUrl(existingConnectionUrl)
+      const effectiveConnectionSummary = summarizeEndpointUrl(connectionUrl)
       let tokenPresent = !!token
       if (!tokenPresent) {
         try {
@@ -5866,10 +5957,20 @@ async function addAuthInfoToRelays(relays) {
         requiresAuth,
         writable,
         readyForReq,
-        fromProfileToken: !!token, // token derived above (profile auth_adds/auth_tokens)
+        fromProfileToken: !!tokenFromProfile,
         fromLegacyToken: !!(profile.auth_tokens && profile.auth_tokens[config.nostr_pubkey_hex]),
         fromStoreToken: !!tokenFromStore,
         tokenApplied: !!token,
+        tokenFromExistingConnection: !!tokenFromExistingConnection,
+        isHostedRelay,
+        preferExistingHostedBase,
+        gatewayBase,
+        proxyServerAddress: config?.proxy_server_address || null,
+        gatewayHttpUrl: config?.gatewayUrl || null,
+        sourceConnectionUrl: existingConnectionUrl,
+        connectionUrlRewritten,
+        sourceConnectionSummary,
+        effectiveConnectionSummary,
         connectionUrl,
         userAuthToken: token
       })
@@ -8028,10 +8129,11 @@ async function handleMessageObject(message) {
             writerIssuerPubkey: null,
             capabilities: {}
           }))
-          hostPeers = normalizePeerKeyList([
+          const authoritativeHostPeers = normalizePeerKeyList([
             ...hostPeers,
             ...(discoveryHints?.hostPeerKeys || [])
           ])
+          hostPeers = authoritativeHostPeers
           leaseReplicaPeerKeys = normalizePeerKeyList([
             ...leaseReplicaPeerKeys,
             ...(discoveryHints?.leaseReplicaPeerKeys || [])
@@ -8045,8 +8147,30 @@ async function handleMessageObject(message) {
           if (!discoveryTopic && (joinRelayKey || publicIdentifier) && relayServer?.deriveRelayDiscoveryTopic) {
             discoveryTopic = relayServer.deriveRelayDiscoveryTopic(joinRelayKey || publicIdentifier)
           }
+          if (
+            gatewayMode === 'disabled'
+            && openJoin
+            && !inviteToken
+            && !authoritativeHostPeers.length
+          ) {
+            console.warn('[Worker] Direct join guard: missing authoritative host peer hints', {
+              publicIdentifier,
+              relayKey: previewValue(joinRelayKey, 16),
+              explicitHostPeersCount: explicitHostPeers.length,
+              discoveryHintHostPeerCount: Array.isArray(discoveryHints?.hostPeerKeys)
+                ? discoveryHints.hostPeerKeys.length
+                : 0,
+              leaseReplicaPeerCount: leaseReplicaPeerKeys.length
+            })
+            throw new Error('missing-host-peer-hints: directJoinOnly requires hostPeerKeys')
+          }
           let topicDiscoveredPeerKeys = []
-          if (joinDirectDiscoveryV2 && discoveryTopic && relayServer?.discoverPeersOnTopic) {
+          if (
+            joinDirectDiscoveryV2
+            && gatewayMode !== 'disabled'
+            && discoveryTopic
+            && relayServer?.discoverPeersOnTopic
+          ) {
             try {
               ensureJoinBudget('topic-discovery', 500)
               const discoveredPeers = await withTimeout(
@@ -8067,7 +8191,7 @@ async function handleMessageObject(message) {
               })
             }
           }
-          if (topicDiscoveredPeerKeys.length) {
+          if (gatewayMode !== 'disabled' && topicDiscoveredPeerKeys.length) {
             hostPeers = normalizePeerKeyList([...hostPeers, ...topicDiscoveredPeerKeys])
           }
 
@@ -8211,13 +8335,30 @@ async function handleMessageObject(message) {
             gatewayMode,
             gatewayOrigin: assignedGatewayOrigin,
             gatewayId: assignedGatewayId,
+            gatewayOrigins,
+            storedGatewayRoute: storedGatewayRoute
+              ? {
+                gatewayOrigin: storedGatewayRoute.gatewayOrigin || null,
+                gatewayId: storedGatewayRoute.gatewayId || null,
+                directJoinOnly: storedGatewayRoute.directJoinOnly === true
+              }
+              : null,
             joinDirectDiscoveryV2,
             hasInviteToken: !!inviteToken,
             relayKey: previewValue(joinRelayKey, 16),
             relayUrlPreview: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
+            relayUrlEndpoint: summarizeEndpointUrl(joinRelayUrl),
             relayUrlPresent: !!joinRelayUrl,
             hostPeersCount: hostPeers.length,
+            hostPeersPreview: hostPeers.slice(0, 8),
+            authoritativeHostPeerCount: authoritativeHostPeers.length,
+            authoritativeHostPeerPreview: authoritativeHostPeers.slice(0, 8),
             leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
+            leaseReplicaPeerPreview: leaseReplicaPeerKeys.slice(0, 8),
+            explicitHostPeersCount: explicitHostPeers.length,
+            explicitHostPeersPreview: explicitHostPeers.slice(0, 8),
+            topicDiscoveredPeerCount: topicDiscoveredPeerKeys.length,
+            topicDiscoveredPeerPreview: topicDiscoveredPeerKeys.slice(0, 8),
             hasWriterLeaseEnvelope: !!writerLeaseEnvelope,
             hasDiscoveryTopic: !!discoveryTopic,
             hasBlindPeer: !!blindPeer?.publicKey,
@@ -8243,7 +8384,13 @@ async function handleMessageObject(message) {
             writerCoreRefsCount: writerCoreRefs.length,
             hasWriterSecret: !!writerSecret,
             writerLeaseId: previewValue(writerLeaseId, 24),
-            writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint)
+            writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
+            relayUrlEndpoint: summarizeEndpointUrl(joinRelayUrl),
+            hostPeersPreview: hostPeers.slice(0, 8),
+            authoritativeHostPeersPreview: authoritativeHostPeers.slice(0, 8),
+            explicitHostPeersPreview: explicitHostPeers.slice(0, 8),
+            topicDiscoveredPeerPreview: topicDiscoveredPeerKeys.slice(0, 8),
+            gatewayOrigins
           })
           sendMessage({
             type: 'JOIN_DISCOVERY_SOURCES',
@@ -8290,9 +8437,11 @@ async function handleMessageObject(message) {
               candidatePeers,
               diagnostics: candidateDiagnostics
             } = buildProbeCandidatePeers({
-              hostPeerKeys: hostPeers,
-              leaseReplicaPeerKeys,
-              topicPeerKeys: topicDiscoveredPeerKeys,
+              hostPeerKeys: gatewayMode === 'disabled' ? authoritativeHostPeers : hostPeers,
+              authoritativeHostPeerKeys: authoritativeHostPeers,
+              leaseReplicaPeerKeys: gatewayMode === 'disabled' ? [] : leaseReplicaPeerKeys,
+              topicPeerKeys: gatewayMode === 'disabled' ? [] : topicDiscoveredPeerKeys,
+              directJoinOnly: gatewayMode === 'disabled',
               capabilityByPeer,
               maxCandidates: JOIN_MAX_PROBE_CANDIDATES
             })
@@ -8304,7 +8453,8 @@ async function handleMessageObject(message) {
                 publicIdentifier,
                 relayKey: previewValue(joinRelayKey, 16),
                 candidateCount: candidatePeers.length,
-                candidatePreview: candidateDiagnostics.slice(0, 6)
+                candidatePreview: candidateDiagnostics.slice(0, 12),
+                candidateDiagnostics
               })
               const probeStartedAt = Date.now()
               const probeResults = await Promise.all(
@@ -8328,6 +8478,18 @@ async function handleMessageObject(message) {
                   }))
                   const completedAt = Date.now()
                   const data = probe?.data && typeof probe.data === 'object' ? probe.data : {}
+                  const expectedRelayKeyForProbe = normalizeRelayKeyHex(joinRelayKey || discoveryHints?.relayKey || null)
+                  const responseRelayKey = normalizeRelayKeyHex(data?.relayKey || data?.relay_key || null)
+                  const expectedIdentifierForProbe = normalizeRelayIdentifierForMatch(
+                    publicIdentifier || discoveryHints?.publicIdentifier || null
+                  )
+                  const responseIdentifier = normalizeRelayIdentifierForMatch(
+                    data?.publicIdentifier || data?.public_identifier || null
+                  )
+                  const relayIdentityMatch = (
+                    (!expectedRelayKeyForProbe || !responseRelayKey || responseRelayKey === expectedRelayKeyForProbe)
+                    && (!expectedIdentifierForProbe || !responseIdentifier || responseIdentifier === expectedIdentifierForProbe)
+                  )
                   const mode = data?.canDirectChallenge === true
                     ? 'direct-challenge'
                     : data?.hasMatchingLease === true
@@ -8335,9 +8497,10 @@ async function handleMessageObject(message) {
                       : data?.canProvisionOpenWriter === true
                         ? 'direct-provision'
                         : null
-                  const writerGuaranteed = openJoin
+                  const writerGuaranteedByCapability = openJoin
                     ? (data?.canDirectChallenge === true || data?.canProvisionOpenWriter === true)
                     : (data?.canDirectChallenge === true || data?.hasMatchingLease === true)
+                  const writerGuaranteed = relayIdentityMatch && writerGuaranteedByCapability
                   const payload = {
                     peerKey,
                     success: probe?.success === true,
@@ -8348,6 +8511,11 @@ async function handleMessageObject(message) {
                     completedAt,
                     mode,
                     writerGuaranteed,
+                    relayIdentityMatch,
+                    expectedRelayKey: expectedRelayKeyForProbe,
+                    responseRelayKey,
+                    expectedIdentifier: expectedIdentifierForProbe,
+                    responseIdentifier,
                     data
                   }
                   sendMessage({
@@ -8360,6 +8528,7 @@ async function handleMessageObject(message) {
                       rttMs: payload.rttMs,
                       mode,
                       writerGuaranteed,
+                      relayIdentityMatch,
                       statusCode: payload.statusCode,
                       error: payload.error
                     }
@@ -8372,6 +8541,11 @@ async function handleMessageObject(message) {
                     supported: payload.supported,
                     mode: payload.mode,
                     writerGuaranteed: payload.writerGuaranteed,
+                    relayIdentityMatch: payload.relayIdentityMatch,
+                    expectedRelayKey: previewValue(payload.expectedRelayKey, 16),
+                    responseRelayKey: previewValue(payload.responseRelayKey, 16),
+                    expectedIdentifier: payload.expectedIdentifier || null,
+                    responseIdentifier: payload.responseIdentifier || null,
                     statusCode: payload.statusCode || null,
                     error: payload.error || null,
                     rttMs: payload.rttMs
@@ -8418,6 +8592,17 @@ async function handleMessageObject(message) {
                   discoveryWindowMs: JOIN_DISCOVERY_WINDOW_MS,
                   probeElapsedMs: windowElapsed
                 }
+              })
+            } else {
+              console.warn('[Worker] Join probe skipped: no candidate peers resolved', {
+                publicIdentifier,
+                relayKey: previewValue(joinRelayKey, 16),
+                hostPeersCount: hostPeers.length,
+                authoritativeHostPeerCount: authoritativeHostPeers.length,
+                authoritativeHostPeerPreview: authoritativeHostPeers.slice(0, 8),
+                leaseReplicaPeerCount: leaseReplicaPeerKeys.length,
+                topicDiscoveredPeerCount: topicDiscoveredPeerKeys.length,
+                diagnostics: candidateDiagnostics
               })
             }
 
@@ -8941,7 +9126,11 @@ async function handleMessageObject(message) {
                   ...(selectedJoinPeerKey ? [selectedJoinPeerKey] : []),
                   ...probeValidatedPeerKeys
                 ])
-                : undefined
+                : (
+                  gatewayMode === 'disabled' && authoritativeHostPeers.length
+                    ? authoritativeHostPeers
+                    : undefined
+                )
             )
             : hostPeers
           const discoveryHintLeaseReplicaPeersForStore = joinDirectDiscoveryV2
@@ -8980,8 +9169,14 @@ async function handleMessageObject(message) {
             hasInviteToken: !!inviteToken,
             relayKey: previewValue(joinRelayKey, 16),
             relayUrlPreview: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
+            relayUrlEndpoint: summarizeEndpointUrl(joinRelayUrl),
             relayUrlPresent: !!joinRelayUrl,
             hostPeersCount: hostPeers.length,
+            hostPeersPreview: hostPeers.slice(0, 8),
+            authoritativeHostPeerCount: authoritativeHostPeers.length,
+            authoritativeHostPeerPreview: authoritativeHostPeers.slice(0, 8),
+            probeValidatedPeerCount: probeValidatedPeerKeys.length,
+            probeValidatedPeerPreview: probeValidatedPeerKeys.slice(0, 8),
             hasBlindPeer: !!blindPeer?.publicKey,
             coreRefsCount: coreRefs.length,
             coreRefsPreview: summarizeCoreRefs(coreRefs),
@@ -8992,7 +9187,9 @@ async function handleMessageObject(message) {
             writerLeaseId: previewValue(writerLeaseId, 24),
             writerCommitCheckpoint: summarizeWriterCommitCheckpoint(writerCommitCheckpoint),
             hasFastForward: !!fastForward,
-            gatewayMode
+            gatewayMode,
+            selectedJoinPathMode: selectedJoinPathMode || null,
+            selectedJoinPeerKey: selectedJoinPeerKey || null
           })
           emitJoinGatewayTrace('join-flow-resolved', joinGatewayTraceContext, {
             publicIdentifier,
@@ -9001,6 +9198,7 @@ async function handleMessageObject(message) {
             relayKey: previewValue(joinRelayKey, 16),
             relayUrlPresent: !!joinRelayUrl,
             hostPeersCount: hostPeers.length,
+            authoritativeHostPeerCount: authoritativeHostPeers.length,
             hasBlindPeer: !!blindPeer?.publicKey,
             coreRefsCount: coreRefs.length,
             writerCoreRefsCount: writerCoreRefs.length,
@@ -9133,7 +9331,33 @@ async function handleMessageObject(message) {
           }
 
           ensureJoinBudget('start-join-auth', 1000)
-          let joinAuthResult = await runStartJoinAuthentication(buildJoinAuthPayload())
+          const initialJoinAuthPayload = buildJoinAuthPayload()
+          console.info('[Worker] Start join authentication dispatch', {
+            publicIdentifier,
+            relayKey: previewValue(joinRelayKey, 16),
+            relayUrlPreview: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
+            relayUrlEndpoint: summarizeEndpointUrl(joinRelayUrl),
+            gatewayMode,
+            gatewayOrigins,
+            joinPathMode: selectedJoinPathMode || null,
+            selectedDirectPeerKey: selectedJoinPeerKey || null,
+            hostPeerCount: Array.isArray(initialJoinAuthPayload.hostPeerKeys)
+              ? initialJoinAuthPayload.hostPeerKeys.length
+              : 0,
+            hostPeerPreview: Array.isArray(initialJoinAuthPayload.hostPeerKeys)
+              ? initialJoinAuthPayload.hostPeerKeys.slice(0, 8)
+              : [],
+            leaseReplicaPeerCount: Array.isArray(initialJoinAuthPayload.leaseReplicaPeerKeys)
+              ? initialJoinAuthPayload.leaseReplicaPeerKeys.length
+              : 0,
+            hasBlindPeer: !!initialJoinAuthPayload?.blindPeer?.publicKey,
+            hasWriterSecret: !!initialJoinAuthPayload.writerSecret,
+            writerCorePrefix: previewValue(initialJoinAuthPayload.writerCore, 16),
+            writerCoreHexPrefix: previewValue(initialJoinAuthPayload.writerCoreHex || initialJoinAuthPayload.autobaseLocal, 16),
+            writerLeaseId: previewValue(initialJoinAuthPayload.writerLeaseId, 24),
+            writerCommitCheckpoint: summarizeWriterCommitCheckpoint(initialJoinAuthPayload.writerCommitCheckpoint)
+          })
+          let joinAuthResult = await runStartJoinAuthentication(initialJoinAuthPayload)
           if (joinAuthResult?.ok === false) {
             const joinAuthError = String(joinAuthResult?.error || '')
             const closedJoinPending =
@@ -9256,12 +9480,32 @@ async function handleMessageObject(message) {
               })
 
               ensureJoinBudget('start-join-auth-fallback', 1000)
-              joinAuthResult = await runStartJoinAuthentication(
-                buildJoinAuthPayload({
-                  hostPeers: [],
-                  hostPeerKeys: []
-                })
-              )
+              const fallbackJoinAuthPayload = buildJoinAuthPayload({
+                hostPeers: [],
+                hostPeerKeys: []
+              })
+              console.info('[Worker] Start join authentication fallback dispatch', {
+                publicIdentifier,
+                relayKey: previewValue(joinRelayKey, 16),
+                relayUrlPreview: joinRelayUrl ? String(joinRelayUrl).slice(0, 80) : null,
+                relayUrlEndpoint: summarizeEndpointUrl(joinRelayUrl),
+                gatewayMode,
+                gatewayOrigins,
+                joinPathMode: 'open-offline-fallback',
+                hostPeerCount: 0,
+                hasBlindPeer: !!fallbackJoinAuthPayload?.blindPeer?.publicKey,
+                hasWriterSecret: !!fallbackJoinAuthPayload.writerSecret,
+                writerCorePrefix: previewValue(fallbackJoinAuthPayload.writerCore, 16),
+                writerCoreHexPrefix: previewValue(
+                  fallbackJoinAuthPayload.writerCoreHex || fallbackJoinAuthPayload.autobaseLocal,
+                  16
+                ),
+                writerLeaseId: previewValue(fallbackJoinAuthPayload.writerLeaseId, 24),
+                writerCommitCheckpoint: summarizeWriterCommitCheckpoint(
+                  fallbackJoinAuthPayload.writerCommitCheckpoint
+                )
+              })
+              joinAuthResult = await runStartJoinAuthentication(fallbackJoinAuthPayload)
             }
           }
 

@@ -697,6 +697,94 @@ function buildCanonicalRelayUrl(identifier, authToken = null, cfg = config) {
   return token ? `${baseUrl}?token=${token}` : baseUrl;
 }
 
+function isLoopbackHostname(hostname) {
+  if (typeof hostname !== 'string') return false;
+  const normalized = hostname.trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1' || normalized === '[::1]';
+}
+
+function toWebsocketOrigin(value) {
+  if (!value || typeof value !== 'string') return null;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
+    else if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
+    if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') return null;
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function buildAdvertisedRelayWsUrl({
+  publicIdentifier,
+  gatewayOrigin = null,
+  cfg = config
+} = {}) {
+  const normalizedIdentifier = normalizeRelayIdentifier(publicIdentifier || '') || String(publicIdentifier || '').trim();
+  if (!normalizedIdentifier) return null;
+  const identifierPath = normalizedIdentifier.includes(':')
+    ? normalizedIdentifier.replace(':', '/')
+    : normalizedIdentifier;
+
+  const protocol = getGatewayWebsocketProtocol(cfg);
+  const candidates = [
+    toWebsocketOrigin(gatewayOrigin),
+    toWebsocketOrigin(cfg?.relay_public_ws_base || process?.env?.RELAY_PUBLIC_WS_BASE || null),
+    (
+      typeof (cfg?.proxy_public_server_address || process?.env?.PROXY_PUBLIC_SERVER_ADDRESS) === 'string'
+      && (cfg?.proxy_public_server_address || process?.env?.PROXY_PUBLIC_SERVER_ADDRESS).trim()
+    )
+      ? `${protocol}://${(cfg?.proxy_public_server_address || process?.env?.PROXY_PUBLIC_SERVER_ADDRESS).trim()}`
+      : null,
+    `${protocol}://${cfg?.proxy_server_address || 'localhost'}`
+  ].filter(Boolean);
+
+  let fallback = null;
+  for (const base of candidates) {
+    if (typeof base !== 'string') continue;
+    const candidate = `${base.replace(/\/$/, '')}/${identifierPath}`;
+    if (!fallback) fallback = candidate;
+    const summary = summarizeEndpointUrl(candidate);
+    if (!isLoopbackHostname(summary.hostname)) {
+      return candidate;
+    }
+  }
+
+  return fallback;
+}
+
+function summarizeEndpointUrl(candidate) {
+  if (!candidate || typeof candidate !== 'string') {
+    return {
+      raw: candidate || null,
+      protocol: null,
+      hostname: null,
+      port: null,
+      pathname: null
+    };
+  }
+  try {
+    const parsed = new URL(candidate);
+    return {
+      raw: candidate,
+      protocol: parsed.protocol || null,
+      hostname: parsed.hostname || null,
+      port: parsed.port || null,
+      pathname: parsed.pathname || null
+    };
+  } catch (_error) {
+    return {
+      raw: candidate,
+      protocol: null,
+      hostname: null,
+      port: null,
+      pathname: null
+    };
+  }
+}
+
 function previewValue(value, limit = 16) {
   if (!value) return null;
   const str = String(value);
@@ -858,6 +946,8 @@ export async function initializeRelayServer(customConfig = {}) {
     proxy_publicKey: customConfig.proxy_publicKey || generateHexKey(),
     proxy_seed: customConfig.proxy_seed || generateHexKey(),
     proxy_server_address: customConfig.proxy_server_address || defaultProxyHost,
+    proxy_public_server_address: customConfig.proxy_public_server_address || process.env.PROXY_PUBLIC_SERVER_ADDRESS || null,
+    relay_public_ws_base: customConfig.relay_public_ws_base || process.env.RELAY_PUBLIC_WS_BASE || null,
     proxy_websocket_protocol: customConfig.proxy_websocket_protocol || defaultProxyProtocol,
     gatewayUrl: customConfig.gatewayUrl || defaultGatewayUrl,
     registerWithGateway: customConfig.registerWithGateway ?? true,
@@ -872,6 +962,8 @@ export async function initializeRelayServer(customConfig = {}) {
   
   console.log('[RelayServer] Configuration:', {
     proxy_server_address: config.proxy_server_address,
+    proxy_public_server_address: config.proxy_public_server_address || null,
+    relay_public_ws_base: config.relay_public_ws_base || null,
     gatewayUrl: config.gatewayUrl,
     registerWithGateway: config.registerWithGateway,
     registerInterval: config.registerInterval,
@@ -1566,8 +1658,7 @@ export async function discoverPeersOnTopic({
       .map((value) => normalizeHex64(value))
       .filter(Boolean);
     const newlyConnected = connectedKeys.filter((value) => !before.has(value));
-    const ordered = [...newlyConnected, ...connectedKeys.filter((value) => !newlyConnected.includes(value))];
-    return Array.from(new Set(ordered)).slice(0, peerCap);
+    return Array.from(new Set(newlyConnected)).slice(0, peerCap);
   } finally {
     try {
       joinHandle.destroy();
@@ -4013,14 +4104,19 @@ function buildCreateRelayBootstrapDraftEvents({
   if (normalizedGatewayOrigin) metadataTags.push([HYPERTUNA_GATEWAY_ORIGIN_TAG, normalizedGatewayOrigin]);
   if (directJoinOnlyEnabled) metadataTags.push([HYPERTUNA_DIRECT_JOIN_ONLY_TAG, '1']);
 
-  if (isPublic && isOpen) {
+  const includeTopicHints = isPublic && isOpen;
+  const includePeerHints = includeTopicHints || directJoinOnlyEnabled;
+
+  if (includeTopicHints) {
     const topic = typeof discoveryTopic === 'string' && discoveryTopic.trim()
       ? discoveryTopic.trim()
       : deriveRelayDiscoveryTopic(canonicalIdentifier);
     if (topic) {
       metadataTags.push(['hypertuna-topic', topic]);
     }
+  }
 
+  if (includePeerHints) {
     const normalizedHostPeers = Array.from(
       new Set(
         (Array.isArray(hostPeerKeys) ? hostPeerKeys : [])
@@ -4181,7 +4277,8 @@ async function publishCreateRelayBootstrapEvents({
   picture,
   gatewayOrigin = null,
   gatewayId = null,
-  directJoinOnly = false
+  directJoinOnly = false,
+  relayWsUrlOverride = null
 }) {
   const canonicalIdentifier = normalizeRelayIdentifier(publicIdentifier || relayKey || '');
   if (!canonicalIdentifier) {
@@ -4201,7 +4298,14 @@ async function publishCreateRelayBootstrapEvents({
     };
   }
 
-  const relayWsUrl = `${buildGatewayWebsocketBase(config)}/${canonicalIdentifier.replace(':', '/')}`;
+  const relayWsUrl =
+    (typeof relayWsUrlOverride === 'string' && relayWsUrlOverride.trim())
+      ? relayWsUrlOverride.trim()
+      : buildAdvertisedRelayWsUrl({
+        publicIdentifier: canonicalIdentifier,
+        gatewayOrigin,
+        cfg: config
+      });
   const discoveryTopic = deriveRelayDiscoveryTopic(canonicalIdentifier);
   const hostPeerKeys = config?.swarmPublicKey ? [config.swarmPublicKey] : [];
   const writerIssuerPubkey = config?.nostr_pubkey_hex || adminPubkey || null;
@@ -6273,6 +6377,11 @@ export async function createRelay(options) {
         // Update the result object with the definitive token and URL.
         result.authToken = authToken;
         result.relayUrl = `${buildGatewayWebsocketBase(config)}/${result.publicIdentifier.replace(':', '/')}?token=${authToken}`;
+        result.discoveryRelayWsUrl = buildAdvertisedRelayWsUrl({
+          publicIdentifier: result.publicIdentifier,
+          gatewayOrigin: normalizedGatewayOrigin,
+          cfg: config
+        });
 
         await publishMemberAddEvent(result.publicIdentifier, adminPubkey, authToken, subnetHashes, 'admin');
         console.log(`[RelayServer] Auto-authorized creator ${adminPubkey.substring(0, 8)}...`);
@@ -6308,6 +6417,14 @@ export async function createRelay(options) {
       });
     }
     result.gatewayRegistration = registrationStatus;
+
+    if (!result.discoveryRelayWsUrl && result.publicIdentifier) {
+      result.discoveryRelayWsUrl = buildAdvertisedRelayWsUrl({
+        publicIdentifier: result.publicIdentifier,
+        gatewayOrigin: normalizedGatewayOrigin,
+        cfg: config
+      });
+    }
 
     try {
       const relayWaitResult = await waitForRelayWriterActivation({
@@ -6376,6 +6493,7 @@ export async function createRelay(options) {
       relayWsUrl: result.publicIdentifier
         ? `${buildGatewayWebsocketBase(config)}/${String(result.publicIdentifier).replace(':', '/')}`
         : null,
+      publishedRelayWsUrl: result.discoveryRelayWsUrl || null,
       error: null
     };
 
@@ -6398,14 +6516,15 @@ export async function createRelay(options) {
         picture,
         gatewayOrigin: normalizedGatewayOrigin,
         gatewayId: normalizedGatewayId,
-        directJoinOnly: relayDirectJoinOnly
+        directJoinOnly: relayDirectJoinOnly,
+        relayWsUrlOverride: result.discoveryRelayWsUrl || null
       });
       bootstrapPublish.status = bootstrapResult.ok ? 'success' : 'failed';
       bootstrapPublish.attempt = bootstrapResult.attempt || 0;
       bootstrapPublish.publishedKinds = (bootstrapResult.published || []).map((entry) => entry.kind);
       bootstrapPublish.eventIds = (bootstrapResult.published || []).map((entry) => entry.id);
       bootstrapPublish.relayIdentifier = bootstrapResult.relayIdentifier || bootstrapPublish.relayIdentifier;
-      bootstrapPublish.relayWsUrl = bootstrapResult.relayWsUrl || bootstrapPublish.relayWsUrl;
+      bootstrapPublish.publishedRelayWsUrl = bootstrapResult.relayWsUrl || bootstrapPublish.publishedRelayWsUrl;
       bootstrapPublish.error = bootstrapResult.error || null;
 
       console.log('[RelayServer] Create relay bootstrap publish complete', {
@@ -6427,6 +6546,9 @@ export async function createRelay(options) {
     }
 
     result.bootstrapPublish = bootstrapPublish;
+    if (!result.discoveryRelayWsUrl && bootstrapPublish.publishedRelayWsUrl) {
+      result.discoveryRelayWsUrl = bootstrapPublish.publishedRelayWsUrl;
+    }
     result.discoveryTopic = deriveRelayDiscoveryTopic(result.publicIdentifier || result.relayKey || null);
     result.hostPeerKeys = config?.swarmPublicKey ? [String(config.swarmPublicKey).toLowerCase()] : [];
     result.leaseReplicaPeerKeys = [...result.hostPeerKeys];
@@ -6445,6 +6567,9 @@ export async function createRelay(options) {
     console.log('[RelayServer][Checkpoint] create-return', {
       relayKey: result.relayKey,
       publicIdentifier: result.publicIdentifier || null,
+      relayUrl: result.relayUrl || null,
+      discoveryRelayWsUrl: result.discoveryRelayWsUrl || null,
+      discoveryRelayEndpoint: summarizeEndpointUrl(result.discoveryRelayWsUrl || null),
       gatewayRegistration: result.gatewayRegistration || null,
       registrationError: result.registrationError || null,
       writable: result.writable ?? null
@@ -6829,9 +6954,16 @@ export async function startJoinAuthentication(options) {
     hasFastForward: !!fastForward,
     expectedWriterSource,
     expectedWriterKeyHex,
+    gatewayWebsocketBase: buildGatewayWebsocketBase(config),
+    gatewayWebsocketProtocol: getGatewayWebsocketProtocol(config),
+    proxyServerAddress: config?.proxy_server_address || null,
+    gatewayHttpUrl: config?.gatewayUrl || null,
+    inviteRelayUrlPreview: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 120) : null,
+    inviteRelayEndpoint: summarizeEndpointUrl(inviteRelayUrl),
     coreRefsCount: resolvedCoreRefs.length,
     writerCoreRefsCount: writerCoreRefsForJoin.length,
     hostPeersCount: Array.isArray(hostPeerList) ? hostPeerList.length : 0,
+    hostPeersPreview: Array.isArray(hostPeerList) ? hostPeerList.slice(0, 8) : [],
     blindPeer: !!blindPeer,
     inviteRelayKey,
     openJoin,
@@ -6944,6 +7076,24 @@ export async function startJoinAuthentication(options) {
       : [];
 
     const blindPeerKey = blindPeer?.publicKey ? String(blindPeer.publicKey).trim().toLowerCase() : null;
+
+    console.log('[RelayServer] Join endpoint candidates', {
+      publicIdentifier,
+      gatewayMode: normalizedGatewayMode,
+      joinPathMode: normalizedJoinPathMode,
+      selectedDirectPeerKey: requestedDirectPeerKey || null,
+      inviteRelayUrlPreview: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 120) : null,
+      inviteRelayEndpoint: summarizeEndpointUrl(inviteRelayUrl),
+      hostPeersCount: hostPeers.length,
+      hostPeersPreview: hostPeers.slice(0, 10),
+      blindPeerKey: blindPeerKey ? blindPeerKey.slice(0, 16) : null,
+      directDiscoveryV2Enabled,
+      hasVerifiedDirectPathLock,
+      blockUnverifiedDirectLoop,
+      closedLeaseDirectPath,
+      openGatewayBootstrapPath,
+      closedInviteOfflineFallbackPath
+    });
 
     if (!hostPeers.length && !inviteToken && !openJoin) {
       throw new Error('No hosting peers discovered for this relay');
@@ -7334,6 +7484,18 @@ export async function startJoinAuthentication(options) {
         const baseUrl = `${gatewayBase}/${identifierPath}`;
         const connectionUrl = inviteToken ? `${baseUrl}?token=${inviteToken}` : baseUrl;
         const resolvedRelayUrl = inviteRelayUrl || connectionUrl;
+        console.log('[RelayServer] Invite fallback relay URL resolution', {
+          publicIdentifier,
+          relayKey: fallbackRelayKey,
+          inviteRelayUrlPreview: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 120) : null,
+          inviteRelayEndpoint: summarizeEndpointUrl(inviteRelayUrl),
+          generatedConnectionUrl: connectionUrl ? String(connectionUrl).slice(0, 120) : null,
+          generatedEndpoint: summarizeEndpointUrl(connectionUrl),
+          resolvedRelayUrl: resolvedRelayUrl ? String(resolvedRelayUrl).slice(0, 120) : null,
+          resolvedEndpoint: summarizeEndpointUrl(resolvedRelayUrl),
+          proxyServerAddress: config?.proxy_server_address || null,
+          gatewayHttpUrl: config?.gatewayUrl || null
+        });
 
         if (relayWaitResult?.writable === true && global.sendMessage) {
           console.log('[RelayServer] Emitting relay-writable (invite fallback)', {
@@ -7650,6 +7812,18 @@ export async function startJoinAuthentication(options) {
         const baseUrl = `${gatewayBase}/${identifierPath}`;
         const connectionUrl = provisionalToken ? `${baseUrl}?token=${provisionalToken}` : baseUrl;
         const resolvedRelayUrl = inviteRelayUrl || connectionUrl;
+        console.log('[RelayServer] Open-offline relay URL resolution', {
+          publicIdentifier,
+          relayKey: fallbackRelayKey,
+          inviteRelayUrlPreview: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 120) : null,
+          inviteRelayEndpoint: summarizeEndpointUrl(inviteRelayUrl),
+          generatedConnectionUrl: connectionUrl ? String(connectionUrl).slice(0, 120) : null,
+          generatedEndpoint: summarizeEndpointUrl(connectionUrl),
+          resolvedRelayUrl: resolvedRelayUrl ? String(resolvedRelayUrl).slice(0, 120) : null,
+          resolvedEndpoint: summarizeEndpointUrl(resolvedRelayUrl),
+          proxyServerAddress: config?.proxy_server_address || null,
+          gatewayHttpUrl: config?.gatewayUrl || null
+        });
 
         if (relayWaitResult?.writable === true && global.sendMessage) {
           console.log('[RelayServer] Emitting relay-writable (open join offline)', {
@@ -7912,6 +8086,16 @@ export async function startJoinAuthentication(options) {
     const finalExpectedWriterSource = directExpectedWriter.source;
     const finalExpectedWriterKeyHex = resolveWriterKeyHex(finalExpectedWriterKey);
     const canonicalRelayUrl = buildCanonicalRelayUrl(finalIdentifier, authToken, config);
+    console.log('[RelayServer] Direct join relay URL resolution', {
+      publicIdentifier: finalIdentifier,
+      relayKey,
+      remoteRelayUrl: relayUrl ? String(relayUrl).slice(0, 120) : null,
+      remoteRelayEndpoint: summarizeEndpointUrl(relayUrl),
+      canonicalRelayUrl: canonicalRelayUrl ? String(canonicalRelayUrl).slice(0, 120) : null,
+      canonicalRelayEndpoint: summarizeEndpointUrl(canonicalRelayUrl),
+      proxyServerAddress: config?.proxy_server_address || null,
+      gatewayHttpUrl: config?.gatewayUrl || null
+    });
     if (relayUrl && canonicalRelayUrl && relayUrl !== canonicalRelayUrl) {
       console.log('[RelayServer] Normalizing relay URL from verify response', {
         publicIdentifier: finalIdentifier,

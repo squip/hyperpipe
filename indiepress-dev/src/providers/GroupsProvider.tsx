@@ -3564,6 +3564,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       }
 
       const relayWsUrl = getBaseRelayUrl(authenticatedRelayUrl)
+      const discoveryRelayWsUrl = getBaseRelayUrl(
+        typeof result.discoveryRelayWsUrl === 'string' && result.discoveryRelayWsUrl.trim()
+          ? result.discoveryRelayWsUrl
+          : relayWsUrl
+      )
       const discoveryTopic =
         typeof result.discoveryTopic === 'string' && result.discoveryTopic.trim()
           ? result.discoveryTopic.trim()
@@ -3596,7 +3601,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           isPublic,
           isOpen,
           fileSharing,
-          relayWsUrl,
+          relayWsUrl: discoveryRelayWsUrl,
           pictureTagUrl: picture,
           gatewayOrigin: normalizedGatewayOrigin,
           gatewayId: normalizedGatewayId,
@@ -3631,7 +3636,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       const workerBootstrap = result?.bootstrapPublish
       const workerBootstrapRelayUrl =
-        resolveRelayUrl(workerBootstrap?.relayWsUrl || authenticatedRelayUrl) ||
+        resolveRelayUrl(authenticatedRelayUrl) ||
         authenticatedRelayUrl
       console.info('[GroupsProvider] create bootstrap worker status', {
         groupId: publicIdentifier,
@@ -3639,7 +3644,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         status: workerBootstrap?.status || 'unknown',
         attempt: workerBootstrap?.attempt ?? null,
         publishedKinds: workerBootstrap?.publishedKinds || [],
-        error: workerBootstrap?.error || null
+        error: workerBootstrap?.error || null,
+        discoveryRelayWsUrl
       })
 
       console.info('[GroupsProvider] create bootstrap verify start', {

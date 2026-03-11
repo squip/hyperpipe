@@ -131,10 +131,14 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   if (args.directJoinOnly === true) {
     metadataTags.push([HYPERTUNA_DIRECT_JOIN_ONLY_TAG, '1'])
   }
-  if (args.isPublic && args.isOpen) {
+  const includeTopicHints = args.isPublic && args.isOpen
+  const includePeerHints = includeTopicHints || args.directJoinOnly === true
+  if (includeTopicHints) {
     if (typeof args.discoveryTopic === 'string' && args.discoveryTopic.trim()) {
       metadataTags.push([HYPERTUNA_TOPIC_TAG, args.discoveryTopic.trim()])
     }
+  }
+  if (includePeerHints) {
     const hostPeerKeys = Array.from(
       new Set(
         (Array.isArray(args.hostPeerKeys) ? args.hostPeerKeys : [])
