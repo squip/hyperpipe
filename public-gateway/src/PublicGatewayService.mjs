@@ -1452,6 +1452,36 @@ class PublicGatewayService {
     }
   }
 
+  #parseMirrorFastForwardTarget(query = null) {
+    const source = query && typeof query === 'object' ? query : {};
+    const rawTargetCoreKey =
+      source.targetCoreKey
+      || source.target_core_key
+      || source.checkpointSystemKey
+      || source.checkpoint_system_key
+      || null;
+    const targetCoreKey = normalizeCoreRefString(rawTargetCoreKey);
+    const rawSignedLength =
+      source.targetSignedLength
+      || source.target_signed_length
+      || source.checkpointSystemSignedLength
+      || source.checkpoint_system_signed_length
+      || null;
+    const parsedSignedLength = Number(rawSignedLength);
+    const targetSignedLength = Number.isFinite(parsedSignedLength)
+      ? Math.max(0, Math.trunc(parsedSignedLength))
+      : null;
+    if (!targetCoreKey && targetSignedLength === null) return null;
+    return {
+      targetCoreKey: targetCoreKey || null,
+      targetSignedLength,
+      checkpoint: {
+        systemKey: targetCoreKey || null,
+        systemSignedLength: targetSignedLength
+      }
+    };
+  }
+
   #extractTagValue(tags, key) {
     if (!Array.isArray(tags)) return null;
     for (const tag of tags) {
@@ -4340,6 +4370,7 @@ class PublicGatewayService {
 
   async #handleRelayMirrorMetadata(req, res) {
     const identifier = req.params?.relayKey;
+    const mirrorTarget = this.#parseMirrorFastForwardTarget(req?.query || null);
     const trace = this.#ensureRequestTrace(req, res, {
       route: 'mirror',
       relayIdentifier: identifier || null
@@ -4356,7 +4387,11 @@ class PublicGatewayService {
       return fail(400, 'relayKey is required', 'warn');
     }
     this.#logJoinTrace('info', 'mirror-request', trace, {
-      identifier
+      identifier,
+      targetCoreKey: mirrorTarget?.targetCoreKey || null,
+      targetSignedLength: Number.isFinite(mirrorTarget?.targetSignedLength)
+        ? mirrorTarget.targetSignedLength
+        : null
     });
     try {
       const trimmedIdentifier = typeof identifier === 'string' ? identifier.trim() : null;
@@ -4365,7 +4400,13 @@ class PublicGatewayService {
         : (trimmedIdentifier ? 'alias' : 'unknown');
       this.logger?.info?.('[PublicGateway] Mirror metadata request', {
         identifier: trimmedIdentifier,
-        identifierType
+        identifierType,
+        targetCoreKey: mirrorTarget?.targetCoreKey
+          ? mirrorTarget.targetCoreKey.slice(0, 16)
+          : null,
+        targetSignedLength: Number.isFinite(mirrorTarget?.targetSignedLength)
+          ? mirrorTarget.targetSignedLength
+          : null
       });
       const resolved = trimmedIdentifier
         ? await this.#resolveOpenJoinRegistration(trimmedIdentifier)
@@ -4390,7 +4431,7 @@ class PublicGatewayService {
           if (poolPayload) {
             const enrichedPoolPayload = await this.#applyAuthoritativeMirrorFastForwardProof(
               poolRelayKey || trimmedIdentifier,
-              null,
+              mirrorTarget?.checkpoint || null,
               poolPayload
             );
             this.logger?.info?.('[PublicGateway] Mirror metadata resolved from open join pool', {
@@ -4447,7 +4488,7 @@ class PublicGatewayService {
           };
           payload = await this.#applyAuthoritativeMirrorFastForwardProof(
             canonicalRelayKey || relayKey || cached.relayKey || trimmedIdentifier,
-            null,
+            mirrorTarget?.checkpoint || null,
             payload
           );
           this.logger?.info?.('[PublicGateway] Mirror metadata resolved from cache', {
@@ -4481,7 +4522,7 @@ class PublicGatewayService {
       }
       payload = await this.#applyAuthoritativeMirrorFastForwardProof(
         relayKey || trimmedIdentifier,
-        null,
+        mirrorTarget?.checkpoint || null,
         payload
       );
       this.logger?.info?.('[PublicGateway] Mirror metadata resolved from registration', {

@@ -205,10 +205,23 @@ class PublicGatewayRegistrar {
     return response;
   }
 
-  async getMirrorMetadata(relayKey) {
+  async getMirrorMetadata(relayKey, options = {}) {
     if (!this.isEnabled()) return null;
     if (!relayKey) throw new Error('relayKey is required');
-    const url = new URL(`/api/relays/${encodeURIComponent(relayKey)}/mirror`, this.baseUrl).toString();
+    const url = new URL(`/api/relays/${encodeURIComponent(relayKey)}/mirror`, this.baseUrl);
+    const targetCoreKey = typeof options?.targetCoreKey === 'string'
+      ? options.targetCoreKey.trim()
+      : null;
+    const targetSignedLengthRaw = Number(options?.targetSignedLength);
+    const targetSignedLength = Number.isFinite(targetSignedLengthRaw)
+      ? Math.max(0, Math.trunc(targetSignedLengthRaw))
+      : null;
+    if (targetCoreKey) {
+      url.searchParams.set('targetCoreKey', targetCoreKey);
+    }
+    if (targetSignedLength !== null) {
+      url.searchParams.set('targetSignedLength', String(targetSignedLength));
+    }
     const response = await this.fetch(url, {
       method: 'GET',
       headers: {

@@ -280,6 +280,65 @@ function isCheckpointDurableAtMirror(checkpoint, fastForward = null) {
   return mirrorSignedLength >= checkpoint.systemSignedLength;
 }
 
+function selectDurabilityTargetCheckpoint(checkpoints = []) {
+  if (!Array.isArray(checkpoints) || checkpoints.length === 0) return null;
+  const keyed = checkpoints.filter((checkpoint) => !!checkpoint?.systemKey);
+  if (keyed.length === 0) return null;
+  keyed.sort((a, b) => {
+    const aLen = Number.isFinite(a?.systemSignedLength) ? Math.trunc(a.systemSignedLength) : -1;
+    const bLen = Number.isFinite(b?.systemSignedLength) ? Math.trunc(b.systemSignedLength) : -1;
+    return bLen - aLen;
+  });
+  return keyed[0] || null;
+}
+
+function classifyDurabilityGap(checkpoints = [], fastForward = null) {
+  const checkpointList = Array.isArray(checkpoints) ? checkpoints : [];
+  if (!checkpointList.length) {
+    return { reason: 'missing-writer-checkpoints' };
+  }
+  if (!fastForward || typeof fastForward !== 'object') {
+    return { reason: 'missing-mirror-fast-forward' };
+  }
+  const mirrorKey = normalizeCoreRefString(fastForward.key || fastForward.checkpointKey || null);
+  const mirrorSignedLength = Number.isFinite(fastForward.signedLength)
+    ? Math.trunc(fastForward.signedLength)
+    : (Number.isFinite(fastForward.length) ? Math.trunc(fastForward.length) : null);
+
+  for (const checkpoint of checkpointList) {
+    if (!checkpoint || typeof checkpoint !== 'object') continue;
+    if (checkpoint.systemKey && mirrorKey && checkpoint.systemKey !== mirrorKey) {
+      return {
+        reason: 'mirror-key-mismatch',
+        checkpoint: summarizeDurabilityCheckpoint(checkpoint),
+        mirror: summarizeMirrorFastForward(fastForward)
+      };
+    }
+    if (!Number.isFinite(checkpoint.systemSignedLength)) {
+      return {
+        reason: 'invalid-checkpoint-signed-length',
+        checkpoint: summarizeDurabilityCheckpoint(checkpoint),
+        mirror: summarizeMirrorFastForward(fastForward)
+      };
+    }
+    if (!Number.isFinite(mirrorSignedLength)) {
+      return {
+        reason: 'missing-mirror-signed-length',
+        checkpoint: summarizeDurabilityCheckpoint(checkpoint),
+        mirror: summarizeMirrorFastForward(fastForward)
+      };
+    }
+    if (mirrorSignedLength < checkpoint.systemSignedLength) {
+      return {
+        reason: 'mirror-behind-checkpoint',
+        checkpoint: summarizeDurabilityCheckpoint(checkpoint),
+        mirror: summarizeMirrorFastForward(fastForward)
+      };
+    }
+  }
+  return { reason: 'unknown-durability-gap' };
+}
+
 function delay(ms) {
   const waitMs = Number.isFinite(ms) && ms > 0 ? Math.trunc(ms) : 0;
   return new Promise((resolve) => setTimeout(resolve, waitMs));
@@ -2242,11 +2301,23 @@ export class GatewayService extends EventEmitter {
         if (durabilityGate.status !== 'ready' && durabilityGate.status !== 'skipped') {
           this.log('warn', `[PublicGateway] Open join pool durability gate blocked relay=${poolRelayKey}`, {
             status: durabilityGate.status,
+            reason: durabilityGate.reason || null,
             attempts: durabilityGate.attempts ?? null,
             timeoutMs: durabilityGate.timeoutMs ?? null,
             checkpoints: Array.isArray(durabilityGate.checkpoints)
               ? durabilityGate.checkpoints.map((checkpoint) => summarizeDurabilityCheckpoint(checkpoint))
               : null,
+            mirror: summarizeMirrorFastForward(durabilityGate.fastForward),
+            error: durabilityGate.error || null
+          });
+          this.log('warn', `[Worker][JOIN_CHECKPOINT_TRACE] open-join-pool-durability-blocked relay=${poolRelayKey}`, {
+            relayKey: poolRelayKey,
+            status: durabilityGate.status,
+            reason: durabilityGate.reason || null,
+            target: durabilityGate.target
+              ? summarizeDurabilityCheckpoint(durabilityGate.target)
+              : null,
+            checkpoint: durabilityGate.checkpoint || null,
             mirror: summarizeMirrorFastForward(durabilityGate.fastForward),
             error: durabilityGate.error || null
           });
@@ -2327,11 +2398,18 @@ export class GatewayService extends EventEmitter {
     let attempts = 0;
     let lastError = null;
     let lastFastForward = null;
+    let lastGap = classifyDurabilityGap(checkpoints, null);
+    const targetCheckpoint = selectDurabilityTargetCheckpoint(checkpoints);
 
     while ((Date.now() - startedAt) <= timeoutMs) {
       attempts += 1;
       try {
-        const mirrorPayload = await this.publicGatewayRegistrar.getMirrorMetadata(relayKey);
+        const mirrorPayload = await this.publicGatewayRegistrar.getMirrorMetadata(relayKey, {
+          targetCoreKey: targetCheckpoint?.systemKey || null,
+          targetSignedLength: Number.isFinite(targetCheckpoint?.systemSignedLength)
+            ? targetCheckpoint.systemSignedLength
+            : null
+        });
         const fastForward = mirrorPayload?.fastForward || mirrorPayload?.fast_forward || null;
         lastFastForward = fastForward || null;
         const durable = checkpoints.every((checkpoint) => isCheckpointDurableAtMirror(checkpoint, fastForward));
@@ -2343,16 +2421,24 @@ export class GatewayService extends EventEmitter {
             fastForward
           };
         }
+        lastGap = classifyDurabilityGap(checkpoints, fastForward);
       } catch (error) {
         lastError = error?.message || String(error);
+        lastGap = {
+          reason: 'mirror-fetch-error',
+          error: lastError
+        };
       }
       await delay(intervalMs);
     }
 
     return {
       status: 'timeout',
+      reason: lastGap?.reason || null,
       attempts,
       timeoutMs,
+      target: targetCheckpoint || null,
+      checkpoint: lastGap?.checkpoint || null,
       checkpoints,
       fastForward: lastFastForward,
       error: lastError
