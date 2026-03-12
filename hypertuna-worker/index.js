@@ -463,6 +463,36 @@ function deriveGatewayHostFromStatus(status) {
   }
 }
 
+function syncRuntimeGatewayEndpointFromStatus(status, source = 'gateway-status') {
+  if (!status?.running) return null
+
+  const { httpUrl, proxyHost, wsProtocol } = deriveGatewayHostFromStatus(status)
+
+  if (config && typeof config === 'object') {
+    config.gatewayUrl = httpUrl
+    config.proxy_server_address = proxyHost
+    config.proxy_websocket_protocol = wsProtocol
+  }
+
+  if (relayServer && typeof relayServer.applyRuntimeGatewayEndpoint === 'function') {
+    const result = relayServer.applyRuntimeGatewayEndpoint({
+      gatewayUrl: httpUrl,
+      proxyHost,
+      proxyWebsocketProtocol: wsProtocol
+    })
+    if (result?.changed) {
+      console.log('[Worker] Synced relay server runtime gateway endpoint', {
+        source,
+        gatewayUrl: result.gatewayUrl || null,
+        proxyServerAddress: result.proxyServerAddress || null,
+        proxyWebsocketProtocol: result.proxyWebsocketProtocol || null
+      })
+    }
+  }
+
+  return { httpUrl, proxyHost, wsProtocol }
+}
+
 async function initializeGatewayOptionsFromSettings() {
   try {
     await loadGatewaySettings()
@@ -1298,8 +1328,25 @@ async function syncActiveRelayCoreRefs({
   }
 
   const identifier = publicIdentifier || relayManager?.publicIdentifier || null
+  let mirrorEligible = true
+  if (manager?.started) {
+    const eligibility = await evaluateRelayMirrorEligibility({
+      relayKey,
+      publicIdentifier: identifier,
+      reason,
+      logSkip: true
+    })
+    mirrorEligible = eligibility.eligible
+    if (!mirrorEligible) {
+      await removeRelayMirrorTarget(manager, {
+        relayKey,
+        publicIdentifier: identifier,
+        reason: `${reason}-direct-join-only`
+      })
+    }
+  }
   const relayCorestore = relayManager?.store || null
-  if (manager?.started && !coreRefsAlreadySynced) {
+  if (manager?.started && mirrorEligible && !coreRefsAlreadySynced) {
     manager.ensureRelayMirror({
       relayKey,
       publicIdentifier: identifier,
@@ -1320,6 +1367,7 @@ async function syncActiveRelayCoreRefs({
   let primeSummary = null
   if (
     manager?.started
+    && mirrorEligible
     && typeof manager.primeRelayCoreRefs === 'function'
     && !coreRefsAlreadySynced
     && !isFastWriterSyncReason
@@ -1334,7 +1382,7 @@ async function syncActiveRelayCoreRefs({
     })
   }
 
-  const rehydrateSummary = manager?.started && !coreRefsAlreadySynced && !isFastWriterSyncReason
+  const rehydrateSummary = manager?.started && mirrorEligible && !coreRefsAlreadySynced && !isFastWriterSyncReason
     ? await rehydrateMirrorsWithRetry(manager, {
       reason,
       timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS,
@@ -1672,6 +1720,74 @@ async function resolveRelayGatewayRouting({
     directJoinOnly: false,
     route: route || null,
     source: 'unassigned'
+  }
+}
+
+async function evaluateRelayMirrorEligibility({
+  relayKey = null,
+  publicIdentifier = null,
+  reason = 'mirror',
+  logSkip = true
+} = {}) {
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey || null) || null
+  const normalizedPublicIdentifier =
+    typeof publicIdentifier === 'string' && publicIdentifier.trim()
+      ? publicIdentifier.trim()
+      : null
+  const relayIdentifier = normalizedRelayKey || normalizedPublicIdentifier || null
+  if (!relayIdentifier) {
+    return {
+      eligible: true,
+      relayKey: normalizedRelayKey,
+      publicIdentifier: normalizedPublicIdentifier,
+      directJoinOnly: false,
+      routing: null
+    }
+  }
+
+  const routing = await resolveRelayGatewayRouting({
+    relayIdentifier,
+    relayKey: normalizedRelayKey,
+    publicIdentifier: normalizedPublicIdentifier,
+    allowFallback: false
+  })
+  const directJoinOnly = routing?.directJoinOnly === true
+  if (directJoinOnly && logSkip) {
+    console.log('[Worker] Skipping relay mirror scheduling (direct-join-only)', {
+      relayKey: normalizedRelayKey || null,
+      publicIdentifier: normalizedPublicIdentifier || null,
+      reason,
+      source: routing?.source || null
+    })
+  }
+  return {
+    eligible: !directJoinOnly,
+    relayKey: normalizedRelayKey,
+    publicIdentifier: normalizedPublicIdentifier,
+    directJoinOnly,
+    routing
+  }
+}
+
+async function removeRelayMirrorTarget(manager, {
+  relayKey = null,
+  publicIdentifier = null,
+  reason = 'direct-join-only'
+} = {}) {
+  if (!manager?.started || typeof manager.removeRelayMirror !== 'function') return false
+  try {
+    return await manager.removeRelayMirror(
+      { relayKey, publicIdentifier },
+      { reason }
+    )
+  } catch (error) {
+    console.warn('[Worker] Failed to remove relay mirror target', {
+      relayKey: relayKey || null,
+      publicIdentifier: publicIdentifier || null,
+      reason,
+      error: error?.message || error
+    })
+    return false
   }
 }
 
@@ -2538,6 +2654,7 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null, optio
       : await relayServer.getActiveRelays()
 
     const entries = []
+    let eligibleRelayCount = 0
 
     for (const relay of activeRelays) {
       if (!relay) continue
@@ -2559,6 +2676,19 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null, optio
       const primaryIdentifier = publicIdentifier || relayKey
       if (!primaryIdentifier) continue
 
+      const routing = await resolveRelayGatewayRouting({
+        relayIdentifier: primaryIdentifier,
+        relayKey: relayKey || null,
+        publicIdentifier: publicIdentifier || null,
+        allowFallback: false
+      })
+      const directJoinOnly = routing.directJoinOnly === true
+      const hasGatewayOrigins = Array.isArray(routing.origins) && routing.origins.length > 0
+      if (!directJoinOnly && !hasGatewayOrigins) {
+        continue
+      }
+      eligibleRelayCount += 1
+
       const gatewayPath = normalizeGatewayPathFragment(resolveRelayIdentifierPath(primaryIdentifier))
       const effectiveConnectionUrl = connectionUrl || `${buildGatewayWebsocketBase(config)}/${gatewayPath || primaryIdentifier}`
 
@@ -2572,6 +2702,7 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null, optio
         isOpen: isOpen === true,
         isHosted: isHosted === true ? true : isHosted === false ? false : undefined,
         isJoined: isJoined === true ? true : isJoined === false ? false : undefined,
+        directJoinOnly,
         metadataUpdatedAt: createdAt || null,
         blindPeeringPublicKey: relayBlindPeeringKey || undefined
       }
@@ -2603,6 +2734,7 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null, optio
           isOpen: isOpen === true,
           isHosted: isHosted === true ? true : isHosted === false ? false : undefined,
           isJoined: isJoined === true ? true : isJoined === false ? false : undefined,
+          directJoinOnly,
           metadataUpdatedAt: createdAt || null,
           blindPeeringPublicKey: relayBlindPeeringKey || undefined,
           pathAliases: gatewayPath ? [gatewayPath] : []
@@ -2611,7 +2743,7 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null, optio
       }
     }
 
-    return { entries, relayCount: activeRelays.length }
+    return { entries, relayCount: eligibleRelayCount }
   } catch (error) {
     console.warn('[Worker] Failed to enumerate relays for gateway sync:', error?.message || error)
     return { entries: [], relayCount: 0 }
@@ -4346,14 +4478,30 @@ async function seedBlindPeeringMirrors(manager) {
   }
   for (const [relayKey, relayManager] of activeRelays.entries()) {
     if (!relayManager?.relay) continue
+    const publicIdentifier = relayManager?.publicIdentifier || null
+    const eligibility = await evaluateRelayMirrorEligibility({
+      relayKey,
+      publicIdentifier,
+      reason: 'seed-blind-peering-mirrors',
+      logSkip: true
+    })
+    if (!eligibility.eligible) {
+      await removeRelayMirrorTarget(manager, {
+        relayKey,
+        publicIdentifier,
+        reason: 'seed-direct-join-only'
+      })
+      detachRelayMirrorHooks(relayManager)
+      continue
+    }
     mirroredRelays += 1
     const storedCoreRefs = await resolveRelayMirrorCoreRefs(
       relayKey,
-      relayManager?.publicIdentifier || null
+      publicIdentifier
     )
     manager.ensureRelayMirror({
       relayKey,
-      publicIdentifier: relayManager?.publicIdentifier || null,
+      publicIdentifier,
       autobase: relayManager.relay,
       coreRefs: storedCoreRefs,
       corestore: relayManager.store || null
@@ -4388,9 +4536,24 @@ function attachRelayMirrorHooks(relayKey, relayManager, manager) {
     }
     inflight = true
     try {
+      const publicIdentifier = relayManager?.publicIdentifier || null
+      const eligibility = await evaluateRelayMirrorEligibility({
+        relayKey,
+        publicIdentifier,
+        reason: 'relay-update',
+        logSkip: false
+      })
+      if (!eligibility.eligible) {
+        await removeRelayMirrorTarget(manager, {
+          relayKey,
+          publicIdentifier,
+          reason: 'relay-update-direct-join-only'
+        })
+        return
+      }
       const coreRefs = await resolveRelayMirrorCoreRefs(
         relayKey,
-        relayManager?.publicIdentifier || null
+        publicIdentifier
       )
       const normalizedRefs = Array.from(new Set(
         (Array.isArray(coreRefs) ? coreRefs : [])
@@ -4402,7 +4565,7 @@ function attachRelayMirrorHooks(relayKey, relayManager, manager) {
 
       manager.ensureRelayMirror({
         relayKey,
-        publicIdentifier: relayManager?.publicIdentifier || null,
+        publicIdentifier,
         autobase,
         coreRefs,
         corestore: relayManager?.store || null
@@ -4533,20 +4696,17 @@ async function startGatewayService(options = {}) {
       const wasRunning = gatewayWasRunning
       gatewayWasRunning = !!status?.running
       if (status?.running) {
+        const runtimeGateway = syncRuntimeGatewayEndpointFromStatus(status, 'gateway-status')
+        const httpUrl = runtimeGateway?.httpUrl || null
+        const proxyHost = runtimeGateway?.proxyHost || null
+        const wsProtocol = runtimeGateway?.wsProtocol || null
+
         if (pendingGatewayMetadataSync || pendingRelayRegistryRefresh || !wasRunning) {
           refreshGatewayRelayRegistry(wasRunning ? 'gateway-status-running' : 'gateway-restarted').catch((err) => {
             console.warn('[Worker] Deferred gateway registry refresh failed on status:', err?.message || err)
           })
         }
-        const { httpUrl, proxyHost, wsProtocol } = deriveGatewayHostFromStatus(status)
-        // Keep runtime relay URL generation aligned with the actual gateway listen host/port.
-        // This is critical when gateway startup falls back to a dynamic port after EADDRINUSE.
-        if (config && typeof config === 'object') {
-          config.gatewayUrl = httpUrl
-          config.proxy_server_address = proxyHost
-          config.proxy_websocket_protocol = wsProtocol
-        }
-        if (!gatewaySettingsApplied) {
+        if (!gatewaySettingsApplied && httpUrl && proxyHost && wsProtocol) {
           try {
             await updateGatewaySettings({
               gatewayUrl: httpUrl,
@@ -4743,6 +4903,7 @@ async function startGatewayService(options = {}) {
   const finishGatewayStart = async (startOptions) => {
     gatewaySettingsApplied = false
     await gatewayService.start(startOptions)
+    syncRuntimeGatewayEndpointFromStatus(gatewayService.getStatus(), 'gateway-start')
     gatewayOptions = {
       ...startOptions,
       port: Number(gatewayService?.config?.port) || Number(startOptions?.port) || gatewayOptions.port
@@ -9541,17 +9702,35 @@ async function handleMessageObject(message) {
           if (manager?.started) {
             const relayManager = resolvedRelayKey ? activeRelays.get(resolvedRelayKey) : null
             if (relayManager?.relay) {
+              const publicIdentifier =
+                message?.data?.publicIdentifier
+                || relayManager?.publicIdentifier
+                || null
+              const eligibility = await evaluateRelayMirrorEligibility({
+                relayKey: resolvedRelayKey,
+                publicIdentifier,
+                reason: 'invite-writer',
+                logSkip: true
+              })
               const storedCoreRefs = await resolveRelayMirrorCoreRefs(
                 resolvedRelayKey,
-                message?.data?.publicIdentifier || relayManager?.publicIdentifier || null
+                publicIdentifier
               )
-              manager.ensureRelayMirror({
-                relayKey: resolvedRelayKey,
-                publicIdentifier: message?.data?.publicIdentifier || relayManager?.publicIdentifier || null,
-                autobase: relayManager.relay,
-                coreRefs: storedCoreRefs,
-                corestore: relayManager.store || null
-              })
+              if (eligibility.eligible) {
+                manager.ensureRelayMirror({
+                  relayKey: resolvedRelayKey,
+                  publicIdentifier,
+                  autobase: relayManager.relay,
+                  coreRefs: storedCoreRefs,
+                  corestore: relayManager.store || null
+                })
+              } else {
+                await removeRelayMirrorTarget(manager, {
+                  relayKey: resolvedRelayKey,
+                  publicIdentifier,
+                  reason: 'invite-writer-direct-join-only'
+                })
+              }
             } else {
               await seedBlindPeeringMirrors(manager)
             }

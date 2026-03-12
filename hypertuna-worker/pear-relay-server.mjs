@@ -38,6 +38,9 @@ import {
   upsertRelayDiscoveryHints
 } from './relay-discovery-store.mjs';
 import {
+  getRelayGatewayRoute
+} from './relay-gateway-map-store.mjs';
+import {
   createRelay as createRelayManager,
   joinRelay as joinRelayManager,
   disconnectRelay as disconnectRelayManager,
@@ -131,6 +134,142 @@ function normalizeHttpOrigin(value) {
   } catch (_) {
     return null;
   }
+}
+
+function normalizePublicIdentifierForRoute(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return normalizeRelayIdentifier(trimmed) || trimmed;
+}
+
+function normalizeGatewayRouteHint(hint) {
+  if (!hint || typeof hint !== 'object') return null;
+  const relayKey = normalizeRelayKeyHex(hint.relayKey || null);
+  const publicIdentifier = normalizePublicIdentifierForRoute(
+    hint.publicIdentifier || hint.identifier || null
+  );
+  if (!relayKey && !publicIdentifier) return null;
+  return {
+    relayKey,
+    publicIdentifier,
+    gatewayOrigin: normalizeHttpOrigin(hint.gatewayOrigin || null),
+    gatewayId: normalizeGatewayId(hint.gatewayId || null),
+    directJoinOnly: hint.directJoinOnly === true
+  };
+}
+
+function normalizeGatewayRouteHints(routeHints = []) {
+  if (!Array.isArray(routeHints)) return [];
+  const normalized = [];
+  for (const hint of routeHints) {
+    const parsed = normalizeGatewayRouteHint(hint);
+    if (parsed) normalized.push(parsed);
+  }
+  return normalized;
+}
+
+function findGatewayRouteHint(routeHints, { relayKey = null, publicIdentifier = null } = {}) {
+  if (!Array.isArray(routeHints) || routeHints.length === 0) return null;
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey);
+  const normalizedPublicIdentifier = normalizePublicIdentifierForRoute(publicIdentifier);
+  for (const hint of routeHints) {
+    if (!hint) continue;
+    if (normalizedRelayKey && hint.relayKey && hint.relayKey === normalizedRelayKey) {
+      return hint;
+    }
+    if (
+      normalizedPublicIdentifier
+      && hint.publicIdentifier
+      && hint.publicIdentifier === normalizedPublicIdentifier
+    ) {
+      return hint;
+    }
+  }
+  return null;
+}
+
+async function getRelayGatewayRouteSafe({ relayKey = null, publicIdentifier = null } = {}) {
+  try {
+    return await getRelayGatewayRoute({ relayKey, publicIdentifier });
+  } catch (error) {
+    console.warn('[RelayServer] Failed to resolve relay gateway route', {
+      relayKey: relayKey || null,
+      publicIdentifier: publicIdentifier || null,
+      error: error?.message || error
+    });
+    return null;
+  }
+}
+
+function evaluateGatewayRegistrationRoute(route = null) {
+  const gatewayOrigin = normalizeHttpOrigin(route?.gatewayOrigin || null);
+  const gatewayId = normalizeGatewayId(route?.gatewayId || null);
+  const directJoinOnly = route?.directJoinOnly === true;
+  if (directJoinOnly) {
+    return {
+      eligible: false,
+      reason: 'direct-join-only',
+      gatewayOrigin,
+      gatewayId
+    };
+  }
+  if (gatewayOrigin || gatewayId) {
+    return {
+      eligible: true,
+      reason: 'mapped',
+      gatewayOrigin,
+      gatewayId
+    };
+  }
+  return {
+    eligible: false,
+    reason: 'gateway-unassigned',
+    gatewayOrigin: null,
+    gatewayId: null
+  };
+}
+
+async function resolveRelayGatewayRegistrationEligibility({
+  relayKey = null,
+  publicIdentifier = null,
+  gatewayOrigin = null,
+  gatewayId = null,
+  directJoinOnly = null
+} = {}) {
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey);
+  const normalizedPublicIdentifier = normalizePublicIdentifierForRoute(publicIdentifier);
+  const explicitGatewayOrigin = normalizeHttpOrigin(gatewayOrigin);
+  const explicitGatewayId = normalizeGatewayId(gatewayId);
+  const explicitDirectJoinOnly = directJoinOnly === true;
+  const hasExplicitRouteInput = explicitDirectJoinOnly || !!explicitGatewayOrigin || !!explicitGatewayId;
+
+  if (hasExplicitRouteInput) {
+    const explicitRoute = {
+      relayKey: normalizedRelayKey,
+      publicIdentifier: normalizedPublicIdentifier,
+      gatewayOrigin: explicitGatewayOrigin,
+      gatewayId: explicitGatewayId,
+      directJoinOnly: explicitDirectJoinOnly
+    };
+    const evaluation = evaluateGatewayRegistrationRoute(explicitRoute);
+    return {
+      ...evaluation,
+      route: explicitRoute,
+      source: 'explicit'
+    };
+  }
+
+  const storedRoute = await getRelayGatewayRouteSafe({
+    relayKey: normalizedRelayKey || null,
+    publicIdentifier: normalizedPublicIdentifier || null
+  });
+  const evaluation = evaluateGatewayRegistrationRoute(storedRoute);
+  return {
+    ...evaluation,
+    route: storedRoute,
+    source: 'stored'
+  };
 }
 
 function normalizeAuthTokenValue(value) {
@@ -695,6 +834,57 @@ function buildCanonicalRelayUrl(identifier, authToken = null, cfg = config) {
   const baseUrl = `${buildGatewayWebsocketBase(cfg)}/${identifierPath}`;
   const token = normalizeAuthTokenValue(authToken);
   return token ? `${baseUrl}?token=${token}` : baseUrl;
+}
+
+export function applyRuntimeGatewayEndpoint({
+  gatewayUrl = null,
+  proxyHost = null,
+  proxyWebsocketProtocol = null
+} = {}) {
+  if (!config || typeof config !== 'object') {
+    return { applied: false, reason: 'config-uninitialized' };
+  }
+
+  const normalizedGatewayUrl = toHttpOrigin(gatewayUrl);
+  const normalizedProxyHost =
+    typeof proxyHost === 'string' && proxyHost.trim()
+      ? proxyHost.trim()
+      : null;
+  const normalizedWsProtocol =
+    proxyWebsocketProtocol === 'ws' || proxyWebsocketProtocol === 'wss'
+      ? proxyWebsocketProtocol
+      : null;
+
+  let changed = false;
+
+  if (normalizedGatewayUrl && config.gatewayUrl !== normalizedGatewayUrl) {
+    config.gatewayUrl = normalizedGatewayUrl;
+    changed = true;
+  }
+  if (normalizedProxyHost && config.proxy_server_address !== normalizedProxyHost) {
+    config.proxy_server_address = normalizedProxyHost;
+    changed = true;
+  }
+  if (normalizedWsProtocol && config.proxy_websocket_protocol !== normalizedWsProtocol) {
+    config.proxy_websocket_protocol = normalizedWsProtocol;
+    changed = true;
+  }
+
+  if (changed) {
+    console.log('[RelayServer] Runtime gateway endpoint updated', {
+      gatewayUrl: config.gatewayUrl || null,
+      proxyServerAddress: config.proxy_server_address || null,
+      proxyWebsocketProtocol: config.proxy_websocket_protocol || null
+    });
+  }
+
+  return {
+    applied: true,
+    changed,
+    gatewayUrl: config.gatewayUrl || null,
+    proxyServerAddress: config.proxy_server_address || null,
+    proxyWebsocketProtocol: config.proxy_websocket_protocol || null
+  };
 }
 
 function previewValue(value, limit = 16) {
@@ -5767,8 +5957,14 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
   const {
     skipQueue = false,
     requestTimeoutMs = GATEWAY_REGISTRATION_REQUEST_TIMEOUT_MS,
-    reason = 'unspecified'
+    reason = 'unspecified',
+    routeHint = null,
+    routeHints = []
   } = options || {};
+  const normalizedRouteHints = normalizeGatewayRouteHints([
+    ...((Array.isArray(routeHints) ? routeHints : [])),
+    ...(routeHint ? [routeHint] : [])
+  ]);
 
   console.log('[RelayServer] ========================================');
   console.log('[RelayServer] GATEWAY REGISTRATION ATTEMPT (Hyperswarm)');
@@ -5824,12 +6020,31 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
 
     const metadataCache = new Map();
     const relayList = [];
+    let skippedByRouting = 0;
 
     for (const relay of activeRelays) {
       const profile =
         profilesByRelayKey.get(relay.relayKey) ||
         (relay.publicIdentifier ? profilesByIdentifier.get(relay.publicIdentifier) : null) ||
         null;
+
+      const routeRelayKey = normalizeRelayKeyHex(relay.relayKey || profile?.relay_key || null);
+      const routePublicIdentifier = normalizePublicIdentifierForRoute(
+        profile?.public_identifier || relay.publicIdentifier || null
+      );
+      const relayRouteHint = findGatewayRouteHint(normalizedRouteHints, {
+        relayKey: routeRelayKey,
+        publicIdentifier: routePublicIdentifier
+      });
+      const relayRoute = relayRouteHint || await getRelayGatewayRouteSafe({
+        relayKey: routeRelayKey || null,
+        publicIdentifier: routePublicIdentifier || null
+      });
+      const relayRouteEvaluation = evaluateGatewayRegistrationRoute(relayRoute);
+      if (!relayRouteEvaluation.eligible) {
+        skippedByRouting += 1;
+        continue;
+      }
 
       const publicIdentifier = String(
         profile?.public_identifier || relay.publicIdentifier || relay.relayKey
@@ -5992,46 +6207,78 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
     }
 
     if (relayProfileInfo) {
-      const newRelayIdentifier = String(
-        relayProfileInfo.public_identifier || relayProfileInfo.relay_key
-      );
+      const newRelayRouteHint = findGatewayRouteHint(normalizedRouteHints, {
+        relayKey: relayProfileInfo.relay_key || null,
+        publicIdentifier: relayProfileInfo.public_identifier || null
+      });
+      const newRelayRoute = newRelayRouteHint || await getRelayGatewayRouteSafe({
+        relayKey: relayProfileInfo.relay_key || null,
+        publicIdentifier: relayProfileInfo.public_identifier || null
+      });
+      const newRelayRouteEvaluation = evaluateGatewayRegistrationRoute(newRelayRoute);
 
-      let newRelayMetadata = metadataCache.get(relayProfileInfo.relay_key);
-      if (newRelayMetadata === undefined) {
-        newRelayMetadata = await getRelayMetadata(
-          relayProfileInfo.relay_key,
-          newRelayIdentifier
-        );
-        metadataCache.set(relayProfileInfo.relay_key, newRelayMetadata || null);
-      }
-      const resolvedNewMetadata = newRelayMetadata || null;
-
-      const profileAvatar = resolveProfileAvatar(relayProfileInfo);
-
-      let newRelayIsPublic;
-      if (typeof resolvedNewMetadata?.isPublic === 'boolean') {
-        newRelayIsPublic = resolvedNewMetadata.isPublic;
-      } else if (typeof relayProfileInfo.isPublic === 'boolean') {
-        newRelayIsPublic = relayProfileInfo.isPublic;
-      } else if (typeof relayProfileInfo.is_public === 'boolean') {
-        newRelayIsPublic = relayProfileInfo.is_public;
+      if (!newRelayRouteEvaluation.eligible) {
+        console.log('[RelayServer] Skipping newRelay registration payload due to routing', {
+          relayKey: relayProfileInfo.relay_key || null,
+          publicIdentifier: relayProfileInfo.public_identifier || null,
+          reason: newRelayRouteEvaluation.reason
+        });
       } else {
-        newRelayIsPublic = true;
+        const newRelayIdentifier = String(
+          relayProfileInfo.public_identifier || relayProfileInfo.relay_key
+        );
+
+        let newRelayMetadata = metadataCache.get(relayProfileInfo.relay_key);
+        if (newRelayMetadata === undefined) {
+          newRelayMetadata = await getRelayMetadata(
+            relayProfileInfo.relay_key,
+            newRelayIdentifier
+          );
+          metadataCache.set(relayProfileInfo.relay_key, newRelayMetadata || null);
+        }
+        const resolvedNewMetadata = newRelayMetadata || null;
+
+        const profileAvatar = resolveProfileAvatar(relayProfileInfo);
+
+        let newRelayIsPublic;
+        if (typeof resolvedNewMetadata?.isPublic === 'boolean') {
+          newRelayIsPublic = resolvedNewMetadata.isPublic;
+        } else if (typeof relayProfileInfo.isPublic === 'boolean') {
+          newRelayIsPublic = relayProfileInfo.isPublic;
+        } else if (typeof relayProfileInfo.is_public === 'boolean') {
+          newRelayIsPublic = relayProfileInfo.is_public;
+        } else {
+          newRelayIsPublic = true;
+        }
+
+        const identifierPath = newRelayIdentifier.includes(':')
+          ? newRelayIdentifier.replace(':', '/')
+          : newRelayIdentifier;
+
+        registrationData.newRelay = {
+          identifier: newRelayIdentifier,
+          name: resolvedNewMetadata?.name || relayProfileInfo.name,
+          description: resolvedNewMetadata?.description || relayProfileInfo.description || '',
+          avatarUrl: resolvedNewMetadata?.avatarUrl || profileAvatar || null,
+          isPublic: newRelayIsPublic,
+          metadataUpdatedAt: resolvedNewMetadata?.updatedAt || toTimestamp(relayProfileInfo.updated_at),
+          metadataEventId: resolvedNewMetadata?.eventId || null,
+          gatewayPath: identifierPath
+        };
       }
+    }
 
-      const identifierPath = newRelayIdentifier.includes(':')
-        ? newRelayIdentifier.replace(':', '/')
-        : newRelayIdentifier;
-
-      registrationData.newRelay = {
-        identifier: newRelayIdentifier,
-        name: resolvedNewMetadata?.name || relayProfileInfo.name,
-        description: resolvedNewMetadata?.description || relayProfileInfo.description || '',
-        avatarUrl: resolvedNewMetadata?.avatarUrl || profileAvatar || null,
-        isPublic: newRelayIsPublic,
-        metadataUpdatedAt: resolvedNewMetadata?.updatedAt || toTimestamp(relayProfileInfo.updated_at),
-        metadataEventId: resolvedNewMetadata?.eventId || null,
-        gatewayPath: identifierPath
+    if (relayList.length === 0 && !registrationData.newRelay) {
+      console.log('[RelayServer] Skipping gateway registration payload (no routing-eligible relays)', {
+        reason: 'gateway-unassigned-or-direct-join-only',
+        activeRelayCount: activeRelays.length,
+        skippedByRouting
+      });
+      console.log('[RelayServer] ========================================');
+      return {
+        skipped: true,
+        reason: 'gateway-unassigned-or-direct-join-only',
+        skippedByRouting
       };
     }
 
@@ -6282,20 +6529,40 @@ export async function createRelay(options) {
       }
     }
 
-    // ALWAYS register with gateway via Hyperswarm if enabled
+    const registrationEligibility = await resolveRelayGatewayRegistrationEligibility({
+      relayKey: result.relayKey || null,
+      publicIdentifier: result.publicIdentifier || null,
+      gatewayOrigin: normalizedGatewayOrigin,
+      gatewayId: normalizedGatewayId,
+      directJoinOnly: relayDirectJoinOnly
+    });
+
+    // Register with gateway via Hyperswarm only when relay route has a gateway target
     let registrationStatus = 'disabled';
-    if (config.registerWithGateway) {
+    if (config.registerWithGateway && registrationEligibility.eligible) {
       console.log('[RelayServer][Checkpoint] create-register-attempt', {
         relayKey: result.relayKey,
         publicIdentifier: result.publicIdentifier || null,
-        requestTimeoutMs: GATEWAY_REGISTRATION_REQUEST_TIMEOUT_MS
+        requestTimeoutMs: GATEWAY_REGISTRATION_REQUEST_TIMEOUT_MS,
+        routeSource: registrationEligibility.source || 'unknown'
       });
       try {
         const registrationResult = await registerWithGateway(result.profile, {
           reason: 'create-relay',
-          requestTimeoutMs: GATEWAY_REGISTRATION_REQUEST_TIMEOUT_MS
+          requestTimeoutMs: GATEWAY_REGISTRATION_REQUEST_TIMEOUT_MS,
+          routeHint: {
+            relayKey: result.relayKey || null,
+            publicIdentifier: result.publicIdentifier || null,
+            gatewayOrigin: registrationEligibility.gatewayOrigin || null,
+            gatewayId: registrationEligibility.gatewayId || null,
+            directJoinOnly: false
+          }
         });
-        registrationStatus = registrationResult?.queued ? 'queued' : 'success';
+        registrationStatus = registrationResult?.skipped
+          ? 'skipped'
+          : registrationResult?.queued
+            ? 'queued'
+            : 'success';
       } catch (regError) {
         registrationStatus = regError?.code === 'gateway-registration-timeout' ? 'timeout' : 'failed';
         result.registrationError = regError?.message || String(regError);
@@ -6305,6 +6572,13 @@ export async function createRelay(options) {
         publicIdentifier: result.publicIdentifier || null,
         gatewayRegistration: registrationStatus,
         registrationError: result.registrationError || null
+      });
+    } else if (config.registerWithGateway) {
+      registrationStatus = 'skipped';
+      console.log('[RelayServer][Checkpoint] create-register-skipped', {
+        relayKey: result.relayKey || null,
+        publicIdentifier: result.publicIdentifier || null,
+        reason: registrationEligibility.reason || 'gateway-unassigned'
       });
     }
     result.gatewayRegistration = registrationStatus;

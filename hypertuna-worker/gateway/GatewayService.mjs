@@ -1160,6 +1160,14 @@ export class GatewayService extends EventEmitter {
       };
     }
 
+    if (!this.#isPublicGatewayRelayKey(relayKey) && metadataCopy?.directJoinOnly === true) {
+      this.publicGatewayRelayState.delete(relayKey);
+      this.#clearRelayToken(relayKey);
+      this.log('debug', `[PublicGateway] Skipping registration for direct-join-only relay ${relayKey}`);
+      this.#emitPublicGatewayStatus();
+      return;
+    }
+
     if (!this.#isPublicGatewayRelayKey(relayKey) && (metadataCopy?.isHosted === false || metadataCopy?.isJoined === true)) {
       this.publicGatewayRelayState.delete(relayKey);
       this.#clearRelayToken(relayKey);
@@ -3080,6 +3088,12 @@ export class GatewayService extends EventEmitter {
 
         if (typeof relayObj.isJoined === 'boolean') {
           nextMetadata.isJoined = relayObj.isJoined;
+        }
+
+        if (typeof relayObj.directJoinOnly === 'boolean') {
+          nextMetadata.directJoinOnly = relayObj.directJoinOnly;
+        } else if (typeof relayObj.gatewayDirectJoinOnly === 'boolean') {
+          nextMetadata.directJoinOnly = relayObj.gatewayDirectJoinOnly;
         }
 
         if (typeof relayObj.isGatewayReplica === 'boolean') {
