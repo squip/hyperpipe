@@ -1,6 +1,6 @@
 # Hypertuna TUI (Ink)
 
-Terminal UI for Hypertuna feature parity work, backed by the existing `hypertuna-worker` IPC protocol.
+Terminal UI implementation of the Hypertuna client, backed by the existing `hypertuna-worker` IPC protocol.
 
 ## Run
 
