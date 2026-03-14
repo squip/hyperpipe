@@ -124,6 +124,7 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 - `group invite [groupId] [relayUrl] <inviteePubkey> [token]`
 - `group invite-accept [inviteId]`
 - `group invite-dismiss [inviteId]`
+- `group approve [groupId] <pubkey>`
 - `group update-members [relayKeyOrIdentifier] add|remove <pubkey>`
 - `group update-auth [relayKeyOrIdentifier] <pubkey> <token>`
 - `file refresh [groupId]`

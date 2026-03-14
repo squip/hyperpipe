@@ -3,7 +3,7 @@ import path from 'node:path'
 import { parseArgs } from 'node:util'
 import React from 'react'
 import { render } from 'ink'
-import { App } from './ui/App.js'
+import { StartupApp } from './ui/StartupApp.js'
 import type { LogLevel, } from './domain/types.js'
 import { resolveDesktopParityStorageDir } from './storage/defaultStorageDir.js'
 import {
@@ -79,7 +79,7 @@ if (stdioCapturePath) {
 }
 
 const app = render(
-  React.createElement(App, {
+  React.createElement(StartupApp, {
     options: {
       cwd,
       storageDir,

@@ -23,6 +23,7 @@
     "demo:e2e:real:relay-scoped-phased-docker": "tsx test/e2e/relay-scoped-phased-docker.tsx"
   },
   "dependencies": {
+    "chalk": "^5.6.2",
     "ink": "^5.0.1",
     "ink-spinner": "^5.0.0",
     "ink-text-input": "^6.0.0",
