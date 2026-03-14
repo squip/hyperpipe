@@ -48,7 +48,7 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 - Center list: `Up/Down/PageUp/PageDown/Home/End`
 - Right top: `Up/Down` select action/tab, `Enter` apply action
 - Right bottom: `Up/Down` scroll details, `Ctrl+U`/`Ctrl+D` page scroll
-- `Groups -> Create Group` and `Chats -> Create Chat`: center `Enter` opens inline field editor, `Enter` submits field, `Esc` cancels field editor
+- `P2P Relays -> Create Relay` and `Chats -> Create Chat`: center `Enter` opens inline field editor, `Enter` submits field, `Esc` cancels field editor
 - `Invites -> Send Invite`: right-bottom accepts text input, suggestion list, and `Enter` to send invite
 - `r`: refresh current section
 - `:`: open command bar
@@ -60,15 +60,14 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 ## Left Tree Nodes
 
 - `Dashboard`
-- `Relays`
-- `Groups`
-  - `Browse Groups`
-  - `My Groups (N)`
-  - `Create Group`
+- `P2P Relays`
+  - `Browse Relays`
+  - `My Relays (N)`
+  - `Create Relay`
 - `Chats`
   - `Create Chat`
 - `Invites`
-  - `Group Invites (N)`
+  - `Relay Invites (N)`
   - `Chat Invites (N)`
   - `Send Invite`
 - `Files (N)`
@@ -84,7 +83,7 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 
 - Most commands infer IDs from the selected row in the center pane.
 - `copy selected` copies the current row's primary value.
-- `copy <field>` copies explicit fields like `group-id`, `invite-id`, `relay`, `conversation-id`, `url`, `sha256`.
+- `copy <field>` copies explicit fields like `relay-id` (`group-id` is still accepted), `invite-id`, `relay`, `conversation-id`, `url`, `sha256`.
 - `copy command [workflow]` copies a workflow command template for the current selection.
 - Secret material (`nsec`, tokens, writer secrets) is blocked by default.
 - Set `HYPERTUNA_TUI_ALLOW_UNSAFE_COPY=1` only for explicit debug use.
@@ -108,25 +107,34 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 - `account select <index|pubkey|label>`
 - `account unlock [password]`
 - `worker start|stop|restart`
+- `relay tab <browse|my|create|invites>`
 - `relay refresh`
+- `relay invites`
+- `relay members [relayId]`
+- `relay search <query|clear>`
+- `relay sort <name|description|open|public|admin|createdAt|members|peers> [asc|desc]`
+- `relay filter visibility <all|public|private>`
+- `relay filter join <all|open|closed>`
 - `relay create <name> --public --open`
 - `relay join [publicIdentifierOrRelayKey] [token]`
 - `relay disconnect <relayKey>`
 - `relay leave <publicIdentifierOrRelayKey> [--archive] [--save-files]`
+- `relay join-flow [publicIdentifier] [token]`
+- `relay request-invite [relayId] [code] [reason]`
+- `relay invite [relayId] [relayUrl] <inviteePubkey> [token]`
+- `relay invite-accept [inviteId]`
+- `relay invite-dismiss [inviteId]`
+- `relay join-requests [relayId]`
+- `relay approve [relayId] <pubkey>`
+- `relay reject [relayId] <pubkey>`
+- `relay update-members [relayKeyOrIdentifier] add|remove <pubkey>`
+- `relay update-auth [relayKeyOrIdentifier] <pubkey> <token>`
+- `invites refresh`
+- `invites accept <relay|chat> [inviteId]`
+- `invites dismiss <relay|chat> [inviteId]`
 - `post <content>`
 - `reply <eventId> <eventPubkey> <content>`
 - `react <eventId> <eventPubkey> <reaction>`
-- `group tab <discover|my>`
-- `group refresh`
-- `group invites`
-- `group join-flow [publicIdentifier] [token]`
-- `group request-invite [groupId] [code] [reason]`
-- `group invite [groupId] [relayUrl] <inviteePubkey> [token]`
-- `group invite-accept [inviteId]`
-- `group invite-dismiss [inviteId]`
-- `group approve [groupId] <pubkey>`
-- `group update-members [relayKeyOrIdentifier] add|remove <pubkey>`
-- `group update-auth [relayKeyOrIdentifier] <pubkey> <token>`
 - `file refresh [groupId]`
 - `file upload <groupIdOrRelayKey> <absolutePath>`
 - `file download [eventId|sha256]`
@@ -138,7 +146,8 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 - `chat dismiss [inviteId]`
 - `chat thread <conversationId>`
 - `chat send <conversationId> <content>`
-- `goto <dashboard|relays|groups|groups:browse|groups:my|groups:create|chats|chats:create|invites|invites:group|invites:chat|invites:send|files|files:images|files:video|files:audio|files:docs|files:other|accounts|logs>`
+- `goto <dashboard|relays|relay:browse|relay:my|relay:create|chats|chats:create|invites|invites:group|invites:chat|invites:send|files|files:images|files:video|files:audio|files:docs|files:other|accounts|logs>`
+
 
 ## Tests
 

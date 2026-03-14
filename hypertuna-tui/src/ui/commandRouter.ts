@@ -531,6 +531,16 @@ function resolveCopyField(field: string, context?: CommandContext): { label: str
     return null
   }
 
+  if (normalized === 'relay-id') {
+    if (selectedGroup?.id) return { label: 'relay-id', value: selectedGroup.id }
+    if (selectedInvite?.kind === 'group' && selectedInvite.groupId) {
+      return { label: 'relay-id', value: selectedInvite.groupId }
+    }
+    if (selectedFile?.groupId) return { label: 'relay-id', value: selectedFile.groupId }
+    if (selectedNote?.groupId) return { label: 'relay-id', value: selectedNote.groupId }
+    return null
+  }
+
   if (normalized === 'group-id' || normalized === 'group') {
     if (selectedGroup?.id) return { label: 'group-id', value: selectedGroup.id }
     if (selectedInvite?.kind === 'group' && selectedInvite.groupId) {
