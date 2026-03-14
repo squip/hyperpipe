@@ -49,7 +49,7 @@ afterEach(() => {
 })
 
 describe.sequential('TUI e2e in-pane form workflows', () => {
-  it('opens and edits the Groups -> Create Group inline field prompt', async () => {
+  it('opens and edits the P2P Relays -> Create Relay inline field prompt', async () => {
     const controller = MockController.withSeedData(BASE_OPTIONS)
     await controller.setSelectedNode('groups:create')
     await controller.setFocusPane('center')
@@ -65,17 +65,17 @@ describe.sequential('TUI e2e in-pane form workflows', () => {
       await waitFor(() => lastFrame(instance).includes('groups:create'))
 
       instance.stdin.write('\r')
-      await waitFor(() => lastFrame(instance).includes('Group name:'))
+      await waitFor(() => lastFrame(instance).includes('Relay name:'))
 
       await typeText(instance, 'tui-form-group')
       instance.stdin.write('\u001b')
-      await waitFor(() => !lastFrame(instance).includes('Group name:'))
+      await waitFor(() => !lastFrame(instance).includes('Relay name:'))
     } finally {
       instance.unmount()
     }
   })
 
-  it('sends a group invite from Invites -> Send Invite right-bottom input', async () => {
+  it('sends a relay invite from Invites -> Send Invite right-bottom input', async () => {
     const controller = MockController.withSeedData(BASE_OPTIONS)
     await controller.setSelectedNode('invites:send')
     await controller.setFocusPane('right-bottom')

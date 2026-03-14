@@ -334,8 +334,9 @@ function fileFamilyForMime(mime?: string | null): FileFamily {
 function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRow[] {
   const rows: NavRow[] = []
   for (const root of ROOT_NAV_ORDER) {
+    if (root === 'relays') continue
     let rootLabel = ROOT_NAV_LABELS[root]
-    if (root === 'groups') rootLabel = 'Groups'
+    if (root === 'groups') rootLabel = 'P2P Relays'
     if (root === 'invites') rootLabel = `Invites (${state.invitesCount})`
     if (root === 'files') rootLabel = `Files (${state.filesCount})`
     if (root === 'chats') rootLabel = `Chats (${state.chatUnreadTotal + state.chatPendingInviteCount})`
@@ -355,7 +356,7 @@ function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRo
     if (root === 'groups' && expanded.groups) {
       rows.push({
         id: 'groups:browse',
-        label: 'Browse Groups',
+        label: 'Browse Relays',
         depth: 1,
         parent: 'groups',
         isParent: false,
@@ -363,7 +364,7 @@ function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRo
       })
       rows.push({
         id: 'groups:my',
-        label: `My Groups (${state.myGroups.length})`,
+        label: `My Relays (${state.myGroups.length})`,
         depth: 1,
         parent: 'groups',
         isParent: false,
@@ -371,7 +372,7 @@ function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRo
       })
       rows.push({
         id: 'groups:create',
-        label: 'Create Group',
+        label: 'Create Relay',
         depth: 1,
         parent: 'groups',
         isParent: false,
@@ -393,7 +394,7 @@ function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRo
     if (root === 'invites' && expanded.invites) {
       rows.push({
         id: 'invites:group',
-        label: `Group Invites (${state.groupInvites.length})`,
+        label: `Relay Invites (${state.groupInvites.length})`,
         depth: 1,
         parent: 'invites',
         isParent: false,
@@ -448,35 +449,23 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
     ]
   }
 
-  if (node === 'relays') {
-    return state.relays.map((relay, idx) => {
-      const label = `${shortId(relay.publicIdentifier || relay.relayKey, 10)} · ${relay.readyForReq ? 'ready' : relay.writable ? 'writable' : 'readonly'}`
-      return {
-        key: `${relay.relayKey}-${idx}`,
-        label,
-        kind: 'relay',
-        data: relay
-      }
-    })
-  }
-
   if (node === 'groups') {
     return [
       {
         key: 'groups:browse',
-        label: `Browse Groups (${state.groupDiscover.length})`,
+        label: `Browse Relays (${state.groupDiscover.length})`,
         kind: 'summary',
         data: null
       },
       {
         key: 'groups:my',
-        label: `My Groups (${state.myGroups.length})`,
+        label: `My Relays (${state.myGroups.length})`,
         kind: 'summary',
         data: null
       },
       {
         key: 'groups:create',
-        label: 'Create Group',
+        label: 'Create Relay',
         kind: 'summary',
         data: null
       }
@@ -500,9 +489,11 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
     return state.myGroups.map((group, idx) => {
       const mode = `${group.isPublic === false ? 'private' : 'public'} | ${group.isOpen === false ? 'closed' : 'open'}`
       const members = group.membersCount || group.members?.length || 0
+      const relay = relayForGroup(state, group)
+      const readiness = relay?.readyForReq ? 'ready' : 'read-only'
       return {
         key: `${group.id}-${group.event?.id || idx}`,
-        label: `${shortText(group.name, 24)} · ${mode} · members:${members}`,
+        label: `${shortText(group.name, 24)} · ${mode} · members:${members} · ${readiness}`,
         kind: 'group',
         data: group
       }
@@ -513,13 +504,13 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
     return [
       {
         key: 'groups:create:name',
-        label: 'group name',
+        label: 'relay name',
         kind: 'form-field',
         data: { form: 'group-create', field: 'name' }
       },
       {
         key: 'groups:create:about',
-        label: 'group description',
+        label: 'relay description',
         kind: 'form-field',
         data: { form: 'group-create', field: 'about' }
       },
@@ -664,7 +655,7 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
     return [
       {
         key: 'invites:group',
-        label: `Group Invites (${state.groupInvites.length})`,
+        label: `Relay Invites (${state.groupInvites.length})`,
         kind: 'summary',
         data: null
       },
@@ -705,7 +696,7 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
     return [
       {
         key: 'invites:send:group',
-        label: 'Group Invite',
+        label: 'Relay Invite',
         kind: 'invite-mode',
         data: { mode: 'group' as const }
       },
@@ -777,8 +768,17 @@ function groupKey(groupId: string, relay?: string | null): string {
   return `${normalizedRelay}|${normalizedGroupId}`
 }
 
+function relayForGroup(state: ControllerState, group: any): any | null {
+  if (!group) return null
+  const groupId = String(group.id || '').trim()
+  const groupRelay = String(group.relay || '').trim()
+  return state.relays.find((relay) => String(relay.publicIdentifier || '').trim() === groupId)
+    || state.relays.find((relay) => String(relay.connectionUrl || '').trim() === groupRelay)
+    || null
+}
+
 function groupDetailsRows(group: any): string[] {
-  if (!group) return ['No group selected']
+  if (!group) return ['No relay selected']
   const members = Number(group.membersCount || group.members?.length || 0)
   return [
     `id: ${group.id}`,
@@ -810,12 +810,12 @@ function noteRowsForGroup(state: ControllerState, group: any): any[] {
 function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: CenterRow | null): string[] {
   if (node === 'groups:browse') {
     const group = selectedRow?.data as any
-    const actions = ['Group details', 'Admin details', 'Members']
+    const actions = ['Relay Details', 'Admin details', 'Members']
     if (!group) return actions
     const isPublic = group.isPublic !== false
     const isOpen = group.isOpen !== false
     if (isPublic && isOpen) {
-      actions.push('Join Group')
+      actions.push('Join Relay')
     } else if (isPublic && !isOpen) {
       actions.push('Request Invite')
     } else if (!isPublic) {
@@ -829,7 +829,7 @@ function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: C
     const files = fileRowsForGroup(state, group).length
     const joinReq = Object.values(state.groupJoinRequests).reduce((acc, rows) => acc + rows.length, 0)
     return [
-      'Group details',
+      'Relay Details',
       `Members (${members})`,
       'Notes',
       `Files (${files})`,
@@ -856,7 +856,7 @@ function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: C
     const group = state.groupDiscover.find((entry) => entry.id === invite?.groupId)
     const members = Number(group?.membersCount || group?.members?.length || 0)
     return [
-      'Group details',
+      'Relay Details',
       'Admin details',
       `Members (${members})`,
       'Accept invite',
@@ -880,7 +880,7 @@ function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: C
         const adminPubkey = String(group.adminPubkey || '').trim().toLowerCase()
         return Boolean(adminPubkey && currentPubkey && adminPubkey === currentPubkey)
       })
-      if (!groups.length) return ['No admin groups available']
+      if (!groups.length) return ['No admin relays available']
       return groups.map((group) => `${shortText(group.name || group.id, 24)} · ${group.id}`)
     }
     const chats = state.conversations.filter((conversation) => {
@@ -906,26 +906,12 @@ function singleRightRows(state: ControllerState, node: NavNodeId, selectedRow: C
       `Worker: ${state.lifecycle}`,
       `Status: ${shortText(state.readinessMessage, 120)}`,
       `Relays: ${state.relays.length}`,
-      `Groups discover: ${state.groupDiscover.length}`,
-      `My groups: ${state.myGroups.length}`,
+      `Browse relays: ${state.groupDiscover.length}`,
+      `My relays: ${state.myGroups.length}`,
       `Invites: ${state.invitesCount}`,
       `Files: ${state.filesCount}`,
       `Chats: ${state.conversations.length} / pending ${state.chatPendingInviteCount}`,
       `Perf avg ${state.perfMetrics.avgLatencyMs.toFixed(1)}ms p95 ${state.perfMetrics.p95LatencyMs.toFixed(1)}ms`
-    ]
-  }
-
-  if (node === 'relays') {
-    const relay = selectedRow?.data as any
-    if (!relay) return ['No relay selected']
-    return [
-      `relayKey: ${shortId(relay.relayKey, 20)}`,
-      `identifier: ${relay.publicIdentifier || '-'}`,
-      `url: ${relay.connectionUrl || '-'}`,
-      `writable: ${String(Boolean(relay.writable))}`,
-      `requiresAuth: ${String(Boolean(relay.requiresAuth))}`,
-      `readyForReq: ${String(Boolean(relay.readyForReq))}`,
-      `members: ${relay.members?.length || 0}`
     ]
   }
 
@@ -975,8 +961,8 @@ function splitBottomRows(
 ): string[] {
   if (node === 'groups:browse') {
     const group = selectedRow?.data as any
-    if (!group) return ['No group selected']
-    if (selectedAction.startsWith('Group details')) {
+    if (!group) return ['No relay selected']
+    if (selectedAction.startsWith('Relay Details')) {
       return groupDetailsRows(group)
     }
     if (selectedAction.startsWith('Admin details')) {
@@ -988,10 +974,10 @@ function splitBottomRows(
         `followers: ${Number.isFinite(profile?.followersCount) ? profile.followersCount : '-'}`
       ]
     }
-    if (selectedAction.startsWith('Join Group')) {
+    if (selectedAction.startsWith('Join Relay')) {
       return [
-        paneActionMessage || 'Press Enter to join this group',
-        `group: ${group.name || group.id}`,
+        paneActionMessage || 'Press Enter to join this relay',
+        `relay: ${group.name || group.id}`,
         `visibility: ${group.isPublic === false ? 'private' : 'public'}`,
         `membership: ${group.isOpen === false ? 'closed' : 'open'}`
       ]
@@ -999,12 +985,12 @@ function splitBottomRows(
     if (selectedAction.startsWith('Request Invite')) {
       return [
         paneActionMessage || 'Press Enter to request an invite',
-        `group: ${group.name || group.id}`,
+        `relay: ${group.name || group.id}`,
         'This will publish a join request for admin review.'
       ]
     }
     if (selectedAction.startsWith('Invite-only (private)')) {
-      return ['Private group (invite-only). Join action unavailable without an invite.']
+      return ['Private relay (invite-only). Join action unavailable without an invite.']
     }
     const members = Array.isArray(group.members) ? group.members : []
     return members.length ? members.map((member: unknown) => `${member}`) : ['No member list available']
@@ -1012,9 +998,16 @@ function splitBottomRows(
 
   if (node === 'groups:my') {
     const group = selectedRow?.data as any
-    if (!group) return ['No group selected']
-    if (selectedAction.startsWith('Group details')) {
-      return groupDetailsRows(group)
+    if (!group) return ['No relay selected']
+    if (selectedAction.startsWith('Relay Details')) {
+      const relay = relayForGroup(state, group)
+      return [
+        ...groupDetailsRows(group),
+        `url: ${relay?.connectionUrl || group.relay || '-'}`,
+        `writable: ${String(Boolean(relay?.writable))}`,
+        `requiresAuth: ${String(Boolean(relay?.requiresAuth))}`,
+        `readyForReq: ${String(Boolean(relay?.readyForReq))}`
+      ]
     }
     if (selectedAction.startsWith('Members')) {
       const members = Array.isArray(group.members) ? group.members : []
@@ -1022,12 +1015,12 @@ function splitBottomRows(
     }
     if (selectedAction.startsWith('Notes')) {
       const notes = noteRowsForGroup(state, group)
-      if (!notes.length) return ['No group notes loaded']
+      if (!notes.length) return ['No relay notes loaded']
       return notes.map((note) => `${new Date(note.createdAt * 1000).toLocaleString()} · ${shortId(note.authorPubkey, 8)} · ${shortText(note.content, 120)}`)
     }
     if (selectedAction.startsWith('Files')) {
       const files = fileRowsForGroup(state, group)
-      if (!files.length) return ['No group files loaded']
+      if (!files.length) return ['No relay files loaded']
       return files.map((file) => `${shortText(file.fileName, 42)} · ${file.mime || '-'} · ${Number(file.size || 0)}B · by:${shortId(file.uploadedBy, 8)}`)
     }
     if (selectedAction.startsWith('Join Requests')) {
@@ -1057,7 +1050,7 @@ function splitBottomRows(
     const invite = selectedRow?.data as any
     if (!invite) return ['No invite selected']
     const group = state.groupDiscover.find((entry) => entry.id === invite.groupId)
-    if (selectedAction.startsWith('Group details')) {
+    if (selectedAction.startsWith('Relay Details')) {
       if (group) return groupDetailsRows(group)
       return [
         `id: ${invite.groupId}`,
@@ -1139,7 +1132,7 @@ function splitBottomRows(
       return lines
     }
     return [
-      `group: ${file.groupId}`,
+      `relay: ${file.groupId}`,
       `groupName: ${file.groupName || '-'}`,
       `name: ${file.fileName}`,
       `mime: ${file.mime || '-'}`,
@@ -1166,7 +1159,7 @@ async function refreshNode(controller: AppController, node: NavNodeId, selectedR
       ])
       break
     case 'relays':
-      await controller.refreshRelays()
+      await Promise.all([controller.refreshRelays(), controller.refreshGroups()])
       break
     case 'groups':
     case 'groups:browse':
@@ -1345,7 +1338,11 @@ export function App({
     if (scopeKey === hydratedScopeKey) return
 
     setHydratedScopeKey(scopeKey)
-    setSelectedNode(state.selectedNode || 'dashboard')
+    const hydratedNode = state.selectedNode === 'relays' ? 'groups:my' : (state.selectedNode || 'dashboard')
+    setSelectedNode(hydratedNode)
+    if (state.selectedNode === 'relays') {
+      controllerRef.current?.setSelectedNode('groups:my').catch(() => {})
+    }
     setFocusPane(state.focusPane || 'left-tree')
     setTreeExpanded({
       groups: state.treeExpanded?.groups ?? true,
@@ -1461,13 +1458,13 @@ export function App({
         if (row.key === 'groups:create:name') {
           return {
             ...row,
-            label: `group name: ${groupCreateDraft.name || '-'}`
+            label: `relay name: ${groupCreateDraft.name || '-'}`
           }
         }
         if (row.key === 'groups:create:about') {
           return {
             ...row,
-            label: `group description: ${groupCreateDraft.about || '-'}`
+            label: `relay description: ${groupCreateDraft.about || '-'}`
           }
         }
         if (row.key === 'groups:create:membership') {
@@ -1765,7 +1762,7 @@ export function App({
     if (!state) return ['No data']
     if (selectedNode === 'invites:send') {
       const lines = [
-        `mode: ${inviteSendMode === 'group' ? 'Group Invite' : 'Chat Invite'}`,
+        `mode: ${inviteSendMode === 'group' ? 'Relay Invite' : 'Chat Invite'}`,
         `target: ${selectedInviteSendTarget ? `${selectedInviteSendTarget.name} (${selectedInviteSendTarget.id})` : '-'}`,
         `input: ${inviteSendQuery || ''}`,
         inviteSendBusy ? 'sending: in progress' : `status: ${inviteSendStatus || 'idle'}`
@@ -1872,8 +1869,14 @@ export function App({
       },
       resolveSelectedRelay: () => {
         const row = centerRowsForNode(snapshot, selectedNodeRef.current)[nodeViewportRef.current[selectedNodeRef.current]?.cursor || 0]
-        if (!row || row.kind !== 'relay') return null
-        const relay = row.data as any
+        if (!row) return null
+        let relay: any = null
+        if (row.kind === 'relay') {
+          relay = row.data as any
+        } else if (row.kind === 'group') {
+          relay = relayForGroup(snapshot, row.data as any)
+        }
+        if (!relay) return null
         return {
           relayKey: relay.relayKey,
           publicIdentifier: relay.publicIdentifier || null,
@@ -2023,7 +2026,7 @@ export function App({
     if (!controller) return
     const name = String(groupCreateDraft.name || '').trim()
     if (!name) {
-      setPaneActionMessage('Group name is required')
+      setPaneActionMessage('Relay name is required')
       return
     }
     const directJoinOnly = groupCreateDraft.directJoinOnly === true
@@ -2040,7 +2043,7 @@ export function App({
       return
     }
     try {
-      setPaneActionMessage('Creating group…')
+      setPaneActionMessage('Creating relay…')
       const result = await controller.createRelay({
         name,
         description: String(groupCreateDraft.about || '').trim() || undefined,
@@ -2056,7 +2059,7 @@ export function App({
         controller.refreshRelays()
       ])
       const createdId = String(result.publicIdentifier || result.relayKey || name)
-      setPaneActionMessage(`Group created: ${createdId}`)
+      setPaneActionMessage(`Relay created: ${createdId}`)
       setGroupCreateDraft({
         name: '',
         about: '',
@@ -2106,11 +2109,11 @@ export function App({
     const controller = controllerRef.current
     if (selectedNode === 'groups:create') {
       if (selectedCenterRow.key === 'groups:create:name') {
-        openFieldInput('groups:create', 'name', 'Group name', groupCreateDraft.name)
+        openFieldInput('groups:create', 'name', 'Relay name', groupCreateDraft.name)
         return
       }
       if (selectedCenterRow.key === 'groups:create:about') {
-        openFieldInput('groups:create', 'about', 'Group description', groupCreateDraft.about)
+        openFieldInput('groups:create', 'about', 'Relay description', groupCreateDraft.about)
         return
       }
       if (selectedCenterRow.key === 'groups:create:membership') {
@@ -2267,7 +2270,7 @@ export function App({
         const group = state.myGroups.find((entry) => entry.id === selectedInviteSendTarget.id)
         const relayUrl = String(group?.relay || selectedInviteSendTarget.relay || '').trim()
         if (!relayUrl) {
-          throw new Error('Selected group has no relay URL')
+          throw new Error('Selected relay has no relay URL')
         }
         await controller.sendInvite({
           groupId: selectedInviteSendTarget.id,
@@ -2305,8 +2308,8 @@ export function App({
     try {
       if (selectedNode === 'groups:browse' && selectedCenterRow.kind === 'group') {
         const group = selectedCenterRow.data as any
-        if (selectedRightTopAction.startsWith('Join Group')) {
-          setPaneActionMessage('Joining group…')
+        if (selectedRightTopAction.startsWith('Join Relay')) {
+          setPaneActionMessage('Joining relay…')
           await controller.startJoinFlow({
             publicIdentifier: group.id,
             relayUrl: group.relay || undefined,
@@ -2319,7 +2322,7 @@ export function App({
             controller.refreshGroups(),
             controller.refreshRelays()
           ])
-          setPaneActionMessage(`Joined group: ${group.name || group.id}`)
+          setPaneActionMessage(`Joined relay: ${group.name || group.id}`)
           return
         }
         if (selectedRightTopAction.startsWith('Request Invite')) {
@@ -2328,7 +2331,7 @@ export function App({
             groupId: group.id,
             relay: group.relay || null
           })
-          setPaneActionMessage(`Invite request sent for ${group.name || group.id}`)
+          setPaneActionMessage(`Invite request sent for relay ${group.name || group.id}`)
           return
         }
       }

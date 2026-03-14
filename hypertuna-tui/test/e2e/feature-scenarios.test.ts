@@ -20,7 +20,7 @@ describe('TUI e2e feature scenarios', () => {
     const initialRelayCount = controller.getState().relays.length
 
     const refreshResult = await executeCommand(controller, 'relay refresh')
-    expect(refreshResult.message).toContain('Relays refreshed')
+    expect(refreshResult.message).toContain('Relay state refreshed')
 
     await executeCommand(controller, 'relay create devgroup --public --open --desc dev_group')
     const afterCreate = controller.getState()
@@ -93,15 +93,15 @@ describe('TUI e2e feature scenarios', () => {
     expect(stateAfterPublish.feed.some((event) => event.content === 'e2e_reply_content')).toBe(true)
   })
 
-  it('groups browse/my views and join flow remain functional', async () => {
+  it('relay browse/my views and join flow remain functional', async () => {
     const controller = createController()
-    await executeCommand(controller, 'group refresh')
+    await executeCommand(controller, 'relay refresh')
     expect(controller.getState().groups.length).toBeGreaterThan(0)
 
-    const tabResult = await executeCommand(controller, 'group tab my')
+    const tabResult = await executeCommand(controller, 'relay tab my')
     expect(tabResult.gotoNode).toBe('groups:my')
 
-    await executeCommand(controller, 'group join-flow npubexternal:groupflow token-flow --open')
+    await executeCommand(controller, 'relay join-flow npubexternal:groupflow token-flow --open')
     expect(controller.getState().logs.some((log) => log.message.includes('join-flow:npubexternal:groupflow'))).toBe(true)
   })
 
@@ -112,11 +112,20 @@ describe('TUI e2e feature scenarios', () => {
     expect(groupInviteId).toBeTruthy()
     expect(chatInviteId).toBeTruthy()
 
-    await executeCommand(controller, `invites accept group ${groupInviteId}`)
+    await executeCommand(controller, `invites accept relay ${groupInviteId}`)
     expect(controller.getState().groupInvites.some((invite) => invite.id === groupInviteId)).toBe(false)
 
     await executeCommand(controller, `invites dismiss chat ${chatInviteId}`)
     expect(controller.getState().chatInvites.some((invite) => invite.id === chatInviteId)).toBe(false)
+  })
+
+  it('returns migration guidance for removed group command aliases', async () => {
+    const controller = createController()
+    const groupInviteId = controller.getState().groupInvites[0]?.id || 'missing'
+
+    await expect(executeCommand(controller, 'group refresh')).rejects.toThrow(/relay refresh/i)
+    await expect(executeCommand(controller, 'goto groups:browse')).rejects.toThrow(/goto relay:browse/i)
+    await expect(executeCommand(controller, `invites accept group ${groupInviteId}`)).rejects.toThrow(/accept relay/i)
   })
 
   it('file upload, download, and local delete workflows operate via file commands', async () => {

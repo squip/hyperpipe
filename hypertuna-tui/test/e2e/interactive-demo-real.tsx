@@ -225,25 +225,25 @@ const commands: ScriptedCommand[] = [
         : null
 
       createdGroupRelay = createdGroup?.relay || null
-      return 'group refresh'
+      return 'relay refresh'
     }
   },
   { command: 'copy selected' },
   { command: 'copy command' },
   { command: 'goto invites:group' },
-  { command: `group update-members add ${inviteePubkey}` },
-  { command: `group update-auth ${inviteePubkey} demo-auth-${suffix}` },
+  { command: `relay update-members add ${inviteePubkey}` },
+  { command: `relay update-auth ${inviteePubkey} demo-auth-${suffix}` },
   {
     resolveCommand: () => {
       if (!createdGroupId || !createdGroupRelay) return null
-      return `group invite ${createdGroupId} ${createdGroupRelay} ${inviteePubkey} demo-token-${suffix}`
+      return `relay invite ${createdGroupId} ${createdGroupRelay} ${inviteePubkey} demo-token-${suffix}`
     }
   },
   {
     resolveCommand: () => {
       const target = joinId || createdGroupId
       if (!target) return null
-      return `group join-flow ${target} demo-join-${suffix} --open`
+      return `relay join-flow ${target} demo-join-${suffix} --open`
     }
   },
   {

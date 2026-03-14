@@ -45,7 +45,7 @@ describe.sequential('TUI copy shortcuts', () => {
       <App
         options={BASE_OPTIONS}
         controllerFactory={(options) => MockController.withSeedData(options)}
-        scriptedCommands={[{ command: 'goto groups:my', delayMs: 50, pauseAfterMs: 50 }]}
+        scriptedCommands={[{ command: 'goto relay:my', delayMs: 50, pauseAfterMs: 50 }]}
       />
     )
 

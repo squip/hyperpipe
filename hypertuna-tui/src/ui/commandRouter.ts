@@ -360,22 +360,20 @@ function looksLikeGroupIdentifier(value: string): boolean {
 
 const NAV_ALIASES: Record<string, NavNodeId> = {
   dashboard: 'dashboard',
-  relays: 'relays',
-  groups: 'groups',
-  'groups:browse': 'groups:browse',
-  browse: 'groups:browse',
-  discover: 'groups:browse',
-  'groups:discover': 'groups:browse',
-  'groups:my': 'groups:my',
-  'groups:create': 'groups:create',
-  'create-group': 'groups:create',
-  my: 'groups:my',
+  relays: 'groups:my',
+  relay: 'groups:my',
+  'relay:browse': 'groups:browse',
+  'relay:my': 'groups:my',
+  'relay:create': 'groups:create',
+  'browse-relays': 'groups:browse',
+  'my-relays': 'groups:my',
+  'create-relay': 'groups:create',
   chats: 'chats',
   'chats:create': 'chats:create',
   'create-chat': 'chats:create',
   invites: 'invites',
   'invites:group': 'invites:group',
-  'group-invites': 'invites:group',
+  'relay-invites': 'invites:group',
   'invites:chat': 'invites:chat',
   'chat-invites': 'invites:chat',
   'invites:send': 'invites:send',
@@ -390,10 +388,27 @@ const NAV_ALIASES: Record<string, NavNodeId> = {
   logs: 'logs'
 }
 
+const LEGACY_GROUP_GOTO_MIGRATIONS: Record<string, string> = {
+  groups: 'relay:my',
+  'groups:browse': 'relay:browse',
+  'groups:discover': 'relay:browse',
+  'groups:my': 'relay:my',
+  'groups:create': 'relay:create',
+  browse: 'relay:browse',
+  discover: 'relay:browse',
+  my: 'relay:my',
+  'create-group': 'relay:create',
+  'group-invites': 'invites:group'
+}
+
 function parseNode(input: string): NavNodeId {
   const normalized = input.trim().toLowerCase()
   const alias = NAV_ALIASES[normalized]
   if (alias) return alias
+  const migrationTarget = LEGACY_GROUP_GOTO_MIGRATIONS[normalized]
+  if (migrationTarget) {
+    throw new Error(`Navigation alias "${input}" was removed. Use "goto ${migrationTarget}" instead.`)
+  }
   if (normalized.startsWith('files:type:')) {
     const family = normalized.replace('files:type:', '')
     if (FILE_FAMILY_ORDER.includes(family as (typeof FILE_FAMILY_ORDER)[number])) {
@@ -444,6 +459,20 @@ function parseProfileSelector(selector: string, profiles: AccountProfileSummary[
 function shortValueForMessage(value: string, max = 160): string {
   if (value.length <= max) return value
   return `${value.slice(0, max - 3)}...`
+}
+
+function suggestRelayMigration(input: string): string {
+  const parts = tokenize(input)
+  const legacyAction = String(parts[1] || '').trim().toLowerCase()
+  const canonicalAction = legacyAction === 'request'
+    ? 'request-invite'
+    : legacyAction === 'accept-invite'
+      ? 'invite-accept'
+      : legacyAction === 'dismiss-invite'
+        ? 'invite-dismiss'
+        : (legacyAction || '<action>')
+  const remaining = parts.slice(2).join(' ')
+  return ['relay', canonicalAction, remaining].filter(Boolean).join(' ').trim()
 }
 
 const SENSITIVE_COPY_FIELDS = new Set(['nsec', 'ncryptsec', 'token', 'secret', 'writer-secret', 'writer_secret'])
@@ -581,25 +610,27 @@ export function buildCommandSnippet(context?: CommandContext, workflow?: string)
 
   const fromWorkflow = (): string | null => {
     if (!normalizedWorkflow) return null
-    if ((normalizedWorkflow === 'join-flow' || normalizedWorkflow === 'group-join')
+    if ((normalizedWorkflow === 'join-flow' || normalizedWorkflow === 'group-join' || normalizedWorkflow === 'relay-join')
       && (selectedGroup?.id || (selectedInvite?.kind === 'group' ? selectedInvite.groupId : null))) {
       const groupId = selectedGroup?.id || (selectedInvite as SelectedGroupInviteRef).groupId
-      return `group join-flow ${groupId}`
+      return `relay join-flow ${groupId}`
     }
-    if ((normalizedWorkflow === 'group-invite' || normalizedWorkflow === 'invite') && selectedGroup?.id) {
-      return `group invite ${selectedGroup.id} <relayUrl> <inviteePubkey> [token]`
+    if ((normalizedWorkflow === 'group-invite' || normalizedWorkflow === 'relay-invite' || normalizedWorkflow === 'invite') && selectedGroup?.id) {
+      return `relay invite ${selectedGroup.id} <relayUrl> <inviteePubkey> [token]`
     }
-    if (normalizedWorkflow === 'group-invite-accept' && selectedInvite?.kind === 'group') {
-      return `group invite-accept ${selectedInvite.id}`
+    if ((normalizedWorkflow === 'group-invite-accept' || normalizedWorkflow === 'relay-invite-accept')
+      && selectedInvite?.kind === 'group') {
+      return `relay invite-accept ${selectedInvite.id}`
     }
-    if (normalizedWorkflow === 'group-invite-dismiss' && selectedInvite?.kind === 'group') {
-      return `group invite-dismiss ${selectedInvite.id}`
+    if ((normalizedWorkflow === 'group-invite-dismiss' || normalizedWorkflow === 'relay-invite-dismiss')
+      && selectedInvite?.kind === 'group') {
+      return `relay invite-dismiss ${selectedInvite.id}`
     }
-    if (normalizedWorkflow === 'group-update-members' && selectedGroup?.id) {
-      return `group update-members ${selectedGroup.id} add <pubkey>`
+    if ((normalizedWorkflow === 'group-update-members' || normalizedWorkflow === 'relay-update-members') && selectedGroup?.id) {
+      return `relay update-members ${selectedGroup.id} add <pubkey>`
     }
-    if (normalizedWorkflow === 'group-update-auth' && selectedGroup?.id) {
-      return `group update-auth ${selectedGroup.id} <pubkey> <token>`
+    if ((normalizedWorkflow === 'group-update-auth' || normalizedWorkflow === 'relay-update-auth') && selectedGroup?.id) {
+      return `relay update-auth ${selectedGroup.id} <pubkey> <token>`
     }
     if ((normalizedWorkflow === 'chat-accept' || normalizedWorkflow === 'accept')
       && selectedInvite?.kind === 'chat') {
@@ -628,12 +659,9 @@ export function buildCommandSnippet(context?: CommandContext, workflow?: string)
   if (byWorkflow) return byWorkflow
 
   if (selectedNode?.startsWith('groups')) {
-    if (selectedInvite?.kind === 'group') return `group invite-accept ${selectedInvite.id}`
-    if (selectedGroup?.id) return `group members ${selectedGroup.id}`
-    return 'group tab my'
-  }
-  if (selectedNode === 'relays' && (selectedRelay?.publicIdentifier || selectedRelay?.relayKey)) {
-    return `relay join ${selectedRelay?.publicIdentifier || selectedRelay?.relayKey}`
+    if (selectedInvite?.kind === 'group') return `relay invite-accept ${selectedInvite.id}`
+    if (selectedGroup?.id) return `relay members ${selectedGroup.id}`
+    return 'relay tab my'
   }
   if ((selectedNode === 'groups:my' || selectedNode === 'groups:browse') && selectedNote?.id) {
     return `reply ${selectedNote.id} ${selectedNote.pubkey} <content>`
@@ -644,7 +672,7 @@ export function buildCommandSnippet(context?: CommandContext, workflow?: string)
     return 'file search <query>'
   }
   if (selectedNode === 'invites:group') {
-    if (selectedInvite?.kind === 'group') return `invites accept group ${selectedInvite.id}`
+    if (selectedInvite?.kind === 'group') return `invites accept relay ${selectedInvite.id}`
     return 'invites refresh'
   }
   if (selectedNode === 'invites:chat') {
@@ -676,10 +704,15 @@ export async function executeCommand(
   const args = tokenize(trimmed)
   const cmd = args[0]?.toLowerCase() || ''
 
+  if (cmd === 'group') {
+    const replacement = suggestRelayMigration(trimmed)
+    throw new Error(`Command root "group" was removed. Use "${replacement}" instead.`)
+  }
+
   if (cmd === 'help') {
     return {
       message:
-        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | gateway list/refresh | relay refresh/create/join/disconnect/leave | group tab/refresh/invites/members/search/sort/filter/join-flow/request-invite/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept/dismiss | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/invite/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot'
+        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | gateway list/refresh | relay tab/refresh/invites/members/search/sort/filter/create/join/disconnect/leave/join-flow/request-invite/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept <relay|chat>/dismiss <relay|chat> | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/invite/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot'
     }
   }
 
@@ -891,9 +924,94 @@ export async function executeCommand(
   if (cmd === 'relay') {
     const action = requireArg(args[1], 'relay action').toLowerCase()
 
+    if (action === 'tab') {
+      const tab = requireArg(args[2], 'tab').toLowerCase()
+      if (tab === 'invites') {
+        return { message: 'Relay invites live under Invites > Relay Invites', gotoNode: 'invites:group' }
+      }
+      if (tab === 'create') {
+        return { message: 'Relay tab create', gotoNode: 'groups:create' }
+      }
+      const normalizedTab = tab === 'browse' ? 'discover' : tab
+      if (!['discover', 'my'].includes(normalizedTab)) {
+        throw new Error('Relay tab must be discover|browse|my|create|invites')
+      }
+      await controller.setGroupViewTab(normalizedTab as 'discover' | 'my')
+      return {
+        message: `Relay tab ${normalizedTab === 'discover' ? 'browse' : normalizedTab}`,
+        gotoNode: normalizedTab === 'my' ? 'groups:my' : 'groups:browse'
+      }
+    }
+
     if (action === 'refresh') {
-      await controller.refreshRelays()
-      return { message: 'Relays refreshed', gotoNode: 'relays' }
+      await Promise.all([controller.refreshRelays(), controller.refreshGroups()])
+      return { message: 'Relay state refreshed', gotoNode: 'groups:my' }
+    }
+
+    if (action === 'invites') {
+      await controller.refreshInvites()
+      return { message: 'Relay invites refreshed', gotoNode: 'invites:group' }
+    }
+
+    if (action === 'members') {
+      const selectedGroup = resolveSelectedGroup(context)
+      let groupId: string | undefined = args[2]
+      if (!groupId) {
+        groupId = selectedGroup?.id
+      }
+      groupId = requireArg(groupId, 'relay id')
+      await controller.refreshGroupMembers(groupId, selectedGroup?.relay || undefined)
+      return { message: `Relay members refreshed for ${groupId}`, gotoNode: 'groups:my' }
+    }
+
+    if (action === 'search') {
+      const query = args[2] ? remainder(trimmed, `${args[0]} ${args[1]}`) : ''
+      if (!query || query.toLowerCase() === 'clear') {
+        await controller.setGroupSearch('')
+        return { message: 'Relay search cleared', gotoNode: 'groups:browse' }
+      }
+      await controller.setGroupSearch(query)
+      return { message: 'Relay search updated', gotoNode: 'groups:browse' }
+    }
+
+    if (action === 'sort') {
+      const sortKey = requireArg(args[2], 'sort key') as
+        | 'name'
+        | 'description'
+        | 'open'
+        | 'public'
+        | 'admin'
+        | 'createdAt'
+        | 'members'
+        | 'peers'
+      if (!['name', 'description', 'open', 'public', 'admin', 'createdAt', 'members', 'peers'].includes(sortKey)) {
+        throw new Error('Relay sort key must be name|description|open|public|admin|createdAt|members|peers')
+      }
+      await controller.setGroupSort(sortKey, args[3])
+      return {
+        message: `Relay sort updated (${sortKey}${args[3] ? ` ${args[3]}` : ''})`,
+        gotoNode: 'groups:browse'
+      }
+    }
+
+    if (action === 'filter') {
+      const target = requireArg(args[2], 'filter target').toLowerCase()
+      const value = requireArg(args[3], 'filter value').toLowerCase()
+      if (target === 'visibility') {
+        if (!['all', 'public', 'private'].includes(value)) {
+          throw new Error('Visibility filter must be all|public|private')
+        }
+        await controller.setGroupVisibilityFilter(value as 'all' | 'public' | 'private')
+        return { message: `Relay visibility filter set (${value})`, gotoNode: 'groups:browse' }
+      }
+      if (target === 'join') {
+        if (!['all', 'open', 'closed'].includes(value)) {
+          throw new Error('Join filter must be all|open|closed')
+        }
+        await controller.setGroupJoinFilter(value as 'all' | 'open' | 'closed')
+        return { message: `Relay join filter set (${value})`, gotoNode: 'groups:browse' }
+      }
+      throw new Error('Relay filter target must be visibility|join')
     }
 
     if (action === 'create') {
@@ -1003,15 +1121,16 @@ export async function executeCommand(
         gatewayId: directJoinOnly ? null : gatewayId,
         directJoinOnly
       })
-      return { message: `Relay created: ${name}`, gotoNode: 'relays' }
+      return { message: `Relay created: ${name}`, gotoNode: 'groups:my' }
     }
 
     if (action === 'join') {
       let identifier: string | undefined = args[2]
       const token = args[3]
       if (!identifier) {
+        const selectedGroup = resolveSelectedGroup(context)
         const selectedRelay = resolveSelectedRelay(context)
-        identifier = selectedRelay?.publicIdentifier || selectedRelay?.relayKey
+        identifier = selectedGroup?.id || selectedRelay?.publicIdentifier || selectedRelay?.relayKey
       }
       identifier = requireArg(identifier, 'publicIdentifier or relayKey')
 
@@ -1021,17 +1140,27 @@ export async function executeCommand(
         publicIdentifier: isRelayKey ? undefined : identifier,
         authToken: token
       })
-      return { message: `Join relay requested for ${identifier}`, gotoNode: 'relays' }
+      return { message: `Join relay requested for ${identifier}`, gotoNode: 'groups:my' }
     }
 
     if (action === 'disconnect') {
-      const relayKey = requireArg(args[2], 'relayKey')
+      let relayKey = args[2]
+      if (!relayKey) {
+        relayKey = resolveSelectedRelay(context)?.relayKey
+      }
+      relayKey = requireArg(relayKey, 'relayKey')
       await controller.disconnectRelay(relayKey)
-      return { message: `Relay disconnected ${relayKey}`, gotoNode: 'relays' }
+      return { message: `Relay disconnected ${relayKey}`, gotoNode: 'groups:my' }
     }
 
     if (action === 'leave') {
-      const identifier = requireArg(args[2], 'publicIdentifier or relayKey')
+      let identifier: string | undefined = args[2]
+      if (!identifier) {
+        const selectedGroup = resolveSelectedGroup(context)
+        const selectedRelay = resolveSelectedRelay(context)
+        identifier = selectedGroup?.id || selectedRelay?.publicIdentifier || selectedRelay?.relayKey
+      }
+      identifier = requireArg(identifier, 'publicIdentifier or relayKey')
       const saveRelaySnapshot = args.includes('--archive') ? true : args.includes('--no-archive') ? false : true
       const saveSharedFiles = args.includes('--save-files') ? true : args.includes('--drop-files') ? false : true
       const isRelayKey = /^[a-f0-9]{64}$/i.test(identifier)
@@ -1041,18 +1170,26 @@ export async function executeCommand(
         saveRelaySnapshot,
         saveSharedFiles
       })
-      return { message: `Leave group requested for ${identifier}`, gotoNode: 'relays' }
+      return { message: `Leave relay requested for ${identifier}`, gotoNode: 'groups:my' }
     }
 
     if (action === 'join-flow') {
-      let publicIdentifier = args[2] && !args[2].startsWith('--') ? args[2] : undefined
-      let token = args[3] && !args[3].startsWith('--') ? args[3] : undefined
+      const selectedGroup = resolveSelectedGroup(context)
+      const selectedGroupInvite = resolveSelectedInvite(context)
+      const candidate = args[2] && !args[2].startsWith('--') ? args[2] : undefined
+      let publicIdentifier: string | undefined
+      let token: string | undefined
       let gatewayOrigin: string | null | undefined
       let gatewayId: string | null | undefined
       let directJoinOnly: boolean | undefined
-      if (!publicIdentifier) {
-        const selectedGroup = resolveSelectedGroup(context)
-        const selectedGroupInvite = resolveSelectedInvite(context)
+
+      if (candidate && looksLikeGroupIdentifier(candidate)) {
+        publicIdentifier = candidate
+        token = args[3]
+      } else {
+        publicIdentifier = selectedGroup?.id
+          || (selectedGroupInvite?.kind === 'group' ? selectedGroupInvite.groupId : undefined)
+        if (candidate && !candidate.startsWith('--')) token = candidate
         if (selectedGroup?.id) {
           publicIdentifier = selectedGroup.id
           gatewayOrigin = selectedGroup.gatewayOrigin
@@ -1078,7 +1215,7 @@ export async function executeCommand(
       return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
     }
 
-    if (action === 'request-invite' || action === 'request') {
+    if (action === 'request-invite') {
       const selectedGroup = resolveSelectedGroup(context)
       let groupId: string | undefined = args[2]
       let code: string | undefined
@@ -1091,165 +1228,6 @@ export async function executeCommand(
       } else {
         code = args[3]
       }
-      groupId = requireArg(groupId, 'groupId')
-      if (args.length >= 5) {
-        reason = remainder(trimmed, `${args[0]} ${args[1]} ${args[2]} ${args[3]}`)
-      } else if (args.length >= 4 && !code) {
-        reason = remainder(trimmed, `${args[0]} ${args[1]} ${args[2]}`)
-      }
-
-      await controller.requestGroupInvite({
-        groupId,
-        relay: selectedGroup?.relay || null,
-        code,
-        reason
-      })
-      return { message: `Invite request submitted for ${groupId}`, gotoNode: 'groups:browse' }
-    }
-
-    throw new Error(`Unknown relay action: ${action}`)
-  }
-
-  if (cmd === 'group') {
-    const action = requireArg(args[1], 'group action').toLowerCase()
-
-    if (action === 'tab') {
-      const tab = requireArg(args[2], 'tab').toLowerCase()
-      if (tab === 'invites') {
-        return { message: 'Group invites live under Invites > Group Invites', gotoNode: 'invites:group' }
-      }
-      if (!['discover', 'my'].includes(tab)) {
-        throw new Error('Group tab must be discover|my')
-      }
-      await controller.setGroupViewTab(tab as 'discover' | 'my')
-      return { message: `Group tab ${tab}`, gotoNode: tab === 'my' ? 'groups:my' : 'groups:browse' }
-    }
-
-    if (action === 'refresh') {
-      await controller.refreshGroups()
-      return { message: 'Groups refreshed', gotoNode: 'groups:browse' }
-    }
-
-    if (action === 'invites') {
-      await controller.refreshInvites()
-      return { message: 'Group invites refreshed', gotoNode: 'invites:group' }
-    }
-
-    if (action === 'members') {
-      let groupId: string | undefined = args[2]
-      if (!groupId) {
-        groupId = resolveSelectedGroup(context)?.id
-      }
-      groupId = requireArg(groupId, 'groupId')
-      await controller.refreshGroupMembers(groupId, resolveSelectedGroup(context)?.relay || undefined)
-      return { message: `Group members refreshed for ${groupId}`, gotoNode: 'groups:my' }
-    }
-
-    if (action === 'search') {
-      const query = args[2] ? remainder(trimmed, `${args[0]} ${args[1]}`) : ''
-      if (!query || query.toLowerCase() === 'clear') {
-        await controller.setGroupSearch('')
-        return { message: 'Group search cleared', gotoNode: 'groups:browse' }
-      }
-      await controller.setGroupSearch(query)
-      return { message: 'Group search updated', gotoNode: 'groups:browse' }
-    }
-
-    if (action === 'sort') {
-      const sortKey = requireArg(args[2], 'sort key') as
-        | 'name'
-        | 'description'
-        | 'open'
-        | 'public'
-        | 'admin'
-        | 'createdAt'
-        | 'members'
-        | 'peers'
-      if (!['name', 'description', 'open', 'public', 'admin', 'createdAt', 'members', 'peers'].includes(sortKey)) {
-        throw new Error('Group sort key must be name|description|open|public|admin|createdAt|members|peers')
-      }
-      await controller.setGroupSort(sortKey, args[3])
-      return { message: `Group sort updated (${sortKey}${args[3] ? ` ${args[3]}` : ''})`, gotoNode: 'groups:browse' }
-    }
-
-    if (action === 'filter') {
-      const target = requireArg(args[2], 'filter target').toLowerCase()
-      const value = requireArg(args[3], 'filter value').toLowerCase()
-      if (target === 'visibility') {
-        if (!['all', 'public', 'private'].includes(value)) {
-          throw new Error('Visibility filter must be all|public|private')
-        }
-        await controller.setGroupVisibilityFilter(value as 'all' | 'public' | 'private')
-        return { message: `Group visibility filter set (${value})`, gotoNode: 'groups:browse' }
-      }
-      if (target === 'join') {
-        if (!['all', 'open', 'closed'].includes(value)) {
-          throw new Error('Join filter must be all|open|closed')
-        }
-        await controller.setGroupJoinFilter(value as 'all' | 'open' | 'closed')
-        return { message: `Group join filter set (${value})`, gotoNode: 'groups:browse' }
-      }
-      throw new Error('Group filter target must be visibility|join')
-    }
-
-    if (action === 'join-flow') {
-      const selectedGroup = resolveSelectedGroup(context)
-      const selectedGroupInvite = resolveSelectedInvite(context)
-      const candidate = args[2] && !args[2].startsWith('--') ? args[2] : undefined
-      let publicIdentifier: string | undefined
-      let token: string | undefined
-      let gatewayOrigin: string | null | undefined
-      let gatewayId: string | null | undefined
-      let directJoinOnly: boolean | undefined
-
-      if (candidate && looksLikeGroupIdentifier(candidate)) {
-        publicIdentifier = candidate
-        token = args[3]
-      } else {
-        publicIdentifier = selectedGroup?.id
-          || (selectedGroupInvite?.kind === 'group' ? selectedGroupInvite.groupId : undefined)
-        if (candidate && !candidate.startsWith('--')) token = candidate
-        if (selectedGroup?.id) {
-          gatewayOrigin = selectedGroup.gatewayOrigin
-          gatewayId = selectedGroup.gatewayId
-          directJoinOnly = selectedGroup.directJoinOnly === true
-        }
-        if (selectedGroupInvite?.kind === 'group') {
-          token = token || selectedGroupInvite.token || undefined
-          gatewayOrigin = selectedGroupInvite.gatewayOrigin
-          gatewayId = selectedGroupInvite.gatewayId
-          directJoinOnly = selectedGroupInvite.directJoinOnly === true
-        }
-      }
-
-      publicIdentifier = requireArg(publicIdentifier, 'publicIdentifier')
-
-      await controller.startJoinFlow({
-        publicIdentifier,
-        token,
-        openJoin: args.includes('--open'),
-        gatewayOrigin,
-        gatewayId,
-        directJoinOnly
-      })
-      return { message: `Join flow started for ${publicIdentifier}`, gotoNode: 'groups:browse' }
-    }
-
-    if (action === 'request-invite' || action === 'request') {
-      const selectedGroup = resolveSelectedGroup(context)
-      let groupId: string | undefined = args[2]
-      let code: string | undefined
-      let reason: string | undefined
-
-      if (!groupId) {
-        groupId = selectedGroup?.id
-      } else if (!looksLikeGroupIdentifier(groupId) && selectedGroup?.id) {
-        code = groupId
-        groupId = selectedGroup.id
-      } else {
-        code = args[3]
-      }
-
       groupId = requireArg(groupId, 'groupId')
       if (args.length >= 5) {
         reason = remainder(trimmed, `${args[0]} ${args[1]} ${args[2]} ${args[3]}`)
@@ -1297,10 +1275,10 @@ export async function executeCommand(
           fileSharing: true
         }
       })
-      return { message: `Invite sent to ${inviteePubkey}`, gotoNode: 'invites:group' }
+      return { message: `Relay invite sent to ${inviteePubkey}`, gotoNode: 'invites:group' }
     }
 
-    if (action === 'invite-accept' || action === 'accept-invite') {
+    if (action === 'invite-accept') {
       let inviteId = args[2] && !args[2].startsWith('--') ? args[2] : undefined
       if (!inviteId) {
         const selectedInvite = resolveSelectedInvite(context)
@@ -1308,10 +1286,10 @@ export async function executeCommand(
       }
       inviteId = requireArg(inviteId, 'inviteId')
       await controller.acceptGroupInvite(inviteId)
-      return { message: `Group invite accepted ${inviteId}`, gotoNode: 'invites:group' }
+      return { message: `Relay invite accepted ${inviteId}`, gotoNode: 'invites:group' }
     }
 
-    if (action === 'invite-dismiss' || action === 'dismiss-invite') {
+    if (action === 'invite-dismiss') {
       let inviteId = args[2]
       if (!inviteId) {
         const selectedInvite = resolveSelectedInvite(context)
@@ -1319,7 +1297,7 @@ export async function executeCommand(
       }
       inviteId = requireArg(inviteId, 'inviteId')
       await controller.dismissGroupInvite(inviteId)
-      return { message: `Group invite dismissed ${inviteId}`, gotoNode: 'invites:group' }
+      return { message: `Relay invite dismissed ${inviteId}`, gotoNode: 'invites:group' }
     }
 
     if (action === 'join-requests') {
@@ -1327,7 +1305,7 @@ export async function executeCommand(
       if (!groupId) {
         groupId = resolveSelectedGroup(context)?.id
       }
-      groupId = requireArg(groupId, 'groupId')
+      groupId = requireArg(groupId, 'relay id')
       await controller.refreshJoinRequests(groupId, resolveSelectedGroup(context)?.relay || undefined)
       return { message: `Join requests refreshed for ${groupId}`, gotoNode: 'groups:my' }
     }
@@ -1339,7 +1317,7 @@ export async function executeCommand(
         groupId = resolveSelectedGroup(context)?.id
         pubkey = args[2]
       }
-      groupId = requireArg(groupId, 'groupId')
+      groupId = requireArg(groupId, 'relay id')
       pubkey = requireArg(pubkey, 'pubkey')
       await controller.approveJoinRequest(groupId, pubkey, resolveSelectedGroup(context)?.relay || undefined)
       return { message: `Approved join request ${pubkey}`, gotoNode: 'groups:my' }
@@ -1352,7 +1330,7 @@ export async function executeCommand(
         groupId = resolveSelectedGroup(context)?.id
         pubkey = args[2]
       }
-      groupId = requireArg(groupId, 'groupId')
+      groupId = requireArg(groupId, 'relay id')
       pubkey = requireArg(pubkey, 'pubkey')
       await controller.rejectJoinRequest(groupId, pubkey, resolveSelectedGroup(context)?.relay || undefined)
       return { message: `Rejected join request ${pubkey}`, gotoNode: 'groups:my' }
@@ -1413,7 +1391,7 @@ export async function executeCommand(
       return { message: `Auth token updated for ${pubkey}`, gotoNode: 'groups:my' }
     }
 
-    throw new Error(`Unknown group action: ${action}`)
+    throw new Error(`Unknown relay action: ${action}`)
   }
 
   if (cmd === 'invites') {
@@ -1424,8 +1402,12 @@ export async function executeCommand(
     }
     const target = requireArg(args[2], 'invite target').toLowerCase()
     const inviteId = args[3] && !args[3].startsWith('--') ? args[3] : undefined
+    if (target === 'group') {
+      const replacement = ['invites', action, 'relay', inviteId].filter(Boolean).join(' ')
+      throw new Error(`Invite target "group" was removed. Use "${replacement}" instead.`)
+    }
 
-    const resolveGroupInviteId = () => {
+    const resolveRelayInviteId = () => {
       if (inviteId) return inviteId
       const selectedInvite = resolveSelectedInvite(context)
       if (selectedInvite?.kind === 'group') return selectedInvite.id
@@ -1440,31 +1422,31 @@ export async function executeCommand(
     }
 
     if (action === 'accept') {
-      if (target === 'group') {
-        const id = requireArg(resolveGroupInviteId(), 'inviteId')
+      if (target === 'relay') {
+        const id = requireArg(resolveRelayInviteId(), 'inviteId')
         await controller.acceptGroupInvite(id)
-        return { message: `Accepted group invite ${id}`, gotoNode: 'invites:group' }
+        return { message: `Accepted relay invite ${id}`, gotoNode: 'invites:group' }
       }
       if (target === 'chat') {
         const id = requireArg(resolveChatInviteId(), 'inviteId')
         await controller.acceptChatInvite(id)
         return { message: `Accepted chat invite ${id}`, gotoNode: 'invites:chat' }
       }
-      throw new Error('Invites accept target must be group|chat')
+      throw new Error('Invites accept target must be relay|chat')
     }
 
     if (action === 'dismiss') {
-      if (target === 'group') {
-        const id = requireArg(resolveGroupInviteId(), 'inviteId')
+      if (target === 'relay') {
+        const id = requireArg(resolveRelayInviteId(), 'inviteId')
         await controller.dismissGroupInvite(id)
-        return { message: `Dismissed group invite ${id}`, gotoNode: 'invites:group' }
+        return { message: `Dismissed relay invite ${id}`, gotoNode: 'invites:group' }
       }
       if (target === 'chat') {
         const id = requireArg(resolveChatInviteId(), 'inviteId')
         await controller.dismissChatInvite(id)
         return { message: `Dismissed chat invite ${id}`, gotoNode: 'invites:chat' }
       }
-      throw new Error('Invites dismiss target must be group|chat')
+      throw new Error('Invites dismiss target must be relay|chat')
     }
 
     throw new Error(`Unknown invites action: ${action}`)

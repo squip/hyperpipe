@@ -37,36 +37,57 @@ function groupContext(controller: MockController, copyImpl?: CommandContext['cop
 }
 
 describe('command router context-first workflows', () => {
-  it('supports goto aliases for new tree workflow nodes', async () => {
+  it('supports relay goto aliases for consolidated tree workflow nodes', async () => {
     const controller = createController()
 
-    const gotoCreateGroup = await executeCommand(controller, 'goto create-group')
+    const gotoCreateRelay = await executeCommand(controller, 'goto relay:create')
+    const gotoBrowseRelay = await executeCommand(controller, 'goto relay:browse')
+    const gotoMyRelay = await executeCommand(controller, 'goto relays')
     const gotoCreateChat = await executeCommand(controller, 'goto chats:create')
     const gotoSendInvite = await executeCommand(controller, 'goto send-invite')
 
-    expect(gotoCreateGroup.gotoNode).toBe('groups:create')
+    expect(gotoCreateRelay.gotoNode).toBe('groups:create')
+    expect(gotoBrowseRelay.gotoNode).toBe('groups:browse')
+    expect(gotoMyRelay.gotoNode).toBe('groups:my')
     expect(gotoCreateChat.gotoNode).toBe('chats:create')
     expect(gotoSendInvite.gotoNode).toBe('invites:send')
   })
 
-  it('uses selected group for join-flow when group id is omitted', async () => {
+  it('returns explicit migration errors for removed group command and goto aliases', async () => {
+    const controller = createController()
+    await expect(executeCommand(controller, 'group refresh')).rejects.toThrow(/Use "relay refresh" instead/i)
+    await expect(executeCommand(controller, 'goto groups:my')).rejects.toThrow(/goto relay:my/i)
+  })
+
+  it('runs consolidated relay refresh across relay and group state', async () => {
+    const controller = createController()
+    const refreshRelaysSpy = vi.spyOn(controller, 'refreshRelays')
+    const refreshGroupsSpy = vi.spyOn(controller, 'refreshGroups')
+
+    const result = await executeCommand(controller, 'relay refresh')
+    expect(result.gotoNode).toBe('groups:my')
+    expect(refreshRelaysSpy).toHaveBeenCalledTimes(1)
+    expect(refreshGroupsSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('uses selected relay for join-flow when relay id is omitted', async () => {
     const controller = createController()
     const context = groupContext(controller)
     const groupId = controller.getState().groups[0]?.id
     expect(groupId).toBeTruthy()
 
-    const result = await executeCommand(controller, 'group join-flow demo-token --open', context)
+    const result = await executeCommand(controller, 'relay join-flow demo-token --open', context)
     expect(result.message).toContain(groupId)
     expect(controller.getState().logs.some((entry) => entry.message.includes(`join-flow:${groupId}`))).toBe(true)
   })
 
-  it('uses selected group and relay for invite when metadata is omitted', async () => {
+  it('uses selected relay and relay url for invite when metadata is omitted', async () => {
     const controller = createController()
     const context = groupContext(controller)
     const groupId = controller.getState().groups[0]?.id
     const inviteePubkey = 'c'.repeat(64)
 
-    await executeCommand(controller, `group invite ${inviteePubkey} invite-token`, context)
+    await executeCommand(controller, `relay invite ${inviteePubkey} invite-token`, context)
 
     const latestInvite = controller.getState().invites[0]
     expect(latestInvite).toBeTruthy()
@@ -74,13 +95,13 @@ describe('command router context-first workflows', () => {
     expect(latestInvite?.token).toBe('invite-token')
   })
 
-  it('uses selected group for update-members and update-auth when identifier is omitted', async () => {
+  it('uses selected relay for update-members and update-auth when identifier is omitted', async () => {
     const controller = createController()
     const context = groupContext(controller)
     const memberPubkey = 'd'.repeat(64)
 
-    await executeCommand(controller, `group update-members add ${memberPubkey}`, context)
-    await executeCommand(controller, `group update-auth ${memberPubkey} auth-token-2`, context)
+    await executeCommand(controller, `relay update-members add ${memberPubkey}`, context)
+    await executeCommand(controller, `relay update-auth ${memberPubkey} auth-token-2`, context)
 
     const logMessages = controller.getState().logs.map((entry) => entry.message)
     expect(logMessages.some((message) => message.includes('members-updated'))).toBe(true)
@@ -109,13 +130,13 @@ describe('command router context-first workflows', () => {
     expect(controller.getState().chatInvites.some((invite) => invite.id === inviteId)).toBe(false)
   })
 
-  it('routes group request-invite through selected group context when group id is omitted', async () => {
+  it('routes relay request-invite through selected relay context when relay id is omitted', async () => {
     const controller = createController()
     const context = groupContext(controller)
     const groupId = controller.getState().groups[0]?.id
     expect(groupId).toBeTruthy()
 
-    const result = await executeCommand(controller, 'group request-invite join-code-1 please approve', context)
+    const result = await executeCommand(controller, 'relay request-invite join-code-1 please approve', context)
     expect(result.message).toContain(groupId)
     expect(controller.getState().logs.some((entry) => entry.message.includes(`request-invite:${groupId}`))).toBe(true)
   })
@@ -162,7 +183,7 @@ describe('command router context-first workflows', () => {
     expect(selectedResult.message).toContain('Copied')
     expect(commandResult.message).toContain('Copied')
     expect(copiedValues[0]).toBe(groupId)
-    expect(copiedValues[1]).toBe(`group members ${groupId}`)
+    expect(copiedValues[1]).toBe(`relay members ${groupId}`)
   })
 
   it('blocks sensitive copy fields by default', async () => {
