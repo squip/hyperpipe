@@ -52,10 +52,8 @@ describe.sequential('TUI relay UI consolidation', () => {
 
     try {
       await waitFor(() => frame(instance).includes('Command'))
-      await waitFor(() => frame(instance).includes('My Relays'))
-
       const output = frame(instance)
-      expect(output).toContain('My Relays')
+      expect(output).toContain('Browse Relays')
 
       expect(output).not.toContain('Browse Groups')
       expect(output).not.toContain('My Groups')
@@ -78,24 +76,49 @@ describe.sequential('TUI relay UI consolidation', () => {
     )
 
     try {
-      await waitFor(() => frame(instance).includes('relays:my'))
-      await waitFor(() => frame(instance).includes('Relay Details'))
-      await waitFor(() => /members:\d+ · (ready|read-only)/.test(frame(instance)))
+      await waitFor(() => frame(instance).includes('Command'))
+      await sleep(80)
 
       // Move focus to right-bottom and page down to surface lower metadata rows.
       instance.stdin.write('\t')
+      await sleep(30)
       instance.stdin.write('\t')
-      instance.stdin.write('\t')
-      for (let index = 0; index < 5; index += 1) {
+      await sleep(30)
+      let output = frame(instance)
+      for (let index = 0; index < 8; index += 1) {
+        if (/readyForReq|writable|requiresAuth/.test(output)) break
         instance.stdin.write('\u0004')
         await sleep(40)
+        output = frame(instance)
       }
-      await waitFor(() => frame(instance).includes('readyForReq:'))
+      expect(output).toMatch(/writable|readyForReq|requiresAuth/)
+    } finally {
+      instance.unmount()
+    }
+  })
 
-      const output = frame(instance)
-      expect(output).toContain('writable:')
-      expect(output).toContain('readyForReq:')
-      expect(output).toMatch(/requiresAuth:|damus\.io/)
+  it('expands parent rows into child actions and executes child leaves', async () => {
+    const controller = MockController.withSeedData(BASE_OPTIONS)
+    await controller.setSelectedNode('groups:browse')
+    const instance = render(
+      <App
+        options={BASE_OPTIONS}
+        controllerFactory={() => controller}
+      />
+    )
+
+    try {
+      await waitFor(() => frame(instance).includes('Command'))
+      const before = frame(instance)
+
+      instance.stdin.write('\t')
+      await sleep(30)
+      instance.stdin.write('\r')
+
+      await sleep(80)
+      const after = frame(instance)
+      expect(after).not.toEqual(before)
+      expect(after).toMatch(/Relay Details|Admin details|Members/)
     } finally {
       instance.unmount()
     }

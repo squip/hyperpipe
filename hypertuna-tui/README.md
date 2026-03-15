@@ -42,17 +42,15 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 
 ## Navigation
 
-- `Tab`: cycle focus `Left Tree -> Center List -> Right Top -> Right Bottom`
+- `Tab`: cycle focus `Left Tree -> Right Top -> Right Bottom`
 - `Shift+Tab`: cycle focus in reverse
 - Left tree: `Up/Down` move cursor, `Right` expand/go child, `Left` collapse/go parent, `Enter` activate/toggle
-- Center list: `Up/Down/PageUp/PageDown/Home/End`
-- Right top: `Up/Down` select action/tab, `Enter` apply action
+- Right top: `Up/Down/PageUp/PageDown/Home/End`, `Enter` expand parent row, execute child action, or edit/submit form rows
 - Right bottom: `Up/Down` scroll details, `Ctrl+U`/`Ctrl+D` page scroll
-- `P2P Relays -> Create Relay` and `Chats -> Create Chat`: center `Enter` opens inline field editor, `Enter` submits field, `Esc` cancels field editor
+- `P2P Relays -> Create Relay` and `Chats -> Create Chat`: right-top `Enter` opens inline field editor, `Enter` submits field, `Esc` cancels field editor
 - `Invites -> Send Invite`: right-bottom accepts text input, suggestion list, and `Enter` to send invite
 - `r`: refresh current section
 - `:`: open command bar
-- `Enter` on non-form center rows: open command bar prefilled from current selection
 - `y`: copy primary selected value
 - `Y`: copy context-aware command snippet
 - `q`: quit
@@ -81,7 +79,7 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 
 ## Context-first copy workflow
 
-- Most commands infer IDs from the selected row in the center pane.
+- Most commands infer IDs from the selected row in the right-top pane.
 - `copy selected` copies the current row's primary value.
 - `copy <field>` copies explicit fields like `relay-id` (`group-id` is still accepted), `invite-id`, `relay`, `conversation-id`, `url`, `sha256`.
 - `copy command [workflow]` copies a workflow command template for the current selection.

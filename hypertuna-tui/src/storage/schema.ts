@@ -26,7 +26,10 @@ const accountScopedUiStateSchema = z.object({
   )),
   chatViewTab: z.enum(['conversations', 'invites']).default('conversations'),
   selectedNode: z.string().default('dashboard'),
-  focusPane: z.enum(['left-tree', 'center', 'right-top', 'right-bottom']).default('left-tree'),
+  focusPane: z.union([
+    z.enum(['left-tree', 'right-top', 'right-bottom']),
+    z.literal('center')
+  ]).default('left-tree').transform((value) => (value === 'center' ? 'right-top' : value)),
   treeExpanded: z.object({
     groups: z.boolean().default(true),
     chats: z.boolean().default(true),

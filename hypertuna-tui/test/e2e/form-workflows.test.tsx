@@ -52,7 +52,7 @@ describe.sequential('TUI e2e in-pane form workflows', () => {
   it('opens and edits the P2P Relays -> Create Relay inline field prompt', async () => {
     const controller = MockController.withSeedData(BASE_OPTIONS)
     await controller.setSelectedNode('groups:create')
-    await controller.setFocusPane('center')
+    await controller.setFocusPane('right-top')
     const instance = render(
       <App
         options={BASE_OPTIONS}
@@ -91,10 +91,11 @@ describe.sequential('TUI e2e in-pane form workflows', () => {
       await waitFor(() => lastFrame(instance).includes('invites:send'))
 
       const invitee = 'b'.repeat(64)
+      const initialInviteCount = controller.getState().invites.length
       await typeText(instance, invitee, 2)
       instance.stdin.write('\r')
 
-      await waitFor(() => lastFrame(instance).includes('Invite sent:'))
+      await waitFor(() => controller.getState().invites.length > initialInviteCount)
       const latestInvite = controller.getState().invites[0]
       expect(latestInvite).toBeTruthy()
       expect(latestInvite?.groupId).toBe(controller.getState().myGroups[0]?.id)

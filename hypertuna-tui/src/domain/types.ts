@@ -269,7 +269,7 @@ export type PaneViewportEntry = {
 
 export type PaneViewportMap = Record<string, PaneViewportEntry>
 
-export type PaneFocus = 'left-tree' | 'center' | 'right-top' | 'right-bottom'
+export type PaneFocus = 'left-tree' | 'right-top' | 'right-bottom'
 
 export type GroupNoteRecord = {
   eventId: string

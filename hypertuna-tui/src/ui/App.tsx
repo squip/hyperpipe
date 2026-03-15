@@ -39,7 +39,7 @@ export interface AppController extends CommandController {
   setPaneViewport(sectionKey: string, cursor: number, offset: number): Promise<void>
   setDetailPaneOffset(sectionKey: string, offset: number): Promise<void>
   setSelectedNode(nodeId: NavNodeId): Promise<void>
-  setFocusPane(focusPane: 'left-tree' | 'center' | 'right-top' | 'right-bottom'): Promise<void>
+  setFocusPane(focusPane: 'left-tree' | 'right-top' | 'right-bottom'): Promise<void>
   setTreeExpanded(nextExpanded: {
     groups: boolean
     chats: boolean
@@ -57,7 +57,7 @@ export type ScriptedCommand = {
   timeoutMs?: number
 }
 
-type FocusPane = 'left-tree' | 'center' | 'right-top' | 'right-bottom'
+type FocusPane = 'left-tree' | 'right-top' | 'right-bottom'
 type TreeExpanded = { groups: boolean; chats: boolean; invites: boolean; files: boolean }
 type ViewportMap = Record<string, { cursor: number; offset: number }>
 type OffsetMap = Record<string, number>
@@ -109,6 +109,24 @@ type ChatCreateDraft = {
 }
 
 type InviteSendMode = 'group' | 'chat'
+type InviteSendTarget = {
+  kind: 'group' | 'chat'
+  id: string
+  relay: string | null
+  name: string
+}
+
+type RightTopRow = {
+  key: string
+  label: string
+  centerRow: CenterRow
+  depth: number
+  kind: 'parent' | 'action'
+  action?: string
+  expandable: boolean
+  expanded: boolean
+  inviteTarget?: InviteSendTarget | null
+}
 
 type ProfileSuggestion = {
   pubkey: string
@@ -758,6 +776,28 @@ function splitNode(node: NavNodeId): boolean {
   )
 }
 
+function supportsActionTree(node: NavNodeId): boolean {
+  return (
+    node === 'groups:browse'
+    || node === 'groups:my'
+    || node === 'invites:group'
+    || node === 'invites:chat'
+    || node === 'invites:send'
+    || node === 'files'
+    || isFileTypeNodeId(node)
+  )
+}
+
+function defaultDetailsAction(node: NavNodeId): string {
+  if (node === 'groups:browse' || node === 'groups:my' || node === 'invites:group') {
+    return 'Relay Details'
+  }
+  if (node === 'invites:chat') {
+    return 'Chat details'
+  }
+  return ''
+}
+
 function isFormCenterNode(node: NavNodeId): boolean {
   return node === 'groups:create' || node === 'chats:create' || node === 'invites:send'
 }
@@ -954,7 +994,7 @@ function singleRightRows(state: ControllerState, node: NavNodeId, selectedRow: C
       `stdout lines: ${state.workerStdout.length}`,
       `stderr lines: ${state.workerStderr.length}`,
       `entries: ${state.logs.length}`,
-      'Use center pane selection to inspect individual log lines.'
+      'Use right-top selection to inspect individual log lines.'
     ]
   }
 
@@ -1043,14 +1083,14 @@ function splitBottomRows(
 
   if (node === 'groups:create') {
     return [
-      paneActionMessage || 'Use center pane to edit fields and run create.',
+      paneActionMessage || 'Use right-top to edit fields and run create.',
       'Create workflow status will appear here.'
     ]
   }
 
   if (node === 'chats:create') {
     return [
-      paneActionMessage || 'Use center pane to edit fields and run create.',
+      paneActionMessage || 'Use right-top to edit fields and run create.',
       'Chat creation workflow status will appear here.'
     ]
   }
@@ -1221,7 +1261,7 @@ export function App({
   const [focusPane, setFocusPane] = useState<FocusPane>('left-tree')
   const [treeExpanded, setTreeExpanded] = useState<TreeExpanded>(DEFAULT_TREE_EXPANDED)
   const [nodeViewport, setNodeViewport] = useState<ViewportMap>({})
-  const [rightTopSelectionByNode, setRightTopSelectionByNode] = useState<IndexMap>({})
+  const [expandedActionParentByNode, setExpandedActionParentByNode] = useState<Record<string, string>>({})
   const [rightBottomOffsetByNode, setRightBottomOffsetByNode] = useState<OffsetMap>({})
   const [paneActionMessage, setPaneActionMessage] = useState<string>('')
   const [commandInputOpen, setCommandInputOpen] = useState(false)
@@ -1263,8 +1303,8 @@ export function App({
   const selectedNodeRef = useRef<NavNodeId>('dashboard')
   const focusPaneRef = useRef<FocusPane>('left-tree')
   const nodeViewportRef = useRef<ViewportMap>({})
-  const rightTopSelectionRef = useRef<IndexMap>({})
   const rightBottomOffsetRef = useRef<OffsetMap>({})
+  const selectedCenterRowRef = useRef<CenterRow | null>(null)
   const myGroupPaneLoadKeyRef = useRef<string>('')
 
   useEffect(() => {
@@ -1333,10 +1373,6 @@ export function App({
   }, [nodeViewport])
 
   useEffect(() => {
-    rightTopSelectionRef.current = rightTopSelectionByNode
-  }, [rightTopSelectionByNode])
-
-  useEffect(() => {
     rightBottomOffsetRef.current = rightBottomOffsetByNode
   }, [rightBottomOffsetByNode])
 
@@ -1352,7 +1388,8 @@ export function App({
     if (state.selectedNode === 'relays') {
       controllerRef.current?.setSelectedNode('groups:my').catch(() => {})
     }
-    setFocusPane(state.focusPane || 'left-tree')
+    const hydratedFocus = state.focusPane || 'left-tree'
+    setFocusPane(hydratedFocus)
     setTreeExpanded({
       groups: state.treeExpanded?.groups ?? true,
       chats: state.treeExpanded?.chats ?? true,
@@ -1360,7 +1397,7 @@ export function App({
       files: state.treeExpanded?.files ?? true
     })
     setNodeViewport(state.nodeViewport || {})
-    setRightTopSelectionByNode(state.rightTopSelectionByNode || {})
+    setExpandedActionParentByNode({})
     setRightBottomOffsetByNode(state.rightBottomOffsetByNode || {})
     setPaneActionMessage('')
     setGroupCreateDraft({
@@ -1419,14 +1456,20 @@ export function App({
   const frameRows = frameSegments(frameHeight)
   const narrowLayout = stdoutWidth < 136
 
-  const navPaneWidth = narrowLayout ? Math.max(22, stdoutWidth - 2) : clamp(Math.floor(stdoutWidth * 0.24), 28, 38)
-  const rightPaneWidth = narrowLayout ? Math.max(22, stdoutWidth - 2) : clamp(Math.floor(stdoutWidth * 0.33), 40, 58)
-  const centerPaneWidth = narrowLayout
-    ? Math.max(24, stdoutWidth - 2)
-    : Math.max(34, stdoutWidth - navPaneWidth - rightPaneWidth - 2)
+  const navPaneWidth = narrowLayout ? Math.max(22, stdoutWidth - 2) : clamp(Math.floor(stdoutWidth * 0.28), 28, 40)
+  const rightPaneWidth = narrowLayout ? Math.max(22, stdoutWidth - 2) : Math.max(48, stdoutWidth - navPaneWidth)
 
-  const centerVisibleRows = Math.max(1, frameRows.mainRows - 2)
-  const rightVisibleRows = Math.max(1, frameRows.mainRows - 2)
+  const wideRightTopBoxRows = Math.max(6, Math.floor(frameRows.mainRows / 2))
+  const wideRightBottomBoxRows = Math.max(6, frameRows.mainRows - wideRightTopBoxRows)
+  const narrowNavBoxRows = Math.max(6, Math.floor(frameRows.mainRows * 0.34))
+  const narrowRightStackRows = Math.max(8, frameRows.mainRows - narrowNavBoxRows)
+  const narrowRightTopBoxRows = Math.max(4, Math.floor(narrowRightStackRows / 2))
+  const narrowRightBottomBoxRows = Math.max(4, narrowRightStackRows - narrowRightTopBoxRows)
+
+  const navBoxRows = narrowLayout ? narrowNavBoxRows : frameRows.mainRows
+  const rightTopBoxRows = narrowLayout ? narrowRightTopBoxRows : wideRightTopBoxRows
+  const rightBottomBoxRows = narrowLayout ? narrowRightBottomBoxRows : wideRightBottomBoxRows
+  const rightTopVisibleRows = Math.max(1, rightTopBoxRows - 3)
 
   const centerRows = useMemo(() => {
     if (!state) return []
@@ -1595,10 +1638,123 @@ export function App({
     return base
   }, [state, selectedNode, groupCreateDraft, chatCreateDraft, groupGatewayPickerExpanded])
 
+  const inviteSendTargetsByMode = useMemo(() => {
+    if (!state) {
+      return {
+        group: [] as InviteSendTarget[],
+        chat: [] as InviteSendTarget[]
+      }
+    }
+    const currentPubkey = String(state.session?.pubkey || '').trim().toLowerCase()
+    if (!currentPubkey) {
+      return {
+        group: [] as InviteSendTarget[],
+        chat: [] as InviteSendTarget[]
+      }
+    }
+    const groupTargets = state.myGroups
+      .filter((group) => String(group.adminPubkey || '').trim().toLowerCase() === currentPubkey)
+      .map((group) => ({
+        kind: 'group' as const,
+        id: group.id,
+        relay: group.relay || null,
+        name: group.name || group.id
+      }))
+    const chatTargets = state.conversations
+      .filter((conversation) => (conversation.adminPubkeys || []).map((value) => String(value || '').trim().toLowerCase()).includes(currentPubkey))
+      .map((conversation) => ({
+        kind: 'chat' as const,
+        id: conversation.id,
+        relay: null,
+        name: conversation.title || conversation.id
+      }))
+    return {
+      group: groupTargets,
+      chat: chatTargets
+    }
+  }, [state])
+
+  const rightTopRows = useMemo(() => {
+    if (!state) return []
+    const rows: RightTopRow[] = []
+    const expandedParent = expandedActionParentByNode[selectedNode] || ''
+    const actionTreeEnabled = supportsActionTree(selectedNode)
+
+    for (const parentRow of centerRows) {
+      const childRows: RightTopRow[] = []
+      if (actionTreeEnabled) {
+        if (selectedNode === 'invites:send') {
+          const mode = (parentRow.data as { mode?: InviteSendMode } | null)?.mode
+          const normalizedMode: InviteSendMode = mode === 'chat' ? 'chat' : 'group'
+          const targets = normalizedMode === 'chat' ? inviteSendTargetsByMode.chat : inviteSendTargetsByMode.group
+          if (targets.length === 0) {
+            const emptyLabel = normalizedMode === 'chat' ? 'No admin chats available' : 'No admin relays available'
+            childRows.push({
+              key: `${parentRow.key}:action:none`,
+              label: emptyLabel,
+              centerRow: parentRow,
+              depth: 1,
+              kind: 'action',
+              action: emptyLabel,
+              expandable: false,
+              expanded: false,
+              inviteTarget: null
+            })
+          } else {
+            for (const [index, target] of targets.entries()) {
+              childRows.push({
+                key: `${parentRow.key}:action:${index}`,
+                label: `${shortText(target.name, 24)} · ${target.id}`,
+                centerRow: parentRow,
+                depth: 1,
+                kind: 'action',
+                action: `${shortText(target.name, 24)} · ${target.id}`,
+                expandable: false,
+                expanded: false,
+                inviteTarget: target
+              })
+            }
+          }
+        } else {
+          const actions = rightTopActions(state, selectedNode, parentRow)
+          for (const [index, action] of actions.entries()) {
+            childRows.push({
+              key: `${parentRow.key}:action:${index}`,
+              label: action,
+              centerRow: parentRow,
+              depth: 1,
+              kind: 'action',
+              action,
+              expandable: false,
+              expanded: false
+            })
+          }
+        }
+      }
+
+      const expandable = childRows.length > 0
+      const expanded = expandable && expandedParent === parentRow.key
+      rows.push({
+        key: parentRow.key,
+        label: parentRow.label,
+        centerRow: parentRow,
+        depth: 0,
+        kind: 'parent',
+        expandable,
+        expanded
+      })
+      if (expanded) {
+        rows.push(...childRows)
+      }
+    }
+
+    return rows
+  }, [state, selectedNode, centerRows, expandedActionParentByNode, inviteSendTargetsByMode])
+
   const selectedNodeViewport = useMemo(() => {
     const current = nodeViewport[selectedNode] || { cursor: 0, offset: 0 }
-    return normalizeViewport(current.cursor, current.offset, centerRows.length, centerVisibleRows)
-  }, [nodeViewport, selectedNode, centerRows.length, centerVisibleRows])
+    return normalizeViewport(current.cursor, current.offset, rightTopRows.length, rightTopVisibleRows)
+  }, [nodeViewport, selectedNode, rightTopRows.length, rightTopVisibleRows])
 
   useEffect(() => {
     const key = selectedNode
@@ -1617,58 +1773,20 @@ export function App({
     controllerRef.current?.setPaneViewport(key, selectedNodeViewport.selectedIndex, selectedNodeViewport.offset).catch(() => {})
   }, [selectedNode, selectedNodeViewport])
 
-  const selectedCenterRow = centerRows[selectedNodeViewport.selectedIndex] || null
-
-  const splitMode = splitNode(selectedNode)
-  const rightTopActionsRows = useMemo(() => {
-    if (!state) return []
-    if (selectedNode === 'groups:create') {
-      const normalizedGatewayId = String(groupCreateDraft.gatewayId || '').trim().toLowerCase()
-      const selectedGateway = normalizedGatewayId
-        ? state.discoveredGateways.find((gateway) => gateway.gatewayId === normalizedGatewayId) || null
-        : null
-      return [
-        `name: ${groupCreateDraft.name || '-'}`,
-        `description: ${groupCreateDraft.about || '-'}`,
-        `membership: ${groupCreateDraft.membership}`,
-        `visibility: ${groupCreateDraft.visibility}`,
-        `direct-join-only: ${groupCreateDraft.directJoinOnly ? 'yes' : 'no'}`,
-        `gateway picker: ${groupGatewayPickerExpanded ? 'expanded' : 'collapsed'} (${state.discoveredGateways.length})`,
-        `selected gateway: ${selectedGateway?.displayName || selectedGateway?.gatewayId || '-'}`,
-        `gateway origin: ${groupCreateDraft.gatewayOrigin || '-'}`,
-        `gateway id: ${groupCreateDraft.gatewayId || '-'}`
-      ]
-    }
-    if (selectedNode === 'chats:create') {
-      return [
-        `name: ${chatCreateDraft.name || '-'}`,
-        `description: ${chatCreateDraft.description || '-'}`,
-        `invite members: ${chatCreateDraft.inviteMembers.length}`,
-        `chat relays: ${chatCreateDraft.relayUrls.length}`
-      ]
-    }
-    return rightTopActions(state, selectedNode, selectedCenterRow)
-  }, [state, selectedNode, selectedCenterRow, groupCreateDraft, chatCreateDraft, groupGatewayPickerExpanded])
-
-  const rightTopIndex = useMemo(() => {
-    const raw = rightTopSelectionByNode[selectedNode] || 0
-    if (rightTopActionsRows.length === 0) return 0
-    return clamp(raw, 0, rightTopActionsRows.length - 1)
-  }, [rightTopSelectionByNode, selectedNode, rightTopActionsRows])
+  const selectedRightTopRow = rightTopRows[selectedNodeViewport.selectedIndex] || null
+  const selectedCenterRow = selectedRightTopRow?.centerRow || null
 
   useEffect(() => {
-    if (rightTopActionsRows.length === 0) return
-    const existing = rightTopSelectionRef.current[selectedNode]
-    if (existing === rightTopIndex) return
-    const next = {
-      ...rightTopSelectionRef.current,
-      [selectedNode]: rightTopIndex
-    }
-    setRightTopSelectionByNode(next)
-    controllerRef.current?.setRightTopSelection(selectedNode, rightTopIndex).catch(() => {})
-  }, [selectedNode, rightTopActionsRows.length, rightTopIndex])
+    selectedCenterRowRef.current = selectedCenterRow
+  }, [selectedCenterRow])
 
-  const selectedRightTopAction = rightTopActionsRows[rightTopIndex] || ''
+  const selectedRightTopAction = useMemo(() => {
+    if (!selectedCenterRow) return ''
+    if (selectedRightTopRow?.kind === 'action') {
+      return selectedRightTopRow.action || ''
+    }
+    return defaultDetailsAction(selectedNode)
+  }, [selectedNode, selectedCenterRow, selectedRightTopRow])
 
   const inviteSendMode: InviteSendMode = useMemo(() => {
     if (selectedNode !== 'invites:send') return 'group'
@@ -1676,31 +1794,16 @@ export function App({
     return mode === 'chat' ? 'chat' : 'group'
   }, [selectedNode, selectedCenterRow])
 
-  const inviteSendTargets = useMemo(() => {
-    if (!state || selectedNode !== 'invites:send') return []
-    const currentPubkey = String(state.session?.pubkey || '').trim().toLowerCase()
-    if (!currentPubkey) return []
-    if (inviteSendMode === 'group') {
-      return state.myGroups
-        .filter((group) => String(group.adminPubkey || '').trim().toLowerCase() === currentPubkey)
-        .map((group) => ({
-          kind: 'group' as const,
-          id: group.id,
-          relay: group.relay || null,
-          name: group.name || group.id
-        }))
+  const selectedInviteSendTarget = useMemo(() => {
+    if (selectedRightTopRow?.kind === 'action') {
+      return selectedRightTopRow.inviteTarget || null
     }
-    return state.conversations
-      .filter((conversation) => (conversation.adminPubkeys || []).map((value) => String(value || '').trim().toLowerCase()).includes(currentPubkey))
-      .map((conversation) => ({
-        kind: 'chat' as const,
-        id: conversation.id,
-        relay: null,
-        name: conversation.title || conversation.id
-      }))
-  }, [state, selectedNode, inviteSendMode])
-
-  const selectedInviteSendTarget = inviteSendTargets[rightTopIndex] || null
+    if (selectedNode !== 'invites:send') return null
+    const fallbackTargets = inviteSendMode === 'chat'
+      ? inviteSendTargetsByMode.chat
+      : inviteSendTargetsByMode.group
+    return fallbackTargets[0] || null
+  }, [selectedRightTopRow, selectedNode, inviteSendMode, inviteSendTargetsByMode])
 
   useEffect(() => {
     if (!state || selectedNode !== 'groups:my') {
@@ -1767,7 +1870,7 @@ export function App({
     }
   }, [selectedNode, inviteSendQuery])
 
-  const splitBottomRawRows = useMemo(() => {
+  const rightBottomRawRows = useMemo(() => {
     if (!state) return ['No data']
     if (selectedNode === 'invites:send') {
       const lines = [
@@ -1786,7 +1889,10 @@ export function App({
       })
       return lines
     }
-    return splitBottomRows(state, selectedNode, selectedCenterRow, selectedRightTopAction, paneActionMessage)
+    if (splitNode(selectedNode)) {
+      return splitBottomRows(state, selectedNode, selectedCenterRow, selectedRightTopAction, paneActionMessage)
+    }
+    return singleRightRows(state, selectedNode, selectedCenterRow)
   }, [
     state,
     selectedNode,
@@ -1802,20 +1908,12 @@ export function App({
     inviteSendStatus
   ])
 
-  const singleRightRawRows = useMemo(() => {
-    if (!state) return ['No data']
-    return singleRightRows(state, selectedNode, selectedCenterRow)
-  }, [state, selectedNode, selectedCenterRow])
-
   const rightBottomWrapWidth = Math.max(18, rightPaneWidth - 4)
   const wrappedRightRows = useMemo(() => {
-    const rows = splitMode ? splitBottomRawRows : singleRightRawRows
-    return rows.flatMap((row) => wrapText(row, rightBottomWrapWidth))
-  }, [splitMode, splitBottomRawRows, singleRightRawRows, rightBottomWrapWidth])
+    return rightBottomRawRows.flatMap((row) => wrapText(row, rightBottomWrapWidth))
+  }, [rightBottomRawRows, rightBottomWrapWidth])
 
-  const rightBottomVisibleRows = splitMode
-    ? Math.max(1, Math.floor(rightVisibleRows / 2) - 2)
-    : Math.max(1, rightVisibleRows)
+  const rightBottomVisibleRows = Math.max(1, rightBottomBoxRows - 3)
 
   const rightBottomOffset = useMemo(() => {
     const raw = rightBottomOffsetByNode[selectedNode] || 0
@@ -1841,11 +1939,12 @@ export function App({
     if (!snapshot) {
       return {}
     }
+    const selectedRow = selectedCenterRowRef.current
 
     return {
       currentNode: selectedNodeRef.current,
       resolveSelectedGroup: () => {
-        const row = centerRowsForNode(snapshot, selectedNodeRef.current)[nodeViewportRef.current[selectedNodeRef.current]?.cursor || 0]
+        const row = selectedRow
         if (!row || row.kind !== 'group') return null
         const group = row.data as any
         return {
@@ -1854,7 +1953,7 @@ export function App({
         }
       },
       resolveSelectedInvite: () => {
-        const row = centerRowsForNode(snapshot, selectedNodeRef.current)[nodeViewportRef.current[selectedNodeRef.current]?.cursor || 0]
+        const row = selectedRow
         if (!row) return null
         if (row.kind === 'group-invite') {
           const invite = row.data as any
@@ -1877,7 +1976,7 @@ export function App({
         return null
       },
       resolveSelectedRelay: () => {
-        const row = centerRowsForNode(snapshot, selectedNodeRef.current)[nodeViewportRef.current[selectedNodeRef.current]?.cursor || 0]
+        const row = selectedRow
         if (!row) return null
         let relay: any = null
         if (row.kind === 'relay') {
@@ -1893,7 +1992,7 @@ export function App({
         }
       },
       resolveSelectedFile: () => {
-        const row = centerRowsForNode(snapshot, selectedNodeRef.current)[nodeViewportRef.current[selectedNodeRef.current]?.cursor || 0]
+        const row = selectedRow
         if (!row || row.kind !== 'file') return null
         const file = row.data as any
         return {
@@ -1906,7 +2005,7 @@ export function App({
         }
       },
       resolveSelectedConversation: () => {
-        const row = centerRowsForNode(snapshot, selectedNodeRef.current)[nodeViewportRef.current[selectedNodeRef.current]?.cursor || 0]
+        const row = selectedRow
         if (!row || row.kind !== 'chat-conversation') return null
         const conversation = row.data as any
         return {
@@ -1914,9 +2013,8 @@ export function App({
         }
       },
       resolveSelectedNote: () => {
-        const node = selectedNodeRef.current
-        if (node !== 'groups:my') return null
-        const row = centerRowsForNode(snapshot, node)[nodeViewportRef.current[node]?.cursor || 0]
+        if (selectedNodeRef.current !== 'groups:my') return null
+        const row = selectedRow
         if (!row || row.kind !== 'group') return null
         const group = row.data as any
         const notes = noteRowsForGroup(snapshot, group)
@@ -1935,11 +2033,6 @@ export function App({
       },
       unsafeCopySecrets: process.env.HYPERTUNA_TUI_ALLOW_UNSAFE_COPY === '1'
     }
-  }
-
-  const prefillCommandInput = (): string => {
-    const snippet = buildCommandSnippet(buildCurrentCommandContext())
-    return snippet || ''
   }
 
   const closeFieldInput = (): void => {
@@ -2113,49 +2206,48 @@ export function App({
     }
   }
 
-  const handleFormCenterEnter = async (): Promise<void> => {
-    if (!selectedCenterRow) return
+  const handleFormRightTopEnter = async (row: CenterRow): Promise<void> => {
     const controller = controllerRef.current
     if (selectedNode === 'groups:create') {
-      if (selectedCenterRow.key === 'groups:create:name') {
+      if (row.key === 'groups:create:name') {
         openFieldInput('groups:create', 'name', 'Relay name', groupCreateDraft.name)
         return
       }
-      if (selectedCenterRow.key === 'groups:create:about') {
+      if (row.key === 'groups:create:about') {
         openFieldInput('groups:create', 'about', 'Relay description', groupCreateDraft.about)
         return
       }
-      if (selectedCenterRow.key === 'groups:create:membership') {
+      if (row.key === 'groups:create:membership') {
         setGroupCreateDraft((previous) => ({
           ...previous,
           membership: previous.membership === 'open' ? 'closed' : 'open'
         }))
         return
       }
-      if (selectedCenterRow.key === 'groups:create:membership:open') {
+      if (row.key === 'groups:create:membership:open') {
         setGroupCreateDraft((previous) => ({ ...previous, membership: 'open' }))
         return
       }
-      if (selectedCenterRow.key === 'groups:create:membership:closed') {
+      if (row.key === 'groups:create:membership:closed') {
         setGroupCreateDraft((previous) => ({ ...previous, membership: 'closed' }))
         return
       }
-      if (selectedCenterRow.key === 'groups:create:visibility') {
+      if (row.key === 'groups:create:visibility') {
         setGroupCreateDraft((previous) => ({
           ...previous,
           visibility: previous.visibility === 'public' ? 'private' : 'public'
         }))
         return
       }
-      if (selectedCenterRow.key === 'groups:create:visibility:public') {
+      if (row.key === 'groups:create:visibility:public') {
         setGroupCreateDraft((previous) => ({ ...previous, visibility: 'public' }))
         return
       }
-      if (selectedCenterRow.key === 'groups:create:visibility:private') {
+      if (row.key === 'groups:create:visibility:private') {
         setGroupCreateDraft((previous) => ({ ...previous, visibility: 'private' }))
         return
       }
-      if (selectedCenterRow.key === 'groups:create:direct-join-only') {
+      if (row.key === 'groups:create:direct-join-only') {
         setGroupCreateDraft((previous) => ({
           ...previous,
           directJoinOnly: !previous.directJoinOnly,
@@ -2168,11 +2260,11 @@ export function App({
         }))
         return
       }
-      if (selectedCenterRow.key === 'groups:create:gateway-picker') {
+      if (row.key === 'groups:create:gateway-picker') {
         setGroupGatewayPickerExpanded((previous) => !previous)
         return
       }
-      if (selectedCenterRow.key === 'groups:create:gateway-refresh') {
+      if (row.key === 'groups:create:gateway-refresh') {
         if (!controller) return
         try {
           setPaneActionMessage('Refreshing gateway catalog…')
@@ -2184,8 +2276,8 @@ export function App({
         }
         return
       }
-      if (selectedCenterRow.key.startsWith('groups:create:gateway-option:')) {
-        const selectedGateway = selectedCenterRow.data as {
+      if (row.key.startsWith('groups:create:gateway-option:')) {
+        const selectedGateway = row.data as {
           gatewayId?: string
           gatewayOrigin?: string
         } | null
@@ -2202,50 +2294,50 @@ export function App({
         }
         return
       }
-      if (selectedCenterRow.key === 'groups:create:gateway-origin') {
+      if (row.key === 'groups:create:gateway-origin') {
         openFieldInput('groups:create', 'gateway-origin', 'Gateway origin (http/https)', groupCreateDraft.gatewayOrigin)
         return
       }
-      if (selectedCenterRow.key === 'groups:create:gateway-id') {
+      if (row.key === 'groups:create:gateway-id') {
         openFieldInput('groups:create', 'gateway-id', 'Gateway ID (optional)', groupCreateDraft.gatewayId)
         return
       }
-      if (selectedCenterRow.key === 'groups:create:submit') {
+      if (row.key === 'groups:create:submit') {
         await runCreateGroup()
       }
       return
     }
 
     if (selectedNode === 'chats:create') {
-      if (selectedCenterRow.key === 'chats:create:name') {
+      if (row.key === 'chats:create:name') {
         openFieldInput('chats:create', 'name', 'Chat name', chatCreateDraft.name)
         return
       }
-      if (selectedCenterRow.key === 'chats:create:about') {
+      if (row.key === 'chats:create:about') {
         openFieldInput('chats:create', 'description', 'Chat description', chatCreateDraft.description)
         return
       }
-      if (selectedCenterRow.key === 'chats:create:members') {
+      if (row.key === 'chats:create:members') {
         openFieldInput('chats:create', 'members', 'Invite members (csv)', chatCreateDraft.inviteMembers.join(','))
         return
       }
-      if (selectedCenterRow.key === 'chats:create:relays') {
+      if (row.key === 'chats:create:relays') {
         openFieldInput('chats:create', 'relays', 'Relay URLs (csv)', chatCreateDraft.relayUrls.join(','))
         return
       }
-      if (selectedCenterRow.key.startsWith('chats:create:relay:')) {
-        const relayUrl = String((selectedCenterRow.data as { value?: string })?.value || '')
+      if (row.key.startsWith('chats:create:relay:')) {
+        const relayUrl = String((row.data as { value?: string })?.value || '')
         toggleChatRelayDraft(relayUrl)
         return
       }
-      if (selectedCenterRow.key === 'chats:create:submit') {
+      if (row.key === 'chats:create:submit') {
         await runCreateChat()
       }
       return
     }
 
     if (selectedNode === 'invites:send') {
-      const mode = (selectedCenterRow.data as { mode?: InviteSendMode } | null)?.mode
+      const mode = (row.data as { mode?: InviteSendMode } | null)?.mode
       if (mode === 'chat' || mode === 'group') {
         setInviteSendQuery('')
         setInviteSendStatus('')
@@ -2312,7 +2404,7 @@ export function App({
   const executeRightTopAction = async (): Promise<void> => {
     const controller = controllerRef.current
     if (!controller || !state) return
-    if (!splitMode || !selectedCenterRow || !selectedRightTopAction) return
+    if (!selectedCenterRow || !selectedRightTopAction) return
 
     try {
       if (selectedNode === 'groups:browse' && selectedCenterRow.kind === 'group') {
@@ -2565,7 +2657,7 @@ export function App({
     }
 
     if (key.tab) {
-      const order: FocusPane[] = ['left-tree', 'center', 'right-top', 'right-bottom']
+      const order: FocusPane[] = ['left-tree', 'right-top', 'right-bottom']
       const current = focusPaneRef.current
       const index = order.indexOf(current)
       const delta = key.shift ? -1 : 1
@@ -2576,7 +2668,7 @@ export function App({
     }
 
     if (input === 'r') {
-      refreshNode(controller, selectedNodeRef.current, selectedCenterRow)
+      refreshNode(controller, selectedNodeRef.current, selectedCenterRowRef.current)
         .then(() => setCommandMessage(`Refreshed ${displayNodeId(selectedNodeRef.current)}`))
         .catch((error) => setCommandMessage(error instanceof Error ? error.message : String(error)))
       return
@@ -2661,12 +2753,12 @@ export function App({
       return
     }
 
-    if (currentFocus === 'center') {
+    if (currentFocus === 'right-top') {
       const viewport = nodeViewportRef.current[currentNode] || { cursor: 0, offset: 0 }
-      const normalized = normalizeViewport(viewport.cursor, viewport.offset, centerRows.length, centerVisibleRows)
+      const normalized = normalizeViewport(viewport.cursor, viewport.offset, rightTopRows.length, rightTopVisibleRows)
 
       const moveCursor = (nextCursor: number) => {
-        const nextViewport = normalizeViewport(nextCursor, normalized.offset, centerRows.length, centerVisibleRows)
+        const nextViewport = normalizeViewport(nextCursor, normalized.offset, rightTopRows.length, rightTopVisibleRows)
         const merged = {
           ...nodeViewportRef.current,
           [currentNode]: {
@@ -2689,12 +2781,12 @@ export function App({
       }
 
       if (key.pageUp) {
-        moveCursor(normalized.selectedIndex - centerVisibleRows)
+        moveCursor(normalized.selectedIndex - rightTopVisibleRows)
         return
       }
 
       if (key.pageDown) {
-        moveCursor(normalized.selectedIndex + centerVisibleRows)
+        moveCursor(normalized.selectedIndex + rightTopVisibleRows)
         return
       }
 
@@ -2707,57 +2799,45 @@ export function App({
       }
 
       if (maybeEnd || (key.ctrl && input === 'e') || input === 'G') {
-        moveCursor(Math.max(0, centerRows.length - 1))
+        moveCursor(Math.max(0, rightTopRows.length - 1))
         return
       }
 
       if (key.return) {
-        if (isFormCenterNode(currentNode)) {
-          handleFormCenterEnter().catch((error) => {
+        const selectedRow = rightTopRows[normalized.selectedIndex] || null
+        if (!selectedRow) return
+
+        if (selectedRow.kind === 'action') {
+          executeRightTopAction().catch((error) => {
             setPaneActionMessage(error instanceof Error ? error.message : String(error))
           })
           return
         }
-        setCommandInputOpen(true)
-        setCommandInput(prefillCommandInput())
-      }
 
-      return
-    }
-
-    if (currentFocus === 'right-top') {
-      if (!splitMode) return
-      const max = rightTopActionsRows.length
-      if (max <= 0) return
-
-      const current = rightTopSelectionRef.current[currentNode] || 0
-      if (key.upArrow) {
-        const nextIndex = clamp(current - 1, 0, max - 1)
-        const next = {
-          ...rightTopSelectionRef.current,
-          [currentNode]: nextIndex
+        if (currentNode === 'invites:send') {
+          handleFormRightTopEnter(selectedRow.centerRow).catch((error) => {
+            setPaneActionMessage(error instanceof Error ? error.message : String(error))
+          })
         }
-        setRightTopSelectionByNode(next)
-        controller.setRightTopSelection(currentNode, nextIndex).catch(() => {})
-        return
-      }
 
-      if (key.downArrow) {
-        const nextIndex = clamp(current + 1, 0, max - 1)
-        const next = {
-          ...rightTopSelectionRef.current,
-          [currentNode]: nextIndex
+        if (selectedRow.expandable) {
+          setExpandedActionParentByNode((previous) => {
+            const existing = previous[currentNode] || ''
+            return {
+              ...previous,
+              [currentNode]: existing === selectedRow.centerRow.key ? '' : selectedRow.centerRow.key
+            }
+          })
+          return
         }
-        setRightTopSelectionByNode(next)
-        controller.setRightTopSelection(currentNode, nextIndex).catch(() => {})
-        return
+
+        if (isFormCenterNode(currentNode)) {
+          handleFormRightTopEnter(selectedRow.centerRow).catch((error) => {
+            setPaneActionMessage(error instanceof Error ? error.message : String(error))
+          })
+        }
       }
 
-      if (key.return) {
-        executeRightTopAction().catch((error) => {
-          setPaneActionMessage(error instanceof Error ? error.message : String(error))
-        })
-      }
       return
     }
 
@@ -2868,13 +2948,13 @@ export function App({
   }
 
   const navIndex = navIndexById.get(selectedNode) ?? 0
-
-  const navBoxRows = Math.max(6, narrowLayout ? 10 : frameRows.mainRows)
-  const centerBoxRows = Math.max(6, narrowLayout ? Math.floor(frameRows.mainRows * 0.4) : frameRows.mainRows)
-  const rightBoxRows = Math.max(6, narrowLayout ? frameRows.mainRows - navBoxRows - centerBoxRows : frameRows.mainRows)
+  const visibleRightTopRows = rightTopRows.slice(
+    selectedNodeViewport.offset,
+    selectedNodeViewport.offset + rightTopVisibleRows
+  )
 
   const keysLabel =
-    'Keys: `:` command, center `Enter` prefill (non-form), form `Enter` edit/submit, `y` copy value, `Y` copy command, `Tab/Shift+Tab` pane focus, tree `←/→`, list `↑/↓`, right-bottom `Ctrl+U/Ctrl+D`, `r` refresh, `q` quit'
+    'Keys: `:` command, right-top `Enter` expand/execute/form edit, `y` copy value, `Y` copy command, `Tab/Shift+Tab` pane focus, tree `←/→`, list `↑/↓`, right-bottom `Ctrl+U/Ctrl+D`, `r` refresh, `q` quit'
   const selectedNodeDisplay = displayNodeId(selectedNode)
 
   const commandStatusLabel = state.lastError
@@ -2882,9 +2962,6 @@ export function App({
     : state.busyTask
       ? `Working: ${state.busyTask}`
       : `Ready · node:${selectedNodeDisplay} · focus:${focusPane}`
-
-  const splitTopRows = splitMode ? Math.max(3, Math.floor(rightVisibleRows / 2)) : 0
-  const splitBottomRowsHeight = splitMode ? Math.max(3, rightVisibleRows - splitTopRows) : 0
 
   return (
     <Box flexDirection="column" height={frameHeight} overflow="hidden">
@@ -2912,56 +2989,36 @@ export function App({
             </Box>
           </Box>
 
-          <Box borderStyle="round" borderColor={focusPane === 'center' ? 'green' : 'blue'} paddingX={1} height={centerBoxRows} overflow="hidden">
+          <Box borderStyle="round" borderColor={focusPane === 'right-top' ? 'green' : 'magenta'} paddingX={1} height={rightTopBoxRows} overflow="hidden">
             <Box flexDirection="column">
-              <Text color="cyan">{selectedNodeDisplay}</Text>
-              {centerRows.length === 0 ? <Text dimColor>No items</Text> : null}
-              {centerRows.slice(selectedNodeViewport.offset, selectedNodeViewport.offset + centerVisibleRows).map((row, idx) => {
+              <Text color="magenta">{selectedNodeDisplay}</Text>
+              {rightTopRows.length === 0 ? <Text dimColor>No items</Text> : null}
+              {visibleRightTopRows.map((row, idx) => {
                 const absolute = selectedNodeViewport.offset + idx
                 const selected = absolute === selectedNodeViewport.selectedIndex
+                const indent = row.depth > 0 ? '  ' : ''
+                const prefix = row.kind === 'parent'
+                  ? row.expandable
+                    ? row.expanded ? '▾' : '▸'
+                    : '•'
+                  : '•'
                 return (
                   <Text key={`${row.key}-${absolute}`} color={selected ? 'green' : undefined}>
-                    {selected ? '>' : ' '} {row.label}
+                    {selected ? '>' : ' '} {indent}{prefix} {row.label}
                   </Text>
                 )
               })}
             </Box>
           </Box>
 
-          {splitMode ? (
-            <Box flexDirection="column" height={rightBoxRows}>
-              <Box borderStyle="round" borderColor={focusPane === 'right-top' ? 'green' : 'magenta'} paddingX={1} height={splitTopRows + 2} overflow="hidden">
-                <Box flexDirection="column">
-                  <Text color="magenta">Actions</Text>
-                  {rightTopActionsRows.map((action, idx) => {
-                    const selected = idx === rightTopIndex
-                    return (
-                      <Text key={`${action}-${idx}`} color={selected ? 'green' : undefined}>
-                        {selected ? '>' : ' '} {action}
-                      </Text>
-                    )
-                  })}
-                </Box>
-              </Box>
-              <Box borderStyle="round" borderColor={focusPane === 'right-bottom' ? 'green' : 'magenta'} paddingX={1} height={splitBottomRowsHeight + 2} overflow="hidden">
-                <Box flexDirection="column">
-                  <Text color="magenta">Details</Text>
-                  {visibleRightRows.map((line, idx) => (
-                    <Text key={`${idx}-${line.slice(0, 22)}`}>{line}</Text>
-                  ))}
-                </Box>
-              </Box>
+          <Box borderStyle="round" borderColor={focusPane === 'right-bottom' ? 'green' : 'magenta'} paddingX={1} height={rightBottomBoxRows} overflow="hidden">
+            <Box flexDirection="column">
+              <Text color="magenta">Details</Text>
+              {visibleRightRows.map((line, idx) => (
+                <Text key={`${idx}-${line.slice(0, 22)}`}>{line}</Text>
+              ))}
             </Box>
-          ) : (
-            <Box borderStyle="round" borderColor={focusPane === 'right-bottom' ? 'green' : 'magenta'} paddingX={1} height={rightBoxRows} overflow="hidden">
-              <Box flexDirection="column">
-                <Text color="magenta">Details</Text>
-                {visibleRightRows.map((line, idx) => (
-                  <Text key={`${idx}-${line.slice(0, 22)}`}>{line}</Text>
-                ))}
-              </Box>
-            </Box>
-          )}
+          </Box>
         </Box>
       ) : (
         <Box height={frameRows.mainRows}>
@@ -2986,57 +3043,37 @@ export function App({
             </Box>
           </Box>
 
-          <Box width={centerPaneWidth} borderStyle="round" borderColor={focusPane === 'center' ? 'green' : 'blue'} paddingX={1} overflow="hidden">
-            <Box flexDirection="column">
-              <Text color="cyan">{selectedNodeDisplay}</Text>
-              {centerRows.length === 0 ? <Text dimColor>No items</Text> : null}
-              {centerRows.slice(selectedNodeViewport.offset, selectedNodeViewport.offset + centerVisibleRows).map((row, idx) => {
-                const absolute = selectedNodeViewport.offset + idx
-                const selected = absolute === selectedNodeViewport.selectedIndex
-                return (
-                  <Text key={`${row.key}-${absolute}`} color={selected ? 'green' : undefined}>
-                    {selected ? '>' : ' '} {row.label}
-                  </Text>
-                )
-              })}
-            </Box>
-          </Box>
-
           <Box width={rightPaneWidth} overflow="hidden" flexDirection="column">
-            {splitMode ? (
-              <>
-                <Box borderStyle="round" borderColor={focusPane === 'right-top' ? 'green' : 'magenta'} paddingX={1} height={splitTopRows + 2} overflow="hidden">
-                  <Box flexDirection="column">
-                    <Text color="magenta">Actions</Text>
-                    {rightTopActionsRows.map((action, idx) => {
-                      const selected = idx === rightTopIndex
-                      return (
-                        <Text key={`${action}-${idx}`} color={selected ? 'green' : undefined}>
-                          {selected ? '>' : ' '} {action}
-                        </Text>
-                      )
-                    })}
-                  </Box>
-                </Box>
-                <Box borderStyle="round" borderColor={focusPane === 'right-bottom' ? 'green' : 'magenta'} paddingX={1} height={splitBottomRowsHeight + 2} overflow="hidden">
-                  <Box flexDirection="column">
-                    <Text color="magenta">Details</Text>
-                    {visibleRightRows.map((line, idx) => (
-                      <Text key={`${idx}-${line.slice(0, 22)}`}>{line}</Text>
-                    ))}
-                  </Box>
-                </Box>
-              </>
-            ) : (
-              <Box borderStyle="round" borderColor={focusPane === 'right-bottom' ? 'green' : 'magenta'} paddingX={1} height={frameRows.mainRows} overflow="hidden">
-                <Box flexDirection="column">
-                  <Text color="magenta">Details</Text>
-                  {visibleRightRows.map((line, idx) => (
-                    <Text key={`${idx}-${line.slice(0, 22)}`}>{line}</Text>
-                  ))}
-                </Box>
+            <Box borderStyle="round" borderColor={focusPane === 'right-top' ? 'green' : 'magenta'} paddingX={1} height={rightTopBoxRows} overflow="hidden">
+              <Box flexDirection="column">
+                <Text color="magenta">{selectedNodeDisplay}</Text>
+                {rightTopRows.length === 0 ? <Text dimColor>No items</Text> : null}
+                {visibleRightTopRows.map((row, idx) => {
+                  const absolute = selectedNodeViewport.offset + idx
+                  const selected = absolute === selectedNodeViewport.selectedIndex
+                  const indent = row.depth > 0 ? '  ' : ''
+                  const prefix = row.kind === 'parent'
+                    ? row.expandable
+                      ? row.expanded ? '▾' : '▸'
+                      : '•'
+                    : '•'
+                  return (
+                    <Text key={`${row.key}-${absolute}`} color={selected ? 'green' : undefined}>
+                      {selected ? '>' : ' '} {indent}{prefix} {row.label}
+                    </Text>
+                  )
+                })}
               </Box>
-            )}
+            </Box>
+
+            <Box borderStyle="round" borderColor={focusPane === 'right-bottom' ? 'green' : 'magenta'} paddingX={1} height={rightBottomBoxRows} overflow="hidden">
+              <Box flexDirection="column">
+                <Text color="magenta">Details</Text>
+                {visibleRightRows.map((line, idx) => (
+                  <Text key={`${idx}-${line.slice(0, 22)}`}>{line}</Text>
+                ))}
+              </Box>
+            </Box>
           </Box>
         </Box>
       )}
