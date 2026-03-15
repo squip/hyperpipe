@@ -475,6 +475,15 @@ function suggestRelayMigration(input: string): string {
   return ['relay', canonicalAction, remaining].filter(Boolean).join(' ').trim()
 }
 
+function displayNodeId(node: NavNodeId): string {
+  if (node === 'groups') return 'P2P Relays'
+  if (node === 'groups:browse') return 'relays:browse'
+  if (node === 'groups:my') return 'relays:my'
+  if (node === 'groups:create') return 'relays:create'
+  if (node === 'invites:group') return 'invites:relay'
+  return node
+}
+
 const SENSITIVE_COPY_FIELDS = new Set(['nsec', 'ncryptsec', 'token', 'secret', 'writer-secret', 'writer_secret'])
 
 function isSensitiveField(field: string): boolean {
@@ -729,7 +738,7 @@ export async function executeCommand(
   if (cmd === 'goto') {
     const node = parseNode(requireArg(args[1], 'node'))
     return {
-      message: `Switched to ${node}`,
+      message: `Switched to ${displayNodeId(node)}`,
       gotoNode: node
     }
   }

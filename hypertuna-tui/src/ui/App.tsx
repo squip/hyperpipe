@@ -441,8 +441,8 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
       {
         key: 'summary',
         label:
-          `Worker:${state.lifecycle} Relays:${state.relays.length} Groups:${state.groupDiscover.length} ` +
-          `MyGroups:${state.myGroups.length} Invites:${state.invitesCount} Files:${state.filesCount} Chats:${state.conversations.length}`,
+          `Worker:${state.lifecycle} p2pRelays:${state.groupDiscover.length} ` +
+          `MyRelays:${state.myGroups.length} Invites:${state.invitesCount} Files:${state.filesCount} Chats:${state.conversations.length}`,
         kind: 'summary',
         data: null
       }
@@ -766,6 +766,15 @@ function groupKey(groupId: string, relay?: string | null): string {
   const normalizedGroupId = String(groupId || '').trim()
   const normalizedRelay = relay ? relay.trim() : ''
   return `${normalizedRelay}|${normalizedGroupId}`
+}
+
+function displayNodeId(node: NavNodeId): string {
+  if (node === 'groups') return 'P2P Relays'
+  if (node === 'groups:browse') return 'relays:browse'
+  if (node === 'groups:my') return 'relays:my'
+  if (node === 'groups:create') return 'relays:create'
+  if (node === 'invites:group') return 'invites:relay'
+  return node
 }
 
 function relayForGroup(state: ControllerState, group: any): any | null {
@@ -2568,7 +2577,7 @@ export function App({
 
     if (input === 'r') {
       refreshNode(controller, selectedNodeRef.current, selectedCenterRow)
-        .then(() => setCommandMessage(`Refreshed ${selectedNodeRef.current}`))
+        .then(() => setCommandMessage(`Refreshed ${displayNodeId(selectedNodeRef.current)}`))
         .catch((error) => setCommandMessage(error instanceof Error ? error.message : String(error)))
       return
     }
@@ -2866,12 +2875,13 @@ export function App({
 
   const keysLabel =
     'Keys: `:` command, center `Enter` prefill (non-form), form `Enter` edit/submit, `y` copy value, `Y` copy command, `Tab/Shift+Tab` pane focus, tree `←/→`, list `↑/↓`, right-bottom `Ctrl+U/Ctrl+D`, `r` refresh, `q` quit'
+  const selectedNodeDisplay = displayNodeId(selectedNode)
 
   const commandStatusLabel = state.lastError
     ? `Error: ${state.lastError}`
     : state.busyTask
       ? `Working: ${state.busyTask}`
-      : `Ready · node:${selectedNode} · focus:${focusPane}`
+      : `Ready · node:${selectedNodeDisplay} · focus:${focusPane}`
 
   const splitTopRows = splitMode ? Math.max(3, Math.floor(rightVisibleRows / 2)) : 0
   const splitBottomRowsHeight = splitMode ? Math.max(3, rightVisibleRows - splitTopRows) : 0
@@ -2904,7 +2914,7 @@ export function App({
 
           <Box borderStyle="round" borderColor={focusPane === 'center' ? 'green' : 'blue'} paddingX={1} height={centerBoxRows} overflow="hidden">
             <Box flexDirection="column">
-              <Text color="cyan">{selectedNode}</Text>
+              <Text color="cyan">{selectedNodeDisplay}</Text>
               {centerRows.length === 0 ? <Text dimColor>No items</Text> : null}
               {centerRows.slice(selectedNodeViewport.offset, selectedNodeViewport.offset + centerVisibleRows).map((row, idx) => {
                 const absolute = selectedNodeViewport.offset + idx
@@ -2978,7 +2988,7 @@ export function App({
 
           <Box width={centerPaneWidth} borderStyle="round" borderColor={focusPane === 'center' ? 'green' : 'blue'} paddingX={1} overflow="hidden">
             <Box flexDirection="column">
-              <Text color="cyan">{selectedNode}</Text>
+              <Text color="cyan">{selectedNodeDisplay}</Text>
               {centerRows.length === 0 ? <Text dimColor>No items</Text> : null}
               {centerRows.slice(selectedNodeViewport.offset, selectedNodeViewport.offset + centerVisibleRows).map((row, idx) => {
                 const absolute = selectedNodeViewport.offset + idx

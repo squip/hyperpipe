@@ -62,7 +62,7 @@ describe.sequential('TUI e2e in-pane form workflows', () => {
 
     try {
       await waitFor(() => lastFrame(instance).includes('Command'))
-      await waitFor(() => lastFrame(instance).includes('groups:create'))
+      await waitFor(() => lastFrame(instance).includes('relays:create'))
 
       instance.stdin.write('\r')
       await waitFor(() => lastFrame(instance).includes('Relay name:'))

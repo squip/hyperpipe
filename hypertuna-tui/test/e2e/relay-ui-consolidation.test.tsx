@@ -78,7 +78,7 @@ describe.sequential('TUI relay UI consolidation', () => {
     )
 
     try {
-      await waitFor(() => frame(instance).includes('groups:my'))
+      await waitFor(() => frame(instance).includes('relays:my'))
       await waitFor(() => frame(instance).includes('Relay Details'))
       await waitFor(() => /members:\d+ · (ready|read-only)/.test(frame(instance)))
 

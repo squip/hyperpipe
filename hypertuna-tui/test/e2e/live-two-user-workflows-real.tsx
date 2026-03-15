@@ -157,7 +157,7 @@ async function runPaneStabilityCheck(runtime: RuntimeOptions): Promise<Check> {
     await sleep(80)
     await typeText(instance.stdin, 'goto relay:my', 2)
     instance.stdin.write('\r')
-    await waitFor('goto relay:my', async () => frame().includes('groups:my') ? true : null, { timeoutMs: 15_000, intervalMs: 120 })
+    await waitFor('goto relay:my', async () => frame().includes('relays:my') ? true : null, { timeoutMs: 15_000, intervalMs: 120 })
 
     instance.stdin.write('\t')
     instance.stdin.write('\t')
@@ -178,7 +178,7 @@ async function runPaneStabilityCheck(runtime: RuntimeOptions): Promise<Check> {
     await sleep(80)
     await typeText(instance.stdin, 'goto relays', 2)
     instance.stdin.write('\r')
-    await waitFor('goto relays after stress navigation', async () => frame().includes('groups:my') ? true : null, {
+    await waitFor('goto relays after stress navigation', async () => frame().includes('relays:my') ? true : null, {
       timeoutMs: 15_000,
       intervalMs: 120
     })
