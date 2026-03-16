@@ -45,9 +45,12 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 - `Tab`: cycle focus `Left Tree -> Right Top -> Right Bottom`
 - `Shift+Tab`: cycle focus in reverse
 - Left tree: `Up/Down` move cursor, `Right` expand/go child, `Left` collapse/go parent, `Enter` activate/toggle
-- Right top: `Up/Down/PageUp/PageDown/Home/End`, `Enter` expand parent row, execute child action, or edit/submit form rows
+- Right top: `Up/Down/PageUp/PageDown/Home/End`, `Enter` expand parent row or execute child action
 - Right bottom: `Up/Down` scroll details, `Ctrl+U`/`Ctrl+D` page scroll
-- `P2P Relays -> Create Relay` and `Chats -> Create Chat`: right-top `Enter` opens inline field editor, `Enter` submits field, `Esc` cancels field editor
+- `P2P Relays -> Create Relay` and `Chats -> Create Chat`: default is browse view; `Enter` on a field opens edit mode, `Enter` saves, `Esc` cancels.
+- Create browse view includes inline picker rows:
+  - `Create Relay`: gateway picker rows (`Enter` selects gateway, plus refresh row)
+  - `Create Chat`: writable relay checklist rows (`Enter` toggles relay)
 - `Invites -> Send Invite`: right-bottom accepts text input, suggestion list, and `Enter` to send invite
 - `r`: refresh current section
 - `:`: open command bar
@@ -85,6 +88,14 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 - `copy command [workflow]` copies a workflow command template for the current selection.
 - Secret material (`nsec`, tokens, writer secrets) is blocked by default.
 - Set `HYPERTUNA_TUI_ALLOW_UNSAFE_COPY=1` only for explicit debug use.
+
+## Table-style views
+
+- Dense list views in the right-top pane now render with compact headers and aligned columns (for relays, invites, files, chats, accounts, and logs).
+- Child action rows remain expandable/collapsible and render as indented action rows within the same table.
+- `Create Relay` and `Create Chat` use a two-state browse/edit flow in right-top (browse rows by default; focused field enters edit mode).
+- Right-bottom details automatically switch to a `Field | Value` key/value table when the content is primarily metadata; mixed narrative/status blocks continue to render as plain wrapped text.
+- On narrow terminals, lower-priority columns are dropped before truncation to preserve readability.
 
 ## User-facing sections removed
 

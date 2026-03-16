@@ -49,7 +49,7 @@ afterEach(() => {
 })
 
 describe.sequential('TUI e2e in-pane form workflows', () => {
-  it('opens and edits the P2P Relays -> Create Relay inline field prompt', async () => {
+  it('renders Create Relay browse view and enters field edit mode on Enter', async () => {
     const controller = MockController.withSeedData(BASE_OPTIONS)
     await controller.setSelectedNode('groups:create')
     await controller.setFocusPane('right-top')
@@ -62,14 +62,39 @@ describe.sequential('TUI e2e in-pane form workflows', () => {
 
     try {
       await waitFor(() => lastFrame(instance).includes('Command'))
-      await waitFor(() => lastFrame(instance).includes('relays:create'))
+      await waitFor(() => lastFrame(instance).includes('Create Relay'))
+      await waitFor(() => lastFrame(instance).includes('Relay Name'))
 
       instance.stdin.write('\r')
-      await waitFor(() => lastFrame(instance).includes('Relay name:'))
+      await typeText(instance, 'relay-browse-edit')
+      instance.stdin.write('\r')
+      await waitFor(() => lastFrame(instance).includes('Relay Name: relay-browse-edit'))
+    } finally {
+      instance.unmount()
+    }
+  })
 
-      await typeText(instance, 'tui-form-group')
-      instance.stdin.write('\u001b')
-      await waitFor(() => !lastFrame(instance).includes('Relay name:'))
+  it('renders Create Chat browse view and enters field edit mode on Enter', async () => {
+    const controller = MockController.withSeedData(BASE_OPTIONS)
+    await controller.setSelectedNode('chats:create')
+    await controller.setFocusPane('right-top')
+    const instance = render(
+      <App
+        options={BASE_OPTIONS}
+        controllerFactory={() => controller}
+      />
+    )
+
+    try {
+      await waitFor(() => lastFrame(instance).includes('Command'))
+      await waitFor(() => lastFrame(instance).includes('Create Chat'))
+      await waitFor(() => lastFrame(instance).includes('Chat Name'))
+
+      instance.stdin.write('\r')
+      await waitFor(() => lastFrame(instance).includes('Editing Chat Name'))
+      await typeText(instance, 'chat-browse-edit')
+      instance.stdin.write('\r')
+      await waitFor(() => lastFrame(instance).includes('Chat Name: chat-browse-edit'))
     } finally {
       instance.unmount()
     }

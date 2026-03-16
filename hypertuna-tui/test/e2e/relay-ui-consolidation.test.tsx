@@ -78,13 +78,16 @@ describe.sequential('TUI relay UI consolidation', () => {
     try {
       await waitFor(() => frame(instance).includes('Command'))
       await sleep(80)
+      await waitFor(() => /Name|Vis|Status/.test(frame(instance)))
 
       // Move focus to right-bottom and page down to surface lower metadata rows.
       instance.stdin.write('\t')
       await sleep(30)
       instance.stdin.write('\t')
       await sleep(30)
+      await waitFor(() => /Field|Value/.test(frame(instance)))
       let output = frame(instance)
+      expect(output).toMatch(/[┌┬┐│├┼┤└┴┘]/)
       for (let index = 0; index < 8; index += 1) {
         if (/readyForReq|writable|requiresAuth/.test(output)) break
         instance.stdin.write('\u0004')
@@ -119,6 +122,7 @@ describe.sequential('TUI relay UI consolidation', () => {
       const after = frame(instance)
       expect(after).not.toEqual(before)
       expect(after).toMatch(/Relay Details|Admin details|Members/)
+      expect(after).toMatch(/[┌│└].*Relay Details/)
     } finally {
       instance.unmount()
     }

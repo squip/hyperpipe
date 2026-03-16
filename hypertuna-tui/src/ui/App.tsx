@@ -23,6 +23,23 @@ import {
   type CommandContext,
   type CommandController
 } from './commandRouter.js'
+import {
+  parseKeyValueLine,
+  formatTableRows,
+  shouldUseKeyValueTable,
+  type TableColumn,
+  type TableRowView
+} from './tableFormatter.js'
+import {
+  CreateFormAdapter,
+  chatCreateRows,
+  csvToUniqueList,
+  groupCreateRows,
+  type CreateBrowseRow,
+  type CreateEditState,
+  type ChatCreateDraft,
+  type GroupCreateDraft
+} from './createFormAdapter.js'
 
 type AppProps = {
   options: RuntimeOptions
@@ -91,22 +108,8 @@ type CenterRow = {
   data: unknown
 }
 
-type GroupCreateDraft = {
-  name: string
-  about: string
-  membership: 'open' | 'closed'
-  visibility: 'public' | 'private'
-  directJoinOnly: boolean
-  gatewayOrigin: string
-  gatewayId: string
-}
-
-type ChatCreateDraft = {
-  name: string
-  description: string
-  inviteMembers: string[]
-  relayUrls: string[]
-}
+type CreateNodeId = 'groups:create' | 'chats:create'
+type CreateCursorMap = Record<CreateNodeId, number>
 
 type InviteSendMode = 'group' | 'chat'
 type InviteSendTarget = {
@@ -126,6 +129,377 @@ type RightTopRow = {
   expandable: boolean
   expanded: boolean
   inviteTarget?: InviteSendTarget | null
+}
+
+type DetailRenderRow =
+  | {
+      key: string
+      kind: 'plain'
+      text: string
+    }
+  | {
+      key: string
+      kind: 'kv-rule'
+      left: string
+      fieldRule: string
+      middle: string
+      valueRule: string
+      right: string
+    }
+  | {
+      key: string
+      kind: 'kv-header' | 'kv-data'
+      field: string
+      value: string
+    }
+
+type ActionBlockPosition = 'single' | 'top' | 'middle' | 'bottom'
+
+function sanitizeDisplayCell(value: string | null | undefined): string {
+  return String(value || '')
+    .replace(/\u001b\[[0-9;]*[A-Za-z]/g, '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function truncateDisplayCell(value: string, width: number): string {
+  const safeWidth = Math.max(1, width)
+  if (value.length <= safeWidth) return value
+  if (safeWidth === 1) return '…'
+  return `${value.slice(0, safeWidth - 1)}…`
+}
+
+function padDisplayCell(value: string, width: number): string {
+  if (value.length >= width) return value
+  return value.padEnd(width, ' ')
+}
+
+function centerDisplayCell(value: string, width: number): string {
+  if (value.length >= width) return value
+  const total = width - value.length
+  const left = Math.floor(total / 2)
+  const right = total - left
+  return `${' '.repeat(left)}${value}${' '.repeat(right)}`
+}
+
+function buildCenteredHeaderLine(columns: TableColumn[], widths: number[], gap = 2): string {
+  if (!columns.length || !widths.length) return ''
+  const separator = ' '.repeat(Math.max(1, gap))
+  return columns.map((column, index) => {
+    const width = widths[index] || 1
+    const label = truncateDisplayCell(sanitizeDisplayCell(column.label), width)
+    return index === 0
+      ? padDisplayCell(label, width)
+      : centerDisplayCell(label, width)
+  }).join(separator)
+}
+
+function coerceDetailLinesToKeyValue(lines: string[]): string[] {
+  const normalized: string[] = []
+  let detailIndex = 0
+  for (const line of lines) {
+    const text = sanitizeDisplayCell(line)
+    if (!text) continue
+    const parsed = parseKeyValueLine(text)
+    if (parsed) {
+      normalized.push(`${parsed.field}: ${parsed.value}`)
+      continue
+    }
+    detailIndex += 1
+    const field = detailIndex === 1 ? 'detail' : `detail${detailIndex}`
+    normalized.push(`${field}: ${text.replace(/^>\s*/, '')}`)
+  }
+  return normalized
+}
+
+function isCreateNodeId(node: NavNodeId): node is CreateNodeId {
+  return node === 'groups:create' || node === 'chats:create'
+}
+
+function actionBlockPosition(rows: RightTopRow[], index: number): ActionBlockPosition | null {
+  const row = rows[index]
+  if (!row || row.kind !== 'action') return null
+  const previousAction = index > 0 && rows[index - 1]?.kind === 'action'
+  const nextAction = index < rows.length - 1 && rows[index + 1]?.kind === 'action'
+  if (!previousAction && !nextAction) return 'single'
+  if (!previousAction) return 'top'
+  if (!nextAction) return 'bottom'
+  return 'middle'
+}
+
+function buildActionDropdownLine(label: string, width: number, position: ActionBlockPosition): string {
+  const safeWidth = Math.max(14, width)
+  const contentWidth = Math.max(6, safeWidth - 4)
+  const text = padDisplayCell(truncateDisplayCell(sanitizeDisplayCell(label), contentWidth), contentWidth)
+
+  if (position === 'single' || position === 'top') {
+    return `┌ ${text} ┐`
+  }
+  if (position === 'middle') {
+    return `│ ${text} │`
+  }
+  return `└ ${text} ┘`
+}
+
+function buildKeyValueDetailRows(lines: string[], width: number, forceTable = false): DetailRenderRow[] {
+  const parsed = lines
+    .map((line) => parseKeyValueLine(line))
+    .filter((row): row is { field: string; value: string } => Boolean(row))
+
+  const minimumRows = forceTable ? 1 : 2
+  if (parsed.length < minimumRows) {
+    return lines.flatMap((line, index) =>
+      wrapText(line, width).map((segment, segmentIndex) => ({
+        key: `plain:${index}:${segmentIndex}`,
+        kind: 'plain' as const,
+        text: segment
+      }))
+    )
+  }
+
+  const minFieldWidth = 8
+  const minValueWidth = 10
+  const innerTotal = Math.max(20, width - 7)
+  const maxFieldLen = Math.max(
+    5,
+    'Field'.length,
+    ...parsed.map((entry) => sanitizeDisplayCell(entry.field).length)
+  )
+  let fieldWidth = clamp(maxFieldLen, minFieldWidth, Math.max(minFieldWidth, innerTotal - minValueWidth))
+  let valueWidth = innerTotal - fieldWidth
+  if (valueWidth < minValueWidth) {
+    valueWidth = minValueWidth
+    fieldWidth = Math.max(minFieldWidth, innerTotal - minValueWidth)
+  }
+
+  const rows: DetailRenderRow[] = []
+  const pushRule = (left: string, middle: string, right: string, key: string): void => {
+    rows.push({
+      key,
+      kind: 'kv-rule',
+      left,
+      fieldRule: '─'.repeat(fieldWidth + 2),
+      middle,
+      valueRule: '─'.repeat(valueWidth + 2),
+      right
+    })
+  }
+
+  pushRule('┌', '┬', '┐', 'rule:top')
+  rows.push({
+    key: 'header',
+    kind: 'kv-header',
+    field: padDisplayCell('Field', fieldWidth),
+    value: padDisplayCell('Value', valueWidth)
+  })
+  pushRule('├', '┼', '┤', 'rule:header')
+
+  parsed.forEach((entry, index) => {
+    rows.push({
+      key: `data:${index}`,
+      kind: 'kv-data',
+      field: padDisplayCell(truncateDisplayCell(sanitizeDisplayCell(entry.field), fieldWidth), fieldWidth),
+      value: padDisplayCell(truncateDisplayCell(sanitizeDisplayCell(entry.value), valueWidth), valueWidth)
+    })
+    if (index < parsed.length - 1) {
+      pushRule('├', '┼', '┤', `rule:between:${index}`)
+    }
+  })
+  pushRule('└', '┴', '┘', 'rule:bottom')
+
+  const narrative = lines
+    .map((line) => sanitizeDisplayCell(line))
+    .filter((line) => !parseKeyValueLine(line) && line.length > 0)
+
+  if (narrative.length) {
+    rows.push({
+      key: 'narrative:spacer',
+      kind: 'plain',
+      text: ''
+    })
+    narrative.forEach((line, index) => {
+      const wrapped = wrapText(line, width)
+      wrapped.forEach((segment, segmentIndex) => {
+        rows.push({
+          key: `narrative:${index}:${segmentIndex}`,
+          kind: 'plain',
+          text: segment
+        })
+      })
+    })
+  }
+
+  return rows
+}
+
+function rightTopTableColumnsForNode(node: NavNodeId): TableColumn[] | null {
+  if (node === 'groups:browse' || node === 'groups:my') {
+    return [
+      { key: 'name', label: 'Name', minWidth: 16, priority: 0 },
+      { key: 'visibility', label: 'Vis', minWidth: 7, priority: 1, align: 'center' },
+      { key: 'membership', label: 'Join', minWidth: 7, priority: 1, align: 'center' },
+      { key: 'members', label: 'Members', minWidth: 7, priority: 2, align: 'center' },
+      { key: 'status', label: 'Status', minWidth: 10, priority: 3, align: 'center' }
+    ]
+  }
+  if (node === 'invites:group') {
+    return [
+      { key: 'relay', label: 'Relay', minWidth: 16, priority: 0 },
+      { key: 'members', label: 'Members', minWidth: 7, priority: 1, align: 'center' },
+      { key: 'from', label: 'By', minWidth: 10, priority: 1, align: 'center' }
+    ]
+  }
+  if (node === 'invites:chat') {
+    return [
+      { key: 'chat', label: 'Chat', minWidth: 16, priority: 0 },
+      { key: 'status', label: 'Status', minWidth: 8, priority: 1, align: 'center' },
+      { key: 'from', label: 'By', minWidth: 10, priority: 1, align: 'center' }
+    ]
+  }
+  if (node === 'files' || isFileTypeNodeId(node)) {
+    return [
+      { key: 'name', label: 'Name', minWidth: 16, priority: 0 },
+      { key: 'mime', label: 'Type', minWidth: 8, priority: 1, align: 'center' },
+      { key: 'size', label: 'Size', minWidth: 7, priority: 1, align: 'center' },
+      { key: 'relay', label: 'Relay', minWidth: 10, priority: 2, align: 'center' },
+      { key: 'by', label: 'By', minWidth: 10, priority: 3, align: 'center' }
+    ]
+  }
+  if (node === 'chats') {
+    return [
+      { key: 'chat', label: 'Chat', minWidth: 18, priority: 0 },
+      { key: 'unread', label: 'Unread', minWidth: 6, priority: 1, align: 'center' }
+    ]
+  }
+  if (node === 'accounts') {
+    return [
+      { key: 'account', label: 'Account', minWidth: 20, priority: 0 },
+      { key: 'signer', label: 'Signer', minWidth: 8, priority: 1, align: 'center' }
+    ]
+  }
+  if (node === 'logs') {
+    return [
+      { key: 'time', label: 'Time', minWidth: 8, priority: 0 },
+      { key: 'level', label: 'Lvl', minWidth: 5, priority: 1, align: 'center' },
+      { key: 'message', label: 'Message', minWidth: 16, priority: 2, align: 'center' }
+    ]
+  }
+  return null
+}
+
+function rowLead(row: RightTopRow): string {
+  if (row.kind === 'action') return '  ↳'
+  if (row.expandable) return row.expanded ? '▾' : '▸'
+  return '•'
+}
+
+function projectRightTopTableRow(
+  state: ControllerState,
+  node: NavNodeId,
+  row: RightTopRow
+): TableRowView {
+  const lead = rowLead(row)
+  if (row.kind === 'action') {
+    if (node === 'invites:group') {
+      return { relay: `${lead} ${row.label}`, members: '', from: '' }
+    }
+    if (node === 'invites:chat') {
+      return { chat: `${lead} ${row.label}`, status: '', from: '' }
+    }
+    if (node === 'files' || isFileTypeNodeId(node)) {
+      return { name: `${lead} ${row.label}`, mime: '', size: '', relay: '', by: '' }
+    }
+    if (node === 'groups:browse' || node === 'groups:my') {
+      return { name: `${lead} ${row.label}`, visibility: '', membership: '', members: '', status: '' }
+    }
+    return { name: `${lead} ${row.label}` }
+  }
+
+  if ((node === 'groups:browse' || node === 'groups:my') && row.centerRow.kind === 'group') {
+    const group = row.centerRow.data as any
+    const relay = relayForGroup(state, group)
+    const members = Number(group.membersCount || group.members?.length || 0)
+    const visibility = group.isPublic === false ? 'private' : 'public'
+    const membership = group.isOpen === false ? 'closed' : 'open'
+    let status = '-'
+    if (node === 'groups:my') {
+      status = relay?.readyForReq ? 'ready' : 'read-only'
+    } else if (group.isPublic !== false && group.isOpen !== false) {
+      status = 'open'
+    } else if (group.isPublic !== false) {
+      status = 'request'
+    } else {
+      status = 'private'
+    }
+    return {
+      name: `${lead} ${group.name || group.id || '-'}`,
+      visibility,
+      membership,
+      members: `${members}`,
+      status
+    }
+  }
+
+  if (node === 'invites:group' && row.centerRow.kind === 'group-invite') {
+    const invite = row.centerRow.data as any
+    const members = invite.event?.tags?.filter((tag: string[]) => tag[0] === 'p').length || 0
+    return {
+      relay: `${lead} ${invite.groupName || invite.groupId || '-'}`,
+      members: `${members}`,
+      from: shortId(invite.event?.pubkey || '-', 8)
+    }
+  }
+
+  if (node === 'invites:chat' && row.centerRow.kind === 'chat-invite') {
+    const invite = row.centerRow.data as any
+    return {
+      chat: `${lead} ${invite.title || invite.id || '-'}`,
+      status: invite.status || '-',
+      from: shortId(invite.senderPubkey || '-', 8)
+    }
+  }
+
+  if ((node === 'files' || isFileTypeNodeId(node)) && row.centerRow.kind === 'file') {
+    const file = row.centerRow.data as any
+    return {
+      name: `${lead} ${file.fileName || '-'}`,
+      mime: file.mime || '-',
+      size: `${Number(file.size || 0)}B`,
+      relay: shortText(file.groupName || file.groupId, 18),
+      by: shortId(file.uploadedBy || '-', 8)
+    }
+  }
+
+  if (node === 'chats' && row.centerRow.kind === 'chat-conversation') {
+    const conversation = row.centerRow.data as any
+    return {
+      chat: `${lead} ${conversation.title || conversation.id || '-'}`,
+      unread: `${Number(conversation.unreadCount || 0)}`
+    }
+  }
+
+  if (node === 'accounts' && row.centerRow.kind === 'account') {
+    const account = row.centerRow.data as any
+    const marker = state.currentAccountPubkey === account.pubkey ? '*' : ' '
+    return {
+      account: `${lead} ${marker} ${shortId(account.pubkey, 10)}`,
+      signer: account.signerType || '-'
+    }
+  }
+
+  if (node === 'logs' && row.centerRow.kind === 'log') {
+    const entry = row.centerRow.data as any
+    return {
+      time: new Date(entry.ts).toLocaleTimeString(),
+      level: String(entry.level || '').toUpperCase(),
+      message: `${lead} ${shortText(entry.message, 90)}`
+    }
+  }
+
+  return {
+    name: `${lead} ${row.label}`
+  }
 }
 
 type ProfileSuggestion = {
@@ -799,7 +1173,7 @@ function defaultDetailsAction(node: NavNodeId): string {
 }
 
 function isFormCenterNode(node: NavNodeId): boolean {
-  return node === 'groups:create' || node === 'chats:create' || node === 'invites:send'
+  return node === 'invites:send'
 }
 
 function groupKey(groupId: string, relay?: string | null): string {
@@ -1266,13 +1640,6 @@ export function App({
   const [paneActionMessage, setPaneActionMessage] = useState<string>('')
   const [commandInputOpen, setCommandInputOpen] = useState(false)
   const [commandInput, setCommandInput] = useState('')
-  const [fieldInputOpen, setFieldInputOpen] = useState(false)
-  const [fieldInputPrompt, setFieldInputPrompt] = useState('')
-  const [fieldInputValue, setFieldInputValue] = useState('')
-  const fieldInputContextRef = useRef<{
-    node: NavNodeId
-    field: string
-  } | null>(null)
   const [groupCreateDraft, setGroupCreateDraft] = useState<GroupCreateDraft>({
     name: '',
     about: '',
@@ -1282,7 +1649,11 @@ export function App({
     gatewayOrigin: '',
     gatewayId: ''
   })
-  const [groupGatewayPickerExpanded, setGroupGatewayPickerExpanded] = useState(false)
+  const [createCursorByNode, setCreateCursorByNode] = useState<CreateCursorMap>({
+    'groups:create': 0,
+    'chats:create': 0
+  })
+  const [createEditState, setCreateEditState] = useState<CreateEditState | null>(null)
   const [chatCreateDraft, setChatCreateDraft] = useState<ChatCreateDraft>({
     name: '',
     description: '',
@@ -1304,6 +1675,11 @@ export function App({
   const focusPaneRef = useRef<FocusPane>('left-tree')
   const nodeViewportRef = useRef<ViewportMap>({})
   const rightBottomOffsetRef = useRef<OffsetMap>({})
+  const createCursorRef = useRef<CreateCursorMap>({
+    'groups:create': 0,
+    'chats:create': 0
+  })
+  const createEditStateRef = useRef<CreateEditState | null>(null)
   const selectedCenterRowRef = useRef<CenterRow | null>(null)
   const myGroupPaneLoadKeyRef = useRef<string>('')
 
@@ -1377,6 +1753,14 @@ export function App({
   }, [rightBottomOffsetByNode])
 
   useEffect(() => {
+    createCursorRef.current = createCursorByNode
+  }, [createCursorByNode])
+
+  useEffect(() => {
+    createEditStateRef.current = createEditState
+  }, [createEditState])
+
+  useEffect(() => {
     if (!state) return
     const scopeKey = String(state.session?.userKey || state.currentAccountPubkey || '')
     if (!scopeKey) return
@@ -1409,7 +1793,12 @@ export function App({
       gatewayOrigin: '',
       gatewayId: ''
     })
-    setGroupGatewayPickerExpanded(false)
+    setCreateCursorByNode({
+      'groups:create': 0,
+      'chats:create': 0
+    })
+    createEditStateRef.current = null
+    setCreateEditState(null)
     setChatCreateDraft({
       name: '',
       description: '',
@@ -1421,14 +1810,7 @@ export function App({
     setInviteSendSuggestionIndex(0)
     setInviteSendBusy(false)
     setInviteSendStatus('')
-    closeFieldInput()
   }, [state, hydratedScopeKey])
-
-  useEffect(() => {
-    if (selectedNode !== 'groups:create' && groupGatewayPickerExpanded) {
-      setGroupGatewayPickerExpanded(false)
-    }
-  }, [selectedNode, groupGatewayPickerExpanded])
 
   const navRows = useMemo(() => {
     if (!state) return []
@@ -1469,174 +1851,12 @@ export function App({
   const navBoxRows = narrowLayout ? narrowNavBoxRows : frameRows.mainRows
   const rightTopBoxRows = narrowLayout ? narrowRightTopBoxRows : wideRightTopBoxRows
   const rightBottomBoxRows = narrowLayout ? narrowRightBottomBoxRows : wideRightBottomBoxRows
-  const rightTopVisibleRows = Math.max(1, rightTopBoxRows - 3)
+  const rightTopContentWidth = Math.max(20, (narrowLayout ? stdoutWidth : rightPaneWidth) - 8)
 
   const centerRows = useMemo(() => {
     if (!state) return []
-    const base = centerRowsForNode(state, selectedNode)
-    if (selectedNode === 'groups:create') {
-      const discoveredGateways = state.discoveredGateways || []
-      const normalizedSelectedGatewayId = String(groupCreateDraft.gatewayId || '').trim().toLowerCase()
-      const normalizedSelectedGatewayOrigin = normalizeHttpOrigin(groupCreateDraft.gatewayOrigin) || null
-      const gatewaySelectionRows: CenterRow[] = discoveredGateways.length
-        ? discoveredGateways.map((gateway) => {
-            const checked =
-              (normalizedSelectedGatewayId && gateway.gatewayId === normalizedSelectedGatewayId)
-              || (!normalizedSelectedGatewayId && normalizedSelectedGatewayOrigin === gateway.publicUrl)
-            const title = gateway.displayName || gateway.gatewayId
-            const region = gateway.region ? ` (${gateway.region})` : ''
-            return {
-              key: `groups:create:gateway-option:${gateway.gatewayId}`,
-              label: `  ${checked ? '[x]' : '[ ]'} ${shortText(title, 24)}${region} - ${gateway.publicUrl}`,
-              kind: 'form-option',
-              data: {
-                form: 'group-create',
-                field: 'gateway-option',
-                gatewayId: gateway.gatewayId,
-                gatewayOrigin: gateway.publicUrl
-              }
-            }
-          })
-        : [
-            {
-              key: 'groups:create:gateway-option:none',
-              label: '  no discovered gateways (use refresh)',
-              kind: 'form-field',
-              data: { form: 'group-create', field: 'gateway-option-empty' }
-            }
-          ]
-
-      const mapped = base.map((row) => {
-        if (row.key === 'groups:create:name') {
-          return {
-            ...row,
-            label: `relay name: ${groupCreateDraft.name || '-'}`
-          }
-        }
-        if (row.key === 'groups:create:about') {
-          return {
-            ...row,
-            label: `relay description: ${groupCreateDraft.about || '-'}`
-          }
-        }
-        if (row.key === 'groups:create:membership') {
-          return {
-            ...row,
-            label: `membership policy: ${groupCreateDraft.membership}`
-          }
-        }
-        if (row.key === 'groups:create:membership:open') {
-          return {
-            ...row,
-            label: `  ${groupCreateDraft.membership === 'open' ? '[x]' : '[ ]'} open`
-          }
-        }
-        if (row.key === 'groups:create:membership:closed') {
-          return {
-            ...row,
-            label: `  ${groupCreateDraft.membership === 'closed' ? '[x]' : '[ ]'} closed`
-          }
-        }
-        if (row.key === 'groups:create:visibility') {
-          return {
-            ...row,
-            label: `visibility: ${groupCreateDraft.visibility}`
-          }
-        }
-        if (row.key === 'groups:create:visibility:public') {
-          return {
-            ...row,
-            label: `  ${groupCreateDraft.visibility === 'public' ? '[x]' : '[ ]'} public`
-          }
-        }
-        if (row.key === 'groups:create:visibility:private') {
-          return {
-            ...row,
-            label: `  ${groupCreateDraft.visibility === 'private' ? '[x]' : '[ ]'} private`
-          }
-        }
-        if (row.key === 'groups:create:direct-join-only') {
-          return {
-            ...row,
-            label: `direct-join-only: ${groupCreateDraft.directJoinOnly ? 'yes' : 'no'}`
-          }
-        }
-        if (row.key === 'groups:create:gateway-picker') {
-          return {
-            ...row,
-            label:
-              `gateway picker: ${groupGatewayPickerExpanded ? 'expanded' : 'collapsed'}`
-              + ` (${discoveredGateways.length} discovered)`
-          }
-        }
-        if (row.key === 'groups:create:gateway-refresh') {
-          return {
-            ...row,
-            label: 'refresh discovered gateways'
-          }
-        }
-        if (row.key === 'groups:create:gateway-origin') {
-          return {
-            ...row,
-            label: `gateway origin: ${groupCreateDraft.gatewayOrigin || '-'}`
-          }
-        }
-        if (row.key === 'groups:create:gateway-id') {
-          return {
-            ...row,
-            label: `gateway id: ${groupCreateDraft.gatewayId || '-'}`
-          }
-        }
-        return row
-      })
-      if (groupGatewayPickerExpanded) {
-        const pickerIndex = mapped.findIndex((row) => row.key === 'groups:create:gateway-picker')
-        if (pickerIndex >= 0) {
-          mapped.splice(pickerIndex + 1, 0, ...gatewaySelectionRows)
-        }
-      }
-      return mapped
-    }
-    if (selectedNode === 'chats:create') {
-      return base.map((row) => {
-        if (row.key === 'chats:create:name') {
-          return {
-            ...row,
-            label: `chat name: ${chatCreateDraft.name || '-'}`
-          }
-        }
-        if (row.key === 'chats:create:about') {
-          return {
-            ...row,
-            label: `chat description: ${chatCreateDraft.description || '-'}`
-          }
-        }
-        if (row.key === 'chats:create:members') {
-          return {
-            ...row,
-            label: `invite members: ${chatCreateDraft.inviteMembers.length ? chatCreateDraft.inviteMembers.join(',') : '-'}`
-          }
-        }
-        if (row.key === 'chats:create:relays') {
-          return {
-            ...row,
-            label: `chat relays: ${chatCreateDraft.relayUrls.length}`
-          }
-        }
-        if (row.key.startsWith('chats:create:relay:')) {
-          const relayUrl = String((row.data as { value?: string })?.value || '')
-          const selected = chatCreateDraft.relayUrls.includes(relayUrl)
-          const relayName = row.label.trim()
-          return {
-            ...row,
-            label: `  ${selected ? '[x]' : '[ ]'} ${relayName.replace(/^\[.\]\s*/, '')}`
-          }
-        }
-        return row
-      })
-    }
-    return base
-  }, [state, selectedNode, groupCreateDraft, chatCreateDraft, groupGatewayPickerExpanded])
+    return centerRowsForNode(state, selectedNode)
+  }, [state, selectedNode])
 
   const inviteSendTargetsByMode = useMemo(() => {
     if (!state) {
@@ -1676,6 +1896,7 @@ export function App({
 
   const rightTopRows = useMemo(() => {
     if (!state) return []
+    if (isCreateNodeId(selectedNode)) return []
     const rows: RightTopRow[] = []
     const expandedParent = expandedActionParentByNode[selectedNode] || ''
     const actionTreeEnabled = supportsActionTree(selectedNode)
@@ -1750,6 +1971,66 @@ export function App({
 
     return rows
   }, [state, selectedNode, centerRows, expandedActionParentByNode, inviteSendTargetsByMode])
+
+  const createRows = useMemo<CreateBrowseRow[]>(() => {
+    if (!state || !isCreateNodeId(selectedNode)) return []
+    if (selectedNode === 'groups:create') {
+      return groupCreateRows(groupCreateDraft, state.discoveredGateways || [])
+    }
+    return chatCreateRows(chatCreateDraft, state.relays || [])
+  }, [state, selectedNode, groupCreateDraft, chatCreateDraft])
+
+  const selectedCreateCursor = isCreateNodeId(selectedNode)
+    ? clamp(createCursorByNode[selectedNode] || 0, 0, Math.max(0, createRows.length - 1))
+    : 0
+  const selectedCreateRow = isCreateNodeId(selectedNode)
+    ? (createRows[selectedCreateCursor] || null)
+    : null
+
+  useEffect(() => {
+    if (!isCreateNodeId(selectedNode)) return
+    const maxIndex = Math.max(0, createRows.length - 1)
+    const current = createCursorByNode[selectedNode] || 0
+    if (current <= maxIndex) return
+    setCreateCursorByNode((previous) => ({
+      ...previous,
+      [selectedNode]: maxIndex
+    }))
+  }, [selectedNode, createRows.length, createCursorByNode])
+
+  useEffect(() => {
+    if (!createEditState) return
+    if (createEditState.node === selectedNode) return
+    createEditStateRef.current = null
+    setCreateEditState(null)
+  }, [selectedNode, createEditState])
+
+  const rightTopTableColumns = useMemo(
+    () => (isCreateNodeId(selectedNode) ? null : rightTopTableColumnsForNode(selectedNode)),
+    [selectedNode]
+  )
+  const rightTopHasTable = Boolean(rightTopTableColumns && rightTopTableColumns.length > 0)
+  const rightTopHeaderRows = rightTopHasTable ? 2 : 0
+  const rightTopBodyRows = Math.max(1, rightTopBoxRows - 2 - rightTopHeaderRows)
+  const rightTopVisibleRows = rightTopBodyRows
+
+  const rightTopProjectedRows = useMemo<TableRowView[]>(() => {
+    if (!state || !rightTopTableColumns?.length) return []
+    return rightTopRows.map((row) => projectRightTopTableRow(state, selectedNode, row))
+  }, [state, selectedNode, rightTopRows, rightTopTableColumns])
+
+  const rightTopTable = useMemo(() => {
+    if (!rightTopTableColumns?.length) return null
+    return formatTableRows({
+      columns: rightTopTableColumns,
+      rows: rightTopProjectedRows,
+      width: rightTopContentWidth
+    })
+  }, [rightTopProjectedRows, rightTopTableColumns, rightTopContentWidth])
+  const rightTopCenteredHeaderLine = useMemo(() => {
+    if (!rightTopTable) return ''
+    return buildCenteredHeaderLine(rightTopTable.columns, rightTopTable.widths, 2)
+  }, [rightTopTable])
 
   const selectedNodeViewport = useMemo(() => {
     const current = nodeViewport[selectedNode] || { cursor: 0, offset: 0 }
@@ -1909,17 +2190,30 @@ export function App({
   ])
 
   const rightBottomWrapWidth = Math.max(18, rightPaneWidth - 4)
-  const wrappedRightRows = useMemo(() => {
-    return rightBottomRawRows.flatMap((row) => wrapText(row, rightBottomWrapWidth))
-  }, [rightBottomRawRows, rightBottomWrapWidth])
+  const rightBottomRenderRows = useMemo<DetailRenderRow[]>(() => {
+    const forceActionTable = selectedRightTopRow?.kind === 'action'
+    const candidateLines = forceActionTable
+      ? coerceDetailLinesToKeyValue(rightBottomRawRows)
+      : rightBottomRawRows
+    if (forceActionTable || shouldUseKeyValueTable(candidateLines)) {
+      return buildKeyValueDetailRows(candidateLines, rightBottomWrapWidth, forceActionTable)
+    }
+    return rightBottomRawRows.flatMap((row, index) =>
+      wrapText(row, rightBottomWrapWidth).map((segment, segmentIndex) => ({
+        key: `plain:${index}:${segmentIndex}`,
+        kind: 'plain' as const,
+        text: segment
+      }))
+    )
+  }, [rightBottomRawRows, rightBottomWrapWidth, selectedRightTopRow])
 
-  const rightBottomVisibleRows = Math.max(1, rightBottomBoxRows - 3)
+  const rightBottomVisibleRows = Math.max(1, rightBottomBoxRows - 2)
 
   const rightBottomOffset = useMemo(() => {
     const raw = rightBottomOffsetByNode[selectedNode] || 0
-    const maxOffset = Math.max(0, wrappedRightRows.length - rightBottomVisibleRows)
+    const maxOffset = Math.max(0, rightBottomRenderRows.length - rightBottomVisibleRows)
     return clamp(raw, 0, maxOffset)
-  }, [rightBottomOffsetByNode, selectedNode, wrappedRightRows.length, rightBottomVisibleRows])
+  }, [rightBottomOffsetByNode, selectedNode, rightBottomRenderRows.length, rightBottomVisibleRows])
 
   useEffect(() => {
     const existing = rightBottomOffsetRef.current[selectedNode]
@@ -1932,7 +2226,7 @@ export function App({
     controllerRef.current?.setDetailPaneOffset(selectedNode, rightBottomOffset).catch(() => {})
   }, [selectedNode, rightBottomOffset])
 
-  const visibleRightRows = wrappedRightRows.slice(rightBottomOffset, rightBottomOffset + rightBottomVisibleRows)
+  const visibleRightRows = rightBottomRenderRows.slice(rightBottomOffset, rightBottomOffset + rightBottomVisibleRows)
 
   const buildCurrentCommandContext = (): CommandContext => {
     const snapshot = stateRef.current
@@ -2035,77 +2329,6 @@ export function App({
     }
   }
 
-  const closeFieldInput = (): void => {
-    setFieldInputOpen(false)
-    setFieldInputPrompt('')
-    setFieldInputValue('')
-    fieldInputContextRef.current = null
-  }
-
-  const openFieldInput = (
-    node: NavNodeId,
-    field: string,
-    prompt: string,
-    initialValue: string
-  ): void => {
-    fieldInputContextRef.current = { node, field }
-    setFieldInputPrompt(prompt)
-    setFieldInputValue(initialValue)
-    setFieldInputOpen(true)
-  }
-
-  const applyFieldInputValue = (rawValue: string): void => {
-    const context = fieldInputContextRef.current
-    if (!context) return
-    const value = String(rawValue || '')
-    if (context.node === 'groups:create') {
-      if (context.field === 'name') {
-        setGroupCreateDraft((previous) => ({ ...previous, name: value.trim() }))
-      } else if (context.field === 'about') {
-        setGroupCreateDraft((previous) => ({ ...previous, about: value.trim() }))
-      } else if (context.field === 'gateway-origin') {
-        const next = value.trim()
-        setGroupCreateDraft((previous) => ({
-          ...previous,
-          gatewayOrigin: next,
-          directJoinOnly: next ? false : previous.directJoinOnly
-        }))
-      } else if (context.field === 'gateway-id') {
-        const next = value.trim().toLowerCase()
-        setGroupCreateDraft((previous) => ({
-          ...previous,
-          gatewayId: next,
-          directJoinOnly: next ? false : previous.directJoinOnly
-        }))
-      }
-      return
-    }
-    if (context.node === 'chats:create') {
-      if (context.field === 'name') {
-        setChatCreateDraft((previous) => ({ ...previous, name: value.trim() }))
-      } else if (context.field === 'description') {
-        setChatCreateDraft((previous) => ({ ...previous, description: value.trim() }))
-      } else if (context.field === 'members') {
-        const members = value
-          .split(/[,\s]+/g)
-          .map((entry) => entry.trim())
-          .filter(Boolean)
-        setChatCreateDraft((previous) => ({ ...previous, inviteMembers: Array.from(new Set(members)) }))
-      } else if (context.field === 'relays') {
-        const relayUrls = value
-          .split(/[,\s]+/g)
-          .map((entry) => entry.trim())
-          .filter(Boolean)
-        setChatCreateDraft((previous) => ({ ...previous, relayUrls: Array.from(new Set(relayUrls)) }))
-      }
-    }
-  }
-
-  const submitFieldInput = (submittedValue: string): void => {
-    applyFieldInputValue(submittedValue)
-    closeFieldInput()
-  }
-
   const toggleChatRelayDraft = (relayUrl: string): void => {
     const normalized = String(relayUrl || '').trim()
     if (!normalized) return
@@ -2171,7 +2394,9 @@ export function App({
         gatewayOrigin: '',
         gatewayId: ''
       })
-      setGroupGatewayPickerExpanded(false)
+      setCreateCursorByNode((previous) => ({ ...previous, 'groups:create': 0 }))
+      createEditStateRef.current = null
+      setCreateEditState(null)
     } catch (error) {
       setPaneActionMessage(error instanceof Error ? error.message : String(error))
     }
@@ -2201,57 +2426,101 @@ export function App({
         inviteMembers: [],
         relayUrls: []
       })
+      setCreateCursorByNode((previous) => ({ ...previous, 'chats:create': 0 }))
+      createEditStateRef.current = null
+      setCreateEditState(null)
     } catch (error) {
       setPaneActionMessage(error instanceof Error ? error.message : String(error))
     }
   }
 
-  const handleFormRightTopEnter = async (row: CenterRow): Promise<void> => {
+  const refreshCreateGatewayCatalog = async (): Promise<void> => {
     const controller = controllerRef.current
-    if (selectedNode === 'groups:create') {
-      if (row.key === 'groups:create:name') {
-        openFieldInput('groups:create', 'name', 'Relay name', groupCreateDraft.name)
+    if (!controller) return
+    try {
+      setPaneActionMessage('Refreshing gateway catalog…')
+      const gateways = await controller.refreshGatewayCatalog({ force: true })
+      setPaneActionMessage(`Gateway catalog refreshed (${gateways.length} discovered)`)
+    } catch (error) {
+      setPaneActionMessage(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const currentCreateFieldValue = (
+    node: CreateNodeId,
+    field: CreateEditState['field']
+  ): string => {
+    if (node === 'groups:create') {
+      if (field === 'name') return groupCreateDraft.name
+      if (field === 'about') return groupCreateDraft.about
+      if (field === 'membership') return groupCreateDraft.membership
+      if (field === 'visibility') return groupCreateDraft.visibility
+      if (field === 'directJoinOnly') return groupCreateDraft.directJoinOnly ? 'true' : 'false'
+      if (field === 'gatewayOrigin') return groupCreateDraft.gatewayOrigin
+      if (field === 'gatewayId') return groupCreateDraft.gatewayId
+      return ''
+    }
+    if (field === 'name') return chatCreateDraft.name
+    if (field === 'description') return chatCreateDraft.description
+    if (field === 'inviteMembers') return chatCreateDraft.inviteMembers.join(',')
+    if (field === 'relayUrls') return chatCreateDraft.relayUrls.join(',')
+    return ''
+  }
+
+  const beginCreateFieldEdit = (row: CreateBrowseRow): void => {
+    if (row.kind !== 'field' || !isCreateNodeId(selectedNode)) return
+    if (row.editor === 'text') {
+      const next: CreateEditState = {
+        node: selectedNode,
+        field: row.field,
+        label: row.label,
+        editor: 'text',
+        value: currentCreateFieldValue(selectedNode, row.field),
+        required: row.required
+      }
+      createEditStateRef.current = next
+      setCreateEditState(next)
+      return
+    }
+    const options = row.options || []
+    const currentValue = currentCreateFieldValue(selectedNode, row.field)
+    const selectedIndex = Math.max(0, options.findIndex((entry) => entry.value === currentValue))
+    const next: CreateEditState = {
+      node: selectedNode,
+      field: row.field,
+      label: row.label,
+      editor: 'choice',
+      options,
+      selectedIndex
+    }
+    createEditStateRef.current = next
+    setCreateEditState(next)
+  }
+
+  const applyCreateFieldEdit = (edit: CreateEditState, value: string): void => {
+    if (edit.node === 'groups:create') {
+      if (edit.field === 'name') {
+        setGroupCreateDraft((previous) => ({ ...previous, name: value.trim() }))
         return
       }
-      if (row.key === 'groups:create:about') {
-        openFieldInput('groups:create', 'about', 'Relay description', groupCreateDraft.about)
+      if (edit.field === 'about') {
+        setGroupCreateDraft((previous) => ({ ...previous, about: value.trim() }))
         return
       }
-      if (row.key === 'groups:create:membership') {
+      if (edit.field === 'membership') {
+        setGroupCreateDraft((previous) => ({ ...previous, membership: value === 'closed' ? 'closed' : 'open' }))
+        return
+      }
+      if (edit.field === 'visibility') {
+        setGroupCreateDraft((previous) => ({ ...previous, visibility: value === 'private' ? 'private' : 'public' }))
+        return
+      }
+      if (edit.field === 'directJoinOnly') {
+        const directJoinOnly = value === 'true'
         setGroupCreateDraft((previous) => ({
           ...previous,
-          membership: previous.membership === 'open' ? 'closed' : 'open'
-        }))
-        return
-      }
-      if (row.key === 'groups:create:membership:open') {
-        setGroupCreateDraft((previous) => ({ ...previous, membership: 'open' }))
-        return
-      }
-      if (row.key === 'groups:create:membership:closed') {
-        setGroupCreateDraft((previous) => ({ ...previous, membership: 'closed' }))
-        return
-      }
-      if (row.key === 'groups:create:visibility') {
-        setGroupCreateDraft((previous) => ({
-          ...previous,
-          visibility: previous.visibility === 'public' ? 'private' : 'public'
-        }))
-        return
-      }
-      if (row.key === 'groups:create:visibility:public') {
-        setGroupCreateDraft((previous) => ({ ...previous, visibility: 'public' }))
-        return
-      }
-      if (row.key === 'groups:create:visibility:private') {
-        setGroupCreateDraft((previous) => ({ ...previous, visibility: 'private' }))
-        return
-      }
-      if (row.key === 'groups:create:direct-join-only') {
-        setGroupCreateDraft((previous) => ({
-          ...previous,
-          directJoinOnly: !previous.directJoinOnly,
-          ...(!previous.directJoinOnly
+          directJoinOnly,
+          ...(directJoinOnly
             ? {
                 gatewayOrigin: '',
                 gatewayId: ''
@@ -2260,82 +2529,92 @@ export function App({
         }))
         return
       }
-      if (row.key === 'groups:create:gateway-picker') {
-        setGroupGatewayPickerExpanded((previous) => !previous)
+      if (edit.field === 'gatewayOrigin') {
+        const next = value.trim()
+        setGroupCreateDraft((previous) => ({
+          ...previous,
+          gatewayOrigin: next,
+          directJoinOnly: next ? false : previous.directJoinOnly
+        }))
         return
       }
-      if (row.key === 'groups:create:gateway-refresh') {
-        if (!controller) return
-        try {
-          setPaneActionMessage('Refreshing gateway catalog…')
-          const gateways = await controller.refreshGatewayCatalog({ force: true })
-          setPaneActionMessage(`Gateway catalog refreshed (${gateways.length} discovered)`)
-          setGroupGatewayPickerExpanded(true)
-        } catch (error) {
-          setPaneActionMessage(error instanceof Error ? error.message : String(error))
-        }
-        return
-      }
-      if (row.key.startsWith('groups:create:gateway-option:')) {
-        const selectedGateway = row.data as {
-          gatewayId?: string
-          gatewayOrigin?: string
-        } | null
-        const selectedGatewayId = String(selectedGateway?.gatewayId || '').trim().toLowerCase()
-        const selectedGatewayOrigin = String(selectedGateway?.gatewayOrigin || '').trim()
-        if (selectedGatewayId && selectedGatewayOrigin) {
-          setGroupCreateDraft((previous) => ({
-            ...previous,
-            directJoinOnly: false,
-            gatewayId: selectedGatewayId,
-            gatewayOrigin: selectedGatewayOrigin
-          }))
-          setPaneActionMessage(`Selected gateway ${selectedGatewayId}`)
-        }
-        return
-      }
-      if (row.key === 'groups:create:gateway-origin') {
-        openFieldInput('groups:create', 'gateway-origin', 'Gateway origin (http/https)', groupCreateDraft.gatewayOrigin)
-        return
-      }
-      if (row.key === 'groups:create:gateway-id') {
-        openFieldInput('groups:create', 'gateway-id', 'Gateway ID (optional)', groupCreateDraft.gatewayId)
-        return
-      }
-      if (row.key === 'groups:create:submit') {
-        await runCreateGroup()
+      if (edit.field === 'gatewayId') {
+        const next = value.trim().toLowerCase()
+        setGroupCreateDraft((previous) => ({
+          ...previous,
+          gatewayId: next,
+          directJoinOnly: next ? false : previous.directJoinOnly
+        }))
       }
       return
     }
 
-    if (selectedNode === 'chats:create') {
-      if (row.key === 'chats:create:name') {
-        openFieldInput('chats:create', 'name', 'Chat name', chatCreateDraft.name)
-        return
+    if (edit.field === 'name') {
+      setChatCreateDraft((previous) => ({ ...previous, name: value.trim() }))
+      return
+    }
+    if (edit.field === 'description') {
+      setChatCreateDraft((previous) => ({ ...previous, description: value.trim() }))
+      return
+    }
+    if (edit.field === 'inviteMembers') {
+      setChatCreateDraft((previous) => ({ ...previous, inviteMembers: csvToUniqueList(value) }))
+      return
+    }
+    if (edit.field === 'relayUrls') {
+      setChatCreateDraft((previous) => ({ ...previous, relayUrls: csvToUniqueList(value) }))
+    }
+  }
+
+  const commitCreateEdit = (): void => {
+    const edit = createEditStateRef.current
+    if (!edit) return
+    if (edit.editor === 'text') {
+      applyCreateFieldEdit(edit, edit.value)
+    } else {
+      const selected = edit.options[edit.selectedIndex]
+      if (selected) {
+        applyCreateFieldEdit(edit, selected.value)
       }
-      if (row.key === 'chats:create:about') {
-        openFieldInput('chats:create', 'description', 'Chat description', chatCreateDraft.description)
-        return
-      }
-      if (row.key === 'chats:create:members') {
-        openFieldInput('chats:create', 'members', 'Invite members (csv)', chatCreateDraft.inviteMembers.join(','))
-        return
-      }
-      if (row.key === 'chats:create:relays') {
-        openFieldInput('chats:create', 'relays', 'Relay URLs (csv)', chatCreateDraft.relayUrls.join(','))
-        return
-      }
-      if (row.key.startsWith('chats:create:relay:')) {
-        const relayUrl = String((row.data as { value?: string })?.value || '')
-        toggleChatRelayDraft(relayUrl)
-        return
-      }
-      if (row.key === 'chats:create:submit') {
+    }
+    createEditStateRef.current = null
+    setCreateEditState(null)
+  }
+
+  const executeCreateBrowseRow = async (row: CreateBrowseRow): Promise<void> => {
+    if (row.kind === 'field') {
+      beginCreateFieldEdit(row)
+      return
+    }
+    if (row.kind === 'gateway-refresh') {
+      await refreshCreateGatewayCatalog()
+      return
+    }
+    if (row.kind === 'gateway-option') {
+      if (!row.gatewayId || !row.gatewayOrigin) return
+      setGroupCreateDraft((previous) => ({
+        ...previous,
+        directJoinOnly: false,
+        gatewayId: row.gatewayId.trim().toLowerCase(),
+        gatewayOrigin: row.gatewayOrigin.trim()
+      }))
+      setPaneActionMessage(`Selected gateway ${row.gatewayId}`)
+      return
+    }
+    if (row.kind === 'chat-relay') {
+      toggleChatRelayDraft(row.relayUrl)
+      return
+    }
+    if (row.kind === 'submit') {
+      if (selectedNode === 'groups:create') {
+        await runCreateGroup()
+      } else if (selectedNode === 'chats:create') {
         await runCreateChat()
       }
-      return
     }
+  }
 
+  const handleInviteSendModeSelect = async (row: CenterRow): Promise<void> => {
     if (selectedNode === 'invites:send') {
       const mode = (row.data as { mode?: InviteSendMode } | null)?.mode
       if (mode === 'chat' || mode === 'group') {
@@ -2600,30 +2879,114 @@ export function App({
       return
     }
 
-    if (fieldInputOpen) {
+    if (key.ctrl && input === 'c') {
+      controller.shutdown().finally(() => exit())
+      return
+    }
+
+    const currentNode = selectedNodeRef.current
+    const currentFocus = focusPaneRef.current
+    const currentCreateEdit = createEditStateRef.current
+    const createEditActive = Boolean(
+      currentCreateEdit
+      && currentFocus === 'right-top'
+      && isCreateNodeId(currentNode)
+      && currentCreateEdit.node === currentNode
+    )
+
+    if (createEditActive && currentCreateEdit) {
       if (key.escape) {
-        closeFieldInput()
+        createEditStateRef.current = null
+        setCreateEditState(null)
         return
       }
-      if (key.return) {
-        submitFieldInput(fieldInputValue)
-        return
-      }
-      if (key.backspace || key.delete) {
-        setFieldInputValue((previous) => previous.slice(0, -1))
-        return
-      }
-      if (!key.ctrl && !key.meta && input) {
-        const sanitized = input.replace(/[\r\n\t]/g, '')
-        if (sanitized) {
-          setFieldInputValue((previous) => `${previous}${sanitized}`)
+      if (currentCreateEdit.editor === 'choice') {
+        if (key.upArrow) {
+          setCreateEditState((previous) => {
+            if (!previous || previous.editor !== 'choice') return previous
+            const next = {
+              ...previous,
+              selectedIndex: clamp(previous.selectedIndex - 1, 0, Math.max(0, previous.options.length - 1))
+            }
+            createEditStateRef.current = next
+            return next
+          })
+          return
         }
+        if (key.downArrow) {
+          setCreateEditState((previous) => {
+            if (!previous || previous.editor !== 'choice') return previous
+            const next = {
+              ...previous,
+              selectedIndex: clamp(previous.selectedIndex + 1, 0, Math.max(0, previous.options.length - 1))
+            }
+            createEditStateRef.current = next
+            return next
+          })
+          return
+        }
+        if (key.return) {
+          commitCreateEdit()
+          return
+        }
+        return
+      }
+
+      if (key.return) {
+        commitCreateEdit()
+        return
+      }
+
+      if (key.backspace || key.delete) {
+        setCreateEditState((previous) => {
+          if (!previous || previous.editor !== 'text') return previous
+          const next = {
+            ...previous,
+            value: previous.value.slice(0, -1)
+          }
+          createEditStateRef.current = next
+          return next
+        })
+        return
+      }
+
+      if (key.ctrl && input === 'u') {
+        setCreateEditState((previous) => {
+          if (!previous || previous.editor !== 'text') return previous
+          const next = {
+            ...previous,
+            value: ''
+          }
+          createEditStateRef.current = next
+          return next
+        })
+        return
+      }
+
+      const isPrintable = !key.ctrl && !(key as unknown as { meta?: boolean }).meta && input.length > 0
+      if (isPrintable) {
+        setCreateEditState((previous) => {
+          if (!previous || previous.editor !== 'text') return previous
+          const next = {
+            ...previous,
+            value: `${previous.value}${input}`
+          }
+          createEditStateRef.current = next
+          return next
+        })
+        return
       }
       return
     }
 
-    if (key.ctrl && input === 'c') {
-      controller.shutdown().finally(() => exit())
+    if (key.tab) {
+      const order: FocusPane[] = ['left-tree', 'right-top', 'right-bottom']
+      const current = focusPaneRef.current
+      const index = order.indexOf(current)
+      const delta = key.shift ? -1 : 1
+      const next = order[(index + delta + order.length) % order.length]
+      setFocusPane(next)
+      controller.setFocusPane(next).catch(() => {})
       return
     }
 
@@ -2656,26 +3019,12 @@ export function App({
       return
     }
 
-    if (key.tab) {
-      const order: FocusPane[] = ['left-tree', 'right-top', 'right-bottom']
-      const current = focusPaneRef.current
-      const index = order.indexOf(current)
-      const delta = key.shift ? -1 : 1
-      const next = order[(index + delta + order.length) % order.length]
-      setFocusPane(next)
-      controller.setFocusPane(next).catch(() => {})
-      return
-    }
-
     if (input === 'r') {
       refreshNode(controller, selectedNodeRef.current, selectedCenterRowRef.current)
         .then(() => setCommandMessage(`Refreshed ${displayNodeId(selectedNodeRef.current)}`))
         .catch((error) => setCommandMessage(error instanceof Error ? error.message : String(error)))
       return
     }
-
-    const currentNode = selectedNodeRef.current
-    const currentFocus = focusPaneRef.current
 
     if (currentFocus === 'left-tree') {
       const navIndex = navIndexById.get(currentNode) ?? 0
@@ -2754,6 +3103,61 @@ export function App({
     }
 
     if (currentFocus === 'right-top') {
+      if (isCreateNodeId(currentNode)) {
+        const maxIndex = Math.max(0, createRows.length - 1)
+        const currentIndex = clamp(createCursorRef.current[currentNode] || 0, 0, maxIndex)
+        const moveCreateCursor = (next: number): void => {
+          const clamped = clamp(next, 0, maxIndex)
+          if (clamped === currentIndex) return
+          setCreateCursorByNode((previous) => ({
+            ...previous,
+            [currentNode]: clamped
+          }))
+        }
+
+        if (key.upArrow) {
+          moveCreateCursor(currentIndex - 1)
+          return
+        }
+
+        if (key.downArrow) {
+          moveCreateCursor(currentIndex + 1)
+          return
+        }
+
+        if (key.pageUp) {
+          moveCreateCursor(currentIndex - Math.max(1, Math.floor(rightTopVisibleRows / 2)))
+          return
+        }
+
+        if (key.pageDown) {
+          moveCreateCursor(currentIndex + Math.max(1, Math.floor(rightTopVisibleRows / 2)))
+          return
+        }
+
+        const maybeHome = (key as unknown as { home?: boolean }).home
+        const maybeEnd = (key as unknown as { end?: boolean }).end
+
+        if (maybeHome || (key.ctrl && input === 'a') || input === 'g') {
+          moveCreateCursor(0)
+          return
+        }
+
+        if (maybeEnd || (key.ctrl && input === 'e') || input === 'G') {
+          moveCreateCursor(maxIndex)
+          return
+        }
+
+        if (key.return) {
+          const row = createRows[currentIndex] || null
+          if (!row) return
+          executeCreateBrowseRow(row).catch((error) => {
+            setPaneActionMessage(error instanceof Error ? error.message : String(error))
+          })
+        }
+        return
+      }
+
       const viewport = nodeViewportRef.current[currentNode] || { cursor: 0, offset: 0 }
       const normalized = normalizeViewport(viewport.cursor, viewport.offset, rightTopRows.length, rightTopVisibleRows)
 
@@ -2814,12 +3218,6 @@ export function App({
           return
         }
 
-        if (currentNode === 'invites:send') {
-          handleFormRightTopEnter(selectedRow.centerRow).catch((error) => {
-            setPaneActionMessage(error instanceof Error ? error.message : String(error))
-          })
-        }
-
         if (selectedRow.expandable) {
           setExpandedActionParentByNode((previous) => {
             const existing = previous[currentNode] || ''
@@ -2832,7 +3230,7 @@ export function App({
         }
 
         if (isFormCenterNode(currentNode)) {
-          handleFormRightTopEnter(selectedRow.centerRow).catch((error) => {
+          handleInviteSendModeSelect(selectedRow.centerRow).catch((error) => {
             setPaneActionMessage(error instanceof Error ? error.message : String(error))
           })
         }
@@ -2877,7 +3275,7 @@ export function App({
         }
       }
 
-      const rows = wrappedRightRows.length
+      const rows = rightBottomRenderRows.length
       const visible = rightBottomVisibleRows
       const maxOffset = Math.max(0, rows - visible)
       const currentOffset = rightBottomOffsetRef.current[currentNode] || 0
@@ -2952,9 +3350,116 @@ export function App({
     selectedNodeViewport.offset,
     selectedNodeViewport.offset + rightTopVisibleRows
   )
+  const rightTopHeaderPrefix = '  '
+
+  const renderRightTopRow = (row: RightTopRow, absolute: number): React.JSX.Element => {
+    const selected = absolute === selectedNodeViewport.selectedIndex
+    if (row.kind === 'action') {
+      const position = actionBlockPosition(rightTopRows, absolute) || 'single'
+      const actionLine = buildActionDropdownLine(row.label, rightTopContentWidth, position)
+      const borderColor = selected ? 'green' : 'blue'
+      const labelColor = selected ? 'green' : 'cyan'
+      return (
+        <Text key={`${row.key}-${absolute}`}>
+          <Text color={selected ? 'green' : undefined}>{selected ? '>' : ' '}</Text>
+          <Text> </Text>
+          <Text color={borderColor}>{actionLine.slice(0, 2)}</Text>
+          <Text color={labelColor}>{actionLine.slice(2, Math.max(2, actionLine.length - 2))}</Text>
+          <Text color={borderColor}>{actionLine.slice(Math.max(2, actionLine.length - 2))}</Text>
+        </Text>
+      )
+    }
+
+    const indent = row.depth > 0 ? '  ' : ''
+    const prefix = row.expandable
+      ? row.expanded ? '▾' : '▸'
+      : '•'
+    const line = rightTopTable
+      ? (rightTopTable.rowLines[absolute] || '')
+      : `${indent}${prefix} ${row.label}`
+    return (
+      <Text key={`${row.key}-${absolute}`} color={selected ? 'green' : undefined}>
+        {selected ? '>' : ' '} {line}
+      </Text>
+    )
+  }
+
+  const renderDetailRow = (row: DetailRenderRow): React.JSX.Element => {
+    if (row.kind === 'plain') {
+      return <Text key={row.key}>{row.text}</Text>
+    }
+    if (row.kind === 'kv-rule') {
+      return (
+        <Text key={row.key}>
+          <Text color="blue">{row.left}</Text>
+          <Text color="blue">{row.fieldRule}</Text>
+          <Text color="blue">{row.middle}</Text>
+          <Text color="blue">{row.valueRule}</Text>
+          <Text color="blue">{row.right}</Text>
+        </Text>
+      )
+    }
+    if (row.kind === 'kv-header') {
+      return (
+        <Text key={row.key}>
+          <Text color="blue">│ </Text>
+          <Text color="yellow">{row.field}</Text>
+          <Text color="blue"> │ </Text>
+          <Text color="yellow">{row.value}</Text>
+          <Text color="blue"> │</Text>
+        </Text>
+      )
+    }
+    return (
+      <Text key={row.key}>
+        <Text color="blue">│ </Text>
+        <Text color="cyan">{row.field}</Text>
+        <Text color="blue"> │ </Text>
+        <Text color="white">{row.value}</Text>
+        <Text color="blue"> │</Text>
+      </Text>
+    )
+  }
+
+  const renderRightTopHeader = (): React.JSX.Element | null => {
+    if (!rightTopTable) return null
+    return (
+      <>
+        <Text color="yellow">{`${rightTopHeaderPrefix}${rightTopCenteredHeaderLine}`}</Text>
+        <Text color="blue">{`${rightTopHeaderPrefix}${rightTopTable.separatorLine}`}</Text>
+      </>
+    )
+  }
+
+  const renderRightTopPaneContent = (): React.JSX.Element => {
+    if (isCreateNodeId(selectedNode)) {
+      return (
+        <CreateFormAdapter
+          node={selectedNode}
+          isFocused={focusPane === 'right-top'}
+          rows={createRows}
+          selectedIndex={selectedCreateCursor}
+          editState={createEditState && createEditState.node === selectedNode ? createEditState : null}
+        />
+      )
+    }
+
+    return (
+      <>
+        {renderRightTopHeader()}
+        {rightTopRows.length === 0
+          ? <Text dimColor>{rightTopTable ? `${rightTopHeaderPrefix}No items` : 'No items'}</Text>
+          : null}
+        {visibleRightTopRows.map((row, idx) => {
+          const absolute = selectedNodeViewport.offset + idx
+          return renderRightTopRow(row, absolute)
+        })}
+      </>
+    )
+  }
 
   const keysLabel =
-    'Keys: `:` command, right-top `Enter` expand/execute/form edit, `y` copy value, `Y` copy command, `Tab/Shift+Tab` pane focus, tree `←/→`, list `↑/↓`, right-bottom `Ctrl+U/Ctrl+D`, `r` refresh, `q` quit'
+    'Keys: `:` command, right-top `Enter` expand/execute, create forms `Enter` edit/save and `Esc` cancel edit, `y` copy value, `Y` copy command, `Tab/Shift+Tab` pane focus, tree `←/→`, list `↑/↓`, right-bottom `Ctrl+U/Ctrl+D`, `r` refresh, `q` quit'
   const selectedNodeDisplay = displayNodeId(selectedNode)
 
   const commandStatusLabel = state.lastError
@@ -2991,32 +3496,13 @@ export function App({
 
           <Box borderStyle="round" borderColor={focusPane === 'right-top' ? 'green' : 'magenta'} paddingX={1} height={rightTopBoxRows} overflow="hidden">
             <Box flexDirection="column">
-              <Text color="magenta">{selectedNodeDisplay}</Text>
-              {rightTopRows.length === 0 ? <Text dimColor>No items</Text> : null}
-              {visibleRightTopRows.map((row, idx) => {
-                const absolute = selectedNodeViewport.offset + idx
-                const selected = absolute === selectedNodeViewport.selectedIndex
-                const indent = row.depth > 0 ? '  ' : ''
-                const prefix = row.kind === 'parent'
-                  ? row.expandable
-                    ? row.expanded ? '▾' : '▸'
-                    : '•'
-                  : '•'
-                return (
-                  <Text key={`${row.key}-${absolute}`} color={selected ? 'green' : undefined}>
-                    {selected ? '>' : ' '} {indent}{prefix} {row.label}
-                  </Text>
-                )
-              })}
+              {renderRightTopPaneContent()}
             </Box>
           </Box>
 
           <Box borderStyle="round" borderColor={focusPane === 'right-bottom' ? 'green' : 'magenta'} paddingX={1} height={rightBottomBoxRows} overflow="hidden">
             <Box flexDirection="column">
-              <Text color="magenta">Details</Text>
-              {visibleRightRows.map((line, idx) => (
-                <Text key={`${idx}-${line.slice(0, 22)}`}>{line}</Text>
-              ))}
+              {visibleRightRows.map((row) => renderDetailRow(row))}
             </Box>
           </Box>
         </Box>
@@ -3046,32 +3532,13 @@ export function App({
           <Box width={rightPaneWidth} overflow="hidden" flexDirection="column">
             <Box borderStyle="round" borderColor={focusPane === 'right-top' ? 'green' : 'magenta'} paddingX={1} height={rightTopBoxRows} overflow="hidden">
               <Box flexDirection="column">
-                <Text color="magenta">{selectedNodeDisplay}</Text>
-                {rightTopRows.length === 0 ? <Text dimColor>No items</Text> : null}
-                {visibleRightTopRows.map((row, idx) => {
-                  const absolute = selectedNodeViewport.offset + idx
-                  const selected = absolute === selectedNodeViewport.selectedIndex
-                  const indent = row.depth > 0 ? '  ' : ''
-                  const prefix = row.kind === 'parent'
-                    ? row.expandable
-                      ? row.expanded ? '▾' : '▸'
-                      : '•'
-                    : '•'
-                  return (
-                    <Text key={`${row.key}-${absolute}`} color={selected ? 'green' : undefined}>
-                      {selected ? '>' : ' '} {indent}{prefix} {row.label}
-                    </Text>
-                  )
-                })}
+                {renderRightTopPaneContent()}
               </Box>
             </Box>
 
             <Box borderStyle="round" borderColor={focusPane === 'right-bottom' ? 'green' : 'magenta'} paddingX={1} height={rightBottomBoxRows} overflow="hidden">
               <Box flexDirection="column">
-                <Text color="magenta">Details</Text>
-                {visibleRightRows.map((line, idx) => (
-                  <Text key={`${idx}-${line.slice(0, 22)}`}>{line}</Text>
-                ))}
+                {visibleRightRows.map((row) => renderDetailRow(row))}
               </Box>
             </Box>
           </Box>
@@ -3087,16 +3554,6 @@ export function App({
               onChange={setCommandInput}
               onSubmit={runCommand}
               placeholder="command"
-            />
-          </Box>
-        ) : fieldInputOpen ? (
-          <Box>
-            <TruncText color="yellow">{fieldInputPrompt || 'input'}:</TruncText>
-            <TextInput
-              value={fieldInputValue}
-              onChange={() => {}}
-              onSubmit={() => {}}
-              placeholder="value"
             />
           </Box>
         ) : (
