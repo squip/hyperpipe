@@ -60,6 +60,7 @@ describe.sequential('TUI relay UI consolidation', () => {
       expect(output).not.toContain('Create Group')
       expect(output).not.toContain('Group Invites')
       expect(output).not.toContain('• Relays')
+      expect(output).not.toContain('• Logs')
     } finally {
       instance.unmount()
     }
@@ -85,7 +86,7 @@ describe.sequential('TUI relay UI consolidation', () => {
       await sleep(30)
       instance.stdin.write('\t')
       await sleep(30)
-      await waitFor(() => /Field|Value/.test(frame(instance)))
+      await waitFor(() => /Relay profile for:/.test(frame(instance)))
       let output = frame(instance)
       expect(output).toMatch(/[┌┬┐│├┼┤└┴┘]/)
       for (let index = 0; index < 8; index += 1) {
@@ -127,4 +128,5 @@ describe.sequential('TUI relay UI consolidation', () => {
       instance.unmount()
     }
   })
+
 })

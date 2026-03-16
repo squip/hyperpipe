@@ -3,6 +3,7 @@ import { Box, Text, useApp, useInput, useStdout } from 'ink'
 import Spinner from 'ink-spinner'
 import TextInput from 'ink-text-input'
 import { TuiController, type ControllerState, type RuntimeOptions } from '../domain/controller.js'
+import type { GroupJoinRequest } from '../domain/types.js'
 import { copy as copyToClipboard } from '../runtime/clipboard.js'
 import {
   FILE_FAMILY_ORDER,
@@ -107,7 +108,6 @@ type CenterRow = {
     | 'chat-conversation'
     | 'form-field'
     | 'form-option'
-    | 'invite-mode'
     | 'file'
     | 'account'
     | 'log'
@@ -118,12 +118,32 @@ type CreateNodeId = 'groups:create' | 'chats:create'
 type CreateCursorMap = Record<CreateNodeId, number>
 type CreateExpandedBranchMap = Record<CreateNodeId, CreateBranchKey | ''>
 
-type InviteSendMode = 'group' | 'chat'
-type InviteSendTarget = {
+type InviteComposeTarget = {
   kind: 'group' | 'chat'
   id: string
   relay: string | null
   name: string
+  isPublic?: boolean
+  isOpen?: boolean
+}
+
+type InviteComposeState = {
+  target: InviteComposeTarget
+  query: string
+  suggestions: ProfileSuggestion[]
+  suggestionIndex: number
+  busy: boolean
+  status: string
+}
+
+type JoinRequestReviewState = {
+  groupId: string
+  groupName: string
+  relay: string | null
+  request: GroupJoinRequest
+  selectedAction: 'approve' | 'dismiss'
+  busy: boolean
+  status: string
 }
 
 type RightTopRow = {
@@ -135,7 +155,12 @@ type RightTopRow = {
   action?: string
   expandable: boolean
   expanded: boolean
-  inviteTarget?: InviteSendTarget | null
+}
+
+type DetailSegment = {
+  text: string
+  color?: 'blue' | 'yellow' | 'cyan' | 'white' | 'green' | 'gray'
+  dimColor?: boolean
 }
 
 type DetailRenderRow =
@@ -158,6 +183,11 @@ type DetailRenderRow =
       kind: 'kv-header' | 'kv-data'
       field: string
       value: string
+    }
+  | {
+      key: string
+      kind: 'segments'
+      segments: DetailSegment[]
     }
 
 type ActionBlockPosition = 'single' | 'top' | 'middle' | 'bottom'
@@ -338,6 +368,295 @@ function buildKeyValueDetailRows(lines: string[], width: number, forceTable = fa
   }
 
   return rows
+}
+
+type DetailTableColumn = {
+  key: string
+  label: string
+  minWidth: number
+  priority: number
+  align?: 'left' | 'right' | 'center'
+  headerColor?: DetailSegment['color']
+  cellColor?: DetailSegment['color']
+}
+
+function formatDetailCell(value: unknown, width: number, align: 'left' | 'right' | 'center' = 'left'): string {
+  const sanitized = truncateDisplayCell(sanitizeDisplayCell(value === null || value === undefined ? '' : String(value)), width)
+  if (align === 'right') {
+    return sanitized.padStart(width, ' ')
+  }
+  if (align === 'center') {
+    return centerDisplayCell(sanitized, width)
+  }
+  return padDisplayCell(sanitized, width)
+}
+
+function gridTableLineLength(widths: number[]): number {
+  if (widths.length === 0) return 0
+  return widths.reduce((total, width) => total + width, 0) + (widths.length * 3) + 1
+}
+
+function formatGridDetailTable(input: {
+  width: number
+  columns: DetailTableColumn[]
+  rows: TableRowView[]
+}): ReturnType<typeof formatTableRows> {
+  const targetWidth = Math.max(18, input.width)
+  // Reserve space for grid borders and per-column padding/separators.
+  let formatWidth = Math.max(8, targetWidth - ((input.columns.length * 2) + 2))
+  let table = formatTableRows({
+    columns: input.columns.map((column) => ({
+      key: column.key,
+      label: column.label,
+      minWidth: column.minWidth,
+      priority: column.priority,
+      align: column.align || 'left'
+    })),
+    rows: input.rows,
+    width: formatWidth,
+    gap: 1
+  })
+
+  // In narrow terminals, iterate a few times to guarantee final grid lines fit the pane.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const overflow = gridTableLineLength(table.widths) - targetWidth
+    if (overflow <= 0) break
+    const nextFormatWidth = Math.max(8, formatWidth - overflow)
+    if (nextFormatWidth === formatWidth) break
+    formatWidth = nextFormatWidth
+    table = formatTableRows({
+      columns: input.columns.map((column) => ({
+        key: column.key,
+        label: column.label,
+        minWidth: column.minWidth,
+        priority: column.priority,
+        align: column.align || 'left'
+      })),
+      rows: input.rows,
+      width: formatWidth,
+      gap: 1
+    })
+  }
+
+  return table
+}
+
+function buildSegmentedTableRows(input: {
+  width: number
+  title?: string
+  columns: DetailTableColumn[]
+  rows: TableRowView[]
+  showHeader?: boolean
+  noItemsLabel?: string
+}): DetailRenderRow[] {
+  const showHeader = input.showHeader !== false
+  const table = formatGridDetailTable({
+    width: input.width,
+    columns: input.columns,
+    rows: input.rows
+  })
+  if (!table.columns.length) {
+    return [{
+      key: 'table:empty',
+      kind: 'plain',
+      text: input.noItemsLabel || 'No items'
+    }]
+  }
+
+  const rows: DetailRenderRow[] = []
+  if (input.title) {
+    rows.push({
+      key: 'table:title',
+      kind: 'segments',
+      segments: [{ text: input.title, color: 'yellow' }]
+    })
+  }
+
+  const topRule = `┌${table.widths.map((width) => '─'.repeat(width + 2)).join('┬')}┐`
+  rows.push({
+    key: 'table:rule:top',
+    kind: 'segments',
+    segments: [{ text: topRule, color: 'blue' }]
+  })
+
+  const renderRow = (
+    keyPrefix: string,
+    values: Record<string, string>,
+    rowIndex: number,
+    header: boolean
+  ): DetailRenderRow => {
+    const segments: DetailSegment[] = [{ text: '│ ', color: 'blue' }]
+    table.columns.forEach((column, columnIndex) => {
+      const color = header
+        ? (input.columns[columnIndex]?.headerColor || 'yellow')
+        : (input.columns[columnIndex]?.cellColor || 'white')
+      const align = (input.columns[columnIndex]?.align || 'left') as 'left' | 'right' | 'center'
+      const value = formatDetailCell(values[column.key] || '', table.widths[columnIndex] || 1, align)
+      segments.push({ text: value, color })
+      segments.push({
+        text: columnIndex === table.columns.length - 1 ? ' │' : ' │ ',
+        color: 'blue'
+      })
+    })
+    return {
+      key: `${keyPrefix}:${rowIndex}`,
+      kind: 'segments',
+      segments
+    }
+  }
+
+  if (showHeader) {
+    const headerValues = Object.fromEntries(table.columns.map((column) => [column.key, column.label]))
+    rows.push(renderRow('table:header', headerValues, 0, true))
+    const headerRule = `├${table.widths.map((width) => '─'.repeat(width + 2)).join('┼')}┤`
+    rows.push({
+      key: 'table:rule:header',
+      kind: 'segments',
+      segments: [{ text: headerRule, color: 'blue' }]
+    })
+  }
+
+  if (input.rows.length === 0) {
+    const firstColumn = table.columns[0]
+    const valueMap: Record<string, string> = Object.fromEntries(table.columns.map((column) => [column.key, '']))
+    valueMap[firstColumn.key] = input.noItemsLabel || 'No items'
+    rows.push(renderRow('table:data', valueMap, 0, false))
+  } else {
+    input.rows.forEach((entry, rowIndex) => {
+      const valueMap = Object.fromEntries(
+        table.columns.map((column) => [column.key, sanitizeDisplayCell(String(entry[column.key] || ''))])
+      )
+      rows.push(renderRow('table:data', valueMap, rowIndex, false))
+      if (rowIndex < input.rows.length - 1) {
+        rows.push({
+          key: `table:rule:between:${rowIndex}`,
+          kind: 'segments',
+          segments: [{ text: `├${table.widths.map((width) => '─'.repeat(width + 2)).join('┼')}┤`, color: 'blue' }]
+        })
+      }
+    })
+  }
+
+  const bottomRule = `└${table.widths.map((width) => '─'.repeat(width + 2)).join('┴')}┘`
+  rows.push({
+    key: 'table:rule:bottom',
+    kind: 'segments',
+    segments: [{ text: bottomRule, color: 'blue' }]
+  })
+
+  return rows
+}
+
+function keyValueTableRows(lines: string[]): TableRowView[] {
+  return lines
+    .map((line) => parseKeyValueLine(line))
+    .filter((entry): entry is { field: string; value: string } => Boolean(entry))
+    .map((entry) => ({
+      field: entry.field,
+      value: entry.value
+    }))
+}
+
+function buildJoinRequestTableRows(input: {
+  width: number
+  title: string
+  requests: GroupJoinRequest[]
+  selectedIndex: number
+}): DetailRenderRow[] {
+  const columns: DetailTableColumn[] = [
+    { key: 'review', label: '', minWidth: 6, priority: 0, align: 'left', headerColor: 'yellow', cellColor: 'cyan' },
+    { key: 'date', label: 'Date', minWidth: 18, priority: 1, align: 'left', headerColor: 'yellow', cellColor: 'white' },
+    { key: 'from', label: 'From', minWidth: 14, priority: 1, align: 'left', headerColor: 'yellow', cellColor: 'cyan' }
+  ]
+  const rows = input.requests.map((request) => ({
+    review: 'Review',
+    date: new Date(request.createdAt * 1000).toLocaleString(),
+    from: shortId(request.pubkey, 12)
+  }))
+  const table = formatGridDetailTable({
+    width: input.width,
+    columns,
+    rows
+  })
+  if (!table.columns.length) {
+    return [{ key: 'join:empty', kind: 'plain', text: 'No pending join requests' }]
+  }
+  const result: DetailRenderRow[] = [
+    {
+      key: 'join:title',
+      kind: 'segments',
+      segments: [{ text: input.title, color: 'yellow' }]
+    },
+    {
+      key: 'join:top',
+      kind: 'segments',
+      segments: [{ text: `┌${table.widths.map((width) => '─'.repeat(width + 2)).join('┬')}┐`, color: 'blue' }]
+    }
+  ]
+  const headerSegments: DetailSegment[] = [{ text: '│ ', color: 'blue' }]
+  table.columns.forEach((column, index) => {
+    const value = formatDetailCell(column.label, table.widths[index] || 1, (columns[index]?.align || 'left'))
+    headerSegments.push({ text: value, color: columns[index]?.headerColor || 'yellow' })
+    headerSegments.push({ text: index === table.columns.length - 1 ? ' │' : ' │ ', color: 'blue' })
+  })
+  result.push({
+    key: 'join:header',
+    kind: 'segments',
+    segments: headerSegments
+  })
+  result.push({
+    key: 'join:header:rule',
+    kind: 'segments',
+    segments: [{ text: `├${table.widths.map((width) => '─'.repeat(width + 2)).join('┼')}┤`, color: 'blue' }]
+  })
+
+  if (rows.length === 0) {
+    const emptySegments: DetailSegment[] = [{ text: '│ ', color: 'blue' }]
+    table.columns.forEach((column, index) => {
+      const value = formatDetailCell(index === 1 ? 'No pending join requests' : '', table.widths[index] || 1, index === 1 ? 'left' : (columns[index]?.align || 'left'))
+      emptySegments.push({ text: value, color: index === 1 ? 'gray' : (columns[index]?.cellColor || 'white'), dimColor: index === 1 })
+      emptySegments.push({ text: index === table.columns.length - 1 ? ' │' : ' │ ', color: 'blue' })
+    })
+    result.push({
+      key: 'join:empty:row',
+      kind: 'segments',
+      segments: emptySegments
+    })
+  } else {
+    rows.forEach((row, rowIndex) => {
+      const rowSegments: DetailSegment[] = [{ text: '│ ', color: 'blue' }]
+      table.columns.forEach((column, columnIndex) => {
+        const align = (columns[columnIndex]?.align || 'left') as 'left' | 'right' | 'center'
+        const value = formatDetailCell(String(row[column.key] || ''), table.widths[columnIndex] || 1, align)
+        const isReviewCell = column.key === 'review'
+        const selected = isReviewCell && rowIndex === input.selectedIndex
+        rowSegments.push({
+          text: value,
+          color: selected ? 'green' : (columns[columnIndex]?.cellColor || 'white')
+        })
+        rowSegments.push({ text: columnIndex === table.columns.length - 1 ? ' │' : ' │ ', color: 'blue' })
+      })
+      result.push({
+        key: `join:row:${rowIndex}`,
+        kind: 'segments',
+        segments: rowSegments
+      })
+      if (rowIndex < rows.length - 1) {
+        result.push({
+          key: `join:rule:${rowIndex}`,
+          kind: 'segments',
+          segments: [{ text: `├${table.widths.map((width) => '─'.repeat(width + 2)).join('┼')}┤`, color: 'blue' }]
+        })
+      }
+    })
+  }
+
+  result.push({
+    key: 'join:bottom',
+    kind: 'segments',
+    segments: [{ text: `└${table.widths.map((width) => '─'.repeat(width + 2)).join('┴')}┘`, color: 'blue' }]
+  })
+  return result
 }
 
 function rightTopTableColumnsForNode(node: NavNodeId): TableColumn[] | null {
@@ -733,7 +1052,7 @@ function fileFamilyForMime(mime?: string | null): FileFamily {
 function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRow[] {
   const rows: NavRow[] = []
   for (const root of ROOT_NAV_ORDER) {
-    if (root === 'relays') continue
+    if (root === 'relays' || root === 'logs') continue
     let rootLabel = ROOT_NAV_LABELS[root]
     if (root === 'groups') rootLabel = 'P2P Relays'
     if (root === 'invites') rootLabel = `Invites (${state.invitesCount})`
@@ -802,14 +1121,6 @@ function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRo
       rows.push({
         id: 'invites:chat',
         label: `Chat Invites (${state.chatInvites.length})`,
-        depth: 1,
-        parent: 'invites',
-        isParent: false,
-        expanded: false
-      })
-      rows.push({
-        id: 'invites:send',
-        label: 'Send Invite',
         depth: 1,
         parent: 'invites',
         isParent: false,
@@ -1063,12 +1374,6 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
         label: `Chat Invites (${state.chatInvites.length})`,
         kind: 'summary',
         data: null
-      },
-      {
-        key: 'invites:send',
-        label: 'Send Invite',
-        kind: 'summary',
-        data: null
       }
     ]
   }
@@ -1089,23 +1394,6 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
       kind: 'chat-invite',
       data: invite
     }))
-  }
-
-  if (node === 'invites:send') {
-    return [
-      {
-        key: 'invites:send:group',
-        label: 'Relay Invite',
-        kind: 'invite-mode',
-        data: { mode: 'group' as const }
-      },
-      {
-        key: 'invites:send:chat',
-        label: 'Chat Invite',
-        kind: 'invite-mode',
-        data: { mode: 'chat' as const }
-      }
-    ]
   }
 
   if (node === 'files' || isFileTypeNodeId(node)) {
@@ -1151,7 +1439,6 @@ function splitNode(node: NavNodeId): boolean {
     || node === 'chats:create'
     || node === 'invites:group'
     || node === 'invites:chat'
-    || node === 'invites:send'
     || node === 'files'
     || isFileTypeNodeId(node)
   )
@@ -1161,9 +1448,9 @@ function supportsActionTree(node: NavNodeId): boolean {
   return (
     node === 'groups:browse'
     || node === 'groups:my'
+    || node === 'chats'
     || node === 'invites:group'
     || node === 'invites:chat'
-    || node === 'invites:send'
     || node === 'files'
     || isFileTypeNodeId(node)
   )
@@ -1177,10 +1464,6 @@ function defaultDetailsAction(node: NavNodeId): string {
     return 'Chat details'
   }
   return ''
-}
-
-function isFormCenterNode(node: NavNodeId): boolean {
-  return node === 'invites:send'
 }
 
 function groupKey(groupId: string, relay?: string | null): string {
@@ -1205,6 +1488,17 @@ function relayForGroup(state: ControllerState, group: any): any | null {
   return state.relays.find((relay) => String(relay.publicIdentifier || '').trim() === groupId)
     || state.relays.find((relay) => String(relay.connectionUrl || '').trim() === groupRelay)
     || null
+}
+
+function groupDisplayName(group: any): string {
+  return String(group?.name || group?.id || '-')
+}
+
+function joinRequestsForGroup(state: ControllerState, group: any): GroupJoinRequest[] {
+  if (!group?.id) return []
+  const relay = String(group.relay || '').trim()
+  const byRelayKey = relay ? `${relay}|${group.id}` : group.id
+  return state.groupJoinRequests[byRelayKey] || state.groupJoinRequests[group.id] || []
 }
 
 function groupDetailsRows(group: any): string[] {
@@ -1263,7 +1557,8 @@ function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: C
       `Members (${members})`,
       'Notes',
       `Files (${files})`,
-      `Join Requests (${joinReq})`
+      `Join Requests (${joinReq})`,
+      'Send Invite'
     ]
   }
   if (node === 'groups:create') {
@@ -1302,25 +1597,9 @@ function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: C
       'Dismiss invite'
     ]
   }
-  if (node === 'invites:send') {
-    const mode = (selectedRow?.data as { mode?: 'group' | 'chat' } | null)?.mode || 'group'
-    const currentPubkey = String(state.session?.pubkey || '').trim().toLowerCase()
-    if (mode === 'group') {
-      const groups = state.myGroups.filter((group) => {
-        const adminPubkey = String(group.adminPubkey || '').trim().toLowerCase()
-        return Boolean(adminPubkey && currentPubkey && adminPubkey === currentPubkey)
-      })
-      if (!groups.length) return ['No admin relays available']
-      return groups.map((group) => `${shortText(group.name || group.id, 24)} · ${group.id}`)
-    }
-    const chats = state.conversations.filter((conversation) => {
-      const admins = Array.isArray(conversation.adminPubkeys)
-        ? conversation.adminPubkeys.map((pubkey) => String(pubkey || '').trim().toLowerCase())
-        : []
-      return Boolean(currentPubkey && admins.includes(currentPubkey))
-    })
-    if (!chats.length) return ['No admin chats available']
-    return chats.map((conversation) => `${shortText(conversation.title || conversation.id, 24)} · ${conversation.id}`)
+  if (node === 'chats') {
+    if (!selectedRow) return []
+    return ['Send Invite']
   }
   if (node === 'files' || isFileTypeNodeId(node)) {
     return ['Download', 'Delete']
@@ -1414,9 +1693,7 @@ function splitBottomRows(
     }
     if (selectedAction.startsWith('Request Invite')) {
       return [
-        paneActionMessage || 'Press Enter to request an invite',
-        `relay: ${group.name || group.id}`,
-        'This will publish a join request for admin review.'
+        paneActionMessage || 'Press Enter to submit join request for admin review'
       ]
     }
     if (selectedAction.startsWith('Invite-only (private)')) {
@@ -1538,13 +1815,6 @@ function splitBottomRows(
     if (selectedAction.startsWith('Accept invite') || selectedAction.startsWith('Dismiss invite')) {
       return [paneActionMessage || 'Press Enter to execute this action']
     }
-  }
-
-  if (node === 'invites:send') {
-    return [
-      paneActionMessage || 'Type a username/pubkey in the invite field and press Enter to send.',
-      'Use right-top pane to select an admin-owned target.'
-    ]
   }
 
   if (node === 'files' || isFileTypeNodeId(node)) {
@@ -1671,11 +1941,9 @@ export function App({
     inviteMembers: [],
     relayUrls: []
   })
-  const [inviteSendQuery, setInviteSendQuery] = useState('')
-  const [inviteSendSuggestions, setInviteSendSuggestions] = useState<ProfileSuggestion[]>([])
-  const [inviteSendSuggestionIndex, setInviteSendSuggestionIndex] = useState(0)
-  const [inviteSendBusy, setInviteSendBusy] = useState(false)
-  const [inviteSendStatus, setInviteSendStatus] = useState<string>('')
+  const [inviteComposeState, setInviteComposeState] = useState<InviteComposeState | null>(null)
+  const [joinRequestCursorByGroupKey, setJoinRequestCursorByGroupKey] = useState<Record<string, number>>({})
+  const [joinRequestReviewState, setJoinRequestReviewState] = useState<JoinRequestReviewState | null>(null)
   const inviteSearchRequestRef = useRef(0)
   const [commandMessage, setCommandMessage] = useState('Type :help for commands')
   const [hydratedScopeKey, setHydratedScopeKey] = useState<string>('')
@@ -1691,6 +1959,7 @@ export function App({
     'chats:create': 0
   })
   const createEditStateRef = useRef<CreateEditState | null>(null)
+  const inviteComposeStateRef = useRef<InviteComposeState | null>(null)
   const selectedCenterRowRef = useRef<CenterRow | null>(null)
   const myGroupPaneLoadKeyRef = useRef<string>('')
 
@@ -1772,16 +2041,25 @@ export function App({
   }, [createEditState])
 
   useEffect(() => {
+    inviteComposeStateRef.current = inviteComposeState
+  }, [inviteComposeState])
+
+  useEffect(() => {
     if (!state) return
     const scopeKey = String(state.session?.userKey || state.currentAccountPubkey || '')
     if (!scopeKey) return
     if (scopeKey === hydratedScopeKey) return
 
     setHydratedScopeKey(scopeKey)
-    const hydratedNode = state.selectedNode === 'relays' ? 'groups:my' : (state.selectedNode || 'dashboard')
+    let hydratedNode = state.selectedNode || 'dashboard'
+    if (hydratedNode === 'relays' || hydratedNode === 'invites:send') {
+      hydratedNode = 'groups:my'
+    } else if (hydratedNode === 'logs') {
+      hydratedNode = 'dashboard'
+    }
     setSelectedNode(hydratedNode)
-    if (state.selectedNode === 'relays') {
-      controllerRef.current?.setSelectedNode('groups:my').catch(() => {})
+    if (state.selectedNode === 'relays' || state.selectedNode === 'invites:send' || state.selectedNode === 'logs') {
+      controllerRef.current?.setSelectedNode(hydratedNode).catch(() => {})
     }
     const hydratedFocus = state.focusPane || 'left-tree'
     setFocusPane(hydratedFocus)
@@ -1820,11 +2098,9 @@ export function App({
       inviteMembers: [],
       relayUrls: []
     })
-    setInviteSendQuery('')
-    setInviteSendSuggestions([])
-    setInviteSendSuggestionIndex(0)
-    setInviteSendBusy(false)
-    setInviteSendStatus('')
+    setInviteComposeState(null)
+    setJoinRequestCursorByGroupKey({})
+    setJoinRequestReviewState(null)
   }, [state, hydratedScopeKey])
 
   const navRows = useMemo(() => {
@@ -1873,42 +2149,6 @@ export function App({
     return centerRowsForNode(state, selectedNode)
   }, [state, selectedNode])
 
-  const inviteSendTargetsByMode = useMemo(() => {
-    if (!state) {
-      return {
-        group: [] as InviteSendTarget[],
-        chat: [] as InviteSendTarget[]
-      }
-    }
-    const currentPubkey = String(state.session?.pubkey || '').trim().toLowerCase()
-    if (!currentPubkey) {
-      return {
-        group: [] as InviteSendTarget[],
-        chat: [] as InviteSendTarget[]
-      }
-    }
-    const groupTargets = state.myGroups
-      .filter((group) => String(group.adminPubkey || '').trim().toLowerCase() === currentPubkey)
-      .map((group) => ({
-        kind: 'group' as const,
-        id: group.id,
-        relay: group.relay || null,
-        name: group.name || group.id
-      }))
-    const chatTargets = state.conversations
-      .filter((conversation) => (conversation.adminPubkeys || []).map((value) => String(value || '').trim().toLowerCase()).includes(currentPubkey))
-      .map((conversation) => ({
-        kind: 'chat' as const,
-        id: conversation.id,
-        relay: null,
-        name: conversation.title || conversation.id
-      }))
-    return {
-      group: groupTargets,
-      chat: chatTargets
-    }
-  }, [state])
-
   const rightTopRows = useMemo(() => {
     if (!state) return []
     if (isCreateNodeId(selectedNode)) return []
@@ -1919,52 +2159,18 @@ export function App({
     for (const parentRow of centerRows) {
       const childRows: RightTopRow[] = []
       if (actionTreeEnabled) {
-        if (selectedNode === 'invites:send') {
-          const mode = (parentRow.data as { mode?: InviteSendMode } | null)?.mode
-          const normalizedMode: InviteSendMode = mode === 'chat' ? 'chat' : 'group'
-          const targets = normalizedMode === 'chat' ? inviteSendTargetsByMode.chat : inviteSendTargetsByMode.group
-          if (targets.length === 0) {
-            const emptyLabel = normalizedMode === 'chat' ? 'No admin chats available' : 'No admin relays available'
-            childRows.push({
-              key: `${parentRow.key}:action:none`,
-              label: emptyLabel,
-              centerRow: parentRow,
-              depth: 1,
-              kind: 'action',
-              action: emptyLabel,
-              expandable: false,
-              expanded: false,
-              inviteTarget: null
-            })
-          } else {
-            for (const [index, target] of targets.entries()) {
-              childRows.push({
-                key: `${parentRow.key}:action:${index}`,
-                label: `${shortText(target.name, 24)} · ${target.id}`,
-                centerRow: parentRow,
-                depth: 1,
-                kind: 'action',
-                action: `${shortText(target.name, 24)} · ${target.id}`,
-                expandable: false,
-                expanded: false,
-                inviteTarget: target
-              })
-            }
-          }
-        } else {
-          const actions = rightTopActions(state, selectedNode, parentRow)
-          for (const [index, action] of actions.entries()) {
-            childRows.push({
-              key: `${parentRow.key}:action:${index}`,
-              label: action,
-              centerRow: parentRow,
-              depth: 1,
-              kind: 'action',
-              action,
-              expandable: false,
-              expanded: false
-            })
-          }
+        const actions = rightTopActions(state, selectedNode, parentRow)
+        for (const [index, action] of actions.entries()) {
+          childRows.push({
+            key: `${parentRow.key}:action:${index}`,
+            label: action,
+            centerRow: parentRow,
+            depth: 1,
+            kind: 'action',
+            action,
+            expandable: false,
+            expanded: false
+          })
         }
       }
 
@@ -1985,7 +2191,7 @@ export function App({
     }
 
     return rows
-  }, [state, selectedNode, centerRows, expandedActionParentByNode, inviteSendTargetsByMode])
+  }, [state, selectedNode, centerRows, expandedActionParentByNode])
 
   const createRows = useMemo<CreateBrowseRow[]>(() => {
     if (!state || !isCreateNodeId(selectedNode)) return []
@@ -2095,22 +2301,40 @@ export function App({
     return defaultDetailsAction(selectedNode)
   }, [selectedNode, selectedCenterRow, selectedRightTopRow])
 
-  const inviteSendMode: InviteSendMode = useMemo(() => {
-    if (selectedNode !== 'invites:send') return 'group'
-    const mode = (selectedCenterRow?.data as { mode?: InviteSendMode } | null)?.mode
-    return mode === 'chat' ? 'chat' : 'group'
-  }, [selectedNode, selectedCenterRow])
+  const selectedInviteComposeTarget = useMemo<InviteComposeTarget | null>(() => {
+    if (!state) return null
+    if (!selectedCenterRow) return null
+    if (!selectedRightTopAction.startsWith('Send Invite')) return null
 
-  const selectedInviteSendTarget = useMemo(() => {
-    if (selectedRightTopRow?.kind === 'action') {
-      return selectedRightTopRow.inviteTarget || null
+    if (selectedNode === 'groups:my' && selectedCenterRow.kind === 'group') {
+      const group = selectedCenterRow.data as any
+      return {
+        kind: 'group',
+        id: group.id,
+        relay: group.relay || null,
+        name: groupDisplayName(group),
+        isPublic: group.isPublic !== false,
+        isOpen: group.isOpen !== false
+      }
     }
-    if (selectedNode !== 'invites:send') return null
-    const fallbackTargets = inviteSendMode === 'chat'
-      ? inviteSendTargetsByMode.chat
-      : inviteSendTargetsByMode.group
-    return fallbackTargets[0] || null
-  }, [selectedRightTopRow, selectedNode, inviteSendMode, inviteSendTargetsByMode])
+
+    if (selectedNode === 'chats' && selectedCenterRow.kind === 'chat-conversation') {
+      const conversation = selectedCenterRow.data as any
+      const currentPubkey = String(state.session?.pubkey || '').trim().toLowerCase()
+      const adminPubkeys = Array.isArray(conversation.adminPubkeys)
+        ? conversation.adminPubkeys.map((entry: unknown) => String(entry || '').trim().toLowerCase())
+        : []
+      if (!currentPubkey || !adminPubkeys.includes(currentPubkey)) return null
+      return {
+        kind: 'chat',
+        id: conversation.id,
+        relay: null,
+        name: String(conversation.title || conversation.id || 'Chat')
+      }
+    }
+
+    return null
+  }, [state, selectedNode, selectedCenterRow, selectedRightTopAction])
 
   useEffect(() => {
     if (!state || selectedNode !== 'groups:my') {
@@ -2141,15 +2365,18 @@ export function App({
   }, [state, selectedNode, selectedCenterRow, selectedRightTopAction])
 
   useEffect(() => {
-    if (selectedNode !== 'invites:send') {
-      setInviteSendSuggestions([])
-      setInviteSendSuggestionIndex(0)
-      return
-    }
-    const query = String(inviteSendQuery || '').trim()
+    if (!inviteComposeState) return
+    const query = String(inviteComposeState.query || '').trim()
     if (!query) {
-      setInviteSendSuggestions([])
-      setInviteSendSuggestionIndex(0)
+      setInviteComposeState((previous) => {
+        if (!previous) return previous
+        if (previous.suggestions.length === 0 && previous.suggestionIndex === 0) return previous
+        return {
+          ...previous,
+          suggestions: [],
+          suggestionIndex: 0
+        }
+      })
       return
     }
     const controller = controllerRef.current
@@ -2161,41 +2388,91 @@ export function App({
         .then((results) => {
           if (cancelled) return
           if (requestId !== inviteSearchRequestRef.current) return
-          setInviteSendSuggestions(results || [])
-          setInviteSendSuggestionIndex(0)
+          setInviteComposeState((previous) => {
+            if (!previous) return previous
+            if (String(previous.query || '').trim() !== query) return previous
+            return {
+              ...previous,
+              suggestions: results || [],
+              suggestionIndex: 0
+            }
+          })
         })
         .catch(() => {
           if (cancelled) return
           if (requestId !== inviteSearchRequestRef.current) return
-          setInviteSendSuggestions([])
-          setInviteSendSuggestionIndex(0)
+          setInviteComposeState((previous) => {
+            if (!previous) return previous
+            if (String(previous.query || '').trim() !== query) return previous
+            return {
+              ...previous,
+              suggestions: [],
+              suggestionIndex: 0
+            }
+          })
         })
     }, 150)
     return () => {
       cancelled = true
       clearTimeout(timer)
     }
-  }, [selectedNode, inviteSendQuery])
+  }, [inviteComposeState])
+
+  useEffect(() => {
+    if (!inviteComposeState) return
+    if (selectedNode === 'groups:my' || selectedNode === 'chats') return
+    inviteComposeStateRef.current = null
+    setInviteComposeState(null)
+  }, [selectedNode, inviteComposeState])
+
+  const selectedJoinRequestContext = useMemo(() => {
+    if (!state) return null
+    if (selectedNode !== 'groups:my') return null
+    if (!selectedCenterRow || selectedCenterRow.kind !== 'group') return null
+    if (!selectedRightTopAction.startsWith('Join Requests')) return null
+    const group = selectedCenterRow.data as any
+    const requests = joinRequestsForGroup(state, group)
+    const key = `${group.id}|${String(group.relay || '').trim()}`
+    return {
+      group,
+      key,
+      requests
+    }
+  }, [state, selectedNode, selectedCenterRow, selectedRightTopAction])
+
+  const selectedJoinRequestCursor = useMemo(() => {
+    if (!selectedJoinRequestContext || selectedJoinRequestContext.requests.length === 0) return 0
+    const raw = joinRequestCursorByGroupKey[selectedJoinRequestContext.key] || 0
+    return clamp(raw, 0, selectedJoinRequestContext.requests.length - 1)
+  }, [selectedJoinRequestContext, joinRequestCursorByGroupKey])
+
+  useEffect(() => {
+    if (!selectedJoinRequestContext || selectedJoinRequestContext.requests.length === 0) return
+    const maxIndex = selectedJoinRequestContext.requests.length - 1
+    setJoinRequestCursorByGroupKey((previous) => {
+      const current = previous[selectedJoinRequestContext.key] || 0
+      const next = clamp(current, 0, maxIndex)
+      if (next === current) return previous
+      return {
+        ...previous,
+        [selectedJoinRequestContext.key]: next
+      }
+    })
+  }, [selectedJoinRequestContext])
+
+  useEffect(() => {
+    if (!joinRequestReviewState) return
+    if (!selectedJoinRequestContext) {
+      setJoinRequestReviewState(null)
+      return
+    }
+    if (joinRequestReviewState.groupId !== selectedJoinRequestContext.group.id) {
+      setJoinRequestReviewState(null)
+    }
+  }, [joinRequestReviewState, selectedJoinRequestContext])
 
   const rightBottomRawRows = useMemo(() => {
     if (!state) return ['No data']
-    if (selectedNode === 'invites:send') {
-      const lines = [
-        `mode: ${inviteSendMode === 'group' ? 'Relay Invite' : 'Chat Invite'}`,
-        `target: ${selectedInviteSendTarget ? `${selectedInviteSendTarget.name} (${selectedInviteSendTarget.id})` : '-'}`,
-        `input: ${inviteSendQuery || ''}`,
-        inviteSendBusy ? 'sending: in progress' : `status: ${inviteSendStatus || 'idle'}`
-      ]
-      if (inviteSendQuery && inviteSendSuggestions.length === 0 && !inviteSendBusy) {
-        lines.push('no suggestions')
-      }
-      inviteSendSuggestions.forEach((entry, idx) => {
-        const marker = idx === inviteSendSuggestionIndex ? '>' : ' '
-        const name = entry.name ? `${entry.name} ` : ''
-        lines.push(`${marker} ${name}${shortId(entry.pubkey, 16)}${entry.nip05 ? ` · ${entry.nip05}` : ''}`)
-      })
-      return lines
-    }
     if (splitNode(selectedNode)) {
       return splitBottomRows(state, selectedNode, selectedCenterRow, selectedRightTopAction, paneActionMessage)
     }
@@ -2205,18 +2482,231 @@ export function App({
     selectedNode,
     selectedCenterRow,
     selectedRightTopAction,
-    paneActionMessage,
-    inviteSendMode,
-    selectedInviteSendTarget,
-    inviteSendQuery,
-    inviteSendSuggestions,
-    inviteSendSuggestionIndex,
-    inviteSendBusy,
-    inviteSendStatus
+    paneActionMessage
   ])
 
   const rightBottomWrapWidth = Math.max(18, rightPaneWidth - 4)
+  const rightBottomSpecialRows = useMemo<DetailRenderRow[] | null>(() => {
+    if (!state) return null
+
+    if (joinRequestReviewState) {
+      const request = joinRequestReviewState.request
+      const segments = [
+        {
+          key: 'join-review:title',
+          kind: 'segments' as const,
+          segments: [{ text: `Review join request for: ${joinRequestReviewState.groupName}`, color: 'yellow' as const }]
+        },
+        {
+          key: 'join-review:from',
+          kind: 'plain' as const,
+          text: `From: ${request.pubkey}`
+        },
+        {
+          key: 'join-review:date',
+          kind: 'plain' as const,
+          text: `Date: ${new Date(request.createdAt * 1000).toLocaleString()}`
+        },
+        {
+          key: 'join-review:reason',
+          kind: 'plain' as const,
+          text: `Reason: ${request.reason || '-'}`
+        },
+        {
+          key: 'join-review:spacer',
+          kind: 'plain' as const,
+          text: ''
+        },
+        {
+          key: 'join-review:approve',
+          kind: 'segments' as const,
+          segments: [
+            { text: joinRequestReviewState.selectedAction === 'approve' ? '> ' : '  ', color: joinRequestReviewState.selectedAction === 'approve' ? 'green' : 'gray' },
+            { text: 'Approve', color: joinRequestReviewState.selectedAction === 'approve' ? 'green' : 'white' }
+          ]
+        },
+        {
+          key: 'join-review:dismiss',
+          kind: 'segments' as const,
+          segments: [
+            { text: joinRequestReviewState.selectedAction === 'dismiss' ? '> ' : '  ', color: joinRequestReviewState.selectedAction === 'dismiss' ? 'green' : 'gray' },
+            { text: 'Dismiss', color: joinRequestReviewState.selectedAction === 'dismiss' ? 'green' : 'white' }
+          ]
+        },
+        {
+          key: 'join-review:hint',
+          kind: 'segments' as const,
+          segments: [
+            {
+              text: joinRequestReviewState.busy
+                ? 'Processing request…'
+                : (joinRequestReviewState.status || 'Use ↑/↓ to choose, Enter to confirm, Esc to cancel.'),
+              color: joinRequestReviewState.busy ? 'cyan' : 'gray',
+              dimColor: !joinRequestReviewState.busy
+            }
+          ]
+        }
+      ]
+      return segments
+    }
+
+    if (!selectedCenterRow || selectedCenterRow.kind !== 'group') return null
+    const group = selectedCenterRow.data as any
+    const groupName = groupDisplayName(group)
+
+    if (selectedNode === 'groups:browse') {
+      if (selectedRightTopAction.startsWith('Relay Details')) {
+        return buildSegmentedTableRows({
+          width: rightBottomWrapWidth,
+          title: `Relay profile for: ${groupName}`,
+          columns: [
+            { key: 'field', label: 'Field', minWidth: 12, priority: 0, cellColor: 'cyan' },
+            { key: 'value', label: 'Value', minWidth: 18, priority: 1, cellColor: 'white' }
+          ],
+          rows: keyValueTableRows(groupDetailsRows(group)),
+          showHeader: false
+        })
+      }
+      if (selectedRightTopAction.startsWith('Admin details')) {
+        const profile = state.adminProfileByPubkey[group.adminPubkey || group.event?.pubkey || '']
+        return buildSegmentedTableRows({
+          width: rightBottomWrapWidth,
+          title: `Admin profile for: ${groupName}`,
+          columns: [
+            { key: 'field', label: 'Field', minWidth: 12, priority: 0, cellColor: 'cyan' },
+            { key: 'value', label: 'Value', minWidth: 18, priority: 1, cellColor: 'white' }
+          ],
+          rows: keyValueTableRows([
+            `name: ${profile?.name || group.adminName || '-'}`,
+            `bio: ${profile?.bio || '-'}`,
+            `pubkey: ${group.adminPubkey || group.event?.pubkey || '-'}`,
+            `followers: ${Number.isFinite(profile?.followersCount) ? profile.followersCount : '-'}`
+          ]),
+          showHeader: false
+        })
+      }
+      if (selectedRightTopAction.startsWith('Members')) {
+        const members = Array.isArray(group.members) ? group.members : []
+        return buildSegmentedTableRows({
+          width: rightBottomWrapWidth,
+          title: `Members list for: ${groupName}`,
+          columns: [
+            { key: 'member', label: '', minWidth: 24, priority: 0, cellColor: 'white' }
+          ],
+          rows: members.map((member: unknown) => ({ member: String(member || '-') })),
+          showHeader: false,
+          noItemsLabel: 'No member list available'
+        })
+      }
+      if (selectedRightTopAction.startsWith('Request Invite')) {
+        return [{
+          key: 'request:invite:hint',
+          kind: 'plain',
+          text: paneActionMessage || 'Press Enter to submit join request for admin review'
+        }]
+      }
+      return null
+    }
+
+    if (selectedNode === 'groups:my') {
+      if (selectedRightTopAction.startsWith('Relay Details')) {
+        const relay = relayForGroup(state, group)
+        return buildSegmentedTableRows({
+          width: rightBottomWrapWidth,
+          title: `Relay profile for: ${groupName}`,
+          columns: [
+            { key: 'field', label: 'Field', minWidth: 12, priority: 0, cellColor: 'cyan' },
+            { key: 'value', label: 'Value', minWidth: 18, priority: 1, cellColor: 'white' }
+          ],
+          rows: keyValueTableRows([
+            ...groupDetailsRows(group),
+            `url: ${relay?.connectionUrl || group.relay || '-'}`,
+            `writable: ${String(Boolean(relay?.writable))}`,
+            `requiresAuth: ${String(Boolean(relay?.requiresAuth))}`,
+            `readyForReq: ${String(Boolean(relay?.readyForReq))}`
+          ]),
+          showHeader: false
+        })
+      }
+      if (selectedRightTopAction.startsWith('Members')) {
+        const members = Array.isArray(group.members) ? group.members : []
+        return buildSegmentedTableRows({
+          width: rightBottomWrapWidth,
+          title: `Members list for: ${groupName}`,
+          columns: [
+            { key: 'member', label: '', minWidth: 24, priority: 0, cellColor: 'white' }
+          ],
+          rows: members.map((member: unknown) => ({ member: String(member || '-') })),
+          showHeader: false,
+          noItemsLabel: 'No member list available'
+        })
+      }
+      if (selectedRightTopAction.startsWith('Notes')) {
+        const notes = noteRowsForGroup(state, group)
+        return buildSegmentedTableRows({
+          width: rightBottomWrapWidth,
+          title: `Notes for: ${groupName}`,
+          columns: [
+            { key: 'publishedDate', label: 'Published date', minWidth: 20, priority: 0, cellColor: 'white' },
+            { key: 'author', label: 'Author', minWidth: 10, priority: 1, cellColor: 'cyan' },
+            { key: 'note', label: 'Note', minWidth: 20, priority: 2, cellColor: 'white' }
+          ],
+          rows: notes.map((note) => ({
+            publishedDate: new Date(note.createdAt * 1000).toLocaleString(),
+            author: shortId(note.authorPubkey, 10),
+            note: shortText(note.content, 160)
+          })),
+          showHeader: true,
+          noItemsLabel: 'No relay notes loaded'
+        })
+      }
+      if (selectedRightTopAction.startsWith('Files')) {
+        const files = fileRowsForGroup(state, group)
+        return buildSegmentedTableRows({
+          width: rightBottomWrapWidth,
+          title: `Files for: ${groupName}`,
+          columns: [
+            { key: 'publishedDate', label: 'Published date', minWidth: 20, priority: 0, cellColor: 'white' },
+            { key: 'author', label: 'Author', minWidth: 10, priority: 1, cellColor: 'cyan' },
+            { key: 'file', label: 'File', minWidth: 16, priority: 2, cellColor: 'white' },
+            { key: 'type', label: 'Type', minWidth: 8, priority: 3, cellColor: 'white' },
+            { key: 'size', label: 'Size', minWidth: 8, priority: 4, align: 'right', cellColor: 'white' }
+          ],
+          rows: files.map((file) => ({
+            publishedDate: new Date(Number(file.uploadedAt || 0) * 1000).toLocaleString(),
+            author: shortId(file.uploadedBy || '-', 10),
+            file: shortText(file.fileName || '-', 64),
+            type: file.mime || '-',
+            size: `${Number(file.size || 0)}B`
+          })),
+          showHeader: true,
+          noItemsLabel: 'No relay files loaded'
+        })
+      }
+      if (selectedRightTopAction.startsWith('Join Requests')) {
+        const requests = joinRequestsForGroup(state, group)
+        return buildJoinRequestTableRows({
+          width: rightBottomWrapWidth,
+          title: `Join requests for: ${groupName}`,
+          requests,
+          selectedIndex: selectedJoinRequestCursor
+        })
+      }
+    }
+    return null
+  }, [
+    state,
+    selectedNode,
+    selectedCenterRow,
+    selectedRightTopAction,
+    paneActionMessage,
+    rightBottomWrapWidth,
+    selectedJoinRequestCursor,
+    joinRequestReviewState
+  ])
+
   const rightBottomRenderRows = useMemo<DetailRenderRow[]>(() => {
+    if (rightBottomSpecialRows) return rightBottomSpecialRows
     const forceActionTable = selectedRightTopRow?.kind === 'action'
     const candidateLines = forceActionTable
       ? coerceDetailLinesToKeyValue(rightBottomRawRows)
@@ -2231,7 +2721,7 @@ export function App({
         text: segment
       }))
     )
-  }, [rightBottomRawRows, rightBottomWrapWidth, selectedRightTopRow])
+  }, [rightBottomRawRows, rightBottomWrapWidth, selectedRightTopRow, rightBottomSpecialRows])
 
   const rightBottomVisibleRows = Math.max(1, rightBottomBoxRows - 2)
 
@@ -2251,6 +2741,35 @@ export function App({
     setRightBottomOffsetByNode(next)
     controllerRef.current?.setDetailPaneOffset(selectedNode, rightBottomOffset).catch(() => {})
   }, [selectedNode, rightBottomOffset])
+
+  useEffect(() => {
+    if (!selectedJoinRequestContext || joinRequestReviewState) return
+    if (selectedJoinRequestContext.requests.length === 0) return
+    const rowLineIndex = 4 + (selectedJoinRequestCursor * 2)
+    const currentOffset = rightBottomOffsetRef.current[selectedNode] || 0
+    let nextOffset = currentOffset
+    if (rowLineIndex < currentOffset) {
+      nextOffset = rowLineIndex
+    } else if (rowLineIndex >= currentOffset + rightBottomVisibleRows) {
+      nextOffset = rowLineIndex - rightBottomVisibleRows + 1
+    }
+    const maxOffset = Math.max(0, rightBottomRenderRows.length - rightBottomVisibleRows)
+    nextOffset = clamp(nextOffset, 0, maxOffset)
+    if (nextOffset === currentOffset) return
+    const next = {
+      ...rightBottomOffsetRef.current,
+      [selectedNode]: nextOffset
+    }
+    setRightBottomOffsetByNode(next)
+    controllerRef.current?.setDetailPaneOffset(selectedNode, nextOffset).catch(() => {})
+  }, [
+    selectedNode,
+    selectedJoinRequestContext,
+    selectedJoinRequestCursor,
+    joinRequestReviewState,
+    rightBottomVisibleRows,
+    rightBottomRenderRows.length
+  ])
 
   const visibleRightRows = rightBottomRenderRows.slice(rightBottomOffset, rightBottomOffset + rightBottomVisibleRows)
 
@@ -2712,69 +3231,117 @@ export function App({
     }
   }
 
-  const handleInviteSendModeSelect = async (row: CenterRow): Promise<void> => {
-    if (selectedNode === 'invites:send') {
-      const mode = (row.data as { mode?: InviteSendMode } | null)?.mode
-      if (mode === 'chat' || mode === 'group') {
-        setInviteSendQuery('')
-        setInviteSendStatus('')
-        setInviteSendSuggestionIndex(0)
-      }
+  const openInviteCompose = (target: InviteComposeTarget): void => {
+    const next: InviteComposeState = {
+      target,
+      query: '',
+      suggestions: [],
+      suggestionIndex: 0,
+      busy: false,
+      status: ''
     }
+    inviteComposeStateRef.current = next
+    setInviteComposeState(next)
   }
 
-  const sendInviteFromRightBottom = async (): Promise<void> => {
+  const sendInviteFromCompose = async (): Promise<void> => {
     const controller = controllerRef.current
-    if (!controller || !state || selectedNode !== 'invites:send') return
-    if (inviteSendBusy) return
-    if (!selectedInviteSendTarget) {
-      setInviteSendStatus('No admin-owned target selected')
-      return
-    }
+    const compose = inviteComposeStateRef.current
+    if (!controller || !state || !compose) return
+    if (compose.busy) return
 
-    const suggestion = inviteSendSuggestions[inviteSendSuggestionIndex] || null
-    const typed = String(inviteSendQuery || '').trim()
+    const suggestion = compose.suggestions[compose.suggestionIndex] || null
+    const typed = String(compose.query || '').trim()
     const inviteePubkey = suggestion?.pubkey || (isHex64(typed) ? typed.toLowerCase() : null)
     if (!inviteePubkey) {
-      setInviteSendStatus('Select a suggestion or enter a valid 64-char pubkey')
+      setInviteComposeState((previous) => (
+        previous
+          ? {
+              ...previous,
+              status: 'Select a suggestion or enter a valid 64-char pubkey'
+            }
+          : previous
+      ))
       return
     }
 
     try {
-      setInviteSendBusy(true)
-      setInviteSendStatus('Sending invite…')
-
-      if (inviteSendMode === 'group') {
-        const group = state.myGroups.find((entry) => entry.id === selectedInviteSendTarget.id)
-        const relayUrl = String(group?.relay || selectedInviteSendTarget.relay || '').trim()
+      setInviteComposeState((previous) => previous ? { ...previous, busy: true, status: 'Sending invite…' } : previous)
+      if (compose.target.kind === 'group') {
+        const group = state.myGroups.find((entry) => entry.id === compose.target.id)
+        const relayUrl = String(group?.relay || compose.target.relay || '').trim()
         if (!relayUrl) {
           throw new Error('Selected relay has no relay URL')
         }
         await controller.sendInvite({
-          groupId: selectedInviteSendTarget.id,
+          groupId: compose.target.id,
           relayUrl,
           inviteePubkey,
           payload: {
-            groupName: group?.name || selectedInviteSendTarget.name || selectedInviteSendTarget.id,
+            groupName: group?.name || compose.target.name || compose.target.id,
             isPublic: group?.isPublic !== false,
             fileSharing: group?.isOpen !== false
           }
         })
       } else {
-        const result = await controller.inviteChatMembers(selectedInviteSendTarget.id, [inviteePubkey])
+        const result = await controller.inviteChatMembers(compose.target.id, [inviteePubkey])
         if (result.failed?.length) {
           throw new Error(result.failed[0]?.error || 'Invite failed')
         }
       }
-
-      setInviteSendStatus(`Invite sent: ${shortId(inviteePubkey, 16)}`)
-      setInviteSendQuery('')
-      setInviteSendSuggestions([])
-      setInviteSendSuggestionIndex(0)
+      const successMessage = `Invite sent: ${shortId(inviteePubkey, 16)}`
+      setPaneActionMessage(successMessage)
+      setInviteComposeState((previous) => (
+        previous
+          ? {
+              ...previous,
+              query: '',
+              suggestions: [],
+              suggestionIndex: 0,
+              busy: false,
+              status: successMessage
+            }
+          : previous
+      ))
     } catch (error) {
-      setInviteSendStatus(error instanceof Error ? error.message : String(error))
-    } finally {
-      setInviteSendBusy(false)
+      setInviteComposeState((previous) => (
+        previous
+          ? {
+              ...previous,
+              busy: false,
+              status: error instanceof Error ? error.message : String(error)
+            }
+          : previous
+      ))
+    }
+  }
+
+  const executeJoinRequestReviewAction = async (): Promise<void> => {
+    const controller = controllerRef.current
+    const review = joinRequestReviewState
+    if (!controller || !review || review.busy) return
+
+    try {
+      setJoinRequestReviewState((previous) => previous ? { ...previous, busy: true, status: 'Processing request…' } : previous)
+      if (review.selectedAction === 'approve') {
+        await controller.approveJoinRequest(review.groupId, review.request.pubkey, review.relay || undefined)
+        setPaneActionMessage(`Approved join request ${shortId(review.request.pubkey, 12)}`)
+      } else {
+        await controller.rejectJoinRequest(review.groupId, review.request.pubkey, review.relay || undefined)
+        setPaneActionMessage(`Dismissed join request ${shortId(review.request.pubkey, 12)}`)
+      }
+      await controller.refreshJoinRequests(review.groupId, review.relay || undefined)
+      setJoinRequestReviewState(null)
+    } catch (error) {
+      setJoinRequestReviewState((previous) => (
+        previous
+          ? {
+              ...previous,
+              busy: false,
+              status: error instanceof Error ? error.message : String(error)
+            }
+          : previous
+      ))
     }
   }
 
@@ -2784,6 +3351,15 @@ export function App({
     if (!selectedCenterRow || !selectedRightTopAction) return
 
     try {
+      if (selectedRightTopAction.startsWith('Send Invite')) {
+        if (!selectedInviteComposeTarget) {
+          setPaneActionMessage('Send Invite is available for admin-owned relays/chats only')
+          return
+        }
+        openInviteCompose(selectedInviteComposeTarget)
+        return
+      }
+
       if (selectedNode === 'groups:browse' && selectedCenterRow.kind === 'group') {
         const group = selectedCenterRow.data as any
         if (selectedRightTopAction.startsWith('Join Relay')) {
@@ -2809,7 +3385,7 @@ export function App({
             groupId: group.id,
             relay: group.relay || null
           })
-          setPaneActionMessage(`Invite request sent for relay ${group.name || group.id}`)
+          setPaneActionMessage(`Join request for ${group.name || group.id} submitted`)
           return
         }
       }
@@ -2883,15 +3459,6 @@ export function App({
           setPaneActionMessage(result.deleted ? 'File deleted from local storage' : `Delete failed: ${result.reason || 'unknown'}`)
           return
         }
-      }
-
-      if (selectedNode === 'invites:send') {
-        if (selectedInviteSendTarget) {
-          setPaneActionMessage(`Target selected: ${selectedInviteSendTarget.name}`)
-        } else {
-          setPaneActionMessage('Select a target and enter an invitee in details pane')
-        }
-        return
       }
 
       setPaneActionMessage(`${selectedRightTopAction} selected`)
@@ -3224,6 +3791,95 @@ export function App({
       return
     }
 
+    const currentInviteCompose = inviteComposeStateRef.current
+    const inviteComposeActive = Boolean(currentInviteCompose && currentFocus === 'right-top')
+    if (inviteComposeActive && currentInviteCompose) {
+      if (key.escape) {
+        inviteComposeStateRef.current = null
+        setInviteComposeState(null)
+        return
+      }
+      if (key.return) {
+        sendInviteFromCompose().catch((error) => {
+          setInviteComposeState((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  busy: false,
+                  status: error instanceof Error ? error.message : String(error)
+                }
+              : previous
+          ))
+        })
+        return
+      }
+      if (key.upArrow) {
+        setInviteComposeState((previous) => {
+          if (!previous) return previous
+          const next = {
+            ...previous,
+            suggestionIndex: clamp(previous.suggestionIndex - 1, 0, Math.max(0, previous.suggestions.length - 1))
+          }
+          inviteComposeStateRef.current = next
+          return next
+        })
+        return
+      }
+      if (key.downArrow) {
+        setInviteComposeState((previous) => {
+          if (!previous) return previous
+          const next = {
+            ...previous,
+            suggestionIndex: clamp(previous.suggestionIndex + 1, 0, Math.max(0, previous.suggestions.length - 1))
+          }
+          inviteComposeStateRef.current = next
+          return next
+        })
+        return
+      }
+      if (key.backspace || key.delete) {
+        setInviteComposeState((previous) => {
+          if (!previous) return previous
+          const next = {
+            ...previous,
+            query: previous.query.slice(0, -1),
+            status: ''
+          }
+          inviteComposeStateRef.current = next
+          return next
+        })
+        return
+      }
+      if (key.ctrl && input === 'u') {
+        setInviteComposeState((previous) => {
+          if (!previous) return previous
+          const next = {
+            ...previous,
+            query: '',
+            status: ''
+          }
+          inviteComposeStateRef.current = next
+          return next
+        })
+        return
+      }
+      if (!key.ctrl && !key.meta && input) {
+        const sanitized = input.replace(/[\r\n\t]/g, '')
+        if (!sanitized) return
+        setInviteComposeState((previous) => {
+          if (!previous) return previous
+          const next = {
+            ...previous,
+            query: `${previous.query}${sanitized}`,
+            status: ''
+          }
+          inviteComposeStateRef.current = next
+          return next
+        })
+      }
+      return
+    }
+
     if (key.tab) {
       const order: FocusPane[] = ['left-tree', 'right-top', 'right-bottom']
       const current = focusPaneRef.current
@@ -3474,48 +4130,72 @@ export function App({
           return
         }
 
-        if (isFormCenterNode(currentNode)) {
-          handleInviteSendModeSelect(selectedRow.centerRow).catch((error) => {
-            setPaneActionMessage(error instanceof Error ? error.message : String(error))
-          })
-        }
       }
 
       return
     }
 
     if (currentFocus === 'right-bottom') {
-      if (currentNode === 'invites:send') {
-        if (key.return) {
-          sendInviteFromRightBottom().catch((error) => {
-            setInviteSendStatus(error instanceof Error ? error.message : String(error))
+      if (joinRequestReviewState) {
+        if (key.escape) {
+          setJoinRequestReviewState(null)
+          return
+        }
+        if (key.upArrow || key.downArrow) {
+          setJoinRequestReviewState((previous) => {
+            if (!previous || previous.busy) return previous
+            return {
+              ...previous,
+              selectedAction: previous.selectedAction === 'approve' ? 'dismiss' : 'approve',
+              status: ''
+            }
           })
           return
         }
+        if (key.return) {
+          executeJoinRequestReviewAction().catch((error) => {
+            setJoinRequestReviewState((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    busy: false,
+                    status: error instanceof Error ? error.message : String(error)
+                  }
+                : previous
+            ))
+          })
+          return
+        }
+      }
+
+      if (selectedJoinRequestContext && !joinRequestReviewState) {
         if (key.upArrow) {
-          setInviteSendSuggestionIndex((previous) => clamp(previous - 1, 0, Math.max(0, inviteSendSuggestions.length - 1)))
+          setJoinRequestCursorByGroupKey((previous) => ({
+            ...previous,
+            [selectedJoinRequestContext.key]: clamp(selectedJoinRequestCursor - 1, 0, Math.max(0, selectedJoinRequestContext.requests.length - 1))
+          }))
           return
         }
         if (key.downArrow) {
-          setInviteSendSuggestionIndex((previous) => clamp(previous + 1, 0, Math.max(0, inviteSendSuggestions.length - 1)))
+          setJoinRequestCursorByGroupKey((previous) => ({
+            ...previous,
+            [selectedJoinRequestContext.key]: clamp(selectedJoinRequestCursor + 1, 0, Math.max(0, selectedJoinRequestContext.requests.length - 1))
+          }))
           return
         }
-        if (key.backspace || key.delete) {
-          setInviteSendQuery((previous) => previous.slice(0, -1))
-          return
-        }
-        if (key.escape) {
-          setInviteSendQuery('')
-          setInviteSendSuggestions([])
-          setInviteSendSuggestionIndex(0)
-          setInviteSendStatus('')
-          return
-        }
-        if (!key.ctrl && !key.meta && input) {
-          const sanitized = input.replace(/[\r\n\t]/g, '')
-          if (sanitized) {
-            setInviteSendQuery((previous) => `${previous}${sanitized}`)
+        if (key.return) {
+          const request = selectedJoinRequestContext.requests[selectedJoinRequestCursor] || null
+          if (!request) return
+          const next: JoinRequestReviewState = {
+            groupId: selectedJoinRequestContext.group.id,
+            groupName: groupDisplayName(selectedJoinRequestContext.group),
+            relay: selectedJoinRequestContext.group.relay || null,
+            request,
+            selectedAction: 'approve',
+            busy: false,
+            status: ''
           }
+          setJoinRequestReviewState(next)
           return
         }
       }
@@ -3633,6 +4313,21 @@ export function App({
     if (row.kind === 'plain') {
       return <Text key={row.key}>{row.text}</Text>
     }
+    if (row.kind === 'segments') {
+      return (
+        <Text key={row.key}>
+          {row.segments.map((segment, index) => (
+            <Text
+              key={`${row.key}:segment:${index}`}
+              color={segment.color}
+              dimColor={segment.dimColor}
+            >
+              {segment.text}
+            </Text>
+          ))}
+        </Text>
+      )
+    }
     if (row.kind === 'kv-rule') {
       return (
         <Text key={row.key}>
@@ -3677,6 +4372,35 @@ export function App({
   }
 
   const renderRightTopPaneContent = (): React.JSX.Element => {
+    if (inviteComposeState) {
+      return (
+        <Box flexDirection="column">
+          <Text color="yellow">Send Invite</Text>
+          <Text dimColor>{`Target: ${inviteComposeState.target.name} (${inviteComposeState.target.kind})`}</Text>
+          <Text dimColor>{'Enter a pubkey or select a suggestion, then press Enter to send.'}</Text>
+          <Text>{''}</Text>
+          <Text>
+            <Text color="cyan">{'Invitee: '}</Text>
+            <Text color="white">{inviteComposeState.query || '-'}</Text>
+          </Text>
+          <Text>
+            <Text dimColor>{`Status: ${inviteComposeState.status || 'idle'}`}</Text>
+          </Text>
+          <Text>{''}</Text>
+          {inviteComposeState.suggestions.length === 0
+            ? <Text dimColor>{inviteComposeState.query ? 'No suggestions' : 'Suggestions appear as you type'}</Text>
+            : inviteComposeState.suggestions.map((entry, index) => {
+              const selected = index === inviteComposeState.suggestionIndex
+              return (
+                <Text key={`invite-suggestion:${entry.pubkey}:${index}`} color={selected ? 'green' : undefined}>
+                  {selected ? '>' : ' '} {entry.name ? `${entry.name} ` : ''}{shortId(entry.pubkey, 16)}{entry.nip05 ? ` · ${entry.nip05}` : ''}
+                </Text>
+              )
+            })}
+        </Box>
+      )
+    }
+
     if (isCreateNodeId(selectedNode)) {
       return (
         <CreateFormAdapter
@@ -3706,7 +4430,7 @@ export function App({
   }
 
   const keysLabel =
-    'Keys: `:` command, right-top `Enter` expand/execute, create forms `Enter` edit/save and `Esc` cancel edit, `y` copy value, `Y` copy command, `Tab/Shift+Tab` pane focus, tree `←/→`, list `↑/↓`, right-bottom `Ctrl+U/Ctrl+D`, `r` refresh, `q` quit'
+    'Keys: `:` command, right-top `Enter` expand/execute, create/invite edit `Enter` save/send and `Esc` cancel, `y` copy value, `Y` copy command, `Tab/Shift+Tab` pane focus, tree `←/→`, list `↑/↓`, right-bottom join-requests `↑/↓` + `Enter` review, `Ctrl+U/Ctrl+D` scroll, `r` refresh, `q` quit'
   const selectedNodeDisplay = displayNodeId(selectedNode)
 
   const commandStatusLabel = state.lastError

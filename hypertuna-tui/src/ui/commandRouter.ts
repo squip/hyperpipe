@@ -376,8 +376,6 @@ const NAV_ALIASES: Record<string, NavNodeId> = {
   'relay-invites': 'invites:group',
   'invites:chat': 'invites:chat',
   'chat-invites': 'invites:chat',
-  'invites:send': 'invites:send',
-  'send-invite': 'invites:send',
   files: 'files',
   'files:images': 'files:type:images',
   'files:video': 'files:type:video',
@@ -403,6 +401,9 @@ const LEGACY_GROUP_GOTO_MIGRATIONS: Record<string, string> = {
 
 function parseNode(input: string): NavNodeId {
   const normalized = input.trim().toLowerCase()
+  if (normalized === 'invites:send' || normalized === 'send-invite') {
+    throw new Error('Navigation alias "send-invite" was removed. Use "goto relay:my" or "goto chats", then open a row and select "Send Invite".')
+  }
   const alias = NAV_ALIASES[normalized]
   if (alias) return alias
   const migrationTarget = LEGACY_GROUP_GOTO_MIGRATIONS[normalized]

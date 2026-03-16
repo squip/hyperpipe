@@ -184,10 +184,10 @@ describe.sequential('TUI e2e in-pane form workflows', () => {
     }
   })
 
-  it('sends a relay invite from Invites -> Send Invite right-bottom input', async () => {
+  it('shows Send Invite child action under My Relays rows', async () => {
     const controller = MockController.withSeedData(BASE_OPTIONS)
-    await controller.setSelectedNode('invites:send')
-    await controller.setFocusPane('right-bottom')
+    await controller.setSelectedNode('groups:my')
+    await controller.setFocusPane('right-top')
     const instance = render(
       <App
         options={BASE_OPTIONS}
@@ -197,17 +197,32 @@ describe.sequential('TUI e2e in-pane form workflows', () => {
 
     try {
       await waitFor(() => lastFrame(instance).includes('Command'))
-      await waitFor(() => lastFrame(instance).includes('invites:send'))
-
-      const invitee = 'b'.repeat(64)
-      const initialInviteCount = controller.getState().invites.length
-      await typeText(instance, invitee, 2)
       instance.stdin.write('\r')
+      await waitFor(() => lastFrame(instance).includes('Relay Details'))
+      await pressKey(instance, '\u001b[B', 6)
+      await waitFor(() => lastFrame(instance).includes('Send Invite'))
+    } finally {
+      instance.unmount()
+    }
+  })
 
-      await waitFor(() => controller.getState().invites.length > initialInviteCount)
-      const latestInvite = controller.getState().invites[0]
-      expect(latestInvite).toBeTruthy()
-      expect(latestInvite?.groupId).toBe(controller.getState().myGroups[0]?.id)
+  it('shows Send Invite child action under Chats rows', async () => {
+    const controller = MockController.withSeedData(BASE_OPTIONS)
+    await controller.setSelectedNode('chats')
+    await controller.setFocusPane('right-top')
+    const instance = render(
+      <App
+        options={BASE_OPTIONS}
+        controllerFactory={() => controller}
+      />
+    )
+
+    try {
+      await waitFor(() => lastFrame(instance).includes('Command'))
+      instance.stdin.write('\r')
+      await waitFor(() => lastFrame(instance).includes('Send Invite'))
+      await pressKey(instance, '\u001b[B', 1)
+      await waitFor(() => lastFrame(instance).includes('Send Invite'))
     } finally {
       instance.unmount()
     }

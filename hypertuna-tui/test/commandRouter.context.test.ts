@@ -44,13 +44,12 @@ describe('command router context-first workflows', () => {
     const gotoBrowseRelay = await executeCommand(controller, 'goto relay:browse')
     const gotoMyRelay = await executeCommand(controller, 'goto relays')
     const gotoCreateChat = await executeCommand(controller, 'goto chats:create')
-    const gotoSendInvite = await executeCommand(controller, 'goto send-invite')
 
     expect(gotoCreateRelay.gotoNode).toBe('groups:create')
     expect(gotoBrowseRelay.gotoNode).toBe('groups:browse')
     expect(gotoMyRelay.gotoNode).toBe('groups:my')
     expect(gotoCreateChat.gotoNode).toBe('chats:create')
-    expect(gotoSendInvite.gotoNode).toBe('invites:send')
+    await expect(executeCommand(controller, 'goto send-invite')).rejects.toThrow(/removed/i)
   })
 
   it('returns explicit migration errors for removed group command and goto aliases', async () => {
