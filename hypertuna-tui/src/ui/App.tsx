@@ -33,10 +33,16 @@ import {
 import {
   CreateFormAdapter,
   chatCreateRows,
+  chatRelayPickerOptions,
   csvToUniqueList,
+  gatewayPickerOptions,
   groupCreateRows,
+  type CreateBranchKey,
   type CreateBrowseRow,
+  type CreateChatRelayPickerOption,
+  type CreateEditableField,
   type CreateEditState,
+  type CreateGatewayPickerOption,
   type ChatCreateDraft,
   type GroupCreateDraft
 } from './createFormAdapter.js'
@@ -110,6 +116,7 @@ type CenterRow = {
 
 type CreateNodeId = 'groups:create' | 'chats:create'
 type CreateCursorMap = Record<CreateNodeId, number>
+type CreateExpandedBranchMap = Record<CreateNodeId, CreateBranchKey | ''>
 
 type InviteSendMode = 'group' | 'chat'
 type InviteSendTarget = {
@@ -1653,6 +1660,10 @@ export function App({
     'groups:create': 0,
     'chats:create': 0
   })
+  const [createExpandedBranchByNode, setCreateExpandedBranchByNode] = useState<CreateExpandedBranchMap>({
+    'groups:create': '',
+    'chats:create': ''
+  })
   const [createEditState, setCreateEditState] = useState<CreateEditState | null>(null)
   const [chatCreateDraft, setChatCreateDraft] = useState<ChatCreateDraft>({
     name: '',
@@ -1796,6 +1807,10 @@ export function App({
     setCreateCursorByNode({
       'groups:create': 0,
       'chats:create': 0
+    })
+    setCreateExpandedBranchByNode({
+      'groups:create': '',
+      'chats:create': ''
     })
     createEditStateRef.current = null
     setCreateEditState(null)
@@ -1974,11 +1989,22 @@ export function App({
 
   const createRows = useMemo<CreateBrowseRow[]>(() => {
     if (!state || !isCreateNodeId(selectedNode)) return []
+    const expandedBranch = createExpandedBranchByNode[selectedNode] || ''
     if (selectedNode === 'groups:create') {
-      return groupCreateRows(groupCreateDraft, state.discoveredGateways || [])
+      return groupCreateRows(groupCreateDraft, expandedBranch, state.discoveredGateways || [])
     }
-    return chatCreateRows(chatCreateDraft, state.relays || [])
-  }, [state, selectedNode, groupCreateDraft, chatCreateDraft])
+    return chatCreateRows(chatCreateDraft, expandedBranch, state.relays || [])
+  }, [state, selectedNode, groupCreateDraft, chatCreateDraft, createExpandedBranchByNode])
+
+  const createGatewayOptions = useMemo<CreateGatewayPickerOption[]>(
+    () => gatewayPickerOptions(groupCreateDraft, state?.discoveredGateways || []),
+    [groupCreateDraft, state]
+  )
+
+  const createChatRelayOptions = useMemo<CreateChatRelayPickerOption[]>(
+    () => chatRelayPickerOptions(chatCreateDraft, state?.relays || []),
+    [chatCreateDraft, state]
+  )
 
   const selectedCreateCursor = isCreateNodeId(selectedNode)
     ? clamp(createCursorByNode[selectedNode] || 0, 0, Math.max(0, createRows.length - 1))
@@ -2395,6 +2421,7 @@ export function App({
         gatewayId: ''
       })
       setCreateCursorByNode((previous) => ({ ...previous, 'groups:create': 0 }))
+      setCreateExpandedBranchByNode((previous) => ({ ...previous, 'groups:create': '' }))
       createEditStateRef.current = null
       setCreateEditState(null)
     } catch (error) {
@@ -2427,6 +2454,7 @@ export function App({
         relayUrls: []
       })
       setCreateCursorByNode((previous) => ({ ...previous, 'chats:create': 0 }))
+      setCreateExpandedBranchByNode((previous) => ({ ...previous, 'chats:create': '' }))
       createEditStateRef.current = null
       setCreateEditState(null)
     } catch (error) {
@@ -2448,7 +2476,7 @@ export function App({
 
   const currentCreateFieldValue = (
     node: CreateNodeId,
-    field: CreateEditState['field']
+    field: CreateEditableField
   ): string => {
     if (node === 'groups:create') {
       if (field === 'name') return groupCreateDraft.name
@@ -2497,8 +2525,58 @@ export function App({
     setCreateEditState(next)
   }
 
+  const openCreateGatewayPicker = (): void => {
+    if (selectedNode !== 'groups:create') return
+    const selectedOptionIndex = createGatewayOptions.findIndex((option) => option.selected)
+    const next: CreateEditState = {
+      node: 'groups:create',
+      editor: 'gateway-picker',
+      selectedIndex: selectedOptionIndex >= 0 ? selectedOptionIndex + 1 : 0
+    }
+    createEditStateRef.current = next
+    setCreateEditState(next)
+  }
+
+  const openCreateGatewayManualEntry = (): void => {
+    if (selectedNode !== 'groups:create') return
+    const next: CreateEditState = {
+      node: 'groups:create',
+      editor: 'gateway-manual',
+      selectedField: 'gatewayOrigin',
+      gatewayOrigin: groupCreateDraft.gatewayOrigin,
+      gatewayId: groupCreateDraft.gatewayId
+    }
+    createEditStateRef.current = next
+    setCreateEditState(next)
+  }
+
+  const openCreateChatRelayPicker = (): void => {
+    if (selectedNode !== 'chats:create') return
+    const selectedOptionIndex = createChatRelayOptions.findIndex((option) => option.selected)
+    const next: CreateEditState = {
+      node: 'chats:create',
+      editor: 'relay-picker',
+      selectedIndex: selectedOptionIndex >= 0 ? selectedOptionIndex : 0
+    }
+    createEditStateRef.current = next
+    setCreateEditState(next)
+  }
+
+  const openCreateChatRelayManualEntry = (): void => {
+    if (selectedNode !== 'chats:create') return
+    const next: CreateEditState = {
+      node: 'chats:create',
+      field: 'relayUrls',
+      label: 'Relay URLs',
+      editor: 'text',
+      value: chatCreateDraft.relayUrls.join(',')
+    }
+    createEditStateRef.current = next
+    setCreateEditState(next)
+  }
+
   const applyCreateFieldEdit = (edit: CreateEditState, value: string): void => {
-    if (edit.node === 'groups:create') {
+    if (edit.node === 'groups:create' && ('field' in edit)) {
       if (edit.field === 'name') {
         setGroupCreateDraft((previous) => ({ ...previous, name: value.trim() }))
         return
@@ -2527,6 +2605,9 @@ export function App({
               }
             : {})
         }))
+        if (directJoinOnly) {
+          setCreateExpandedBranchByNode((previous) => ({ ...previous, 'groups:create': '' }))
+        }
         return
       }
       if (edit.field === 'gatewayOrigin') {
@@ -2548,6 +2629,8 @@ export function App({
       }
       return
     }
+
+    if (!('field' in edit)) return
 
     if (edit.field === 'name') {
       setChatCreateDraft((previous) => ({ ...previous, name: value.trim() }))
@@ -2571,11 +2654,20 @@ export function App({
     if (!edit) return
     if (edit.editor === 'text') {
       applyCreateFieldEdit(edit, edit.value)
-    } else {
+    } else if (edit.editor === 'choice') {
       const selected = edit.options[edit.selectedIndex]
       if (selected) {
         applyCreateFieldEdit(edit, selected.value)
       }
+    } else if (edit.editor === 'gateway-manual') {
+      const nextOrigin = String(edit.gatewayOrigin || '').trim()
+      const nextGatewayId = String(edit.gatewayId || '').trim().toLowerCase()
+      setGroupCreateDraft((previous) => ({
+        ...previous,
+        gatewayOrigin: nextOrigin,
+        gatewayId: nextGatewayId,
+        directJoinOnly: (nextOrigin || nextGatewayId) ? false : previous.directJoinOnly
+      }))
     }
     createEditStateRef.current = null
     setCreateEditState(null)
@@ -2586,23 +2678,29 @@ export function App({
       beginCreateFieldEdit(row)
       return
     }
-    if (row.kind === 'gateway-refresh') {
-      await refreshCreateGatewayCatalog()
-      return
-    }
-    if (row.kind === 'gateway-option') {
-      if (!row.gatewayId || !row.gatewayOrigin) return
-      setGroupCreateDraft((previous) => ({
+    if (row.kind === 'branch-parent' && isCreateNodeId(selectedNode)) {
+      setCreateExpandedBranchByNode((previous) => ({
         ...previous,
-        directJoinOnly: false,
-        gatewayId: row.gatewayId.trim().toLowerCase(),
-        gatewayOrigin: row.gatewayOrigin.trim()
+        [selectedNode]: previous[selectedNode] === row.branch ? '' : row.branch
       }))
-      setPaneActionMessage(`Selected gateway ${row.gatewayId}`)
       return
     }
-    if (row.kind === 'chat-relay') {
-      toggleChatRelayDraft(row.relayUrl)
+    if (row.kind === 'branch-child') {
+      if (row.action === 'gateway-picker') {
+        openCreateGatewayPicker()
+        return
+      }
+      if (row.action === 'gateway-manual') {
+        openCreateGatewayManualEntry()
+        return
+      }
+      if (row.action === 'relay-picker') {
+        openCreateChatRelayPicker()
+        return
+      }
+      if (row.action === 'relay-manual') {
+        openCreateChatRelayManualEntry()
+      }
       return
     }
     if (row.kind === 'submit') {
@@ -2900,6 +2998,153 @@ export function App({
         setCreateEditState(null)
         return
       }
+
+      if (currentCreateEdit.editor === 'gateway-picker') {
+        const totalRows = Math.max(1, createGatewayOptions.length) + 1 // refresh row + options/placeholder
+        const maxIndex = Math.max(0, totalRows - 1)
+        if (key.upArrow) {
+          setCreateEditState((previous) => {
+            if (!previous || previous.editor !== 'gateway-picker') return previous
+            const next = {
+              ...previous,
+              selectedIndex: clamp(previous.selectedIndex - 1, 0, maxIndex)
+            }
+            createEditStateRef.current = next
+            return next
+          })
+          return
+        }
+        if (key.downArrow) {
+          setCreateEditState((previous) => {
+            if (!previous || previous.editor !== 'gateway-picker') return previous
+            const next = {
+              ...previous,
+              selectedIndex: clamp(previous.selectedIndex + 1, 0, maxIndex)
+            }
+            createEditStateRef.current = next
+            return next
+          })
+          return
+        }
+        if (key.return) {
+          const selectedIndex = currentCreateEdit.selectedIndex
+          if (selectedIndex <= 0) {
+            refreshCreateGatewayCatalog().catch((error) => {
+              setPaneActionMessage(error instanceof Error ? error.message : String(error))
+            })
+            return
+          }
+          const selectedOption = createGatewayOptions[selectedIndex - 1]
+          if (!selectedOption) return
+          setGroupCreateDraft((previous) => ({
+            ...previous,
+            directJoinOnly: false,
+            gatewayId: selectedOption.gatewayId.trim().toLowerCase(),
+            gatewayOrigin: selectedOption.gatewayOrigin.trim()
+          }))
+          setPaneActionMessage(`Selected gateway ${selectedOption.gatewayId}`)
+          createEditStateRef.current = null
+          setCreateEditState(null)
+          return
+        }
+        return
+      }
+
+      if (currentCreateEdit.editor === 'relay-picker') {
+        const maxIndex = Math.max(0, createChatRelayOptions.length - 1)
+        if (key.upArrow) {
+          setCreateEditState((previous) => {
+            if (!previous || previous.editor !== 'relay-picker') return previous
+            const next = {
+              ...previous,
+              selectedIndex: clamp(previous.selectedIndex - 1, 0, maxIndex)
+            }
+            createEditStateRef.current = next
+            return next
+          })
+          return
+        }
+        if (key.downArrow) {
+          setCreateEditState((previous) => {
+            if (!previous || previous.editor !== 'relay-picker') return previous
+            const next = {
+              ...previous,
+              selectedIndex: clamp(previous.selectedIndex + 1, 0, maxIndex)
+            }
+            createEditStateRef.current = next
+            return next
+          })
+          return
+        }
+        if (key.return) {
+          const selectedOption = createChatRelayOptions[currentCreateEdit.selectedIndex]
+          if (!selectedOption) return
+          toggleChatRelayDraft(selectedOption.relayUrl)
+          return
+        }
+        return
+      }
+
+      if (currentCreateEdit.editor === 'gateway-manual') {
+        if (key.upArrow || key.downArrow) {
+          setCreateEditState((previous) => {
+            if (!previous || previous.editor !== 'gateway-manual') return previous
+            const next = {
+              ...previous,
+              selectedField: previous.selectedField === 'gatewayOrigin' ? 'gatewayId' : 'gatewayOrigin'
+            }
+            createEditStateRef.current = next
+            return next
+          })
+          return
+        }
+        if (key.return) {
+          commitCreateEdit()
+          return
+        }
+        if (key.backspace || key.delete) {
+          setCreateEditState((previous) => {
+            if (!previous || previous.editor !== 'gateway-manual') return previous
+            const field = previous.selectedField
+            const next = {
+              ...previous,
+              [field]: previous[field].slice(0, -1)
+            }
+            createEditStateRef.current = next
+            return next
+          })
+          return
+        }
+        if (key.ctrl && input === 'u') {
+          setCreateEditState((previous) => {
+            if (!previous || previous.editor !== 'gateway-manual') return previous
+            const field = previous.selectedField
+            const next = {
+              ...previous,
+              [field]: ''
+            }
+            createEditStateRef.current = next
+            return next
+          })
+          return
+        }
+        const isPrintable = !key.ctrl && !(key as unknown as { meta?: boolean }).meta && input.length > 0
+        if (isPrintable) {
+          setCreateEditState((previous) => {
+            if (!previous || previous.editor !== 'gateway-manual') return previous
+            const field = previous.selectedField
+            const next = {
+              ...previous,
+              [field]: `${previous[field]}${input}`
+            }
+            createEditStateRef.current = next
+            return next
+          })
+          return
+        }
+        return
+      }
+
       if (currentCreateEdit.editor === 'choice') {
         if (key.upArrow) {
           setCreateEditState((previous) => {
@@ -3440,6 +3685,8 @@ export function App({
           rows={createRows}
           selectedIndex={selectedCreateCursor}
           editState={createEditState && createEditState.node === selectedNode ? createEditState : null}
+          groupGatewayOptions={createGatewayOptions}
+          chatRelayOptions={createChatRelayOptions}
         />
       )
     }

@@ -31,6 +31,15 @@ async function typeText(instance: RenderInstance, value: string, delayMs = 4): P
   }
 }
 
+async function pressKey(instance: RenderInstance, key: string, repeat = 1, delayMs = 12): Promise<void> {
+  for (let index = 0; index < repeat; index += 1) {
+    instance.stdin.write(key)
+    if (delayMs > 0) {
+      await sleep(delayMs)
+    }
+  }
+}
+
 async function waitFor(check: () => boolean, timeoutMs = 4_000): Promise<void> {
   const started = Date.now()
   while (Date.now() - started < timeoutMs) {
@@ -95,6 +104,81 @@ describe.sequential('TUI e2e in-pane form workflows', () => {
       await typeText(instance, 'chat-browse-edit')
       instance.stdin.write('\r')
       await waitFor(() => lastFrame(instance).includes('Chat Name: chat-browse-edit'))
+    } finally {
+      instance.unmount()
+    }
+  })
+
+  it('shows relay gateway branch and dedicated picker/manual editors in Create Relay', async () => {
+    const controller = MockController.withSeedData(BASE_OPTIONS)
+    await controller.setSelectedNode('groups:create')
+    await controller.setFocusPane('right-top')
+    const instance = render(
+      <App
+        options={BASE_OPTIONS}
+        controllerFactory={() => controller}
+      />
+    )
+
+    try {
+      await waitFor(() => lastFrame(instance).includes('Create Relay'))
+      await waitFor(() => lastFrame(instance).includes('Direct Join Only'))
+
+      await pressKey(instance, '\u001b[B', 4)
+      await pressKey(instance, '\r')
+      await waitFor(() => lastFrame(instance).includes('Editing Direct Join Only'))
+      await pressKey(instance, '\u001b[B')
+      await pressKey(instance, '\r')
+
+      await waitFor(() => lastFrame(instance).includes('Gateway Server'))
+      await pressKey(instance, '\u001b[B')
+      await pressKey(instance, '\r')
+      await waitFor(() => lastFrame(instance).includes('Gateway Picker'))
+      await waitFor(() => lastFrame(instance).includes('Manual entry'))
+
+      await pressKey(instance, '\u001b[B')
+      await pressKey(instance, '\r')
+      await waitFor(() => lastFrame(instance).includes('Editing Gateway Server: Gateway Picker'))
+      await pressKey(instance, '\u001b')
+
+      await pressKey(instance, '\u001b[B')
+      await pressKey(instance, '\r')
+      await waitFor(() => lastFrame(instance).includes('Editing Gateway Server: Manual entry'))
+    } finally {
+      instance.unmount()
+    }
+  })
+
+  it('shows chat relay branch with URL-only picker and manual relay URL editor', async () => {
+    const controller = MockController.withSeedData(BASE_OPTIONS)
+    await controller.setSelectedNode('chats:create')
+    await controller.setFocusPane('right-top')
+    const instance = render(
+      <App
+        options={BASE_OPTIONS}
+        controllerFactory={() => controller}
+      />
+    )
+
+    try {
+      await waitFor(() => lastFrame(instance).includes('Create Chat'))
+      await waitFor(() => lastFrame(instance).includes('Chat Relays'))
+
+      await pressKey(instance, '\u001b[B', 3)
+      await pressKey(instance, '\r')
+      await waitFor(() => lastFrame(instance).includes('Relay Picker'))
+      await waitFor(() => lastFrame(instance).includes('Manual entry'))
+
+      await pressKey(instance, '\u001b[B')
+      await pressKey(instance, '\r')
+      await waitFor(() => lastFrame(instance).includes('Editing Chat Relays: Relay Picker'))
+      await waitFor(() => lastFrame(instance).includes('wss://'))
+      expect(lastFrame(instance)).not.toContain('npubseed')
+      await pressKey(instance, '\u001b')
+
+      await pressKey(instance, '\u001b[B')
+      await pressKey(instance, '\r')
+      await waitFor(() => lastFrame(instance).includes('Editing Relay URLs'))
     } finally {
       instance.unmount()
     }

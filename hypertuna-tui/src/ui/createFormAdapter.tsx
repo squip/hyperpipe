@@ -36,6 +36,9 @@ export type CreateEditableField =
   | 'inviteMembers'
   | 'relayUrls'
 
+export type CreateBranchKey = 'group:gateway-server' | 'chat:relays'
+export type CreateBranchAction = 'gateway-picker' | 'gateway-manual' | 'relay-picker' | 'relay-manual'
+
 export type CreateBrowseRow =
   | {
       key: string
@@ -49,27 +52,38 @@ export type CreateBrowseRow =
     }
   | {
       key: string
-      kind: 'gateway-refresh'
+      kind: 'branch-parent'
+      branch: CreateBranchKey
       label: string
+      value: string
+      expanded: boolean
     }
   | {
       key: string
-      kind: 'gateway-option'
+      kind: 'branch-child'
+      branch: CreateBranchKey
+      action: CreateBranchAction
       label: string
-      gatewayId: string
-      gatewayOrigin: string
-    }
-  | {
-      key: string
-      kind: 'chat-relay'
-      label: string
-      relayUrl: string
     }
   | {
       key: string
       kind: 'submit'
       label: string
     }
+
+export type CreateGatewayPickerOption = {
+  key: string
+  gatewayId: string
+  gatewayOrigin: string
+  label: string
+  selected: boolean
+}
+
+export type CreateChatRelayPickerOption = {
+  key: string
+  relayUrl: string
+  selected: boolean
+}
 
 export type CreateEditState =
   | {
@@ -88,6 +102,23 @@ export type CreateEditState =
       options: CreateChoiceOption[]
       selectedIndex: number
     }
+  | {
+      node: 'groups:create'
+      editor: 'gateway-picker'
+      selectedIndex: number
+    }
+  | {
+      node: 'groups:create'
+      editor: 'gateway-manual'
+      selectedField: 'gatewayOrigin' | 'gatewayId'
+      gatewayOrigin: string
+      gatewayId: string
+    }
+  | {
+      node: 'chats:create'
+      editor: 'relay-picker'
+      selectedIndex: number
+    }
 
 function clean(value: unknown): string {
   return String(value || '')
@@ -97,18 +128,66 @@ function clean(value: unknown): string {
     .trim()
 }
 
+function gatewayServerValue(draft: GroupCreateDraft): string {
+  const id = clean(draft.gatewayId)
+  const origin = clean(draft.gatewayOrigin)
+  if (id && origin) return `${id} @ ${origin}`
+  if (origin) return origin
+  if (id) return id
+  return '-'
+}
+
 export function csvToUniqueList(value: string): string[] {
   return Array.from(new Set(
     String(value || '')
-      .split(/[,\s]+/g)
+      .split(/[\s,]+/g)
       .map((entry) => entry.trim())
       .filter(Boolean)
   ))
 }
 
-export function groupCreateRows(
+export function gatewayPickerOptions(
   draft: GroupCreateDraft,
   gateways: DiscoveredGateway[]
+): CreateGatewayPickerOption[] {
+  const selectedId = clean(draft.gatewayId).toLowerCase()
+  const selectedOrigin = clean(draft.gatewayOrigin)
+
+  return gateways.map((gateway) => {
+    const title = clean(gateway.displayName) || gateway.gatewayId
+    const selected = (
+      (selectedId && gateway.gatewayId === selectedId)
+      || (!selectedId && selectedOrigin && selectedOrigin === gateway.publicUrl)
+    )
+    return {
+      key: `group:gateway:${gateway.gatewayId}`,
+      gatewayId: gateway.gatewayId,
+      gatewayOrigin: gateway.publicUrl,
+      label: `${selected ? '[x]' : '[ ]'} ${title} - ${gateway.publicUrl}`,
+      selected
+    }
+  })
+}
+
+export function chatRelayPickerOptions(
+  draft: ChatCreateDraft,
+  relays: RelayEntry[]
+): CreateChatRelayPickerOption[] {
+  return relays
+    .filter((entry) => entry.writable === true && entry.connectionUrl)
+    .map((entry) => String(entry.connectionUrl || '').trim())
+    .filter((relayUrl) => relayUrl.length > 0)
+    .map((relayUrl) => ({
+      key: `chat:relay:${relayUrl}`,
+      relayUrl,
+      selected: draft.relayUrls.includes(relayUrl)
+    }))
+}
+
+export function groupCreateRows(
+  draft: GroupCreateDraft,
+  expandedBranch: CreateBranchKey | '',
+  _gateways: DiscoveredGateway[]
 ): CreateBrowseRow[] {
   const rows: CreateBrowseRow[] = [
     {
@@ -163,57 +242,37 @@ export function groupCreateRows(
         { label: 'true', value: 'true' },
         { label: 'false', value: 'false' }
       ]
-    },
-    {
-      key: 'group:gatewayOrigin',
-      kind: 'field',
-      field: 'gatewayOrigin',
-      label: 'Gateway Origin',
-      value: clean(draft.gatewayOrigin) || '-',
-      editor: 'text'
-    },
-    {
-      key: 'group:gatewayId',
-      kind: 'field',
-      field: 'gatewayId',
-      label: 'Gateway ID',
-      value: clean(draft.gatewayId) || '-',
-      editor: 'text'
     }
   ]
 
   if (!draft.directJoinOnly) {
+    const branch: CreateBranchKey = 'group:gateway-server'
+    const expanded = expandedBranch === branch
     rows.push({
-      key: 'group:gateway-refresh',
-      kind: 'gateway-refresh',
-      label: 'Refresh discovered gateways'
+      key: 'group:gateway-server',
+      kind: 'branch-parent',
+      branch,
+      label: 'Gateway Server',
+      value: gatewayServerValue(draft),
+      expanded
     })
-
-    if (!gateways.length) {
-      rows.push({
-        key: 'group:gateway:none',
-        kind: 'gateway-option',
-        label: '[ ] no gateways discovered',
-        gatewayId: '',
-        gatewayOrigin: ''
-      })
-    } else {
-      const selectedId = clean(draft.gatewayId).toLowerCase()
-      const selectedOrigin = clean(draft.gatewayOrigin)
-      for (const gateway of gateways) {
-        const selected = (
-          (selectedId && gateway.gatewayId === selectedId)
-          || (!selectedId && selectedOrigin && selectedOrigin === gateway.publicUrl)
-        )
-        const title = clean(gateway.displayName) || gateway.gatewayId
-        rows.push({
-          key: `group:gateway:${gateway.gatewayId}`,
-          kind: 'gateway-option',
-          label: `${selected ? '[x]' : '[ ]'} ${title} - ${gateway.publicUrl}`,
-          gatewayId: gateway.gatewayId,
-          gatewayOrigin: gateway.publicUrl
-        })
-      }
+    if (expanded) {
+      rows.push(
+        {
+          key: 'group:gateway-server:picker',
+          kind: 'branch-child',
+          branch,
+          action: 'gateway-picker',
+          label: 'Gateway Picker'
+        },
+        {
+          key: 'group:gateway-server:manual',
+          kind: 'branch-child',
+          branch,
+          action: 'gateway-manual',
+          label: 'Manual entry'
+        }
+      )
     }
   }
 
@@ -228,8 +287,12 @@ export function groupCreateRows(
 
 export function chatCreateRows(
   draft: ChatCreateDraft,
-  relays: RelayEntry[]
+  expandedBranch: CreateBranchKey | '',
+  _relays: RelayEntry[]
 ): CreateBrowseRow[] {
+  const branch: CreateBranchKey = 'chat:relays'
+  const expanded = expandedBranch === branch
+
   const rows: CreateBrowseRow[] = [
     {
       key: 'chat:name',
@@ -257,31 +320,32 @@ export function chatCreateRows(
       editor: 'text'
     },
     {
-      key: 'chat:relayUrls',
-      kind: 'field',
-      field: 'relayUrls',
+      key: 'chat:relays',
+      kind: 'branch-parent',
+      branch,
       label: 'Chat Relays',
-      value: draft.relayUrls.length ? String(draft.relayUrls.length) : '0',
-      editor: 'text'
+      value: String(draft.relayUrls.length),
+      expanded
     }
   ]
 
-  const writableRelays = relays
-    .filter((entry) => entry.writable === true && entry.connectionUrl)
-    .map((entry) => ({
-      relayKey: entry.relayKey,
-      relayUrl: String(entry.connectionUrl || '').trim(),
-      name: clean(entry.publicIdentifier) || entry.relayKey
-    }))
-    .filter((entry) => entry.relayUrl.length > 0)
-
-  for (const entry of writableRelays) {
-    rows.push({
-      key: `chat:relay:${entry.relayKey}`,
-      kind: 'chat-relay',
-      relayUrl: entry.relayUrl,
-      label: `${draft.relayUrls.includes(entry.relayUrl) ? '[x]' : '[ ]'} ${entry.name} - ${entry.relayUrl}`
-    })
+  if (expanded) {
+    rows.push(
+      {
+        key: 'chat:relays:picker',
+        kind: 'branch-child',
+        branch,
+        action: 'relay-picker',
+        label: 'Relay Picker'
+      },
+      {
+        key: 'chat:relays:manual',
+        kind: 'branch-child',
+        branch,
+        action: 'relay-manual',
+        label: 'Manual entry'
+      }
+    )
   }
 
   rows.push({
@@ -299,47 +363,120 @@ type CreateFormAdapterProps = {
   rows: CreateBrowseRow[]
   selectedIndex: number
   editState: CreateEditState | null
+  groupGatewayOptions: CreateGatewayPickerOption[]
+  chatRelayOptions: CreateChatRelayPickerOption[]
 }
 
 export function CreateFormAdapter(props: CreateFormAdapterProps): React.JSX.Element {
   const title = props.node === 'groups:create' ? 'Create Relay' : 'Create Chat'
   const selected = (index: number): boolean => props.isFocused && !props.editState && index === props.selectedIndex
   const rowEntries = props.rows.map((row, index) => ({ row, index }))
-  const fieldRows = rowEntries.filter((entry) => entry.row.kind === 'field')
-  const gatewayRows = rowEntries.filter((entry) => (
-    entry.row.kind === 'gateway-refresh' || entry.row.kind === 'gateway-option'
-  ))
-  const relayRows = rowEntries.filter((entry) => entry.row.kind === 'chat-relay')
-  const submitRow = rowEntries.find((entry) => entry.row.kind === 'submit') || null
 
   if (props.editState) {
+    if (props.editState.editor === 'text') {
+      return (
+        <Box flexDirection="column">
+          <Text dimColor>{`Editing ${props.editState.label}`}</Text>
+          <Text dimColor>Press ESC to cancel, or Enter to complete field</Text>
+          <Box marginTop={1} flexDirection="column">
+            <Text color="yellow">
+              {props.editState.label}
+              {props.editState.required ? '*' : ''}: 
+            </Text>
+            <Box borderStyle="round" borderColor="white" paddingX={1}>
+              <Text color="white">{props.editState.value.length ? props.editState.value : ' '}</Text>
+            </Box>
+          </Box>
+        </Box>
+      )
+    }
+
+    if (props.editState.editor === 'choice') {
+      return (
+        <Box flexDirection="column">
+          <Text dimColor>{`Editing ${props.editState.label}`}</Text>
+          <Text dimColor>Use arrow keys to choose, then Enter to apply</Text>
+          <Box marginTop={1} flexDirection="column">
+            {props.editState.options.map((option, index) => {
+              const isActive = index === props.editState.selectedIndex
+              return (
+                <Text key={`${option.value}-${index}`} color={isActive ? 'green' : undefined}>
+                  {isActive ? '>' : ' '} {option.label}
+                </Text>
+              )
+            })}
+          </Box>
+        </Box>
+      )
+    }
+
+    if (props.editState.editor === 'gateway-picker') {
+      return (
+        <Box flexDirection="column">
+          <Text dimColor>Editing Gateway Server: Gateway Picker</Text>
+          <Text dimColor>Enter refreshes/selects. Esc closes this editor.</Text>
+          <Box marginTop={1} borderStyle="round" borderColor="blue" paddingX={1} flexDirection="column">
+            <Text color="cyan">Gateway Picker</Text>
+            <Text color={props.editState.selectedIndex === 0 ? 'green' : undefined}>
+              {props.editState.selectedIndex === 0 ? '>' : ' '} Refresh discovered gateways
+            </Text>
+            {props.groupGatewayOptions.length === 0 ? (
+              <Text color={props.editState.selectedIndex === 1 ? 'green' : 'gray'}>
+                {props.editState.selectedIndex === 1 ? '>' : ' '} [ ] no gateways discovered
+              </Text>
+            ) : props.groupGatewayOptions.map((option, optionIndex) => {
+              const isActive = props.editState.selectedIndex === optionIndex + 1
+              return (
+                <Text key={option.key} color={isActive ? 'green' : undefined}>
+                  {isActive ? '>' : ' '} {option.label}
+                </Text>
+              )
+            })}
+          </Box>
+        </Box>
+      )
+    }
+
+    if (props.editState.editor === 'gateway-manual') {
+      const editingOrigin = props.editState.selectedField === 'gatewayOrigin'
+      return (
+        <Box flexDirection="column">
+          <Text dimColor>Editing Gateway Server: Manual entry</Text>
+          <Text dimColor>Use ↑/↓ to switch field, Enter to save, Esc to cancel</Text>
+          <Box marginTop={1} flexDirection="column">
+            <Text>
+              <Text color={editingOrigin ? 'green' : 'gray'}>{editingOrigin ? '>' : ' '}</Text>
+              <Text> </Text>
+              <Text color="yellow">Gateway Origin</Text>
+              <Text color="white">: {props.editState.gatewayOrigin || '-'}</Text>
+            </Text>
+            <Text>
+              <Text color={!editingOrigin ? 'green' : 'gray'}>{!editingOrigin ? '>' : ' '}</Text>
+              <Text> </Text>
+              <Text color="yellow">Gateway ID</Text>
+              <Text color="white">: {props.editState.gatewayId || '-'}</Text>
+            </Text>
+          </Box>
+        </Box>
+      )
+    }
+
     return (
       <Box flexDirection="column">
-        <Text dimColor>{`Editing ${props.editState.label}`}</Text>
-        <Text dimColor>Press ESC to cancel, or Enter to complete field</Text>
-        <Box marginTop={1} flexDirection="column">
-          {props.editState.editor === 'text' ? (
-            <>
-              <Text color="cyan">
-                {props.editState.label}
-                {props.editState.required ? '*' : ''}: 
+        <Text dimColor>Editing Chat Relays: Relay Picker</Text>
+        <Text dimColor>Use ↑/↓ then Enter to toggle relay URLs. Esc closes this editor.</Text>
+        <Box marginTop={1} borderStyle="round" borderColor="blue" paddingX={1} flexDirection="column">
+          <Text color="cyan">Relay Picker</Text>
+          {props.chatRelayOptions.length === 0 ? (
+            <Text color="gray">  [ ] no writable relays discovered</Text>
+          ) : props.chatRelayOptions.map((option, optionIndex) => {
+            const isActive = props.editState.selectedIndex === optionIndex
+            return (
+              <Text key={option.key} color={isActive ? 'green' : undefined}>
+                {isActive ? '>' : ' '} {option.selected ? '[x]' : '[ ]'} {option.relayUrl}
               </Text>
-              <Box borderStyle="round" borderColor="white" paddingX={1}>
-                <Text>{props.editState.value.length ? props.editState.value : ' '}</Text>
-              </Box>
-            </>
-          ) : (
-            <Box flexDirection="column">
-              {props.editState.options.map((option, index) => {
-                const isActive = index === props.editState.selectedIndex
-                return (
-                  <Text key={`${option.value}-${index}`} color={isActive ? 'green' : undefined}>
-                    {isActive ? '>' : ' '} {option.label}
-                  </Text>
-                )
-              })}
-            </Box>
-          )}
+            )
+          })}
         </Box>
       </Box>
     )
@@ -349,52 +486,51 @@ export function CreateFormAdapter(props: CreateFormAdapterProps): React.JSX.Elem
     <Box flexDirection="column">
       <Text color="yellow">{title}</Text>
       <Box flexDirection="column">
-        {fieldRows.map((entry) => {
-          const row = entry.row
+        {rowEntries.map((entry) => {
           const isSelected = selected(entry.index)
+          const prefix = isSelected ? '>' : ' '
+
+          if (entry.row.kind === 'field') {
+            return (
+              <Text key={entry.row.key}>
+                <Text color={isSelected ? 'green' : 'gray'}>{prefix}</Text>
+                <Text> </Text>
+                <Text color="cyan">{entry.row.label}</Text>
+                <Text color="white">: {entry.row.value}</Text>
+              </Text>
+            )
+          }
+
+          if (entry.row.kind === 'branch-parent') {
+            return (
+              <Text key={entry.row.key}>
+                <Text color={isSelected ? 'green' : 'gray'}>{prefix}</Text>
+                <Text> </Text>
+                <Text color="blue">{entry.row.expanded ? '▾' : '▸'} </Text>
+                <Text color="cyan">{entry.row.label}</Text>
+                <Text color="white">: {entry.row.value}</Text>
+              </Text>
+            )
+          }
+
+          if (entry.row.kind === 'branch-child') {
+            return (
+              <Text key={entry.row.key}>
+                <Text color={isSelected ? 'green' : 'gray'}>{prefix}</Text>
+                <Text color="blue">   └─ </Text>
+                <Text color={isSelected ? 'green' : 'white'}>{entry.row.label}</Text>
+              </Text>
+            )
+          }
+
           return (
-            <Text key={row.key} color={isSelected ? 'green' : undefined}>
-              {(isSelected ? '>' : ' ')} {row.label}: {row.value}
+            <Text key={entry.row.key}>
+              <Text color={isSelected ? 'green' : 'gray'}>{prefix}</Text>
+              <Text color={isSelected ? 'green' : 'yellow'}>{` ┏━ ${entry.row.label} ━┓`}</Text>
             </Text>
           )
         })}
       </Box>
-
-      {gatewayRows.length > 0 ? (
-        <Box borderStyle="round" borderColor="blue" paddingX={1} flexDirection="column">
-          <Text color="cyan">Gateway Picker</Text>
-          {gatewayRows.map((entry) => {
-            const row = entry.row
-            return (
-              <Text key={row.key} color={selected(entry.index) ? 'green' : undefined}>
-                {selected(entry.index) ? '>' : ' '} {row.label}
-              </Text>
-            )
-          })}
-        </Box>
-      ) : null}
-
-      {relayRows.length > 0 ? (
-        <Box borderStyle="round" borderColor="blue" paddingX={1} flexDirection="column">
-          <Text color="cyan">Relay Picker</Text>
-          {relayRows.map((entry) => {
-            const row = entry.row
-            return (
-              <Text key={row.key} color={selected(entry.index) ? 'green' : undefined}>
-                {selected(entry.index) ? '>' : ' '} {row.label}
-              </Text>
-            )
-          })}
-        </Box>
-      ) : null}
-
-      {submitRow ? (
-        <Box>
-          <Text color={selected(submitRow.index) ? 'green' : 'yellow'}>
-            {selected(submitRow.index) ? '>' : ' '} {`┏━ ${submitRow.row.label} ━┓`}
-          </Text>
-        </Box>
-      ) : null}
     </Box>
   )
 }
