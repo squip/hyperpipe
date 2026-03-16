@@ -376,6 +376,7 @@ type DetailTableColumn = {
   minWidth: number
   priority: number
   align?: 'left' | 'right' | 'center'
+  grow?: number
   headerColor?: DetailSegment['color']
   cellColor?: DetailSegment['color']
 }
@@ -410,7 +411,8 @@ function formatGridDetailTable(input: {
       label: column.label,
       minWidth: column.minWidth,
       priority: column.priority,
-      align: column.align || 'left'
+      align: column.align || 'left',
+      grow: column.grow
     })),
     rows: input.rows,
     width: formatWidth,
@@ -430,7 +432,8 @@ function formatGridDetailTable(input: {
         label: column.label,
         minWidth: column.minWidth,
         priority: column.priority,
-        align: column.align || 'left'
+        align: column.align || 'left',
+        grow: column.grow
       })),
       rows: input.rows,
       width: formatWidth,
@@ -1494,6 +1497,19 @@ function groupDisplayName(group: any): string {
   return String(group?.name || group?.id || '-')
 }
 
+function formatCompactLocalDateTime(unixSeconds: number | null | undefined): string {
+  const seconds = Number(unixSeconds ?? 0)
+  if (!Number.isFinite(seconds) || seconds <= 0) return '-'
+  const date = new Date(seconds * 1000)
+  if (!Number.isFinite(date.getTime())) return '-'
+  const year = String(date.getFullYear())
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  const hours = String(date.getHours()).padStart(2, '0')
+  const minutes = String(date.getMinutes()).padStart(2, '0')
+  return `${year}-${month}-${day} ${hours}:${minutes}`
+}
+
 function joinRequestsForGroup(state: ControllerState, group: any): GroupJoinRequest[] {
   if (!group?.id) return []
   const relay = String(group.relay || '').trim()
@@ -2489,6 +2505,14 @@ export function App({
   const rightBottomSpecialRows = useMemo<DetailRenderRow[] | null>(() => {
     if (!state) return null
 
+    if (selectedRightTopAction.startsWith('Send Invite')) {
+      return [{
+        key: 'invite:compose:hint',
+        kind: 'plain',
+        text: 'Press Enter to compose new invite'
+      }]
+    }
+
     if (joinRequestReviewState) {
       const request = joinRequestReviewState.request
       const segments = [
@@ -2598,6 +2622,13 @@ export function App({
           noItemsLabel: 'No member list available'
         })
       }
+      if (selectedRightTopAction.startsWith('Join Relay')) {
+        return [{
+          key: 'join:relay:hint',
+          kind: 'plain',
+          text: 'Press Enter to join this relay'
+        }]
+      }
       if (selectedRightTopAction.startsWith('Request Invite')) {
         return [{
           key: 'request:invite:hint',
@@ -2647,13 +2678,13 @@ export function App({
           width: rightBottomWrapWidth,
           title: `Notes for: ${groupName}`,
           columns: [
-            { key: 'publishedDate', label: 'Published date', minWidth: 20, priority: 0, cellColor: 'white' },
-            { key: 'author', label: 'Author', minWidth: 10, priority: 1, cellColor: 'cyan' },
-            { key: 'note', label: 'Note', minWidth: 20, priority: 2, cellColor: 'white' }
+            { key: 'publishedDate', label: 'Published date', minWidth: 16, priority: 1, grow: 0, cellColor: 'white' },
+            { key: 'author', label: 'Author', minWidth: 15, priority: 2, grow: 0, cellColor: 'cyan' },
+            { key: 'note', label: 'Note', minWidth: 20, priority: 0, grow: 1, cellColor: 'white' }
           ],
           rows: notes.map((note) => ({
-            publishedDate: new Date(note.createdAt * 1000).toLocaleString(),
-            author: shortId(note.authorPubkey, 10),
+            publishedDate: formatCompactLocalDateTime(note.createdAt),
+            author: shortId(note.authorPubkey, 7),
             note: shortText(note.content, 160)
           })),
           showHeader: true,

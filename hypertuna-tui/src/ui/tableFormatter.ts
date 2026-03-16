@@ -6,6 +6,7 @@ export type TableColumn = {
   minWidth: number
   priority: number
   align?: TableAlign
+  grow?: number
 }
 
 export type TableRowView = Record<string, string | number | boolean | null | undefined>
@@ -123,12 +124,42 @@ function allocateWidths(columns: TableColumn[], rows: TableRowView[], width: num
     remaining -= 1
   }
 
-  // If we still have space, distribute evenly to avoid ragged layouts.
-  let cursor = 0
-  while (remaining > 0 && widths.length > 0) {
-    widths[cursor] += 1
-    remaining -= 1
-    cursor = (cursor + 1) % widths.length
+  if (remaining > 0 && widths.length > 0) {
+    const weightedColumns = columns
+      .map((column, index) => ({
+        index,
+        weight: Math.max(0, Number.isFinite(Number(column.grow)) ? Number(column.grow) : 1)
+      }))
+      .filter((entry) => entry.weight > 0)
+
+    if (weightedColumns.length === 0) {
+      // If all columns opt out of growth, keep current widths.
+      remaining = 0
+    } else {
+      const totalWeight = weightedColumns.reduce((acc, entry) => acc + entry.weight, 0)
+      const additions = widths.map(() => 0)
+      let distributed = 0
+
+      weightedColumns.forEach((entry) => {
+        const share = Math.floor((remaining * entry.weight) / totalWeight)
+        additions[entry.index] = share
+        distributed += share
+      })
+
+      let leftover = remaining - distributed
+      let cursor = 0
+      while (leftover > 0) {
+        const entry = weightedColumns[cursor % weightedColumns.length]
+        additions[entry.index] += 1
+        leftover -= 1
+        cursor += 1
+      }
+
+      additions.forEach((value, index) => {
+        widths[index] += value
+      })
+      remaining = 0
+    }
   }
 
   return widths

@@ -49,6 +49,28 @@ describe('tableFormatter', () => {
     expect(table.rowLines[0]).toBe('   12    ')
   })
 
+  it('applies remaining width to columns with grow weight', () => {
+    const table = formatTableRows({
+      columns: [
+        { key: 'date', label: 'Date', minWidth: 16, priority: 0, grow: 0 },
+        { key: 'author', label: 'Author', minWidth: 15, priority: 1, grow: 0 },
+        { key: 'note', label: 'Note', minWidth: 20, priority: 0, grow: 1 }
+      ],
+      rows: [
+        {
+          date: '2026-03-12 20:05',
+          author: 'b0f4e20…34c5e5a',
+          note: 'hello'
+        }
+      ],
+      width: 80
+    })
+
+    expect(table.widths[0]).toBe(16)
+    expect(table.widths[1]).toBe(15)
+    expect(table.widths[2]).toBeGreaterThan(20)
+  })
+
   it('detects key/value style rows and formats as a two-column table', () => {
     const lines = [
       'id: npub123',
