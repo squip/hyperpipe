@@ -175,6 +175,10 @@ function fileRecordKey(file: GroupFileRecord): string {
   return String(file.sha256 || file.eventId || `${file.groupId}:${file.fileName || ''}`).trim().toLowerCase()
 }
 
+function scopedGroupKey(groupId: string, relay?: string | null): string {
+  return `${String(relay || '').trim()}|${String(groupId || '').trim()}`
+}
+
 function emptyState(): ControllerState {
   return {
     initialized: false,
@@ -377,6 +381,7 @@ export class MockController implements AppController {
   private rawFeed: Event[] = []
   private rawGroups: GroupSummary[] = []
   private rawFiles: GroupFileRecord[] = []
+  private chatThreadByConversation = new Map<string, ThreadMessage[]>()
 
   constructor(options: RuntimeOptions, state?: Partial<ControllerState>) {
     this.options = options
@@ -410,6 +415,12 @@ export class MockController implements AppController {
     this.rawFeed = [...this.state.feed]
     this.rawGroups = [...(this.state.groupDiscover.length ? this.state.groupDiscover : this.state.groups)]
     this.rawFiles = [...this.state.files]
+    for (const message of this.state.threadMessages) {
+      const conversationId = String(message.conversationId || '').trim()
+      if (!conversationId) continue
+      const existing = this.chatThreadByConversation.get(conversationId) || []
+      this.chatThreadByConversation.set(conversationId, [...existing, { ...message }])
+    }
     if (!this.state.activeFeedRelays.length) {
       this.state.activeFeedRelays = this.state.relays
         .map((relay) => relay.connectionUrl)
@@ -1045,26 +1056,69 @@ export class MockController implements AppController {
   async refreshGroupNotes(groupId: string, relay?: string): Promise<void> {
     const key = String(groupId || '').trim()
     if (!key) return
-    const note: GroupNoteRecord = {
-      eventId: `note-${hex64(`${key}:${Date.now()}`).slice(0, 16)}`,
-      groupId: key,
-      relay: relay || null,
-      content: `mock group note ${new Date().toISOString()}`,
-      createdAt: nowSec(),
-      authorPubkey: this.state.session?.pubkey || shortPubkeySeed('note-author'),
-      event: makeEvent({
-        idSeed: `note:${key}:${Date.now()}`,
-        pubkey: this.state.session?.pubkey || shortPubkeySeed('note-author'),
-        kind: 1,
-        content: `mock group note for ${key}`
-      })
-    }
+    const scopedKey = scopedGroupKey(key, relay || null)
+    const existing = this.state.groupNotesByGroupKey[scopedKey]
+      || this.state.groupNotesByGroupKey[key]
+      || []
+    const notes = existing.length > 0
+      ? existing
+      : [{
+          eventId: `note-${hex64(`${key}:${Date.now()}`).slice(0, 16)}`,
+          groupId: key,
+          relay: relay || null,
+          content: `mock group note ${new Date().toISOString()}`,
+          createdAt: nowSec(),
+          authorPubkey: this.state.session?.pubkey || shortPubkeySeed('note-author'),
+          event: makeEvent({
+            idSeed: `note:${key}:${Date.now()}`,
+            pubkey: this.state.session?.pubkey || shortPubkeySeed('note-author'),
+            kind: 1,
+            content: `mock group note for ${key}`
+          })
+        } satisfies GroupNoteRecord]
     this.patch({
       groupNotesByGroupKey: {
         ...this.state.groupNotesByGroupKey,
-        [key]: [note, ...(this.state.groupNotesByGroupKey[key] || [])]
+        [scopedKey]: notes.map((entry) => ({ ...entry })),
+        [key]: notes.map((entry) => ({ ...entry }))
       }
     })
+  }
+
+  async publishGroupNote(input: { groupId: string; relayUrl: string; content: string }): Promise<Event> {
+    const groupId = String(input.groupId || '').trim()
+    const relayUrl = String(input.relayUrl || '').trim()
+    const content = String(input.content || '').trim()
+    if (!groupId) throw new Error('groupId is required')
+    if (!relayUrl) throw new Error('relayUrl is required')
+    if (!content) throw new Error('Note content is required')
+
+    const sessionPubkey = this.state.session?.pubkey || shortPubkeySeed('note-author')
+    const event = makeEvent({
+      idSeed: `publish-note:${groupId}:${relayUrl}:${content}:${Date.now()}`,
+      pubkey: sessionPubkey,
+      kind: 1,
+      content,
+      tags: [['h', groupId]]
+    })
+    const record: GroupNoteRecord = {
+      eventId: event.id,
+      groupId,
+      relay: relayUrl,
+      content,
+      createdAt: Number(event.created_at || nowSec()),
+      authorPubkey: sessionPubkey,
+      event
+    }
+    const scopedKey = scopedGroupKey(groupId, relayUrl)
+    this.patch({
+      groupNotesByGroupKey: {
+        ...this.state.groupNotesByGroupKey,
+        [scopedKey]: [record, ...(this.state.groupNotesByGroupKey[scopedKey] || [])],
+        [groupId]: [record, ...(this.state.groupNotesByGroupKey[groupId] || [])]
+      }
+    })
+    return event
   }
 
   async downloadGroupFile(input: {
@@ -2256,32 +2310,43 @@ export class MockController implements AppController {
   }
 
   async loadChatThread(conversationId: string): Promise<void> {
-    const base: ThreadMessage[] = [
-      {
-        id: `msg-${hex64(conversationId).slice(0, 8)}`,
-        conversationId,
-        senderPubkey: this.state.session?.pubkey || shortPubkeySeed('anonymous'),
-        content: `thread for ${conversationId}`,
-        timestamp: nowSec(),
-        type: 'text'
-      }
-    ]
-
-    this.patch({ threadMessages: base })
+    const key = String(conversationId || '').trim()
+    if (!key) throw new Error('conversationId is required')
+    const existing = this.chatThreadByConversation.get(key) || []
+    if (existing.length === 0) {
+      const base: ThreadMessage[] = [
+        {
+          id: `msg-${hex64(key).slice(0, 8)}`,
+          conversationId: key,
+          senderPubkey: this.state.session?.pubkey || shortPubkeySeed('anonymous'),
+          content: `thread for ${key}`,
+          timestamp: nowSec(),
+          type: 'text'
+        }
+      ]
+      this.chatThreadByConversation.set(key, base)
+      this.patch({ threadMessages: base })
+      return
+    }
+    this.patch({ threadMessages: existing.map((entry) => ({ ...entry })) })
   }
 
   async sendChatMessage(conversationId: string, content: string): Promise<void> {
+    const key = String(conversationId || '').trim()
+    if (!key) throw new Error('conversationId is required')
     const message: ThreadMessage = {
-      id: `msg-${hex64(`${conversationId}:${content}`)}`,
-      conversationId,
+      id: `msg-${hex64(`${key}:${content}`)}`,
+      conversationId: key,
       senderPubkey: this.state.session?.pubkey || shortPubkeySeed('anonymous'),
       content,
       timestamp: nowSec(),
       type: 'text'
     }
 
+    const nextThread = [...(this.chatThreadByConversation.get(key) || []), message]
+    this.chatThreadByConversation.set(key, nextThread)
     this.patch({
-      threadMessages: [...this.state.threadMessages, message]
+      threadMessages: nextThread
     })
   }
 

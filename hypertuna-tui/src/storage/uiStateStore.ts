@@ -17,6 +17,7 @@ const defaultAccountScopedUiState = (): AccountScopedUiState => ({
   nodeViewport: {},
   rightTopSelectionByNode: {},
   rightBottomOffsetByNode: {},
+  profileNameCacheByPubkey: {},
   discoveryRelays: uniqueRelayUrls(DEFAULT_DISCOVERY_RELAYS),
   feedSource: {
     mode: 'relays',
@@ -152,6 +153,12 @@ export class UiStateStore {
         ...defaultAccountScopedUiState().rightBottomOffsetByNode,
         ...((raw as { rightBottomOffsetByNode?: Record<string, number> }).rightBottomOffsetByNode || {})
       },
+      profileNameCacheByPubkey: {
+        ...defaultAccountScopedUiState().profileNameCacheByPubkey,
+        ...((raw as {
+          profileNameCacheByPubkey?: Record<string, { name?: string; bio?: string | null; updatedAt?: number }>
+        }).profileNameCacheByPubkey || {})
+      },
       discoveryRelays: uniqueRelayUrls(
         ((raw as { discoveryRelays?: string[] }).discoveryRelays || defaultAccountScopedUiState().discoveryRelays)
       )
@@ -185,6 +192,10 @@ export class UiStateStore {
       rightBottomOffsetByNode: {
         ...previous.rightBottomOffsetByNode,
         ...(patch.rightBottomOffsetByNode || {})
+      },
+      profileNameCacheByPubkey: {
+        ...previous.profileNameCacheByPubkey,
+        ...(patch.profileNameCacheByPubkey || {})
       },
       treeExpanded: {
         ...previous.treeExpanded,

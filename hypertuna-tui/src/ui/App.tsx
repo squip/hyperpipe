@@ -84,6 +84,7 @@ export interface AppController extends CommandController {
   setRightTopSelection(nodeId: string, index: number): Promise<void>
   setDiscoveryRelayUrls(relays: string[]): Promise<void>
   publishProfileMetadata(input: { name: string; about?: string; relays?: string[] }): Promise<void>
+  publishGroupNote(input: { groupId: string; relayUrl: string; content: string }): Promise<unknown>
 }
 
 export type ScriptedCommand = {
@@ -145,6 +146,20 @@ type InviteComposeState = {
   query: string
   suggestions: ProfileSuggestion[]
   suggestionIndex: number
+  busy: boolean
+  status: string
+}
+
+type NoteComposeTarget = {
+  kind: 'group' | 'chat'
+  id: string
+  relayUrl: string | null
+  name: string
+}
+
+type NoteComposeState = {
+  target: NoteComposeTarget
+  content: string
   busy: boolean
   status: string
 }
@@ -645,6 +660,7 @@ function keyValueTableRows(lines: string[]): TableRowView[] {
 }
 
 function buildJoinRequestTableRows(input: {
+  state: ControllerState
   width: number
   title: string
   requests: GroupJoinRequest[]
@@ -658,7 +674,7 @@ function buildJoinRequestTableRows(input: {
   const rows = input.requests.map((request) => ({
     review: 'Review',
     date: new Date(request.createdAt * 1000).toLocaleString(),
-    from: shortId(request.pubkey, 12)
+    from: formatPubkeyDisplay(input.state, request.pubkey, 12)
   }))
   const table = formatGridDetailTable({
     width: input.width,
@@ -820,6 +836,9 @@ function projectRightTopTableRow(
     if (node === 'invites:chat') {
       return { chat: `${lead} ${row.label}`, status: '', from: '' }
     }
+    if (node === 'chats') {
+      return { chat: `${lead} ${row.label}`, unread: '' }
+    }
     if (node === 'files' || isFileTypeNodeId(node)) {
       return { name: `${lead} ${row.label}`, mime: '', size: '', relay: '', by: '' }
     }
@@ -860,7 +879,7 @@ function projectRightTopTableRow(
     return {
       relay: `${lead} ${invite.groupName || invite.groupId || '-'}`,
       members: `${members}`,
-      from: shortId(invite.event?.pubkey || '-', 8)
+      from: formatPubkeyDisplay(state, invite.event?.pubkey || '-', 8)
     }
   }
 
@@ -869,7 +888,7 @@ function projectRightTopTableRow(
     return {
       chat: `${lead} ${invite.title || invite.id || '-'}`,
       status: invite.status || '-',
-      from: shortId(invite.senderPubkey || '-', 8)
+      from: formatPubkeyDisplay(state, invite.senderPubkey || '-', 8)
     }
   }
 
@@ -880,7 +899,7 @@ function projectRightTopTableRow(
       mime: file.mime || '-',
       size: `${Number(file.size || 0)}B`,
       relay: shortText(file.groupName || file.groupId, 18),
-      by: shortId(file.uploadedBy || '-', 8)
+      by: formatPubkeyDisplay(state, file.uploadedBy || '-', 8)
     }
   }
 
@@ -896,7 +915,7 @@ function projectRightTopTableRow(
     const account = row.centerRow.data as any
     const marker = state.currentAccountPubkey === account.pubkey ? '*' : ' '
     return {
-      account: `${lead} ${marker} ${shortId(account.pubkey, 10)}`,
+      account: `${lead} ${marker} ${formatPubkeyDisplay(state, account.pubkey, 10)}`,
       signer: account.signerType || '-'
     }
   }
@@ -936,6 +955,18 @@ function clamp(value: number, min: number, max: number): number {
 
 function isHex64(value: string | null | undefined): boolean {
   return /^[a-f0-9]{64}$/i.test(String(value || '').trim())
+}
+
+function formatPubkeyDisplay(state: ControllerState, value: string | null | undefined, shortLength = 12): string {
+  const raw = String(value || '').trim()
+  const normalized = raw.toLowerCase()
+  if (!isHex64(normalized)) {
+    return raw || '-'
+  }
+  const profile = state.adminProfileByPubkey[normalized] || state.adminProfileByPubkey[raw]
+  const name = String(profile?.name || '').trim()
+  const compact = shortId(normalized, shortLength)
+  return name ? `${name} · ${compact}` : compact
 }
 
 function normalizeHttpOrigin(value: string | null | undefined): string | null {
@@ -1502,7 +1533,7 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
   if (node === 'invites:group') {
     return state.groupInvites.map((invite) => ({
       key: invite.id,
-      label: `${shortText(invite.groupName || invite.groupId, 24)} · members:${invite.event?.tags?.filter((tag) => tag[0] === 'p').length || 0} · by:${shortId(invite.event.pubkey, 8)}`,
+      label: `${shortText(invite.groupName || invite.groupId, 24)} · members:${invite.event?.tags?.filter((tag) => tag[0] === 'p').length || 0} · by:${formatPubkeyDisplay(state, invite.event.pubkey, 8)}`,
       kind: 'group-invite',
       data: invite
     }))
@@ -1511,7 +1542,7 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
   if (node === 'invites:chat') {
     return state.chatInvites.map((invite) => ({
       key: invite.id,
-      label: `${shortText(invite.title || invite.id, 24)} · ${invite.status} · by:${shortId(invite.senderPubkey, 8)}`,
+      label: `${shortText(invite.title || invite.id, 24)} · ${invite.status} · by:${formatPubkeyDisplay(state, invite.senderPubkey, 8)}`,
       kind: 'chat-invite',
       data: invite
     }))
@@ -1525,7 +1556,7 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
     return filtered.map((file, idx) => ({
       key: `${file.eventId}-${idx}`,
       label:
-        `${shortText(file.fileName, 24)} · ${file.mime || '-'} · ${Number(file.size || 0)}B · ${shortText(file.groupName || file.groupId, 16)} · by:${shortId(file.uploadedBy, 8)}`,
+        `${shortText(file.fileName, 24)} · ${file.mime || '-'} · ${Number(file.size || 0)}B · ${shortText(file.groupName || file.groupId, 16)} · by:${formatPubkeyDisplay(state, file.uploadedBy, 8)}`,
       kind: 'file',
       data: file
     }))
@@ -1534,7 +1565,7 @@ function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[]
   if (node === 'accounts') {
     return state.accounts.map((account, idx) => ({
       key: `${account.pubkey}-${idx}`,
-      label: `${state.currentAccountPubkey === account.pubkey ? '*' : ' '} ${shortId(account.pubkey, 10)} · ${account.signerType}`,
+      label: `${state.currentAccountPubkey === account.pubkey ? '*' : ' '} ${formatPubkeyDisplay(state, account.pubkey, 10)} · ${account.signerType}`,
       kind: 'account',
       data: account
     }))
@@ -1557,6 +1588,7 @@ function splitNode(node: NavNodeId): boolean {
     node === 'groups:browse'
     || node === 'groups:my'
     || node === 'groups:create'
+    || node === 'chats'
     || node === 'chats:create'
     || node === 'invites:group'
     || node === 'invites:chat'
@@ -1581,6 +1613,9 @@ function supportsActionTree(node: NavNodeId): boolean {
 function defaultDetailsAction(node: NavNodeId): string {
   if (node === 'groups:browse' || node === 'groups:my' || node === 'invites:group') {
     return 'Relay Details'
+  }
+  if (node === 'chats') {
+    return 'Notes'
   }
   if (node === 'invites:chat') {
     return 'Chat details'
@@ -1656,14 +1691,24 @@ function fileRowsForGroup(state: ControllerState, group: any): any[] {
   if (!group) return []
   const directKey = groupKey(group.id, group.relay || null)
   const fallbackKey = groupKey(group.id, null)
-  return state.groupFilesByGroupKey[directKey] || state.groupFilesByGroupKey[fallbackKey] || []
+  return (
+    state.groupFilesByGroupKey[directKey]
+    || state.groupFilesByGroupKey[fallbackKey]
+    || state.groupFilesByGroupKey[String(group.id || '').trim()]
+    || []
+  )
 }
 
 function noteRowsForGroup(state: ControllerState, group: any): any[] {
   if (!group) return []
   const directKey = groupKey(group.id, group.relay || null)
   const fallbackKey = groupKey(group.id, null)
-  return state.groupNotesByGroupKey[directKey] || state.groupNotesByGroupKey[fallbackKey] || []
+  return (
+    state.groupNotesByGroupKey[directKey]
+    || state.groupNotesByGroupKey[fallbackKey]
+    || state.groupNotesByGroupKey[String(group.id || '').trim()]
+    || []
+  )
 }
 
 function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: CenterRow | null): string[] {
@@ -1741,7 +1786,7 @@ function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: C
   }
   if (node === 'chats') {
     if (!selectedRow) return []
-    return ['Send Invite']
+    return ['Notes', 'Send Invite']
   }
   if (node === 'files' || isFileTypeNodeId(node)) {
     return ['Download', 'Delete']
@@ -1752,8 +1797,8 @@ function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: C
 function singleRightRows(state: ControllerState, node: NavNodeId, selectedRow: CenterRow | null): string[] {
   if (node === 'dashboard') {
     return [
-      `Current account: ${state.currentAccountPubkey ? shortId(state.currentAccountPubkey, 10) : 'none'}`,
-      `Session: ${state.session ? shortId(state.session.pubkey, 10) : 'locked'}`,
+      `Current account: ${state.currentAccountPubkey ? formatPubkeyDisplay(state, state.currentAccountPubkey, 10) : 'none'}`,
+      `Session: ${state.session ? formatPubkeyDisplay(state, state.session.pubkey, 10) : 'locked'}`,
       `Worker: ${state.lifecycle}`,
       `Status: ${shortText(state.readinessMessage, 120)}`,
       `Relays: ${state.relays.length}`,
@@ -1783,7 +1828,7 @@ function singleRightRows(state: ControllerState, node: NavNodeId, selectedRow: C
     const account = selectedRow?.data as any
     if (!account) return ['No account selected']
     return [
-      `pubkey: ${account.pubkey}`,
+      `pubkey: ${formatPubkeyDisplay(state, account.pubkey, 12)}`,
       `signer: ${account.signerType}`,
       `label: ${account.label || '-'}`,
       `created: ${new Date(account.createdAt).toLocaleString()}`,
@@ -1821,7 +1866,7 @@ function splitBottomRows(
       return [
         `name: ${profile?.name || group.adminName || '-'}`,
         `bio: ${profile?.bio || '-'}`,
-        `pubkey: ${group.adminPubkey || group.event?.pubkey || '-'}`,
+        `pubkey: ${formatPubkeyDisplay(state, group.adminPubkey || group.event?.pubkey || '-', 12)}`,
         `followers: ${Number.isFinite(profile?.followersCount) ? profile.followersCount : '-'}`
       ]
     }
@@ -1865,20 +1910,43 @@ function splitBottomRows(
     if (selectedAction.startsWith('Notes')) {
       const notes = noteRowsForGroup(state, group)
       if (!notes.length) return ['No relay notes loaded']
-      return notes.map((note) => `${new Date(note.createdAt * 1000).toLocaleString()} · ${shortId(note.authorPubkey, 8)} · ${shortText(note.content, 120)}`)
+      return notes.map((note) => `${new Date(note.createdAt * 1000).toLocaleString()} · ${formatPubkeyDisplay(state, note.authorPubkey, 8)} · ${shortText(note.content, 120)}`)
     }
     if (selectedAction.startsWith('Files')) {
       const files = fileRowsForGroup(state, group)
       if (!files.length) return ['No relay files loaded']
-      return files.map((file) => `${shortText(file.fileName, 42)} · ${file.mime || '-'} · ${Number(file.size || 0)}B · by:${shortId(file.uploadedBy, 8)}`)
+      return files.map((file) => `${shortText(file.fileName, 42)} · ${file.mime || '-'} · ${Number(file.size || 0)}B · by:${formatPubkeyDisplay(state, file.uploadedBy, 8)}`)
     }
     if (selectedAction.startsWith('Join Requests')) {
       const byRelayKey = group.relay ? `${group.relay}|${group.id}` : group.id
       const requests = state.groupJoinRequests[byRelayKey] || state.groupJoinRequests[group.id] || []
       if (!requests.length) return ['No pending join requests']
-      return requests.map((request) => `${shortId(request.pubkey, 10)} · ${new Date(request.createdAt * 1000).toLocaleString()}`)
+      return requests.map((request) => `${formatPubkeyDisplay(state, request.pubkey, 10)} · ${new Date(request.createdAt * 1000).toLocaleString()}`)
     }
     return ['No details']
+  }
+
+  if (node === 'chats') {
+    const row = selectedRow?.data as any
+    if (!row) return ['No conversation selected']
+    if (selectedAction.startsWith('Notes')) {
+      const messages = state.threadMessages
+        .filter((entry) => entry.conversationId === row.id)
+        .sort((left, right) => Number(left.timestamp || 0) - Number(right.timestamp || 0))
+      if (!messages.length) return ['No chat notes loaded']
+      return messages.map((entry) => `${new Date(Number(entry.timestamp || 0) * 1000).toLocaleString()} · ${formatPubkeyDisplay(state, entry.senderPubkey, 8)} · ${shortText(entry.content, 120)}`)
+    }
+    if (selectedAction.startsWith('Send Invite')) {
+      return [paneActionMessage || 'Press Enter to compose new invite']
+    }
+    return [
+      `id: ${row.id}`,
+      `title: ${row.title || '-'}`,
+      `participants: ${Array.isArray(row.participants) ? row.participants.length : 0}`,
+      `admins: ${Array.isArray(row.adminPubkeys) ? row.adminPubkeys.length : 0}`,
+      `unread: ${row.unreadCount || 0}`,
+      `last message: ${row.lastMessagePreview || '-'}`
+    ]
   }
 
   if (node === 'groups:create') {
@@ -1908,7 +1976,7 @@ function splitBottomRows(
         `createdAt: ${invite.event?.created_at ? new Date(invite.event.created_at * 1000).toLocaleString() : '-'}`,
         `visibility: ${invite.isPublic === false ? 'private' : 'public'}`,
         `membership: ${invite.fileSharing === false ? 'closed' : 'open'}`,
-        `admin: ${invite.event?.pubkey || '-'}`,
+        `admin: ${formatPubkeyDisplay(state, invite.event?.pubkey || '-', 12)}`,
         `members: -`
       ]
     }
@@ -1917,7 +1985,7 @@ function splitBottomRows(
       return [
         `name: ${profile?.name || '-'}`,
         `bio: ${profile?.bio || '-'}`,
-        `pubkey: ${invite.event?.pubkey || '-'}`,
+        `pubkey: ${formatPubkeyDisplay(state, invite.event?.pubkey || '-', 12)}`,
         `followers: ${Number.isFinite(profile?.followersCount) ? profile.followersCount : '-'}`
       ]
     }
@@ -1947,7 +2015,7 @@ function splitBottomRows(
       return [
         `name: ${profile?.name || '-'}`,
         `bio: ${profile?.bio || '-'}`,
-        `pubkey: ${invite.senderPubkey || '-'}`,
+        `pubkey: ${formatPubkeyDisplay(state, invite.senderPubkey || '-', 12)}`,
         `followers: ${Number.isFinite(profile?.followersCount) ? profile.followersCount : '-'}`
       ]
     }
@@ -1980,7 +2048,7 @@ function splitBottomRows(
       `mime: ${file.mime || '-'}`,
       `size: ${file.size || 0}`,
       `uploadedAt: ${new Date(file.uploadedAt * 1000).toLocaleString()}`,
-      `uploadedBy: ${file.uploadedBy}`,
+      `uploadedBy: ${formatPubkeyDisplay(state, file.uploadedBy, 12)}`,
       `sha256: ${file.sha256 || '-'}`,
       `url: ${file.url || '-'}`
     ]
@@ -2158,6 +2226,7 @@ export function App({
     relayUrls: []
   })
   const [dashboardEditState, setDashboardEditState] = useState<DashboardEditState | null>(null)
+  const [noteComposeState, setNoteComposeState] = useState<NoteComposeState | null>(null)
   const [inviteComposeState, setInviteComposeState] = useState<InviteComposeState | null>(null)
   const [joinRequestCursorByGroupKey, setJoinRequestCursorByGroupKey] = useState<Record<string, number>>({})
   const [joinRequestReviewState, setJoinRequestReviewState] = useState<JoinRequestReviewState | null>(null)
@@ -2179,11 +2248,13 @@ export function App({
   })
   const createEditStateRef = useRef<CreateEditState | null>(null)
   const dashboardEditStateRef = useRef<DashboardEditState | null>(null)
+  const noteComposeStateRef = useRef<NoteComposeState | null>(null)
   const inviteComposeStateRef = useRef<InviteComposeState | null>(null)
   const startupGateRef = useRef<StartupGateState | null>(null)
   const startupGateInitializedRef = useRef(false)
   const selectedCenterRowRef = useRef<CenterRow | null>(null)
   const myGroupPaneLoadKeyRef = useRef<string>('')
+  const chatPaneLoadKeyRef = useRef<string>('')
 
   useEffect(() => {
     exitRef.current = exit
@@ -2270,6 +2341,10 @@ export function App({
   }, [dashboardEditState])
 
   useEffect(() => {
+    noteComposeStateRef.current = noteComposeState
+  }, [noteComposeState])
+
+  useEffect(() => {
     inviteComposeStateRef.current = inviteComposeState
   }, [inviteComposeState])
 
@@ -2347,6 +2422,7 @@ export function App({
       relayUrls: []
     })
     setDashboardEditState(null)
+    setNoteComposeState(null)
     setInviteComposeState(null)
     setJoinRequestCursorByGroupKey({})
     setJoinRequestReviewState(null)
@@ -2593,6 +2669,37 @@ export function App({
     return null
   }, [state, selectedNode, selectedCenterRow, selectedRightTopAction])
 
+  const selectedNoteComposeTarget = useMemo<NoteComposeTarget | null>(() => {
+    if (!state || !selectedCenterRow) return null
+    if (!selectedRightTopAction.startsWith('Notes')) return null
+
+    if (selectedNode === 'groups:my' && selectedCenterRow.kind === 'group') {
+      const group = selectedCenterRow.data as any
+      const relay = relayForGroup(state, group)
+      const relayUrl = String(relay?.connectionUrl || group?.relay || '').trim()
+      if (!group?.id || !relayUrl) return null
+      return {
+        kind: 'group',
+        id: group.id,
+        relayUrl,
+        name: groupDisplayName(group)
+      }
+    }
+
+    if (selectedNode === 'chats' && selectedCenterRow.kind === 'chat-conversation') {
+      const conversation = selectedCenterRow.data as any
+      if (!conversation?.id) return null
+      return {
+        kind: 'chat',
+        id: conversation.id,
+        relayUrl: null,
+        name: String(conversation.title || conversation.id || 'Chat')
+      }
+    }
+
+    return null
+  }, [state, selectedNode, selectedCenterRow, selectedRightTopAction])
+
   useEffect(() => {
     if (!state || selectedNode !== 'groups:my') {
       myGroupPaneLoadKeyRef.current = ''
@@ -2619,6 +2726,25 @@ export function App({
     } else if (actionName.startsWith('Join Requests')) {
       controller.refreshJoinRequests(group.id, relay || undefined).catch(() => {})
     }
+  }, [state, selectedNode, selectedCenterRow, selectedRightTopAction])
+
+  useEffect(() => {
+    if (!state || selectedNode !== 'chats') {
+      chatPaneLoadKeyRef.current = ''
+      return
+    }
+    if (!selectedCenterRow || selectedCenterRow.kind !== 'chat-conversation') return
+    if (!selectedRightTopAction.startsWith('Notes')) return
+    const controller = controllerRef.current
+    if (!controller) return
+
+    const conversation = selectedCenterRow.data as any
+    const conversationId = String(conversation?.id || '').trim()
+    if (!conversationId) return
+    const key = `${conversationId}|${selectedRightTopAction}`
+    if (chatPaneLoadKeyRef.current === key) return
+    chatPaneLoadKeyRef.current = key
+    controller.loadChatThread(conversationId).catch(() => {})
   }, [state, selectedNode, selectedCenterRow, selectedRightTopAction])
 
   useEffect(() => {
@@ -2674,6 +2800,13 @@ export function App({
       clearTimeout(timer)
     }
   }, [inviteComposeState])
+
+  useEffect(() => {
+    if (!noteComposeState) return
+    if (selectedNode === 'groups:my' || selectedNode === 'chats') return
+    noteComposeStateRef.current = null
+    setNoteComposeState(null)
+  }, [selectedNode, noteComposeState])
 
   useEffect(() => {
     if (!inviteComposeState) return
@@ -2765,7 +2898,7 @@ export function App({
         {
           key: 'join-review:from',
           kind: 'plain' as const,
-          text: `From: ${request.pubkey}`
+          text: `From: ${formatPubkeyDisplay(state, request.pubkey, 12)}`
         },
         {
           key: 'join-review:date',
@@ -2815,6 +2948,33 @@ export function App({
       return segments
     }
 
+    if (selectedNode === 'chats' && selectedCenterRow?.kind === 'chat-conversation') {
+      const conversation = selectedCenterRow.data as any
+      const conversationName = String(conversation?.title || conversation?.id || 'Chat')
+      if (selectedRightTopAction.startsWith('Notes')) {
+        const messages = state.threadMessages
+          .filter((entry) => entry.conversationId === conversation.id)
+          .sort((left, right) => Number(left.timestamp || 0) - Number(right.timestamp || 0))
+        return buildSegmentedTableRows({
+          width: rightBottomWrapWidth,
+          title: `Notes for: ${conversationName}`,
+          columns: [
+            { key: 'publishedDate', label: 'Published date', minWidth: 16, priority: 1, grow: 0, cellColor: 'white' },
+            { key: 'author', label: 'Author', minWidth: 15, priority: 2, grow: 0, cellColor: 'cyan' },
+            { key: 'note', label: 'Note', minWidth: 20, priority: 0, grow: 1, cellColor: 'white' }
+          ],
+          rows: messages.map((entry) => ({
+            publishedDate: formatCompactLocalDateTime(entry.timestamp),
+            author: formatPubkeyDisplay(state, entry.senderPubkey, 7),
+            note: shortText(entry.content, 160)
+          })),
+          showHeader: true,
+          noItemsLabel: 'No chat notes loaded'
+        })
+      }
+      return null
+    }
+
     if (!selectedCenterRow || selectedCenterRow.kind !== 'group') return null
     const group = selectedCenterRow.data as any
     const groupName = groupDisplayName(group)
@@ -2844,7 +3004,7 @@ export function App({
           rows: keyValueTableRows([
             `name: ${profile?.name || group.adminName || '-'}`,
             `bio: ${profile?.bio || '-'}`,
-            `pubkey: ${group.adminPubkey || group.event?.pubkey || '-'}`,
+            `pubkey: ${formatPubkeyDisplay(state, group.adminPubkey || group.event?.pubkey || '-', 12)}`,
             `followers: ${Number.isFinite(profile?.followersCount) ? profile.followersCount : '-'}`
           ]),
           showHeader: false
@@ -2925,7 +3085,7 @@ export function App({
           ],
           rows: notes.map((note) => ({
             publishedDate: formatCompactLocalDateTime(note.createdAt),
-            author: shortId(note.authorPubkey, 7),
+            author: formatPubkeyDisplay(state, note.authorPubkey, 7),
             note: shortText(note.content, 160)
           })),
           showHeader: true,
@@ -2946,7 +3106,7 @@ export function App({
           ],
           rows: files.map((file) => ({
             publishedDate: new Date(Number(file.uploadedAt || 0) * 1000).toLocaleString(),
-            author: shortId(file.uploadedBy || '-', 10),
+            author: formatPubkeyDisplay(state, file.uploadedBy || '-', 10),
             file: shortText(file.fileName || '-', 64),
             type: file.mime || '-',
             size: `${Number(file.size || 0)}B`
@@ -2958,6 +3118,7 @@ export function App({
       if (selectedRightTopAction.startsWith('Join Requests')) {
         const requests = joinRequestsForGroup(state, group)
         return buildJoinRequestTableRows({
+          state,
           width: rightBottomWrapWidth,
           title: `Join requests for: ${groupName}`,
           requests,
@@ -3503,6 +3664,70 @@ export function App({
     }
   }
 
+  const openNoteCompose = (target: NoteComposeTarget): void => {
+    const next: NoteComposeState = {
+      target,
+      content: '',
+      busy: false,
+      status: ''
+    }
+    noteComposeStateRef.current = next
+    setNoteComposeState(next)
+  }
+
+  const publishNoteFromCompose = async (): Promise<void> => {
+    const controller = controllerRef.current
+    const compose = noteComposeStateRef.current
+    if (!controller || !compose) return
+    if (compose.busy) return
+    const content = String(compose.content || '').trim()
+    if (!content) {
+      setNoteComposeState((previous) => (
+        previous
+          ? {
+              ...previous,
+              status: 'Note content is required'
+            }
+          : previous
+      ))
+      return
+    }
+
+    try {
+      setNoteComposeState((previous) => previous ? { ...previous, busy: true, status: 'Publishing note…' } : previous)
+      if (compose.target.kind === 'group') {
+        if (!compose.target.relayUrl) {
+          throw new Error('Selected relay has no relay URL')
+        }
+        await controller.publishGroupNote({
+          groupId: compose.target.id,
+          relayUrl: compose.target.relayUrl,
+          content
+        })
+        await controller.refreshGroupNotes(compose.target.id, compose.target.relayUrl)
+      } else {
+        await controller.sendChatMessage(compose.target.id, content)
+        await controller.loadChatThread(compose.target.id)
+      }
+      const successMessage = compose.target.kind === 'group'
+        ? `Published note to ${compose.target.name}`
+        : `Published chat note to ${compose.target.name}`
+      setPaneActionMessage(successMessage)
+      noteComposeStateRef.current = null
+      setNoteComposeState(null)
+    } catch (error) {
+      setNoteComposeState((previous) => (
+        previous
+          ? {
+              ...previous,
+              busy: false,
+              status: error instanceof Error ? error.message : String(error)
+            }
+          : previous
+      ))
+    }
+  }
+
   const openInviteCompose = (target: InviteComposeTarget): void => {
     const next: InviteComposeState = {
       target,
@@ -3561,7 +3786,7 @@ export function App({
           throw new Error(result.failed[0]?.error || 'Invite failed')
         }
       }
-      const successMessage = `Invite sent: ${shortId(inviteePubkey, 16)}`
+      const successMessage = `Invite sent: ${formatPubkeyDisplay(state, inviteePubkey, 16)}`
       setPaneActionMessage(successMessage)
       setInviteComposeState((previous) => (
         previous
@@ -3591,16 +3816,16 @@ export function App({
   const executeJoinRequestReviewAction = async (): Promise<void> => {
     const controller = controllerRef.current
     const review = joinRequestReviewState
-    if (!controller || !review || review.busy) return
+    if (!controller || !review || review.busy || !state) return
 
     try {
       setJoinRequestReviewState((previous) => previous ? { ...previous, busy: true, status: 'Processing request…' } : previous)
       if (review.selectedAction === 'approve') {
         await controller.approveJoinRequest(review.groupId, review.request.pubkey, review.relay || undefined)
-        setPaneActionMessage(`Approved join request ${shortId(review.request.pubkey, 12)}`)
+        setPaneActionMessage(`Approved join request ${formatPubkeyDisplay(state, review.request.pubkey, 12)}`)
       } else {
         await controller.rejectJoinRequest(review.groupId, review.request.pubkey, review.relay || undefined)
-        setPaneActionMessage(`Dismissed join request ${shortId(review.request.pubkey, 12)}`)
+        setPaneActionMessage(`Dismissed join request ${formatPubkeyDisplay(state, review.request.pubkey, 12)}`)
       }
       await controller.refreshJoinRequests(review.groupId, review.relay || undefined)
       setJoinRequestReviewState(null)
@@ -3765,6 +3990,15 @@ export function App({
           openDashboardCommandReference()
           return
         }
+      }
+
+      if (selectedRightTopAction.startsWith('Notes')) {
+        if (!selectedNoteComposeTarget) {
+          setPaneActionMessage('No note target selected')
+          return
+        }
+        openNoteCompose(selectedNoteComposeTarget)
+        return
       }
 
       if (selectedRightTopAction.startsWith('Send Invite')) {
@@ -5352,6 +5586,71 @@ export function App({
       return
     }
 
+    const currentNoteCompose = noteComposeStateRef.current
+    const noteComposeActive = Boolean(currentNoteCompose && currentFocus === 'right-top')
+    if (noteComposeActive && currentNoteCompose) {
+      if (key.escape) {
+        noteComposeStateRef.current = null
+        setNoteComposeState(null)
+        return
+      }
+      if (key.return) {
+        publishNoteFromCompose().catch((error) => {
+          setNoteComposeState((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  busy: false,
+                  status: error instanceof Error ? error.message : String(error)
+                }
+              : previous
+          ))
+        })
+        return
+      }
+      if (key.backspace || key.delete) {
+        setNoteComposeState((previous) => {
+          if (!previous) return previous
+          const next = {
+            ...previous,
+            content: previous.content.slice(0, -1),
+            status: ''
+          }
+          noteComposeStateRef.current = next
+          return next
+        })
+        return
+      }
+      if (key.ctrl && input === 'u') {
+        setNoteComposeState((previous) => {
+          if (!previous) return previous
+          const next = {
+            ...previous,
+            content: '',
+            status: ''
+          }
+          noteComposeStateRef.current = next
+          return next
+        })
+        return
+      }
+      if (!key.ctrl && !key.meta && input) {
+        const sanitized = input.replace(/[\r\n\t]/g, '')
+        if (!sanitized) return
+        setNoteComposeState((previous) => {
+          if (!previous) return previous
+          const next = {
+            ...previous,
+            content: `${previous.content}${sanitized}`,
+            status: ''
+          }
+          noteComposeStateRef.current = next
+          return next
+        })
+      }
+      return
+    }
+
     const currentInviteCompose = inviteComposeStateRef.current
     const inviteComposeActive = Boolean(currentInviteCompose && currentFocus === 'right-top')
     if (inviteComposeActive && currentInviteCompose) {
@@ -5879,7 +6178,7 @@ export function App({
                 const marker = state.currentAccountPubkey === account.pubkey ? '*' : ' '
                 return (
                   <Text key={`startup-account:${account.pubkey}:${index}`} color={selected ? 'green' : undefined}>
-                    {selected ? '>' : ' '} [{marker}] {account.label || shortId(account.pubkey, 10)} · {account.signerType}
+                    {selected ? '>' : ' '} [{marker}] {account.label || formatPubkeyDisplay(state, account.pubkey, 10)} · {account.signerType}
                   </Text>
                 )
               })}
@@ -6302,6 +6601,26 @@ export function App({
       )
     }
 
+    if (noteComposeState) {
+      const header = noteComposeState.target.kind === 'group'
+        ? `Publish a new note to the ${noteComposeState.target.name} relay`
+        : `Publish a new note to the ${noteComposeState.target.name} thread`
+      return (
+        <Box flexDirection="column">
+          <Text color="yellow">{header}</Text>
+          <Text dimColor>Press Enter to publish, Esc to cancel.</Text>
+          <Text>{''}</Text>
+          <Text>
+            <Text color="cyan">{'Note: '}</Text>
+            <Text color="white">{noteComposeState.content || '-'}</Text>
+          </Text>
+          <Text>{''}</Text>
+          <Text color="cyan">Publish</Text>
+          <Text dimColor>{`Status: ${noteComposeState.status || 'idle'}`}</Text>
+        </Box>
+      )
+    }
+
     if (inviteComposeState) {
       return (
         <Box flexDirection="column">
@@ -6360,7 +6679,7 @@ export function App({
   }
 
   const keysLabel =
-    'Keys: `:` command, right-top `Enter` expand/execute, dashboard/create/invite edit `Enter` submit and `Esc` cancel, `y` copy value, `Y` copy command, `Tab/Shift+Tab` pane focus, tree `←/→`, list `↑/↓`, right-bottom join-requests `↑/↓` + `Enter` review, `Ctrl+U/Ctrl+D` scroll, `r` refresh, `q` quit'
+    'Keys: `:` command, right-top `Enter` expand/execute, dashboard/create/note/invite edit `Enter` submit and `Esc` cancel, `y` copy value, `Y` copy command, `Tab/Shift+Tab` pane focus, tree `←/→`, list `↑/↓`, right-bottom join-requests `↑/↓` + `Enter` review, `Ctrl+U/Ctrl+D` scroll, `r` refresh, `q` quit'
   const selectedNodeDisplay = displayNodeId(selectedNode)
 
   const commandStatusLabel = state.lastError
@@ -6376,7 +6695,7 @@ export function App({
           <Box borderStyle="round" borderColor={focusPane === 'left-tree' ? 'green' : 'cyan'} paddingX={1} height={navBoxRows} overflow="hidden">
             <Box flexDirection="column">
               <TruncText color="cyan">Hypertuna TUI</TruncText>
-              <TruncText dimColor>account: {state.currentAccountPubkey ? shortId(state.currentAccountPubkey, 8) : 'none'}</TruncText>
+              <TruncText dimColor>account: {state.currentAccountPubkey ? formatPubkeyDisplay(state, state.currentAccountPubkey, 8) : 'none'}</TruncText>
               <TruncText dimColor>session: {state.session ? 'unlocked' : 'locked'} · worker: {state.lifecycle}</TruncText>
               <Box marginTop={1} flexDirection="column">
                 {navRows.map((row, index) => {
@@ -6411,7 +6730,7 @@ export function App({
         <Box height={frameRows.mainRows}>
           <Box width={navPaneWidth} flexDirection="column" borderStyle="round" borderColor={focusPane === 'left-tree' ? 'green' : 'cyan'} paddingX={1} overflow="hidden">
             <TruncText color="cyan">Hypertuna TUI</TruncText>
-            <TruncText dimColor>account: {state.currentAccountPubkey ? shortId(state.currentAccountPubkey, 8) : 'none'}</TruncText>
+            <TruncText dimColor>account: {state.currentAccountPubkey ? formatPubkeyDisplay(state, state.currentAccountPubkey, 8) : 'none'}</TruncText>
             <TruncText dimColor>session: {state.session ? 'unlocked' : 'locked'} · worker: {state.lifecycle}</TruncText>
             <Box marginTop={1} flexDirection="column">
               {navRows.map((row, index) => {

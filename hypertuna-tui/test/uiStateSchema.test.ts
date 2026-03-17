@@ -15,4 +15,18 @@ describe('uiStateSchema focusPane normalization', () => {
 
     expect(parsed.accountScoped[key]?.focusPane).toBe('right-top')
   })
+
+  it('defaults profileNameCacheByPubkey to empty map for legacy account-scoped state', () => {
+    const key = 'legacy-user'
+    const parsed = uiStateSchema.parse({
+      version: 3,
+      accountScoped: {
+        [key]: {
+          selectedNode: 'dashboard'
+        }
+      }
+    })
+
+    expect(parsed.accountScoped[key]?.profileNameCacheByPubkey).toEqual({})
+  })
 })

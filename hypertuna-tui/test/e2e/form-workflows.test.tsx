@@ -227,4 +227,58 @@ describe.sequential('TUI e2e in-pane form workflows', () => {
       instance.unmount()
     }
   })
+
+  it('opens My Relays notes composer and publishes a relay-scoped note', async () => {
+    const controller = MockController.withSeedData(BASE_OPTIONS)
+    await controller.setSelectedNode('groups:my')
+    await controller.setFocusPane('right-top')
+    const instance = render(
+      <App
+        options={BASE_OPTIONS}
+        controllerFactory={() => controller}
+      />
+    )
+
+    try {
+      await waitFor(() => lastFrame(instance).includes('Command'))
+      await pressKey(instance, '\r')
+      await waitFor(() => lastFrame(instance).includes('Notes'))
+      await pressKey(instance, '\u001b[B', 3)
+      await pressKey(instance, '\r')
+      await waitFor(() => lastFrame(instance).includes('Publish a new note to the'))
+      await typeText(instance, 'hello relay note')
+      await pressKey(instance, '\r')
+      await waitFor(() => !lastFrame(instance).includes('Publish a new note to the'))
+      await waitFor(() => lastFrame(instance).includes('hello relay note'))
+    } finally {
+      instance.unmount()
+    }
+  })
+
+  it('opens chat notes composer and publishes to chat thread feed', async () => {
+    const controller = MockController.withSeedData(BASE_OPTIONS)
+    await controller.setSelectedNode('chats')
+    await controller.setFocusPane('right-top')
+    const instance = render(
+      <App
+        options={BASE_OPTIONS}
+        controllerFactory={() => controller}
+      />
+    )
+
+    try {
+      await waitFor(() => lastFrame(instance).includes('Command'))
+      await pressKey(instance, '\r')
+      await waitFor(() => lastFrame(instance).includes('Notes'))
+      await pressKey(instance, '\u001b[B')
+      await pressKey(instance, '\r')
+      await waitFor(() => lastFrame(instance).includes('Publish a new note to the'))
+      await typeText(instance, 'hello chat note')
+      await pressKey(instance, '\r')
+      await waitFor(() => !lastFrame(instance).includes('Publish a new note to the'))
+      await waitFor(() => lastFrame(instance).includes('hello chat note'))
+    } finally {
+      instance.unmount()
+    }
+  })
 })

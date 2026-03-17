@@ -87,4 +87,94 @@ describe('TuiController profile persistence', () => {
 
     await second.shutdown()
   })
+
+  it('hydrates profile name cache from account-scoped UI state when relays return no metadata', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hypertuna-tui-profile-cache-hydrate-'))
+    const options: RuntimeOptions = {
+      cwd: root,
+      storageDir: root,
+      noAnimations: true,
+      logLevel: 'error'
+    }
+
+    const quietStub: NostrStub = {
+      async query(): Promise<Event[]> {
+        return []
+      },
+      async publish(): Promise<void> {
+        // no-op for this test
+      },
+      destroy(): void {
+        // no-op for tests
+      }
+    }
+
+    const first = new TuiController(options)
+    attachNostrStub(first, quietStub)
+    await first.initialize()
+    const generated = await first.generateNsecAccount('cache-hydrate')
+    await first.unlockCurrentAccount()
+    await first.publishProfileMetadata({
+      name: 'Cached Name',
+      about: 'Cached Bio',
+      relays: ['wss://relay.damus.io/']
+    })
+    await first.shutdown()
+
+    const second = new TuiController(options)
+    attachNostrStub(second, quietStub)
+    await second.initialize()
+    await second.unlockCurrentAccount()
+    const profile = second.getState().adminProfileByPubkey[generated.pubkey]
+    expect(profile?.name).toBe('Cached Name')
+    expect(profile?.bio).toBe('Cached Bio')
+    await second.shutdown()
+  })
+
+  it('publishGroupNote publishes kind 1 with h tag to exactly the selected relay', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hypertuna-tui-publish-group-note-'))
+    const options: RuntimeOptions = {
+      cwd: root,
+      storageDir: root,
+      noAnimations: true,
+      logLevel: 'error'
+    }
+
+    const publishedCalls: Array<{ relays: string[]; event: Event }> = []
+    const stub: NostrStub = {
+      async query(): Promise<Event[]> {
+        return []
+      },
+      async publish(relays: string[], event: Event): Promise<void> {
+        publishedCalls.push({
+          relays: [...relays],
+          event
+        })
+      },
+      destroy(): void {
+        // no-op for tests
+      }
+    }
+
+    const controller = new TuiController(options)
+    attachNostrStub(controller, stub)
+    await controller.initialize()
+    await controller.generateNsecAccount('group-note')
+    await controller.unlockCurrentAccount()
+
+    const event = await controller.publishGroupNote({
+      groupId: 'npub1testgroup',
+      relayUrl: 'wss://relay.example',
+      content: 'hello relay note'
+    })
+
+    expect(event.kind).toBe(1)
+    expect(event.content).toBe('hello relay note')
+    expect(event.tags).toContainEqual(['h', 'npub1testgroup'])
+    expect(publishedCalls).toHaveLength(1)
+    expect(publishedCalls[0]?.relays).toEqual(['wss://relay.example/'])
+    expect(publishedCalls[0]?.event.tags).toContainEqual(['h', 'npub1testgroup'])
+
+    await controller.shutdown()
+  })
 })

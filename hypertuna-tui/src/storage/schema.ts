@@ -48,6 +48,11 @@ const accountScopedUiStateSchema = z.object({
   })).default({}),
   rightTopSelectionByNode: z.record(z.number().int().nonnegative()).default({}),
   rightBottomOffsetByNode: z.record(z.number().int().nonnegative()).default({}),
+  profileNameCacheByPubkey: z.record(z.object({
+    name: z.string().default(''),
+    bio: z.string().nullable().optional(),
+    updatedAt: z.number().int().nonnegative().default(0)
+  })).default({}),
   discoveryRelays: z.array(z.string()).default(DEFAULT_DISCOVERY_RELAYS.map((entry) => String(entry))),
   feedSource: z.object({
     mode: z.enum(['relays', 'relay', 'following', 'group']).default('relays'),

@@ -207,6 +207,12 @@ export type ControllerState = {
   lastCopiedMethod: ClipboardCopyResult['method'] | null
 }
 
+type ProfileNameCacheEntry = {
+  name: string
+  bio?: string | null
+  updatedAt: number
+}
+
 function trimLogs<T>(items: T[], max = 400): T[] {
   if (items.length <= max) return items
   return items.slice(items.length - max)
@@ -895,9 +901,98 @@ export class TuiController {
     return this.state.session?.userKey || this.state.currentAccountPubkey || null
   }
 
+  private profileNameCachePatchFromState(): Record<string, ProfileNameCacheEntry> {
+    const next: Record<string, ProfileNameCacheEntry> = {}
+    for (const [pubkey, profile] of Object.entries(this.state.adminProfileByPubkey)) {
+      const normalizedPubkey = String(pubkey || '').trim().toLowerCase()
+      if (!/^[a-f0-9]{64}$/i.test(normalizedPubkey)) continue
+      const name = String(profile?.name || '').trim()
+      if (!name) continue
+      next[normalizedPubkey] = {
+        name,
+        bio: String(profile?.bio || '').trim() || null,
+        updatedAt: Date.now()
+      }
+    }
+    return next
+  }
+
+  private async persistProfileNameCacheFromState(): Promise<void> {
+    await this.persistAccountScopedUiState({
+      profileNameCacheByPubkey: this.profileNameCachePatchFromState()
+    })
+  }
+
+  private async upsertAdminProfiles(
+    rows: Array<{
+      pubkey: string
+      name?: string | null
+      bio?: string | null
+      followersCount?: number | null
+      updatedAt?: number
+    }>,
+    options: { persist?: boolean } = {}
+  ): Promise<void> {
+    if (!rows.length) return
+    const next = { ...this.state.adminProfileByPubkey }
+    let changed = false
+    for (const row of rows) {
+      const pubkey = String(row.pubkey || '').trim().toLowerCase()
+      if (!/^[a-f0-9]{64}$/i.test(pubkey)) continue
+      const name = String(row.name || '').trim() || null
+      const bio = String(row.bio || '').trim() || null
+      const followersCount = Number(row.followersCount)
+      const previous = next[pubkey]
+      const nextProfile = {
+        name,
+        bio,
+        followersCount: Number.isFinite(followersCount)
+          ? followersCount
+          : (previous?.followersCount ?? null)
+      }
+      if (
+        previous?.name === nextProfile.name
+        && previous?.bio === nextProfile.bio
+        && previous?.followersCount === nextProfile.followersCount
+      ) {
+        continue
+      }
+      next[pubkey] = nextProfile
+      if (name) {
+        this.profileNameCache.set(pubkey, name)
+      } else {
+        this.profileNameCache.delete(pubkey)
+      }
+      changed = true
+    }
+    if (!changed) return
+    this.patchState({ adminProfileByPubkey: next })
+    if (options.persist !== false) {
+      await this.persistProfileNameCacheFromState()
+    }
+  }
+
   private async loadAccountScopedUiState(userKey: string | null): Promise<void> {
     if (!userKey) return
     const scoped = this.uiStateStore.getAccountState(userKey)
+    this.profileNameCache = new Map<string, string>()
+    const cachedProfiles = Object.entries(scoped.profileNameCacheByPubkey || {}).reduce<Record<string, {
+      name: string | null
+      bio: string | null
+      followersCount: number | null
+    }>>((acc, [pubkey, entry]) => {
+      const normalizedPubkey = String(pubkey || '').trim().toLowerCase()
+      if (!/^[a-f0-9]{64}$/i.test(normalizedPubkey)) return acc
+      const name = String(entry?.name || '').trim()
+      if (!name) return acc
+      this.profileNameCache.set(normalizedPubkey, name)
+      acc[normalizedPubkey] = {
+        name,
+        bio: String(entry?.bio || '').trim() || null,
+        followersCount: null
+      }
+      return acc
+    }, {})
     this.patchState({
       groupViewTab: scoped.groupViewTab,
       chatViewTab: scoped.chatViewTab,
@@ -914,6 +1009,10 @@ export class TuiController {
         : scoped.paneViewport,
       rightTopSelectionByNode: scoped.rightTopSelectionByNode || {},
       rightBottomOffsetByNode: scoped.rightBottomOffsetByNode || {},
+      adminProfileByPubkey: {
+        ...this.state.adminProfileByPubkey,
+        ...cachedProfiles
+      },
       discoveryRelayUrls: uniqueRelayUrls(
         scoped.discoveryRelays && scoped.discoveryRelays.length > 0
           ? scoped.discoveryRelays
@@ -972,6 +1071,7 @@ export class TuiController {
     acceptedChatInviteConversationIds?: string[]
     hiddenDeletedFileKeys?: string[]
     perfOverlayEnabled?: boolean
+    profileNameCacheByPubkey?: Record<string, ProfileNameCacheEntry>
   }): Promise<void> {
     const userKey = this.currentUiScopeKey()
     if (!userKey) return
@@ -1904,15 +2004,13 @@ export class TuiController {
           : this.searchableRelayUrls(16)
       )
       await this.nostrClient.publish(targets, event)
-      this.patchState({
-        adminProfileByPubkey: {
-          ...this.state.adminProfileByPubkey,
-          [session.pubkey]: {
-            name,
-            bio: about || null,
-            followersCount: this.state.adminProfileByPubkey[session.pubkey]?.followersCount ?? null
-          }
-        }
+      await this.upsertAdminProfiles([{
+        pubkey: session.pubkey,
+        name,
+        bio: about || null,
+        followersCount: this.state.adminProfileByPubkey[session.pubkey]?.followersCount ?? null
+      }], {
+        persist: true
       })
     })
   }
@@ -3829,15 +3927,28 @@ export class TuiController {
           },
           GROUP_METADATA_TIMEOUT_MS
         )
+        const profileRows: Array<{
+          pubkey: string
+          name?: string | null
+          bio?: string | null
+        }> = []
         for (const profile of profiles) {
           try {
             const parsed = JSON.parse(profile.content || '{}')
             const name = String(parsed?.display_name || parsed?.name || parsed?.username || '').trim()
-            if (name) this.profileNameCache.set(profile.pubkey, name)
+            const bio = String(parsed?.about || parsed?.bio || '').trim()
+            if (!name) continue
+            this.profileNameCache.set(String(profile.pubkey || '').trim().toLowerCase(), name)
+            profileRows.push({
+              pubkey: String(profile.pubkey || '').trim().toLowerCase(),
+              name,
+              bio: bio || null
+            })
           } catch {
             // ignore invalid metadata json
           }
         }
+        await this.upsertAdminProfiles(profileRows, { persist: true })
       } catch {
         // optional enrichment
       }
@@ -3857,7 +3968,7 @@ export class TuiController {
       const admins = adminEvent ? parseGroupAdminsEvent(adminEvent) : []
       const members = memberEvent ? parseGroupMembersEvent(memberEvent) : []
       const adminPubkey = admins[0]?.pubkey || group.adminPubkey || group.event?.pubkey || null
-      const adminName = adminPubkey ? (this.profileNameCache.get(adminPubkey) || null) : null
+      const adminName = adminPubkey ? (this.profileNameCache.get(String(adminPubkey).toLowerCase()) || null) : null
       const peersOnline = this.resolveGroupPeerCount(group.id, group.relay)
       const createdAt = group.createdAt || group.event?.created_at || null
       return {
@@ -3876,16 +3987,16 @@ export class TuiController {
     const unique = Array.from(
       new Set(
         pubkeys
-          .map((value) => String(value || '').trim())
+          .map((value) => String(value || '').trim().toLowerCase())
           .filter((value) => /^[a-f0-9]{64}$/i.test(value))
       )
     )
     if (unique.length === 0) return
 
-    const next = { ...this.state.adminProfileByPubkey }
-    const missing = unique.filter((pubkey) => !next[pubkey])
+    const missing = unique.filter((pubkey) => !this.state.adminProfileByPubkey[pubkey])
     if (missing.length === 0) return
 
+    const latestByPubkey = new Map<string, Event>()
     try {
       const events = await this.nostrClient.query(
         this.searchableRelayUrls(12),
@@ -3898,32 +4009,48 @@ export class TuiController {
       )
       for (const event of events) {
         if (!event?.pubkey) continue
-        if (next[event.pubkey]) continue
-        try {
-          const payload = JSON.parse(event.content || '{}')
-          const name = String(payload?.display_name || payload?.name || payload?.username || '').trim()
-          const bio = String(payload?.about || payload?.bio || '').trim()
-          const followersRaw = Number(payload?.followers || payload?.followers_count)
-          next[event.pubkey] = {
-            name: name || null,
-            bio: bio || null,
-            followersCount: Number.isFinite(followersRaw) ? followersRaw : null
-          }
-        } catch {
-          next[event.pubkey] = {
-            name: null,
-            bio: null,
-            followersCount: null
-          }
+        const pubkey = String(event.pubkey || '').trim().toLowerCase()
+        if (!missing.includes(pubkey)) continue
+        const existing = latestByPubkey.get(pubkey)
+        if (!existing || Number(event.created_at || 0) >= Number(existing.created_at || 0)) {
+          latestByPubkey.set(pubkey, event)
         }
       }
     } catch {
       // best-effort enrichment
     }
 
-    this.patchState({
-      adminProfileByPubkey: next
+    const rows = missing.map((pubkey) => {
+      const event = latestByPubkey.get(pubkey)
+      if (!event) {
+        return {
+          pubkey,
+          name: null,
+          bio: null,
+          followersCount: null
+        }
+      }
+      try {
+        const payload = JSON.parse(event.content || '{}')
+        const name = String(payload?.display_name || payload?.name || payload?.username || '').trim()
+        const bio = String(payload?.about || payload?.bio || '').trim()
+        const followersRaw = Number(payload?.followers || payload?.followers_count)
+        return {
+          pubkey,
+          name: name || null,
+          bio: bio || null,
+          followersCount: Number.isFinite(followersRaw) ? followersRaw : null
+        }
+      } catch {
+        return {
+          pubkey,
+          name: null,
+          bio: null,
+          followersCount: null
+        }
+      }
     })
+    await this.upsertAdminProfiles(rows)
   }
 
   async refreshGroups(): Promise<void> {
@@ -4703,6 +4830,38 @@ export class TuiController {
     })
   }
 
+  async publishGroupNote(input: {
+    groupId: string
+    relayUrl: string
+    content: string
+  }): Promise<Event> {
+    return await this.runTask('Publish relay note', async () => {
+      const session = this.requireSession()
+      const groupId = String(input.groupId || '').trim()
+      const relayUrl = normalizeRelayUrl(input.relayUrl)
+      const content = String(input.content || '').trim()
+      if (!groupId) {
+        throw new Error('groupId is required')
+      }
+      if (!relayUrl) {
+        throw new Error('relayUrl is required')
+      }
+      if (!content) {
+        throw new Error('Note content is required')
+      }
+
+      const draft: EventTemplate = {
+        kind: 1,
+        created_at: eventNow(),
+        tags: [['h', groupId]],
+        content
+      }
+      const event = signDraftEvent(session.nsecHex, draft)
+      await this.nostrClient.publish([relayUrl], event)
+      return event
+    })
+  }
+
   async uploadGroupFile(input: {
     relayKey?: string | null
     publicIdentifier?: string | null
@@ -4834,6 +4993,7 @@ export class TuiController {
       this.patchState({
         groupNotesByGroupKey: next
       })
+      await this.ensureAdminProfiles(notes.map((entry) => entry.authorPubkey))
     }, { dedupeKey: `refresh:group-notes:${groupId}:${relay || ''}`, retries: 0 })
   }
 
@@ -5009,6 +5169,7 @@ export class TuiController {
     await this.runTask('Load chat thread', async () => {
       const messages = await this.chatService.loadThread(conversationId)
       this.patchState({ threadMessages: messages })
+      await this.ensureAdminProfiles(messages.map((entry) => entry.senderPubkey))
     })
   }
 
@@ -5018,6 +5179,7 @@ export class TuiController {
       this.patchState({
         threadMessages: [...this.state.threadMessages, sent]
       })
+      await this.ensureAdminProfiles([sent.senderPubkey])
     })
   }
 
