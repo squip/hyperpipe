@@ -45,7 +45,23 @@ export class NostrClient {
     }
 
     const writes = this.pool.publish(targets, event, { maxWait: maxWaitMs })
-    await Promise.allSettled(writes)
+    const results = await Promise.allSettled(writes)
+    const fulfilled = results.some((entry) => entry.status === 'fulfilled')
+    if (fulfilled) return
+
+    const reasons = results
+      .map((entry) => (entry.status === 'rejected' ? entry.reason : null))
+      .map((reason) => {
+        if (!reason) return ''
+        return reason instanceof Error ? reason.message : String(reason)
+      })
+      .map((message) => message.trim())
+      .filter(Boolean)
+
+    if (reasons.length > 0) {
+      throw new Error(`Failed to publish event to all relay targets: ${reasons.join('; ')}`)
+    }
+    throw new Error('Failed to publish event to all relay targets')
   }
 
   subscribe(

@@ -1250,10 +1250,10 @@ function dashboardOpenRelayUrls(state: ControllerState): string[] {
   const live = state.relays
     .map((entry) => String(entry.connectionUrl || '').trim())
     .filter(Boolean)
-  if (live.length > 0) {
-    return uniqueRelayUrls(live)
-  }
-  return uniqueRelayUrls(state.discoveryRelayUrls || DEFAULT_DISCOVERY_RELAYS)
+  return uniqueRelayUrls([
+    ...live,
+    ...(state.discoveryRelayUrls || DEFAULT_DISCOVERY_RELAYS)
+  ])
 }
 
 function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[] {

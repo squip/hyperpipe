@@ -1849,6 +1849,9 @@ export class TuiController {
       const session = await this.accountService.unlockAccount(currentPubkey, getPassword)
       this.patchState({ session })
       await this.loadAccountScopedUiState(session.userKey)
+      // Ensure the active account's latest profile metadata is available for dashboard rendering
+      // even when the user has no discovered groups/invites to trigger profile enrichment.
+      await this.ensureAdminProfiles([session.pubkey])
     })
   }
 
