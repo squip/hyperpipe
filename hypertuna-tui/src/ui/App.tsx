@@ -19,12 +19,14 @@ import {
   type ParentNavId
 } from '../lib/constants.js'
 import { shortId } from '../lib/format.js'
+import { uniqueRelayUrls } from '../lib/nostr.js'
 import {
   buildCommandSnippet,
   executeCommand,
   type CommandContext,
   type CommandController
 } from './commandRouter.js'
+import { buildCommandReferenceLines } from './commandCatalog.js'
 import {
   parseKeyValueLine,
   formatTableRows,
@@ -146,6 +148,37 @@ type InviteComposeState = {
   busy: boolean
   status: string
 }
+
+type DashboardActionKey = 'profile' | 'discovery' | 'commands'
+type DashboardProfileFocus = 'name' | 'bio' | 'submit'
+type DashboardDiscoveryInputMode = 'list' | 'manual'
+
+type DashboardEditState =
+  | {
+      mode: 'profile'
+      name: string
+      bio: string
+      focus: DashboardProfileFocus
+      editField: 'name' | 'bio' | null
+      busy: boolean
+      status: string
+      error: string
+    }
+  | {
+      mode: 'discovery'
+      options: string[]
+      selected: string[]
+      index: number
+      inputMode: DashboardDiscoveryInputMode
+      manualInput: string
+      busy: boolean
+      status: string
+      error: string
+    }
+  | {
+      mode: 'commands'
+      offset: number
+    }
 
 type JoinRequestReviewState = {
   groupId: string
@@ -1199,16 +1232,50 @@ function navRowsFromState(state: ControllerState, expanded: TreeExpanded): NavRo
   return rows
 }
 
+function dashboardActionFromRow(row: CenterRow | null | undefined): DashboardActionKey | null {
+  const action = String((row?.data as { dashboardAction?: string } | undefined)?.dashboardAction || '').trim().toLowerCase()
+  if (action === 'profile' || action === 'discovery' || action === 'commands') {
+    return action
+  }
+  return null
+}
+
+function activeProfileName(state: ControllerState): string {
+  const currentPubkey = String(state.session?.pubkey || state.currentAccountPubkey || '').trim()
+  const name = String(state.adminProfileByPubkey[currentPubkey]?.name || '').trim()
+  return name || '-'
+}
+
+function dashboardOpenRelayUrls(state: ControllerState): string[] {
+  const live = state.relays
+    .map((entry) => String(entry.connectionUrl || '').trim())
+    .filter(Boolean)
+  if (live.length > 0) {
+    return uniqueRelayUrls(live)
+  }
+  return uniqueRelayUrls(state.discoveryRelayUrls || DEFAULT_DISCOVERY_RELAYS)
+}
+
 function centerRowsForNode(state: ControllerState, node: NavNodeId): CenterRow[] {
   if (node === 'dashboard') {
     return [
       {
-        key: 'summary',
-        label:
-          `Worker:${state.lifecycle} p2pRelays:${state.groupDiscover.length} ` +
-          `MyRelays:${state.myGroups.length} Invites:${state.invitesCount} Files:${state.filesCount} Chats:${state.conversations.length}`,
+        key: 'dashboard:profile',
+        label: `User Profile: ${activeProfileName(state)}`,
         kind: 'summary',
-        data: null
+        data: { dashboardAction: 'profile' as const }
+      },
+      {
+        key: 'dashboard:discovery',
+        label: `Discovery Relays: ${state.discoveryRelayUrls.length}`,
+        kind: 'summary',
+        data: { dashboardAction: 'discovery' as const }
+      },
+      {
+        key: 'dashboard:commands',
+        label: 'Terminal Commands',
+        kind: 'summary',
+        data: { dashboardAction: 'commands' as const }
       }
     ]
   }
@@ -1500,7 +1567,8 @@ function splitNode(node: NavNodeId): boolean {
 
 function supportsActionTree(node: NavNodeId): boolean {
   return (
-    node === 'groups:browse'
+    node === 'dashboard'
+    || node === 'groups:browse'
     || node === 'groups:my'
     || node === 'chats'
     || node === 'invites:group'
@@ -1599,6 +1667,13 @@ function noteRowsForGroup(state: ControllerState, group: any): any[] {
 }
 
 function rightTopActions(state: ControllerState, node: NavNodeId, selectedRow: CenterRow | null): string[] {
+  if (node === 'dashboard') {
+    const action = dashboardActionFromRow(selectedRow)
+    if (action === 'profile') return ['Edit Profile']
+    if (action === 'discovery') return ['Edit Discovery Relays']
+    if (action === 'commands') return ['Open Command Reference']
+    return []
+  }
   if (node === 'groups:browse') {
     const group = selectedRow?.data as any
     const actions = ['Relay Details', 'Admin details', 'Members']
@@ -2082,6 +2157,7 @@ export function App({
     inviteMembers: [],
     relayUrls: []
   })
+  const [dashboardEditState, setDashboardEditState] = useState<DashboardEditState | null>(null)
   const [inviteComposeState, setInviteComposeState] = useState<InviteComposeState | null>(null)
   const [joinRequestCursorByGroupKey, setJoinRequestCursorByGroupKey] = useState<Record<string, number>>({})
   const [joinRequestReviewState, setJoinRequestReviewState] = useState<JoinRequestReviewState | null>(null)
@@ -2102,6 +2178,7 @@ export function App({
     'chats:create': 0
   })
   const createEditStateRef = useRef<CreateEditState | null>(null)
+  const dashboardEditStateRef = useRef<DashboardEditState | null>(null)
   const inviteComposeStateRef = useRef<InviteComposeState | null>(null)
   const startupGateRef = useRef<StartupGateState | null>(null)
   const startupGateInitializedRef = useRef(false)
@@ -2189,6 +2266,10 @@ export function App({
   }, [createEditState])
 
   useEffect(() => {
+    dashboardEditStateRef.current = dashboardEditState
+  }, [dashboardEditState])
+
+  useEffect(() => {
     inviteComposeStateRef.current = inviteComposeState
   }, [inviteComposeState])
 
@@ -2265,6 +2346,7 @@ export function App({
       inviteMembers: [],
       relayUrls: []
     })
+    setDashboardEditState(null)
     setInviteComposeState(null)
     setJoinRequestCursorByGroupKey({})
     setJoinRequestReviewState(null)
@@ -2404,6 +2486,13 @@ export function App({
     setCreateEditState(null)
   }, [selectedNode, createEditState])
 
+  useEffect(() => {
+    if (!dashboardEditState) return
+    if (selectedNode === 'dashboard') return
+    dashboardEditStateRef.current = null
+    setDashboardEditState(null)
+  }, [selectedNode, dashboardEditState])
+
   const rightTopTableColumns = useMemo(
     () => (isCreateNodeId(selectedNode) ? null : rightTopTableColumnsForNode(selectedNode)),
     [selectedNode]
@@ -2412,6 +2501,7 @@ export function App({
   const rightTopHeaderRows = rightTopHasTable ? 2 : 0
   const rightTopBodyRows = Math.max(1, rightTopBoxRows - 2 - rightTopHeaderRows)
   const rightTopVisibleRows = rightTopBodyRows
+  const commandReferenceLines = useMemo(() => buildCommandReferenceLines(), [])
 
   const rightTopProjectedRows = useMemo<TableRowView[]>(() => {
     if (!state || !rightTopTableColumns?.length) return []
@@ -3527,12 +3617,156 @@ export function App({
     }
   }
 
+  const openDashboardProfileEdit = (): void => {
+    const snapshot = stateRef.current
+    if (!snapshot) return
+    const currentPubkey = String(snapshot.session?.pubkey || snapshot.currentAccountPubkey || '').trim()
+    const profile = snapshot.adminProfileByPubkey[currentPubkey || '']
+    const next: DashboardEditState = {
+      mode: 'profile',
+      name: String(profile?.name || '').trim(),
+      bio: String(profile?.bio || '').trim(),
+      focus: 'name',
+      editField: null,
+      busy: false,
+      status: 'Edit profile fields and submit to publish kind 0 metadata.',
+      error: ''
+    }
+    dashboardEditStateRef.current = next
+    setDashboardEditState(next)
+  }
+
+  const openDashboardDiscoveryEdit = (): void => {
+    const snapshot = stateRef.current
+    const discovery = buildDiscoveryRelayState({
+      persisted: snapshot?.discoveryRelayUrls || [],
+      active: snapshot?.discoveryRelayUrls || DEFAULT_DISCOVERY_RELAYS
+    })
+    const next: DashboardEditState = {
+      mode: 'discovery',
+      options: discovery.options,
+      selected: discovery.selected,
+      index: 0,
+      inputMode: 'list',
+      manualInput: '',
+      busy: false,
+      status: 'Select discovery relays and submit.',
+      error: ''
+    }
+    dashboardEditStateRef.current = next
+    setDashboardEditState(next)
+  }
+
+  const openDashboardCommandReference = (): void => {
+    const next: DashboardEditState = {
+      mode: 'commands',
+      offset: 0
+    }
+    dashboardEditStateRef.current = next
+    setDashboardEditState(next)
+  }
+
+  const submitDashboardProfileEdit = async (): Promise<void> => {
+    const controller = controllerRef.current
+    const snapshot = stateRef.current
+    const edit = dashboardEditStateRef.current
+    if (!controller || !snapshot || !edit || edit.mode !== 'profile' || edit.busy) return
+    const name = String(edit.name || '').trim()
+    if (!name) {
+      setDashboardEditState((previous) => (
+        previous && previous.mode === 'profile'
+          ? { ...previous, error: 'Name is required' }
+          : previous
+      ))
+      return
+    }
+
+    setDashboardEditState((previous) => (
+      previous && previous.mode === 'profile'
+        ? { ...previous, busy: true, status: 'Publishing kind 0 metadata…', error: '' }
+        : previous
+    ))
+    try {
+      await controller.publishProfileMetadata({
+        name,
+        about: String(edit.bio || '').trim() || undefined,
+        relays: dashboardOpenRelayUrls(snapshot)
+      })
+      dashboardEditStateRef.current = null
+      setDashboardEditState(null)
+      setPaneActionMessage('User profile updated')
+    } catch (error) {
+      setDashboardEditState((previous) => (
+        previous && previous.mode === 'profile'
+          ? {
+              ...previous,
+              busy: false,
+              error: error instanceof Error ? error.message : String(error),
+              status: 'Publish failed'
+            }
+          : previous
+      ))
+    }
+  }
+
+  const submitDashboardDiscoveryEdit = async (): Promise<void> => {
+    const controller = controllerRef.current
+    const edit = dashboardEditStateRef.current
+    if (!controller || !edit || edit.mode !== 'discovery' || edit.busy) return
+    if (edit.selected.length === 0) {
+      setDashboardEditState((previous) => (
+        previous && previous.mode === 'discovery'
+          ? { ...previous, error: 'Select at least one discovery relay' }
+          : previous
+      ))
+      return
+    }
+
+    setDashboardEditState((previous) => (
+      previous && previous.mode === 'discovery'
+        ? { ...previous, busy: true, error: '', status: 'Applying discovery relays…' }
+        : previous
+    ))
+    try {
+      await controller.setDiscoveryRelayUrls(edit.selected)
+      dashboardEditStateRef.current = null
+      setDashboardEditState(null)
+      setPaneActionMessage('Discovery relays updated')
+    } catch (error) {
+      setDashboardEditState((previous) => (
+        previous && previous.mode === 'discovery'
+          ? {
+              ...previous,
+              busy: false,
+              error: error instanceof Error ? error.message : String(error),
+              status: 'Update failed'
+            }
+          : previous
+      ))
+    }
+  }
+
   const executeRightTopAction = async (): Promise<void> => {
     const controller = controllerRef.current
     if (!controller || !state) return
     if (!selectedCenterRow || !selectedRightTopAction) return
 
     try {
+      if (selectedNode === 'dashboard') {
+        if (selectedRightTopAction.startsWith('Edit Profile')) {
+          openDashboardProfileEdit()
+          return
+        }
+        if (selectedRightTopAction.startsWith('Edit Discovery Relays')) {
+          openDashboardDiscoveryEdit()
+          return
+        }
+        if (selectedRightTopAction.startsWith('Open Command Reference')) {
+          openDashboardCommandReference()
+          return
+        }
+      }
+
       if (selectedRightTopAction.startsWith('Send Invite')) {
         if (!selectedInviteComposeTarget) {
           setPaneActionMessage('Send Invite is available for admin-owned relays/chats only')
@@ -4532,6 +4766,344 @@ export function App({
       return
     }
 
+    const currentNode = selectedNodeRef.current
+    const currentFocus = focusPaneRef.current
+    const currentDashboardEdit = dashboardEditStateRef.current
+    const dashboardEditActive = Boolean(
+      currentDashboardEdit
+      && currentNode === 'dashboard'
+      && currentFocus === 'right-top'
+    )
+
+    if (dashboardEditActive && currentDashboardEdit) {
+      if (key.escape) {
+        dashboardEditStateRef.current = null
+        setDashboardEditState(null)
+        return
+      }
+
+      const isPrintable = !key.ctrl && !(key as unknown as { meta?: boolean }).meta && input.length > 0
+
+      if (currentDashboardEdit.mode === 'commands') {
+        const visibleRows = Math.max(1, rightTopVisibleRows - 2)
+        const maxOffset = Math.max(0, commandReferenceLines.length - visibleRows)
+        const moveOffset = (delta: number) => {
+          setDashboardEditState((previous) => {
+            if (!previous || previous.mode !== 'commands') return previous
+            const next = {
+              ...previous,
+              offset: clamp(previous.offset + delta, 0, maxOffset)
+            }
+            dashboardEditStateRef.current = next
+            return next
+          })
+        }
+        if (key.upArrow) {
+          moveOffset(-1)
+          return
+        }
+        if (key.downArrow) {
+          moveOffset(1)
+          return
+        }
+        if (key.pageUp) {
+          moveOffset(-Math.max(1, Math.floor(visibleRows / 2)))
+          return
+        }
+        if (key.pageDown) {
+          moveOffset(Math.max(1, Math.floor(visibleRows / 2)))
+          return
+        }
+        const maybeHome = (key as unknown as { home?: boolean }).home
+        const maybeEnd = (key as unknown as { end?: boolean }).end
+        if (maybeHome || (key.ctrl && input === 'a') || input === 'g') {
+          setDashboardEditState((previous) => {
+            if (!previous || previous.mode !== 'commands') return previous
+            const next = { ...previous, offset: 0 }
+            dashboardEditStateRef.current = next
+            return next
+          })
+          return
+        }
+        if (maybeEnd || (key.ctrl && input === 'e') || input === 'G') {
+          setDashboardEditState((previous) => {
+            if (!previous || previous.mode !== 'commands') return previous
+            const next = { ...previous, offset: maxOffset }
+            dashboardEditStateRef.current = next
+            return next
+          })
+          return
+        }
+        return
+      }
+
+      if (currentDashboardEdit.mode === 'profile') {
+        if (currentDashboardEdit.busy) {
+          return
+        }
+        const focusRows: DashboardProfileFocus[] = ['name', 'bio', 'submit']
+        if (currentDashboardEdit.editField) {
+          if (key.return) {
+            setDashboardEditState((previous) => {
+              if (!previous || previous.mode !== 'profile') return previous
+              const next = { ...previous, editField: null, error: '' }
+              dashboardEditStateRef.current = next
+              return next
+            })
+            return
+          }
+          if (key.backspace || key.delete) {
+            setDashboardEditState((previous) => {
+              if (!previous || previous.mode !== 'profile') return previous
+              if (previous.editField === 'name') {
+                const next = { ...previous, name: previous.name.slice(0, -1), error: '' }
+                dashboardEditStateRef.current = next
+                return next
+              }
+              const next = { ...previous, bio: previous.bio.slice(0, -1), error: '' }
+              dashboardEditStateRef.current = next
+              return next
+            })
+            return
+          }
+          if (key.ctrl && input === 'u') {
+            setDashboardEditState((previous) => {
+              if (!previous || previous.mode !== 'profile') return previous
+              if (previous.editField === 'name') {
+                const next = { ...previous, name: '', error: '' }
+                dashboardEditStateRef.current = next
+                return next
+              }
+              const next = { ...previous, bio: '', error: '' }
+              dashboardEditStateRef.current = next
+              return next
+            })
+            return
+          }
+          if (isPrintable) {
+            const sanitized = input.replace(/[\r\n\t]/g, '')
+            if (!sanitized) return
+            setDashboardEditState((previous) => {
+              if (!previous || previous.mode !== 'profile') return previous
+              if (previous.editField === 'name') {
+                const next = { ...previous, name: `${previous.name}${sanitized}`, error: '' }
+                dashboardEditStateRef.current = next
+                return next
+              }
+              const next = { ...previous, bio: `${previous.bio}${sanitized}`, error: '' }
+              dashboardEditStateRef.current = next
+              return next
+            })
+          }
+          return
+        }
+
+        if (key.upArrow || key.downArrow) {
+          const currentIndex = focusRows.indexOf(currentDashboardEdit.focus)
+          const delta = key.upArrow ? -1 : 1
+          const nextFocus = focusRows[clamp(currentIndex + delta, 0, focusRows.length - 1)] || 'name'
+          setDashboardEditState((previous) => {
+            if (!previous || previous.mode !== 'profile') return previous
+            const next = { ...previous, focus: nextFocus, error: '' }
+            dashboardEditStateRef.current = next
+            return next
+          })
+          return
+        }
+
+        if (key.return) {
+          if (currentDashboardEdit.focus === 'name' || currentDashboardEdit.focus === 'bio') {
+            setDashboardEditState((previous) => {
+              if (!previous || previous.mode !== 'profile') return previous
+              const next = {
+                ...previous,
+                editField: previous.focus === 'name' ? 'name' : 'bio',
+                error: ''
+              }
+              dashboardEditStateRef.current = next
+              return next
+            })
+            return
+          }
+          submitDashboardProfileEdit().catch((error) => {
+            setDashboardEditState((previous) => (
+              previous && previous.mode === 'profile'
+                ? {
+                    ...previous,
+                    busy: false,
+                    error: error instanceof Error ? error.message : String(error),
+                    status: 'Publish failed'
+                  }
+                : previous
+            ))
+          })
+        }
+        return
+      }
+
+      if (currentDashboardEdit.busy) {
+        return
+      }
+
+      if (currentDashboardEdit.inputMode === 'manual') {
+        if (key.return) {
+          try {
+            const next = appendDiscoveryRelay(
+              currentDashboardEdit.options,
+              currentDashboardEdit.selected,
+              currentDashboardEdit.manualInput
+            )
+            setDashboardEditState((previous) => {
+              if (!previous || previous.mode !== 'discovery') return previous
+              const updated = {
+                ...previous,
+                options: next.options,
+                selected: next.selected,
+                inputMode: 'list' as const,
+                index: Math.max(0, next.options.length - 1),
+                manualInput: '',
+                error: '',
+                status: 'Added relay URL'
+              }
+              dashboardEditStateRef.current = updated
+              return updated
+            })
+          } catch (error) {
+            setDashboardEditState((previous) => (
+              previous && previous.mode === 'discovery'
+                ? {
+                    ...previous,
+                    error: error instanceof Error ? error.message : String(error)
+                  }
+                : previous
+            ))
+          }
+          return
+        }
+        if (key.backspace || key.delete) {
+          setDashboardEditState((previous) => {
+            if (!previous || previous.mode !== 'discovery') return previous
+            const next = {
+              ...previous,
+              manualInput: previous.manualInput.slice(0, -1),
+              error: ''
+            }
+            dashboardEditStateRef.current = next
+            return next
+          })
+          return
+        }
+        if (key.ctrl && input === 'u') {
+          setDashboardEditState((previous) => {
+            if (!previous || previous.mode !== 'discovery') return previous
+            const next = {
+              ...previous,
+              manualInput: '',
+              error: ''
+            }
+            dashboardEditStateRef.current = next
+            return next
+          })
+          return
+        }
+        if (isPrintable) {
+          const sanitized = input.replace(/[\r\n\t]/g, '')
+          if (!sanitized) return
+          setDashboardEditState((previous) => {
+            if (!previous || previous.mode !== 'discovery') return previous
+            const next = {
+              ...previous,
+              manualInput: `${previous.manualInput}${sanitized}`,
+              error: ''
+            }
+            dashboardEditStateRef.current = next
+            return next
+          })
+        }
+        return
+      }
+
+      const actionAddRow = currentDashboardEdit.options.length
+      const actionSubmitRow = currentDashboardEdit.options.length + 1
+      const maxIndex = actionSubmitRow
+
+      if (key.upArrow) {
+        setDashboardEditState((previous) => {
+          if (!previous || previous.mode !== 'discovery') return previous
+          const next = {
+            ...previous,
+            index: clamp(previous.index - 1, 0, maxIndex),
+            error: ''
+          }
+          dashboardEditStateRef.current = next
+          return next
+        })
+        return
+      }
+      if (key.downArrow) {
+        setDashboardEditState((previous) => {
+          if (!previous || previous.mode !== 'discovery') return previous
+          const next = {
+            ...previous,
+            index: clamp(previous.index + 1, 0, maxIndex),
+            error: ''
+          }
+          dashboardEditStateRef.current = next
+          return next
+        })
+        return
+      }
+
+      if (key.return) {
+        const index = clamp(currentDashboardEdit.index, 0, maxIndex)
+        if (index < currentDashboardEdit.options.length) {
+          const relayUrl = currentDashboardEdit.options[index]
+          const nextSelected = toggleDiscoveryRelay(currentDashboardEdit.selected, relayUrl)
+          setDashboardEditState((previous) => {
+            if (!previous || previous.mode !== 'discovery') return previous
+            const next = {
+              ...previous,
+              selected: nextSelected,
+              error: ''
+            }
+            dashboardEditStateRef.current = next
+            return next
+          })
+          return
+        }
+
+        if (index === actionAddRow) {
+          setDashboardEditState((previous) => {
+            if (!previous || previous.mode !== 'discovery') return previous
+            const next = {
+              ...previous,
+              inputMode: 'manual' as const,
+              manualInput: '',
+              error: '',
+              status: 'Enter a relay URL and press Enter to add it.'
+            }
+            dashboardEditStateRef.current = next
+            return next
+          })
+          return
+        }
+
+        submitDashboardDiscoveryEdit().catch((error) => {
+          setDashboardEditState((previous) => (
+            previous && previous.mode === 'discovery'
+              ? {
+                  ...previous,
+                  busy: false,
+                  error: error instanceof Error ? error.message : String(error),
+                  status: 'Update failed'
+                }
+              : previous
+          ))
+        })
+      }
+      return
+    }
+
     if (commandInputOpen) {
       if (key.escape) {
         setCommandInputOpen(false)
@@ -4540,8 +5112,6 @@ export function App({
       return
     }
 
-    const currentNode = selectedNodeRef.current
-    const currentFocus = focusPaneRef.current
     const currentCreateEdit = createEditStateRef.current
     const createEditActive = Boolean(
       currentCreateEdit
@@ -5492,6 +6062,35 @@ export function App({
       )
     }
 
+    if (selectedNode === 'dashboard' && row.kind === 'parent' && !rightTopTable) {
+      const label = String(row.label || '')
+      const separatorIndex = label.indexOf(':')
+      const fieldLabel = separatorIndex >= 0 ? label.slice(0, separatorIndex).trim() : label.trim()
+      const fieldValue = separatorIndex >= 0 ? label.slice(separatorIndex + 1).trim() : ''
+      const indent = row.depth > 0 ? '  ' : ''
+      const prefix = row.expandable
+        ? row.expanded ? '▾' : '▸'
+        : '•'
+      return (
+        <React.Fragment key={`${row.key}-${absolute}`}>
+          {absolute > 0 ? <Text>{' '}</Text> : null}
+          <Text>
+            <Text color={selected ? 'green' : undefined}>{selected ? '>' : ' '}</Text>
+            <Text>{` ${indent}${prefix} `}</Text>
+            <Text color="cyan">{fieldLabel}</Text>
+            {fieldValue
+              ? (
+                  <>
+                    <Text>{': '}</Text>
+                    <Text color="white">{fieldValue}</Text>
+                  </>
+                )
+              : null}
+          </Text>
+        </React.Fragment>
+      )
+    }
+
     const indent = row.depth > 0 ? '  ' : ''
     const prefix = row.expandable
       ? row.expanded ? '▾' : '▸'
@@ -5569,6 +6168,140 @@ export function App({
   }
 
   const renderRightTopPaneContent = (): React.JSX.Element => {
+    if (dashboardEditState && selectedNode === 'dashboard') {
+      if (dashboardEditState.mode === 'profile') {
+        const fieldLabel = dashboardEditState.editField === 'name' ? 'Name' : 'Bio'
+        return (
+          <Box flexDirection="column">
+            <Text color="yellow">Edit User Profile</Text>
+            <Text dimColor>Publish updated kind 0 name/bio metadata.</Text>
+            <Text>{''}</Text>
+            {dashboardEditState.editField ? (
+              <Box flexDirection="column">
+                <Text dimColor>{`Editing ${fieldLabel}`}</Text>
+                <Text color="cyan">{fieldLabel}:</Text>
+                <Box borderStyle="round" borderColor="white" paddingX={1}>
+                  <Text color="white">
+                    {dashboardEditState.editField === 'name'
+                      ? (dashboardEditState.name || ' ')
+                      : (dashboardEditState.bio || ' ')}
+                  </Text>
+                </Box>
+              </Box>
+            ) : (
+              <Box flexDirection="column">
+                <Text>
+                  <Text color={dashboardEditState.focus === 'name' ? 'green' : undefined}>
+                    {dashboardEditState.focus === 'name' ? '>' : ' '}
+                  </Text>
+                  <Text>{' '}</Text>
+                  <Text color="cyan">Name:</Text>
+                  <Text color="white">{` ${dashboardEditState.name || '-'}`}</Text>
+                </Text>
+                <Text>
+                  <Text color={dashboardEditState.focus === 'bio' ? 'green' : undefined}>
+                    {dashboardEditState.focus === 'bio' ? '>' : ' '}
+                  </Text>
+                  <Text>{' '}</Text>
+                  <Text color="cyan">Bio:</Text>
+                  <Text color="white">{` ${dashboardEditState.bio || '-'}`}</Text>
+                </Text>
+                <Text>
+                  <Text color={dashboardEditState.focus === 'submit' ? 'green' : undefined}>
+                    {dashboardEditState.focus === 'submit' ? '>' : ' '}
+                  </Text>
+                  <Text>{' '}</Text>
+                  <Text color="cyan">Submit</Text>
+                </Text>
+              </Box>
+            )}
+            <Text>{''}</Text>
+            <Text color={dashboardEditState.error ? 'red' : dashboardEditState.busy ? 'cyan' : 'gray'} dimColor={!dashboardEditState.error && !dashboardEditState.busy}>
+              {dashboardEditState.error || dashboardEditState.status || 'Ready'}
+            </Text>
+          </Box>
+        )
+      }
+
+      if (dashboardEditState.mode === 'discovery') {
+        const addRowIndex = dashboardEditState.options.length
+        const submitRowIndex = dashboardEditState.options.length + 1
+        return (
+          <Box flexDirection="column">
+            <Text color="yellow">Edit Discovery Relays</Text>
+            <Text dimColor>Use these relays to find other Hyperpipe peers and help them to find you.</Text>
+            <Text>{''}</Text>
+            {dashboardEditState.inputMode === 'manual' ? (
+              <Box flexDirection="column">
+                <Text dimColor>Enter relay URL (ws:// or wss://) and press Enter to add.</Text>
+                <Text color="cyan">Relay URL:</Text>
+                <Box borderStyle="round" borderColor="white" paddingX={1}>
+                  <Text color="white">{dashboardEditState.manualInput || ' '}</Text>
+                </Box>
+              </Box>
+            ) : (
+              <Box flexDirection="column">
+                {dashboardEditState.options.map((relayUrl, index) => {
+                  const selectedRow = dashboardEditState.index === index
+                  const checked = dashboardEditState.selected.includes(relayUrl)
+                  return (
+                    <Text key={`dashboard-discovery:${relayUrl}:${index}`}>
+                      <Text color={selectedRow ? 'green' : undefined}>{selectedRow ? '>' : ' '}</Text>
+                      <Text>{' '}</Text>
+                      <Text color="cyan">Relay:</Text>
+                      <Text color="white">{` ${checked ? '[x]' : '[ ]'} ${relayUrl}`}</Text>
+                    </Text>
+                  )
+                })}
+                <Text>
+                  <Text color={dashboardEditState.index === addRowIndex ? 'green' : undefined}>
+                    {dashboardEditState.index === addRowIndex ? '>' : ' '}
+                  </Text>
+                  <Text>{' '}</Text>
+                  <Text color="cyan">Add relay URL manually</Text>
+                </Text>
+                <Text>
+                  <Text color={dashboardEditState.index === submitRowIndex ? 'green' : undefined}>
+                    {dashboardEditState.index === submitRowIndex ? '>' : ' '}
+                  </Text>
+                  <Text>{' '}</Text>
+                  <Text color="cyan">Submit</Text>
+                </Text>
+              </Box>
+            )}
+            <Text>{''}</Text>
+            <Text color={dashboardEditState.error ? 'red' : dashboardEditState.busy ? 'cyan' : 'gray'} dimColor={!dashboardEditState.error && !dashboardEditState.busy}>
+              {dashboardEditState.error || dashboardEditState.status || 'Ready'}
+            </Text>
+          </Box>
+        )
+      }
+
+      const visibleRows = Math.max(1, rightTopVisibleRows - 2)
+      const maxOffset = Math.max(0, commandReferenceLines.length - visibleRows)
+      const offset = clamp(dashboardEditState.offset, 0, maxOffset)
+      const visibleLines = commandReferenceLines.slice(offset, offset + visibleRows)
+      return (
+        <Box flexDirection="column">
+          <Text color="yellow">Terminal Commands</Text>
+          <Text dimColor>Read-only reference. Use ↑/↓, PageUp/PageDown, Home/End to scroll.</Text>
+          <Text>{''}</Text>
+          {visibleLines.map((line, index) => {
+            const trimmed = line.trim()
+            if (!trimmed) {
+              return <Text key={`dashboard-command-line:${offset + index}`}>{line}</Text>
+            }
+            const heading = !line.startsWith('  ')
+            return (
+              <Text key={`dashboard-command-line:${offset + index}`} color={heading ? 'cyan' : 'white'}>
+                {line}
+              </Text>
+            )
+          })}
+        </Box>
+      )
+    }
+
     if (inviteComposeState) {
       return (
         <Box flexDirection="column">
@@ -5627,7 +6360,7 @@ export function App({
   }
 
   const keysLabel =
-    'Keys: `:` command, right-top `Enter` expand/execute, create/invite edit `Enter` save/send and `Esc` cancel, `y` copy value, `Y` copy command, `Tab/Shift+Tab` pane focus, tree `←/→`, list `↑/↓`, right-bottom join-requests `↑/↓` + `Enter` review, `Ctrl+U/Ctrl+D` scroll, `r` refresh, `q` quit'
+    'Keys: `:` command, right-top `Enter` expand/execute, dashboard/create/invite edit `Enter` submit and `Esc` cancel, `y` copy value, `Y` copy command, `Tab/Shift+Tab` pane focus, tree `←/→`, list `↑/↓`, right-bottom join-requests `↑/↓` + `Enter` review, `Ctrl+U/Ctrl+D` scroll, `r` refresh, `q` quit'
   const selectedNodeDisplay = displayNodeId(selectedNode)
 
   const commandStatusLabel = state.lastError

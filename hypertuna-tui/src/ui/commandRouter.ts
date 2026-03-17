@@ -2,6 +2,7 @@ import type { NavNodeId } from '../lib/constants.js'
 import { FILE_FAMILY_ORDER } from '../lib/constants.js'
 import type { ClipboardCopyResult } from '../runtime/clipboard.js'
 import { normalizeBool, splitCsv } from '../lib/format.js'
+import { buildCommandHelpSummary } from './commandCatalog.js'
 
 export type CommandResult = {
   message: string
@@ -731,8 +732,7 @@ export async function executeCommand(
 
   if (cmd === 'help') {
     return {
-      message:
-        'Commands: help | goto <node> | copy <field|selected|command> | account generate/profiles/login/add-nsec/add-ncryptsec/select/unlock/remove/clear | worker start/stop/restart | gateway list/refresh | relay tab/refresh/invites/members/search/sort/filter/create/join/disconnect/leave/join-flow/request-invite/invite/invite-accept/invite-dismiss/join-requests/approve/reject/update-members/update-auth | invites refresh/accept <relay|chat>/dismiss <relay|chat> | file refresh/upload/download/delete/search/sort/filter | chat tab/init/refresh/create/invite/accept/dismiss/thread/send | compose start/text/attach/remove/show/publish/cancel | post/reply/react | perf overlay/snapshot'
+      message: buildCommandHelpSummary()
     }
   }
 

@@ -51,6 +51,10 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 - Create browse view includes inline picker rows:
   - `Create Relay`: gateway picker rows (`Enter` selects gateway, plus refresh row)
   - `Create Chat`: writable relay checklist rows (`Enter` toggles relay)
+- `Dashboard` right-top now exposes action rows:
+  - `User Profile: <name>` -> `Edit Profile` opens kind 0 name/bio edit mode
+  - `Discovery Relays: <N>` -> `Edit Discovery Relays` opens relay checklist/manual-add mode
+  - `Terminal Commands` -> `Open Command Reference` opens read-only command docs
 - `My Relays` and `Chats`: expand a row and choose `Send Invite` to open invite compose edit mode in right-top
 - `r`: refresh current section
 - `:`: open command bar
@@ -105,6 +109,18 @@ Normal interactive startup now runs through an authentication/setup gate immedia
 - `copy command [workflow]` copies a workflow command template for the current selection.
 - Secret material (`nsec`, tokens, writer secrets) is blocked by default.
 - Set `HYPERTUNA_TUI_ALLOW_UNSAFE_COPY=1` only for explicit debug use.
+
+## Dashboard Actions
+
+- `Dashboard` uses expand-then-open action-tree behavior in right-top.
+- `Edit Profile`:
+  - edit `Name` and `Bio`, then `Submit`
+  - publishes kind 0 metadata using open relay URLs first, with discovery-relay fallback
+- `Edit Discovery Relays`:
+  - toggle selected relays
+  - add manual `ws://` / `wss://` relay URLs
+  - submit to update active runtime discovery relay set
+- `Open Command Reference` is read-only and scrollable (`↑/↓`, `PageUp/PageDown`, `Home/End`).
 
 ## Table-style views
 
@@ -173,6 +189,8 @@ Normal interactive startup now runs through an authentication/setup gate immedia
 - `chat thread <conversationId>`
 - `chat send <conversationId> <content>`
 - `goto <dashboard|relays|relay:browse|relay:my|relay:create|chats|chats:create|invites|invites:group|invites:chat|files|files:images|files:video|files:audio|files:docs|files:other|accounts>`
+
+`help` and the Dashboard `Terminal Commands` view are generated from the same command catalog source.
 
 
 ## Tests
