@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { DEFAULT_DISCOVERY_RELAYS } from '../lib/constants.js'
 
 export const accountRecordSchema = z.object({
   pubkey: z.string().regex(/^[a-f0-9]{64}$/),
@@ -47,6 +48,7 @@ const accountScopedUiStateSchema = z.object({
   })).default({}),
   rightTopSelectionByNode: z.record(z.number().int().nonnegative()).default({}),
   rightBottomOffsetByNode: z.record(z.number().int().nonnegative()).default({}),
+  discoveryRelays: z.array(z.string()).default(DEFAULT_DISCOVERY_RELAYS.map((entry) => String(entry))),
   feedSource: z.object({
     mode: z.enum(['relays', 'relay', 'following', 'group']).default('relays'),
     relayUrl: z.string().nullable().optional(),

@@ -1,5 +1,7 @@
 import { readJsonFile, writeJsonFile } from './jsonStore.js'
 import { defaultUiState, type AccountScopedUiState, type UiState, uiStateSchema } from './schema.js'
+import { DEFAULT_DISCOVERY_RELAYS } from '../lib/constants.js'
+import { uniqueRelayUrls } from '../lib/nostr.js'
 
 const defaultAccountScopedUiState = (): AccountScopedUiState => ({
   groupViewTab: 'discover',
@@ -15,6 +17,7 @@ const defaultAccountScopedUiState = (): AccountScopedUiState => ({
   nodeViewport: {},
   rightTopSelectionByNode: {},
   rightBottomOffsetByNode: {},
+  discoveryRelays: uniqueRelayUrls(DEFAULT_DISCOVERY_RELAYS),
   feedSource: {
     mode: 'relays',
     relayUrl: null,
@@ -148,7 +151,10 @@ export class UiStateStore {
       rightBottomOffsetByNode: {
         ...defaultAccountScopedUiState().rightBottomOffsetByNode,
         ...((raw as { rightBottomOffsetByNode?: Record<string, number> }).rightBottomOffsetByNode || {})
-      }
+      },
+      discoveryRelays: uniqueRelayUrls(
+        ((raw as { discoveryRelays?: string[] }).discoveryRelays || defaultAccountScopedUiState().discoveryRelays)
+      )
     }
   }
 

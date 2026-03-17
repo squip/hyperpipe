@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import type { Event } from 'nostr-tools'
+import { nip19, type Event, utils } from 'nostr-tools'
 import type { ControllerState, RuntimeOptions } from '../../../src/domain/controller.js'
 import type { AppController } from '../../../src/ui/App.js'
 import type {
@@ -35,7 +35,7 @@ import type {
   StarterPack,
   ThreadMessage
 } from '../../../src/domain/types.js'
-import { FILE_FAMILY_ORDER, type NavNodeId } from '../../../src/lib/constants.js'
+import { DEFAULT_DISCOVERY_RELAYS, FILE_FAMILY_ORDER, type NavNodeId } from '../../../src/lib/constants.js'
 import { buildInvitesInbox } from '../../../src/domain/parity/groupFilters.js'
 import {
   selectChatPendingInviteCount,
@@ -43,6 +43,7 @@ import {
   selectFilesCount,
   selectInvitesCount
 } from '../../../src/domain/parity/counters.js'
+import { uniqueRelayUrls } from '../../../src/lib/nostr.js'
 
 function nowSec(): number {
   return Math.floor(Date.now() / 1000)
@@ -187,6 +188,7 @@ function emptyState(): ControllerState {
       read: [],
       write: []
     },
+    discoveryRelayUrls: uniqueRelayUrls(DEFAULT_DISCOVERY_RELAYS),
     gatewayPeerCounts: {},
     discoveredGateways: [],
     feed: [],
@@ -282,6 +284,7 @@ function cloneState(state: ControllerState): ControllerState {
       read: [...state.relayListPreferences.read],
       write: [...state.relayListPreferences.write]
     },
+    discoveryRelayUrls: [...state.discoveryRelayUrls],
     gatewayPeerCounts: { ...state.gatewayPeerCounts },
     discoveredGateways: state.discoveredGateways.map((entry) => ({ ...entry })),
     feed: [...state.feed],
@@ -393,6 +396,7 @@ export class MockController implements AppController {
       searchResults: state?.searchResults || [],
       bookmarks: state?.bookmarks || { event: null, eventIds: [] },
       relayListPreferences: state?.relayListPreferences || { read: [], write: [] },
+      discoveryRelayUrls: state?.discoveryRelayUrls || uniqueRelayUrls(DEFAULT_DISCOVERY_RELAYS),
       gatewayPeerCounts: state?.gatewayPeerCounts || {},
       discoveredGateways: state?.discoveredGateways || [],
       feedSource: state?.feedSource || defaultFeedSource(),
@@ -856,7 +860,8 @@ export class MockController implements AppController {
   }
 
   async generateNsecAccount(label?: string): Promise<{ pubkey: string; nsec: string; label?: string }> {
-    const nsec = `nsec-generated-${nowMs()}`
+    const seed = hex64(`generated-account:${nowMs()}:${Math.random().toString(16).slice(2)}`)
+    const nsec = nip19.nsecEncode(utils.hexToBytes(seed))
     await this.addNsecAccount(nsec, label)
     const pubkey = this.state.currentAccountPubkey
     if (!pubkey) {
@@ -931,6 +936,35 @@ export class MockController implements AppController {
     this.patch({
       lastCopiedValue: value || null,
       lastCopiedMethod: method || null
+    })
+  }
+
+  async setDiscoveryRelayUrls(relays: string[]): Promise<void> {
+    const next = uniqueRelayUrls(relays || [])
+    this.patch({
+      discoveryRelayUrls: next.length ? next : uniqueRelayUrls(DEFAULT_DISCOVERY_RELAYS)
+    })
+  }
+
+  async publishProfileMetadata(input: { name: string; about?: string; relays?: string[] }): Promise<void> {
+    const sessionPubkey = this.state.session?.pubkey
+    if (!sessionPubkey) {
+      throw new Error('No unlocked account session')
+    }
+    const name = String(input.name || '').trim()
+    if (!name) {
+      throw new Error('Profile name is required')
+    }
+    const about = String(input.about || '').trim()
+    this.patch({
+      adminProfileByPubkey: {
+        ...this.state.adminProfileByPubkey,
+        [sessionPubkey]: {
+          name,
+          bio: about || null,
+          followersCount: this.state.adminProfileByPubkey[sessionPubkey]?.followersCount ?? null
+        }
+      }
     })
   }
 

@@ -29,6 +29,7 @@ export function StartupApp({
   return (
     <App
       options={options}
+      enableStartupGate
       controllerFactory={controllerFactory}
       scriptedCommands={scriptedCommands}
       autoExitOnScriptComplete={autoExitOnScriptComplete}

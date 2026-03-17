@@ -6,6 +6,7 @@ import { TuiController, type ControllerState, type RuntimeOptions } from '../dom
 import type { GroupJoinRequest } from '../domain/types.js'
 import { copy as copyToClipboard } from '../runtime/clipboard.js'
 import {
+  DEFAULT_DISCOVERY_RELAYS,
   FILE_FAMILY_ORDER,
   FILE_FAMILY_LABELS,
   type FileFamily,
@@ -47,9 +48,17 @@ import {
   type ChatCreateDraft,
   type GroupCreateDraft
 } from './createFormAdapter.js'
+import {
+  appendDiscoveryRelay,
+  buildDiscoveryRelayState,
+  parseNsecCredentialInput,
+  toggleDiscoveryRelay,
+  type ParsedNsecCredential
+} from './startupAuth.js'
 
 type AppProps = {
   options: RuntimeOptions
+  enableStartupGate?: boolean
   controllerFactory?: (options: RuntimeOptions) => AppController
   scriptedCommands?: ScriptedCommand[]
   autoExitOnScriptComplete?: boolean
@@ -71,6 +80,8 @@ export interface AppController extends CommandController {
     files: boolean
   }): Promise<void>
   setRightTopSelection(nodeId: string, index: number): Promise<void>
+  setDiscoveryRelayUrls(relays: string[]): Promise<void>
+  publishProfileMetadata(input: { name: string; about?: string; relays?: string[] }): Promise<void>
 }
 
 export type ScriptedCommand = {
@@ -191,6 +202,46 @@ type DetailRenderRow =
     }
 
 type ActionBlockPosition = 'single' | 'top' | 'middle' | 'bottom'
+
+type StartupStage =
+  | 'auth-menu'
+  | 'setup-auth-choice'
+  | 'saved-account-picker'
+  | 'saved-account-password'
+  | 'import-nsec'
+  | 'generated-keys'
+  | 'profile'
+  | 'discovery'
+
+type StartupMenuAction = 'saved-account' | 'generate' | 'import-nsec'
+type StartupFlowMode = 'saved-account' | 'generate' | 'import-nsec'
+type StartupProfileFocus = 'name' | 'bio' | 'publish' | 'skip'
+type StartupDiscoveryMode = 'list' | 'manual'
+
+type StartupGateState = {
+  active: boolean
+  hadStoredAccounts: boolean
+  stage: StartupStage
+  mode: StartupFlowMode | null
+  menuIndex: number
+  accountIndex: number
+  selectedAccountPubkey: string | null
+  password: string
+  nsecInput: string
+  generated: ParsedNsecCredential | null
+  profileName: string
+  profileBio: string
+  profileFocus: StartupProfileFocus
+  profileEditField: 'name' | 'bio' | null
+  discoveryOptions: string[]
+  discoverySelected: string[]
+  discoveryIndex: number
+  discoveryMode: StartupDiscoveryMode
+  manualRelayInput: string
+  status: string
+  error: string
+  busy: boolean
+}
 
 function sanitizeDisplayCell(value: string | null | undefined): string {
   return String(value || '')
@@ -1911,8 +1962,82 @@ async function refreshNode(controller: AppController, node: NavNodeId, selectedR
   }
 }
 
+function startupMenuOptions(hasAccounts: boolean): Array<{
+  id: StartupMenuAction
+  label: string
+  description: string
+}> {
+  if (!hasAccounts) {
+    return [
+      {
+        id: 'generate',
+        label: 'Generate New Account',
+        description: 'Create a new keypair and continue setup.'
+      },
+      {
+        id: 'import-nsec',
+        label: 'Sign In With Existing nsec',
+        description: 'Import an existing nsec (hex or bech32).'
+      }
+    ]
+  }
+
+  return [
+    {
+      id: 'saved-account',
+      label: 'Sign In With Saved Account',
+      description: 'Select and authenticate an existing local account.'
+    },
+    {
+      id: 'generate',
+      label: 'Generate New Account',
+      description: 'Create a fresh keypair and account profile.'
+    },
+    {
+      id: 'import-nsec',
+      label: 'Sign In With Existing nsec',
+      description: 'Import an existing nsec (hex or bech32).'
+    }
+  ]
+}
+
+function createStartupGateState(state: ControllerState): StartupGateState {
+  const discovery = buildDiscoveryRelayState({
+    persisted: state.discoveryRelayUrls,
+    active: state.discoveryRelayUrls
+  })
+  const hasAccounts = state.accounts.length > 0
+  return {
+    active: true,
+    hadStoredAccounts: hasAccounts,
+    stage: hasAccounts ? 'auth-menu' : 'setup-auth-choice',
+    mode: null,
+    menuIndex: 0,
+    accountIndex: 0,
+    selectedAccountPubkey: null,
+    password: '',
+    nsecInput: '',
+    generated: null,
+    profileName: '',
+    profileBio: '',
+    profileFocus: 'name',
+    profileEditField: null,
+    discoveryOptions: discovery.options,
+    discoverySelected: discovery.selected,
+    discoveryIndex: 0,
+    discoveryMode: 'list',
+    manualRelayInput: '',
+    status: hasAccounts
+      ? 'Choose a sign-in method to continue.'
+      : 'Complete account setup to continue.',
+    error: '',
+    busy: false
+  }
+}
+
 export function App({
   options,
+  enableStartupGate = false,
   controllerFactory,
   scriptedCommands,
   autoExitOnScriptComplete = false
@@ -1960,10 +2085,12 @@ export function App({
   const [inviteComposeState, setInviteComposeState] = useState<InviteComposeState | null>(null)
   const [joinRequestCursorByGroupKey, setJoinRequestCursorByGroupKey] = useState<Record<string, number>>({})
   const [joinRequestReviewState, setJoinRequestReviewState] = useState<JoinRequestReviewState | null>(null)
+  const [startupGate, setStartupGate] = useState<StartupGateState | null>(null)
   const inviteSearchRequestRef = useRef(0)
   const [commandMessage, setCommandMessage] = useState('Type :help for commands')
   const [hydratedScopeKey, setHydratedScopeKey] = useState<string>('')
   const initialized = state?.initialized || false
+  const scriptedMode = Boolean(scriptedCommands?.length)
 
   const stateRef = useRef<ControllerState | null>(null)
   const selectedNodeRef = useRef<NavNodeId>('dashboard')
@@ -1976,6 +2103,8 @@ export function App({
   })
   const createEditStateRef = useRef<CreateEditState | null>(null)
   const inviteComposeStateRef = useRef<InviteComposeState | null>(null)
+  const startupGateRef = useRef<StartupGateState | null>(null)
+  const startupGateInitializedRef = useRef(false)
   const selectedCenterRowRef = useRef<CenterRow | null>(null)
   const myGroupPaneLoadKeyRef = useRef<string>('')
 
@@ -2002,7 +2131,8 @@ export function App({
 
         const snapshot = controller.getState()
         const scriptedMode = Boolean(scriptedCommands?.length)
-        if (snapshot.currentAccountPubkey && !scriptedMode) {
+        const startupGateEnabled = enableStartupGate && !scriptedMode
+        if (snapshot.currentAccountPubkey && !scriptedMode && !startupGateEnabled) {
           try {
             await controller.unlockCurrentAccount()
             await controller.startWorker()
@@ -2015,6 +2145,8 @@ export function App({
           }
         } else if (snapshot.currentAccountPubkey && scriptedMode) {
           setCommandMessage('Script mode active: skipping automatic unlock/start bootstrap')
+        } else if (startupGateEnabled) {
+          setCommandMessage('Startup authentication required')
         }
       } catch (error) {
         setCommandMessage(error instanceof Error ? error.message : String(error))
@@ -2026,7 +2158,7 @@ export function App({
       unsubscribe()
       controller.shutdown().catch(() => {})
     }
-  }, [options, controllerFactory, scriptedCommands])
+  }, [options, controllerFactory, scriptedCommands, enableStartupGate])
 
   useEffect(() => {
     stateRef.current = state
@@ -2059,6 +2191,25 @@ export function App({
   useEffect(() => {
     inviteComposeStateRef.current = inviteComposeState
   }, [inviteComposeState])
+
+  useEffect(() => {
+    startupGateRef.current = startupGate
+  }, [startupGate])
+
+  useEffect(() => {
+    if (!state?.initialized) return
+    if (startupGateInitializedRef.current) return
+
+    const shouldGate = enableStartupGate && !scriptedMode
+    startupGateInitializedRef.current = true
+    if (!shouldGate) return
+    if (state.session) return
+
+    setCommandInputOpen(false)
+    setCommandInput('')
+    setStartupGate(createStartupGateState(state))
+    setCommandMessage('Complete startup authentication to continue')
+  }, [state, enableStartupGate, scriptedMode])
 
   useEffect(() => {
     if (!state) return
@@ -3498,6 +3649,245 @@ export function App({
     }
   }
 
+  const startupHomeStage = (gate: StartupGateState): StartupStage => (
+    gate.hadStoredAccounts ? 'auth-menu' : 'setup-auth-choice'
+  )
+
+  const moveStartupToDiscovery = (mode: StartupFlowMode, statusMessage: string): void => {
+    const snapshot = controllerRef.current?.getState() || stateRef.current
+    const discovery = buildDiscoveryRelayState({
+      persisted: snapshot?.discoveryRelayUrls || [],
+      active: snapshot?.discoveryRelayUrls || DEFAULT_DISCOVERY_RELAYS
+    })
+    setStartupGate((previous) => (
+      previous
+        ? {
+            ...previous,
+            stage: 'discovery',
+            mode,
+            discoveryOptions: discovery.options,
+            discoverySelected: discovery.selected,
+            discoveryIndex: 0,
+            discoveryMode: 'list',
+            manualRelayInput: '',
+            profileEditField: null,
+            busy: false,
+            status: statusMessage,
+            error: ''
+          }
+        : previous
+    ))
+  }
+
+  const completeStartupBootstrap = async (statusMessage: string): Promise<void> => {
+    const controller = controllerRef.current
+    if (!controller) return
+    await controller.startWorker()
+    await refreshNode(controller, 'dashboard', null)
+    setSelectedNode('dashboard')
+    setFocusPane('left-tree')
+    controller.setSelectedNode('dashboard').catch(() => {})
+    controller.setFocusPane('left-tree').catch(() => {})
+    setStartupGate(null)
+    setCommandMessage(statusMessage)
+  }
+
+  const setStartupBusyStatus = (statusMessage: string): void => {
+    setStartupGate((previous) => (
+      previous
+        ? {
+            ...previous,
+            busy: true,
+            status: statusMessage,
+            error: ''
+          }
+        : previous
+    ))
+  }
+
+  const setStartupError = (message: string): void => {
+    setStartupGate((previous) => (
+      previous
+        ? {
+            ...previous,
+            busy: false,
+            error: message,
+            status: previous.status || 'Action failed'
+          }
+        : previous
+    ))
+  }
+
+  const beginStartupGenerateFlow = async (): Promise<void> => {
+    const controller = controllerRef.current
+    if (!controller) return
+    setStartupBusyStatus('Generating account…')
+    try {
+      const created = await controller.generateNsecAccount()
+      await controller.unlockCurrentAccount()
+      const parsed = parseNsecCredentialInput(created.nsec)
+      setStartupGate((previous) => (
+        previous
+          ? {
+              ...previous,
+              stage: 'generated-keys',
+              mode: 'generate',
+              generated: parsed,
+              nsecInput: '',
+              profileName: '',
+              profileBio: '',
+              profileFocus: 'name',
+              profileEditField: null,
+              busy: false,
+              error: '',
+              status: `Generated account ${created.pubkey}`
+            }
+          : previous
+      ))
+    } catch (error) {
+      setStartupError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const beginStartupImportFlow = (): void => {
+    setStartupGate((previous) => (
+      previous
+        ? {
+            ...previous,
+            stage: 'import-nsec',
+            mode: 'import-nsec',
+            nsecInput: '',
+            busy: false,
+            error: '',
+            status: 'Enter your existing nsec (hex or bech32).'
+          }
+        : previous
+    ))
+  }
+
+  const submitStartupImportedNsec = async (): Promise<void> => {
+    const controller = controllerRef.current
+    const gate = startupGateRef.current
+    if (!controller || !gate) return
+    const raw = String(gate.nsecInput || '').trim()
+    if (!raw) {
+      setStartupError('nsec input is required')
+      return
+    }
+    setStartupBusyStatus('Importing account…')
+    try {
+      const parsed = parseNsecCredentialInput(raw)
+      await controller.addNsecAccount(parsed.nsec)
+      await controller.unlockCurrentAccount()
+      moveStartupToDiscovery('import-nsec', `Imported account ${parsed.pubkeyHex}`)
+    } catch (error) {
+      setStartupError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const authenticateStartupSavedAccount = async (accountPubkey: string, password?: string): Promise<void> => {
+    const controller = controllerRef.current
+    const snapshot = stateRef.current
+    if (!controller || !snapshot) return
+    const account = snapshot.accounts.find((entry) => entry.pubkey === accountPubkey)
+    if (!account) {
+      setStartupError('Selected account not found')
+      return
+    }
+
+    setStartupBusyStatus('Authenticating saved account…')
+    try {
+      await controller.selectAccount(accountPubkey)
+      await controller.unlockCurrentAccount(
+        account.signerType === 'ncryptsec'
+          ? async () => String(password || '')
+          : undefined
+      )
+      await completeStartupBootstrap(`Authenticated profile ${account.label || account.pubkey}`)
+    } catch (error) {
+      setStartupError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const submitStartupProfilePublish = async (): Promise<void> => {
+    const controller = controllerRef.current
+    const gate = startupGateRef.current
+    if (!controller || !gate) return
+    const name = String(gate.profileName || '').trim()
+    if (!name) {
+      setStartupError('Profile name is required')
+      return
+    }
+    setStartupBusyStatus('Publishing profile metadata…')
+    try {
+      await controller.publishProfileMetadata({
+        name,
+        about: String(gate.profileBio || '').trim() || undefined,
+        relays: gate.discoverySelected
+      })
+      moveStartupToDiscovery('generate', 'Profile metadata published')
+    } catch (error) {
+      setStartupError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const skipStartupProfilePublish = (): void => {
+    moveStartupToDiscovery('generate', 'Skipped profile metadata publish')
+  }
+
+  const submitStartupDiscoverySelection = async (): Promise<void> => {
+    const controller = controllerRef.current
+    const gate = startupGateRef.current
+    if (!controller || !gate) return
+    if (!gate.discoverySelected.length) {
+      setStartupError('Select at least one discovery relay')
+      return
+    }
+    setStartupBusyStatus('Applying discovery relays…')
+    try {
+      await controller.setDiscoveryRelayUrls(gate.discoverySelected)
+      await completeStartupBootstrap('Startup authentication complete')
+    } catch (error) {
+      setStartupError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const returnToStartupHome = (): void => {
+    setStartupGate((previous) => {
+      if (!previous) return previous
+      const homeStage = startupHomeStage(previous)
+      const discovery = buildDiscoveryRelayState({
+        persisted: previous.discoverySelected,
+        active: previous.discoveryOptions
+      })
+      return {
+        ...previous,
+        stage: homeStage,
+        mode: null,
+        menuIndex: 0,
+        accountIndex: 0,
+        selectedAccountPubkey: null,
+        password: '',
+        nsecInput: '',
+        generated: null,
+        profileName: '',
+        profileBio: '',
+        profileFocus: 'name',
+        profileEditField: null,
+        discoveryOptions: discovery.options,
+        discoverySelected: discovery.selected,
+        discoveryIndex: 0,
+        discoveryMode: 'list',
+        manualRelayInput: '',
+        busy: false,
+        error: '',
+        status: homeStage === 'auth-menu'
+          ? 'Choose a sign-in method to continue.'
+          : 'Complete account setup to continue.'
+      }
+    })
+  }
+
   useEffect(() => {
     if (!initialized) return
     if (!scriptedCommands?.length) return
@@ -3567,16 +3957,586 @@ export function App({
     const snapshot = stateRef.current
     if (!controller || !snapshot) return
 
+    if (key.ctrl && input === 'c') {
+      controller.shutdown().finally(() => exit())
+      return
+    }
+
+    const currentStartupGate = startupGateRef.current
+    if (currentStartupGate?.active) {
+      if (currentStartupGate.busy) {
+        return
+      }
+
+      if (key.escape) {
+        if (currentStartupGate.stage === 'saved-account-picker') {
+          returnToStartupHome()
+          return
+        }
+        if (currentStartupGate.stage === 'saved-account-password') {
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  stage: 'saved-account-picker',
+                  password: '',
+                  busy: false,
+                  error: '',
+                  status: 'Select a saved account'
+                }
+              : previous
+          ))
+          return
+        }
+        if (currentStartupGate.stage === 'import-nsec') {
+          returnToStartupHome()
+          return
+        }
+        if (currentStartupGate.stage === 'generated-keys') {
+          returnToStartupHome()
+          return
+        }
+        if (currentStartupGate.stage === 'profile') {
+          if (currentStartupGate.profileEditField) {
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    profileEditField: null,
+                    error: ''
+                  }
+                : previous
+            ))
+          } else {
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    stage: 'generated-keys',
+                    profileEditField: null,
+                    error: '',
+                    status: 'Review and confirm your generated keys.'
+                  }
+                : previous
+            ))
+          }
+          return
+        }
+        if (currentStartupGate.stage === 'discovery') {
+          if (currentStartupGate.discoveryMode === 'manual') {
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    discoveryMode: 'list',
+                    manualRelayInput: '',
+                    error: ''
+                  }
+                : previous
+            ))
+            return
+          }
+          if (currentStartupGate.mode === 'generate') {
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    stage: 'profile',
+                    profileEditField: null,
+                    error: '',
+                    status: 'Enter profile details or skip.'
+                  }
+                : previous
+            ))
+            return
+          }
+          if (currentStartupGate.mode === 'import-nsec') {
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    stage: 'import-nsec',
+                    nsecInput: '',
+                    error: '',
+                    status: 'Enter your existing nsec (hex or bech32).'
+                  }
+                : previous
+            ))
+          }
+          return
+        }
+      }
+
+      const isPrintable = !key.ctrl && !(key as unknown as { meta?: boolean }).meta && input.length > 0
+
+      if (currentStartupGate.stage === 'auth-menu' || currentStartupGate.stage === 'setup-auth-choice') {
+        const options = startupMenuOptions(currentStartupGate.hadStoredAccounts)
+        const maxIndex = Math.max(0, options.length - 1)
+        if (key.upArrow) {
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  menuIndex: clamp(previous.menuIndex - 1, 0, maxIndex),
+                  error: ''
+                }
+              : previous
+          ))
+          return
+        }
+        if (key.downArrow) {
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  menuIndex: clamp(previous.menuIndex + 1, 0, maxIndex),
+                  error: ''
+                }
+              : previous
+          ))
+          return
+        }
+        if (key.return) {
+          const selected = options[clamp(currentStartupGate.menuIndex, 0, maxIndex)]
+          if (!selected) return
+          if (selected.id === 'saved-account') {
+            if (!snapshot.accounts.length) {
+              setStartupError('No saved accounts available')
+              return
+            }
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    stage: 'saved-account-picker',
+                    mode: 'saved-account',
+                    accountIndex: clamp(previous.accountIndex, 0, Math.max(0, snapshot.accounts.length - 1)),
+                    error: '',
+                    status: 'Select a saved account'
+                  }
+                : previous
+            ))
+            return
+          }
+          if (selected.id === 'generate') {
+            beginStartupGenerateFlow().catch((error) => {
+              setStartupError(error instanceof Error ? error.message : String(error))
+            })
+            return
+          }
+          beginStartupImportFlow()
+        }
+        return
+      }
+
+      if (currentStartupGate.stage === 'saved-account-picker') {
+        const maxIndex = Math.max(0, snapshot.accounts.length - 1)
+        if (key.upArrow) {
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  accountIndex: clamp(previous.accountIndex - 1, 0, maxIndex),
+                  error: ''
+                }
+              : previous
+          ))
+          return
+        }
+        if (key.downArrow) {
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  accountIndex: clamp(previous.accountIndex + 1, 0, maxIndex),
+                  error: ''
+                }
+              : previous
+          ))
+          return
+        }
+        if (key.return) {
+          const account = snapshot.accounts[clamp(currentStartupGate.accountIndex, 0, maxIndex)]
+          if (!account) {
+            setStartupError('No saved accounts available')
+            return
+          }
+          if (account.signerType === 'ncryptsec') {
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    stage: 'saved-account-password',
+                    selectedAccountPubkey: account.pubkey,
+                    password: '',
+                    error: '',
+                    status: `Enter password for ${account.label || account.pubkey}`
+                  }
+                : previous
+            ))
+            return
+          }
+          authenticateStartupSavedAccount(account.pubkey).catch((error) => {
+            setStartupError(error instanceof Error ? error.message : String(error))
+          })
+        }
+        return
+      }
+
+      if (currentStartupGate.stage === 'saved-account-password') {
+        if (key.return) {
+          const pubkey = String(currentStartupGate.selectedAccountPubkey || '').trim()
+          if (!pubkey) {
+            setStartupError('No account selected')
+            return
+          }
+          if (!currentStartupGate.password) {
+            setStartupError('Password is required')
+            return
+          }
+          authenticateStartupSavedAccount(pubkey, currentStartupGate.password).catch((error) => {
+            setStartupError(error instanceof Error ? error.message : String(error))
+          })
+          return
+        }
+        if (key.backspace || key.delete) {
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  password: previous.password.slice(0, -1),
+                  error: ''
+                }
+              : previous
+          ))
+          return
+        }
+        if (key.ctrl && input === 'u') {
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  password: '',
+                  error: ''
+                }
+              : previous
+          ))
+          return
+        }
+        if (isPrintable) {
+          const sanitized = input.replace(/[\r\n\t]/g, '')
+          if (!sanitized) return
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  password: `${previous.password}${sanitized}`,
+                  error: ''
+                }
+              : previous
+          ))
+        }
+        return
+      }
+
+      if (currentStartupGate.stage === 'import-nsec') {
+        if (key.return) {
+          submitStartupImportedNsec().catch((error) => {
+            setStartupError(error instanceof Error ? error.message : String(error))
+          })
+          return
+        }
+        if (key.backspace || key.delete) {
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  nsecInput: previous.nsecInput.slice(0, -1),
+                  error: ''
+                }
+              : previous
+          ))
+          return
+        }
+        if (key.ctrl && input === 'u') {
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  nsecInput: '',
+                  error: ''
+                }
+              : previous
+          ))
+          return
+        }
+        if (isPrintable) {
+          const sanitized = input.replace(/[\r\n\t]/g, '')
+          if (!sanitized) return
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  nsecInput: `${previous.nsecInput}${sanitized}`,
+                  error: ''
+                }
+              : previous
+          ))
+        }
+        return
+      }
+
+      if (currentStartupGate.stage === 'generated-keys') {
+        if (key.return) {
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  stage: 'profile',
+                  profileFocus: 'name',
+                  profileEditField: null,
+                  error: '',
+                  status: 'Enter profile details or skip.'
+                }
+              : previous
+          ))
+        }
+        return
+      }
+
+      if (currentStartupGate.stage === 'profile') {
+        const profileRows: StartupProfileFocus[] = ['name', 'bio', 'publish', 'skip']
+        if (currentStartupGate.profileEditField) {
+          if (key.return) {
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    profileEditField: null,
+                    error: ''
+                  }
+                : previous
+            ))
+            return
+          }
+          if (key.backspace || key.delete) {
+            setStartupGate((previous) => {
+              if (!previous) return previous
+              if (previous.profileEditField === 'name') {
+                return { ...previous, profileName: previous.profileName.slice(0, -1), error: '' }
+              }
+              return { ...previous, profileBio: previous.profileBio.slice(0, -1), error: '' }
+            })
+            return
+          }
+          if (key.ctrl && input === 'u') {
+            setStartupGate((previous) => {
+              if (!previous) return previous
+              if (previous.profileEditField === 'name') {
+                return { ...previous, profileName: '', error: '' }
+              }
+              return { ...previous, profileBio: '', error: '' }
+            })
+            return
+          }
+          if (isPrintable) {
+            const sanitized = input.replace(/[\r\n\t]/g, '')
+            if (!sanitized) return
+            setStartupGate((previous) => {
+              if (!previous) return previous
+              if (previous.profileEditField === 'name') {
+                return { ...previous, profileName: `${previous.profileName}${sanitized}`, error: '' }
+              }
+              return { ...previous, profileBio: `${previous.profileBio}${sanitized}`, error: '' }
+            })
+          }
+          return
+        }
+
+        if (key.upArrow || key.downArrow) {
+          const currentIndex = profileRows.indexOf(currentStartupGate.profileFocus)
+          const delta = key.upArrow ? -1 : 1
+          const nextFocus = profileRows[clamp(currentIndex + delta, 0, profileRows.length - 1)] || 'name'
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  profileFocus: nextFocus,
+                  error: ''
+                }
+              : previous
+          ))
+          return
+        }
+
+        if (key.return) {
+          if (currentStartupGate.profileFocus === 'name' || currentStartupGate.profileFocus === 'bio') {
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    profileEditField: previous.profileFocus === 'bio' ? 'bio' : 'name',
+                    error: ''
+                  }
+                : previous
+            ))
+            return
+          }
+          if (currentStartupGate.profileFocus === 'publish') {
+            submitStartupProfilePublish().catch((error) => {
+              setStartupError(error instanceof Error ? error.message : String(error))
+            })
+            return
+          }
+          skipStartupProfilePublish()
+        }
+        return
+      }
+
+      if (currentStartupGate.stage === 'discovery') {
+        if (currentStartupGate.discoveryMode === 'manual') {
+          if (key.return) {
+            try {
+              const next = appendDiscoveryRelay(
+                currentStartupGate.discoveryOptions,
+                currentStartupGate.discoverySelected,
+                currentStartupGate.manualRelayInput
+              )
+              setStartupGate((previous) => (
+                previous
+                  ? {
+                      ...previous,
+                      discoveryOptions: next.options,
+                      discoverySelected: next.selected,
+                      discoveryMode: 'list',
+                      discoveryIndex: Math.max(0, next.options.length - 1),
+                      manualRelayInput: '',
+                      error: '',
+                      status: 'Added relay to discovery selection'
+                    }
+                  : previous
+              ))
+            } catch (error) {
+              setStartupError(error instanceof Error ? error.message : String(error))
+            }
+            return
+          }
+          if (key.backspace || key.delete) {
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    manualRelayInput: previous.manualRelayInput.slice(0, -1),
+                    error: ''
+                  }
+                : previous
+            ))
+            return
+          }
+          if (key.ctrl && input === 'u') {
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    manualRelayInput: '',
+                    error: ''
+                  }
+                : previous
+            ))
+            return
+          }
+          if (isPrintable) {
+            const sanitized = input.replace(/[\r\n\t]/g, '')
+            if (!sanitized) return
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    manualRelayInput: `${previous.manualRelayInput}${sanitized}`,
+                    error: ''
+                  }
+                : previous
+            ))
+          }
+          return
+        }
+
+        const actionAddRow = currentStartupGate.discoveryOptions.length
+        const actionContinueRow = currentStartupGate.discoveryOptions.length + 1
+        const maxIndex = actionContinueRow
+
+        if (key.upArrow) {
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  discoveryIndex: clamp(previous.discoveryIndex - 1, 0, maxIndex),
+                  error: ''
+                }
+              : previous
+          ))
+          return
+        }
+        if (key.downArrow) {
+          setStartupGate((previous) => (
+            previous
+              ? {
+                  ...previous,
+                  discoveryIndex: clamp(previous.discoveryIndex + 1, 0, maxIndex),
+                  error: ''
+                }
+              : previous
+          ))
+          return
+        }
+
+        if (key.return) {
+          const index = clamp(currentStartupGate.discoveryIndex, 0, maxIndex)
+          if (index < currentStartupGate.discoveryOptions.length) {
+            const relayUrl = currentStartupGate.discoveryOptions[index]
+            const nextSelected = toggleDiscoveryRelay(currentStartupGate.discoverySelected, relayUrl)
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    discoverySelected: nextSelected,
+                    error: ''
+                  }
+                : previous
+            ))
+            return
+          }
+
+          if (index === actionAddRow) {
+            setStartupGate((previous) => (
+              previous
+                ? {
+                    ...previous,
+                    discoveryMode: 'manual',
+                    manualRelayInput: '',
+                    error: '',
+                    status: 'Enter a relay URL and press Enter to add it.'
+                  }
+                : previous
+            ))
+            return
+          }
+
+          submitStartupDiscoverySelection().catch((error) => {
+            setStartupError(error instanceof Error ? error.message : String(error))
+          })
+        }
+        return
+      }
+
+      return
+    }
+
     if (commandInputOpen) {
       if (key.escape) {
         setCommandInputOpen(false)
         setCommandInput('')
       }
-      return
-    }
-
-    if (key.ctrl && input === 'c') {
-      controller.shutdown().finally(() => exit())
       return
     }
 
@@ -4297,6 +5257,212 @@ export function App({
     return (
       <Box flexDirection="column">
         <TruncText color="cyan">Booting Hypertuna TUI…</TruncText>
+      </Box>
+    )
+  }
+
+  if (startupGate?.active) {
+    const menuOptions = startupMenuOptions(startupGate.hadStoredAccounts)
+    const startupError = String(startupGate.error || '').trim()
+    const startupStatus = String(startupGate.status || '').trim()
+    const startupKeysLabel =
+      'Keys: `↑/↓` navigate, `Enter` select/apply, text fields type directly, `Backspace` delete, `Ctrl+U` clear, `Esc` back/cancel, `Ctrl+C` quit'
+
+    const startupContent = (() => {
+      if (startupGate.stage === 'auth-menu' || startupGate.stage === 'setup-auth-choice') {
+        const title = startupGate.stage === 'auth-menu'
+          ? 'Sign In'
+          : 'Account Setup'
+        return (
+          <Box flexDirection="column">
+            <Text color="yellow">{title}</Text>
+            <Text dimColor>
+              {startupGate.stage === 'auth-menu'
+                ? 'Select an authentication method to continue.'
+                : 'No stored accounts found. Choose how to start.'}
+            </Text>
+            <Text>{''}</Text>
+            {menuOptions.map((entry, index) => {
+              const selected = index === clamp(startupGate.menuIndex, 0, Math.max(0, menuOptions.length - 1))
+              return (
+                <Text key={`startup-menu:${entry.id}:${index}`} color={selected ? 'green' : undefined}>
+                  {selected ? '>' : ' '} {entry.label} <Text dimColor>{`- ${entry.description}`}</Text>
+                </Text>
+              )
+            })}
+          </Box>
+        )
+      }
+
+      if (startupGate.stage === 'saved-account-picker') {
+        const maxIndex = Math.max(0, state.accounts.length - 1)
+        const selectedIndex = clamp(startupGate.accountIndex, 0, maxIndex)
+        return (
+          <Box flexDirection="column">
+            <Text color="yellow">Saved Accounts</Text>
+            <Text dimColor>Select an account to authenticate.</Text>
+            <Text>{''}</Text>
+            {state.accounts.length === 0
+              ? <Text dimColor>No saved accounts found.</Text>
+              : state.accounts.map((account, index) => {
+                const selected = index === selectedIndex
+                const marker = state.currentAccountPubkey === account.pubkey ? '*' : ' '
+                return (
+                  <Text key={`startup-account:${account.pubkey}:${index}`} color={selected ? 'green' : undefined}>
+                    {selected ? '>' : ' '} [{marker}] {account.label || shortId(account.pubkey, 10)} · {account.signerType}
+                  </Text>
+                )
+              })}
+          </Box>
+        )
+      }
+
+      if (startupGate.stage === 'saved-account-password') {
+        return (
+          <Box flexDirection="column">
+            <Text color="yellow">Account Password</Text>
+            <Text dimColor>Enter password for selected ncryptsec account.</Text>
+            <Text>{''}</Text>
+            <Text color="cyan">Password:</Text>
+            <Box borderStyle="round" borderColor="white" paddingX={1}>
+              <Text color="white">{startupGate.password ? '*'.repeat(startupGate.password.length) : ' '}</Text>
+            </Box>
+          </Box>
+        )
+      }
+
+      if (startupGate.stage === 'import-nsec') {
+        return (
+          <Box flexDirection="column">
+            <Text color="yellow">Sign In With Existing nsec</Text>
+            <Text dimColor>Enter 64-char nsec hex or bech32 nsec value.</Text>
+            <Text>{''}</Text>
+            <Text color="cyan">nsec:</Text>
+            <Box borderStyle="round" borderColor="white" paddingX={1}>
+              <Text color="white">{startupGate.nsecInput || ' '}</Text>
+            </Box>
+          </Box>
+        )
+      }
+
+      if (startupGate.stage === 'generated-keys') {
+        return (
+          <Box flexDirection="column">
+            <Text color="yellow">Generated Account Keys</Text>
+            <Text dimColor>Write these keys down before continuing.</Text>
+            <Text>{''}</Text>
+            <Text><Text color="cyan">pubkey (hex): </Text><Text color="white">{startupGate.generated?.pubkeyHex || '-'}</Text></Text>
+            <Text><Text color="cyan">nsec (hex): </Text><Text color="white">{startupGate.generated?.nsecHex || '-'}</Text></Text>
+            <Text><Text color="cyan">nsec (bech32): </Text><Text color="white">{startupGate.generated?.nsec || '-'}</Text></Text>
+            <Text><Text color="cyan">npub: </Text><Text color="white">{startupGate.generated?.npub || '-'}</Text></Text>
+            <Text>{''}</Text>
+            <Text color="green">{'> Continue to profile setup'}</Text>
+          </Box>
+        )
+      }
+
+      if (startupGate.stage === 'profile') {
+        const fieldLabel = startupGate.profileEditField === 'name' ? 'Name' : 'Bio'
+        return (
+          <Box flexDirection="column">
+            <Text color="yellow">Profile Setup (kind 0)</Text>
+            <Text dimColor>Name is required. Bio is optional.</Text>
+            <Text>{''}</Text>
+            {startupGate.profileEditField ? (
+              <Box flexDirection="column">
+                <Text dimColor>{`Editing ${fieldLabel}`}</Text>
+                <Text color="cyan">{fieldLabel}:</Text>
+                <Box borderStyle="round" borderColor="white" paddingX={1}>
+                  <Text color="white">
+                    {startupGate.profileEditField === 'name'
+                      ? (startupGate.profileName || ' ')
+                      : (startupGate.profileBio || ' ')}
+                  </Text>
+                </Box>
+              </Box>
+            ) : (
+              <Box flexDirection="column">
+                <Text color={startupGate.profileFocus === 'name' ? 'green' : undefined}>
+                  {startupGate.profileFocus === 'name' ? '>' : ' '} Name: {startupGate.profileName || '-'}
+                </Text>
+                <Text color={startupGate.profileFocus === 'bio' ? 'green' : undefined}>
+                  {startupGate.profileFocus === 'bio' ? '>' : ' '} Bio: {startupGate.profileBio || '-'}
+                </Text>
+                <Text color={startupGate.profileFocus === 'publish' ? 'green' : undefined}>
+                  {startupGate.profileFocus === 'publish' ? '>' : ' '} Publish profile and continue
+                </Text>
+                <Text color={startupGate.profileFocus === 'skip' ? 'green' : undefined}>
+                  {startupGate.profileFocus === 'skip' ? '>' : ' '} Skip for now
+                </Text>
+              </Box>
+            )}
+          </Box>
+        )
+      }
+
+      const addRowIndex = startupGate.discoveryOptions.length
+      const continueRowIndex = startupGate.discoveryOptions.length + 1
+      return (
+        <Box flexDirection="column">
+          <Text color="yellow">Discovery Relays</Text>
+          <Text dimColor>Use these relays to find other Hyperpipe peers and help them to find you.</Text>
+          <Text>{''}</Text>
+          {startupGate.discoveryMode === 'manual' ? (
+            <Box flexDirection="column">
+              <Text dimColor>Enter a relay websocket URL to add (ws:// or wss://).</Text>
+              <Text color="cyan">Relay URL:</Text>
+              <Box borderStyle="round" borderColor="white" paddingX={1}>
+                <Text color="white">{startupGate.manualRelayInput || ' '}</Text>
+              </Box>
+            </Box>
+          ) : (
+            <Box flexDirection="column">
+              {startupGate.discoveryOptions.map((relayUrl, index) => {
+                const selectedRow = startupGate.discoveryIndex === index
+                const checked = startupGate.discoverySelected.includes(relayUrl)
+                return (
+                  <Text key={`startup-discovery:${relayUrl}:${index}`} color={selectedRow ? 'green' : undefined}>
+                    {selectedRow ? '>' : ' '} {checked ? '[x]' : '[ ]'} {relayUrl}
+                  </Text>
+                )
+              })}
+              <Text color={startupGate.discoveryIndex === addRowIndex ? 'green' : undefined}>
+                {startupGate.discoveryIndex === addRowIndex ? '>' : ' '} Add relay URL manually
+              </Text>
+              <Text color={startupGate.discoveryIndex === continueRowIndex ? 'green' : undefined}>
+                {startupGate.discoveryIndex === continueRowIndex ? '>' : ' '} Continue
+              </Text>
+            </Box>
+          )}
+        </Box>
+      )
+    })()
+
+    return (
+      <Box flexDirection="column" height={frameHeight} overflow="hidden">
+        <Box height={frameRows.mainRows} borderStyle="round" borderColor="magenta" paddingX={1} overflow="hidden">
+          <Box flexDirection="column">
+            {startupContent}
+          </Box>
+        </Box>
+
+        <Box borderStyle="round" borderColor="gray" paddingX={1} height={frameRows.commandRows} overflow="hidden">
+          <Box>
+            <TruncText color="yellow">Startup</TruncText>
+            <TruncText>: {shortText(startupStatus || 'Awaiting input', Math.max(30, stdoutWidth - 24))}</TruncText>
+          </Box>
+        </Box>
+
+        <Box height={frameRows.keysRows} overflow="hidden">
+          <TruncText dimColor>{shortText(startupKeysLabel, Math.max(32, stdoutWidth - 2))}</TruncText>
+        </Box>
+
+        <Box height={frameRows.statusRows} overflow="hidden">
+          {startupGate.busy && !options.noAnimations ? <Spinner type="dots" /> : null}
+          <TruncText color={startupError ? 'red' : startupGate.busy ? 'cyan' : 'gray'}>
+            {shortText(startupError || startupStatus || 'Ready', Math.max(30, stdoutWidth - 2))}
+          </TruncText>
+        </Box>
       </Box>
     )
   }

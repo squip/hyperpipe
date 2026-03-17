@@ -51,7 +51,7 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 - Create browse view includes inline picker rows:
   - `Create Relay`: gateway picker rows (`Enter` selects gateway, plus refresh row)
   - `Create Chat`: writable relay checklist rows (`Enter` toggles relay)
-- `Invites -> Send Invite`: right-bottom accepts text input, suggestion list, and `Enter` to send invite
+- `My Relays` and `Chats`: expand a row and choose `Send Invite` to open invite compose edit mode in right-top
 - `r`: refresh current section
 - `:`: open command bar
 - `y`: copy primary selected value
@@ -70,7 +70,6 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 - `Invites`
   - `Relay Invites (N)`
   - `Chat Invites (N)`
-  - `Send Invite`
 - `Files (N)`
   - `Images (N)`
   - `Video (N)`
@@ -78,7 +77,25 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
   - `Docs (N)`
   - `Other (N)`
 - `Accounts`
-- `Logs`
+
+## Startup Auth Gate (Post-Splash)
+
+Normal interactive startup now runs through an authentication/setup gate immediately after splash.
+
+- If no stored accounts exist:
+  - `Generate New Account` or `Sign In With Existing nsec`
+  - generated-account flow shows full key material and requires explicit continue
+  - generated-account flow includes profile setup (`name` required, `bio` optional) with kind 0 publish (`retry` or `skip`)
+  - discovery relay selection step is required before entering main UI
+- If stored accounts exist:
+  - auth menu: `Sign In With Saved Account`, `Generate New Account`, `Sign In With Existing nsec`
+  - saved-account path opens account picker and prompts password for `ncryptsec` accounts
+  - generate/import paths include discovery relay selection before bootstrap
+- Discovery relay step:
+  - default list is pre-populated and selected
+  - manual `ws://` or `wss://` URL add appends to the checklist and selects it
+  - final selection persists per account and becomes the active runtime discovery relay set
+- Scripted mode bypasses the startup gate (`scriptedCommands` path remains non-interactive).
 
 ## Context-first copy workflow
 
@@ -91,7 +108,7 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 
 ## Table-style views
 
-- Dense list views in the right-top pane now render with compact headers and aligned columns (for relays, invites, files, chats, accounts, and logs).
+- Dense list views in the right-top pane now render with compact headers and aligned columns (for relays, invites, files, chats, and accounts).
 - Child action rows remain expandable/collapsible and render as indented action rows within the same table.
 - `Create Relay` and `Create Chat` use a two-state browse/edit flow in right-top (browse rows by default; focused field enters edit mode).
 - Right-bottom details automatically switch to a `Field | Value` key/value table when the content is primarily metadata; mixed narrative/status blocks continue to render as plain wrapped text.
@@ -155,7 +172,7 @@ TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
 - `chat dismiss [inviteId]`
 - `chat thread <conversationId>`
 - `chat send <conversationId> <content>`
-- `goto <dashboard|relays|relay:browse|relay:my|relay:create|chats|chats:create|invites|invites:group|invites:chat|invites:send|files|files:images|files:video|files:audio|files:docs|files:other|accounts|logs>`
+- `goto <dashboard|relays|relay:browse|relay:my|relay:create|chats|chats:create|invites|invites:group|invites:chat|files|files:images|files:video|files:audio|files:docs|files:other|accounts>`
 
 
 ## Tests

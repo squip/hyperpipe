@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events'
 import path from 'node:path'
 import { promises as fs } from 'node:fs'
-import type { Event, Filter } from 'nostr-tools'
+import type { Event, EventTemplate, Filter } from 'nostr-tools'
 import { generateSecretKey, nip19 } from 'nostr-tools'
 import { AccountService } from './accountService.js'
 import type {
@@ -127,6 +127,7 @@ export type ControllerState = {
   readinessMessage: string
   relays: RelayEntry[]
   relayListPreferences: RelayListPreferences
+  discoveryRelayUrls: string[]
   gatewayPeerCounts: Record<string, number>
   discoveredGateways: DiscoveredGateway[]
   feed: FeedItem[]
@@ -475,6 +476,7 @@ export class TuiController {
       read: [],
       write: []
     },
+    discoveryRelayUrls: uniqueRelayUrls(DEFAULT_DISCOVERY_RELAYS),
     gatewayPeerCounts: {},
     discoveredGateways: [],
     feed: [],
@@ -594,6 +596,7 @@ export class TuiController {
         read: [...this.state.relayListPreferences.read],
         write: [...this.state.relayListPreferences.write]
       },
+      discoveryRelayUrls: [...this.state.discoveryRelayUrls],
       gatewayPeerCounts: { ...this.state.gatewayPeerCounts },
       discoveredGateways: this.state.discoveredGateways.map((gateway) => ({ ...gateway })),
       feed: [...this.state.feed],
@@ -911,6 +914,11 @@ export class TuiController {
         : scoped.paneViewport,
       rightTopSelectionByNode: scoped.rightTopSelectionByNode || {},
       rightBottomOffsetByNode: scoped.rightBottomOffsetByNode || {},
+      discoveryRelayUrls: uniqueRelayUrls(
+        scoped.discoveryRelays && scoped.discoveryRelays.length > 0
+          ? scoped.discoveryRelays
+          : DEFAULT_DISCOVERY_RELAYS
+      ),
       feedSource: scoped.feedSource || defaultFeedSourceState(),
       feedControls: scoped.feedControls || defaultFeedControls(),
       groupControls: scoped.groupControls || defaultGroupControls(),
@@ -949,6 +957,7 @@ export class TuiController {
     nodeViewport?: PaneViewportMap
     rightTopSelectionByNode?: Record<string, number>
     rightBottomOffsetByNode?: Record<string, number>
+    discoveryRelays?: string[]
     feedSource?: FeedSourceState
     feedControls?: FeedControls
     groupControls?: GroupControls
@@ -1852,6 +1861,55 @@ export class TuiController {
         session: null,
         lifecycle: 'stopped',
         readinessMessage: 'Stopped'
+      })
+    })
+  }
+
+  async setDiscoveryRelayUrls(relays: string[]): Promise<void> {
+    const normalized = uniqueRelayUrls(relays || [])
+    const next = normalized.length ? normalized : uniqueRelayUrls(DEFAULT_DISCOVERY_RELAYS)
+    this.patchState({ discoveryRelayUrls: next })
+    await this.persistAccountScopedUiState({ discoveryRelays: next })
+  }
+
+  async publishProfileMetadata(input: {
+    name: string
+    about?: string
+    relays?: string[]
+  }): Promise<void> {
+    await this.runTask('Publish profile metadata', async () => {
+      const session = this.requireSession()
+      const name = String(input.name || '').trim()
+      if (!name) {
+        throw new Error('Profile name is required')
+      }
+      const about = String(input.about || '').trim()
+      const metadata = {
+        name,
+        ...(about ? { about } : {})
+      }
+      const draft: EventTemplate = {
+        kind: 0,
+        created_at: eventNow(),
+        tags: [],
+        content: JSON.stringify(metadata)
+      }
+      const event = signDraftEvent(session.nsecHex, draft)
+      const targets = uniqueRelayUrls(
+        input.relays && input.relays.length > 0
+          ? input.relays
+          : this.searchableRelayUrls(16)
+      )
+      await this.nostrClient.publish(targets, event)
+      this.patchState({
+        adminProfileByPubkey: {
+          ...this.state.adminProfileByPubkey,
+          [session.pubkey]: {
+            name,
+            bio: about || null,
+            followersCount: this.state.adminProfileByPubkey[session.pubkey]?.followersCount ?? null
+          }
+        }
       })
     })
   }
@@ -2883,7 +2941,7 @@ export class TuiController {
       ...this.getWorkerReadableRelayUrls(),
       ...this.state.relayListPreferences.read,
       ...joinedGroupRelays,
-      ...DEFAULT_DISCOVERY_RELAYS
+      ...this.state.discoveryRelayUrls
     ])
   }
 
@@ -2891,7 +2949,7 @@ export class TuiController {
     return uniqueRelayUrls([
       ...this.getWorkerWritableRelayUrls(),
       ...this.state.relayListPreferences.write,
-      ...DEFAULT_DISCOVERY_RELAYS
+      ...this.state.discoveryRelayUrls
     ])
   }
 
