@@ -77,6 +77,21 @@ const DEFAULT_CONFIG = {
     nostrPublishIntervalMs: Number(process.env.GATEWAY_NOSTR_DISCOVERY_REFRESH_MS || process.env.GATEWAY_DISCOVERY_REFRESH_MS || 30000),
     nostrKeySeed: process.env.GATEWAY_NOSTR_DISCOVERY_KEY_SEED || null
   },
+  auth: {
+    hostPolicy: (process.env.GATEWAY_AUTH_HOST_POLICY || 'open').trim().toLowerCase(),
+    memberDelegationMode: (process.env.GATEWAY_AUTH_MEMBER_DELEGATION || 'all-members').trim().toLowerCase(),
+    operatorPubkey: process.env.GATEWAY_AUTH_OPERATOR_PUBKEY || null,
+    allowlistPubkeys: parseCsvList(process.env.GATEWAY_AUTH_ALLOWLIST_PUBKEYS),
+    wotRootPubkey: process.env.GATEWAY_AUTH_WOT_ROOT_PUBKEY || null,
+    wotMaxDepth: parseEnvNumber('GATEWAY_AUTH_WOT_MAX_DEPTH', 1),
+    wotMinFollowersDepth2: parseEnvNumber('GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2', 0),
+    quotas: {
+      maxRelaysPerSponsor: parseEnvNumber('GATEWAY_AUTH_MAX_RELAYS_PER_SPONSOR', 100),
+      maxMembersPerRelay: parseEnvNumber('GATEWAY_AUTH_MAX_MEMBERS_PER_RELAY', 500),
+      maxOpenJoinPool: parseEnvNumber('GATEWAY_AUTH_MAX_OPEN_JOIN_POOL', 100),
+      maxMirroredBytesPerRelay: parseEnvNumber('GATEWAY_AUTH_MAX_MIRRORED_BYTES_PER_RELAY', 0)
+    }
+  },
   relay: {
     storageDir: process.env.GATEWAY_RELAY_STORAGE || null,
     datasetNamespace: process.env.GATEWAY_RELAY_NAMESPACE || 'public-gateway-relay',
@@ -159,6 +174,14 @@ function loadConfig(overrides = {}) {
       ...DEFAULT_CONFIG.discovery,
       ...(overrides.discovery || {})
     },
+    auth: {
+      ...DEFAULT_CONFIG.auth,
+      ...(overrides.auth || {}),
+      quotas: {
+        ...DEFAULT_CONFIG.auth.quotas,
+        ...(overrides.auth?.quotas || {})
+      }
+    },
     relay: {
       ...DEFAULT_CONFIG.relay,
       ...(overrides.relay || {})
@@ -191,6 +214,7 @@ function loadConfig(overrides = {}) {
 
   merged.relay = normalizeRelaySettings(merged.relay);
   merged.blindPeer = normalizeBlindPeerSettings(merged.blindPeer);
+  merged.auth = normalizeAuthSettings(merged.auth);
 
   if (!Number.isFinite(merged.registration.tokenTtlSeconds)) {
     merged.registration.tokenTtlSeconds = merged.registration.defaultTokenTtl;
@@ -284,6 +308,65 @@ function normalizeBlindPeerSettings(settings = {}) {
     staleCoreTtlMs: toPositiveInt(settings.staleCoreTtlMs, 7 * 24 * 60 * 60 * 1000),
     trustedPeersPersistPath: sanitizePath(settings.trustedPeersPersistPath)
   };
+}
+
+function normalizeHexPubkey(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().toLowerCase();
+  return /^[0-9a-f]{64}$/.test(trimmed) ? trimmed : null;
+}
+
+function normalizeAuthSettings(settings = {}) {
+  const result = {
+    ...settings,
+    quotas: {
+      ...(settings?.quotas || {})
+    }
+  };
+
+  const hostPolicy = typeof result.hostPolicy === 'string'
+    ? result.hostPolicy.trim().toLowerCase()
+    : 'open';
+  result.hostPolicy = ['open', 'allowlist', 'wot', 'allowlist+wot'].includes(hostPolicy)
+    ? hostPolicy
+    : 'open';
+
+  const memberDelegationMode = typeof result.memberDelegationMode === 'string'
+    ? result.memberDelegationMode.trim().toLowerCase()
+    : 'all-members';
+  result.memberDelegationMode = ['none', 'closed-members', 'all-members'].includes(memberDelegationMode)
+    ? memberDelegationMode
+    : 'all-members';
+
+  result.operatorPubkey = normalizeHexPubkey(result.operatorPubkey);
+  result.allowlistPubkeys = Array.from(new Set(
+    (Array.isArray(result.allowlistPubkeys) ? result.allowlistPubkeys : [])
+      .map((value) => normalizeHexPubkey(value))
+      .filter(Boolean)
+  ));
+  result.wotRootPubkey = normalizeHexPubkey(result.wotRootPubkey);
+  result.wotMaxDepth = Number.isFinite(Number(result.wotMaxDepth))
+    ? Math.max(1, Math.trunc(Number(result.wotMaxDepth)))
+    : 1;
+  result.wotMinFollowersDepth2 = Number.isFinite(Number(result.wotMinFollowersDepth2))
+    ? Math.max(0, Math.trunc(Number(result.wotMinFollowersDepth2)))
+    : 0;
+  result.quotas = {
+    maxRelaysPerSponsor: Number.isFinite(Number(result.quotas?.maxRelaysPerSponsor))
+      ? Math.max(0, Math.trunc(Number(result.quotas.maxRelaysPerSponsor)))
+      : 100,
+    maxMembersPerRelay: Number.isFinite(Number(result.quotas?.maxMembersPerRelay))
+      ? Math.max(0, Math.trunc(Number(result.quotas.maxMembersPerRelay)))
+      : 500,
+    maxOpenJoinPool: Number.isFinite(Number(result.quotas?.maxOpenJoinPool))
+      ? Math.max(0, Math.trunc(Number(result.quotas.maxOpenJoinPool)))
+      : 100,
+    maxMirroredBytesPerRelay: Number.isFinite(Number(result.quotas?.maxMirroredBytesPerRelay))
+      ? Math.max(0, Math.trunc(Number(result.quotas.maxMirroredBytesPerRelay)))
+      : 0
+  };
+
+  return result;
 }
 
 export {

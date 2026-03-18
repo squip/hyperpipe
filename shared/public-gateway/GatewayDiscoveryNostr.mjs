@@ -53,6 +53,12 @@ function parseIntTag(value, fallback = null) {
   return Math.round(parsed);
 }
 
+function normalizePubkey(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().toLowerCase();
+  return /^[0-9a-f]{64}$/.test(trimmed) ? trimmed : null;
+}
+
 function isFresh(createdAtSeconds, ttlSeconds = DEFAULT_TTL_SECONDS, now = Date.now()) {
   if (!Number.isFinite(createdAtSeconds) || createdAtSeconds <= 0) return false;
   const ttl = Number.isFinite(ttlSeconds) && ttlSeconds > 0 ? Math.round(ttlSeconds) : DEFAULT_TTL_SECONDS;
@@ -75,6 +81,13 @@ function buildGatewayAnnouncementEventTemplate({
   tokenRefreshWindowSeconds = null,
   capabilities = [],
   openAccess = true,
+  authMethod = null,
+  hostPolicy = null,
+  memberDelegationMode = null,
+  operatorPubkey = null,
+  wotRootPubkey = null,
+  wotMaxDepth = null,
+  wotMinFollowersDepth2 = null,
   ttlSeconds = DEFAULT_TTL_SECONDS
 } = {}) {
   const normalizedGatewayId =
@@ -118,6 +131,21 @@ function buildGatewayAnnouncementEventTemplate({
   if (Number.isFinite(tokenRefreshWindowSeconds) && tokenRefreshWindowSeconds > 0) {
     tags.push(['token-refresh-window', String(Math.round(tokenRefreshWindowSeconds))]);
   }
+  if (typeof authMethod === 'string' && authMethod.trim()) tags.push(['auth-method', authMethod.trim()]);
+  if (typeof hostPolicy === 'string' && hostPolicy.trim()) tags.push(['host-policy', hostPolicy.trim()]);
+  if (typeof memberDelegationMode === 'string' && memberDelegationMode.trim()) {
+    tags.push(['member-delegation', memberDelegationMode.trim()]);
+  }
+  const normalizedOperatorPubkey = normalizePubkey(operatorPubkey);
+  if (normalizedOperatorPubkey) tags.push(['operator-pubkey', normalizedOperatorPubkey]);
+  const normalizedWotRootPubkey = normalizePubkey(wotRootPubkey);
+  if (normalizedWotRootPubkey) tags.push(['wot-root-pubkey', normalizedWotRootPubkey]);
+  if (Number.isFinite(wotMaxDepth) && Number(wotMaxDepth) > 0) {
+    tags.push(['wot-max-depth', String(Math.round(Number(wotMaxDepth)))]);
+  }
+  if (Number.isFinite(wotMinFollowersDepth2) && Number(wotMinFollowersDepth2) >= 0) {
+    tags.push(['wot-min-followers-depth2', String(Math.round(Number(wotMinFollowersDepth2)))]);
+  }
 
   for (const capability of Array.isArray(capabilities) ? capabilities : []) {
     if (typeof capability !== 'string') continue;
@@ -130,7 +158,12 @@ function buildGatewayAnnouncementEventTemplate({
     v: 1,
     gatewayId: normalizedGatewayId,
     httpOrigin: normalizedHttpOrigin,
-    openAccess: openAccess === true
+    openAccess: openAccess === true,
+    authMethod: typeof authMethod === 'string' && authMethod.trim() ? authMethod.trim() : null,
+    hostPolicy: typeof hostPolicy === 'string' && hostPolicy.trim() ? hostPolicy.trim() : null,
+    memberDelegationMode: typeof memberDelegationMode === 'string' && memberDelegationMode.trim()
+      ? memberDelegationMode.trim()
+      : null
   });
 
   return {
@@ -176,6 +209,13 @@ function parseGatewayAnnouncementEvent(event, { now = Date.now() } = {}) {
     relayReplicationTopic: readTag(tags, 'relay-replication-topic') || '',
     defaultTokenTtl: parseIntTag(readTag(tags, 'token-ttl'), null),
     tokenRefreshWindowSeconds: parseIntTag(readTag(tags, 'token-refresh-window'), null),
+    authMethod: readTag(tags, 'auth-method') || '',
+    hostPolicy: readTag(tags, 'host-policy') || '',
+    memberDelegationMode: readTag(tags, 'member-delegation') || '',
+    operatorPubkey: normalizePubkey(readTag(tags, 'operator-pubkey')) || '',
+    wotRootPubkey: normalizePubkey(readTag(tags, 'wot-root-pubkey')) || '',
+    wotMaxDepth: parseIntTag(readTag(tags, 'wot-max-depth'), null),
+    wotMinFollowersDepth2: parseIntTag(readTag(tags, 'wot-min-followers-depth2'), 0),
     capabilities: readAllTags(tags, 'capability'),
     openAccess,
     ttl: ttlSeconds,

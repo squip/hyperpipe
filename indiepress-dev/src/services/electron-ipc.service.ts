@@ -77,10 +77,52 @@ export type GatewayStatus = {
 
 export type PublicGatewayStatus = {
   enabled?: boolean
+  authMethod?: string | null
   baseUrl?: string
   wsBase?: string
   defaultTokenTtl?: number
   lastUpdatedAt?: number
+  discoveredGateways?: Array<{
+    gatewayId: string
+    publicUrl: string
+    displayName?: string | null
+    region?: string | null
+    isExpired?: boolean
+    authMethod?: string | null
+    hostPolicy?: string | null
+    memberDelegationMode?: string | null
+    operatorPubkey?: string | null
+  }>
+  authorizedGateways?: Array<{
+    gatewayId: string
+    publicUrl: string
+    displayName?: string | null
+    region?: string | null
+    isExpired?: boolean
+    authMethod?: string | null
+    hostPolicy?: string | null
+    memberDelegationMode?: string | null
+    operatorPubkey?: string | null
+  }>
+  gatewayAccessCatalog?: Array<{
+    gatewayId?: string | null
+    gatewayOrigin?: string | null
+    hostingState?: string
+    reason?: string | null
+    lastCheckedAt?: number | null
+    memberDelegationMode?: string | null
+    authMethod?: string | null
+    policy?: {
+      hostPolicy?: string | null
+      authMethod?: string | null
+      openAccess?: boolean
+      operatorPubkey?: string | null
+      wotRootPubkey?: string | null
+      wotMaxDepth?: number | null
+      wotMinFollowersDepth2?: number | null
+      capabilities?: string[]
+    } | null
+  }>
   relays?: Record<
     string,
     {

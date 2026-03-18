@@ -155,7 +155,7 @@ export function gatewayPickerOptions(
 
   return gateways.map((gateway) => {
     const title = clean(gateway.displayName) || gateway.gatewayId
-    const selected = (
+    const selected = Boolean(
       (selectedId && gateway.gatewayId === selectedId)
       || (!selectedId && selectedOrigin && selectedOrigin === gateway.publicUrl)
     )

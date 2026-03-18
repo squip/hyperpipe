@@ -39,6 +39,10 @@ export default class PublicGatewayControlClient {
     this.logger = safeLogger(logger)
   }
 
+  isEnabled() {
+    return Boolean(this.baseUrl && this.fetchImpl)
+  }
+
   setBaseUrl(baseUrl) {
     const next = normalizeBaseUrl(baseUrl)
     if (next === this.baseUrl) return
@@ -50,9 +54,14 @@ export default class PublicGatewayControlClient {
 
   async registerRelay(relayKey, payload = {}) {
     const relayIdentifier = typeof relayKey === 'string' ? relayKey.trim() : ''
-    const response = await this.#requestWithAuth('/api/relay/register', {
+    const response = await this.#requestWithAuth('/api/relays', {
       method: 'POST',
-      body: payload || {},
+      body: {
+        registration: {
+          relayKey: relayIdentifier || null,
+          ...(payload && typeof payload === 'object' ? payload : {})
+        }
+      },
       scope: 'gateway:relay-register',
       relayKey: relayIdentifier || null
     })
@@ -66,13 +75,118 @@ export default class PublicGatewayControlClient {
 
   async unregisterRelay(relayKey) {
     const relayIdentifier = typeof relayKey === 'string' ? relayKey.trim() : ''
-    const response = await this.#requestWithAuth('/api/relay/unregister', {
-      method: 'POST',
-      body: { relayKey: relayIdentifier || null },
-      scope: 'gateway:relay-register',
+    const response = await this.#requestWithAuth(`/api/relays/${encodeURIComponent(relayIdentifier)}`, {
+      method: 'DELETE',
+      scope: 'gateway:relay-unregister',
       relayKey: relayIdentifier || null
     })
 
+    return {
+      success: response.ok,
+      statusCode: response.status,
+      ...(response.payload && typeof response.payload === 'object' ? response.payload : {})
+    }
+  }
+
+  async updateOpenJoinPool(relayKey, entries = [], options = {}) {
+    const relayIdentifier = typeof relayKey === 'string' ? relayKey.trim() : ''
+    const response = await this.#requestWithAuth(`/api/relays/${encodeURIComponent(relayIdentifier)}/open-join/pool`, {
+      method: 'POST',
+      body: {
+        payload: {
+          relayKey: relayIdentifier || null,
+          entries: Array.isArray(entries) ? entries : [],
+          ...(options && typeof options === 'object' ? options : {})
+        }
+      },
+      scope: 'relay:open-join-pool-update',
+      relayKey: relayIdentifier || null
+    })
+
+    return {
+      success: response.ok,
+      statusCode: response.status,
+      ...(response.payload && typeof response.payload === 'object' ? response.payload : {})
+    }
+  }
+
+  async authorizeRelayMember(relayKey, payload = {}) {
+    const relayIdentifier = typeof relayKey === 'string' ? relayKey.trim() : ''
+    const response = await this.#requestWithAuth(`/api/relays/${encodeURIComponent(relayIdentifier)}/members/authorize`, {
+      method: 'POST',
+      body: payload || {},
+      scope: 'relay:member-authorize',
+      relayKey: relayIdentifier || null
+    })
+    return {
+      success: response.ok,
+      statusCode: response.status,
+      ...(response.payload && typeof response.payload === 'object' ? response.payload : {})
+    }
+  }
+
+  async revokeRelayMember(relayKey, payload = {}) {
+    const relayIdentifier = typeof relayKey === 'string' ? relayKey.trim() : ''
+    const response = await this.#requestWithAuth(`/api/relays/${encodeURIComponent(relayIdentifier)}/members/revoke`, {
+      method: 'POST',
+      body: payload || {},
+      scope: 'relay:member-revoke',
+      relayKey: relayIdentifier || null
+    })
+    return {
+      success: response.ok,
+      statusCode: response.status,
+      ...(response.payload && typeof response.payload === 'object' ? response.payload : {})
+    }
+  }
+
+  async issueGatewayToken(relayKey, payload = {}) {
+    const relayIdentifier = typeof relayKey === 'string' ? relayKey.trim() : ''
+    const response = await this.#requestWithAuth('/api/relay-tokens/issue', {
+      method: 'POST',
+      body: {
+        relayKey: relayIdentifier || null,
+        ...(payload && typeof payload === 'object' ? payload : {})
+      },
+      scope: 'gateway:relay-register',
+      relayKey: relayIdentifier || null
+    })
+    return {
+      success: response.ok,
+      statusCode: response.status,
+      ...(response.payload && typeof response.payload === 'object' ? response.payload : {})
+    }
+  }
+
+  async refreshGatewayToken(relayKey, payload = {}) {
+    const relayIdentifier = typeof relayKey === 'string' ? relayKey.trim() : ''
+    const response = await this.#requestWithAuth('/api/relay-tokens/refresh', {
+      method: 'POST',
+      body: {
+        relayKey: relayIdentifier || null,
+        ...(payload && typeof payload === 'object' ? payload : {})
+      },
+      scope: 'gateway:relay-register',
+      relayKey: relayIdentifier || null
+    })
+    return {
+      success: response.ok,
+      statusCode: response.status,
+      ...(response.payload && typeof response.payload === 'object' ? response.payload : {})
+    }
+  }
+
+  async revokeGatewayToken(relayKey, payload = {}) {
+    const relayIdentifier = typeof relayKey === 'string' ? relayKey.trim() : ''
+    const response = await this.#requestWithAuth('/api/relay-tokens/revoke', {
+      method: 'POST',
+      body: {
+        relayKey: relayIdentifier || null,
+        ...(payload && typeof payload === 'object' ? payload : {})
+      },
+      scope: 'gateway:relay-unregister',
+      relayKey: relayIdentifier || null
+    })
     return {
       success: response.ok,
       statusCode: response.status,

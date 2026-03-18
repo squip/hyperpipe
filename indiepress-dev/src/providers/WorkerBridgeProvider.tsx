@@ -19,6 +19,7 @@ import {
 } from '@/services/electron-ipc.service'
 import { isElectron } from '@/lib/platform'
 import { useNostr } from '@/providers/NostrProvider'
+import type { TGroupGatewayAccess } from '@/types/groups'
 
 type WorkerStatusPhase =
   | 'starting'
@@ -240,6 +241,7 @@ type WorkerBridgeContextValue = {
       leaseReplicaPeerKeys?: string[]
       writerIssuerPubkey?: string | null
       writerLeaseEnvelope?: Record<string, unknown> | null
+      gatewayAccess?: TGroupGatewayAccess | null
       blindPeer?: {
         publicKey?: string | null
         encryptionKey?: string | null
@@ -647,6 +649,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         leaseReplicaPeerKeys?: string[]
         writerIssuerPubkey?: string | null
         writerLeaseEnvelope?: Record<string, unknown> | null
+        gatewayAccess?: TGroupGatewayAccess | null
         blindPeer?: {
           publicKey?: string | null
           encryptionKey?: string | null
@@ -740,7 +743,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           ? opts.leaseReplicaPeerKeys
           : undefined,
         writerIssuerPubkey: opts?.writerIssuerPubkey || undefined,
-        writerLeaseEnvelope: opts?.writerLeaseEnvelope || undefined
+        writerLeaseEnvelope: opts?.writerLeaseEnvelope || undefined,
+        gatewayAccess: opts?.gatewayAccess || undefined
       }
       if (mergedHostPeers.length) {
         data.hostPeers = mergedHostPeers
@@ -1775,6 +1779,16 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         }
         const msgType = (message as any)?.type
         const expectsReply = msgType === 'provision-writer-for-invitee'
+        if (msgType === 'authorize-relay-member-access') {
+          const result = await electronIpc.sendToWorkerAwait({
+            message,
+            timeoutMs: 30_000
+          })
+          if (result && typeof result === 'object' && 'success' in result && (result as any).success === false) {
+            throw new Error((result as any).error || 'Worker rejected message')
+          }
+          return (result as any)?.data ?? result
+        }
         if (expectsReply) {
           const requestId = (message as any)?.requestId || makeRequestId('provision-writer')
           const payload = { ...(message as any), requestId }

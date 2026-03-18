@@ -13,6 +13,9 @@ import {
 export const PRIVATE_GROUP_LEAVE_SHADOW_NAMESPACE = 'ht-private-leave:v1'
 const HYPERTUNA_GATEWAY_ID_TAG = 'hypertuna-gateway-id'
 const HYPERTUNA_GATEWAY_ORIGIN_TAG = 'hypertuna-gateway-origin'
+const HYPERTUNA_GATEWAY_AUTH_METHOD_TAG = 'hypertuna-gateway-auth-method'
+const HYPERTUNA_GATEWAY_DELEGATION_TAG = 'hypertuna-gateway-delegation'
+const HYPERTUNA_GATEWAY_SPONSOR_TAG = 'hypertuna-gateway-sponsor'
 const HYPERTUNA_DIRECT_JOIN_ONLY_TAG = 'hypertuna-direct-join-only'
 
 function normalizeHttpOrigin(value?: string | null): string | null {
@@ -59,6 +62,9 @@ export function parseGroupMetadataEvent(event: Event, relay?: string): TGroupMet
   const gatewayOrigin = normalizeHttpOrigin(
     event.tags.find((t) => t[0] === HYPERTUNA_GATEWAY_ORIGIN_TAG)?.[1] ?? null
   )
+  const gatewayAuthMethod = event.tags.find((t) => t[0] === HYPERTUNA_GATEWAY_AUTH_METHOD_TAG)?.[1] ?? null
+  const gatewayDelegation = event.tags.find((t) => t[0] === HYPERTUNA_GATEWAY_DELEGATION_TAG)?.[1] ?? null
+  const gatewaySponsorPubkey = event.tags.find((t) => t[0] === HYPERTUNA_GATEWAY_SPONSOR_TAG)?.[1] ?? null
   const directJoinOnly = event.tags.some(
     (t) => t[0] === HYPERTUNA_DIRECT_JOIN_ONLY_TAG && (t[1] === '1' || t[1] === 'true')
   )
@@ -74,6 +80,9 @@ export function parseGroupMetadataEvent(event: Event, relay?: string): TGroupMet
     discoveryTopic,
     gatewayId: gatewayId ? gatewayId.toLowerCase() : null,
     gatewayOrigin,
+    gatewayAuthMethod,
+    gatewayDelegation,
+    gatewaySponsorPubkey,
     directJoinOnly,
     hostPeerKeys,
     leaseReplicaPeerKeys,
@@ -192,6 +201,9 @@ export function parseGroupInviteEvent(event: Event, relay?: string): TGroupInvit
   const gatewayOrigin = normalizeHttpOrigin(
     event.tags.find((t) => t[0] === HYPERTUNA_GATEWAY_ORIGIN_TAG)?.[1] ?? null
   )
+  const gatewayAuthMethod = event.tags.find((t) => t[0] === HYPERTUNA_GATEWAY_AUTH_METHOD_TAG)?.[1] ?? null
+  const gatewayDelegation = event.tags.find((t) => t[0] === HYPERTUNA_GATEWAY_DELEGATION_TAG)?.[1] ?? null
+  const gatewaySponsorPubkey = event.tags.find((t) => t[0] === HYPERTUNA_GATEWAY_SPONSOR_TAG)?.[1] ?? null
   const directJoinOnly = event.tags.some(
     (t) => t[0] === HYPERTUNA_DIRECT_JOIN_ONLY_TAG && (t[1] === '1' || t[1] === 'true')
   )
@@ -200,6 +212,9 @@ export function parseGroupInviteEvent(event: Event, relay?: string): TGroupInvit
     relay,
     gatewayId: gatewayId ? gatewayId.toLowerCase() : null,
     gatewayOrigin,
+    gatewayAuthMethod,
+    gatewayDelegation,
+    gatewaySponsorPubkey,
     directJoinOnly,
     groupName: name,
     groupPicture: picture,

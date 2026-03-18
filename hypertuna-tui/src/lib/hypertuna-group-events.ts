@@ -13,6 +13,9 @@ export const HYPERTUNA_WRITER_ISSUER_TAG = 'hypertuna-writer-issuer'
 export const HYPERTUNA_LEASE_REPLICA_PEER_TAG = 'hypertuna-lease-replica-peer'
 export const HYPERTUNA_GATEWAY_ID_TAG = 'hypertuna-gateway-id'
 export const HYPERTUNA_GATEWAY_ORIGIN_TAG = 'hypertuna-gateway-origin'
+export const HYPERTUNA_GATEWAY_AUTH_METHOD_TAG = 'hypertuna-gateway-auth-method'
+export const HYPERTUNA_GATEWAY_DELEGATION_TAG = 'hypertuna-gateway-delegation'
+export const HYPERTUNA_GATEWAY_SPONSOR_TAG = 'hypertuna-gateway-sponsor'
 export const HYPERTUNA_DIRECT_JOIN_ONLY_TAG = 'hypertuna-direct-join-only'
 
 export function getBaseRelayUrl(url: string): string {
@@ -71,6 +74,9 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   leaseReplicaPeerKeys?: string[]
   gatewayId?: string | null
   gatewayOrigin?: string | null
+  gatewayAuthMethod?: string | null
+  gatewayDelegation?: string | null
+  gatewaySponsorPubkey?: string | null
   directJoinOnly?: boolean
 }): { groupCreateEvent: EventTemplate; metadataEvent: EventTemplate; hypertunaEvent: EventTemplate } {
   const now = Math.floor(Date.now() / 1000)
@@ -113,6 +119,20 @@ export function buildHypertunaDiscoveryDraftEvents(args: {
   }
   if (gatewayOrigin) {
     metadataTags.push([HYPERTUNA_GATEWAY_ORIGIN_TAG, gatewayOrigin])
+  }
+  const gatewayAuthMethod = typeof args.gatewayAuthMethod === 'string' ? args.gatewayAuthMethod.trim() : ''
+  const gatewayDelegation = typeof args.gatewayDelegation === 'string' ? args.gatewayDelegation.trim() : ''
+  const gatewaySponsorPubkey = typeof args.gatewaySponsorPubkey === 'string'
+    ? args.gatewaySponsorPubkey.trim().toLowerCase()
+    : ''
+  if (gatewayAuthMethod) {
+    metadataTags.push([HYPERTUNA_GATEWAY_AUTH_METHOD_TAG, gatewayAuthMethod])
+  }
+  if (gatewayDelegation) {
+    metadataTags.push([HYPERTUNA_GATEWAY_DELEGATION_TAG, gatewayDelegation])
+  }
+  if (gatewaySponsorPubkey) {
+    metadataTags.push([HYPERTUNA_GATEWAY_SPONSOR_TAG, gatewaySponsorPubkey])
   }
   if (args.directJoinOnly === true) {
     metadataTags.push([HYPERTUNA_DIRECT_JOIN_ONLY_TAG, '1'])

@@ -128,6 +128,7 @@ export function registerClosedJoinSimulator(deps: ClosedJoinSimulatorDeps) {
         token: inviteData.token,
         relayKey,
         relayUrl: relayUrlForJoin,
+        gatewayAccess: inviteData.gatewayAccess || undefined,
         blindPeer: inviteData.blindPeer,
         cores: inviteData.cores,
         writerCore: inviteData.writerCore,

@@ -66,6 +66,30 @@ export type DiscoveredGateway = {
   source?: string | null
   isExpired?: boolean
   lastSeenAt?: number | null
+  authMethod?: string | null
+  hostPolicy?: string | null
+  memberDelegationMode?: string | null
+  operatorPubkey?: string | null
+}
+
+export type GatewayAccessState = {
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  hostingState?: 'approved' | 'denied' | 'unknown' | 'error' | string
+  reason?: string | null
+  lastCheckedAt?: number | null
+  memberDelegationMode?: string | null
+  authMethod?: string | null
+  policy?: {
+    hostPolicy?: string | null
+    authMethod?: string | null
+    openAccess?: boolean
+    operatorPubkey?: string | null
+    wotRootPubkey?: string | null
+    wotMaxDepth?: number | null
+    wotMinFollowersDepth2?: number | null
+    capabilities?: string[]
+  } | null
 }
 
 export type GroupSummary = {
@@ -78,6 +102,9 @@ export type GroupSummary = {
   isOpen?: boolean
   gatewayId?: string | null
   gatewayOrigin?: string | null
+  gatewayAuthMethod?: string | null
+  gatewayDelegation?: string | null
+  gatewaySponsorPubkey?: string | null
   directJoinOnly?: boolean
   discoveryTopic?: string | null
   hostPeerKeys?: string[]
@@ -98,6 +125,9 @@ export type GroupInvite = {
   relay?: string
   gatewayId?: string | null
   gatewayOrigin?: string | null
+  gatewayAuthMethod?: string | null
+  gatewayDelegation?: string | null
+  gatewaySponsorPubkey?: string | null
   directJoinOnly?: boolean
   relayUrl?: string | null
   relayKey?: string | null
@@ -123,6 +153,14 @@ export type GroupInvite = {
   leaseReplicaPeerKeys?: string[]
   writerIssuerPubkey?: string | null
   writerLeaseEnvelope?: Record<string, unknown> | null
+  gatewayAccess?: {
+    version?: string | null
+    authMethod?: string | null
+    grantId?: string | null
+    gatewayId?: string | null
+    gatewayOrigin?: string | null
+    scopes?: string[]
+  } | null
   writerCore?: string | null
   writerCoreHex?: string | null
   autobaseLocal?: string | null
@@ -436,6 +474,14 @@ export interface RelayService {
     leaseReplicaPeerKeys?: string[]
     writerIssuerPubkey?: string | null
     writerLeaseEnvelope?: Record<string, unknown> | null
+    gatewayAccess?: {
+      version?: string | null
+      authMethod?: string | null
+      grantId?: string | null
+      gatewayId?: string | null
+      gatewayOrigin?: string | null
+      scopes?: string[]
+    } | null
     openJoin?: boolean
     hostPeers?: string[]
     blindPeer?: {

@@ -17,6 +17,9 @@ export type TGroupMetadata = {
   discoveryTopic?: string | null
   gatewayId?: string | null
   gatewayOrigin?: string | null
+  gatewayAuthMethod?: string | null
+  gatewayDelegation?: string | null
+  gatewaySponsorPubkey?: string | null
   directJoinOnly?: boolean
   hostPeerKeys?: string[]
   leaseReplicaPeerKeys?: string[]
@@ -28,6 +31,15 @@ export type TGroupMetadata = {
 export type TGroupAdmin = {
   pubkey: string
   roles: string[]
+}
+
+export type TGroupGatewayAccess = {
+  version?: string | null
+  authMethod?: string | null
+  grantId?: string | null
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  scopes?: string[]
 }
 
 export type TGroupMembershipStatus = 'member' | 'not-member' | 'removed' | 'pending'
@@ -47,6 +59,9 @@ export type TGroupInvite = {
   relay?: string
   gatewayId?: string | null
   gatewayOrigin?: string | null
+  gatewayAuthMethod?: string | null
+  gatewayDelegation?: string | null
+  gatewaySponsorPubkey?: string | null
   directJoinOnly?: boolean
   groupName?: string
   groupPicture?: string
@@ -79,6 +94,7 @@ export type TGroupInvite = {
   leaseReplicaPeerKeys?: string[]
   writerIssuerPubkey?: string | null
   writerLeaseEnvelope?: Record<string, unknown> | null
+  gatewayAccess?: TGroupGatewayAccess | null
   token?: string
   event: Event
 }

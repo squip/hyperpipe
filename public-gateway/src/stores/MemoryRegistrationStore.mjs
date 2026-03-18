@@ -1,3 +1,11 @@
+function compositeKey(...parts) {
+  return parts.map((value) => String(value || '').trim().toLowerCase()).join('::');
+}
+
+function isExpiredRecord(record, now = Date.now()) {
+  return Boolean(record?.expiresAt && record.expiresAt <= now);
+}
+
 class MemoryRegistrationStore {
   constructor(options = 300) {
     const resolved = typeof options === 'object' && options !== null
@@ -19,6 +27,11 @@ class MemoryRegistrationStore {
     this.relayAliasIndex = new Map();
     this.openJoinAliases = new Map();
     this.openJoinAliasIndex = new Map();
+    this.hostApprovals = new Map();
+    this.relaySponsorships = new Map();
+    this.relayMemberAcls = new Map();
+    this.relayMemberGrantIndex = new Map();
+    this.relayMemberTokenState = new Map();
   }
 
   async upsertRelay(relayKey, payload) {
@@ -50,6 +63,18 @@ class MemoryRegistrationStore {
     this.openJoinPools.delete(relayKey);
     this.removeRelayAliases(relayKey);
     this.clearOpenJoinAliases(relayKey);
+    this.relaySponsorships.delete(relayKey);
+    for (const [key, record] of this.relayMemberAcls.entries()) {
+      if (record?.relayKey === relayKey) {
+        this.relayMemberAcls.delete(key);
+        if (record?.grantId) this.relayMemberGrantIndex.delete(record.grantId);
+      }
+    }
+    for (const [key, record] of this.relayMemberTokenState.entries()) {
+      if (record?.relayKey === relayKey) {
+        this.relayMemberTokenState.delete(key);
+      }
+    }
   }
 
   pruneExpired() {
@@ -85,6 +110,31 @@ class MemoryRegistrationStore {
     for (const [key, record] of this.mirrorMetadata.entries()) {
       if (record?.expiresAt && record.expiresAt <= now) {
         this.mirrorMetadata.delete(key);
+      }
+    }
+
+    for (const [key, record] of this.hostApprovals.entries()) {
+      if (isExpiredRecord(record, now)) {
+        this.hostApprovals.delete(key);
+      }
+    }
+
+    for (const [key, record] of this.relaySponsorships.entries()) {
+      if (isExpiredRecord(record, now)) {
+        this.relaySponsorships.delete(key);
+      }
+    }
+
+    for (const [key, record] of this.relayMemberAcls.entries()) {
+      if (isExpiredRecord(record, now)) {
+        this.relayMemberAcls.delete(key);
+        if (record?.grantId) this.relayMemberGrantIndex.delete(record.grantId);
+      }
+    }
+
+    for (const [key, record] of this.relayMemberTokenState.entries()) {
+      if (isExpiredRecord(record, now)) {
+        this.relayMemberTokenState.delete(key);
       }
     }
 
@@ -273,6 +323,161 @@ class MemoryRegistrationStore {
 
   async clearMirrorMetadata(relayKey) {
     this.mirrorMetadata.delete(relayKey);
+  }
+
+  async upsertHostApproval(gatewayId, subjectPubkey, approval = {}) {
+    if (!gatewayId || !subjectPubkey) return null;
+    const record = {
+      ...approval,
+      gatewayId: String(gatewayId).trim().toLowerCase(),
+      subjectPubkey: String(subjectPubkey).trim().toLowerCase(),
+      updatedAt: Date.now()
+    };
+    this.hostApprovals.set(compositeKey(gatewayId, subjectPubkey), record);
+    return record;
+  }
+
+  async getHostApproval(gatewayId, subjectPubkey) {
+    const record = this.hostApprovals.get(compositeKey(gatewayId, subjectPubkey)) || null;
+    if (isExpiredRecord(record)) {
+      this.hostApprovals.delete(compositeKey(gatewayId, subjectPubkey));
+      return null;
+    }
+    return record;
+  }
+
+  async listHostApprovals(gatewayId = null) {
+    const normalizedGatewayId = gatewayId ? String(gatewayId).trim().toLowerCase() : null;
+    const out = [];
+    for (const record of this.hostApprovals.values()) {
+      if (!record) continue;
+      if (normalizedGatewayId && record.gatewayId !== normalizedGatewayId) continue;
+      if (isExpiredRecord(record)) continue;
+      out.push(record);
+    }
+    return out;
+  }
+
+  async upsertRelaySponsorship(relayKey, sponsorship = {}) {
+    if (!relayKey) return null;
+    const record = {
+      ...sponsorship,
+      relayKey: String(relayKey).trim(),
+      updatedAt: Date.now()
+    };
+    this.relaySponsorships.set(String(relayKey).trim(), record);
+    return record;
+  }
+
+  async getRelaySponsorship(relayKey) {
+    const key = String(relayKey || '').trim();
+    if (!key) return null;
+    const record = this.relaySponsorships.get(key) || null;
+    if (isExpiredRecord(record)) {
+      this.relaySponsorships.delete(key);
+      return null;
+    }
+    return record;
+  }
+
+  async removeRelaySponsorship(relayKey) {
+    const key = String(relayKey || '').trim();
+    if (!key) return;
+    this.relaySponsorships.delete(key);
+  }
+
+  async storeRelayMemberAcl(relayKey, subjectPubkey, acl = {}) {
+    if (!relayKey || !subjectPubkey) return null;
+    const normalizedRelayKey = String(relayKey).trim();
+    const normalizedSubjectPubkey = String(subjectPubkey).trim().toLowerCase();
+    const key = compositeKey(normalizedRelayKey, normalizedSubjectPubkey);
+    const previous = this.relayMemberAcls.get(key) || null;
+    if (previous?.grantId && previous.grantId !== acl?.grantId) {
+      this.relayMemberGrantIndex.delete(previous.grantId);
+    }
+    const record = {
+      ...(previous || {}),
+      ...acl,
+      relayKey: normalizedRelayKey,
+      subjectPubkey: normalizedSubjectPubkey,
+      updatedAt: Date.now()
+    };
+    this.relayMemberAcls.set(key, record);
+    if (record.grantId) {
+      this.relayMemberGrantIndex.set(record.grantId, key);
+    }
+    return record;
+  }
+
+  async getRelayMemberAcl(relayKey, subjectPubkey) {
+    const key = compositeKey(relayKey, subjectPubkey);
+    const record = this.relayMemberAcls.get(key) || null;
+    if (isExpiredRecord(record)) {
+      this.relayMemberAcls.delete(key);
+      if (record?.grantId) this.relayMemberGrantIndex.delete(record.grantId);
+      return null;
+    }
+    return record;
+  }
+
+  async getRelayMemberAclByGrantId(grantId) {
+    const key = this.relayMemberGrantIndex.get(String(grantId || '').trim()) || null;
+    if (!key) return null;
+    const record = this.relayMemberAcls.get(key) || null;
+    if (isExpiredRecord(record)) {
+      this.relayMemberAcls.delete(key);
+      if (record?.grantId) this.relayMemberGrantIndex.delete(record.grantId);
+      return null;
+    }
+    return record;
+  }
+
+  async listRelayMemberAcls(relayKey) {
+    const normalizedRelayKey = String(relayKey || '').trim();
+    if (!normalizedRelayKey) return [];
+    const out = [];
+    for (const record of this.relayMemberAcls.values()) {
+      if (!record || record.relayKey !== normalizedRelayKey) continue;
+      if (isExpiredRecord(record)) continue;
+      out.push(record);
+    }
+    return out;
+  }
+
+  async clearRelayMemberAcls(relayKey) {
+    const normalizedRelayKey = String(relayKey || '').trim();
+    if (!normalizedRelayKey) return;
+    for (const [key, record] of this.relayMemberAcls.entries()) {
+      if (record?.relayKey !== normalizedRelayKey) continue;
+      this.relayMemberAcls.delete(key);
+      if (record?.grantId) this.relayMemberGrantIndex.delete(record.grantId);
+    }
+  }
+
+  async storeRelayMemberTokenState(relayKey, subjectPubkey, state = {}) {
+    if (!relayKey || !subjectPubkey) return null;
+    const record = {
+      ...state,
+      relayKey: String(relayKey).trim(),
+      subjectPubkey: String(subjectPubkey).trim().toLowerCase(),
+      updatedAt: Date.now()
+    };
+    this.relayMemberTokenState.set(compositeKey(relayKey, subjectPubkey), record);
+    return record;
+  }
+
+  async getRelayMemberTokenState(relayKey, subjectPubkey) {
+    const key = compositeKey(relayKey, subjectPubkey);
+    const record = this.relayMemberTokenState.get(key) || null;
+    if (isExpiredRecord(record)) {
+      this.relayMemberTokenState.delete(key);
+      return null;
+    }
+    return record;
+  }
+
+  async clearRelayMemberTokenState(relayKey, subjectPubkey) {
+    this.relayMemberTokenState.delete(compositeKey(relayKey, subjectPubkey));
   }
 
   async storeRelayAlias(identifier, relayKey) {

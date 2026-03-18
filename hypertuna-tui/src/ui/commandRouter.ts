@@ -88,6 +88,26 @@ export type CommandContext = {
 }
 
 export interface CommandController {
+  getState(): {
+    discoveredGateways: Array<{
+      gatewayId: string
+      publicUrl: string
+      displayName?: string | null
+      region?: string | null
+    }>
+    authorizedGateways: Array<{
+      gatewayId: string
+      publicUrl: string
+      displayName?: string | null
+      region?: string | null
+    }>
+    gatewayAccessCatalog: Array<{
+      gatewayId?: string | null
+      gatewayOrigin?: string | null
+      hostingState?: string
+      reason?: string | null
+    }>
+  }
   addNsecAccount(nsec: string, label?: string): Promise<void>
   addNcryptsecAccount(ncryptsec: string, password: string, label?: string): Promise<void>
   generateNsecAccount(label?: string): Promise<GeneratedAccount>
@@ -919,24 +939,31 @@ export async function executeCommand(
     const action = requireArg(args[1], 'gateway action').toLowerCase()
     if (action === 'refresh') {
       const gateways = await controller.refreshGatewayCatalog({ force: true })
-      if (!gateways.length) {
-        return { message: 'Gateway catalog refreshed (no discovered gateways)' }
+      const state = controller.getState()
+      return {
+        message: `Gateway catalog refreshed (${state.authorizedGateways.length} approved, ${state.discoveredGateways.length} discovered)`
       }
-      return { message: `Gateway catalog refreshed (${gateways.length} discovered)` }
     }
     if (action === 'list') {
-      const gateways = await controller.refreshGatewayCatalog({ force: args.includes('--refresh') })
-      if (!gateways.length) {
-        return { message: 'No discovered gateways. Run `gateway refresh`.' }
+      await controller.refreshGatewayCatalog({ force: args.includes('--refresh') })
+      const state = controller.getState()
+      const catalog = state.gatewayAccessCatalog || []
+      if (!catalog.length) {
+        return { message: 'No gateway access state available. Run `gateway refresh`.' }
       }
-      const compact = gateways
-        .map((gateway, index) => {
-          const label = gateway.displayName ? `${gateway.displayName}` : gateway.gatewayId
-          const region = gateway.region ? ` (${gateway.region})` : ''
-          return `[${index}] ${label}${region} id=${gateway.gatewayId} origin=${gateway.publicUrl}`
+      const compact = catalog
+        .map((entry: { gatewayId?: string | null; gatewayOrigin?: string | null; hostingState?: string; reason?: string | null }, index: number) => {
+          const discovered = state.discoveredGateways.find((gateway) =>
+            (entry.gatewayId && gateway.gatewayId === entry.gatewayId)
+            || (entry.gatewayOrigin && gateway.publicUrl === entry.gatewayOrigin)
+          )
+          const label = discovered?.displayName ? `${discovered.displayName}` : (entry.gatewayId || entry.gatewayOrigin || 'gateway')
+          const region = discovered?.region ? ` (${discovered.region})` : ''
+          const reason = entry.reason ? ` reason=${entry.reason}` : ''
+          return `[${index}] ${label}${region} state=${entry.hostingState || 'unknown'} id=${entry.gatewayId || '-'} origin=${entry.gatewayOrigin || discovered?.publicUrl || '-'}${reason}`
         })
         .join(' | ')
-      return { message: `Discovered gateways: ${compact}` }
+      return { message: `Gateway access: ${compact}` }
     }
     throw new Error(`Unknown gateway action: ${action}`)
   }

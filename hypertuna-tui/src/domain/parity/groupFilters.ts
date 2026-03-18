@@ -170,6 +170,18 @@ export function parseGroupInviteWithPayload(args: {
     || normalizeHttpOrigin(payload.gateway_origin)
     || parsed.gatewayOrigin
     || null
+  const gatewayAuthMethod =
+    typeof payload.gatewayAuthMethod === 'string'
+      ? payload.gatewayAuthMethod.trim() || null
+      : typeof payload.gateway_auth_method === 'string'
+        ? payload.gateway_auth_method.trim() || null
+        : parsed.gatewayAuthMethod || null
+  const gatewayDelegation =
+    typeof payload.gatewayDelegation === 'string'
+      ? payload.gatewayDelegation.trim() || null
+      : typeof payload.gateway_delegation === 'string'
+        ? payload.gateway_delegation.trim() || null
+        : parsed.gatewayDelegation || null
   const directJoinOnly =
     payload.directJoinOnly === true
     || payload.gatewayDirectJoinOnly === true
@@ -203,6 +215,49 @@ export function parseGroupInviteWithPayload(args: {
     payload.writerLeaseEnvelope && typeof payload.writerLeaseEnvelope === 'object'
       ? payload.writerLeaseEnvelope as Record<string, unknown>
       : null
+  const gatewayAccessPayload =
+    payload.gatewayAccess && typeof payload.gatewayAccess === 'object'
+      ? payload.gatewayAccess as Record<string, unknown>
+      : payload.gateway_access && typeof payload.gateway_access === 'object'
+        ? payload.gateway_access as Record<string, unknown>
+        : null
+  const gatewayAccess = gatewayAccessPayload
+    ? {
+        version:
+          typeof gatewayAccessPayload.version === 'string'
+            ? gatewayAccessPayload.version
+            : null,
+        authMethod:
+          typeof gatewayAccessPayload.authMethod === 'string'
+            ? gatewayAccessPayload.authMethod
+            : typeof gatewayAccessPayload.auth_method === 'string'
+              ? gatewayAccessPayload.auth_method
+              : null,
+        grantId:
+          typeof gatewayAccessPayload.grantId === 'string'
+            ? gatewayAccessPayload.grantId
+            : typeof gatewayAccessPayload.grant_id === 'string'
+              ? gatewayAccessPayload.grant_id
+              : null,
+        gatewayId:
+          typeof gatewayAccessPayload.gatewayId === 'string'
+            ? gatewayAccessPayload.gatewayId.trim().toLowerCase()
+            : typeof gatewayAccessPayload.gateway_id === 'string'
+              ? gatewayAccessPayload.gateway_id.trim().toLowerCase()
+              : gatewayId,
+        gatewayOrigin:
+          normalizeHttpOrigin(gatewayAccessPayload.gatewayOrigin)
+          || normalizeHttpOrigin(gatewayAccessPayload.gateway_origin)
+          || gatewayOrigin,
+        scopes: Array.isArray(gatewayAccessPayload.scopes)
+          ? Array.from(new Set(
+              gatewayAccessPayload.scopes
+                .map((entry) => String(entry || '').trim())
+                .filter(Boolean)
+            ))
+          : undefined
+      }
+    : null
 
   const authorizedMemberPubkeysRaw = Array.isArray(payload.authorizedMemberPubkeys)
     ? payload.authorizedMemberPubkeys
@@ -300,6 +355,8 @@ export function parseGroupInviteWithPayload(args: {
     relayKey,
     gatewayId,
     gatewayOrigin,
+    gatewayAuthMethod,
+    gatewayDelegation,
     directJoinOnly,
     groupName,
     groupPicture,
@@ -312,6 +369,7 @@ export function parseGroupInviteWithPayload(args: {
     leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : undefined,
     writerIssuerPubkey,
     writerLeaseEnvelope,
+    gatewayAccess,
     authorizedMemberPubkeys: authorizedMemberPubkeys.length ? authorizedMemberPubkeys : undefined,
     blindPeer,
     cores,

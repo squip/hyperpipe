@@ -129,6 +129,64 @@ type ScenarioRunResult = {
   error?: string | null
 }
 
+type ScenarioAccount = {
+  pubkey: string
+  nsec: string
+  label?: string
+}
+
+type ScenarioSession = {
+  pubkey: string
+  nsecHex: string
+  nsec: string
+} | null
+
+type ScenarioPostJoinValidateContext = {
+  scenarioDir: string
+  hostStorage: string
+  joinerStorage: string
+  host: TuiController
+  joiner: TuiController
+  hostAccount: ScenarioAccount
+  joinerAccount: ScenarioAccount
+  hostSession: ScenarioSession
+  joinerSession: ScenarioSession
+  createdGroup: GroupSummary
+  createdHostRelay: RelayEntry
+  invite: GroupInvite | null
+  discovered: GroupSummary | null
+  joinedRelay: RelayEntry
+  joinerRelayKey: string | null
+  gatewayOrigin: string | null
+  gatewaySecret: string | null
+  gatewayTrace: GatewayTrace[]
+  gatewayStages: GatewayStageEvent[]
+  checkpoints: JoinCheckpoint[]
+  joinCheckpointTrace: JoinCheckpointTraceEvent[]
+  emitTimeline: (event: string, payload?: Record<string, unknown>) => Promise<void>
+  recordCheckpoint: (
+    phase: string,
+    expected: Record<string, unknown>,
+    actual: Record<string, unknown>,
+    status: CheckpointStatus
+  ) => Promise<JoinCheckpoint>
+  assertCheckpoint: (
+    phase: string,
+    expected: Record<string, unknown>,
+    actual: Record<string, unknown>,
+    predicate: boolean,
+    failureReason: string
+  ) => Promise<void>
+  waitForGatewayStageCheckpoint: (options: {
+    phase: string
+    expected: Record<string, unknown>
+    timeoutMs: number
+    match: (entry: GatewayStageEvent) => boolean
+    failOn?: (entry: GatewayStageEvent) => boolean
+    failureReason: string
+  }) => Promise<void>
+}
+
 type PhaseCheck = {
   name: string
   ok: boolean
@@ -249,6 +307,152 @@ async function fileExists(target: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+function normalizeIdentityKey(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  return /^[0-9a-f]{64}$/i.test(trimmed) ? trimmed.toLowerCase() : trimmed
+}
+
+async function readRelayMemberAccessCache(storageDir: string): Promise<Record<string, unknown> | null> {
+  const target = path.join(storageDir, 'relay-member-access-cache.json')
+  if (!await fileExists(target)) return null
+  try {
+    const raw = await fs.readFile(target, 'utf8')
+    const parsed = JSON.parse(raw) as {
+      relays?: Record<string, unknown>
+    } | null
+    if (!parsed || typeof parsed !== 'object') return null
+    return parsed.relays && typeof parsed.relays === 'object'
+      ? parsed.relays
+      : parsed as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
+async function waitForRelayMemberAccessEntry(
+  storageDir: string,
+  {
+    relayKey = null,
+    publicIdentifier = null,
+    timeoutMs = 45_000
+  }: {
+    relayKey?: string | null
+    publicIdentifier?: string | null
+    timeoutMs?: number
+  } = {}
+): Promise<Record<string, unknown>> {
+  const lookupKeys = Array.from(new Set([
+    normalizeIdentityKey(relayKey),
+    normalizeIdentityKey(publicIdentifier)
+  ].filter((entry): entry is string => Boolean(entry))))
+
+  return await waitFor(
+    'relay member access entry',
+    async () => {
+      const cache = await readRelayMemberAccessCache(storageDir)
+      if (!cache) return null
+      for (const key of lookupKeys) {
+        const entry = cache[key]
+        if (entry && typeof entry === 'object') {
+          return entry as Record<string, unknown>
+        }
+      }
+      return null
+    },
+    { timeoutMs, intervalMs: 300 }
+  )
+}
+
+async function readJsonResponse(response: Response): Promise<Record<string, unknown>> {
+  const text = await response.text().catch(() => '')
+  if (!text) return {}
+  try {
+    const parsed = JSON.parse(text)
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {}
+  } catch {
+    return { raw: text }
+  }
+}
+
+function installSyntheticGatewayApproval(
+  controller: TuiController,
+  {
+    gatewayOrigin,
+    gatewayId,
+    joinType
+  }: {
+    gatewayOrigin: string
+    gatewayId?: string | null
+    joinType: JoinType
+  }
+): Record<string, unknown> | null {
+  const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin)
+  if (!normalizedGatewayOrigin) return null
+
+  const syntheticGatewayId = gatewayId
+    || `e2e-${new URL(normalizedGatewayOrigin).host.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`
+  const syntheticGateway = {
+    gatewayId: syntheticGatewayId,
+    publicUrl: normalizedGatewayOrigin,
+    displayName: `E2E Gateway ${syntheticGatewayId}`,
+    authMethod: 'relay-scoped-bearer-v1',
+    hostPolicy: 'allowlist',
+    memberDelegationMode: joinType === 'open' ? 'all-members' : 'closed-members'
+  }
+  const controllerHost = controller as unknown as {
+    patchState?: (patch: Record<string, unknown>) => void
+    refreshGatewayCatalog?: (options?: { force?: boolean; timeoutMs?: number }) => Promise<unknown[]>
+    __e2eSyntheticGatewayRefreshWrapped?: boolean
+  }
+  if (typeof controllerHost.patchState !== 'function') return syntheticGateway
+
+  const applySyntheticState = (): void => {
+    const state = controller.getState()
+    const mergeGateways = (entries: Array<Record<string, unknown>>) => [
+      syntheticGateway,
+      ...entries.filter((entry) => normalizeHttpOrigin(entry.publicUrl) !== normalizedGatewayOrigin)
+    ]
+    controllerHost.patchState?.({
+      discoveredGateways: mergeGateways(state.discoveredGateways as unknown as Array<Record<string, unknown>>),
+      authorizedGateways: mergeGateways(state.authorizedGateways as unknown as Array<Record<string, unknown>>),
+      gatewayAccessCatalog: [
+        {
+          gatewayId: syntheticGatewayId,
+          gatewayOrigin: normalizedGatewayOrigin,
+          hostingState: 'approved',
+          reason: 'e2e-local-manual-gateway',
+          lastCheckedAt: Date.now(),
+          memberDelegationMode: syntheticGateway.memberDelegationMode,
+          authMethod: syntheticGateway.authMethod,
+          policy: {
+            hostPolicy: syntheticGateway.hostPolicy,
+            authMethod: syntheticGateway.authMethod,
+            capabilities: ['relay-member-delegation']
+          }
+        },
+        ...state.gatewayAccessCatalog.filter((entry) => (
+          normalizeHttpOrigin(entry.gatewayOrigin || null) !== normalizedGatewayOrigin
+        ))
+      ]
+    })
+  }
+
+  if (!controllerHost.__e2eSyntheticGatewayRefreshWrapped && typeof controllerHost.refreshGatewayCatalog === 'function') {
+    const originalRefreshGatewayCatalog = controllerHost.refreshGatewayCatalog.bind(controller)
+    controllerHost.refreshGatewayCatalog = async (options) => {
+      const result = await originalRefreshGatewayCatalog(options)
+      applySyntheticState()
+      return result
+    }
+    controllerHost.__e2eSyntheticGatewayRefreshWrapped = true
+  }
+
+  applySyntheticState()
+  return syntheticGateway
 }
 
 function parseLogLevel(value: string | undefined): LogLevel {
@@ -1233,6 +1437,7 @@ async function runScenario(options: {
   keepDocker: boolean
   preferredGatewayPort: number
   gatewayRuntime: GatewayRuntime
+  postJoinValidate?: ((context: ScenarioPostJoinValidateContext) => Promise<void>) | null
 }): Promise<ScenarioRunResult> {
   const startedAtIso = nowIso()
   const startedAtMs = Date.now()
@@ -1280,12 +1485,23 @@ async function runScenario(options: {
   let lastJoinError: string | null = null
   let joinFlowInputSeen = false
   let joinFlowResolvedSeen = false
+  let joinFlowActive = false
+  let joinerJoinStartLineIndex = 0
   let writerMaterialSignalSeen = false
   let joinAuthSuccessSeen = false
-  let hostIntentionallyStopped = false
   let joinerRelayKey: string | null = null
   let gatewayOrigin: string | null = normalizeHttpOrigin(scenario.gatewayOrigin || null)
   let gatewaySecret: string | null = null
+  let hostStorage = ''
+  let joinerStorage = ''
+  let hostAccount: ScenarioAccount | null = null
+  let joinerAccount: ScenarioAccount | null = null
+  let hostSession: ScenarioSession = null
+  let joinerSession: ScenarioSession = null
+  let createdGroup: GroupSummary | null = null
+  let createdHostRelay: RelayEntry | null = null
+  let invite: GroupInvite | null = null
+  let discovered: GroupSummary | null = null
 
   let hostTap: WorkerLogTap | null = null
   let joinerTap: WorkerLogTap | null = null
@@ -1297,6 +1513,7 @@ async function runScenario(options: {
 
   const hostLines: string[] = []
   const joinerLines: string[] = []
+  const joinerJoinFlowLines = (): string[] => joinerLines.slice(joinerJoinStartLineIndex)
 
   const emitTimeline = async (event: string, payload: Record<string, unknown> = {}): Promise<void> => {
     await appendJsonLine(timelineFile, {
@@ -1488,7 +1705,7 @@ async function runScenario(options: {
     if (label === 'host') hostLines.push(normalized)
     else joinerLines.push(normalized)
 
-    if (label === 'joiner' && hasJoinFailureMarker(normalized)) {
+    if (label === 'joiner' && joinFlowActive && hasJoinFailureMarker(normalized)) {
       lastJoinError = normalized
     }
 
@@ -1533,8 +1750,8 @@ async function runScenario(options: {
   try {
     await emitTimeline('scenario-start', { manifest: scenario })
 
-    const hostStorage = path.join(os.tmpdir(), randomId(`${scenario.scenarioId}-host`))
-    const joinerStorage = path.join(os.tmpdir(), randomId(`${scenario.scenarioId}-joiner`))
+    hostStorage = path.join(os.tmpdir(), randomId(`${scenario.scenarioId}-host`))
+    joinerStorage = path.join(os.tmpdir(), randomId(`${scenario.scenarioId}-joiner`))
     await fs.mkdir(hostStorage, { recursive: true })
     await fs.mkdir(joinerStorage, { recursive: true })
 
@@ -1559,12 +1776,26 @@ async function runScenario(options: {
     await host.initialize()
     await joiner.initialize()
 
-    const hostAccount = await host.generateNsecAccount(`host-${scenario.scenarioId}`)
-    const joinerAccount = await joiner.generateNsecAccount(`joiner-${scenario.scenarioId}`)
+    hostAccount = await host.generateNsecAccount(`host-${scenario.scenarioId}`)
+    joinerAccount = await joiner.generateNsecAccount(`joiner-${scenario.scenarioId}`)
     await host.selectAccount(hostAccount.pubkey)
     await host.unlockCurrentAccount()
     await joiner.selectAccount(joinerAccount.pubkey)
     await joiner.unlockCurrentAccount()
+    hostSession = host.getState().session
+      ? {
+        pubkey: host.getState().session!.pubkey,
+        nsecHex: host.getState().session!.nsecHex,
+        nsec: host.getState().session!.nsec
+      }
+      : null
+    joinerSession = joiner.getState().session
+      ? {
+        pubkey: joiner.getState().session!.pubkey,
+        nsecHex: joiner.getState().session!.nsecHex,
+        nsec: joiner.getState().session!.nsec
+      }
+      : null
 
     if (scenario.gatewayAvailability === 'online') {
       gatewayStack = await startGatewayStack({
@@ -1647,7 +1878,7 @@ async function runScenario(options: {
           ? message.data as Record<string, unknown>
           : {}
         const reason = typeof payload.error === 'string' ? payload.error : (typeof payload.reason === 'string' ? payload.reason : null)
-        if (reason) lastJoinError = reason
+        if (joinFlowActive && reason) lastJoinError = reason
       }
     })
 
@@ -1737,7 +1968,19 @@ async function runScenario(options: {
           writerDurabilityProofSource: typeof payload.writerDurabilityProofSource === 'string'
             ? payload.writerDurabilityProofSource
             : null,
-          writerDurabilityProofAuthoritative: payload.writerDurabilityProofAuthoritative === true
+          writerDurabilityProofAuthoritative: payload.writerDurabilityProofAuthoritative === true,
+          membershipState: typeof payload.membershipState === 'string'
+            ? payload.membershipState
+            : null,
+          hasMirror: payload.hasMirror === true,
+          hasAccessToken: payload.hasAccessToken === true,
+          refreshAfter: Number.isFinite(Number(payload.refreshAfter))
+            ? Number(payload.refreshAfter)
+            : null,
+          expiresAt: Number.isFinite(Number(payload.expiresAt))
+            ? Number(payload.expiresAt)
+            : null,
+          grantId: typeof payload.grantId === 'string' ? payload.grantId : null
         }
         void recordGatewayStage({
           route,
@@ -1800,7 +2043,7 @@ async function runScenario(options: {
           ? message.data as Record<string, unknown>
           : {}
         const reason = typeof payload.error === 'string' ? payload.error : (typeof payload.reason === 'string' ? payload.reason : null)
-        if (reason) lastJoinError = reason
+        if (joinFlowActive && reason) lastJoinError = reason
       }
     })
 
@@ -1837,6 +2080,48 @@ async function runScenario(options: {
       'JOIN_DIRECT_DISCOVERY_V2 must be true for relay-scoped join validation'
     )
 
+    if (scenario.gatewayAvailability === 'online' && !scenario.directJoinOnly && gatewayOrigin) {
+      await host.refreshGatewayCatalog({ force: true, timeoutMs: 8_000 }).catch(() => {})
+      const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin)
+      let authorizedGateway = host.getState().authorizedGateways.find((gateway) => (
+        normalizeHttpOrigin(gateway.publicUrl) === normalizedGatewayOrigin
+      )) || null
+      let approvalSource = 'discovered'
+
+      if (!authorizedGateway && normalizedGatewayOrigin) {
+        const syntheticGateway = installSyntheticGatewayApproval(host, {
+          gatewayOrigin: normalizedGatewayOrigin,
+          gatewayId: scenario.gatewayId || null,
+          joinType: scenario.joinType
+        })
+        if (syntheticGateway) {
+          authorizedGateway = syntheticGateway as typeof authorizedGateway
+          approvalSource = 'synthetic'
+        }
+      }
+
+      await assertCheckpoint(
+        'gateway-host-approval-ready',
+        { required: true },
+        {
+          gatewayOrigin: normalizedGatewayOrigin,
+          gatewayId: authorizedGateway?.gatewayId || null,
+          source: approvalSource,
+          authorizedGatewayCount: host.getState().authorizedGateways.length,
+          accessCatalogCount: host.getState().gatewayAccessCatalog.length
+        },
+        !!authorizedGateway,
+        'gateway hosting approval was not available before createRelay'
+      )
+    } else {
+      await recordCheckpoint(
+        'gateway-host-approval-ready',
+        { required: false },
+        { skipped: true },
+        'skip'
+      )
+    }
+
     const relayName = `${scenario.joinType}-relay-${scenario.scenarioId}`
     const createGatewayOrigin = scenario.omitGatewayAssignment
       ? null
@@ -1860,7 +2145,7 @@ async function runScenario(options: {
       directJoinOnly: scenario.directJoinOnly
     })
 
-    const createdGroup = await waitFor<GroupSummary>(
+    createdGroup = await waitFor<GroupSummary>(
       'created group',
       async () => {
         await host.refreshGroups()
@@ -1870,7 +2155,7 @@ async function runScenario(options: {
       { timeoutMs: 120_000, intervalMs: 1_250 }
     )
 
-    const createdHostRelay = await waitFor<RelayEntry>(
+    createdHostRelay = await waitFor<RelayEntry>(
       'host writable relay',
       async () => {
         await host.refreshRelays()
@@ -1882,8 +2167,6 @@ async function runScenario(options: {
       { timeoutMs: 120_000, intervalMs: 1_250 }
     )
 
-    let invite: GroupInvite | null = null
-    let discovered: GroupSummary | null = null
     const metadataPolicy: MetadataPolicy = scenario.metadataPolicy || 'strict'
 
     if (scenario.joinType === 'closed') {
@@ -1899,6 +2182,8 @@ async function runScenario(options: {
           fileSharing: true,
           gatewayOrigin: createGatewayOrigin,
           gatewayId: scenario.gatewayId || null,
+          gatewayAuthMethod: createdGroup.gatewayAuthMethod || 'relay-scoped-bearer-v1',
+          gatewayDelegation: createdGroup.gatewayDelegation || 'closed-members',
           directJoinOnly: scenario.directJoinOnly
         }
       })
@@ -1935,6 +2220,31 @@ async function runScenario(options: {
         metadataPolicy === 'lenient' ? true : closedMetadataMatch,
         'invite metadata gateway assignment mismatch'
       )
+
+      if (!scenario.directJoinOnly && !scenario.omitGatewayAssignment) {
+        const gatewayAccessGrantId = typeof invite.gatewayAccess?.grantId === 'string'
+          ? invite.gatewayAccess.grantId.trim()
+          : ''
+        await assertCheckpoint(
+          'invite-gateway-access-grant',
+          { required: true },
+          {
+            grantId: gatewayAccessGrantId || null,
+            authMethod: invite.gatewayAccess?.authMethod || null,
+            gatewayOrigin: invite.gatewayAccess?.gatewayOrigin || null,
+            scopes: Array.isArray(invite.gatewayAccess?.scopes) ? invite.gatewayAccess.scopes : []
+          },
+          !!gatewayAccessGrantId,
+          'invite payload missing gatewayAccess.grantId'
+        )
+      } else {
+        await recordCheckpoint(
+          'invite-gateway-access-grant',
+          { required: false },
+          { skipped: true },
+          'skip'
+        )
+      }
     } else {
       try {
         discovered = await waitFor<GroupSummary>(
@@ -2042,7 +2352,6 @@ async function runScenario(options: {
     if (scenario.hostAvailability === 'offline') {
       await emitTimeline('host-stop-before-join')
       await host.stopWorker()
-      hostIntentionallyStopped = true
       await host.shutdown().catch(() => {})
       await assertCheckpoint(
         'host-availability-transition',
@@ -2067,6 +2376,14 @@ async function runScenario(options: {
       directJoinOnly: scenario.directJoinOnly,
       gatewayOrigin
     })
+    joinFlowActive = true
+    joinerJoinStartLineIndex = joinerLines.length
+    lastJoinError = null
+    joinFlowInputSeen = false
+    joinFlowResolvedSeen = false
+    joinAuthSuccessSeen = false
+    selectedPathMode = null
+    selectedPathPeer = null
 
     const forceGatewayBootstrapPath =
       scenario.hostAvailability === 'offline'
@@ -2092,6 +2409,7 @@ async function runScenario(options: {
         leaseReplicaPeerKeys: invite.leaseReplicaPeerKeys || undefined,
         writerIssuerPubkey: invite.writerIssuerPubkey || undefined,
         writerLeaseEnvelope: invite.writerLeaseEnvelope || undefined,
+        gatewayAccess: invite.gatewayAccess || undefined,
         blindPeer: invite.blindPeer || undefined,
         cores: invite.cores || undefined,
         writerCore: invite.writerCore || undefined,
@@ -2133,9 +2451,9 @@ async function runScenario(options: {
     const startJoinSignal = await waitFor<'input' | 'error'>(
       'start join flow input or early error',
       async () => {
-        if (joinFlowInputSeen || joinerLines.some((line) => line.includes('[Worker] Start join flow input'))) return 'input'
+        if (joinFlowInputSeen || joinerJoinFlowLines().some((line) => line.includes('[Worker] Start join flow input'))) return 'input'
         if (lastJoinError) return 'error'
-        const errorLine = joinerLines.find((line) => hasJoinFailureMarker(line))
+        const errorLine = joinerJoinFlowLines().find((line) => hasJoinFailureMarker(line))
         if (errorLine) return 'error'
         return null
       },
@@ -2151,9 +2469,15 @@ async function runScenario(options: {
 
     if (expectJoinSuccess) {
       let openJoinResponseStage: GatewayStageEvent | null = null
+      let inviteClaimResponseStage: GatewayStageEvent | null = null
       const requiresOpenJoinStages =
         scenario.gatewayCallPolicy === 'required'
         && scenario.joinType === 'open'
+        && !scenario.directJoinOnly
+        && !scenario.omitGatewayAssignment
+      const requiresInviteClaimStages =
+        scenario.gatewayCallPolicy === 'required'
+        && scenario.joinType === 'closed'
         && !scenario.directJoinOnly
         && !scenario.omitGatewayAssignment
 
@@ -2238,12 +2562,56 @@ async function runScenario(options: {
         )
       }
 
+      if (requiresInviteClaimStages) {
+        await waitForGatewayStageCheckpoint({
+          phase: 'gateway-invite-claim-challenge',
+          expected: { route: 'invite-claim', stage: 'challenge-response', status: 'ok' },
+          timeoutMs: CHECKPOINT_TIMEOUTS.gatewayDispatch,
+          match: (entry) => entry.route === 'invite-claim' && entry.stage === 'challenge-response' && entry.status === 'ok',
+          failOn: (entry) => entry.route === 'invite-claim' && entry.stage === 'response' && entry.status === 'error',
+          failureReason: 'invite-claim challenge never reached a successful response'
+        })
+
+        await waitForGatewayStageCheckpoint({
+          phase: 'gateway-invite-claim-response',
+          expected: { route: 'invite-claim', stage: 'response', status: 'ok' },
+          timeoutMs: CHECKPOINT_TIMEOUTS.gatewayResponse,
+          match: (entry) => entry.route === 'invite-claim' && entry.stage === 'response' && entry.status === 'ok',
+          failOn: (entry) => entry.route === 'invite-claim' && entry.stage === 'response' && entry.status === 'error',
+          failureReason: 'invite-claim response never returned member access bootstrap material'
+        })
+
+        inviteClaimResponseStage = [...gatewayStages]
+          .reverse()
+          .find((entry) => entry.route === 'invite-claim' && entry.stage === 'response' && entry.status === 'ok')
+          || null
+        const claimDetails = (inviteClaimResponseStage?.details || null) as Record<string, unknown> | null
+        await assertCheckpoint(
+          'gateway-invite-claim-payload',
+          { membershipState: 'active', hasMirror: true, hasAccessToken: true },
+          {
+            stage: summarizeGatewayStage(inviteClaimResponseStage),
+            membershipState: typeof claimDetails?.membershipState === 'string'
+              ? claimDetails.membershipState
+              : null,
+            hasMirror: claimDetails?.hasMirror === true,
+            hasAccessToken: claimDetails?.hasAccessToken === true,
+            refreshAfter: claimDetails?.refreshAfter ?? null,
+            expiresAt: claimDetails?.expiresAt ?? null
+          },
+          claimDetails?.hasMirror === true
+            && claimDetails?.hasAccessToken === true
+            && claimDetails?.membershipState === 'active',
+          'invite claim response missing active membership bootstrap material'
+        )
+      }
+
       const joinResolvedSignal = await waitFor<'resolved' | 'error'>(
         'start join flow resolved marker or early error',
         async () => {
-          if (joinFlowResolvedSeen || joinerLines.some((line) => line.includes('[Worker] Start join flow resolved'))) return 'resolved'
+          if (joinFlowResolvedSeen || joinerJoinFlowLines().some((line) => line.includes('[Worker] Start join flow resolved'))) return 'resolved'
           if (lastJoinError) return 'error'
-          const joinerErrorLine = joinerLines.find((line) => hasJoinFailureMarker(line))
+          const joinerErrorLine = joinerJoinFlowLines().find((line) => hasJoinFailureMarker(line))
           if (joinerErrorLine) {
             lastJoinError = joinerErrorLine
             return 'error'
@@ -2266,7 +2634,7 @@ async function runScenario(options: {
         'join path selected',
         async () => {
           if (selectedPathMode) return selectedPathMode
-          const fromLog = joinerLines
+          const fromLog = joinerJoinFlowLines()
             .map((line) => parsePathModeFromLine(line))
             .filter((entry): entry is string => Boolean(entry))
             .pop()
@@ -2326,7 +2694,7 @@ async function runScenario(options: {
             if (gatewayStages.some((entry) => (
               entry.stage === 'response'
               && entry.status === 'ok'
-              && (entry.route === 'open-join' || entry.route === 'mirror')
+              && (entry.route === 'open-join' || entry.route === 'mirror' || entry.route === 'invite-claim')
             ))) {
               return 'event'
             }
@@ -2498,6 +2866,39 @@ async function runScenario(options: {
         'pass'
       )
 
+      if (typeof options.postJoinValidate === 'function') {
+        if (!host || !joiner || !hostAccount || !joinerAccount || !createdGroup || !createdHostRelay) {
+          throw new Error('scenario-post-join-context-incomplete')
+        }
+        await options.postJoinValidate({
+          scenarioDir,
+          hostStorage,
+          joinerStorage,
+          host,
+          joiner,
+          hostAccount,
+          joinerAccount,
+          hostSession,
+          joinerSession,
+          createdGroup,
+          createdHostRelay,
+          invite,
+          discovered,
+          joinedRelay,
+          joinerRelayKey,
+          gatewayOrigin,
+          gatewaySecret,
+          gatewayTrace,
+          gatewayStages,
+          checkpoints,
+          joinCheckpointTrace,
+          emitTimeline,
+          recordCheckpoint,
+          assertCheckpoint,
+          waitForGatewayStageCheckpoint
+        })
+      }
+
       const observedOrigins = normalizeGatewayOriginList(gatewayTrace.map((entry) => entry.gatewayOrigin))
       if (gatewayTrace.length && gatewayOrigin) {
         await assertCheckpoint(
@@ -2556,7 +2957,7 @@ async function runScenario(options: {
     await waitFor(
       'expected join error',
       async () => {
-        const errorLine = lastJoinError || joinerLines.find((line) => hasJoinFailureMarker(line))
+        const errorLine = lastJoinError || joinerJoinFlowLines().find((line) => hasJoinFailureMarker(line))
         if (!errorLine) return null
         return errorLine
       },
@@ -3228,99 +3629,298 @@ async function runPhase5Isolation(options: {
 
 async function runPhase6AuthLifecycle(options: {
   repoRoot: string
+  tuiRoot: string
   runRoot: string
+  logLevel: LogLevel
   timeoutMs: number
   keepDocker: boolean
   gatewayRuntime: GatewayRuntime
 }): Promise<PhaseResult> {
   const phase: PhaseId = 6
-  const name = 'Auth Lifecycle'
+  const name = 'Relay Member Lifecycle'
   const startedAt = nowIso()
   const startedAtMs = Date.now()
   const phaseDir = path.join(options.runRoot, 'phase-6-auth-lifecycle')
   await fs.mkdir(phaseDir, { recursive: true })
   const summaryFile = path.join(phaseDir, 'phase-summary.json')
-
-  const relayKey = `${'ab'.repeat(32)}`
-  const hostAllowPubkey = `${'cd'.repeat(32)}`
-
-  const stack = await startGatewayStack({
-    repoRoot: options.repoRoot,
-    runDir: phaseDir,
-    preferredPort: 4437,
-    hostAllowPubkey,
-    timeoutMs: Math.min(options.timeoutMs, 240_000),
-    runtime: options.gatewayRuntime
-  })
-
-  const authProbeFile = path.join(phaseDir, 'auth-probe.json')
-  const checks: PhaseCheck[] = []
-
-  try {
-    const registrarModulePath = path.join(options.repoRoot, 'hypertuna-worker/gateway/PublicGatewayRegistrar.mjs')
-    const registrarModuleUrl = pathToFileURL(registrarModulePath).href
-    const registrarMod = await import(registrarModuleUrl) as {
-      default: new (args: {
-        baseUrl: string
-        sharedSecret: string
-        fetchImpl?: typeof fetch
-        logger?: Console
-      }) => {
-        registerRelay: (relayKey: string, payload?: Record<string, unknown>) => Promise<Record<string, unknown>>
-        unregisterRelay: (relayKey: string) => Promise<boolean>
+  const lifecycleSummaryFile = path.join(phaseDir, 'relay-member-lifecycle.json')
+  const workerAuthClientPath = pathToFileURL(
+    path.join(options.repoRoot, 'hypertuna-worker/gateway/PublicGatewayAuthClient.mjs')
+  ).href
+  const workerControlClientPath = pathToFileURL(
+    path.join(options.repoRoot, 'hypertuna-worker/gateway/PublicGatewayControlClient.mjs')
+  ).href
+  const authClientModule = await import(workerAuthClientPath) as {
+    default: new (args: {
+      baseUrl: string
+      fetchImpl?: typeof fetch
+      logger?: Console
+      getAuthContext?: () => {
+        pubkey?: string
+        nsecHex?: string
       }
-    }
-
-    const PublicGatewayRegistrar = registrarMod.default
-
-    const badRegistrar = new PublicGatewayRegistrar({
-      baseUrl: stack.origin,
-      sharedSecret: 'stale-invalid-secret',
-      fetchImpl: fetch,
-      logger: console
-    })
-
-    const badResult = await badRegistrar.registerRelay(relayKey, {
-      publicIdentifier: `auth-probe-${Date.now().toString(36)}`
-    })
-
-    const goodRegistrar = new PublicGatewayRegistrar({
-      baseUrl: stack.origin,
-      sharedSecret: stack.secret,
-      fetchImpl: fetch,
-      logger: console
-    })
-
-    const goodResult = await goodRegistrar.registerRelay(relayKey, {
-      publicIdentifier: `auth-probe-${Date.now().toString(36)}`
-    })
-
-    const cleanupOk = await goodRegistrar.unregisterRelay(relayKey)
-
-    await fs.writeFile(authProbeFile, `${JSON.stringify({ badResult, goodResult, cleanupOk }, null, 2)}\n`, 'utf8')
-
-    checks.push({
-      name: 'auth-failure-on-stale-secret',
-      ok: badResult?.success === false,
-      detail: `badSuccess=${String(badResult?.success)}`
-    })
-
-    checks.push({
-      name: 'auth-success-after-secret-refresh-once',
-      ok: goodResult?.success === true,
-      detail: `goodSuccess=${String(goodResult?.success)}`
-    })
-
-    checks.push({
-      name: 'auth-cleanup-unregister',
-      ok: cleanupOk === true,
-      detail: `cleanupOk=${String(cleanupOk)}`
-    })
-  } finally {
-    if (!options.keepDocker) {
-      await stopGatewayStack(stack, phaseDir).catch(() => {})
+    }) => {
+      isEnabled: () => boolean
+      issueBearerToken: (args?: {
+        scope?: string
+        relayKey?: string | null
+        forceRefresh?: boolean
+      }) => Promise<string>
     }
   }
+  const controlClientModule = await import(workerControlClientPath) as {
+    default: new (args: {
+      baseUrl: string
+      authClient?: unknown
+      fetchImpl?: typeof fetch
+      logger?: Console
+    }) => {
+      revokeRelayMember: (
+        relayKey: string,
+        payload?: Record<string, unknown>
+      ) => Promise<Record<string, unknown>>
+    }
+  }
+  const PublicGatewayAuthClient = authClientModule.default
+  const PublicGatewayControlClient = controlClientModule.default
+
+  const scenario = await runScenario({
+    repoRoot: options.repoRoot,
+    tuiRoot: options.tuiRoot,
+    phaseDir,
+    manifest: {
+      scenarioId: 'auth-lifecycle-closed-offline-gateway-online',
+      joinType: 'closed',
+      hostAvailability: 'offline',
+      gatewayAvailability: 'online',
+      directJoinOnly: false,
+      metadataPolicy: 'lenient',
+      gatewayCallPolicy: 'required',
+      expectedPathModes: ['closed-lease-direct', 'closed-invite-offline-fallback']
+    },
+    logLevel: options.logLevel,
+    timeoutMs: options.timeoutMs,
+    keepDocker: options.keepDocker,
+    preferredGatewayPort: 4437,
+    gatewayRuntime: options.gatewayRuntime,
+    postJoinValidate: async (context) => {
+      const relayKey = String(
+        context.joinedRelay.relayKey
+        || context.joinerRelayKey
+        || context.invite?.relayKey
+        || ''
+      ).trim()
+      const publicIdentifier = context.invite?.groupId || context.createdGroup.id
+      const grantId = typeof context.invite?.gatewayAccess?.grantId === 'string'
+        ? context.invite.gatewayAccess.grantId.trim()
+        : ''
+      const gatewayOrigin = normalizeHttpOrigin(context.gatewayOrigin)
+      if (!relayKey) throw new Error('missing-relay-key-for-phase-6')
+      if (!gatewayOrigin) throw new Error('missing-gateway-origin-for-phase-6')
+      if (!context.hostSession?.nsecHex) throw new Error('missing-host-session-for-phase-6')
+
+      const accessEntry = await waitForRelayMemberAccessEntry(context.joinerStorage, {
+        relayKey,
+        publicIdentifier,
+        timeoutMs: 45_000
+      })
+
+      const storedAccessToken = typeof accessEntry.accessToken === 'string'
+        ? accessEntry.accessToken.trim()
+        : ''
+      const storedGrantId = typeof accessEntry.grantId === 'string'
+        ? accessEntry.grantId.trim()
+        : ''
+      await context.assertCheckpoint(
+        'relay-member-access-stored',
+        { grantId, accessToken: true },
+        {
+          relayKey,
+          publicIdentifier,
+          grantId: storedGrantId || null,
+          hasAccessToken: !!storedAccessToken,
+          scopes: Array.isArray(accessEntry.scopes) ? accessEntry.scopes : [],
+          expiresAt: accessEntry.expiresAt ?? null,
+          refreshAfter: accessEntry.refreshAfter ?? null
+        },
+        !!storedAccessToken && (!grantId || storedGrantId === grantId),
+        'relay member access token was not persisted to the joiner cache'
+      )
+
+      const refreshResponse = await fetch(`${gatewayOrigin}/api/relay-member-tokens/refresh`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          relayKey,
+          token: storedAccessToken
+        })
+      })
+      const refreshPayload = await readJsonResponse(refreshResponse)
+      const refreshedToken = typeof refreshPayload.accessToken === 'string'
+        ? refreshPayload.accessToken.trim()
+        : ''
+      await context.assertCheckpoint(
+        'relay-member-token-refresh',
+        { status: 200, tokenRotated: true },
+        {
+          statusCode: refreshResponse.status,
+          hasAccessToken: !!refreshedToken,
+          tokenRotated: !!refreshedToken && refreshedToken !== storedAccessToken,
+          expiresAt: refreshPayload.expiresAt ?? null,
+          refreshAfter: refreshPayload.refreshAfter ?? null,
+          error: typeof refreshPayload.error === 'string' ? refreshPayload.error : null
+        },
+        refreshResponse.ok && !!refreshedToken && refreshedToken !== storedAccessToken,
+        'relay member access token did not refresh successfully'
+      )
+
+      const authClient = new PublicGatewayAuthClient({
+        baseUrl: gatewayOrigin,
+        fetchImpl: fetch,
+        logger: console,
+        getAuthContext: () => ({
+          pubkey: context.hostAccount.pubkey,
+          nsecHex: context.hostSession?.nsecHex || ''
+        })
+      })
+      const controlClient = new PublicGatewayControlClient({
+        baseUrl: gatewayOrigin,
+        authClient,
+        fetchImpl: fetch,
+        logger: console
+      })
+      const revokeResult = await controlClient.revokeRelayMember(relayKey, {
+        subjectPubkey: context.joinerAccount.pubkey,
+        reason: 'relay-member-lifecycle-e2e'
+      })
+      await context.assertCheckpoint(
+        'relay-member-revoke',
+        { success: true, state: 'revoked' },
+        revokeResult,
+        revokeResult?.success === true && revokeResult?.state === 'revoked',
+        'relay member revoke did not complete successfully'
+      )
+
+      const revokedRefreshResponse = await fetch(`${gatewayOrigin}/api/relay-member-tokens/refresh`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          relayKey,
+          token: refreshedToken || storedAccessToken
+        })
+      })
+      const revokedRefreshPayload = await readJsonResponse(revokedRefreshResponse)
+      const revokedRefreshError = typeof revokedRefreshPayload.error === 'string'
+        ? revokedRefreshPayload.error
+        : null
+      await context.assertCheckpoint(
+        'relay-member-refresh-revoked',
+        { status: 401, error: 'gateway-member-access-revoked' },
+        {
+          statusCode: revokedRefreshResponse.status,
+          error: revokedRefreshError,
+          payload: revokedRefreshPayload
+        },
+        revokedRefreshResponse.status === 401 && revokedRefreshError === 'gateway-member-access-revoked',
+        'revoked relay member token still refreshed successfully'
+      )
+
+      const revokedMirrorResponse = await fetch(
+        `${gatewayOrigin}/api/relays/${encodeURIComponent(relayKey)}/mirror`,
+        {
+          headers: {
+            authorization: `Bearer ${refreshedToken || storedAccessToken}`
+          }
+        }
+      )
+      const revokedMirrorPayload = await readJsonResponse(revokedMirrorResponse)
+      const revokedMirrorError = typeof revokedMirrorPayload.error === 'string'
+        ? revokedMirrorPayload.error
+        : null
+      await context.assertCheckpoint(
+        'relay-member-mirror-revoked',
+        { status: 401, error: 'gateway-member-access-revoked' },
+        {
+          statusCode: revokedMirrorResponse.status,
+          error: revokedMirrorError,
+          payload: revokedMirrorPayload
+        },
+        revokedMirrorResponse.status === 401 && revokedMirrorError === 'gateway-member-access-revoked',
+        'revoked relay member token still fetched mirror metadata'
+      )
+
+      await fs.writeFile(
+        lifecycleSummaryFile,
+        `${JSON.stringify({
+          generatedAt: nowIso(),
+          relayKey,
+          publicIdentifier,
+          gatewayOrigin,
+          inviteGrantId: grantId || null,
+          storedGrantId: storedGrantId || null,
+          refreshedTokenIssued: !!refreshedToken,
+          revokeResult,
+          revokedRefresh: {
+            statusCode: revokedRefreshResponse.status,
+            error: revokedRefreshError
+          },
+          revokedMirror: {
+            statusCode: revokedMirrorResponse.status,
+            error: revokedMirrorError
+          }
+        }, null, 2)}\n`,
+        'utf8'
+      )
+    }
+  })
+
+  const checkpointsByPhase = new Set(scenario.checkpoints.map((checkpoint) => checkpoint.phase))
+  const checks: PhaseCheck[] = [
+    {
+      name: 'scenario-pass',
+      ok: scenario.verdict.ok,
+      detail: scenario.verdict.reason
+    },
+    {
+      name: 'invite-grant-issued',
+      ok: checkpointsByPhase.has('invite-gateway-access-grant'),
+      detail: checkpointsByPhase.has('invite-gateway-access-grant') ? 'present' : 'missing'
+    },
+    {
+      name: 'invite-claim-stage',
+      ok: checkpointsByPhase.has('gateway-invite-claim-response'),
+      detail: checkpointsByPhase.has('gateway-invite-claim-response') ? 'present' : 'missing'
+    },
+    {
+      name: 'member-access-stored',
+      ok: checkpointsByPhase.has('relay-member-access-stored'),
+      detail: checkpointsByPhase.has('relay-member-access-stored') ? 'present' : 'missing'
+    },
+    {
+      name: 'member-token-refresh',
+      ok: checkpointsByPhase.has('relay-member-token-refresh'),
+      detail: checkpointsByPhase.has('relay-member-token-refresh') ? 'present' : 'missing'
+    },
+    {
+      name: 'member-revoke',
+      ok: checkpointsByPhase.has('relay-member-revoke'),
+      detail: checkpointsByPhase.has('relay-member-revoke') ? 'present' : 'missing'
+    },
+    {
+      name: 'member-refresh-denied-after-revoke',
+      ok: checkpointsByPhase.has('relay-member-refresh-revoked'),
+      detail: checkpointsByPhase.has('relay-member-refresh-revoked') ? 'present' : 'missing'
+    },
+    {
+      name: 'member-mirror-denied-after-revoke',
+      ok: checkpointsByPhase.has('relay-member-mirror-revoked'),
+      detail: checkpointsByPhase.has('relay-member-mirror-revoked') ? 'present' : 'missing'
+    }
+  ]
 
   const status: PhaseStatus = checks.every((check) => check.ok) ? 'PASS' : 'FAIL'
   const result = makePhaseResult({
@@ -3329,12 +3929,12 @@ async function runPhase6AuthLifecycle(options: {
     status,
     startedAt,
     startedAtMs,
-    reason: status === 'PASS' ? 'auth-lifecycle-pass' : 'auth-lifecycle-fail',
+    reason: status === 'PASS' ? 'relay-member-lifecycle-pass' : 'relay-member-lifecycle-fail',
     checks,
     summaryFile,
+    scenarioResults: [scenario],
     data: {
-      gatewayOrigin: stack.origin,
-      authProbeFile
+      lifecycleSummaryFile
     }
   })
 
@@ -3716,7 +4316,9 @@ async function main(): Promise<void> {
     if (phase === 6) {
       const result = await runPhase6AuthLifecycle({
         repoRoot,
+        tuiRoot,
         runRoot,
+        logLevel,
         timeoutMs,
         keepDocker,
         gatewayRuntime

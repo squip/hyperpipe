@@ -27,6 +27,7 @@ import {
 import { TDraftEvent } from '@/types'
 import {
   TGroupAdmin,
+  TGroupGatewayAccess,
   TGroupInvite,
   TGroupListEntry,
   TGroupMembershipStatus,
@@ -68,6 +69,7 @@ const TOKENIZED_RELAY_REFRESH_MIN_INTERVAL_MS = 5000
 const LEAVE_PUBLISH_RETRY_BASE_DELAY_MS = 5000
 const LEAVE_PUBLISH_RETRY_MAX_DELAY_MS = 60 * 60 * 1000
 const JOIN_FLOW_SUCCESS_FRESH_MS = 15 * 60 * 1000
+const DEFAULT_GATEWAY_MEMBER_SCOPES = ['relay:bootstrap', 'relay:mirror-read', 'relay:mirror-sync', 'relay:ws-connect']
 
 type GroupMemberPreviewEntry = {
   members: string[]
@@ -259,6 +261,9 @@ type TGroupsContext = {
     fileSharing?: boolean
     gatewayOrigin?: string | null
     gatewayId?: string | null
+    gatewayAuthMethod?: string | null
+    gatewayDelegation?: string | null
+    gatewaySponsorPubkey?: string | null
     directJoinOnly?: boolean
   }) => Promise<{ groupId: string; relay: string }>
 }
@@ -513,6 +518,7 @@ const buildInvitePayload = (args: {
     autobaseLocal?: string
     writerSecret?: string
   } | null
+  gatewayAccess?: TGroupGatewayAccess | null
 }) => ({
   relayUrl: args.relayUrl,
   token: args.token,
@@ -538,7 +544,8 @@ const buildInvitePayload = (args: {
   writerCore: args.writerInfo?.writerCore || null,
   writerCoreHex: args.writerInfo?.writerCoreHex || args.writerInfo?.autobaseLocal || null,
   autobaseLocal: args.writerInfo?.autobaseLocal || args.writerInfo?.writerCoreHex || null,
-  writerSecret: args.writerInfo?.writerSecret || null
+  writerSecret: args.writerInfo?.writerSecret || null,
+  gatewayAccess: args.gatewayAccess || null
 })
 
 const buildOpenInvitePayload = (args: {
@@ -554,6 +561,7 @@ const buildOpenInvitePayload = (args: {
   groupName?: string
   groupPicture?: string
   authorizedMemberPubkeys?: string[]
+  gatewayAccess?: TGroupGatewayAccess | null
 }) => ({
   relayUrl: args.relayUrl,
   relayKey: args.relayKey ?? null,
@@ -566,8 +574,57 @@ const buildOpenInvitePayload = (args: {
   writerIssuerPubkey: args.writerIssuerPubkey || null,
   groupName: args.groupName || null,
   groupPicture: args.groupPicture || null,
-  authorizedMemberPubkeys: normalizePubkeyList(args.authorizedMemberPubkeys)
+  authorizedMemberPubkeys: normalizePubkeyList(args.authorizedMemberPubkeys),
+  gatewayAccess: args.gatewayAccess || null
 })
+
+const parseGatewayAccessPayload = (value: unknown): TGroupGatewayAccess | null => {
+  if (!value || typeof value !== 'object') return null
+  const candidate = value as Record<string, unknown>
+  const gatewayOrigin =
+    normalizeHttpOrigin(typeof candidate.gatewayOrigin === 'string' ? candidate.gatewayOrigin : null)
+    || normalizeHttpOrigin(typeof candidate.gateway_origin === 'string' ? candidate.gateway_origin : null)
+  const gatewayId =
+    typeof candidate.gatewayId === 'string'
+      ? candidate.gatewayId.trim().toLowerCase() || null
+      : typeof candidate.gateway_id === 'string'
+        ? candidate.gateway_id.trim().toLowerCase() || null
+        : null
+  const grantId =
+    typeof candidate.grantId === 'string'
+      ? candidate.grantId.trim() || null
+      : typeof candidate.grant_id === 'string'
+        ? candidate.grant_id.trim() || null
+        : null
+  const authMethod =
+    typeof candidate.authMethod === 'string'
+      ? candidate.authMethod.trim() || null
+      : typeof candidate.auth_method === 'string'
+        ? candidate.auth_method.trim() || null
+        : null
+  const version =
+    typeof candidate.version === 'string'
+      ? candidate.version.trim() || null
+      : null
+  const scopes = Array.isArray(candidate.scopes)
+    ? Array.from(
+        new Set(
+          candidate.scopes
+            .map((entry) => String(entry || '').trim())
+            .filter(Boolean)
+        )
+      )
+    : []
+  if (!grantId && !gatewayOrigin && !gatewayId) return null
+  return {
+    version,
+    authMethod,
+    grantId,
+    gatewayId,
+    gatewayOrigin,
+    scopes: scopes.length ? scopes : [...DEFAULT_GATEWAY_MEMBER_SCOPES]
+  }
+}
 
 const extractRelayKeyFromUrl = (value?: string | null) => {
   if (!value) return null
@@ -1246,6 +1303,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let leaseReplicaPeerKeys: string[] | undefined
             let writerIssuerPubkey: string | null | undefined
             let writerLeaseEnvelope: Record<string, unknown> | null | undefined
+            let gatewayAccess: TGroupGatewayAccess | null | undefined
             let writerCore: string | null | undefined
             let writerCoreHex: string | null | undefined
             let autobaseLocal: string | null | undefined
@@ -1320,6 +1378,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 if (payload.writerLeaseEnvelope && typeof payload.writerLeaseEnvelope === 'object') {
                   writerLeaseEnvelope = payload.writerLeaseEnvelope as Record<string, unknown>
                 }
+                gatewayAccess = parseGatewayAccessPayload(payload.gatewayAccess ?? payload.gateway_access)
                 if (typeof payload.writerCore === 'string') {
                   writerCore = payload.writerCore
                 }
@@ -1410,6 +1469,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               leaseReplicaPeerKeys,
               writerIssuerPubkey,
               writerLeaseEnvelope,
+              gatewayAccess,
               writerCore,
               writerCoreHex,
               autobaseLocal,
@@ -3524,6 +3584,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       fileSharing,
       gatewayOrigin,
       gatewayId,
+      gatewayAuthMethod,
+      gatewayDelegation,
+      gatewaySponsorPubkey,
       directJoinOnly
     }: {
       name: string
@@ -3534,6 +3597,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       fileSharing?: boolean
       gatewayOrigin?: string | null
       gatewayId?: string | null
+      gatewayAuthMethod?: string | null
+      gatewayDelegation?: string | null
+      gatewaySponsorPubkey?: string | null
       directJoinOnly?: boolean
     }) => {
       if (!pubkey) throw new Error('Not logged in')
@@ -3600,6 +3666,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           pictureTagUrl: picture,
           gatewayOrigin: normalizedGatewayOrigin,
           gatewayId: normalizedGatewayId,
+          gatewayAuthMethod,
+          gatewayDelegation,
+          gatewaySponsorPubkey,
           directJoinOnly: normalizedDirectJoinOnly,
           discoveryTopic,
           hostPeerKeys,
@@ -3783,6 +3852,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           ? metadataHints.gatewayId.trim().toLowerCase()
           : null
       const gatewayOrigin = normalizeHttpOrigin(metadataHints?.gatewayOrigin || null)
+      const gatewayAuthMethod =
+        typeof metadataHints?.gatewayAuthMethod === 'string' && metadataHints.gatewayAuthMethod.trim()
+          ? metadataHints.gatewayAuthMethod.trim()
+          : null
       const directJoinOnly = metadataHints?.directJoinOnly === true
       const discoveryTopic =
         typeof metadataHints?.discoveryTopic === 'string' && metadataHints.discoveryTopic.trim()
@@ -3910,6 +3983,25 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         invitees.map(async (invitee) => {
           const token = isOpenGroup ? null : randomString(24)
           const writerInfo = await provisionWriterInfo(invitee, token)
+          const gatewayAccess =
+            !isOpenGroup
+            && gatewayAuthMethod === 'relay-scoped-bearer-v1'
+            && !directJoinOnly
+            && !!gatewayOrigin
+            && !!inviteRelayKey
+            && !!sendToWorker
+              ? await sendToWorker({
+                  type: 'authorize-relay-member-access',
+                  data: {
+                    relayKey: inviteRelayKey,
+                    publicIdentifier: groupId,
+                    subjectPubkey: invitee,
+                    gatewayOrigin,
+                    gatewayId,
+                    scopes: DEFAULT_GATEWAY_MEMBER_SCOPES
+                  }
+                }) as TGroupGatewayAccess
+              : null
           const inviteMirrorMetadata = buildInviteMirrorMetadata(writerInfo)
           const payload = isOpenGroup
             ? buildOpenInvitePayload({
@@ -3924,7 +4016,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 writerIssuerPubkey: metadataWriterIssuerPubkey,
                 groupName: inviteName,
                 groupPicture: invitePicture,
-                authorizedMemberPubkeys: baseAuthorizedMemberPubkeys
+                authorizedMemberPubkeys: baseAuthorizedMemberPubkeys,
+                gatewayAccess
               })
             : buildInvitePayload({
                 token: token as string,
@@ -3949,7 +4042,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 writerLeaseEnvelope: writerInfo?.writerLeaseEnvelope || null,
                 mirrorMetadata: inviteMirrorMetadata,
                 writerInfo,
-                fastForward: writerInfo?.fastForward || null
+                fastForward: writerInfo?.fastForward || null,
+                gatewayAccess
               })
           const encryptedPayload = await nip04Encrypt(invitee, JSON.stringify(payload))
           console.info('[GroupsProvider] Invite payload built', {
@@ -3962,6 +4056,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             hasWriterSecret: !!writerInfo?.writerSecret,
             writerSecretLen: writerInfo?.writerSecret ? String(writerInfo.writerSecret).length : 0,
             hasFastForward: !!writerInfo?.fastForward,
+            hasGatewayAccess: !!gatewayAccess?.grantId,
             relayKey: inviteRelayKey ? String(inviteRelayKey).slice(0, 16) : null,
             relayUrl: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 80) : null,
             mirrorCoresCount: Array.isArray(inviteMirrorMetadata?.cores)

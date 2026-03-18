@@ -753,6 +753,7 @@ const GroupsPage = forwardRef<
         leaseReplicaPeerKeys: inviteHints.leaseReplicaPeerKeys || undefined,
         writerIssuerPubkey: inviteHints.writerIssuerPubkey || undefined,
         writerLeaseEnvelope: inviteHints.writerLeaseEnvelope || undefined,
+        gatewayAccess: inv.gatewayAccess || undefined,
         blindPeer: inv.blindPeer,
         cores: inv.cores,
         writerCore: inv.writerCore,

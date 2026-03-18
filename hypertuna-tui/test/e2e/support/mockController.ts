@@ -195,6 +195,8 @@ function emptyState(): ControllerState {
     discoveryRelayUrls: uniqueRelayUrls(DEFAULT_DISCOVERY_RELAYS),
     gatewayPeerCounts: {},
     discoveredGateways: [],
+    authorizedGateways: [],
+    gatewayAccessCatalog: [],
     feed: [],
     feedSource: defaultFeedSource(),
     activeFeedRelays: [],
@@ -291,6 +293,8 @@ function cloneState(state: ControllerState): ControllerState {
     discoveryRelayUrls: [...state.discoveryRelayUrls],
     gatewayPeerCounts: { ...state.gatewayPeerCounts },
     discoveredGateways: state.discoveredGateways.map((entry) => ({ ...entry })),
+    authorizedGateways: state.authorizedGateways.map((entry) => ({ ...entry })),
+    gatewayAccessCatalog: state.gatewayAccessCatalog.map((entry) => ({ ...entry })),
     feed: [...state.feed],
     feedSource: { ...state.feedSource },
     activeFeedRelays: [...state.activeFeedRelays],
@@ -404,6 +408,8 @@ export class MockController implements AppController {
       discoveryRelayUrls: state?.discoveryRelayUrls || uniqueRelayUrls(DEFAULT_DISCOVERY_RELAYS),
       gatewayPeerCounts: state?.gatewayPeerCounts || {},
       discoveredGateways: state?.discoveredGateways || [],
+      authorizedGateways: state?.authorizedGateways || [],
+      gatewayAccessCatalog: state?.gatewayAccessCatalog || [],
       feedSource: state?.feedSource || defaultFeedSource(),
       activeFeedRelays: state?.activeFeedRelays || [],
       feedControls: state?.feedControls || defaultFeedControls(),
@@ -1268,9 +1274,20 @@ export class MockController implements AppController {
           lastSeenAt: nowMs()
         }
       ]
-      this.patch({ discoveredGateways: fallback })
+      this.patch({
+        discoveredGateways: fallback,
+        authorizedGateways: fallback,
+        gatewayAccessCatalog: fallback.map((entry) => ({
+          gatewayId: entry.gatewayId,
+          gatewayOrigin: entry.publicUrl,
+          hostingState: 'approved',
+          reason: 'mock-approved',
+          lastCheckedAt: nowMs()
+        }))
+      })
     }
-    return this.state.discoveredGateways.map((entry) => ({ ...entry }))
+    return (this.state.authorizedGateways.length ? this.state.authorizedGateways : this.state.discoveredGateways)
+      .map((entry) => ({ ...entry }))
   }
 
   async createRelay(input: {

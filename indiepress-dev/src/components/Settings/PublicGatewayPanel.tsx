@@ -3,15 +3,11 @@ import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import { isElectron } from '@/lib/platform'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 
 export default function PublicGatewayPanel() {
-  const { publicGatewayStatus, publicGatewayToken, lastError, sendToWorker } = useWorkerBridge()
+  const { publicGatewayStatus, lastError, sendToWorker } = useWorkerBridge()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [tokenRelayKey, setTokenRelayKey] = useState('')
-  const [tokenTtl, setTokenTtl] = useState(3600)
 
   if (!isElectron()) {
     return (
@@ -25,15 +21,9 @@ export default function PublicGatewayPanel() {
   }
 
   const status = publicGatewayStatus
-  const tokenExpiresText = (() => {
-    const expiresAt = publicGatewayToken?.expiresAt
-    if (!expiresAt) return null
-    try {
-      return new Date(expiresAt).toLocaleString()
-    } catch (_) {
-      return String(expiresAt)
-    }
-  })()
+  const accessCatalog = Array.isArray(status?.gatewayAccessCatalog) ? status.gatewayAccessCatalog : []
+  const authorizedGateways = Array.isArray(status?.authorizedGateways) ? status.authorizedGateways : []
+  const discoveredGateways = Array.isArray(status?.discoveredGateways) ? status.discoveredGateways : []
 
   const refreshStatus = async () => {
     setBusy(true)
@@ -80,7 +70,53 @@ export default function PublicGatewayPanel() {
         <Badge variant={status?.enabled ? 'default' : 'outline'}>
           {status?.enabled ? 'Enabled' : 'Disabled'}
         </Badge>
+        {status?.authMethod && <Badge variant="outline">{status.authMethod}</Badge>}
         {status?.baseUrl && <div className="text-muted-foreground">{status.baseUrl}</div>}
+      </div>
+      <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-3">
+        <div>Discovered: {discoveredGateways.length}</div>
+        <div>Approved for hosting: {authorizedGateways.length}</div>
+        <div>Last update: {status?.lastUpdatedAt ? new Date(status.lastUpdatedAt).toLocaleString() : 'n/a'}</div>
+      </div>
+      <div className="space-y-1">
+        <div className="text-sm font-medium">Gateway access</div>
+        {!accessCatalog.length ? (
+          <div className="text-xs text-muted-foreground">
+            No gateway access state cached yet. Refresh to probe discovered gateways.
+          </div>
+        ) : (
+          <div className="space-y-1 text-xs">
+            {accessCatalog.map((entry, index) => (
+              <div key={`${entry.gatewayId || entry.gatewayOrigin || 'gateway'}:${index}`} className="rounded-md border border-border/50 bg-background/60 p-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="font-medium truncate">{entry.gatewayOrigin || entry.gatewayId || 'Gateway'}</div>
+                  <Badge
+                    variant={
+                      entry.hostingState === 'approved'
+                        ? 'default'
+                        : entry.hostingState === 'denied'
+                          ? 'destructive'
+                          : 'outline'
+                    }
+                    className="capitalize"
+                  >
+                    {entry.hostingState || 'unknown'}
+                  </Badge>
+                </div>
+                <div className="text-muted-foreground">
+                  Policy: {entry.policy?.hostPolicy || 'unknown'}
+                  {entry.memberDelegationMode ? ` • Delegation: ${entry.memberDelegationMode}` : ''}
+                </div>
+                {entry.reason && <div className="text-muted-foreground">Reason: {entry.reason}</div>}
+                {entry.lastCheckedAt && (
+                  <div className="text-muted-foreground">
+                    Checked: {new Date(entry.lastCheckedAt).toLocaleString()}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
       <div className="space-y-1">
         <div className="text-sm font-medium">Registered relays</div>
@@ -102,82 +138,6 @@ export default function PublicGatewayPanel() {
                 )}
               </div>
             ))}
-          </div>
-        )}
-      </div>
-      <div className="space-y-2">
-        <div className="text-sm font-medium">Issue access token</div>
-        <div className="grid gap-3 sm:grid-cols-[2fr_1fr] items-end">
-          <div className="space-y-1">
-            <Label htmlFor="token-relay">Relay key or identifier</Label>
-            <Input
-              id="token-relay"
-              value={tokenRelayKey}
-              onChange={(e) => setTokenRelayKey(e.target.value)}
-              placeholder="relay key or npub:relayName"
-            />
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="token-ttl">TTL (seconds)</Label>
-            <Input
-              id="token-ttl"
-              type="number"
-              value={tokenTtl}
-              onChange={(e) => setTokenTtl(Number(e.target.value) || 0)}
-              min={60}
-            />
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button
-            size="sm"
-            onClick={async () => {
-              setBusy(true)
-              setError(null)
-              try {
-                await sendToWorker({
-                  type: 'generate-public-gateway-token',
-                  relayKey: tokenRelayKey || undefined,
-                  ttlSeconds: tokenTtl || undefined
-                })
-              } catch (err: any) {
-                setError(err?.message || 'Failed to issue token')
-              } finally {
-                setBusy(false)
-              }
-            }}
-            disabled={busy || !tokenRelayKey}
-          >
-            {busy ? 'Issuing…' : 'Generate token'}
-          </Button>
-        </div>
-        {publicGatewayToken && (
-          <div className="rounded-md border border-border/50 bg-background/60 p-3 space-y-2 text-xs">
-            <div className="flex items-center justify-between gap-2">
-              <div className="font-medium truncate">Token for {publicGatewayToken.relayKey}</div>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  const url = publicGatewayToken.connectionUrl
-                  if (!url) return
-                  navigator.clipboard?.writeText?.(url).catch(() => {})
-                }}
-              >
-                Copy URL
-              </Button>
-            </div>
-            {tokenExpiresText && (
-              <div className="text-muted-foreground">Expires: {tokenExpiresText}</div>
-            )}
-            <div className="break-all">
-              <span className="text-muted-foreground">URL: </span>
-              {publicGatewayToken.connectionUrl}
-            </div>
-            <div className="break-all">
-              <span className="text-muted-foreground">Token: </span>
-              {publicGatewayToken.token}
-            </div>
           </div>
         )}
       </div>

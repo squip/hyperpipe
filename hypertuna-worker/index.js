@@ -120,6 +120,13 @@ import {
   pruneRelayLeaseReplicaStore,
   upsertRelayLeaseEnvelope
 } from './relay-lease-replica-store.mjs'
+import {
+  configureRelayMemberAccessStore,
+  getRelayMemberAccess,
+  pruneRelayMemberAccessStore,
+  removeRelayMemberAccess,
+  upsertRelayMemberAccess
+} from './relay-member-access-store.mjs'
 import MarmotService from './marmot-service.mjs'
 import ConversationFileIndex from './conversation-file-index.mjs'
 import MediaServiceManager from './media/MediaServiceManager.mjs'
@@ -197,6 +204,9 @@ const BLIND_PEER_MIRROR_METADATA_TIMEOUT_MS = 8000
 const OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_TIMEOUT_MS = 8000
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores'
+const RELAY_OPEN_JOIN_PURPOSE = 'relay-open-join'
+const RELAY_INVITE_CLAIM_PURPOSE = 'relay-invite-claim'
+const DEFAULT_RELAY_MEMBER_SCOPES = ['relay:bootstrap', 'relay:mirror-read', 'relay:mirror-sync', 'relay:ws-connect']
 const JOIN_TRACE_ID_HEADER = 'x-hypertuna-join-trace-id'
 const JOIN_TRACE_ATTEMPT_ID_HEADER = 'x-hypertuna-join-attempt-id'
 const JOIN_TRACE_REQUEST_ID_HEADER = 'x-hypertuna-worker-request-id'
@@ -283,6 +293,8 @@ configureRelayWriterPoolStore({ storageBase: defaultStorageDir, logger: console 
 configureRelayDiscoveryStore({ storageBase: defaultStorageDir, logger: console })
 configureRelayGatewayMapStore({ storageBase: defaultStorageDir, logger: console })
 configureRelayLeaseReplicaStore({ storageBase: defaultStorageDir, logger: console })
+configureRelayMemberAccessStore({ storageBase: defaultStorageDir, logger: console })
+pruneRelayMemberAccessStore().catch(() => {})
 
 const relayMirrorSubscriptions = new Map()
 const relayMirrorSyncState = new Map()
@@ -317,6 +329,7 @@ const RELAY_MIRROR_UPDATE_DEBOUNCE_MS = 750
 const RELAY_MIRROR_UPDATE_MIN_INTERVAL_MS = 2000
 const relaySubscriptionRefreshRecent = new Map()
 const relaySubscriptionRefreshInFlight = new Map()
+const relayMemberAccessRefreshInflight = new Map()
 
 function normalizeJoinAttemptIdentifier(value) {
   if (typeof value !== 'string') return null
@@ -527,6 +540,543 @@ function describeRelayIdentifierType(value) {
 function resolveRelayIdentifierPath(identifier) {
   if (!identifier || typeof identifier !== 'string') return null
   return identifier.includes(':') ? identifier.replace(':', '/') : identifier
+}
+
+function normalizeRelayMemberScopes(value) {
+  const scopes = Array.isArray(value)
+    ? Array.from(
+      new Set(
+        value
+          .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
+          .filter(Boolean)
+      )
+    )
+    : []
+  return scopes.length ? scopes : [...DEFAULT_RELAY_MEMBER_SCOPES]
+}
+
+function normalizeRelayMemberGatewayAccess(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const candidate = value
+  const authMethod =
+    typeof candidate.authMethod === 'string' && candidate.authMethod.trim()
+      ? candidate.authMethod.trim()
+      : typeof candidate.auth_method === 'string' && candidate.auth_method.trim()
+        ? candidate.auth_method.trim()
+        : 'relay-scoped-bearer-v1'
+  const grantId =
+    typeof candidate.grantId === 'string' && candidate.grantId.trim()
+      ? candidate.grantId.trim()
+      : typeof candidate.memberGrantId === 'string' && candidate.memberGrantId.trim()
+        ? candidate.memberGrantId.trim()
+        : typeof candidate.grant_id === 'string' && candidate.grant_id.trim()
+          ? candidate.grant_id.trim()
+          : null
+  const gatewayOrigin = normalizeHttpOrigin(
+    candidate.gatewayOrigin
+    || candidate.gateway_origin
+    || candidate.origin
+    || null
+  )
+  const gatewayId = normalizeGatewayId(
+    candidate.gatewayId
+    || candidate.gateway_id
+    || null
+  )
+  const version =
+    typeof candidate.version === 'string' && candidate.version.trim()
+      ? candidate.version.trim()
+      : 'v1'
+  const scopes = normalizeRelayMemberScopes(
+    candidate.scopes
+    || candidate.scope
+    || null
+  )
+  if (!grantId && !gatewayOrigin && !gatewayId) return null
+  return {
+    version,
+    authMethod,
+    grantId,
+    gatewayOrigin,
+    gatewayId,
+    scopes
+  }
+}
+
+function resolveRelayMemberAccessLookup(relayIdentifier = null) {
+  const relayKey = normalizeRelayKeyHex(relayIdentifier) || null
+  const publicIdentifier =
+    relayKey
+      ? null
+      : (typeof relayIdentifier === 'string' && relayIdentifier.trim()
+        ? relayIdentifier.trim()
+        : null)
+  return {
+    relayKey,
+    publicIdentifier
+  }
+}
+
+function accessMatchesGateway(access = null, { gatewayOrigin = null, gatewayId = null } = {}) {
+  if (!access || typeof access !== 'object') return false
+  const normalizedOrigin = normalizeHttpOrigin(gatewayOrigin)
+  const normalizedGatewayId = normalizeGatewayId(gatewayId)
+  if (normalizedOrigin && normalizeHttpOrigin(access.gatewayOrigin || null) !== normalizedOrigin) {
+    return false
+  }
+  if (normalizedGatewayId && normalizeGatewayId(access.gatewayId || null) !== normalizedGatewayId) {
+    return false
+  }
+  return true
+}
+
+async function storeRelayMemberAccessToken({
+  relayKey = null,
+  publicIdentifier = null,
+  gatewayOrigin = null,
+  gatewayId = null,
+  authMethod = 'relay-scoped-bearer-v1',
+  accessToken = null,
+  grantId = null,
+  scopes = null,
+  subjectPubkey = null,
+  subjectRole = 'member',
+  sponsorPubkey = null,
+  devicePeerKey = null,
+  issuedAt = null,
+  expiresAt = null,
+  refreshAfter = null
+} = {}) {
+  if (typeof accessToken !== 'string' || !accessToken.trim()) return null
+  return upsertRelayMemberAccess({
+    relayKey: normalizeRelayKeyHex(relayKey) || relayKey || null,
+    publicIdentifier:
+      typeof publicIdentifier === 'string' && publicIdentifier.trim()
+        ? publicIdentifier.trim()
+        : null,
+    gatewayOrigin: normalizeHttpOrigin(gatewayOrigin),
+    gatewayId: normalizeGatewayId(gatewayId),
+    authMethod:
+      typeof authMethod === 'string' && authMethod.trim()
+        ? authMethod.trim()
+        : 'relay-scoped-bearer-v1',
+    accessToken: accessToken.trim(),
+    grantId:
+      typeof grantId === 'string' && grantId.trim()
+        ? grantId.trim()
+        : null,
+    scopes: normalizeRelayMemberScopes(scopes),
+    subjectPubkey: isHex64(subjectPubkey) ? String(subjectPubkey).trim().toLowerCase() : null,
+    subjectRole:
+      typeof subjectRole === 'string' && subjectRole.trim()
+        ? subjectRole.trim()
+        : 'member',
+    sponsorPubkey: isHex64(sponsorPubkey) ? String(sponsorPubkey).trim().toLowerCase() : null,
+    devicePeerKey:
+      typeof devicePeerKey === 'string' && devicePeerKey.trim()
+        ? devicePeerKey.trim()
+        : null,
+    issuedAt: Number.isFinite(Number(issuedAt)) ? Number(issuedAt) : null,
+    expiresAt: Number.isFinite(Number(expiresAt)) ? Number(expiresAt) : null,
+    refreshAfter: Number.isFinite(Number(refreshAfter)) ? Number(refreshAfter) : null,
+    updatedAt: Date.now()
+  })
+}
+
+function buildRelayMemberAuthEvent({
+  challenge,
+  purpose,
+  relayIdentifier,
+  publicIdentifier = null,
+  gatewayOrigin = null,
+  peerKey = null,
+  authPubkey
+} = {}) {
+  const normalizedChallenge =
+    typeof challenge === 'string' && challenge.trim()
+      ? challenge.trim()
+      : null
+  const normalizedPurpose =
+    typeof purpose === 'string' && purpose.trim()
+      ? purpose.trim()
+      : null
+  const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin)
+  if (!normalizedChallenge || !normalizedPurpose || !normalizedGatewayOrigin || !authPubkey) {
+    return null
+  }
+  const tags = [
+    ['relay', normalizedGatewayOrigin],
+    ['challenge', normalizedChallenge],
+    ['purpose', normalizedPurpose]
+  ]
+  const normalizedPublicIdentifier =
+    typeof publicIdentifier === 'string' && publicIdentifier.trim()
+      ? publicIdentifier.trim()
+      : (typeof relayIdentifier === 'string' && relayIdentifier.trim() ? relayIdentifier.trim() : null)
+  if (normalizedPublicIdentifier) {
+    tags.push(['h', normalizedPublicIdentifier])
+  }
+  if (typeof peerKey === 'string' && peerKey.trim()) {
+    tags.push(['peer', peerKey.trim().toLowerCase()])
+  }
+  return {
+    kind: 22242,
+    created_at: Math.floor(Date.now() / 1000),
+    pubkey: authPubkey,
+    tags,
+    content: ''
+  }
+}
+
+function parseGatewayErrorPayload(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return { errorCode: null, payload: null }
+  try {
+    const payload = JSON.parse(raw)
+    return {
+      errorCode:
+        payload && typeof payload === 'object' && typeof payload.error === 'string'
+          ? payload.error.trim() || null
+          : null,
+      payload
+    }
+  } catch (_) {
+    return { errorCode: null, payload: null }
+  }
+}
+
+async function refreshRelayMemberAccessToken({
+  relayKey = null,
+  publicIdentifier = null,
+  gatewayOrigin = null,
+  gatewayId = null,
+  force = false
+} = {}) {
+  const lookup = resolveRelayMemberAccessLookup(relayKey || publicIdentifier || null)
+  const normalizedPublicIdentifier =
+    typeof publicIdentifier === 'string' && publicIdentifier.trim()
+      ? publicIdentifier.trim()
+      : lookup.publicIdentifier
+  let stored = await getRelayMemberAccess({
+    relayKey: lookup.relayKey,
+    publicIdentifier: normalizedPublicIdentifier
+  }).catch(() => null)
+  if (!stored?.accessToken) return null
+  if (!accessMatchesGateway(stored, { gatewayOrigin, gatewayId })) {
+    return null
+  }
+
+  const normalizedRelayKey = normalizeRelayKeyHex(stored.relayKey || relayKey || null)
+  const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin || stored.gatewayOrigin || null)
+  if (!normalizedRelayKey || !normalizedGatewayOrigin) {
+    return stored
+  }
+
+  const now = Date.now()
+  const refreshAfter = Number.isFinite(Number(stored.refreshAfter)) ? Number(stored.refreshAfter) : null
+  const expiresAt = Number.isFinite(Number(stored.expiresAt)) ? Number(stored.expiresAt) : null
+  if (!force) {
+    if (expiresAt && expiresAt <= now + 2_000) {
+      // force refresh below
+    } else if (refreshAfter && refreshAfter > now + 2_000) {
+      return stored
+    } else if (!refreshAfter && expiresAt && expiresAt > now + 30_000) {
+      return stored
+    }
+  }
+
+  const inflightKey = `${normalizedRelayKey}|${normalizedGatewayOrigin}`
+  if (relayMemberAccessRefreshInflight.has(inflightKey)) {
+    return relayMemberAccessRefreshInflight.get(inflightKey)
+  }
+
+  const task = (async () => {
+    const fetchImpl = globalThis.fetch
+    if (typeof fetchImpl !== 'function') return stored
+    const response = await fetchImpl(`${normalizedGatewayOrigin}/api/relay-member-tokens/refresh`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        relayKey: normalizedRelayKey,
+        token: stored.accessToken
+      })
+    })
+    const raw = await response.text().catch(() => '')
+    if (!response.ok) {
+      const { errorCode } = parseGatewayErrorPayload(raw)
+      if (errorCode === 'gateway-member-access-revoked' || errorCode === 'gateway-sponsorship-revoked') {
+        await removeRelayMemberAccess({
+          relayKey: normalizedRelayKey,
+          publicIdentifier: stored.publicIdentifier || normalizedPublicIdentifier || null
+        }).catch(() => {})
+      }
+      throw new Error(errorCode || `relay-member-refresh status ${response.status}`)
+    }
+    const data = raw ? JSON.parse(raw) : {}
+    stored = await storeRelayMemberAccessToken({
+      relayKey: normalizedRelayKey,
+      publicIdentifier: stored.publicIdentifier || normalizedPublicIdentifier || null,
+      gatewayOrigin: normalizedGatewayOrigin,
+      gatewayId: normalizeGatewayId(gatewayId || stored.gatewayId || null),
+      authMethod: stored.authMethod || 'relay-scoped-bearer-v1',
+      grantId: stored.grantId || null,
+      accessToken: data?.accessToken || stored.accessToken,
+      scopes: stored.scopes || DEFAULT_RELAY_MEMBER_SCOPES,
+      subjectPubkey: stored.subjectPubkey || config?.nostr_pubkey_hex || null,
+      subjectRole: stored.subjectRole || 'member',
+      sponsorPubkey: stored.sponsorPubkey || null,
+      devicePeerKey: stored.devicePeerKey || null,
+      issuedAt: now,
+      expiresAt: data?.expiresAt || stored.expiresAt || null,
+      refreshAfter: data?.refreshAfter || stored.refreshAfter || null
+    })
+    return stored
+  })()
+    .finally(() => {
+      relayMemberAccessRefreshInflight.delete(inflightKey)
+    })
+
+  relayMemberAccessRefreshInflight.set(inflightKey, task)
+  return task
+}
+
+async function resolveRelayMemberAccessTokenForGateway({
+  relayKey = null,
+  publicIdentifier = null,
+  gatewayOrigin = null,
+  gatewayId = null,
+  forceRefresh = false
+} = {}) {
+  const lookup = resolveRelayMemberAccessLookup(relayKey || publicIdentifier || null)
+  const normalizedPublicIdentifier =
+    typeof publicIdentifier === 'string' && publicIdentifier.trim()
+      ? publicIdentifier.trim()
+      : lookup.publicIdentifier
+  let stored = await getRelayMemberAccess({
+    relayKey: lookup.relayKey,
+    publicIdentifier: normalizedPublicIdentifier
+  }).catch(() => null)
+  if (!stored?.accessToken || !accessMatchesGateway(stored, { gatewayOrigin, gatewayId })) {
+    return null
+  }
+
+  if (forceRefresh) {
+    stored = await refreshRelayMemberAccessToken({
+      relayKey: lookup.relayKey || stored.relayKey || null,
+      publicIdentifier: normalizedPublicIdentifier || stored.publicIdentifier || null,
+      gatewayOrigin,
+      gatewayId,
+      force: true
+    }).catch((error) => {
+      console.warn('[Worker] Relay member access refresh failed', {
+        relayKey: lookup.relayKey || stored?.relayKey || null,
+        publicIdentifier: normalizedPublicIdentifier || stored?.publicIdentifier || null,
+        gatewayOrigin: normalizeHttpOrigin(gatewayOrigin || stored?.gatewayOrigin || null),
+        error: error?.message || error
+      })
+      return null
+    })
+  } else {
+    stored = await refreshRelayMemberAccessToken({
+      relayKey: lookup.relayKey || stored.relayKey || null,
+      publicIdentifier: normalizedPublicIdentifier || stored.publicIdentifier || null,
+      gatewayOrigin,
+      gatewayId,
+      force: false
+    }).catch(() => stored)
+  }
+
+  return stored?.accessToken || null
+}
+
+async function claimRelayMemberGatewayAccess({
+  relayIdentifier = null,
+  relayKey = null,
+  publicIdentifier = null,
+  gatewayOrigin = null,
+  gatewayId = null,
+  grantId = null,
+  scopes = null,
+  traceContext = null
+} = {}) {
+  const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin)
+  const normalizedRelayIdentifier =
+    typeof relayIdentifier === 'string' && relayIdentifier.trim()
+      ? relayIdentifier.trim()
+      : (normalizeRelayKeyHex(relayKey) || relayKey || publicIdentifier || null)
+  const normalizedGrantId =
+    typeof grantId === 'string' && grantId.trim()
+      ? grantId.trim()
+      : null
+  if (!normalizedGatewayOrigin || !normalizedRelayIdentifier || !normalizedGrantId) {
+    return { status: 'skipped', reason: 'missing-claim-input' }
+  }
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey) || null
+  const trace = withJoinTraceContext(traceContext, {
+    relayIdentifier: normalizedRelayIdentifier,
+    route: 'invite-claim'
+  })
+  if (!config?.nostr_nsec_hex) {
+    return { status: 'skipped', reason: 'missing-nostr-credentials' }
+  }
+  const fetchImpl = globalThis.fetch
+  if (typeof fetchImpl !== 'function') {
+    return { status: 'skipped', reason: 'fetch-unavailable' }
+  }
+
+  let authPubkey = null
+  try {
+    authPubkey = NostrUtils.getPublicKey(config.nostr_nsec_hex)
+  } catch (error) {
+    return { status: 'error', reason: error?.message || 'nostr-pubkey-derivation-failed' }
+  }
+
+  emitJoinGatewayStage('invite-claim', 'challenge-request', {
+    status: 'attempt',
+    relayIdentifier: normalizedRelayIdentifier,
+    relayKey: normalizedRelayKey,
+    gatewayOrigin: normalizedGatewayOrigin,
+    grantId: normalizedGrantId,
+    traceContext: trace
+  })
+  const challengeResult = await fetchOpenJoinChallenge(normalizedRelayIdentifier, {
+    origin: normalizedGatewayOrigin,
+    purpose: RELAY_INVITE_CLAIM_PURPOSE,
+    traceContext: trace
+  })
+  if (!challengeResult || challengeResult.status !== 'ok') {
+    emitJoinGatewayStage('invite-claim', 'challenge-response', {
+      status: 'error',
+      relayIdentifier: normalizedRelayIdentifier,
+      relayKey: normalizedRelayKey,
+      gatewayOrigin: normalizedGatewayOrigin,
+      grantId: normalizedGrantId,
+      reason: challengeResult?.reason || 'challenge-failed',
+      errorCode: challengeResult?.errorCode || null,
+      traceContext: trace
+    })
+    return {
+      status: 'error',
+      reason: challengeResult?.reason || 'challenge-failed',
+      errorCode: challengeResult?.errorCode || null
+    }
+  }
+  emitJoinGatewayStage('invite-claim', 'challenge-response', {
+    status: 'ok',
+    relayIdentifier: normalizedRelayIdentifier,
+    relayKey: normalizedRelayKey,
+    gatewayOrigin: normalizedGatewayOrigin,
+    grantId: normalizedGrantId,
+    traceContext: trace
+  })
+  const challengeData = challengeResult.data || {}
+  const authEventDraft = buildRelayMemberAuthEvent({
+    challenge: challengeData.challenge,
+    purpose: RELAY_INVITE_CLAIM_PURPOSE,
+    relayIdentifier: normalizedRelayIdentifier,
+    publicIdentifier: challengeData.publicIdentifier || publicIdentifier || normalizedRelayIdentifier,
+    gatewayOrigin: normalizedGatewayOrigin,
+    peerKey: config?.swarmPublicKey || null,
+    authPubkey
+  })
+  if (!authEventDraft) {
+    return { status: 'error', reason: 'claim-auth-event-invalid' }
+  }
+  const authEvent = await NostrUtils.signEvent(authEventDraft, config.nostr_nsec_hex)
+  emitJoinGatewayStage('invite-claim', 'request', {
+    status: 'attempt',
+    relayIdentifier: normalizedRelayIdentifier,
+    relayKey: normalizedRelayKey,
+    gatewayOrigin: normalizedGatewayOrigin,
+    grantId: normalizedGrantId,
+    traceContext: trace
+  })
+  const response = await fetchImpl(
+    `${normalizedGatewayOrigin}/api/relays/${encodeURIComponent(normalizedRelayIdentifier)}/invites/claim`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        grantId: normalizedGrantId,
+        authEvent
+      })
+    }
+  )
+  const raw = await response.text().catch(() => '')
+  if (!response.ok) {
+    const { errorCode } = parseGatewayErrorPayload(raw)
+    emitJoinGatewayStage('invite-claim', 'response', {
+      status: 'error',
+      relayIdentifier: normalizedRelayIdentifier,
+      relayKey: normalizedRelayKey,
+      gatewayOrigin: normalizedGatewayOrigin,
+      grantId: normalizedGrantId,
+      reason: errorCode || `claim status ${response.status}`,
+      errorCode: errorCode || null,
+      statusCode: response.status,
+      traceContext: trace
+    })
+    return {
+      status: 'error',
+      reason: errorCode || `claim status ${response.status}`,
+      errorCode: errorCode || null
+    }
+  }
+  const data = raw ? JSON.parse(raw) : {}
+  const mirror = data?.mirror && typeof data.mirror === 'object' ? data.mirror : null
+  const resolvedRelayKey = normalizeRelayKeyHex(
+    mirror?.relayKey
+    || mirror?.relay_key
+    || challengeData?.relayKey
+    || relayKey
+    || null
+  )
+  const resolvedPublicIdentifier =
+    typeof (mirror?.publicIdentifier || mirror?.public_identifier || publicIdentifier || challengeData?.publicIdentifier) === 'string'
+      ? String(mirror?.publicIdentifier || mirror?.public_identifier || publicIdentifier || challengeData?.publicIdentifier).trim()
+      : null
+  await storeRelayMemberAccessToken({
+    relayKey: resolvedRelayKey || relayKey || null,
+    publicIdentifier: resolvedPublicIdentifier || publicIdentifier || normalizedRelayIdentifier,
+    gatewayOrigin: normalizedGatewayOrigin,
+    gatewayId: normalizeGatewayId(gatewayId || challengeData?.gatewayId || null),
+    authMethod: 'relay-scoped-bearer-v1',
+    grantId: normalizedGrantId,
+    accessToken: data?.accessToken || null,
+    scopes: scopes || DEFAULT_RELAY_MEMBER_SCOPES,
+    subjectPubkey: authEvent?.pubkey || config?.nostr_pubkey_hex || null,
+    subjectRole: 'member',
+    devicePeerKey: config?.swarmPublicKey || null,
+    issuedAt: Date.now(),
+    expiresAt: data?.expiresAt || null,
+    refreshAfter: data?.refreshAfter || null
+  }).catch(() => {})
+
+  emitJoinGatewayStage('invite-claim', 'response', {
+    status: 'ok',
+    relayIdentifier: normalizedRelayIdentifier,
+    relayKey: resolvedRelayKey || normalizedRelayKey,
+    gatewayOrigin: normalizedGatewayOrigin,
+    grantId: normalizedGrantId,
+    membershipState: typeof data?.membershipState === 'string' ? data.membershipState : null,
+    hasMirror: !!mirror,
+    hasAccessToken: typeof data?.accessToken === 'string' && !!data.accessToken.trim(),
+    refreshAfter: data?.refreshAfter || null,
+    expiresAt: data?.expiresAt || null,
+    traceContext: trace
+  })
+
+  return {
+    status: 'ok',
+    origin: normalizedGatewayOrigin,
+    data,
+    mirror,
+    relayKey: resolvedRelayKey || null,
+    publicIdentifier: resolvedPublicIdentifier || null
+  }
 }
 
 function makeRelaySubscriptionRefreshKey({ relayKey = null, publicIdentifier = null } = {}) {
@@ -1492,14 +2042,16 @@ function normalizeGatewayRouteInput(data = {}) {
       directJoinOnly: false
     }
   }
+  const gatewayAccess = normalizeRelayMemberGatewayAccess(data.gatewayAccess)
   const gatewayOrigin = normalizeHttpOrigin(
     data.gatewayOrigin
     || data.publicGatewayOrigin
     || data.assignedGatewayOrigin
     || data.gatewayBaseUrl
+    || gatewayAccess?.gatewayOrigin
     || null
   )
-  const gatewayId = normalizeGatewayId(data.gatewayId || data.assignedGatewayId || null)
+  const gatewayId = normalizeGatewayId(data.gatewayId || data.assignedGatewayId || gatewayAccess?.gatewayId || null)
   const directJoinOnly = data.directJoinOnly === true || data.gatewayDirectJoinOnly === true
   return {
     hasExplicitRoute: Boolean(gatewayOrigin || gatewayId || directJoinOnly),
@@ -2862,10 +3414,10 @@ async function fetchOpenJoinChallenge(relayIdentifier, {
   const base = origin.replace(/\/$/, '')
   const encodedRelay = encodeURIComponent(relayIdentifier)
   const query = purpose ? `?purpose=${encodeURIComponent(purpose)}` : ''
-  const url = `${base}/api/relays/${encodedRelay}/open-join/challenge${query}`
+  const url = `${base}/api/relays/${encodedRelay}/access/challenge${query}`
   const { trace, headers: traceHeaders } = buildJoinTraceHeaders(traceContext, {
     relayIdentifier,
-    route: 'open-join/challenge',
+    route: 'access/challenge',
     purpose
   })
   emitJoinGatewayTrace('open-join-challenge-dispatch', trace, {
@@ -2888,11 +3440,13 @@ async function fetchOpenJoinChallenge(relayIdentifier, {
       try {
         body = await response.text()
       } catch (_) {}
+      const { errorCode } = parseGatewayErrorPayload(body)
       emitJoinGatewayTrace('open-join-challenge-response', trace, {
         relayIdentifier,
         gatewayOrigin: base,
         status: 'error',
         statusCode: response.status,
+        errorCode: errorCode || null,
         gatewayTraceId: responseTrace.traceId || null,
         gatewayRequestId: responseTrace.gatewayRequestId || null,
         responseBodyPreview: body ? body.slice(0, 200) : null
@@ -2900,6 +3454,7 @@ async function fetchOpenJoinChallenge(relayIdentifier, {
       return {
         status: 'error',
         reason: `challenge status ${response.status}`,
+        errorCode: errorCode || null,
         origin: base,
         body: body ? body.slice(0, 200) : null,
         traceId: trace.traceId,
@@ -3474,14 +4029,15 @@ async function fetchOpenJoinBootstrap(relayIdentifier, {
     })
     const { headers: challengeTraceHeaders } = buildJoinTraceHeaders(trace, {
       relayIdentifier,
-      route: 'open-join/challenge'
+      route: 'access/challenge',
+      purpose: RELAY_OPEN_JOIN_PURPOSE
     })
     const controller = typeof AbortController === 'function' ? new AbortController() : null
     const timer = controller
       ? setTimeout(() => controller.abort(), OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS)
       : null
     try {
-      const challengeUrl = `${base}/api/relays/${encodedRelay}/open-join/challenge`
+      const challengeUrl = `${base}/api/relays/${encodedRelay}/access/challenge?purpose=${encodeURIComponent(RELAY_OPEN_JOIN_PURPOSE)}`
       const challengeResponse = await fetchImpl(challengeUrl, {
         signal: controller?.signal,
         headers: challengeTraceHeaders
@@ -3601,10 +4157,14 @@ async function fetchOpenJoinBootstrap(relayIdentifier, {
       })
       const tags = [
         ['relay', base],
-        ['challenge', challenge]
+        ['challenge', challenge],
+        ['purpose', RELAY_OPEN_JOIN_PURPOSE]
       ]
       if (publicIdentifier) {
         tags.push(['h', publicIdentifier])
+      }
+      if (typeof config?.swarmPublicKey === 'string' && config.swarmPublicKey.trim()) {
+        tags.push(['peer', config.swarmPublicKey.trim().toLowerCase()])
       }
       const unsigned = {
         kind: 22242,
@@ -3859,6 +4419,31 @@ async function fetchOpenJoinBootstrap(relayIdentifier, {
         issuedAt: data.issuedAt ?? null,
         expiresAt: data.expiresAt ?? null
       })
+      await storeRelayMemberAccessToken({
+        relayKey: normalizeRelayKeyHex(data.relayKey || data.relay_key || null) || relayIdentifier,
+        publicIdentifier:
+          typeof (data.publicIdentifier || data.public_identifier || publicIdentifier || relayIdentifier) === 'string'
+            ? String(data.publicIdentifier || data.public_identifier || publicIdentifier || relayIdentifier).trim()
+            : null,
+        gatewayOrigin: base,
+        gatewayId: normalizeGatewayId(data.gatewayId || data.gateway_id || challengeData?.gatewayId || null),
+        authMethod: 'relay-scoped-bearer-v1',
+        accessToken: data.accessToken || null,
+        scopes: DEFAULT_RELAY_MEMBER_SCOPES,
+        subjectPubkey: authEvent?.pubkey || authPubkey,
+        subjectRole: 'member',
+        sponsorPubkey: null,
+        devicePeerKey: config?.swarmPublicKey || null,
+        issuedAt: data.issuedAt ?? Date.now(),
+        expiresAt: data.expiresAt ?? null,
+        refreshAfter: data.refreshAfter ?? null
+      }).catch((error) => {
+        console.warn('[Worker] Failed to persist open join relay-member access token', {
+          relayIdentifier,
+          origin: base,
+          error: error?.message || error
+        })
+      })
       return {
         status: 'ok',
         origin: base,
@@ -3996,6 +4581,14 @@ async function fetchRelayMirrorMetadata(relayKey, {
       relayIdentifier: relayKey,
       route: 'mirror/request'
     })
+    const relayMemberAccessToken = await resolveRelayMemberAccessTokenForGateway({
+      relayKey: normalizeRelayKeyHex(relayKey) || null,
+      publicIdentifier:
+        normalizeRelayKeyHex(relayKey)
+          ? null
+          : relayKey,
+      gatewayOrigin: base
+    }).catch(() => null)
     emitJoinGatewayStage('mirror', 'request', {
       status: 'attempt',
       relayKey,
@@ -4013,20 +4606,36 @@ async function fetchRelayMirrorMetadata(relayKey, {
         relayKeyType,
         origin,
         reason,
+        hasRelayMemberAccess: !!relayMemberAccessToken,
         traceId: trace.traceId
       })
       const response = await fetchImpl(url, {
         signal: controller?.signal,
-        headers: mirrorTraceHeaders
+        headers: {
+          ...mirrorTraceHeaders,
+          ...(relayMemberAccessToken ? { authorization: `Bearer ${relayMemberAccessToken}` } : {})
+        }
       })
       const responseTrace = readGatewayTraceHeaders(response)
       if (!response.ok) {
+        let raw = ''
+        try {
+          raw = await response.text()
+        } catch (_) {}
+        const { errorCode } = parseGatewayErrorPayload(raw)
+        if (errorCode === 'gateway-member-access-revoked' || errorCode === 'gateway-sponsorship-revoked') {
+          await removeRelayMemberAccess({
+            relayKey: normalizeRelayKeyHex(relayKey) || null,
+            publicIdentifier: normalizeRelayKeyHex(relayKey) ? null : relayKey
+          }).catch(() => {})
+        }
         emitJoinGatewayStage('mirror', 'response', {
           status: 'error',
           relayKey,
           gatewayOrigin: base,
           reason: 'mirror-status-error',
           statusCode: response.status,
+          errorCode: errorCode || null,
           traceContext: trace
         })
         emitJoinGatewayTrace('mirror-response', trace, {
@@ -4035,10 +4644,12 @@ async function fetchRelayMirrorMetadata(relayKey, {
           status: 'error',
           reason: 'mirror-status-error',
           statusCode: response.status,
+          errorCode: errorCode || null,
+          responseBodyPreview: raw ? raw.slice(0, 200) : null,
           gatewayTraceId: responseTrace.traceId || null,
           gatewayRequestId: responseTrace.gatewayRequestId || null
         }, 'warn')
-        lastError = new Error(`status ${response.status}`)
+        lastError = new Error(errorCode || `status ${response.status}`)
         continue
       }
       const data = await response.json().catch(() => null)
@@ -4677,6 +5288,10 @@ async function startGatewayService(options = {}) {
     gatewayService = new GatewayService({
       publicGateway: publicGatewaySettings,
       getCurrentPubkey: () => config?.nostr_pubkey_hex || null,
+      getGatewayAuthContext: () => ({
+        pubkey: config?.nostr_pubkey_hex || null,
+        nsecHex: config?.nostr_nsec_hex || null
+      }),
       getOwnPeerPublicKey: () => config?.swarmPublicKey || deriveSwarmPublicKey(config),
       openJoinPoolProvider: ensureOpenJoinWriterPool
     })
@@ -8064,6 +8679,7 @@ async function handleMessageObject(message) {
           }
           const joinDirectDiscoveryV2 = isJoinDirectDiscoveryV2Enabled()
           const gatewayRouteInput = normalizeGatewayRouteInput(data)
+          const gatewayAccess = normalizeRelayMemberGatewayAccess(data.gatewayAccess)
           let gatewayMode = gatewayRouteInput.directJoinOnly ? 'disabled' : 'auto'
           let assignedGatewayOrigin = gatewayRouteInput.gatewayOrigin || null
           let assignedGatewayId = gatewayRouteInput.gatewayId || null
@@ -8103,6 +8719,12 @@ async function handleMessageObject(message) {
             null
           let autobaseLocal = data.autobaseLocal || data.autobase_local || null
           let fastForward = data.fastForward || data.fast_forward || null
+          if (!assignedGatewayOrigin) {
+            assignedGatewayOrigin = normalizeHttpOrigin(gatewayAccess?.gatewayOrigin || null)
+          }
+          if (!assignedGatewayId) {
+            assignedGatewayId = normalizeGatewayId(gatewayAccess?.gatewayId || null)
+          }
           joinGatewayTraceContext = withJoinTraceContext(joinGatewayTraceContext, {
             relayIdentifier: joinRelayKey || publicIdentifier || null
           })
@@ -8133,6 +8755,76 @@ async function handleMessageObject(message) {
             gatewayMode === 'disabled'
               ? []
               : (assignedGatewayOrigin ? [assignedGatewayOrigin] : [])
+          if (
+            gatewayMode === 'auto'
+            && !openJoin
+            && !!inviteToken
+            && gatewayAccess?.grantId
+            && assignedGatewayOrigin
+          ) {
+            ensureJoinBudget('gateway-invite-claim', 750)
+            const claimResult = await withTimeout(
+              claimRelayMemberGatewayAccess({
+                relayIdentifier: joinRelayKey || publicIdentifier || null,
+                relayKey: joinRelayKey || null,
+                publicIdentifier: publicIdentifier || null,
+                gatewayOrigin: assignedGatewayOrigin,
+                gatewayId: assignedGatewayId || gatewayAccess.gatewayId || null,
+                grantId: gatewayAccess.grantId,
+                scopes: gatewayAccess.scopes,
+                traceContext: withJoinTraceContext(joinGatewayTraceContext, {
+                  relayIdentifier: joinRelayKey || publicIdentifier || null,
+                  route: 'invite-claim'
+                })
+              }),
+              Math.max(1000, Math.min(OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS + 1500, getRemainingJoinBudget())),
+              'Relay invite claim timeout'
+            )
+            if (claimResult?.status !== 'ok') {
+              throw new Error(claimResult?.errorCode || claimResult?.reason || 'gateway-member-claim-failed')
+            }
+            const claimMirror = claimResult.mirror && typeof claimResult.mirror === 'object'
+              ? claimResult.mirror
+              : null
+            const claimRelayKey = normalizeRelayKeyHex(
+              claimResult?.relayKey
+              || claimMirror?.relayKey
+              || claimMirror?.relay_key
+              || null
+            )
+            if (!joinRelayKey && claimRelayKey) {
+              joinRelayKey = claimRelayKey
+            }
+            if (joinRelayKey || publicIdentifier) {
+              joinGatewayTraceContext = withJoinTraceContext(joinGatewayTraceContext, {
+                relayIdentifier: joinRelayKey || publicIdentifier || null
+              })
+            }
+            if (claimMirror) {
+              const claimBlindPeer = sanitizeBlindPeerMeta(claimMirror.blindPeer)
+              const claimCoreRefs = normalizeMirrorCoreRefs(claimMirror.cores)
+              const claimWriterCoreRefs = normalizeMirrorWriterCoreRefs(claimMirror.cores)
+              if (!blindPeer && claimBlindPeer) blindPeer = claimBlindPeer
+              if (claimCoreRefs.length) {
+                coreRefs = mergeCoreRefLists(coreRefs, claimCoreRefs)
+              }
+              if (claimWriterCoreRefs.length) {
+                writerCoreRefs = mergeCoreRefLists(writerCoreRefs, claimWriterCoreRefs)
+              }
+              if (!writerCore && (claimMirror.writerCore || claimMirror.writer_core)) {
+                writerCore = String(claimMirror.writerCore || claimMirror.writer_core)
+              }
+              if (!writerCoreHex && (claimMirror.writerCoreHex || claimMirror.writer_core_hex)) {
+                writerCoreHex = String(claimMirror.writerCoreHex || claimMirror.writer_core_hex)
+              }
+              if (!autobaseLocal && (claimMirror.autobaseLocal || claimMirror.autobase_local)) {
+                autobaseLocal = String(claimMirror.autobaseLocal || claimMirror.autobase_local)
+              }
+              if (!writerSecret && (claimMirror.writerSecret || claimMirror.writer_secret)) {
+                writerSecret = String(claimMirror.writerSecret || claimMirror.writer_secret)
+              }
+            }
+          }
           if (writerCoreHex && !autobaseLocal) autobaseLocal = writerCoreHex
           if (autobaseLocal && !writerCoreHex) writerCoreHex = autobaseLocal
           const writerCoreKey = writerCoreHex || autobaseLocal || writerCore || null
@@ -8372,6 +9064,10 @@ async function handleMessageObject(message) {
             gatewayMode,
             gatewayOrigin: assignedGatewayOrigin,
             gatewayId: assignedGatewayId,
+            hasGatewayAccess: !!gatewayAccess,
+            gatewayAccessGrantId: previewValue(gatewayAccess?.grantId, 24),
+            gatewayAccessOrigin: gatewayAccess?.gatewayOrigin || null,
+            gatewayAccessId: gatewayAccess?.gatewayId || null,
             joinDirectDiscoveryV2,
             hasInviteToken: !!inviteToken,
             relayKey: previewValue(joinRelayKey, 16),
@@ -8397,6 +9093,10 @@ async function handleMessageObject(message) {
             openJoin,
             gatewayMode,
             gatewayOrigin: assignedGatewayOrigin,
+            hasGatewayAccess: !!gatewayAccess,
+            gatewayAccessGrantId: previewValue(gatewayAccess?.grantId, 24),
+            gatewayAccessOrigin: gatewayAccess?.gatewayOrigin || null,
+            gatewayAccessId: gatewayAccess?.gatewayId || null,
             relayKey: previewValue(joinRelayKey, 16),
             hostPeersCount: hostPeers.length,
             hasBlindPeer: !!blindPeer?.publicKey,
@@ -9521,6 +10221,76 @@ async function handleMessageObject(message) {
             error: 'Relay server not initialized'
           }
         })
+      }
+      break
+
+    case 'authorize-relay-member-access':
+      {
+        const requestId = extractMessageRequestId(message)
+        const payload = (message && typeof message === 'object' ? message.data : null) || {}
+        try {
+          if (!gatewayService) {
+            throw new Error('public-gateway-unavailable')
+          }
+          const relayKey = normalizeRelayKeyHex(payload.relayKey) || payload.relayKey || null
+          const publicIdentifier =
+            typeof payload.publicIdentifier === 'string' && payload.publicIdentifier.trim()
+              ? payload.publicIdentifier.trim()
+              : null
+          const subjectPubkey = isHex64(payload.subjectPubkey)
+            ? String(payload.subjectPubkey).trim().toLowerCase()
+            : null
+          const gatewayOrigin = normalizeHttpOrigin(payload.gatewayOrigin || null)
+          const gatewayId = normalizeGatewayId(payload.gatewayId || null)
+          if (!relayKey) {
+            throw new Error('relayKey is required')
+          }
+          if (!subjectPubkey) {
+            throw new Error('subjectPubkey is required')
+          }
+          if (gatewayOrigin || gatewayId || payload.directJoinOnly === true) {
+            await upsertRelayGatewayRoute({
+              relayKey,
+              publicIdentifier,
+              gatewayOrigin,
+              gatewayId,
+              directJoinOnly: payload.directJoinOnly === true,
+              source: 'authorize-relay-member-access',
+              observedAt: Date.now()
+            }).catch(() => {})
+          }
+          const result = await gatewayService.authorizeRelayMemberAccess(
+            relayKey,
+            {
+              subjectPubkey,
+              scopes: normalizeRelayMemberScopes(payload.scopes),
+              inviteExpiresAt: Number.isFinite(Number(payload.inviteExpiresAt))
+                ? Number(payload.inviteExpiresAt)
+                : null
+            },
+            {
+              gatewayOrigin,
+              gatewayId
+            }
+          )
+          const responseData = {
+            grantId: typeof result?.grantId === 'string' ? result.grantId : null,
+            gatewayOrigin: normalizeHttpOrigin(result?.gatewayOrigin || gatewayOrigin || null),
+            gatewayId: normalizeGatewayId(result?.gatewayId || gatewayId || null),
+            authMethod: 'relay-scoped-bearer-v1',
+            scopes: normalizeRelayMemberScopes(result?.scopes || payload.scopes),
+            state: typeof result?.state === 'string' ? result.state : 'invited'
+          }
+          if (!responseData.grantId) {
+            throw new Error('gateway-member-grant-missing')
+          }
+          sendWorkerResponse(requestId, { success: true, data: responseData })
+        } catch (error) {
+          sendWorkerResponse(requestId, {
+            success: false,
+            error: error?.message || String(error)
+          })
+        }
       }
       break
 

@@ -235,13 +235,6 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
       return;
     }
 
-    if (!announcement.openAccess) {
-      this.logger?.debug?.('[PublicGatewayDiscovery] Gateway is restricted, skipping', {
-        gatewayId: announcement.gatewayId
-      });
-      return;
-    }
-
     if (!verifyAnnouncementSignature(announcement)) {
       this.logger?.warn?.('[PublicGatewayDiscovery] Invalid announcement signature', {
         gatewayId: announcement.gatewayId,
@@ -274,7 +267,17 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
       lastSeenAt: now,
       timestamp: Number(announcement.timestamp) || now,
       expiresAt: Number(announcement.timestamp) + ttlMs,
-      openAccess: true,
+      openAccess: announcement.openAccess === true,
+      authMethod: announcement.authMethod || '',
+      hostPolicy: announcement.hostPolicy || '',
+      memberDelegationMode: announcement.memberDelegationMode || '',
+      operatorPubkey: announcement.operatorPubkey || '',
+      wotRootPubkey: announcement.wotRootPubkey || '',
+      wotMaxDepth: this.#positiveNumber(announcement.wotMaxDepth) || null,
+      wotMinFollowersDepth2: Number.isFinite(Number(announcement.wotMinFollowersDepth2))
+        ? Math.max(0, Math.trunc(Number(announcement.wotMinFollowersDepth2)))
+        : 0,
+      capabilities: Array.isArray(announcement.capabilities) ? announcement.capabilities : [],
       relayHyperbeeKey: announcement.relayKey || '',
       relayDiscoveryKey: announcement.relayDiscoveryKey || '',
       relayReplicationTopic: announcement.relayReplicationTopic || '',
@@ -327,7 +330,6 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
     const now = this.clock();
     const parsed = parseGatewayAnnouncementEvent(event, { now });
     if (!parsed) return;
-    if (!parsed.openAccess) return;
 
     const sourceData = {
       source: 'nostr',
@@ -345,6 +347,16 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
       timestamp: parsed.timestamp || now,
       expiresAt: parsed.expiresAt || (now + Math.max(5_000, (parsed.ttl || 60) * 1000)),
       openAccess: parsed.openAccess !== false,
+      authMethod: parsed.authMethod || '',
+      hostPolicy: parsed.hostPolicy || '',
+      memberDelegationMode: parsed.memberDelegationMode || '',
+      operatorPubkey: parsed.operatorPubkey || '',
+      wotRootPubkey: parsed.wotRootPubkey || '',
+      wotMaxDepth: this.#positiveNumber(parsed.wotMaxDepth) || null,
+      wotMinFollowersDepth2: Number.isFinite(Number(parsed.wotMinFollowersDepth2))
+        ? Math.max(0, Math.trunc(Number(parsed.wotMinFollowersDepth2)))
+        : 0,
+      capabilities: Array.isArray(parsed.capabilities) ? parsed.capabilities : [],
       relayHyperbeeKey: parsed.relayHyperbeeKey || '',
       relayDiscoveryKey: parsed.relayDiscoveryKey || '',
       relayReplicationTopic: parsed.relayReplicationTopic || '',
@@ -408,6 +420,14 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
     entry.lastSeenAt = active.lastSeenAt || now;
     entry.expiresAt = active.expiresAt || null;
     entry.openAccess = active.openAccess !== false;
+    entry.authMethod = active.authMethod || '';
+    entry.hostPolicy = active.hostPolicy || '';
+    entry.memberDelegationMode = active.memberDelegationMode || '';
+    entry.operatorPubkey = active.operatorPubkey || '';
+    entry.wotRootPubkey = active.wotRootPubkey || '';
+    entry.wotMaxDepth = active.wotMaxDepth || null;
+    entry.wotMinFollowersDepth2 = active.wotMinFollowersDepth2 ?? 0;
+    entry.capabilities = Array.isArray(active.capabilities) ? [...active.capabilities] : [];
     entry.relayHyperbeeKey = active.relayHyperbeeKey || '';
     entry.relayDiscoveryKey = active.relayDiscoveryKey || '';
     entry.relayReplicationTopic = active.relayReplicationTopic || '';
@@ -592,7 +612,15 @@ class PublicGatewayDiscoveryClient extends EventEmitter {
       expiresAt: entry.expiresAt || null,
       ttl: entry.ttl || 60,
       signatureKey: entry.signatureKey || null,
-      openAccess: true,
+      openAccess: entry.openAccess === true,
+      authMethod: entry.authMethod || null,
+      hostPolicy: entry.hostPolicy || null,
+      memberDelegationMode: entry.memberDelegationMode || null,
+      operatorPubkey: entry.operatorPubkey || null,
+      wotRootPubkey: entry.wotRootPubkey || null,
+      wotMaxDepth: entry.wotMaxDepth || null,
+      wotMinFollowersDepth2: entry.wotMinFollowersDepth2 ?? 0,
+      capabilities: Array.isArray(entry.capabilities) ? [...entry.capabilities] : [],
       relayHyperbeeKey: entry.relayHyperbeeKey || null,
       relayDiscoveryKey: entry.relayDiscoveryKey || null,
       relayReplicationTopic: entry.relayReplicationTopic || null,

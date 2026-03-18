@@ -17,6 +17,8 @@ import {
   requestPfpFromPeer
 } from './HyperswarmClient.mjs';
 import PublicGatewayRegistrar from './PublicGatewayRegistrar.mjs';
+import PublicGatewayAuthClient from './PublicGatewayAuthClient.mjs';
+import PublicGatewayControlClient from './PublicGatewayControlClient.mjs';
 import PublicGatewayDiscoveryClient from './PublicGatewayDiscoveryClient.mjs';
 import PublicGatewayRelayClient from './PublicGatewayRelayClient.mjs';
 import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGatewayHyperbeeAdapter.mjs';
@@ -238,6 +240,11 @@ export class GatewayService extends EventEmitter {
     this.loggerBridge = null;
     this.publicGatewaySettings = this.#normalizePublicGatewayConfig(options.publicGateway);
     this.publicGatewayRegistrar = null;
+    this.publicGatewayAuthClients = new Map();
+    this.publicGatewayControlClients = new Map();
+    this.publicGatewayLegacyRegistrars = new Map();
+    this.gatewayAccessCatalog = new Map();
+    this.gatewayAccessProbeInflight = new Map();
     this.openJoinPoolProvider = typeof options.openJoinPoolProvider === 'function'
       ? options.openJoinPoolProvider
       : null;
@@ -285,6 +292,12 @@ export class GatewayService extends EventEmitter {
     this.getCurrentPubkey = typeof options.getCurrentPubkey === 'function'
       ? options.getCurrentPubkey
       : () => options.currentPubkey || null;
+    this.getGatewayAuthContext = typeof options.getGatewayAuthContext === 'function'
+      ? options.getGatewayAuthContext
+      : () => ({
+        pubkey: this.getCurrentPubkey?.() || null,
+        nsecHex: options.currentNsecHex || null
+      });
 
     this.#configurePublicGateway();
   }
@@ -321,9 +334,13 @@ export class GatewayService extends EventEmitter {
     const selectionMode = ['default', 'discovered', 'manual'].includes(selectionRaw)
       ? selectionRaw
       : '';
+    const authMethod = typeof rawConfig?.authMethod === 'string' && rawConfig.authMethod.trim()
+      ? rawConfig.authMethod.trim()
+      : (rawConfig?.sharedSecret ? 'shared-secret-v1' : 'relay-scoped-bearer-v1');
 
     const config = {
       enabled: rawConfig?.enabled ?? envEnabled,
+      authMethod,
       selectionMode,
       selectedGatewayId: typeof rawConfig?.selectedGatewayId === 'string'
         ? rawConfig.selectedGatewayId.trim() || null
@@ -337,6 +354,9 @@ export class GatewayService extends EventEmitter {
       tokenRefreshWindowSeconds,
       openJoinPoolSyncIntervalMs,
       resolvedGatewayId: rawConfig?.resolvedGatewayId || null,
+      resolvedAuthMethod: typeof rawConfig?.resolvedAuthMethod === 'string' && rawConfig.resolvedAuthMethod.trim()
+        ? rawConfig.resolvedAuthMethod.trim()
+        : null,
       resolvedSecretVersion: rawConfig?.resolvedSecretVersion || null,
       resolvedSharedSecretHash: rawConfig?.resolvedSharedSecretHash || null,
       resolvedDisplayName: rawConfig?.resolvedDisplayName || null,
@@ -457,15 +477,341 @@ export class GatewayService extends EventEmitter {
     return trimmed.length ? trimmed : null;
   }
 
+  #normalizeGatewayOrigin(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+      return parsed.origin;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  #normalizeGatewayId(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim().toLowerCase();
+    return trimmed || null;
+  }
+
+  #gatewayAccessCatalogKey({ gatewayId = null, gatewayOrigin = null } = {}) {
+    return this.#normalizeGatewayId(gatewayId)
+      || this.#normalizeGatewayOrigin(gatewayOrigin)
+      || null;
+  }
+
+  #inferGatewayAuthMethod(entry = null) {
+    const advertised = typeof entry?.authMethod === 'string' ? entry.authMethod.trim() : '';
+    if (advertised) return advertised;
+    if (entry?.openAccess === true) return 'shared-secret-v1';
+    return 'relay-scoped-bearer-v1';
+  }
+
+  #findDiscoveredGatewayByOrigin(origin) {
+    const normalizedOrigin = this.#normalizeGatewayOrigin(origin);
+    if (!normalizedOrigin) return null;
+    return (this.discoveredGateways || []).find((candidate) => {
+      const candidateOrigin = this.#normalizeGatewayOrigin(candidate?.publicUrl || candidate?.gatewayOrigin || null);
+      return candidateOrigin === normalizedOrigin;
+    }) || null;
+  }
+
+  #findDiscoveredGateway({ gatewayId = null, gatewayOrigin = null } = {}) {
+    const normalizedId = this.#normalizeGatewayId(gatewayId);
+    if (normalizedId && this.discoveryClient?.getGatewayById) {
+      return this.discoveryClient.getGatewayById(normalizedId) || null;
+    }
+    if (normalizedId) {
+      return (this.discoveredGateways || []).find((candidate) =>
+        this.#normalizeGatewayId(candidate?.gatewayId) === normalizedId
+      ) || null;
+    }
+    return this.#findDiscoveredGatewayByOrigin(gatewayOrigin);
+  }
+
+  #summarizeGatewayPolicy(entry = null) {
+    if (!entry || typeof entry !== 'object') return null;
+    return {
+      hostPolicy: typeof entry.hostPolicy === 'string' ? entry.hostPolicy : null,
+      authMethod: this.#inferGatewayAuthMethod(entry),
+      openAccess: entry.openAccess === true,
+      operatorPubkey: typeof entry.operatorPubkey === 'string' ? entry.operatorPubkey : null,
+      wotRootPubkey: typeof entry.wotRootPubkey === 'string' ? entry.wotRootPubkey : null,
+      wotMaxDepth: Number.isFinite(Number(entry.wotMaxDepth)) ? Number(entry.wotMaxDepth) : null,
+      wotMinFollowersDepth2: Number.isFinite(Number(entry.wotMinFollowersDepth2))
+        ? Number(entry.wotMinFollowersDepth2)
+        : null,
+      capabilities: Array.isArray(entry.capabilities)
+        ? entry.capabilities.filter((value) => typeof value === 'string' && value.trim())
+        : []
+    };
+  }
+
+  async #resolveGatewayRoute({
+    relayKey = null,
+    metadata = null,
+    gatewayOrigin = null,
+    gatewayId = null,
+    allowSettingsFallback = true
+  } = {}) {
+    const normalizedOrigin = this.#normalizeGatewayOrigin(
+      gatewayOrigin
+      || metadata?.gatewayOrigin
+      || null
+    );
+    let normalizedGatewayId = this.#normalizeGatewayId(gatewayId || metadata?.gatewayId || null);
+
+    let entry = this.#findDiscoveredGateway({
+      gatewayId: normalizedGatewayId,
+      gatewayOrigin: normalizedOrigin
+    });
+
+    if (!entry && allowSettingsFallback) {
+      const settingsOrigin = this.#normalizeGatewayOrigin(this.publicGatewaySettings?.baseUrl || null);
+      if (settingsOrigin && (!normalizedOrigin || settingsOrigin === normalizedOrigin)) {
+        entry = this.#findDiscoveredGatewayByOrigin(settingsOrigin);
+      }
+    }
+
+    if (!normalizedGatewayId && entry?.gatewayId) {
+      normalizedGatewayId = this.#normalizeGatewayId(entry.gatewayId);
+    }
+
+    const routeOrigin = this.#normalizeGatewayOrigin(
+      normalizedOrigin
+      || entry?.publicUrl
+      || (allowSettingsFallback ? this.publicGatewaySettings?.baseUrl : null)
+    );
+    if (!routeOrigin) {
+      return null;
+    }
+
+    const authMethod = this.#inferGatewayAuthMethod(entry);
+    let sharedSecret = typeof entry?.sharedSecret === 'string' && entry.sharedSecret.trim()
+      ? entry.sharedSecret.trim()
+      : null;
+    if (!sharedSecret
+      && authMethod !== 'relay-scoped-bearer-v1'
+      && normalizedGatewayId
+      && this.discoveryClient?.ensureSecret) {
+      try {
+        await this.discoveryClient.ensureSecret(normalizedGatewayId);
+        entry = this.#findDiscoveredGateway({ gatewayId: normalizedGatewayId, gatewayOrigin: routeOrigin });
+        sharedSecret = typeof entry?.sharedSecret === 'string' && entry.sharedSecret.trim()
+          ? entry.sharedSecret.trim()
+          : null;
+      } catch (error) {
+        this.log('debug', `[PublicGateway] Secret fetch skipped for ${normalizedGatewayId}: ${error.message}`);
+      }
+    }
+
+    return {
+      relayKey: relayKey || null,
+      gatewayId: normalizedGatewayId || null,
+      gatewayOrigin: routeOrigin,
+      publicUrl: routeOrigin,
+      wsUrl: typeof entry?.wsUrl === 'string' ? entry.wsUrl : this.#computePublicGatewayWsBase(routeOrigin),
+      authMethod,
+      sharedSecret,
+      openAccess: entry?.openAccess === true,
+      memberDelegationMode: typeof entry?.memberDelegationMode === 'string'
+        ? entry.memberDelegationMode
+        : null,
+      policy: this.#summarizeGatewayPolicy(entry),
+      discoveryEntry: entry || null
+    };
+  }
+
+  #getGatewayAuthClient(baseUrl) {
+    const normalizedBaseUrl = this.#normalizeGatewayOrigin(baseUrl);
+    if (!normalizedBaseUrl) return null;
+    let client = this.publicGatewayAuthClients.get(normalizedBaseUrl) || null;
+    if (!client) {
+      client = new PublicGatewayAuthClient({
+        baseUrl: normalizedBaseUrl,
+        logger: this.loggerBridge || console,
+        getAuthContext: () => this.getGatewayAuthContext?.() || null
+      });
+      this.publicGatewayAuthClients.set(normalizedBaseUrl, client);
+    } else if (typeof client.setBaseUrl === 'function') {
+      client.setBaseUrl(normalizedBaseUrl);
+    }
+    return client;
+  }
+
+  #getGatewayControlClient(baseUrl) {
+    const normalizedBaseUrl = this.#normalizeGatewayOrigin(baseUrl);
+    if (!normalizedBaseUrl) return null;
+    let client = this.publicGatewayControlClients.get(normalizedBaseUrl) || null;
+    if (!client) {
+      client = new PublicGatewayControlClient({
+        baseUrl: normalizedBaseUrl,
+        authClient: this.#getGatewayAuthClient(normalizedBaseUrl),
+        logger: this.loggerBridge || console
+      });
+      this.publicGatewayControlClients.set(normalizedBaseUrl, client);
+    } else {
+      client.setBaseUrl(normalizedBaseUrl);
+      client.authClient = this.#getGatewayAuthClient(normalizedBaseUrl);
+    }
+    return client;
+  }
+
+  #getLegacyGatewayRegistrar(baseUrl, sharedSecret) {
+    const normalizedBaseUrl = this.#normalizeGatewayOrigin(baseUrl);
+    const normalizedSecret = typeof sharedSecret === 'string' ? sharedSecret.trim() : '';
+    if (!normalizedBaseUrl || !normalizedSecret) return null;
+    const cacheKey = `${normalizedBaseUrl}::${normalizedSecret}`;
+    let registrar = this.publicGatewayLegacyRegistrars.get(cacheKey) || null;
+    if (!registrar) {
+      registrar = new PublicGatewayRegistrar({
+        baseUrl: normalizedBaseUrl,
+        sharedSecret: normalizedSecret,
+        logger: this.loggerBridge || console
+      });
+      this.publicGatewayLegacyRegistrars.set(cacheKey, registrar);
+    }
+    return registrar;
+  }
+
+  async #getGatewayBridgeClient(route = null) {
+    if (!route?.gatewayOrigin) return null;
+    if (route.authMethod === 'relay-scoped-bearer-v1') {
+      const controlClient = this.#getGatewayControlClient(route.gatewayOrigin);
+      if (!controlClient?.isEnabled?.()) return null;
+      return {
+        mode: route.authMethod,
+        gatewayOrigin: route.gatewayOrigin,
+        gatewayId: route.gatewayId || null,
+        authMethod: route.authMethod,
+        isEnabled: () => controlClient.isEnabled?.() !== false,
+        registerRelay: (...args) => controlClient.registerRelay(...args),
+        unregisterRelay: (...args) => controlClient.unregisterRelay(...args),
+        updateOpenJoinPool: (...args) => controlClient.updateOpenJoinPool(...args),
+        issueGatewayToken: (...args) => controlClient.issueGatewayToken(...args),
+        refreshGatewayToken: (...args) => controlClient.refreshGatewayToken(...args),
+        revokeGatewayToken: (...args) => controlClient.revokeGatewayToken(...args),
+        controlClient
+      };
+    }
+
+    const registrar = this.#getLegacyGatewayRegistrar(route.gatewayOrigin, route.sharedSecret);
+    if (!registrar?.isEnabled?.()) return null;
+      return {
+        mode: 'legacy-shared-secret',
+        gatewayOrigin: route.gatewayOrigin,
+        gatewayId: route.gatewayId || null,
+        authMethod: route.authMethod,
+        isEnabled: () => registrar.isEnabled?.() === true,
+        registerRelay: (...args) => registrar.registerRelay(...args),
+        unregisterRelay: (...args) => registrar.unregisterRelay(...args),
+        updateOpenJoinPool: (...args) => registrar.updateOpenJoinPool(...args),
+        issueGatewayToken: (...args) => registrar.issueGatewayToken(...args),
+        refreshGatewayToken: (...args) => registrar.refreshGatewayToken(...args),
+        revokeGatewayToken: (...args) => registrar.revokeGatewayToken(...args),
+        registrar
+      };
+  }
+
+  async #probeGatewayHostingAccess(route = null, { force = false } = {}) {
+    const catalogKey = this.#gatewayAccessCatalogKey(route);
+    if (!catalogKey || !route?.gatewayOrigin) return null;
+
+    const existing = this.gatewayAccessCatalog.get(catalogKey) || null;
+    if (!force && existing?.hostingState === 'approved') {
+      return existing;
+    }
+    if (!force && existing?.lastCheckedAt && (Date.now() - existing.lastCheckedAt) < 60_000) {
+      return existing;
+    }
+    if (this.gatewayAccessProbeInflight.has(catalogKey)) {
+      return this.gatewayAccessProbeInflight.get(catalogKey);
+    }
+
+    const task = (async () => {
+      const base = {
+        gatewayId: route.gatewayId || null,
+        gatewayOrigin: route.gatewayOrigin,
+        policy: route.policy || null,
+        memberDelegationMode: route.memberDelegationMode || null,
+        authMethod: route.authMethod || null,
+        lastCheckedAt: Date.now(),
+        reason: null,
+        hostingState: 'unknown'
+      };
+
+      try {
+        if (route.openAccess === true || route.policy?.hostPolicy === 'open') {
+          const approved = { ...base, hostingState: 'approved', reason: 'open-access' };
+          this.gatewayAccessCatalog.set(catalogKey, approved);
+          return approved;
+        }
+        if (route.authMethod !== 'relay-scoped-bearer-v1') {
+          const unknown = { ...base, hostingState: route.sharedSecret ? 'approved' : 'unknown', reason: route.sharedSecret ? 'shared-secret-available' : 'shared-secret-required' };
+          this.gatewayAccessCatalog.set(catalogKey, unknown);
+          return unknown;
+        }
+        const authClient = this.#getGatewayAuthClient(route.gatewayOrigin);
+        await authClient.issueBearerToken({
+          scope: 'gateway:relay-register',
+          relayKey: null,
+          forceRefresh: force
+        });
+        const approved = { ...base, hostingState: 'approved', reason: 'gateway-host-approved' };
+        this.gatewayAccessCatalog.set(catalogKey, approved);
+        return approved;
+      } catch (error) {
+        const reason = error?.message || 'gateway-host-unauthorized';
+        const denied = {
+          ...base,
+          hostingState: reason === 'gateway-host-unauthorized' ? 'denied' : 'error',
+          reason
+        };
+        this.gatewayAccessCatalog.set(catalogKey, denied);
+        return denied;
+      } finally {
+        this.gatewayAccessProbeInflight.delete(catalogKey);
+      }
+    })();
+
+    this.gatewayAccessProbeInflight.set(catalogKey, task);
+    return task;
+  }
+
+  async #refreshGatewayAccessCatalog({ force = false } = {}) {
+    const routes = [];
+    const seen = new Set();
+    for (const entry of this.discoveredGateways || []) {
+      const route = await this.#resolveGatewayRoute({
+        gatewayId: entry?.gatewayId || null,
+        gatewayOrigin: entry?.publicUrl || entry?.gatewayOrigin || null,
+        allowSettingsFallback: false
+      });
+      if (!route) continue;
+      const cacheKey = this.#gatewayAccessCatalogKey(route);
+      if (!cacheKey || seen.has(cacheKey)) continue;
+      seen.add(cacheKey);
+      routes.push(route);
+    }
+
+    await Promise.all(routes.map((route) => this.#probeGatewayHostingAccess(route, { force })));
+  }
+
   #configurePublicGateway() {
     const config = this.publicGatewaySettings || { enabled: false };
     const hasBaseUrl = !!(config.baseUrl && String(config.baseUrl).trim());
     const hasSharedSecret = !!(config.sharedSecret && String(config.sharedSecret).trim());
+    const authMethod = typeof config.resolvedAuthMethod === 'string' && config.resolvedAuthMethod.trim()
+      ? config.resolvedAuthMethod.trim()
+      : (typeof config.authMethod === 'string' && config.authMethod.trim() ? config.authMethod.trim() : 'relay-scoped-bearer-v1');
 
     console.info('[PublicGateway] Registrar config', {
       enabled: !!config.enabled,
       hasBaseUrl,
       hasSharedSecret,
+      authMethod,
       baseUrl: hasBaseUrl ? config.baseUrl : null
     });
 
@@ -481,12 +827,14 @@ export class GatewayService extends EventEmitter {
       this.hyperbeeAdapter.logger = this.loggerBridge;
     }
 
-    if (config.enabled && config.baseUrl && config.sharedSecret) {
-      this.publicGatewayRegistrar = new PublicGatewayRegistrar({
-        baseUrl: config.baseUrl,
-        sharedSecret: config.sharedSecret,
-        logger: this.loggerBridge
-      });
+    if (config.enabled && config.baseUrl) {
+      if (authMethod === 'relay-scoped-bearer-v1') {
+        this.publicGatewayRegistrar = this.#getGatewayControlClient(config.baseUrl);
+      } else if (config.sharedSecret) {
+        this.publicGatewayRegistrar = this.#getLegacyGatewayRegistrar(config.baseUrl, config.sharedSecret);
+      } else {
+        this.publicGatewayRegistrar = null;
+      }
       this.publicGatewayWsBase = this.#computePublicGatewayWsBase(config.baseUrl);
     } else {
       this.publicGatewayRegistrar = null;
@@ -509,6 +857,9 @@ export class GatewayService extends EventEmitter {
       this.discoveryClient = new PublicGatewayDiscoveryClient({ logger: this.loggerBridge });
       this.discoveryClient.on('updated', (catalog) => {
         this.discoveredGateways = catalog;
+        this.#refreshGatewayAccessCatalog().catch((error) => {
+          this.log('debug', `[PublicGateway] Gateway access catalog refresh skipped: ${error.message}`);
+        });
         if (this.publicGatewaySettings?.enabled) {
           this.#scheduleDiscoveryConfigRefresh();
         }
@@ -528,6 +879,7 @@ export class GatewayService extends EventEmitter {
       await this.discoveryClientReady;
       this.discoveryDisabledReason = null;
       this.discoveredGateways = this.discoveryClient.getGateways({ includeExpired: true });
+      await this.#refreshGatewayAccessCatalog();
     } catch (error) {
       throw error;
     }
@@ -721,7 +1073,10 @@ export class GatewayService extends EventEmitter {
   async #refreshRelayToken(relayKey, { force = false } = {}) {
     if (!relayKey) return;
     const state = this.publicGatewayRelayState.get(relayKey);
-    const isBridgeEnabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
+    const metadata = this.activeRelays.get(relayKey)?.metadata || state?.metadata || null;
+    const route = await this.#resolveGatewayRoute({ relayKey, metadata });
+    const bridgeClient = await this.#getGatewayBridgeClient(route);
+    const isBridgeEnabled = this.publicGatewaySettings?.enabled && bridgeClient?.isEnabled?.();
     if (!isBridgeEnabled || !state || state.status !== 'registered') {
       this.#clearRelayToken(relayKey);
       this.#emitPublicGatewayStatus();
@@ -778,15 +1133,17 @@ export class GatewayService extends EventEmitter {
 
     try {
       if (existing?.token && !tokenMismatch) {
-        const refreshed = await this.publicGatewayRegistrar.refreshGatewayToken(relayKey, {
+        const refreshed = await bridgeClient.refreshGatewayToken(relayKey, {
           token: existing.token,
-          ttlSeconds
+          ttlSeconds,
+          relayAuthToken: authToken,
+          pubkey: requestingPubkey,
+          scope: 'relay-access'
         });
         const expiresAt = Number(refreshed?.expiresAt) || (now + ttlSeconds * 1000);
         const refreshAfterResult = Number(refreshed?.refreshAfter) || null;
         const sequence = refreshed?.sequence || existing?.sequence || null;
 
-        const metadata = this.activeRelays.get(relayKey)?.metadata || {};
         let gatewayPath = metadata.gatewayPath || null;
         if (!gatewayPath) {
           gatewayPath = this._normalizeGatewayPath(relayKey, metadata.gatewayPath, metadata.connectionUrl);
@@ -794,14 +1151,17 @@ export class GatewayService extends EventEmitter {
         if (!gatewayPath) {
           gatewayPath = relayKey.includes(':') ? relayKey.replace(':', '/') : relayKey;
         }
-        const connectionUrl = `${this.publicGatewayWsBase}/${gatewayPath}?token=${encodeURIComponent(refreshed.token)}`;
+        const wsBase = route?.wsUrl || this.#computePublicGatewayWsBase(route?.gatewayOrigin || this.publicGatewaySettings?.baseUrl);
+        const connectionUrl = wsBase
+          ? `${wsBase}/${gatewayPath}?token=${encodeURIComponent(refreshed.token)}`
+          : null;
 
         this.#recordRelayToken(relayKey, {
           token: refreshed.token,
           expiresAt,
           ttlSeconds,
           connectionUrl,
-          baseUrl: this.publicGatewaySettings.baseUrl,
+          baseUrl: route?.gatewayOrigin || this.publicGatewaySettings.baseUrl,
           issuedForPubkey: requestingPubkey,
           issuedAt: now,
           relayAuthToken: authToken,
@@ -824,7 +1184,9 @@ export class GatewayService extends EventEmitter {
     const previousResolved = {
       baseUrl: config.baseUrl,
       sharedSecret: config.sharedSecret,
+      authMethod: config.authMethod,
       resolvedGatewayId: config.resolvedGatewayId,
+      resolvedAuthMethod: config.resolvedAuthMethod,
       resolvedSecretVersion: config.resolvedSecretVersion,
       resolvedSharedSecretHash: config.resolvedSharedSecretHash,
       resolvedDisplayName: config.resolvedDisplayName,
@@ -863,7 +1225,9 @@ export class GatewayService extends EventEmitter {
       if (previousResolved.sharedSecret != null) {
         config.sharedSecret = previousResolved.sharedSecret;
       }
+      config.authMethod = previousResolved.authMethod || config.authMethod || 'relay-scoped-bearer-v1';
       config.resolvedGatewayId = previousResolved.resolvedGatewayId || null;
+      config.resolvedAuthMethod = previousResolved.resolvedAuthMethod || null;
       config.resolvedSecretVersion = previousResolved.resolvedSecretVersion || null;
       config.resolvedSharedSecretHash = previousResolved.resolvedSharedSecretHash || null;
       config.resolvedDisplayName = previousResolved.resolvedDisplayName || null;
@@ -885,11 +1249,14 @@ export class GatewayService extends EventEmitter {
     }
 
     if (config.selectionMode === 'manual') {
-      if (!config.baseUrl || !config.sharedSecret) {
+      if (!config.baseUrl) {
         config.enabled = false;
-        config.disabledReason = 'Manual configuration requires base URL and shared secret';
+        config.disabledReason = 'Manual configuration requires a gateway URL';
         config.baseUrl = '';
         config.sharedSecret = '';
+      } else {
+        config.authMethod = config.sharedSecret ? 'shared-secret-v1' : 'relay-scoped-bearer-v1';
+        config.resolvedAuthMethod = config.authMethod;
       }
       return config;
     }
@@ -922,6 +1289,15 @@ export class GatewayService extends EventEmitter {
       }
     };
 
+    const resolveEntryForSelection = async (entry) => {
+      if (!entry || entry.isExpired) return null;
+      const authMethod = this.#inferGatewayAuthMethod(entry);
+      if (authMethod === 'relay-scoped-bearer-v1') {
+        return entry;
+      }
+      return ensureEntrySecret(entry);
+    };
+
     let resolvedEntry = null;
 
     if (config.selectionMode === 'discovered') {
@@ -938,11 +1314,11 @@ export class GatewayService extends EventEmitter {
         return config;
       }
 
-      resolvedEntry = await ensureEntrySecret(entry);
-      if (!resolvedEntry || !resolvedEntry.sharedSecret) {
+      resolvedEntry = await resolveEntryForSelection(entry);
+      if (!resolvedEntry) {
         config.disabledReason = entry.isExpired
           ? 'Selected public gateway advertisement expired'
-          : 'Unable to retrieve shared secret for selected gateway';
+          : 'Unable to resolve selected gateway';
         config.sharedSecret = '';
         return config;
       }
@@ -953,30 +1329,32 @@ export class GatewayService extends EventEmitter {
         entry = null;
       }
 
-      resolvedEntry = await ensureEntrySecret(entry);
+      resolvedEntry = await resolveEntryForSelection(entry);
 
-      if (!resolvedEntry || !resolvedEntry.sharedSecret) {
+      if (!resolvedEntry) {
         const candidates = (this.discoveryClient.getGateways() || [])
-          .filter((candidate) => candidate.sharedSecret && !candidate.isExpired);
+          .filter((candidate) => !candidate.isExpired);
         if (candidates.length) {
-          resolvedEntry = await ensureEntrySecret(candidates[0]);
-          if (resolvedEntry && resolvedEntry.sharedSecret) {
+          resolvedEntry = await resolveEntryForSelection(candidates[0]);
+          if (resolvedEntry) {
             config.resolvedFallback = true;
           }
         }
       }
 
-      if (!resolvedEntry || !resolvedEntry.sharedSecret) {
-        this.discoveryWarning = 'No open public gateways available; using cached discovery state';
-        this.log('debug', '[PublicGateway] Discovery catalog empty; reusing cached gateway credentials');
+      if (!resolvedEntry) {
+        this.discoveryWarning = 'No public gateways available; using cached discovery state';
+        this.log('debug', '[PublicGateway] Discovery catalog empty; reusing cached gateway route');
         restorePreviousResolved();
         return config;
       }
     }
 
     config.baseUrl = resolvedEntry.publicUrl || config.baseUrl || config.preferredBaseUrl;
+    config.authMethod = this.#inferGatewayAuthMethod(resolvedEntry);
     config.sharedSecret = resolvedEntry.sharedSecret || '';
     config.resolvedGatewayId = resolvedEntry.gatewayId;
+    config.resolvedAuthMethod = config.authMethod;
     config.resolvedSecretVersion = resolvedEntry.sharedSecretVersion || null;
     config.resolvedSharedSecretHash = resolvedEntry.secretHash || null;
     config.resolvedDisplayName = resolvedEntry.displayName || null;
@@ -1107,9 +1485,7 @@ export class GatewayService extends EventEmitter {
   }
 
   async #syncPublicGatewayRelay(relayKey, { forceTokenRefresh = false } = {}) {
-    const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
-
-    if (!enabled) {
+    if (!this.publicGatewaySettings?.enabled) {
       this.publicGatewayRelayState.delete(relayKey);
       this.#clearRelayToken(relayKey);
       await this.#unregisterPublicGatewayVirtualRelay(relayKey);
@@ -1179,6 +1555,23 @@ export class GatewayService extends EventEmitter {
       return;
     }
 
+    const route = await this.#resolveGatewayRoute({ relayKey, metadata: metadataCopy });
+    const bridgeClient = await this.#getGatewayBridgeClient(route);
+    if (!bridgeClient?.isEnabled?.()) {
+      this.publicGatewayRelayState.set(relayKey, {
+        relayKey,
+        status: 'error',
+        peerCount: peers.length,
+        lastSyncedAt: Date.now(),
+        message: 'Gateway route unavailable or unauthorized',
+        metadata: metadataCopy,
+        peers
+      });
+      this.#clearRelayToken(relayKey);
+      this.#emitPublicGatewayStatus();
+      return;
+    }
+
     const now = Date.now();
 
     const relayCores = await this.#collectRelayCoreMetadata(relayKey, metadataCopy?.identifier || null);
@@ -1201,7 +1594,7 @@ export class GatewayService extends EventEmitter {
           payload.relayCoresMode = 'merge';
         }
         try {
-          const registrationResult = await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
+          const registrationResult = await bridgeClient.registerRelay(relayKey, payload);
           if (!registrationResult?.success) {
             throw new Error(registrationResult?.error || 'Registration rejected by gateway');
           }
@@ -1244,7 +1637,7 @@ export class GatewayService extends EventEmitter {
         return;
       }
       try {
-        await this.publicGatewayRegistrar.unregisterRelay(relayKey);
+        await bridgeClient.unregisterRelay(relayKey);
         this.publicGatewayRelayState.set(relayKey, {
           relayKey,
           status: 'offline',
@@ -1293,7 +1686,7 @@ export class GatewayService extends EventEmitter {
     }
 
     try {
-      const registrationResult = await this.publicGatewayRegistrar.registerRelay(relayKey, payload);
+      const registrationResult = await bridgeClient.registerRelay(relayKey, payload);
       if (!registrationResult?.success) {
         throw new Error(registrationResult?.error || 'Registration rejected by gateway');
       }
@@ -1863,16 +2256,36 @@ export class GatewayService extends EventEmitter {
     }
 
     const config = this.publicGatewaySettings || {};
-    const enabled = !!(config.enabled && this.publicGatewayRegistrar?.isEnabled?.());
+    const enabled = !!config.enabled;
     const summary = this.blindPeerSummary;
     const defaultKeys = Array.isArray(config.blindPeerKeys) ? config.blindPeerKeys.filter(Boolean) : [];
     const manualKeys = Array.isArray(config.blindPeerManualKeys) ? config.blindPeerManualKeys.filter(Boolean) : [];
     const summaryKeys = summary?.publicKey ? [summary.publicKey] : [];
     const blindPeerKeys = summaryKeys.length ? summaryKeys : defaultKeys;
     const combinedBlindPeerKeys = Array.from(new Set([...manualKeys, ...blindPeerKeys]));
+    const gatewayAccessCatalog = Array.from(this.gatewayAccessCatalog.values())
+      .map((entry) => ({ ...(entry || {}) }))
+      .sort((left, right) => {
+        const byState = String(left.hostingState || '').localeCompare(String(right.hostingState || ''));
+        if (byState !== 0) return byState;
+        return String(left.gatewayOrigin || left.gatewayId || '').localeCompare(String(right.gatewayOrigin || right.gatewayId || ''));
+      });
+    const approvedCatalogKeys = new Set(
+      gatewayAccessCatalog
+        .filter((entry) => entry?.hostingState === 'approved')
+        .map((entry) => this.#gatewayAccessCatalogKey(entry))
+        .filter(Boolean)
+    );
+    const authorizedGateways = (this.discoveredGateways || [])
+      .filter((gateway) => approvedCatalogKeys.has(this.#gatewayAccessCatalogKey({
+        gatewayId: gateway?.gatewayId || null,
+        gatewayOrigin: gateway?.publicUrl || gateway?.gatewayOrigin || null
+      })))
+      .map((gateway) => ({ ...gateway }));
 
     return {
       enabled,
+      authMethod: config.resolvedAuthMethod || config.authMethod || null,
       selectionMode: config.selectionMode || 'default',
       selectedGatewayId: config.selectedGatewayId || null,
       preferredBaseUrl: config.preferredBaseUrl || null,
@@ -1905,6 +2318,8 @@ export class GatewayService extends EventEmitter {
       lastUpdatedAt: this.publicGatewayStatusUpdatedAt,
       relays,
       discoveredGateways: this.discoveredGateways || [],
+      authorizedGateways,
+      gatewayAccessCatalog,
       discoveryUnavailableReason: this.discoveryDisabledReason,
       discoveryWarning: this.discoveryWarning,
       disabledReason: enabled ? null : (config.disabledReason || this.discoveryDisabledReason || null)
@@ -1985,8 +2400,10 @@ export class GatewayService extends EventEmitter {
         console.info('[PublicGateway] Open join pool sync skipped: missing provider', { relayKey });
         return;
       }
-      if (!this.publicGatewayRegistrar?.isEnabled?.()) {
-        console.info('[PublicGateway] Open join pool sync skipped: registrar disabled', {
+      const route = await this.#resolveGatewayRoute({ relayKey, metadata });
+      const bridgeClient = await this.#getGatewayBridgeClient(route);
+      if (!bridgeClient?.isEnabled?.()) {
+        console.info('[PublicGateway] Open join pool sync skipped: gateway bridge unavailable', {
           relayKey,
           enabled: !!this.publicGatewaySettings?.enabled
         });
@@ -2106,7 +2523,7 @@ export class GatewayService extends EventEmitter {
         });
       };
 
-      let report = await this.publicGatewayRegistrar.updateOpenJoinPool(poolRelayKey, [], {
+      let report = await bridgeClient.updateOpenJoinPool(poolRelayKey, [], {
         updatedAt: Date.now(),
         targetSize,
         publicIdentifier: poolPublicIdentifier || null,
@@ -2151,7 +2568,7 @@ export class GatewayService extends EventEmitter {
           return;
         }
         const updatedAt = provision.updatedAt || Date.now();
-        report = await this.publicGatewayRegistrar.updateOpenJoinPool(poolRelayKey, entries, {
+        report = await bridgeClient.updateOpenJoinPool(poolRelayKey, entries, {
           updatedAt,
           targetSize,
           publicIdentifier: poolPublicIdentifier || null,
@@ -2221,6 +2638,13 @@ export class GatewayService extends EventEmitter {
   }
 
   async resyncPublicGateway() {
+    try {
+      await this.#ensureDiscoveryClient();
+      await this.#refreshGatewayAccessCatalog({ force: true });
+    } catch (error) {
+      this.log('debug', `[PublicGateway] Gateway access refresh skipped during resync: ${error.message}`);
+    }
+
     const enabled = this.publicGatewaySettings?.enabled && this.publicGatewayRegistrar?.isEnabled?.();
     if (!enabled) {
       this.publicGatewayRelayState.clear();
@@ -2292,13 +2716,15 @@ export class GatewayService extends EventEmitter {
       throw new Error('relayKey is required');
     }
 
-    if (!this.publicGatewayRegistrar?.isEnabled?.() || !this.publicGatewaySettings?.enabled) {
-      throw new Error('Public gateway bridge is disabled');
-    }
-
     const relayData = this.activeRelays.get(relayKey);
     if (!relayData) {
       throw new Error('Relay not registered with gateway');
+    }
+    const metadata = relayData.metadata || null;
+    const route = await this.#resolveGatewayRoute({ relayKey, metadata });
+    const bridgeClient = await this.#getGatewayBridgeClient(route);
+    if (!bridgeClient?.isEnabled?.() || !this.publicGatewaySettings?.enabled) {
+      throw new Error('Public gateway bridge is disabled');
     }
 
     const requestingPubkey = this.getCurrentPubkey?.() || null;
@@ -2320,7 +2746,7 @@ export class GatewayService extends EventEmitter {
 
     const issuedAt = Date.now();
 
-    const tokenResponse = await this.publicGatewayRegistrar.issueGatewayToken(relayKey, {
+    const tokenResponse = await bridgeClient.issueGatewayToken(relayKey, {
       ttlSeconds,
       relayAuthToken,
       pubkey: requestingPubkey,
@@ -2335,7 +2761,6 @@ export class GatewayService extends EventEmitter {
     const expiresAt = Number(tokenResponse.expiresAt) || (issuedAt + ttlSeconds * 1000);
     const refreshAfter = Number(tokenResponse.refreshAfter) || null;
     const sequence = tokenResponse.sequence || null;
-    const metadata = relayData.metadata || {};
     let gatewayPath = metadata.gatewayPath || null;
     if (!gatewayPath) {
       gatewayPath = this._normalizeGatewayPath(relayKey, metadata.gatewayPath, metadata.connectionUrl);
@@ -2344,11 +2769,12 @@ export class GatewayService extends EventEmitter {
       gatewayPath = relayKey.includes(':') ? relayKey.replace(':', '/') : relayKey;
     }
 
-    if (!this.publicGatewayWsBase) {
+    const wsBase = route?.wsUrl || this.#computePublicGatewayWsBase(route?.gatewayOrigin || this.publicGatewaySettings?.baseUrl);
+    if (!wsBase) {
       throw new Error('Invalid public gateway base URL');
     }
 
-    const connectionUrl = `${this.publicGatewayWsBase}/${gatewayPath}?token=${encodeURIComponent(token)}`;
+    const connectionUrl = `${wsBase}/${gatewayPath}?token=${encodeURIComponent(token)}`;
 
     const logDetails = {
       relayKey,
@@ -2364,7 +2790,7 @@ export class GatewayService extends EventEmitter {
       expiresAt,
       ttlSeconds,
       connectionUrl,
-      baseUrl: this.publicGatewaySettings.baseUrl,
+      baseUrl: route?.gatewayOrigin || this.publicGatewaySettings.baseUrl,
       issuedForPubkey: requestingPubkey,
       issuedAt,
       relayAuthToken,
@@ -2379,10 +2805,48 @@ export class GatewayService extends EventEmitter {
       expiresAt,
       ttlSeconds,
       gatewayPath,
-      baseUrl: this.publicGatewaySettings.baseUrl,
+      baseUrl: route?.gatewayOrigin || this.publicGatewaySettings.baseUrl,
       issuedForPubkey: requestingPubkey,
       refreshAfter,
       sequence
+    };
+  }
+
+  async authorizeRelayMemberAccess(relayKey, payload = {}, options = {}) {
+    const relayIdentifier = typeof relayKey === 'string' ? relayKey.trim() : '';
+    if (!relayIdentifier) {
+      throw new Error('relayKey is required');
+    }
+
+    const relayData = this.activeRelays.get(relayIdentifier);
+    const metadata = options?.metadata || relayData?.metadata || null;
+    const route = await this.#resolveGatewayRoute({
+      relayKey: relayIdentifier,
+      metadata,
+      gatewayOrigin: options?.gatewayOrigin || null,
+      gatewayId: options?.gatewayId || null,
+      allowSettingsFallback: false
+    });
+    const bridgeClient = await this.#getGatewayBridgeClient(route);
+    if (!bridgeClient?.isEnabled?.() || !this.publicGatewaySettings?.enabled) {
+      throw new Error('Public gateway bridge is disabled');
+    }
+    if (route?.authMethod !== 'relay-scoped-bearer-v1' || !bridgeClient.controlClient?.authorizeRelayMember) {
+      throw new Error('relay-member-authorize-unsupported');
+    }
+
+    const result = await bridgeClient.controlClient.authorizeRelayMember(relayIdentifier, payload);
+    if (!result?.success) {
+      const message = typeof result?.error === 'string'
+        ? result.error
+        : (typeof result?.reason === 'string' ? result.reason : `gateway-member-authorize status ${result?.statusCode || 'unknown'}`);
+      throw new Error(message);
+    }
+
+    return {
+      ...result,
+      gatewayOrigin: route?.gatewayOrigin || null,
+      gatewayId: route?.gatewayId || null
     };
   }
 

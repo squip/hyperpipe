@@ -74,12 +74,12 @@ class GatewayAdvertiser {
   }
 
   isEnabled() {
-    return !!(this.config.enabled && this.config.openAccess);
+    return !!this.config.enabled;
   }
 
   async start() {
     if (!this.isEnabled()) {
-      this.logger?.info?.('[GatewayAdvertiser] Discovery disabled or gateway not open access');
+      this.logger?.info?.('[GatewayAdvertiser] Discovery disabled');
       return;
     }
     if (this.running) return;
@@ -191,6 +191,7 @@ class GatewayAdvertiser {
     const sharedSecret = await this.getSharedSecret();
     const sharedSecretVersion = await this.getSharedSecretVersion();
     const relayInfo = await this.getRelayInfo?.();
+    const authConfig = this.config?.auth || {};
     const timestamp = Date.now();
     const displayName = this.config.displayName || null;
     const region = this.config.region || null;
@@ -207,6 +208,22 @@ class GatewayAdvertiser {
     const relayTokenTtl = toPositiveInt(relayInfo?.defaultTokenTtl);
     const relayTokenRefreshWindow = toPositiveInt(relayInfo?.tokenRefreshWindowSeconds);
     const dispatcher = relayInfo?.dispatcher || {};
+    const authMethod = typeof authConfig?.authMethod === 'string' && authConfig.authMethod.trim()
+      ? authConfig.authMethod.trim()
+      : 'relay-scoped-bearer-v1';
+    const hostPolicy = typeof authConfig?.hostPolicy === 'string' ? authConfig.hostPolicy.trim().toLowerCase() : 'open';
+    const memberDelegationMode = typeof authConfig?.memberDelegationMode === 'string'
+      ? authConfig.memberDelegationMode.trim().toLowerCase()
+      : 'all-members';
+    const capabilities = Array.from(new Set([
+      'relay-sponsor',
+      memberDelegationMode !== 'none' ? 'relay-member-delegation' : null,
+      memberDelegationMode === 'all-members' ? 'relay-open-join' : null,
+      memberDelegationMode === 'closed-members' || memberDelegationMode === 'all-members'
+        ? 'relay-closed-invite'
+        : null
+    ].filter(Boolean)));
+    const openAccess = hostPolicy === 'open';
 
     const payload = {
       gatewayId: this.gatewayId,
@@ -214,10 +231,10 @@ class GatewayAdvertiser {
       ttl: this.ttl,
       publicUrl: this.publicUrl || '',
       wsUrl: this.wsUrl || '',
-      secretUrl: this.secretUrl || '',
-      secretHash: computeSecretHash(sharedSecret || ''),
-      openAccess: true,
-      sharedSecretVersion: sharedSecretVersion || '',
+      secretUrl: openAccess && this.secretUrl ? this.secretUrl : '',
+      secretHash: openAccess && sharedSecret ? computeSecretHash(sharedSecret || '') : '',
+      openAccess,
+      sharedSecretVersion: openAccess ? (sharedSecretVersion || '') : '',
       displayName: displayName || '',
       region: region || '',
       protocolVersion,
@@ -233,7 +250,15 @@ class GatewayAdvertiser {
       dispatcherFailureWeight: toPositiveInt(dispatcher.failureWeight),
       dispatcherReassignLagBlocks: toPositiveInt(dispatcher.reassignOnLagBlocks),
       dispatcherCircuitBreakerThreshold: toPositiveInt(dispatcher.circuitBreakerThreshold),
-      dispatcherCircuitBreakerTimeoutMs: toPositiveInt(dispatcher.circuitBreakerDurationMs)
+      dispatcherCircuitBreakerTimeoutMs: toPositiveInt(dispatcher.circuitBreakerDurationMs),
+      authMethod,
+      hostPolicy,
+      memberDelegationMode,
+      operatorPubkey: authConfig?.operatorPubkey || null,
+      wotRootPubkey: authConfig?.wotRootPubkey || null,
+      wotMaxDepth: toPositiveInt(authConfig?.wotMaxDepth),
+      wotMinFollowersDepth2: Math.max(0, toPositiveInt(authConfig?.wotMinFollowersDepth2)),
+      capabilities
     };
 
     payload.signature = signAnnouncement(payload, this.keyPair.secretKey);
@@ -291,7 +316,15 @@ class GatewayAdvertiser {
       relayReplicationTopic: announcement.relayReplicationTopic || null,
       defaultTokenTtl: announcement.relayTokenTtl || null,
       tokenRefreshWindowSeconds: announcement.relayTokenRefreshWindow || null,
-      openAccess: true,
+      openAccess: announcement.openAccess === true,
+      authMethod: announcement.authMethod || null,
+      hostPolicy: announcement.hostPolicy || null,
+      memberDelegationMode: announcement.memberDelegationMode || null,
+      operatorPubkey: announcement.operatorPubkey || null,
+      wotRootPubkey: announcement.wotRootPubkey || null,
+      wotMaxDepth: announcement.wotMaxDepth || null,
+      wotMinFollowersDepth2: announcement.wotMinFollowersDepth2 ?? null,
+      capabilities: Array.isArray(announcement.capabilities) ? announcement.capabilities : [],
       ttlSeconds: announcement.ttl || this.ttl
     });
 

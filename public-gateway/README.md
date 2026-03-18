@@ -71,26 +71,92 @@ The repository ships with a Dockerfile rooted at `public-gateway/Dockerfile`.
 # build from the repository root
 docker build -f public-gateway/Dockerfile -t hypertuna/public-gateway .
 
-# run with TLS disabled and local Redis cache
+# run with TLS disabled, Redis-backed state, and WoT-based host authorization
 docker run -p 4430:4430 \
-  -e GATEWAY_PUBLIC_URL=https://hypertuna.com \
-  -e GATEWAY_REGISTRATION_SECRET=change-me \
+  -e GATEWAY_PUBLIC_URL=https://gateway.example.com \
+  -e GATEWAY_REGISTRATION_SECRET=replace-this \
   -e GATEWAY_REGISTRATION_REDIS=redis://redis:6379 \
+  -e GATEWAY_DISCOVERY_ENABLED=true \
+  -e GATEWAY_DISCOVERY_DISPLAY_NAME="Example Gateway" \
+  -e GATEWAY_DISCOVERY_REGION="us-west" \
+  -e GATEWAY_NOSTR_DISCOVERY_RELAYS="wss://relay.damus.io/,wss://relay.primal.net/,wss://nos.lol/" \
+  -e GATEWAY_AUTH_HOST_POLICY=allowlist+wot \
+  -e GATEWAY_AUTH_MEMBER_DELEGATION=all-members \
+  -e GATEWAY_AUTH_OPERATOR_PUBKEY=<64-char-hex> \
+  -e GATEWAY_AUTH_WOT_MAX_DEPTH=2 \
+  -e GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2=2 \
+  -e GATEWAY_AUTH_ALLOWLIST_PUBKEYS=<64-char-hex>,<64-char-hex> \
   hypertuna/public-gateway
 ```
 
 For Compose deployments ensure the `shared/` directory remains mounted so the service can import the shared protocol modules.
 
+The gateway now defaults to relay-scoped bearer auth for restricted hosting. `GATEWAY_REGISTRATION_SECRET` is still required because the gateway signs and verifies sponsor/member tokens with that secret even when `GATEWAY_AUTH_HOST_POLICY` is not `open`.
+
+WoT host checks currently use the same relay list as Nostr discovery. Set `GATEWAY_NOSTR_DISCOVERY_RELAYS` to the relays you want the gateway to query for contact lists. There is internal support for separate WoT relay URLs, but there is not a dedicated env var for that yet.
+
 ### Configuration Reference
 
 | Environment Variable | Description |
 | -------------------- | ----------- |
+| `PORT` | HTTP/HTTPS bind port. Defaults to `4430`. |
 | `GATEWAY_PUBLIC_URL` | External HTTPS base used when generating share links. |
-| `GATEWAY_REGISTRATION_SECRET` | Shared HMAC secret the worker uses to sign registration payloads and tokens. |
+| `GATEWAY_TLS_ENABLED` | Enables TLS when set to `true`. |
+| `GATEWAY_TLS_KEY` | Path to the TLS private key when TLS is enabled. |
+| `GATEWAY_TLS_CERT` | Path to the TLS certificate when TLS is enabled. |
+| `GATEWAY_METRICS_ENABLED` | Enables the Prometheus-style metrics endpoint unless set to `false`. |
+| `GATEWAY_METRICS_PATH` | Metrics path. Defaults to `/metrics`. |
+| `GATEWAY_REGISTRATION_SECRET` | Shared HMAC secret used to issue and verify sponsor/member bearer tokens and legacy registration tokens. Required for restricted gateways. |
 | `GATEWAY_REGISTRATION_REDIS` | Optional Redis connection string for distributed registration state. Falls back to in-memory cache when omitted or unavailable. |
 | `GATEWAY_REGISTRATION_REDIS_PREFIX` | Namespace prefix for Redis keys. Defaults to `gateway:registrations:`. |
-| `GATEWAY_REGISTRATION_TTL` | Registration TTL in seconds. Defaults to `300`. |
-| `GATEWAY_DEFAULT_TOKEN_TTL` | Default token lifetime in seconds for link generation. Defaults to `3600`. |
+| `GATEWAY_REGISTRATION_TTL` | Relay registration TTL in seconds. Defaults to `1800`. |
+| `GATEWAY_DEFAULT_TOKEN_TTL` | Default sponsor/member token lifetime in seconds. Defaults to `3600`. |
+| `GATEWAY_TOKEN_REFRESH_WINDOW` | Default refresh window in seconds before token expiry. Defaults to `300`. |
+| `GATEWAY_RATELIMIT_ENABLED` | Enables request rate limiting when set to `true`. |
+| `GATEWAY_RATELIMIT_WINDOW` | Rate-limit window in seconds. Defaults to `60`. |
+| `GATEWAY_RATELIMIT_MAX` | Max requests per window. Defaults to `120`. |
+| `GATEWAY_DISCOVERY_ENABLED` | Enables gateway discovery announcements when set to `true`. |
+| `GATEWAY_DISCOVERY_DISPLAY_NAME` | Human-readable gateway name advertised over discovery. |
+| `GATEWAY_DISCOVERY_REGION` | Region label advertised over discovery. |
+| `GATEWAY_NOSTR_DISCOVERY_ENABLED` | Enables Nostr discovery publishing and subscription unless set to `false`. |
+| `GATEWAY_NOSTR_DISCOVERY_RELAYS` | Comma-separated Nostr relay URLs used for gateway discovery and current WoT graph loading. |
+| `GATEWAY_AUTH_HOST_POLICY` | Host sponsorship policy: `open`, `allowlist`, `wot`, or `allowlist+wot`. |
+| `GATEWAY_AUTH_MEMBER_DELEGATION` | Relay member delegation policy: `none`, `closed-members`, or `all-members`. |
+| `GATEWAY_AUTH_OPERATOR_PUBKEY` | Operator pubkey in 64-character hex. Auto-approved and published in discovery metadata. |
+| `GATEWAY_AUTH_ALLOWLIST_PUBKEYS` | Comma-separated 64-character hex pubkeys approved for `allowlist` or `allowlist+wot`. |
+| `GATEWAY_AUTH_WOT_ROOT_PUBKEY` | Optional 64-character hex WoT root. Falls back to `GATEWAY_AUTH_OPERATOR_PUBKEY` when omitted. |
+| `GATEWAY_AUTH_WOT_MAX_DEPTH` | Maximum allowed WoT distance from the root. Defaults to `1`. |
+| `GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2` | Optional follower threshold applied only to depth-2 approvals. Defaults to `0`. |
+| `GATEWAY_AUTH_MAX_RELAYS_PER_SPONSOR` | Max relays a sponsored host may register. Defaults to `100`. |
+| `GATEWAY_AUTH_MAX_MEMBERS_PER_RELAY` | Max relay member ACL rows per relay. Defaults to `500`. |
+| `GATEWAY_AUTH_MAX_OPEN_JOIN_POOL` | Max open-join pool entries per relay. Defaults to `100`. |
+| `GATEWAY_AUTH_MAX_MIRRORED_BYTES_PER_RELAY` | Optional mirrored-byte quota per relay. `0` disables the quota. |
+| `GATEWAY_FEATURE_HYPERBEE_RELAY` | Enables the embedded gateway relay runtime when set to `true`. |
+| `GATEWAY_RELAY_STORAGE` | Filesystem path for relay storage. |
+| `GATEWAY_RELAY_SEED` | 64-character hex seed for the gateway relay identity. |
+| `GATEWAY_RELAY_ADMIN_PUBLIC_KEY` | 64-character hex relay admin pubkey. |
+| `GATEWAY_RELAY_ADMIN_SECRET_KEY` | 64-character hex relay admin secret key. |
+| `GATEWAY_RELAY_NAMESPACE` | Dataset namespace for the embedded relay. Defaults to `public-gateway-relay`. |
+
+### WoT Notes
+
+- Use raw 64-character hex pubkeys for all auth env vars. `npub` values are not accepted by the current config normalizer.
+- `GATEWAY_AUTH_HOST_POLICY=wot` means only WoT-approved pubkeys may sponsor new relays on the gateway.
+- `GATEWAY_AUTH_HOST_POLICY=allowlist+wot` means a pubkey may sponsor a relay if it is either explicitly allowlisted or passes WoT.
+- `GATEWAY_AUTH_MEMBER_DELEGATION=all-members` is the setting that preserves offline join parity for sponsored relays, because it lets trusted relay sponsors delegate relay-scoped mirror access to their members.
+- The current WoT implementation uses `@nostr-dev-kit/wot` and evaluates trust from the configured root user outward using contact-list depth. Depth-2 approvals can optionally require multiple in-graph followers via `GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2`.
+
+### Suggested Policies
+
+- Tight private gateway:
+  - `GATEWAY_AUTH_HOST_POLICY=allowlist+wot`
+  - `GATEWAY_AUTH_WOT_MAX_DEPTH=1`
+  - `GATEWAY_AUTH_MEMBER_DELEGATION=closed-members`
+- Hobby/community gateway:
+  - `GATEWAY_AUTH_HOST_POLICY=wot`
+  - `GATEWAY_AUTH_WOT_MAX_DEPTH=2`
+  - `GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2=2`
+  - `GATEWAY_AUTH_MEMBER_DELEGATION=all-members`
 
 ### Testing
 

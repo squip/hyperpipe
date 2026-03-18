@@ -26,6 +26,11 @@ class RedisRegistrationStore {
     this.openJoinAliasPrefix = `${this.prefix}open-join-aliases:`;
     this.mirrorPrefix = `${this.prefix}mirrors:`;
     this.aliasPrefix = `${this.prefix}aliases:`;
+    this.hostApprovalPrefix = `${this.prefix}host-approvals:`;
+    this.relaySponsorshipPrefix = `${this.prefix}sponsorships:`;
+    this.relayMemberAclPrefix = `${this.prefix}member-acl:`;
+    this.relayMemberGrantPrefix = `${this.prefix}member-grants:`;
+    this.relayMemberTokenPrefix = `${this.prefix}member-tokens:`;
     this.logger = logger || console;
     this.client = createClient({ url: this.url });
     this.readyPromise = null;
@@ -73,6 +78,26 @@ class RedisRegistrationStore {
     return `${this.aliasPrefix}${identifier}`;
   }
 
+  #hostApprovalKey(gatewayId, subjectPubkey) {
+    return `${this.hostApprovalPrefix}${String(gatewayId || '').trim().toLowerCase()}:${String(subjectPubkey || '').trim().toLowerCase()}`;
+  }
+
+  #relaySponsorshipKey(relayKey) {
+    return `${this.relaySponsorshipPrefix}${relayKey}`;
+  }
+
+  #relayMemberAclKey(relayKey, subjectPubkey) {
+    return `${this.relayMemberAclPrefix}${String(relayKey || '').trim()}:${String(subjectPubkey || '').trim().toLowerCase()}`;
+  }
+
+  #relayMemberGrantKey(grantId) {
+    return `${this.relayMemberGrantPrefix}${String(grantId || '').trim()}`;
+  }
+
+  #relayMemberTokenKey(relayKey, subjectPubkey) {
+    return `${this.relayMemberTokenPrefix}${String(relayKey || '').trim()}:${String(subjectPubkey || '').trim().toLowerCase()}`;
+  }
+
   async upsertRelay(relayKey, payload) {
     await this.#ensureConnected();
     const data = JSON.stringify({ ...payload, relayKey, updatedAt: Date.now() });
@@ -104,6 +129,8 @@ class RedisRegistrationStore {
     await this.client.del(this.#key(relayKey));
     await this.client.del(this.#tokenKey(relayKey));
     await this.clearOpenJoinPool(relayKey);
+    await this.removeRelaySponsorship(relayKey);
+    await this.clearRelayMemberAcls(relayKey);
   }
 
   pruneExpired() {
@@ -301,6 +328,195 @@ class RedisRegistrationStore {
     await this.client.del(this.#mirrorKey(relayKey));
   }
 
+  async upsertHostApproval(gatewayId, subjectPubkey, approval = {}) {
+    await this.#ensureConnected();
+    const payload = JSON.stringify({
+      ...approval,
+      gatewayId: String(gatewayId || '').trim().toLowerCase(),
+      subjectPubkey: String(subjectPubkey || '').trim().toLowerCase(),
+      updatedAt: Date.now()
+    });
+    await this.client.set(this.#hostApprovalKey(gatewayId, subjectPubkey), payload);
+    return JSON.parse(payload);
+  }
+
+  async getHostApproval(gatewayId, subjectPubkey) {
+    await this.#ensureConnected();
+    const value = await this.client.get(this.#hostApprovalKey(gatewayId, subjectPubkey));
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse redis host approval payload', { gatewayId, subjectPubkey, error: error.message });
+      return null;
+    }
+  }
+
+  async listHostApprovals(gatewayId = null) {
+    await this.#ensureConnected();
+    const normalizedGatewayId = gatewayId ? String(gatewayId).trim().toLowerCase() : null;
+    let cursor = '0';
+    const out = [];
+    const match = normalizedGatewayId
+      ? `${this.hostApprovalPrefix}${normalizedGatewayId}:*`
+      : `${this.hostApprovalPrefix}*`;
+    do {
+      const result = await this.client.scan(cursor, { MATCH: match, COUNT: 100 });
+      cursor = result.cursor;
+      const keys = result.keys || [];
+      if (!keys.length) continue;
+      const values = await this.client.mGet(keys);
+      for (const value of values) {
+        if (!value) continue;
+        try {
+          out.push(JSON.parse(value));
+        } catch (error) {
+          this.logger?.warn?.('Failed to parse redis host approval during list', { error: error.message });
+        }
+      }
+    } while (cursor !== '0');
+    return out;
+  }
+
+  async upsertRelaySponsorship(relayKey, sponsorship = {}) {
+    await this.#ensureConnected();
+    const payload = JSON.stringify({
+      ...sponsorship,
+      relayKey: String(relayKey || '').trim(),
+      updatedAt: Date.now()
+    });
+    await this.client.set(this.#relaySponsorshipKey(relayKey), payload);
+    return JSON.parse(payload);
+  }
+
+  async getRelaySponsorship(relayKey) {
+    await this.#ensureConnected();
+    const value = await this.client.get(this.#relaySponsorshipKey(relayKey));
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse redis relay sponsorship payload', { relayKey, error: error.message });
+      return null;
+    }
+  }
+
+  async removeRelaySponsorship(relayKey) {
+    await this.#ensureConnected();
+    await this.client.del(this.#relaySponsorshipKey(relayKey));
+  }
+
+  async storeRelayMemberAcl(relayKey, subjectPubkey, acl = {}) {
+    await this.#ensureConnected();
+    const payload = {
+      ...acl,
+      relayKey: String(relayKey || '').trim(),
+      subjectPubkey: String(subjectPubkey || '').trim().toLowerCase(),
+      updatedAt: Date.now()
+    };
+    await this.client.set(this.#relayMemberAclKey(relayKey, subjectPubkey), JSON.stringify(payload));
+    if (payload.grantId) {
+      await this.client.set(this.#relayMemberGrantKey(payload.grantId), this.#relayMemberAclKey(relayKey, subjectPubkey));
+    }
+    return payload;
+  }
+
+  async getRelayMemberAcl(relayKey, subjectPubkey) {
+    await this.#ensureConnected();
+    const value = await this.client.get(this.#relayMemberAclKey(relayKey, subjectPubkey));
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse redis relay member ACL payload', { relayKey, subjectPubkey, error: error.message });
+      return null;
+    }
+  }
+
+  async getRelayMemberAclByGrantId(grantId) {
+    await this.#ensureConnected();
+    const aclKey = await this.client.get(this.#relayMemberGrantKey(grantId));
+    if (!aclKey) return null;
+    const value = await this.client.get(aclKey);
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse redis relay member ACL by grantId', { grantId, error: error.message });
+      return null;
+    }
+  }
+
+  async listRelayMemberAcls(relayKey) {
+    await this.#ensureConnected();
+    const normalizedRelayKey = String(relayKey || '').trim();
+    if (!normalizedRelayKey) return [];
+    let cursor = '0';
+    const out = [];
+    do {
+      const result = await this.client.scan(cursor, {
+        MATCH: `${this.relayMemberAclPrefix}${normalizedRelayKey}:*`,
+        COUNT: 100
+      });
+      cursor = result.cursor;
+      const keys = result.keys || [];
+      if (!keys.length) continue;
+      const values = await this.client.mGet(keys);
+      for (const value of values) {
+        if (!value) continue;
+        try {
+          out.push(JSON.parse(value));
+        } catch (error) {
+          this.logger?.warn?.('Failed to parse redis relay member ACL during list', { relayKey, error: error.message });
+        }
+      }
+    } while (cursor !== '0');
+    return out;
+  }
+
+  async clearRelayMemberAcls(relayKey) {
+    await this.#ensureConnected();
+    const records = await this.listRelayMemberAcls(relayKey);
+    const keys = records.map((record) => this.#relayMemberAclKey(relayKey, record.subjectPubkey));
+    const grantKeys = records
+      .map((record) => record?.grantId ? this.#relayMemberGrantKey(record.grantId) : null)
+      .filter(Boolean);
+    const tokenKeys = records.map((record) => this.#relayMemberTokenKey(relayKey, record.subjectPubkey));
+    const allKeys = [...keys, ...grantKeys, ...tokenKeys];
+    if (allKeys.length) {
+      await this.client.del(...allKeys);
+    }
+  }
+
+  async storeRelayMemberTokenState(relayKey, subjectPubkey, state = {}) {
+    await this.#ensureConnected();
+    const payload = {
+      ...state,
+      relayKey: String(relayKey || '').trim(),
+      subjectPubkey: String(subjectPubkey || '').trim().toLowerCase(),
+      updatedAt: Date.now()
+    };
+    await this.client.set(this.#relayMemberTokenKey(relayKey, subjectPubkey), JSON.stringify(payload));
+    return payload;
+  }
+
+  async getRelayMemberTokenState(relayKey, subjectPubkey) {
+    await this.#ensureConnected();
+    const value = await this.client.get(this.#relayMemberTokenKey(relayKey, subjectPubkey));
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      this.logger?.warn?.('Failed to parse redis relay member token state', { relayKey, subjectPubkey, error: error.message });
+      return null;
+    }
+  }
+
+  async clearRelayMemberTokenState(relayKey, subjectPubkey) {
+    await this.#ensureConnected();
+    await this.client.del(this.#relayMemberTokenKey(relayKey, subjectPubkey));
+  }
+
   async storeRelayAlias(identifier, relayKey) {
     if (!identifier || !relayKey) return;
     await this.#ensureConnected();
@@ -341,7 +557,12 @@ class RedisRegistrationStore {
       this.openJoinPrefix,
       this.openJoinAliasPrefix,
       this.mirrorPrefix,
-      this.aliasPrefix
+      this.aliasPrefix,
+      this.hostApprovalPrefix,
+      this.relaySponsorshipPrefix,
+      this.relayMemberAclPrefix,
+      this.relayMemberGrantPrefix,
+      this.relayMemberTokenPrefix
     ];
     let cursor = '0';
     do {

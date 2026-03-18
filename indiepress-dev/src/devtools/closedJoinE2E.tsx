@@ -780,6 +780,7 @@ export default function ClosedJoinE2EBridge(): null {
             token: invite.token,
             relayKey: inviteRelayKey || null,
             relayUrl: inviteRelayUrl || null,
+            gatewayAccess: invite.gatewayAccess || undefined,
             blindPeer: invite.blindPeer,
             cores: invite.cores,
             writerCore: invite.writerCore,

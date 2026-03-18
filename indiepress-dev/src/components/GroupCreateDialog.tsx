@@ -32,9 +32,9 @@ export default function GroupCreateDialog({
   const [manualGatewayOrigin, setManualGatewayOrigin] = useState('')
   const [isSaving, setIsSaving] = useState(false)
 
-  const discoveredGateways = useMemo(() => {
-    const rows = Array.isArray((publicGatewayStatus as any)?.discoveredGateways)
-      ? ((publicGatewayStatus as any).discoveredGateways as Array<Record<string, unknown>>)
+  const authorizedGateways = useMemo(() => {
+    const rows = Array.isArray((publicGatewayStatus as any)?.authorizedGateways)
+      ? ((publicGatewayStatus as any).authorizedGateways as Array<Record<string, unknown>>)
       : []
     return rows
       .map((row) => {
@@ -42,16 +42,30 @@ export default function GroupCreateDialog({
         const publicUrl = typeof row.publicUrl === 'string' ? row.publicUrl.trim() : ''
         const displayName = typeof row.displayName === 'string' ? row.displayName.trim() : ''
         const region = typeof row.region === 'string' ? row.region.trim() : ''
+        const authMethod = typeof row.authMethod === 'string' ? row.authMethod.trim() : ''
+        const memberDelegationMode = typeof row.memberDelegationMode === 'string' ? row.memberDelegationMode.trim() : ''
+        const operatorPubkey = typeof row.operatorPubkey === 'string' ? row.operatorPubkey.trim() : ''
         const isExpired = row.isExpired === true
         if (!gatewayId || !publicUrl || isExpired) return null
         return {
           gatewayId,
           publicUrl,
           displayName,
-          region
+          region,
+          authMethod,
+          memberDelegationMode,
+          operatorPubkey
         }
       })
-      .filter((row): row is { gatewayId: string; publicUrl: string; displayName: string; region: string } => !!row)
+      .filter((row): row is {
+        gatewayId: string
+        publicUrl: string
+        displayName: string
+        region: string
+        authMethod: string
+        memberDelegationMode: string
+        operatorPubkey: string
+      } => !!row)
   }, [publicGatewayStatus])
 
   const normalizeHttpOrigin = (value: string): string | null => {
@@ -75,6 +89,9 @@ export default function GroupCreateDialog({
     try {
       let gatewayOrigin: string | null = null
       let gatewayId: string | null = null
+      let gatewayAuthMethod: string | null = null
+      let gatewayDelegation: string | null = null
+      let gatewaySponsorPubkey: string | null = null
       let directJoinOnly = false
 
       if (gatewaySelection === 'direct') {
@@ -87,16 +104,32 @@ export default function GroupCreateDialog({
           return
         }
       } else if (gatewaySelection.startsWith('gateway:')) {
-        const selected = discoveredGateways.find(
+        const selected = authorizedGateways.find(
           (gateway) => `gateway:${gateway.gatewayId}` === gatewaySelection
         )
         if (!selected) {
-          toast.error(t('Selected gateway is unavailable'))
+          toast.error(t('Selected gateway is unavailable or not approved'))
           setIsSaving(false)
           return
         }
         gatewayId = selected.gatewayId
         gatewayOrigin = normalizeHttpOrigin(selected.publicUrl)
+        gatewayAuthMethod = selected.authMethod || null
+        gatewayDelegation = selected.memberDelegationMode || null
+        gatewaySponsorPubkey = selected.operatorPubkey || null
+      }
+
+      if (gatewaySelection === 'manual' && gatewayOrigin) {
+        const approvedManual = authorizedGateways.find((gateway) => normalizeHttpOrigin(gateway.publicUrl) === gatewayOrigin)
+        if (!approvedManual) {
+          toast.error(t('Manual gateway URL is not approved for this account'))
+          setIsSaving(false)
+          return
+        }
+        gatewayId = approvedManual.gatewayId
+        gatewayAuthMethod = approvedManual.authMethod || null
+        gatewayDelegation = approvedManual.memberDelegationMode || null
+        gatewaySponsorPubkey = approvedManual.operatorPubkey || null
       }
 
       await createHypertunaRelayGroup({
@@ -108,6 +141,9 @@ export default function GroupCreateDialog({
         fileSharing: true,
         gatewayOrigin,
         gatewayId,
+        gatewayAuthMethod,
+        gatewayDelegation,
+        gatewaySponsorPubkey,
         directJoinOnly
       })
       toast.success(t('Group created'), { duration: 2000 })
@@ -224,7 +260,7 @@ export default function GroupCreateDialog({
               className="w-full rounded-md border bg-background px-3 py-2 text-sm"
             >
               <option value="direct">{t('Direct-join only (no gateway)')}</option>
-              {discoveredGateways.map((gateway) => (
+              {authorizedGateways.map((gateway) => (
                 <option key={gateway.gatewayId} value={`gateway:${gateway.gatewayId}`}>
                   {gateway.displayName || gateway.gatewayId}
                   {gateway.region ? ` (${gateway.region})` : ''} - {gateway.publicUrl}
@@ -239,6 +275,11 @@ export default function GroupCreateDialog({
                 placeholder="https://gateway.example.com"
               />
             )}
+            <div className="text-xs text-muted-foreground">
+              {authorizedGateways.length
+                ? t('Only gateways that already approved this account for hosting are shown here.')
+                : t('No approved gateways available yet. You can still create a direct-join-only group.')}
+            </div>
             <div className="text-xs text-muted-foreground">
               {t('This gateway assignment is stored on group metadata and used for relay-specific join/mirror routing.')}
             </div>

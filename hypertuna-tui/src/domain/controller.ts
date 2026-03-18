@@ -12,6 +12,7 @@ import type {
   ChatConversation,
   ChatInvite,
   DiscoveredGateway,
+  GatewayAccessState,
   FeedControls,
   FeedSortKey,
   FeedItem,
@@ -130,6 +131,8 @@ export type ControllerState = {
   discoveryRelayUrls: string[]
   gatewayPeerCounts: Record<string, number>
   discoveredGateways: DiscoveredGateway[]
+  authorizedGateways: DiscoveredGateway[]
+  gatewayAccessCatalog: GatewayAccessState[]
   feed: FeedItem[]
   feedSource: FeedSourceState
   activeFeedRelays: string[]
@@ -485,6 +488,8 @@ export class TuiController {
     discoveryRelayUrls: uniqueRelayUrls(DEFAULT_DISCOVERY_RELAYS),
     gatewayPeerCounts: {},
     discoveredGateways: [],
+    authorizedGateways: [],
+    gatewayAccessCatalog: [],
     feed: [],
     feedSource: defaultFeedSourceState(),
     activeFeedRelays: [],
@@ -605,6 +610,8 @@ export class TuiController {
       discoveryRelayUrls: [...this.state.discoveryRelayUrls],
       gatewayPeerCounts: { ...this.state.gatewayPeerCounts },
       discoveredGateways: this.state.discoveredGateways.map((gateway) => ({ ...gateway })),
+      authorizedGateways: this.state.authorizedGateways.map((gateway) => ({ ...gateway })),
+      gatewayAccessCatalog: this.state.gatewayAccessCatalog.map((entry) => ({ ...entry })),
       feed: [...this.state.feed],
       feedSource: { ...this.state.feedSource },
       activeFeedRelays: [...this.state.activeFeedRelays],
@@ -1202,7 +1209,13 @@ export class TuiController {
           const discoveredGateways = this.parseDiscoveredGateways(
             (state as { discoveredGateways?: unknown } | null | undefined)?.discoveredGateways
           )
-          this.patchState({ discoveredGateways })
+          const authorizedGateways = this.parseDiscoveredGateways(
+            (state as { authorizedGateways?: unknown } | null | undefined)?.authorizedGateways
+          )
+          const gatewayAccessCatalog = this.parseGatewayAccessCatalog(
+            (state as { gatewayAccessCatalog?: unknown } | null | undefined)?.gatewayAccessCatalog
+          )
+          this.patchState({ discoveredGateways, authorizedGateways, gatewayAccessCatalog })
           return
         }
 
@@ -2625,7 +2638,13 @@ export class TuiController {
         region: typeof source.region === 'string' ? source.region.trim() || null : null,
         source: typeof source.source === 'string' ? source.source.trim() || null : null,
         isExpired: source.isExpired === true,
-        lastSeenAt: Number.isFinite(Number(source.lastSeenAt)) ? Number(source.lastSeenAt) : null
+        lastSeenAt: Number.isFinite(Number(source.lastSeenAt)) ? Number(source.lastSeenAt) : null,
+        authMethod: typeof source.authMethod === 'string' ? source.authMethod.trim() || null : null,
+        hostPolicy: typeof source.hostPolicy === 'string' ? source.hostPolicy.trim() || null : null,
+        memberDelegationMode: typeof source.memberDelegationMode === 'string'
+          ? source.memberDelegationMode.trim() || null
+          : null,
+        operatorPubkey: typeof source.operatorPubkey === 'string' ? source.operatorPubkey.trim() || null : null
       }
       const previous = byId.get(gatewayId)
       if (!previous) {
@@ -2648,24 +2667,99 @@ export class TuiController {
       })
   }
 
-  private findDiscoveredGateway(gatewaySelector: string | null | undefined): DiscoveredGateway | null {
+  private parseGatewayAccessCatalog(input: unknown): GatewayAccessState[] {
+    if (!Array.isArray(input)) return []
+    const normalizeOrigin = (value: unknown): string | null => {
+      if (typeof value !== 'string') return null
+      const trimmed = value.trim()
+      if (!trimmed) return null
+      try {
+        const parsed = new URL(trimmed)
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+        return parsed.origin
+      } catch {
+        return null
+      }
+    }
+
+    return input
+      .map((row) => {
+        if (!row || typeof row !== 'object') return null
+        const source = row as Record<string, unknown>
+        return {
+          gatewayId: typeof source.gatewayId === 'string' ? source.gatewayId.trim().toLowerCase() : null,
+          gatewayOrigin: normalizeOrigin(source.gatewayOrigin),
+          hostingState: typeof source.hostingState === 'string' ? source.hostingState.trim() : 'unknown',
+          reason: typeof source.reason === 'string' ? source.reason.trim() || null : null,
+          lastCheckedAt: Number.isFinite(Number(source.lastCheckedAt)) ? Number(source.lastCheckedAt) : null,
+          memberDelegationMode: typeof source.memberDelegationMode === 'string'
+            ? source.memberDelegationMode.trim() || null
+            : null,
+          authMethod: typeof source.authMethod === 'string' ? source.authMethod.trim() || null : null,
+          policy: source.policy && typeof source.policy === 'object'
+            ? {
+                hostPolicy: typeof (source.policy as Record<string, unknown>).hostPolicy === 'string'
+                  ? String((source.policy as Record<string, unknown>).hostPolicy).trim() || null
+                  : null,
+                authMethod: typeof (source.policy as Record<string, unknown>).authMethod === 'string'
+                  ? String((source.policy as Record<string, unknown>).authMethod).trim() || null
+                  : null,
+                openAccess: (source.policy as Record<string, unknown>).openAccess === true,
+                operatorPubkey: typeof (source.policy as Record<string, unknown>).operatorPubkey === 'string'
+                  ? String((source.policy as Record<string, unknown>).operatorPubkey).trim() || null
+                  : null,
+                wotRootPubkey: typeof (source.policy as Record<string, unknown>).wotRootPubkey === 'string'
+                  ? String((source.policy as Record<string, unknown>).wotRootPubkey).trim() || null
+                  : null,
+                wotMaxDepth: Number.isFinite(Number((source.policy as Record<string, unknown>).wotMaxDepth))
+                  ? Number((source.policy as Record<string, unknown>).wotMaxDepth)
+                  : null,
+                wotMinFollowersDepth2: Number.isFinite(Number((source.policy as Record<string, unknown>).wotMinFollowersDepth2))
+                  ? Number((source.policy as Record<string, unknown>).wotMinFollowersDepth2)
+                  : null,
+                capabilities: Array.isArray((source.policy as Record<string, unknown>).capabilities)
+                  ? ((source.policy as Record<string, unknown>).capabilities as unknown[])
+                    .filter((value) => typeof value === 'string')
+                    .map((value) => String(value))
+                  : []
+              }
+            : null
+        } as GatewayAccessState
+      })
+      .filter((entry): entry is GatewayAccessState => Boolean(entry && (entry.gatewayId || entry.gatewayOrigin)))
+      .sort((left, right) => {
+        const byState = String(left.hostingState || '').localeCompare(String(right.hostingState || ''))
+        if (byState !== 0) return byState
+        return String(left.gatewayOrigin || left.gatewayId || '').localeCompare(String(right.gatewayOrigin || right.gatewayId || ''))
+      })
+  }
+
+  private findGatewayInList(list: DiscoveredGateway[], gatewaySelector: string | null | undefined): DiscoveredGateway | null {
     const selector = String(gatewaySelector || '').trim()
     if (!selector) return null
     const normalized = selector.toLowerCase()
-    const directId = this.state.discoveredGateways.find((gateway) => gateway.gatewayId === normalized)
+    const directId = list.find((gateway) => gateway.gatewayId === normalized)
     if (directId) return directId
     if (/^\d+$/.test(selector)) {
       const index = Number.parseInt(selector, 10)
-      if (Number.isFinite(index) && index >= 0 && index < this.state.discoveredGateways.length) {
-        return this.state.discoveredGateways[index] || null
+      if (Number.isFinite(index) && index >= 0 && index < list.length) {
+        return list[index] || null
       }
     }
     return null
   }
 
+  private findDiscoveredGateway(gatewaySelector: string | null | undefined): DiscoveredGateway | null {
+    return this.findGatewayInList(this.state.discoveredGateways, gatewaySelector)
+  }
+
+  private findAuthorizedGateway(gatewaySelector: string | null | undefined): DiscoveredGateway | null {
+    return this.findGatewayInList(this.state.authorizedGateways, gatewaySelector)
+  }
+
   async refreshGatewayCatalog(options?: { force?: boolean; timeoutMs?: number }): Promise<DiscoveredGateway[]> {
     if (!this.workerHost.isRunning()) {
-      return this.state.discoveredGateways
+      return this.state.authorizedGateways.length ? this.state.authorizedGateways : this.state.discoveredGateways
     }
 
     const timeoutMs = Number.isFinite(options?.timeoutMs) ? Number(options?.timeoutMs) : 4_500
@@ -2684,10 +2778,16 @@ export class TuiController {
       const discoveredGateways = this.parseDiscoveredGateways(
         (state as { discoveredGateways?: unknown } | null | undefined)?.discoveredGateways
       )
-      this.patchState({ discoveredGateways })
-      return discoveredGateways
+      const authorizedGateways = this.parseDiscoveredGateways(
+        (state as { authorizedGateways?: unknown } | null | undefined)?.authorizedGateways
+      )
+      const gatewayAccessCatalog = this.parseGatewayAccessCatalog(
+        (state as { gatewayAccessCatalog?: unknown } | null | undefined)?.gatewayAccessCatalog
+      )
+      this.patchState({ discoveredGateways, authorizedGateways, gatewayAccessCatalog })
+      return authorizedGateways.length ? authorizedGateways : discoveredGateways
     } catch {
-      return this.state.discoveredGateways
+      return this.state.authorizedGateways.length ? this.state.authorizedGateways : this.state.discoveredGateways
     }
   }
 
@@ -3370,22 +3470,24 @@ export class TuiController {
       }
 
       if (!directJoinOnly && !resolvedGatewayOrigin && resolvedGatewayId) {
-        let selectedGateway = this.findDiscoveredGateway(resolvedGatewayId)
+        let selectedGateway = this.findAuthorizedGateway(resolvedGatewayId)
         if (!selectedGateway) {
           await this.refreshGatewayCatalog({ force: true, timeoutMs: 5_000 }).catch(() => {})
-          selectedGateway = this.findDiscoveredGateway(resolvedGatewayId)
+          selectedGateway = this.findAuthorizedGateway(resolvedGatewayId)
         }
         if (!selectedGateway) {
-          throw new Error(`Gateway "${resolvedGatewayId}" not found in discovered catalog. Run "gateway refresh" and retry.`)
+          throw new Error(`Gateway "${resolvedGatewayId}" is not approved for hosting on this account. Run "gateway refresh" and retry.`)
         }
         resolvedGatewayId = selectedGateway.gatewayId
         resolvedGatewayOrigin = selectedGateway.publicUrl
       }
 
       if (!directJoinOnly && resolvedGatewayOrigin && !resolvedGatewayId) {
-        const matchedByOrigin = this.state.discoveredGateways.find((gateway) => gateway.publicUrl === resolvedGatewayOrigin)
+        const matchedByOrigin = this.state.authorizedGateways.find((gateway) => gateway.publicUrl === resolvedGatewayOrigin)
         if (matchedByOrigin) {
           resolvedGatewayId = matchedByOrigin.gatewayId
+        } else {
+          throw new Error('Gateway origin is not approved for hosting on this account')
         }
       }
 
@@ -3589,6 +3691,14 @@ export class TuiController {
     leaseReplicaPeerKeys?: string[]
     writerIssuerPubkey?: string | null
     writerLeaseEnvelope?: Record<string, unknown> | null
+    gatewayAccess?: {
+      version?: string | null
+      authMethod?: string | null
+      grantId?: string | null
+      gatewayId?: string | null
+      gatewayOrigin?: string | null
+      scopes?: string[]
+    } | null
     openJoin?: boolean
     hostPeers?: string[]
     blindPeer?: {
@@ -4179,6 +4289,7 @@ export class TuiController {
         leaseReplicaPeerKeys: target.leaseReplicaPeerKeys || undefined,
         writerIssuerPubkey: target.writerIssuerPubkey || undefined,
         writerLeaseEnvelope: target.writerLeaseEnvelope || undefined,
+        gatewayAccess: target.gatewayAccess || undefined,
         fileSharing: target.fileSharing,
         openJoin: !target.token && target.fileSharing !== false,
         blindPeer: target.blindPeer || undefined,
@@ -4289,6 +4400,16 @@ export class TuiController {
       const payload: Record<string, unknown> = {
         relayUrl,
         relayKey: relayKey || null,
+        gatewayId: selectedGroup?.gatewayId || null,
+        gatewayOrigin: selectedGroup?.gatewayOrigin || null,
+        gatewayAuthMethod: selectedGroup?.gatewayAuthMethod || null,
+        directJoinOnly: selectedGroup?.directJoinOnly === true,
+        discoveryTopic: selectedGroup?.discoveryTopic || null,
+        hostPeerKeys: Array.isArray(selectedGroup?.hostPeerKeys) ? selectedGroup.hostPeerKeys : undefined,
+        leaseReplicaPeerKeys: Array.isArray(selectedGroup?.leaseReplicaPeerKeys)
+          ? selectedGroup.leaseReplicaPeerKeys
+          : undefined,
+        writerIssuerPubkey: selectedGroup?.writerIssuerPubkey || null,
         groupName: selectedGroup?.name || normalizedGroupId,
         groupPicture: selectedGroup?.picture || null,
         name: selectedGroup?.name || normalizedGroupId,
@@ -4402,6 +4523,16 @@ export class TuiController {
       }
 
       const payloadInput = input.payload as Record<string, unknown>
+      const normalizeHttpOrigin = (value: unknown): string | null => {
+        if (typeof value !== 'string' || !value.trim()) return null
+        try {
+          const parsed = new URL(value.trim())
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+          return parsed.origin
+        } catch {
+          return null
+        }
+      }
       const discoveryTopic = typeof payloadInput.discoveryTopic === 'string'
         ? payloadInput.discoveryTopic
         : null
@@ -4418,6 +4549,37 @@ export class TuiController {
       const payloadWriterIssuerPubkey = typeof payloadInput.writerIssuerPubkey === 'string'
         ? payloadInput.writerIssuerPubkey.trim().toLowerCase()
         : null
+      const payloadGatewayAccess =
+        payloadInput.gatewayAccess && typeof payloadInput.gatewayAccess === 'object'
+          ? payloadInput.gatewayAccess as Record<string, unknown>
+          : payloadInput.gateway_access && typeof payloadInput.gateway_access === 'object'
+            ? payloadInput.gateway_access as Record<string, unknown>
+            : null
+      const payloadGatewayOrigin =
+        normalizeHttpOrigin(payloadInput.gatewayOrigin)
+        || normalizeHttpOrigin(payloadInput.gateway_origin)
+      const payloadGatewayId =
+        typeof payloadInput.gatewayId === 'string'
+          ? payloadInput.gatewayId.trim().toLowerCase()
+          : typeof payloadInput.gateway_id === 'string'
+            ? payloadInput.gateway_id.trim().toLowerCase()
+            : null
+      const payloadGatewayAccessAuthMethod =
+        payloadGatewayAccess && typeof payloadGatewayAccess.authMethod === 'string'
+          ? payloadGatewayAccess.authMethod.trim()
+          : payloadGatewayAccess && typeof payloadGatewayAccess.auth_method === 'string'
+            ? payloadGatewayAccess.auth_method.trim()
+            : null
+      const payloadGatewayAuthMethod =
+        typeof payloadInput.gatewayAuthMethod === 'string'
+          ? payloadInput.gatewayAuthMethod.trim()
+          : typeof payloadInput.gateway_auth_method === 'string'
+            ? payloadInput.gateway_auth_method.trim()
+            : null
+      const effectiveGatewayAuthMethod =
+        payloadGatewayAccessAuthMethod
+        || payloadGatewayAuthMethod
+        || null
       const isOpenGroup = input.token
         ? false
         : (typeof payloadInput.fileSharing === 'boolean' ? payloadInput.fileSharing : true)
@@ -4530,6 +4692,27 @@ export class TuiController {
         )
       }
 
+      const gatewayAccess =
+        !isOpenGroup
+        && effectiveGatewayAuthMethod === 'relay-scoped-bearer-v1'
+        && payloadGatewayOrigin
+        && resolvedRelayKey
+          ? await this.workerHost.request<Record<string, unknown>>(
+              {
+                type: 'authorize-relay-member-access',
+                data: {
+                  relayKey: resolvedRelayKey,
+                  publicIdentifier: normalizedGroupId,
+                  subjectPubkey: normalizedInvitee,
+                  gatewayOrigin: payloadGatewayOrigin,
+                  gatewayId: payloadGatewayId,
+                  scopes: ['relay:bootstrap', 'relay:mirror-read', 'relay:mirror-sync', 'relay:ws-connect']
+                }
+              },
+              30_000
+            )
+          : null
+
       const mergedCores = new Map<string, { key: string; role?: string | null }>()
       const upsertCore = (key: string, role?: string | null): void => {
         const normalized = String(key || '').trim()
@@ -4569,6 +4752,7 @@ export class TuiController {
         leaseReplicaPeerKeys: leaseReplicaPeerKeys.length ? leaseReplicaPeerKeys : undefined,
         writerIssuerPubkey: writerIssuerPubkey || null,
         writerLeaseEnvelope: writerLeaseEnvelope || null,
+        gatewayAccess: gatewayAccess || payloadGatewayAccess || null,
         token: inviteToken || null,
         writerCore: writerCore || payloadInput.writerCore || null,
         writerCoreHex: writerCoreHex || payloadInput.writerCoreHex || payloadInput.writer_core_hex || null,

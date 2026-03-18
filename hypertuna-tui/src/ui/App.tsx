@@ -2522,13 +2522,13 @@ export function App({
     if (!state || !isCreateNodeId(selectedNode)) return []
     const expandedBranch = createExpandedBranchByNode[selectedNode] || ''
     if (selectedNode === 'groups:create') {
-      return groupCreateRows(groupCreateDraft, expandedBranch, state.discoveredGateways || [])
+      return groupCreateRows(groupCreateDraft, expandedBranch, state.authorizedGateways || [])
     }
     return chatCreateRows(chatCreateDraft, expandedBranch, state.relays || [])
   }, [state, selectedNode, groupCreateDraft, chatCreateDraft, createExpandedBranchByNode])
 
   const createGatewayOptions = useMemo<CreateGatewayPickerOption[]>(
-    () => gatewayPickerOptions(groupCreateDraft, state?.discoveredGateways || []),
+    () => gatewayPickerOptions(groupCreateDraft, state?.authorizedGateways || []),
     [groupCreateDraft, state]
   )
 

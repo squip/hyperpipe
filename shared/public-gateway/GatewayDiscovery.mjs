@@ -33,6 +33,14 @@ const announcementEncoding = {
     c.uint.preencode(state, value.dispatcherReassignLagBlocks || 0);
     c.uint.preencode(state, value.dispatcherCircuitBreakerThreshold || 0);
     c.uint.preencode(state, value.dispatcherCircuitBreakerTimeoutMs || 0);
+    c.string.preencode(state, value.authMethod || '');
+    c.string.preencode(state, value.hostPolicy || '');
+    c.string.preencode(state, value.memberDelegationMode || '');
+    c.string.preencode(state, value.operatorPubkey || '');
+    c.string.preencode(state, value.wotRootPubkey || '');
+    c.uint.preencode(state, value.wotMaxDepth || 0);
+    c.uint.preencode(state, value.wotMinFollowersDepth2 || 0);
+    c.string.preencode(state, Array.isArray(value.capabilities) ? value.capabilities.join(',') : '');
   },
   encode(state, value) {
     c.string.encode(state, value.gatewayId || '');
@@ -61,6 +69,14 @@ const announcementEncoding = {
     c.uint.encode(state, value.dispatcherReassignLagBlocks || 0);
     c.uint.encode(state, value.dispatcherCircuitBreakerThreshold || 0);
     c.uint.encode(state, value.dispatcherCircuitBreakerTimeoutMs || 0);
+    c.string.encode(state, value.authMethod || '');
+    c.string.encode(state, value.hostPolicy || '');
+    c.string.encode(state, value.memberDelegationMode || '');
+    c.string.encode(state, value.operatorPubkey || '');
+    c.string.encode(state, value.wotRootPubkey || '');
+    c.uint.encode(state, value.wotMaxDepth || 0);
+    c.uint.encode(state, value.wotMinFollowersDepth2 || 0);
+    c.string.encode(state, Array.isArray(value.capabilities) ? value.capabilities.join(',') : '');
   },
   decode(state) {
     const announcement = {
@@ -95,6 +111,19 @@ const announcementEncoding = {
     announcement.dispatcherReassignLagBlocks = maybeDecodeUint();
     announcement.dispatcherCircuitBreakerThreshold = maybeDecodeUint();
     announcement.dispatcherCircuitBreakerTimeoutMs = maybeDecodeUint();
+    announcement.authMethod = state.start < state.end ? c.string.decode(state) : '';
+    announcement.hostPolicy = state.start < state.end ? c.string.decode(state) : '';
+    announcement.memberDelegationMode = state.start < state.end ? c.string.decode(state) : '';
+    announcement.operatorPubkey = state.start < state.end ? c.string.decode(state) : '';
+    announcement.wotRootPubkey = state.start < state.end ? c.string.decode(state) : '';
+    announcement.wotMaxDepth = maybeDecodeUint();
+    announcement.wotMinFollowersDepth2 = maybeDecodeUint();
+    announcement.capabilities = state.start < state.end
+      ? String(c.string.decode(state) || '')
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean)
+      : [];
 
     return announcement;
   }
@@ -139,6 +168,16 @@ function canonicalizeAnnouncement(announcement) {
   if (announcement.dispatcherReassignLagBlocks) payload.dispatcherReassignLagBlocks = announcement.dispatcherReassignLagBlocks;
   if (announcement.dispatcherCircuitBreakerThreshold) payload.dispatcherCircuitBreakerThreshold = announcement.dispatcherCircuitBreakerThreshold;
   if (announcement.dispatcherCircuitBreakerTimeoutMs) payload.dispatcherCircuitBreakerTimeoutMs = announcement.dispatcherCircuitBreakerTimeoutMs;
+  if (announcement.authMethod) payload.authMethod = announcement.authMethod;
+  if (announcement.hostPolicy) payload.hostPolicy = announcement.hostPolicy;
+  if (announcement.memberDelegationMode) payload.memberDelegationMode = announcement.memberDelegationMode;
+  if (announcement.operatorPubkey) payload.operatorPubkey = announcement.operatorPubkey;
+  if (announcement.wotRootPubkey) payload.wotRootPubkey = announcement.wotRootPubkey;
+  if (announcement.wotMaxDepth) payload.wotMaxDepth = announcement.wotMaxDepth;
+  if (announcement.wotMinFollowersDepth2) payload.wotMinFollowersDepth2 = announcement.wotMinFollowersDepth2;
+  if (Array.isArray(announcement.capabilities) && announcement.capabilities.length) {
+    payload.capabilities = announcement.capabilities;
+  }
   const json = JSON.stringify(payload);
   return Buffer.from(json, 'utf8');
 }

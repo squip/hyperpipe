@@ -1203,6 +1203,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           leaseReplicaPeerKeys: mergedLeaseReplicaPeerKeys.length ? mergedLeaseReplicaPeerKeys : undefined,
           writerIssuerPubkey,
           writerLeaseEnvelope: inviteHints.writerLeaseEnvelope || undefined,
+          gatewayAccess: inviteData?.gatewayAccess || undefined,
           blindPeer: inviteData?.blindPeer,
           cores: inviteData?.cores,
           writerCore: inviteData?.writerCore,
