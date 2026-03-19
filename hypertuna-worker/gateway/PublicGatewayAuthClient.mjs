@@ -20,6 +20,12 @@ function toHex(bytes) {
   return Buffer.from(bytes).toString('hex')
 }
 
+function normalizePubkey(value) {
+  if (typeof value !== 'string') return ''
+  const trimmed = value.trim().toLowerCase()
+  return /^[0-9a-f]{64}$/.test(trimmed) ? trimmed : ''
+}
+
 function safeLogger(logger = null) {
   const noop = () => {}
   const value = logger && typeof logger === 'object' ? logger : {}
@@ -71,27 +77,34 @@ export default class PublicGatewayAuthClient {
       this.tokenCache.clear()
       return
     }
-    const cacheKey = this.#buildCacheKey(scope, relayKey)
-    this.tokenCache.delete(cacheKey)
+    const cachePrefix = this.#buildCachePrefix(scope, relayKey)
+    for (const cacheKey of this.tokenCache.keys()) {
+      if (cacheKey.startsWith(cachePrefix)) {
+        this.tokenCache.delete(cacheKey)
+      }
+    }
   }
 
   async issueBearerToken({ scope = 'gateway:relay-register', relayKey = null, forceRefresh = false } = {}) {
     if (!this.isEnabled()) {
       throw new Error('public-gateway-auth-disabled')
     }
-    const cacheKey = this.#buildCacheKey(scope, relayKey)
+    const authContext = this.getAuthContext() || {}
+    const pubkey = normalizePubkey(authContext.pubkey)
+    const nsecHex = typeof authContext.nsecHex === 'string' ? authContext.nsecHex.trim() : ''
+    if (!pubkey) {
+      throw new Error('public-gateway-auth-context-invalid')
+    }
+
+    const cacheKey = this.#buildCacheKey(scope, relayKey, pubkey)
     if (!forceRefresh) {
       const cached = this.tokenCache.get(cacheKey)
       if (cached && cached.token && cached.expiresAt > Date.now() + 2_000) {
         return cached.token
       }
     }
-
-    const authContext = this.getAuthContext() || {}
-    const pubkey = typeof authContext.pubkey === 'string' ? authContext.pubkey.trim() : ''
-    const nsecHex = typeof authContext.nsecHex === 'string' ? authContext.nsecHex.trim() : ''
     const secretBytes = hexToBytes(nsecHex)
-    if (!pubkey || !secretBytes) {
+    if (!secretBytes) {
       throw new Error('public-gateway-auth-context-invalid')
     }
 
@@ -123,15 +136,20 @@ export default class PublicGatewayAuthClient {
       : 60
     this.tokenCache.set(cacheKey, {
       token,
-      expiresAt: Date.now() + (expiresIn * 1000)
+      expiresAt: Date.now() + (expiresIn * 1000),
+      subjectPubkey: pubkey
     })
     return token
   }
 
-  #buildCacheKey(scope, relayKey) {
+  #buildCachePrefix(scope, relayKey) {
     const normalizedScope = typeof scope === 'string' ? scope.trim() : ''
     const normalizedRelay = typeof relayKey === 'string' ? relayKey.trim() : ''
-    return `${normalizedScope}::${normalizedRelay || '*'}`
+    return `${normalizedScope}::${normalizedRelay || '*'}::`
+  }
+
+  #buildCacheKey(scope, relayKey, pubkey = '') {
+    return `${this.#buildCachePrefix(scope, relayKey)}${normalizePubkey(pubkey) || '*'}`
   }
 
   async #request(pathname, payload) {
