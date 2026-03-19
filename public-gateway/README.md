@@ -85,6 +85,8 @@ docker run -p 4430:4430 \
   -e GATEWAY_AUTH_OPERATOR_PUBKEY=<64-char-hex> \
   -e GATEWAY_AUTH_WOT_MAX_DEPTH=2 \
   -e GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2=2 \
+  -e GATEWAY_AUTH_WOT_RELAYS="wss://relay.primal.net/,wss://nos.lol/" \
+  -e GATEWAY_AUTH_WOT_LOAD_TIMEOUT_MS=12000 \
   -e GATEWAY_AUTH_ALLOWLIST_PUBKEYS=<64-char-hex>,<64-char-hex> \
   hypertuna/public-gateway
 ```
@@ -93,7 +95,7 @@ For Compose deployments ensure the `shared/` directory remains mounted so the se
 
 The gateway now defaults to relay-scoped bearer auth for restricted hosting. `GATEWAY_REGISTRATION_SECRET` is still required because the gateway signs and verifies sponsor/member tokens with that secret even when `GATEWAY_AUTH_HOST_POLICY` is not `open`.
 
-WoT host checks currently use the same relay list as Nostr discovery. Set `GATEWAY_NOSTR_DISCOVERY_RELAYS` to the relays you want the gateway to query for contact lists. There is internal support for separate WoT relay URLs, but there is not a dedicated env var for that yet.
+WoT host checks default to the discovery relay list, but can now be isolated with `GATEWAY_AUTH_WOT_RELAYS`. Use that when you want a smaller or more reliable relay set for auth decisions than the one you advertise for discovery. `GATEWAY_AUTH_WOT_LOAD_TIMEOUT_MS` and `GATEWAY_AUTH_WOT_REFRESH_MS` let you tune how aggressively the gateway fetches and refreshes the cached WoT graph.
 
 ### Configuration Reference
 
@@ -119,7 +121,7 @@ WoT host checks currently use the same relay list as Nostr discovery. Set `GATEW
 | `GATEWAY_DISCOVERY_DISPLAY_NAME` | Human-readable gateway name advertised over discovery. |
 | `GATEWAY_DISCOVERY_REGION` | Region label advertised over discovery. |
 | `GATEWAY_NOSTR_DISCOVERY_ENABLED` | Enables Nostr discovery publishing and subscription unless set to `false`. |
-| `GATEWAY_NOSTR_DISCOVERY_RELAYS` | Comma-separated Nostr relay URLs used for gateway discovery and current WoT graph loading. |
+| `GATEWAY_NOSTR_DISCOVERY_RELAYS` | Comma-separated Nostr relay URLs used for gateway discovery publishing. Also used as the WoT relay fallback when `GATEWAY_AUTH_WOT_RELAYS` is unset. |
 | `GATEWAY_AUTH_HOST_POLICY` | Host sponsorship policy: `open`, `allowlist`, `wot`, or `allowlist+wot`. |
 | `GATEWAY_AUTH_MEMBER_DELEGATION` | Relay member delegation policy: `none`, `closed-members`, or `all-members`. |
 | `GATEWAY_AUTH_OPERATOR_PUBKEY` | Operator pubkey in 64-character hex. Auto-approved and published in discovery metadata. |
@@ -127,6 +129,9 @@ WoT host checks currently use the same relay list as Nostr discovery. Set `GATEW
 | `GATEWAY_AUTH_WOT_ROOT_PUBKEY` | Optional 64-character hex WoT root. Falls back to `GATEWAY_AUTH_OPERATOR_PUBKEY` when omitted. |
 | `GATEWAY_AUTH_WOT_MAX_DEPTH` | Maximum allowed WoT distance from the root. Defaults to `1`. |
 | `GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2` | Optional follower threshold applied only to depth-2 approvals. Defaults to `0`. |
+| `GATEWAY_AUTH_WOT_RELAYS` | Optional comma-separated relay URLs used only for WoT contact-list loading. Falls back to `GATEWAY_NOSTR_DISCOVERY_RELAYS` when omitted. |
+| `GATEWAY_AUTH_WOT_LOAD_TIMEOUT_MS` | Max time in milliseconds to spend building the cached WoT graph before failing closed. Defaults to `30000`. |
+| `GATEWAY_AUTH_WOT_REFRESH_MS` | Cached WoT graph refresh interval in milliseconds. Defaults to `600000`. |
 | `GATEWAY_AUTH_MAX_RELAYS_PER_SPONSOR` | Max relays a sponsored host may register. Defaults to `100`. |
 | `GATEWAY_AUTH_MAX_MEMBERS_PER_RELAY` | Max relay member ACL rows per relay. Defaults to `500`. |
 | `GATEWAY_AUTH_MAX_OPEN_JOIN_POOL` | Max open-join pool entries per relay. Defaults to `100`. |
@@ -144,7 +149,8 @@ WoT host checks currently use the same relay list as Nostr discovery. Set `GATEW
 - `GATEWAY_AUTH_HOST_POLICY=wot` means only WoT-approved pubkeys may sponsor new relays on the gateway.
 - `GATEWAY_AUTH_HOST_POLICY=allowlist+wot` means a pubkey may sponsor a relay if it is either explicitly allowlisted or passes WoT.
 - `GATEWAY_AUTH_MEMBER_DELEGATION=all-members` is the setting that preserves offline join parity for sponsored relays, because it lets trusted relay sponsors delegate relay-scoped mirror access to their members.
-- The current WoT implementation uses `@nostr-dev-kit/wot` and evaluates trust from the configured root user outward using contact-list depth. Depth-2 approvals can optionally require multiple in-graph followers via `GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2`.
+- The current WoT implementation uses a bounded relay fetcher that loads the latest kind `3` contact lists for the configured root and its reachable follow graph, then evaluates trust from that root outward by depth. Depth-2 approvals can optionally require multiple in-graph followers via `GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2`.
+- If one discovery relay is slow or unreliable, prefer setting `GATEWAY_AUTH_WOT_RELAYS` to a smaller dedicated relay set rather than coupling auth to every discovery relay.
 
 ### Suggested Policies
 

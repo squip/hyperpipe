@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "pear run -d .",
     "test": "brittle test/*.test.js",
-    "test:ipc": "brittle test/group-file-ipc.test.js test/public-gateway-hyperbee-adapter.test.js"
+    "test:ipc": "brittle test/group-file-ipc.test.js test/public-gateway-hyperbee-adapter.test.js",
+    "gateway:auth-fixture": "node ./bin/generate-gateway-auth-fixture.mjs",
+    "gateway:auth-validate": "node ./bin/validate-gateway-auth-fixture.mjs"
   },
   "pear": {
     "name": "worker-app",

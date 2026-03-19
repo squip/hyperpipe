@@ -7,8 +7,6 @@ import WebSocket, { WebSocketServer } from 'ws';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { schnorr } from '@noble/curves/secp256k1';
-import NDK from '@nostr-dev-kit/ndk';
-import { NDKWoT } from '@nostr-dev-kit/wot';
 import HypercoreId from 'hypercore-id-encoding';
 
 import {
@@ -54,6 +52,7 @@ import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGate
 import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hyperbeeReplicationChannel.mjs';
 import BlindPeerService from './blind-peer/BlindPeerService.mjs';
 import BlindPeerReplicaManager from './blind-peer/BlindPeerReplicaManager.mjs';
+import { buildWotGraphFromRelays } from './utils/WotGraphLoader.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores';
@@ -377,7 +376,6 @@ class PublicGatewayService {
     };
     this.discoveryConfig = config.discovery || {};
     this.wotState = {
-      ndk: null,
       wot: null,
       rootPubkey: null,
       relayUrls: [],
@@ -1315,23 +1313,14 @@ class PublicGatewayService {
 
     const task = (async () => {
       const depth = Math.max(1, Math.trunc(Number(this.authConfig?.wotMaxDepth) || 1));
-      const ndk = this.wotState?.ndk && this.wotState.rootPubkey === rootPubkey
-        ? this.wotState.ndk
-        : new NDK({
-          explicitRelayUrls: relayUrls.length ? relayUrls : undefined,
-          autoConnectUserRelays: false,
-          enableOutboxModel: false,
-          filterValidationMode: 'fix'
-        });
-      await ndk.connect(this.wotLoadTimeoutMs);
-      const wot = new NDKWoT(ndk, rootPubkey);
-      await wot.load({
+      const wot = await buildWotGraphFromRelays({
+        rootPubkey,
+        relayUrls,
         depth,
-        timeout: this.wotLoadTimeoutMs,
-        relayUrls: relayUrls.length ? relayUrls : undefined
+        timeoutMs: this.wotLoadTimeoutMs,
+        logger: this.logger
       });
       this.wotState = {
-        ndk,
         wot,
         rootPubkey,
         relayUrls,

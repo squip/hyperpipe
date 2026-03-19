@@ -83,8 +83,11 @@ const DEFAULT_CONFIG = {
     operatorPubkey: process.env.GATEWAY_AUTH_OPERATOR_PUBKEY || null,
     allowlistPubkeys: parseCsvList(process.env.GATEWAY_AUTH_ALLOWLIST_PUBKEYS),
     wotRootPubkey: process.env.GATEWAY_AUTH_WOT_ROOT_PUBKEY || null,
+    wotRelayUrls: parseCsvList(process.env.GATEWAY_AUTH_WOT_RELAYS),
     wotMaxDepth: parseEnvNumber('GATEWAY_AUTH_WOT_MAX_DEPTH', 1),
     wotMinFollowersDepth2: parseEnvNumber('GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2', 0),
+    wotRefreshIntervalMs: parseEnvNumber('GATEWAY_AUTH_WOT_REFRESH_MS', 10 * 60 * 1000),
+    wotLoadTimeoutMs: parseEnvNumber('GATEWAY_AUTH_WOT_LOAD_TIMEOUT_MS', 30_000),
     quotas: {
       maxRelaysPerSponsor: parseEnvNumber('GATEWAY_AUTH_MAX_RELAYS_PER_SPONSOR', 100),
       maxMembersPerRelay: parseEnvNumber('GATEWAY_AUTH_MAX_MEMBERS_PER_RELAY', 500),
@@ -345,12 +348,23 @@ function normalizeAuthSettings(settings = {}) {
       .filter(Boolean)
   ));
   result.wotRootPubkey = normalizeHexPubkey(result.wotRootPubkey);
+  result.wotRelayUrls = Array.from(new Set(
+    (Array.isArray(result.wotRelayUrls) ? result.wotRelayUrls : [])
+      .map((value) => (typeof value === 'string' ? value.trim() : ''))
+      .filter(Boolean)
+  ));
   result.wotMaxDepth = Number.isFinite(Number(result.wotMaxDepth))
     ? Math.max(1, Math.trunc(Number(result.wotMaxDepth)))
     : 1;
   result.wotMinFollowersDepth2 = Number.isFinite(Number(result.wotMinFollowersDepth2))
     ? Math.max(0, Math.trunc(Number(result.wotMinFollowersDepth2)))
     : 0;
+  result.wotRefreshIntervalMs = Number.isFinite(Number(result.wotRefreshIntervalMs))
+    ? Math.max(60_000, Math.trunc(Number(result.wotRefreshIntervalMs)))
+    : (10 * 60 * 1000);
+  result.wotLoadTimeoutMs = Number.isFinite(Number(result.wotLoadTimeoutMs))
+    ? Math.max(1_000, Math.trunc(Number(result.wotLoadTimeoutMs)))
+    : 30_000;
   result.quotas = {
     maxRelaysPerSponsor: Number.isFinite(Number(result.quotas?.maxRelaysPerSponsor))
       ? Math.max(0, Math.trunc(Number(result.quotas.maxRelaysPerSponsor)))
