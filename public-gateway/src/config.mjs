@@ -82,6 +82,8 @@ const DEFAULT_CONFIG = {
     memberDelegationMode: (process.env.GATEWAY_AUTH_MEMBER_DELEGATION || 'all-members').trim().toLowerCase(),
     operatorPubkey: process.env.GATEWAY_AUTH_OPERATOR_PUBKEY || null,
     allowlistPubkeys: parseCsvList(process.env.GATEWAY_AUTH_ALLOWLIST_PUBKEYS),
+    allowlistFile: process.env.GATEWAY_AUTH_ALLOWLIST_FILE || null,
+    allowlistRefreshMs: parseEnvNumber('GATEWAY_AUTH_ALLOWLIST_REFRESH_MS', 5000),
     wotRootPubkey: process.env.GATEWAY_AUTH_WOT_ROOT_PUBKEY || null,
     wotRelayUrls: parseCsvList(process.env.GATEWAY_AUTH_WOT_RELAYS),
     wotMaxDepth: parseEnvNumber('GATEWAY_AUTH_WOT_MAX_DEPTH', 1),
@@ -347,6 +349,12 @@ function normalizeAuthSettings(settings = {}) {
       .map((value) => normalizeHexPubkey(value))
       .filter(Boolean)
   ));
+  result.allowlistFile = typeof result.allowlistFile === 'string' && result.allowlistFile.trim().length
+    ? result.allowlistFile.trim()
+    : null;
+  result.allowlistRefreshMs = Number.isFinite(Number(result.allowlistRefreshMs))
+    ? Math.max(0, Math.trunc(Number(result.allowlistRefreshMs)))
+    : 5000;
   result.wotRootPubkey = normalizeHexPubkey(result.wotRootPubkey);
   result.wotRelayUrls = Array.from(new Set(
     (Array.isArray(result.wotRelayUrls) ? result.wotRelayUrls : [])

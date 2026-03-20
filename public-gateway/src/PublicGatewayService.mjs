@@ -1,7 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
 import { createHash, randomBytes } from 'node:crypto';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import WebSocket, { WebSocketServer } from 'ws';
 import helmet from 'helmet';
@@ -53,11 +54,13 @@ import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hype
 import BlindPeerService from './blind-peer/BlindPeerService.mjs';
 import BlindPeerReplicaManager from './blind-peer/BlindPeerReplicaManager.mjs';
 import { buildWotGraphFromRelays } from './utils/WotGraphLoader.mjs';
+import AllowlistStore from './utils/AllowlistStore.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores';
 const RELAY_OPEN_JOIN_PURPOSE = 'relay-open-join';
 const RELAY_INVITE_CLAIM_PURPOSE = 'relay-invite-claim';
+const ADMIN_ALLOWLIST_PURPOSE = 'gateway:allowlist-admin';
 const JOIN_TRACE_ID_HEADER = 'x-hypertuna-join-trace-id';
 const JOIN_TRACE_ATTEMPT_ID_HEADER = 'x-hypertuna-join-attempt-id';
 const JOIN_TRACE_REQUEST_ID_HEADER = 'x-hypertuna-worker-request-id';
@@ -72,6 +75,10 @@ const AUTHORITATIVE_MIRROR_FAST_FORWARD_SOURCES = new Set([
   'gateway-mirror-authoritative',
   'blind-peer-cache-authoritative'
 ]);
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const ADMIN_ASSET_DIR = resolve(MODULE_DIR, 'admin');
+const NOBLE_CURVES_ESM_DIR = resolve(MODULE_DIR, '..', 'node_modules', '@noble', 'curves', 'esm');
+const NOBLE_HASHES_ESM_DIR = resolve(MODULE_DIR, '..', 'node_modules', '@noble', 'hashes', 'esm');
 
 function safeString(value) {
   if (typeof value === 'string') return value;
@@ -80,6 +87,14 @@ function safeString(value) {
   } catch (_) {
     return null;
   }
+}
+
+function escapeHtmlAttribute(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
 }
 
 function normalizeHexPubkey(value) {
@@ -365,6 +380,7 @@ class PublicGatewayService {
     this.openJoinConfig = this.#normalizeOpenJoinConfig(config?.openJoin);
     this.openJoinChallenges = new Map();
     this.authChallenges = new Map();
+    this.adminAuthChallenges = new Map();
     this.openJoinLeaseLocks = new Set();
     this.openJoinTelemetry = {
       poolDepletion: {
@@ -392,6 +408,14 @@ class PublicGatewayService {
       5_000,
       Number(this.authConfig?.wotLoadTimeoutMs) || 30_000
     );
+    this.allowlistStore = this.#allowlistStoreEnabled()
+      ? new AllowlistStore({
+        filePath: this.authConfig?.allowlistFile,
+        refreshMs: this.authConfig?.allowlistRefreshMs,
+        bootstrapPubkeys: this.authConfig?.allowlistPubkeys || [],
+        logger: this.logger
+      })
+      : null;
     this.explicitSharedSecretVersion = this.discoveryConfig?.sharedSecretVersion || null;
     this.sharedSecretVersion = this.explicitSharedSecretVersion;
     this.secretEndpointPath = this.#normalizeSecretPath(this.discoveryConfig?.secretPath);
@@ -622,6 +646,14 @@ class PublicGatewayService {
 
   async init() {
     this.#setupHttpServer();
+    if (this.allowlistStore?.enabled) {
+      await this.allowlistStore.initialize();
+      this.logger?.info?.('[PublicGateway] Live allowlist store initialized', {
+        filePath: this.authConfig?.allowlistFile,
+        allowlistCount: this.allowlistStore.snapshot().count,
+        source: this.allowlistStore.snapshot().source
+      });
+    }
     await this.connectionPool.initialize();
     if (Number.isFinite(this.config?.registration?.relayGcAfterMs) && this.config.registration.relayGcAfterMs > 0) {
       this.logger?.info?.('[PublicGateway] Relay GC policy enabled', {
@@ -795,6 +827,13 @@ class PublicGatewayService {
 
   #setupHttpServer() {
     const app = this.app;
+    const requireAllowlistAdmin = (req, res, next) => {
+      if (!this.#allowlistAdminEnabled()) {
+        return res.status(404).json({ error: 'not-found' });
+      }
+      this.#setNoStore(res);
+      return next();
+    };
     app.disable('x-powered-by');
     app.use((req, res, next) => {
       res.header('Access-Control-Allow-Origin', '*');
@@ -824,6 +863,31 @@ class PublicGatewayService {
     if (this.config.metrics?.enabled) {
       app.use(metricsMiddleware(this.config.metrics.path));
     }
+
+    app.use(
+      '/admin/allowlist/assets',
+      requireAllowlistAdmin,
+      express.static(ADMIN_ASSET_DIR, {
+        index: false,
+        setHeaders: (res) => this.#setNoStore(res)
+      })
+    );
+    app.use(
+      '/admin/allowlist/vendor/@noble/curves',
+      requireAllowlistAdmin,
+      express.static(NOBLE_CURVES_ESM_DIR, {
+        index: false,
+        setHeaders: (res) => this.#setNoStore(res)
+      })
+    );
+    app.use(
+      '/admin/allowlist/vendor/@noble/hashes',
+      requireAllowlistAdmin,
+      express.static(NOBLE_HASHES_ESM_DIR, {
+        index: false,
+        setHeaders: (res) => this.#setNoStore(res)
+      })
+    );
 
     app.get('/api/blind-peer', (req, res) => this.#handleBlindPeerStatus(req, res));
     app.get('/api/blind-peer/replicas', (req, res) => this.#handleBlindPeerReplicas(req, res));
@@ -903,6 +967,11 @@ class PublicGatewayService {
     app.post('/api/relays', (req, res) => this.#handleRelayRegistration(req, res));
     app.delete('/api/relays/:relayKey', (req, res) => this.#handleRelayDeletion(req, res));
     app.get('/api/relays/:relayKey/mirror', (req, res) => this.#handleRelayMirrorMetadata(req, res));
+    app.get('/admin/allowlist', (req, res) => this.#handleAllowlistAdminPage(req, res));
+    app.post('/api/admin/auth/challenge', (req, res) => this.#handleAdminAuthChallenge(req, res));
+    app.post('/api/admin/auth/verify', (req, res) => this.#handleAdminAuthVerify(req, res));
+    app.get('/api/admin/allowlist', (req, res) => this.#handleAdminAllowlistGet(req, res));
+    app.put('/api/admin/allowlist', (req, res) => this.#handleAdminAllowlistPut(req, res));
     app.post('/api/auth/challenge', (req, res) => this.#handleAuthChallenge(req, res));
     app.post('/api/auth/verify', (req, res) => this.#handleAuthVerify(req, res));
     app.get('/api/relays/:relayKey/access/challenge', (req, res) => this.#handleRelayAccessChallenge(req, res));
@@ -1245,12 +1314,105 @@ class PublicGatewayService {
     return entry;
   }
 
+  #pruneAdminAuthChallenges() {
+    if (!this.adminAuthChallenges?.size) return;
+    const now = Date.now();
+    for (const [challenge, entry] of this.adminAuthChallenges.entries()) {
+      if (!entry?.expiresAt || entry.expiresAt <= now) {
+        this.adminAuthChallenges.delete(challenge);
+      }
+    }
+  }
+
+  #issueAdminAuthChallenge(pubkey) {
+    this.#pruneAdminAuthChallenges();
+    const normalizedPubkey = normalizeHexPubkey(pubkey);
+    const now = Date.now();
+    const ttlMs = this.openJoinConfig?.challengeTtlMs || 120000;
+    const challenge = randomBytes(24).toString('hex');
+    const entry = {
+      challenge,
+      pubkey: normalizedPubkey,
+      issuedAt: now,
+      expiresAt: now + ttlMs,
+      purpose: ADMIN_ALLOWLIST_PURPOSE
+    };
+    this.adminAuthChallenges.set(challenge, entry);
+    return entry;
+  }
+
+  #consumeAdminAuthChallenge(challenge) {
+    if (!challenge) return null;
+    this.#pruneAdminAuthChallenges();
+    const normalizedChallenge = String(challenge).trim();
+    const entry = this.adminAuthChallenges.get(normalizedChallenge) || null;
+    if (!entry) return null;
+    this.adminAuthChallenges.delete(normalizedChallenge);
+    if (entry.expiresAt && entry.expiresAt <= Date.now()) return null;
+    return entry;
+  }
+
+  #setNoStore(res) {
+    try {
+      res.setHeader('Cache-Control', 'no-store');
+    } catch (_) {}
+  }
+
+  #allowlistPolicyEnabled() {
+    const hostPolicy = this.authConfig?.hostPolicy || 'open';
+    return hostPolicy === 'allowlist' || hostPolicy === 'allowlist+wot';
+  }
+
+  #allowlistStoreEnabled() {
+    return this.#allowlistPolicyEnabled() && typeof this.authConfig?.allowlistFile === 'string' && this.authConfig.allowlistFile.length > 0;
+  }
+
+  #allowlistAdminEnabled() {
+    return this.#allowlistStoreEnabled()
+      && !!this.sharedSecret
+      && !!normalizeHexPubkey(this.authConfig?.operatorPubkey)
+      && !!this.allowlistStore?.enabled;
+  }
+
+  async #ensureAllowlistState({ force = false } = {}) {
+    if (!this.allowlistStore?.enabled) {
+      return {
+        version: 1,
+        updatedAt: null,
+        updatedBy: null,
+        pubkeys: Array.isArray(this.authConfig?.allowlistPubkeys)
+          ? [...this.authConfig.allowlistPubkeys]
+          : [],
+        count: Array.isArray(this.authConfig?.allowlistPubkeys) ? this.authConfig.allowlistPubkeys.length : 0,
+        source: 'env',
+        lastError: null
+      };
+    }
+    return this.allowlistStore.ensureFresh({ force });
+  }
+
+  async #isAllowlisted(subjectPubkey) {
+    const normalizedSubjectPubkey = normalizeHexPubkey(subjectPubkey);
+    if (!normalizedSubjectPubkey) return false;
+    if (this.allowlistStore?.enabled) {
+      await this.#ensureAllowlistState();
+      return this.allowlistStore.has(normalizedSubjectPubkey);
+    }
+    return Array.isArray(this.authConfig?.allowlistPubkeys)
+      && this.authConfig.allowlistPubkeys.includes(normalizedSubjectPubkey);
+  }
+
   #policySnapshot() {
+    const allowlistSnapshot = this.allowlistStore?.enabled
+      ? this.allowlistStore.snapshot()
+      : null;
     return {
       hostPolicy: this.authConfig?.hostPolicy || 'open',
       memberDelegationMode: this.authConfig?.memberDelegationMode || 'all-members',
       operatorPubkey: this.authConfig?.operatorPubkey || null,
-      allowlistCount: Array.isArray(this.authConfig?.allowlistPubkeys) ? this.authConfig.allowlistPubkeys.length : 0,
+      allowlistCount: allowlistSnapshot
+        ? allowlistSnapshot.count
+        : (Array.isArray(this.authConfig?.allowlistPubkeys) ? this.authConfig.allowlistPubkeys.length : 0),
       wotRootPubkey: this.authConfig?.wotRootPubkey || null,
       wotMaxDepth: this.authConfig?.wotMaxDepth || null,
       wotMinFollowersDepth2: this.authConfig?.wotMinFollowersDepth2 || null
@@ -1411,8 +1573,9 @@ class PublicGatewayService {
       return { authorized: false, reason: 'gateway-host-unauthorized', source: 'invalid-pubkey' };
     }
     const hostPolicy = this.authConfig?.hostPolicy || 'open';
-    const allowlisted = Array.isArray(this.authConfig?.allowlistPubkeys)
-      && this.authConfig.allowlistPubkeys.includes(normalizedSubjectPubkey);
+    const allowlisted = this.#allowlistPolicyEnabled()
+      ? await this.#isAllowlisted(normalizedSubjectPubkey)
+      : false;
     const wotEvaluation = await this.#evaluateWotAccess(normalizedSubjectPubkey);
     const wotApproved = wotEvaluation.approved === true;
 
@@ -4172,6 +4335,190 @@ class PublicGatewayService {
       expiresIn: issued.expiresIn,
       expiresAt: issued.expiresAt
     });
+  }
+
+  #renderAllowlistAdminPage() {
+    const nonce = randomBytes(16).toString('base64');
+    const operatorPubkey = escapeHtmlAttribute(normalizeHexPubkey(this.authConfig?.operatorPubkey) || '');
+    const relay = escapeHtmlAttribute(this.config?.publicBaseUrl || '');
+    const csp = [
+      "default-src 'self'",
+      "base-uri 'none'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+      "object-src 'none'",
+      "img-src 'self' data:",
+      "connect-src 'self'",
+      `script-src 'self' 'nonce-${nonce}'`,
+      "style-src 'self'"
+    ].join('; ');
+    const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Gateway Allowlist Admin</title>
+    <meta http-equiv="Cache-Control" content="no-store">
+    <link rel="stylesheet" href="/admin/allowlist/assets/allowlist-admin.css">
+    <script type="importmap" nonce="${nonce}">
+      {
+        "imports": {
+          "@noble/curves/": "/admin/allowlist/vendor/@noble/curves/",
+          "@noble/hashes/": "/admin/allowlist/vendor/@noble/hashes/"
+        }
+      }
+    </script>
+    <script
+      type="module"
+      nonce="${nonce}"
+      src="/admin/allowlist/assets/allowlist-admin.js"
+    ></script>
+  </head>
+  <body>
+    <main
+      id="allowlist-admin-root"
+      data-operator-pubkey="${operatorPubkey}"
+      data-relay="${relay}"
+      data-purpose="${ADMIN_ALLOWLIST_PURPOSE}"
+    >
+      <section>
+        <p>Public Gateway</p>
+        <h1>Allowlist Pubkeys</h1>
+        <p>Loading the live allowlist editor…</p>
+      </section>
+      <noscript>This page requires JavaScript.</noscript>
+    </main>
+  </body>
+</html>`;
+    return { html, csp };
+  }
+
+  async #handleAllowlistAdminPage(_req, res) {
+    if (!this.#allowlistAdminEnabled()) {
+      return res.status(404).send('Not Found');
+    }
+    this.#setNoStore(res);
+    const { html, csp } = this.#renderAllowlistAdminPage();
+    res.setHeader('Content-Security-Policy', csp);
+    res.type('html');
+    return res.status(200).send(html);
+  }
+
+  async #handleAdminAuthChallenge(req, res) {
+    this.#setNoStore(res);
+    if (!this.#allowlistAdminEnabled()) {
+      return res.status(404).json({ error: 'not-found' });
+    }
+    const pubkey = normalizeHexPubkey(req.body?.pubkey);
+    const operatorPubkey = normalizeHexPubkey(this.authConfig?.operatorPubkey);
+    if (!pubkey) {
+      return res.status(400).json({ error: 'pubkey-required' });
+    }
+    if (!operatorPubkey || pubkey !== operatorPubkey) {
+      return res.status(403).json({ error: 'gateway-admin-unauthorized' });
+    }
+    const challenge = this.#issueAdminAuthChallenge(pubkey);
+    return res.json({
+      challenge: challenge.challenge,
+      expiresAt: challenge.expiresAt,
+      purpose: ADMIN_ALLOWLIST_PURPOSE,
+      relay: this.config?.publicBaseUrl || ''
+    });
+  }
+
+  async #handleAdminAuthVerify(req, res) {
+    this.#setNoStore(res);
+    if (!this.#allowlistAdminEnabled()) {
+      return res.status(404).json({ error: 'not-found' });
+    }
+    const authEvent = req.body?.authEvent;
+    if (!authEvent || typeof authEvent !== 'object') {
+      return res.status(400).json({ error: 'authEvent-required' });
+    }
+    const pubkey = normalizeHexPubkey(authEvent.pubkey);
+    const operatorPubkey = normalizeHexPubkey(this.authConfig?.operatorPubkey);
+    if (!pubkey || !operatorPubkey || pubkey !== operatorPubkey) {
+      return res.status(403).json({ error: 'gateway-admin-unauthorized' });
+    }
+    const challengeTag = this.#extractTagValue(Array.isArray(authEvent.tags) ? authEvent.tags : [], 'challenge');
+    const challenge = this.#consumeAdminAuthChallenge(challengeTag);
+    if (!challenge || challenge.pubkey !== pubkey) {
+      return res.status(401).json({ error: 'invalid-auth-challenge' });
+    }
+    const verification = await this.#verifyOpenJoinAuthEvent(authEvent, {
+      challenge: challenge.challenge,
+      purpose: ADMIN_ALLOWLIST_PURPOSE
+    });
+    if (!verification?.ok) {
+      return res.status(401).json({ error: verification?.error || 'invalid-auth-event' });
+    }
+    const issued = await this.#issueGatewayBearerToken({
+      subjectPubkey: pubkey,
+      scope: ADMIN_ALLOWLIST_PURPOSE,
+      ttlSeconds: 300
+    });
+    return res.json({
+      token: issued.token,
+      expiresAt: issued.expiresAt,
+      pubkey,
+      scope: ADMIN_ALLOWLIST_PURPOSE
+    });
+  }
+
+  async #handleAdminAllowlistGet(req, res) {
+    this.#setNoStore(res);
+    if (!this.#allowlistAdminEnabled()) {
+      return res.status(404).json({ error: 'not-found' });
+    }
+    const auth = await this.#authenticateGatewayRequest(req, {
+      requiredScope: ADMIN_ALLOWLIST_PURPOSE
+    });
+    const operatorPubkey = normalizeHexPubkey(this.authConfig?.operatorPubkey);
+    if (!auth || normalizeHexPubkey(auth.subjectPubkey) !== operatorPubkey) {
+      return res.status(401).json({ error: 'gateway-admin-unauthorized' });
+    }
+    const snapshot = await this.#ensureAllowlistState();
+    return res.json(snapshot);
+  }
+
+  async #handleAdminAllowlistPut(req, res) {
+    this.#setNoStore(res);
+    if (!this.#allowlistAdminEnabled()) {
+      return res.status(404).json({ error: 'not-found' });
+    }
+    const auth = await this.#authenticateGatewayRequest(req, {
+      requiredScope: ADMIN_ALLOWLIST_PURPOSE
+    });
+    const operatorPubkey = normalizeHexPubkey(this.authConfig?.operatorPubkey);
+    if (!auth || normalizeHexPubkey(auth.subjectPubkey) !== operatorPubkey) {
+      return res.status(401).json({ error: 'gateway-admin-unauthorized' });
+    }
+    if (!Array.isArray(req.body?.pubkeys)) {
+      return res.status(400).json({ error: 'pubkeys-array-required' });
+    }
+    const normalized = [];
+    for (const value of req.body.pubkeys) {
+      const pubkey = normalizeHexPubkey(value);
+      if (!pubkey) {
+        return res.status(400).json({ error: 'invalid-pubkey' });
+      }
+      normalized.push(pubkey);
+    }
+    if (!this.allowlistStore?.enabled) {
+      return res.status(503).json({ error: 'live-allowlist-disabled' });
+    }
+    try {
+      const snapshot = await this.allowlistStore.replacePubkeys(normalized, {
+        updatedBy: operatorPubkey
+      });
+      return res.json(snapshot);
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Failed to persist allowlist update', {
+        filePath: this.authConfig?.allowlistFile,
+        error: error?.message || error
+      });
+      return res.status(500).json({ error: 'allowlist-write-failed', message: error?.message || String(error) });
+    }
   }
 
   async #handleRelayAccessChallenge(req, res) {

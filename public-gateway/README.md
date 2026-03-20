@@ -78,7 +78,6 @@ docker run -p 4430:4430 \
   -e GATEWAY_REGISTRATION_REDIS=redis://redis:6379 \
   -e GATEWAY_DISCOVERY_ENABLED=true \
   -e GATEWAY_DISCOVERY_DISPLAY_NAME="Example Gateway" \
-  -e GATEWAY_DISCOVERY_REGION="us-west" \
   -e GATEWAY_NOSTR_DISCOVERY_RELAYS="wss://relay.damus.io/,wss://relay.primal.net/,wss://nos.lol/" \
   -e GATEWAY_AUTH_HOST_POLICY=allowlist+wot \
   -e GATEWAY_AUTH_MEMBER_DELEGATION=all-members \
@@ -88,6 +87,8 @@ docker run -p 4430:4430 \
   -e GATEWAY_AUTH_WOT_RELAYS="wss://relay.primal.net/,wss://nos.lol/" \
   -e GATEWAY_AUTH_WOT_LOAD_TIMEOUT_MS=12000 \
   -e GATEWAY_AUTH_ALLOWLIST_PUBKEYS=<64-char-hex>,<64-char-hex> \
+  -e GATEWAY_AUTH_ALLOWLIST_FILE=/data/config/allowlist.json \
+  -e GATEWAY_AUTH_ALLOWLIST_REFRESH_MS=5000 \
   hypertuna/public-gateway
 ```
 
@@ -96,6 +97,8 @@ For Compose deployments ensure the `shared/` directory remains mounted so the se
 The gateway now defaults to relay-scoped bearer auth for restricted hosting. `GATEWAY_REGISTRATION_SECRET` is still required because the gateway signs and verifies sponsor/member tokens with that secret even when `GATEWAY_AUTH_HOST_POLICY` is not `open`.
 
 WoT host checks default to the discovery relay list, but can now be isolated with `GATEWAY_AUTH_WOT_RELAYS`. Use that when you want a smaller or more reliable relay set for auth decisions than the one you advertise for discovery. `GATEWAY_AUTH_WOT_LOAD_TIMEOUT_MS` and `GATEWAY_AUTH_WOT_REFRESH_MS` let you tune how aggressively the gateway fetches and refreshes the cached WoT graph.
+
+If you want to edit the allowlist live without restarting the container, set `GATEWAY_AUTH_ALLOWLIST_FILE`. When the host policy is `allowlist` or `allowlist+wot`, the gateway will hot-reload that file and expose an operator-only admin page at `/admin/allowlist`.
 
 ### Configuration Reference
 
@@ -126,6 +129,8 @@ WoT host checks default to the discovery relay list, but can now be isolated wit
 | `GATEWAY_AUTH_MEMBER_DELEGATION` | Relay member delegation policy: `none`, `closed-members`, or `all-members`. |
 | `GATEWAY_AUTH_OPERATOR_PUBKEY` | Operator pubkey in 64-character hex. Auto-approved and published in discovery metadata. |
 | `GATEWAY_AUTH_ALLOWLIST_PUBKEYS` | Comma-separated 64-character hex pubkeys approved for `allowlist` or `allowlist+wot`. |
+| `GATEWAY_AUTH_ALLOWLIST_FILE` | Optional JSON file path for the live allowlist store. When set with `allowlist` or `allowlist+wot`, the gateway hot-reloads this file and exposes `/admin/allowlist`. |
+| `GATEWAY_AUTH_ALLOWLIST_REFRESH_MS` | How often to re-stat the allowlist file before auth checks and admin reads. Defaults to `5000`. |
 | `GATEWAY_AUTH_WOT_ROOT_PUBKEY` | Optional 64-character hex WoT root. Falls back to `GATEWAY_AUTH_OPERATOR_PUBKEY` when omitted. |
 | `GATEWAY_AUTH_WOT_MAX_DEPTH` | Maximum allowed WoT distance from the root. Defaults to `1`. |
 | `GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2` | Optional follower threshold applied only to depth-2 approvals. Defaults to `0`. |
@@ -163,6 +168,28 @@ WoT host checks default to the discovery relay list, but can now be isolated wit
   - `GATEWAY_AUTH_WOT_MAX_DEPTH=2`
   - `GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2=2`
   - `GATEWAY_AUTH_MEMBER_DELEGATION=all-members`
+
+### Live Allowlist Admin
+
+- Live allowlist management is opt-in. Set `GATEWAY_AUTH_ALLOWLIST_FILE=/data/config/allowlist.json` and use `GATEWAY_AUTH_HOST_POLICY=allowlist` or `allowlist+wot`.
+- The file format is:
+
+```json
+{
+  "version": 1,
+  "updatedAt": 1770000000000,
+  "updatedBy": "64-char-hex-pubkey",
+  "pubkeys": [
+    "64-char-hex-pubkey"
+  ]
+}
+```
+
+- The gateway normalizes `pubkeys` to lowercase, unique, sorted 64-character hex strings.
+- If the file is missing on first boot and `GATEWAY_AUTH_ALLOWLIST_PUBKEYS` is non-empty, the gateway seeds the file from the env value once and then continues from the file.
+- The operator admin page lives at `/admin/allowlist`.
+- Admin auth is operator-only and uses a signed kind `22242` auth event with purpose `gateway:allowlist-admin`.
+- Admin bearer tokens are short-lived, in-memory only, and scoped to allowlist editing.
 
 ### Testing
 
