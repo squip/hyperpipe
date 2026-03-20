@@ -48,6 +48,7 @@ function createExecStub({
   dockerOk = true,
   composeOk = true,
   dockerInfoOk = true,
+  dockerInfoStderr = 'daemon unavailable',
   composeConfigOk = true,
   composeUpOk = true,
   containerStates = { gateway: 'running' }
@@ -56,7 +57,12 @@ function createExecStub({
   const execStub = async (command, args) => {
     calls.push({ command, args });
 
-    if (command === 'docker' && args[0] === 'version') {
+    if (command === 'sudo') {
+      command = args[0];
+      args = args.slice(1);
+    }
+
+    if (command === 'docker' && args[0] === '--version') {
       return dockerOk ? execResult(true, 'Docker version 26.0.0') : execResult(false, '', 'docker missing');
     }
     if (command === 'docker' && args[0] === 'compose' && args[1] === 'version') {
@@ -66,7 +72,7 @@ function createExecStub({
       return composeOk ? execResult(true, 'docker-compose version 1.29.2') : execResult(false, '', 'compose missing');
     }
     if (command === 'docker' && args[0] === 'info') {
-      return dockerInfoOk ? execResult(true, 'Docker info') : execResult(false, '', 'daemon unavailable');
+      return dockerInfoOk ? execResult(true, 'Docker info') : execResult(false, '', dockerInfoStderr);
     }
     if (command === 'docker' && args[0] === 'compose' && args.includes('config')) {
       return composeConfigOk ? execResult(true, 'services: {}') : execResult(false, '', 'invalid compose');
@@ -187,6 +193,63 @@ test('runCheckCommand fails cleanly when Docker is unavailable', async (t) => {
 
   assert.equal(result.ok, false);
   assert.match(result.errors.join('\n'), /Docker CLI is not available/u);
+});
+
+test('runCheckCommand surfaces docker socket permission errors clearly', async (t) => {
+  const dir = await createTempDir(t);
+  const envFile = join(dir, 'gateway.env');
+  const io = createIo();
+
+  await runInitCommand({
+    deployEnv: envFile,
+    nonInteractive: true,
+    profile: 'open',
+    host: 'example.com',
+    email: 'admin@example.com',
+    displayName: 'Example Public Gateway',
+    discoveryRelays: 'wss://relay.damus.io/,wss://relay.primal.net/'
+  }, io);
+
+  const execStub = createExecStub({
+    dockerInfoOk: false,
+    dockerInfoStderr: 'permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock'
+  });
+  const result = await runCheckCommand({
+    deployEnv: envFile,
+    skipPortChecks: true
+  }, io, execStub);
+
+  assert.equal(result.ok, false);
+  assert.match(result.errors.join('\n'), /Docker daemon socket is not accessible to the current user/u);
+  assert.match(result.errors.join('\n'), /--sudo-docker/u);
+});
+
+test('runCheckCommand supports a sudo docker wrapper when requested', async (t) => {
+  const dir = await createTempDir(t);
+  const envFile = join(dir, 'gateway.env');
+  const io = createIo();
+
+  await runInitCommand({
+    deployEnv: envFile,
+    nonInteractive: true,
+    profile: 'open',
+    host: 'example.com',
+    email: 'admin@example.com',
+    displayName: 'Example Public Gateway',
+    discoveryRelays: 'wss://relay.damus.io/,wss://relay.primal.net/'
+  }, io);
+
+  const execStub = createExecStub();
+  const result = await runCheckCommand({
+    deployEnv: envFile,
+    skipPortChecks: true,
+    sudoDocker: true
+  }, io, execStub);
+
+  assert.equal(result.ok, true);
+  const sudoCalls = execStub.calls.filter((entry) => entry.command === 'sudo');
+  assert.ok(sudoCalls.length > 0);
+  assert.ok(sudoCalls.some((entry) => entry.args[0] === 'docker'));
 });
 
 test('runCheckCommand surfaces docker compose config failures', async (t) => {

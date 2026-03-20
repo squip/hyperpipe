@@ -73,6 +73,8 @@ test('allowlist profile requires allowlist pubkeys and validates when present', 
   assert.deepEqual(validValidation.errors, []);
   assert.equal(validConfig.GATEWAY_AUTH_HOST_POLICY, 'allowlist');
   assert.equal(validConfig.GATEWAY_DISCOVERY_OPEN_ACCESS, 'false');
+  assert.equal(validConfig.GATEWAY_AUTH_ALLOWLIST_FILE, '/data/config/allowlist.json');
+  assert.equal(validConfig.GATEWAY_AUTH_ALLOWLIST_REFRESH_MS, '5000');
 });
 
 test('wot profile defaults root and auth relays and picks the correct default policy column', () => {
@@ -109,6 +111,7 @@ test('allowlist+wot profile validates the union of allowlist and wot settings', 
   const validation = validateConfig(config);
   assert.deepEqual(validation.errors, []);
   assert.equal(config.GATEWAY_AUTH_HOST_POLICY, 'allowlist+wot');
+  assert.equal(config.GATEWAY_AUTH_ALLOWLIST_FILE, '/data/config/allowlist.json');
   assert.equal(defaultPolicyColumnForConfig(config), 'allowlistPlusWot');
 });
 

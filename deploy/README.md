@@ -114,6 +114,13 @@ Profile defaults are stored in:
 The CLI writes explicit env values for discovery relays, auth relays, public URL, and auth policy so deployments do not inherit project-specific defaults accidentally.
 The checked-in profile files are also the source of truth for the profile presets loaded by the schema.
 
+For `allowlist` and `allowlist+wot`, the deploy bundle now enables the live allowlist store by default with:
+
+- `GATEWAY_AUTH_ALLOWLIST_FILE=/data/config/allowlist.json`
+- `GATEWAY_AUTH_ALLOWLIST_REFRESH_MS=5000`
+
+If `GATEWAY_AUTH_OPERATOR_PUBKEY` is also set, the gateway exposes the operator admin page at `/admin/allowlist`.
+
 ## Portable Defaults
 
 The deploy CLI generates and persists the following values automatically when missing:

@@ -284,6 +284,14 @@ test('file-backed allowlist bootstraps from env and serves the admin page', asyn
     assert.equal(html.response.status, 200);
     assert.match(html.text, /Allowlist Pubkeys/);
 
+    const hashesUtils = await fetchJson(`${baseUrl}/admin/allowlist/vendor/@noble/hashes/utils`);
+    assert.equal(hashesUtils.response.status, 200);
+    assert.match(hashesUtils.text, /randomBytes|createView/);
+
+    const hashesCrypto = await fetchJson(`${baseUrl}/admin/allowlist/vendor/@noble/hashes/crypto`);
+    assert.equal(hashesCrypto.response.status, 200);
+    assert.match(hashesCrypto.text, /export.*crypto|const crypto/);
+
     const token = await authenticateAdmin(baseUrl);
     const list = await getAdminAllowlist(baseUrl, token);
     assert.equal(list.response.status, 200);

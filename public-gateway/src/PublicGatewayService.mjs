@@ -1,7 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
 import { createHash, randomBytes } from 'node:crypto';
-import { dirname, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { dirname, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import WebSocket, { WebSocketServer } from 'ws';
@@ -79,6 +80,22 @@ const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const ADMIN_ASSET_DIR = resolve(MODULE_DIR, 'admin');
 const NOBLE_CURVES_ESM_DIR = resolve(MODULE_DIR, '..', 'node_modules', '@noble', 'curves', 'esm');
 const NOBLE_HASHES_ESM_DIR = resolve(MODULE_DIR, '..', 'node_modules', '@noble', 'hashes', 'esm');
+
+function createExtensionlessJsModuleMiddleware(rootDir, setHeaders) {
+  const normalizedRoot = resolve(rootDir);
+  return (req, res, next) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+    const requestPath = typeof req.path === 'string' ? req.path : '';
+    if (!requestPath || requestPath.endsWith('/') || extname(requestPath)) return next();
+    const candidatePath = resolve(normalizedRoot, `.${requestPath}.js`);
+    if (candidatePath !== normalizedRoot && !candidatePath.startsWith(`${normalizedRoot}/`)) {
+      return next();
+    }
+    if (!existsSync(candidatePath)) return next();
+    setHeaders?.(res);
+    return res.sendFile(candidatePath);
+  };
+}
 
 function safeString(value) {
   if (typeof value === 'string') return value;
@@ -875,6 +892,10 @@ class PublicGatewayService {
     app.use(
       '/admin/allowlist/vendor/@noble/curves',
       requireAllowlistAdmin,
+      createExtensionlessJsModuleMiddleware(
+        NOBLE_CURVES_ESM_DIR,
+        (res) => this.#setNoStore(res)
+      ),
       express.static(NOBLE_CURVES_ESM_DIR, {
         index: false,
         setHeaders: (res) => this.#setNoStore(res)
@@ -883,6 +904,10 @@ class PublicGatewayService {
     app.use(
       '/admin/allowlist/vendor/@noble/hashes',
       requireAllowlistAdmin,
+      createExtensionlessJsModuleMiddleware(
+        NOBLE_HASHES_ESM_DIR,
+        (res) => this.#setNoStore(res)
+      ),
       express.static(NOBLE_HASHES_ESM_DIR, {
         index: false,
         setHeaders: (res) => this.#setNoStore(res)

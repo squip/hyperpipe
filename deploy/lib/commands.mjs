@@ -202,6 +202,15 @@ async function collectInteractiveAnswers(existing, initialOptions) {
         existing.GATEWAY_AUTH_ALLOWLIST_PUBKEYS || '',
         (value) => validatePubkeyCsv(value)
       );
+      if (profile === 'allowlist') {
+        answers.GATEWAY_AUTH_OPERATOR_PUBKEY = initialOptions.operatorPubkey ?? await promptText(
+          rl,
+          'Operator pubkey for /admin/allowlist (optional)',
+          existing.GATEWAY_AUTH_OPERATOR_PUBKEY || '',
+          (value) => value === '' || isHex64(value) || 'Enter a 64-character hex pubkey or leave blank',
+          { allowEmpty: true }
+        );
+      }
     }
 
     if (profile === 'wot' || profile === 'allowlist+wot') {
@@ -318,7 +327,7 @@ export async function runCommand(command, args, { cwd = process.cwd(), env = pro
     const child = spawn(command, args, {
       cwd,
       env,
-      stdio: ['ignore', 'pipe', 'pipe']
+      stdio: ['inherit', 'pipe', 'pipe']
     });
     let stdout = '';
     let stderr = '';
@@ -339,6 +348,29 @@ export async function runCommand(command, args, { cwd = process.cwd(), env = pro
   });
 }
 
+function isTruthyEnv(value) {
+  return /^(1|true|yes|on)$/iu.test(String(value || '').trim());
+}
+
+function shouldUseSudoDocker(options = {}) {
+  if (options.sudoDocker === true) return true;
+  return isTruthyEnv(process.env.GATEWAY_DEPLOY_USE_SUDO_DOCKER);
+}
+
+function wrapDockerExec(execImpl, options = {}) {
+  if (!shouldUseSudoDocker(options)) return execImpl;
+  if (execImpl?.__gatewayDeployDockerWrapped) return execImpl;
+
+  const wrapped = async (command, args, runOptions) => {
+    if (command === 'docker' || command === 'docker-compose') {
+      return execImpl('sudo', [command, ...args], runOptions);
+    }
+    return execImpl(command, args, runOptions);
+  };
+  wrapped.__gatewayDeployDockerWrapped = true;
+  return wrapped;
+}
+
 export async function resolveComposeCommand(execImpl = runCommand) {
   const dockerCompose = await execImpl('docker', ['compose', 'version']);
   if (dockerCompose.ok) {
@@ -349,6 +381,21 @@ export async function resolveComposeCommand(execImpl = runCommand) {
     return ['docker-compose'];
   }
   return null;
+}
+
+function commandOutput(result = {}) {
+  return `${result?.stderr || ''}\n${result?.stdout || ''}`.trim();
+}
+
+function dockerInfoError(result = {}) {
+  const output = commandOutput(result).toLowerCase();
+  if (
+    output.includes('permission denied while trying to connect to the docker daemon socket')
+    || output.includes('dial unix /var/run/docker.sock: connect: permission denied')
+  ) {
+    return 'Docker daemon socket is not accessible to the current user (rerun with --sudo-docker or fix docker group/socket permissions)';
+  }
+  return 'Docker daemon is not reachable';
 }
 
 async function checkTcpPortInUse(port) {
@@ -408,7 +455,7 @@ function splitComposeCommand(composeCommand) {
 
 export async function checkPrerequisites({ execImpl = runCommand } = {}) {
   const errors = [];
-  const dockerVersion = await execImpl('docker', ['version']);
+  const dockerVersion = await execImpl('docker', ['--version']);
   if (!dockerVersion.ok) {
     errors.push('Docker CLI is not available');
   }
@@ -419,13 +466,14 @@ export async function checkPrerequisites({ execImpl = runCommand } = {}) {
   if (dockerVersion.ok) {
     const dockerInfo = await execImpl('docker', ['info']);
     if (!dockerInfo.ok) {
-      errors.push('Docker daemon is not reachable');
+      errors.push(dockerInfoError(dockerInfo));
     }
   }
   return { errors, composeCommand };
 }
 
 export async function runCheckCommand(options = {}, io = process, execImpl = runCommand) {
+  const resolvedExec = wrapDockerExec(execImpl, options);
   const envFile = resolveEnvFilePath(options.deployEnv);
   if (!(await fileExists(envFile))) {
     return {
@@ -443,7 +491,7 @@ export async function runCheckCommand(options = {}, io = process, execImpl = run
   const errors = [...validation.errors];
   const warnings = [...validation.warnings];
 
-  const prerequisiteReport = await checkPrerequisites({ execImpl });
+  const prerequisiteReport = await checkPrerequisites({ execImpl: resolvedExec });
   errors.push(...prerequisiteReport.errors);
   if (!options.skipPortChecks) {
     warnings.push(...(await collectPortWarnings(config)));
@@ -451,7 +499,7 @@ export async function runCheckCommand(options = {}, io = process, execImpl = run
 
   if (prerequisiteReport.composeCommand) {
     const { command, baseArgs } = splitComposeCommand(prerequisiteReport.composeCommand);
-    const composeConfig = await execImpl(command, [
+    const composeConfig = await resolvedExec(command, [
       ...baseArgs,
       ...composeArgs(envFile, ['config'])
     ]);
@@ -479,12 +527,13 @@ export async function runCheckCommand(options = {}, io = process, execImpl = run
 }
 
 export async function runApplyCommand(options = {}, io = process, execImpl = runCommand) {
+  const resolvedExec = wrapDockerExec(execImpl, options);
   const checkResult = await runCheckCommand(options, io, execImpl);
   if (!checkResult.ok) {
     throw new Error('deploy-check-failed');
   }
   const { command, baseArgs } = splitComposeCommand(checkResult.composeCommand);
-  const result = await execImpl(command, [
+  const result = await resolvedExec(command, [
     ...baseArgs,
     ...composeArgs(checkResult.envFile, ['up', '-d', '--build'])
   ]);
@@ -538,12 +587,13 @@ async function inspectComposeContainers(composeCommand, envFile, execImpl) {
 }
 
 export async function runSmokeCommand(options = {}, io = process, execImpl = runCommand, fetchImpl = globalThis.fetch) {
+  const resolvedExec = wrapDockerExec(execImpl, options);
   const checkResult = await runCheckCommand(options, io, execImpl);
   if (!checkResult.ok) {
     throw new Error('deploy-check-failed');
   }
 
-  const containerStates = await inspectComposeContainers(checkResult.composeCommand, checkResult.envFile, execImpl);
+  const containerStates = await inspectComposeContainers(checkResult.composeCommand, checkResult.envFile, resolvedExec);
   const unhealthy = containerStates.filter((entry) => entry.status !== 'running');
   if (unhealthy.length) {
     throw new Error(`Containers not running: ${unhealthy.map((entry) => `${entry.name}:${entry.status}`).join(', ')}`);
@@ -620,6 +670,7 @@ export function usage() {
     '  --deploy-env <path|name> Env file path, or named env under deploy/environments/',
     '  --profile <name>         Deployment profile: open, allowlist, wot, allowlist+wot',
     '  --non-interactive        Do not prompt during init',
+    '  --sudo-docker            Run docker/docker compose through sudo',
     '',
     'Smoke options:',
     '  --gateway-origin <url>   Override public gateway origin',

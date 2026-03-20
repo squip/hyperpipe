@@ -40,6 +40,8 @@ export const ENV_SECTIONS = [
       'GATEWAY_AUTH_MEMBER_DELEGATION',
       'GATEWAY_AUTH_OPERATOR_PUBKEY',
       'GATEWAY_AUTH_ALLOWLIST_PUBKEYS',
+      'GATEWAY_AUTH_ALLOWLIST_FILE',
+      'GATEWAY_AUTH_ALLOWLIST_REFRESH_MS',
       'GATEWAY_AUTH_WOT_ROOT_PUBKEY',
       'GATEWAY_AUTH_WOT_MAX_DEPTH',
       'GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2',
@@ -101,6 +103,8 @@ export const FIELD_CLASSIFICATIONS = {
   GATEWAY_NOSTR_DISCOVERY_RELAYS: 'prompted',
   GATEWAY_AUTH_ALLOWLIST_PUBKEYS: 'prompted_profile',
   GATEWAY_AUTH_OPERATOR_PUBKEY: 'prompted_profile',
+  GATEWAY_AUTH_ALLOWLIST_FILE: 'derived',
+  GATEWAY_AUTH_ALLOWLIST_REFRESH_MS: 'derived',
   GATEWAY_AUTH_WOT_ROOT_PUBKEY: 'prompted_profile_optional',
   GATEWAY_AUTH_WOT_MAX_DEPTH: 'prompted_profile',
   GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2: 'prompted_profile',
@@ -132,6 +136,8 @@ const BASE_DEFAULTS = {
   GATEWAY_REGISTRATION_REDIS: 'redis://redis:6379',
   GATEWAY_DEFAULT_TOKEN_TTL: '3600',
   STORAGE_DIR: '/data',
+  GATEWAY_AUTH_ALLOWLIST_FILE: '',
+  GATEWAY_AUTH_ALLOWLIST_REFRESH_MS: '5000',
   GATEWAY_FEATURE_HYPERBEE_RELAY: 'true',
   GATEWAY_RELAY_STORAGE: '/data/gateway-relay',
   GATEWAY_FEATURE_RELAY_DISPATCHER: 'false',
@@ -340,6 +346,16 @@ export function buildRuntimeConfig({ profile, answers = {}, existing = {} }) {
   merged.GATEWAY_AUTH_OPERATOR_PUBKEY = normalizeString(
     answers.GATEWAY_AUTH_OPERATOR_PUBKEY || existing.GATEWAY_AUTH_OPERATOR_PUBKEY
   ).toLowerCase();
+  merged.GATEWAY_AUTH_ALLOWLIST_FILE = normalizeString(
+    existing.GATEWAY_AUTH_ALLOWLIST_FILE
+    || (normalizedProfile === 'allowlist' || normalizedProfile === 'allowlist+wot'
+      ? '/data/config/allowlist.json'
+      : '')
+  );
+  merged.GATEWAY_AUTH_ALLOWLIST_REFRESH_MS = normalizeNumberString(
+    answers.GATEWAY_AUTH_ALLOWLIST_REFRESH_MS || existing.GATEWAY_AUTH_ALLOWLIST_REFRESH_MS || BASE_DEFAULTS.GATEWAY_AUTH_ALLOWLIST_REFRESH_MS,
+    5000
+  );
   merged.GATEWAY_AUTH_WOT_ROOT_PUBKEY = normalizeString(
     answers.GATEWAY_AUTH_WOT_ROOT_PUBKEY || existing.GATEWAY_AUTH_WOT_ROOT_PUBKEY || merged.GATEWAY_AUTH_OPERATOR_PUBKEY
   ).toLowerCase();
@@ -368,16 +384,19 @@ export function buildRuntimeConfig({ profile, answers = {}, existing = {} }) {
   if (normalizedProfile === 'open') {
     merged.GATEWAY_DISCOVERY_OPEN_ACCESS = 'true';
     merged.GATEWAY_AUTH_ALLOWLIST_PUBKEYS = '';
+    merged.GATEWAY_AUTH_ALLOWLIST_FILE = '';
     merged.GATEWAY_AUTH_OPERATOR_PUBKEY = '';
     merged.GATEWAY_AUTH_WOT_ROOT_PUBKEY = '';
     merged.GATEWAY_AUTH_WOT_RELAYS = '';
   } else if (normalizedProfile === 'allowlist') {
     merged.GATEWAY_DISCOVERY_OPEN_ACCESS = 'false';
-    merged.GATEWAY_AUTH_OPERATOR_PUBKEY = '';
     merged.GATEWAY_AUTH_WOT_ROOT_PUBKEY = '';
     merged.GATEWAY_AUTH_WOT_RELAYS = '';
   } else {
     merged.GATEWAY_DISCOVERY_OPEN_ACCESS = 'false';
+    if (normalizedProfile === 'wot') {
+      merged.GATEWAY_AUTH_ALLOWLIST_FILE = '';
+    }
   }
 
   return merged;
@@ -443,6 +462,9 @@ export function validateConfig(config = {}) {
   if (!isPositiveIntegerString(normalized.GATEWAY_AUTH_WOT_REFRESH_MS)) {
     errors.push('GATEWAY_AUTH_WOT_REFRESH_MS must be a positive integer');
   }
+  if (!isPositiveIntegerString(normalized.GATEWAY_AUTH_ALLOWLIST_REFRESH_MS)) {
+    errors.push('GATEWAY_AUTH_ALLOWLIST_REFRESH_MS must be a positive integer');
+  }
 
   if (profile === 'open') {
     if (normalizeString(normalized.GATEWAY_DISCOVERY_OPEN_ACCESS).toLowerCase() !== 'true') {
@@ -460,6 +482,9 @@ export function validateConfig(config = {}) {
   if (profile === 'allowlist' || profile === 'allowlist+wot') {
     if (!isValidPubkeyList(normalized.GATEWAY_AUTH_ALLOWLIST_PUBKEYS)) {
       errors.push('Allowlist-based profiles require GATEWAY_AUTH_ALLOWLIST_PUBKEYS to be a comma-separated list of 64-character hex pubkeys');
+    }
+    if (!normalizeString(normalized.GATEWAY_AUTH_ALLOWLIST_FILE)) {
+      errors.push('Allowlist-based profiles require GATEWAY_AUTH_ALLOWLIST_FILE so the live allowlist store can be enabled');
     }
   }
 
