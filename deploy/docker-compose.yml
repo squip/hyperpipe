@@ -36,8 +36,8 @@ services:
       GATEWAY_REGISTRATION_SECRET: ${GATEWAY_REGISTRATION_SECRET}
       GATEWAY_DISCOVERY_ENABLED: "true"
       GATEWAY_DISCOVERY_OPEN_ACCESS: ${GATEWAY_DISCOVERY_OPEN_ACCESS:-false}
-      GATEWAY_DISCOVERY_DISPLAY_NAME: "Hypertuna.com Public Gateway"
-      GATEWAY_DISCOVERY_REGION: "us-west"
+      GATEWAY_DISCOVERY_DISPLAY_NAME: ${GATEWAY_DISCOVERY_DISPLAY_NAME:-Public Gateway}
+      GATEWAY_DISCOVERY_REGION: ${GATEWAY_DISCOVERY_REGION:-}
       GATEWAY_NOSTR_DISCOVERY_RELAYS: ${GATEWAY_NOSTR_DISCOVERY_RELAYS}
       GATEWAY_REGISTRATION_REDIS: redis://redis:6379
       GATEWAY_REGISTRATION_REDIS_PREFIX: "public-gateway:${GATEWAY_HOST}:"
@@ -95,7 +95,7 @@ services:
       - redis
     volumes:
       - public-gateway-data:/data
-      - /home/squip/public-gateway-logs:/app/public-gateway/logs
+      - public-gateway-logs:/app/public-gateway/logs
     labels:
       - traefik.enable=true
       - traefik.http.routers.gateway.rule=Host(`${GATEWAY_HOST}`)
@@ -109,3 +109,4 @@ volumes:
   traefik-lets:
   redis-data:
   public-gateway-data:
+  public-gateway-logs:

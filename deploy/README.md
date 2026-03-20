@@ -1,53 +1,132 @@
-# Public Gateway Docker Bundle
+# Public Gateway Deploy Bundle
 
-This directory contains a turnkey docker-compose setup that launches the public gateway, a Redis cache, and a Traefik reverse proxy with automatic Let's Encrypt certificates.
+This directory contains a standalone Docker Compose bundle and deploy CLI for self-hosting the public gateway on a machine or VPS.
 
-## Quick Start
+## Recommended Flow
 
-1. **Install prerequisites**
-   - Docker and Docker Compose Plugin (or docker-compose v2)
-   - DNS A record pointing `your.domain` at the VPS
+1. Install prerequisites:
+   - Docker
+   - Docker Compose plugin or `docker-compose`
+   - Node.js 20+ for the deploy CLI
+   - a DNS A record pointing your chosen hostname at the target machine
 
-2. **Configure secrets**
+2. Install the deploy CLI dependencies:
    ```bash
    cd deploy
-   cp .env.example .env
-   # edit .env and set:
-   # GATEWAY_HOST=your.domain
-   # LETSENCRYPT_EMAIL=admin@domain
-   # GATEWAY_REGISTRATION_SECRET=openssl rand -hex 32
+   npm install
    ```
 
-3. **Start the stack**
+3. Generate a runtime env file:
    ```bash
-   docker compose up -d --build
+   npm run deploy:init
    ```
 
-Traefik listens on ports 80/443, requests certificates from Let's Encrypt, and proxies HTTPS traffic to the public gateway container. Redis stores registration state so the gateway can scale horizontally or survive restarts.
+4. Validate the deploy bundle:
+   ```bash
+   npm run deploy:check
+   ```
 
-## Services
+5. Start the stack:
+   ```bash
+   npm run deploy:apply
+   ```
 
-| Service        | Description                                           |
-| -------------- | ----------------------------------------------------- |
-| `proxy`        | Traefik reverse proxy + automatic TLS certificates    |
-| `redis`        | Redis cache for relay registrations                   |
-| `public-gateway` | Hypertuna public gateway (builds from repo source)  |
+6. Run smoke checks:
+   ```bash
+   npm run deploy:smoke
+   ```
 
-Volumes `traefik-lets` and `redis-data` persist ACME certificates and Redis data respectively.
+The package also exposes the standalone CLI directly if you prefer:
 
-## Updating
-
-Pull repository updates and rebuild:
 ```bash
-docker compose pull
-docker compose up -d --build
+./bin/gateway-deploy.mjs init
+./bin/gateway-deploy.mjs check
 ```
 
-## Stopping / Removing
-```bash
-docker compose down
-```
-Add `-v` to remove persisted volumes.
+By default the generated runtime config is written to `deploy/.env`. You can also target a named env file under `deploy/environments/`:
 
-## Desktop Configuration
-In the desktop app, enable the Public Gateway bridge and set the base URL to `https://your.domain` with the same registration secret used above.
+```bash
+npm run deploy:init -- --deploy-env production
+npm run deploy:apply -- --deploy-env production
+```
+
+## Commands
+
+### `init`
+
+Interactive setup wizard that:
+
+- prompts for foundational values such as host, email, profile, display name, region, and relay lists
+- applies one of the built-in auth profiles:
+  - `open`
+  - `allowlist`
+  - `wot`
+  - `allowlist+wot`
+- generates stable secrets and relay admin keys when missing
+- preserves existing values when re-run against the same env file
+
+### `check`
+
+Runs deploy validation before you start containers:
+
+- schema validation for the selected profile
+- Docker / Compose availability checks
+- Docker daemon reachability
+- best-effort port-availability warnings
+- `docker compose config` validation against `deploy/docker-compose.yml`
+
+### `apply`
+
+Runs `check` first, then executes:
+
+```bash
+docker compose --env-file <selected-env> -f deploy/docker-compose.yml up -d --build
+```
+
+### `smoke`
+
+Runs post-deploy health checks:
+
+- `docker compose ps`
+- container runtime inspection
+- `GET /health` against the configured public URL
+- secret endpoint validation when the selected profile advertises open access
+
+Optional deep auth validation is available if you provide an auth manifest:
+
+```bash
+npm run deploy:smoke -- \
+  --auth-manifest ./path/to/manifest.json \
+  --policy-column wotDepth2Threshold
+```
+
+The manifest should follow the same shape used by the gateway auth fixture tooling: an `accounts` array with credential material and a `policyMatrix` describing expected `ALLOW` / `DENY` outcomes.
+
+## Profiles
+
+Profile defaults are stored in:
+
+- `deploy/profiles/open.env`
+- `deploy/profiles/allowlist.env`
+- `deploy/profiles/wot.env`
+- `deploy/profiles/allowlist+wot.env`
+
+The CLI writes explicit env values for discovery relays, auth relays, public URL, and auth policy so deployments do not inherit project-specific defaults accidentally.
+The checked-in profile files are also the source of truth for the profile presets loaded by the schema.
+
+## Portable Defaults
+
+The deploy CLI generates and persists the following values automatically when missing:
+
+- `GATEWAY_REGISTRATION_SECRET`
+- `GATEWAY_RELAY_NAMESPACE`
+- `GATEWAY_RELAY_REPLICATION_TOPIC`
+- `GATEWAY_RELAY_ADMIN_PUBLIC_KEY`
+- `GATEWAY_RELAY_ADMIN_SECRET_KEY`
+- `GATEWAY_BLINDPEER_PORT`
+
+Override these manually only if you already have stable values you need to preserve.
+
+## Advanced Manual Editing
+
+`deploy/.env.example` is a full reference template for advanced users, but the preferred workflow is still `init -> check -> apply -> smoke`.

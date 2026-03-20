@@ -1,0 +1,22 @@
+{
+  "name": "public-gateway-deploy",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "gateway-deploy": "./bin/gateway-deploy.mjs"
+  },
+  "scripts": {
+    "init": "node ./bin/gateway-deploy.mjs init",
+    "check": "node ./bin/gateway-deploy.mjs check",
+    "apply": "node ./bin/gateway-deploy.mjs apply",
+    "smoke": "node ./bin/gateway-deploy.mjs smoke",
+    "deploy:init": "node ./bin/gateway-deploy.mjs init",
+    "deploy:check": "node ./bin/gateway-deploy.mjs check",
+    "deploy:apply": "node ./bin/gateway-deploy.mjs apply",
+    "deploy:smoke": "node ./bin/gateway-deploy.mjs smoke",
+    "test": "node --test ./test/*.test.mjs"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.2.0"
+  }
+}
