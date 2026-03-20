@@ -19,6 +19,7 @@ const TAB_LABELS = {
   blocklist: 'Block List'
 };
 const PROFILE_TIMEOUT_MS = 4500;
+const AUTOSAVE_DELAY_MS = 600;
 const INITIAL_ACTIVE_TAB = firstEnabledTabForConfig(config);
 
 const state = {
@@ -29,8 +30,14 @@ const state = {
   operatorInput: normalizePubkey(config.operatorPubkey) || '',
   privateKeyInput: '',
   authPanelOpen: true,
+  navOpen: false,
   activeTab: INITIAL_ACTIVE_TAB,
   banner: null,
+  modal: {
+    open: false,
+    kind: null,
+    inputValue: ''
+  },
   allowlist: createListState(config.allowlistEnabled),
   blocklist: createListState(config.blocklistEnabled),
   wot: {
@@ -84,7 +91,9 @@ function createListState(enabled) {
     enabled: !!enabled,
     loading: false,
     saving: false,
-    inputValue: '',
+    saveState: 'idle',
+    saveError: null,
+    saveTimer: null,
     draftPubkeys: [],
     serverPubkeys: [],
     meta: {
@@ -196,17 +205,19 @@ function escapeHtml(value) {
     .replaceAll('"', '&quot;');
 }
 
-function firstEnabledTab() {
-  const tabs = getEnabledTabs();
-  return tabs[0]?.key || 'allowlist';
-}
-
 function getEnabledTabs() {
   const tabs = [];
   if (state.allowlist.enabled) tabs.push({ key: 'allowlist', label: TAB_LABELS.allowlist });
   if (state.wot.enabled) tabs.push({ key: 'wot', label: TAB_LABELS.wot });
   if (state.blocklist.enabled) tabs.push({ key: 'blocklist', label: TAB_LABELS.blocklist });
   return tabs;
+}
+
+function humanizeSource(source) {
+  if (!source) return null;
+  if (source === 'env-bootstrap') return 'Env bootstrap';
+  if (source === 'file') return 'File';
+  return source;
 }
 
 function setBanner(message, tone = 'info') {
@@ -235,27 +246,82 @@ function listStateFor(kind) {
 
 function isDirty(kind) {
   const current = listStateFor(kind);
+  return isDirtyState(current);
+}
+
+function isDirtyState(current) {
   if (!current) return false;
   return JSON.stringify(current.draftPubkeys) !== JSON.stringify(current.serverPubkeys);
 }
 
+function activeTabPubkeys() {
+  if (state.activeTab === 'allowlist') return state.allowlist.draftPubkeys;
+  if (state.activeTab === 'blocklist') return state.blocklist.draftPubkeys;
+  if (state.activeTab === 'wot') return state.wot.entries.map((entry) => entry.pubkey);
+  return [];
+}
+
+function saveStatusLabel(current) {
+  if (!current) return '';
+  if (current.loading) return 'Refreshing…';
+  if (current.saving) return 'Saving…';
+  if (current.saveState === 'error') return 'Save failed';
+  if (isDirtyState(current)) return 'Syncing…';
+  if (current.saveState === 'saved') return 'Saved';
+  return '';
+}
+
+function tabCount(key) {
+  if (key === 'allowlist') return state.allowlist.draftPubkeys.length;
+  if (key === 'blocklist') return state.blocklist.draftPubkeys.length;
+  if (key === 'wot') return state.wot.entries.length;
+  return 0;
+}
+
+function openAddModal(kind) {
+  if (!listStateFor(kind)?.enabled) return;
+  state.modal = {
+    open: true,
+    kind,
+    inputValue: ''
+  };
+  renderModal();
+  requestAnimationFrame(() => {
+    root.querySelector('#modal-pubkey-input')?.focus();
+  });
+}
+
+function closeAddModal() {
+  state.modal = {
+    open: false,
+    kind: null,
+    inputValue: ''
+  };
+  renderModal();
+}
+
+function renderInlineMeta(parts) {
+  const items = parts.filter(Boolean);
+  if (!items.length) return '';
+  return `
+    <div class="inline-meta">
+      ${items.map((item) => `<span>${escapeHtml(item)}</span>`).join('')}
+    </div>
+  `;
+}
+
 function renderShell() {
   root.innerHTML = `
-    <div class="access-shell">
-      <header class="access-hero">
-        <div class="access-hero__copy">
-          <p class="eyebrow">Public Gateway</p>
-          <h1>Access Manager</h1>
-          <p class="muted">Manage your Allow List, Web of Trust, and Block List without restarting the gateway container.</p>
-        </div>
-        <div class="access-hero__actions">
-          <button class="button-ghost" type="button" data-action="toggle-auth-panel">Authenticate</button>
-        </div>
-      </header>
-      <div id="status-banner" class="status-banner"></div>
-      <section id="auth-panel"></section>
-      <section id="tabs-region"></section>
-      <section id="content-region"></section>
+    <div class="access-app">
+      <div id="nav-backdrop" class="nav-backdrop" data-action="close-nav"></div>
+      <aside id="sidebar-region"></aside>
+      <main class="access-main">
+        <header id="topbar-region"></header>
+        <div id="status-banner" class="status-banner"></div>
+        <section id="auth-panel"></section>
+        <section id="content-region"></section>
+      </main>
+      <div id="modal-region"></div>
     </div>
   `;
 }
@@ -271,17 +337,29 @@ function handleClick(event) {
   if (!target) return;
   const action = target.dataset.action;
 
+  if (action === 'toggle-nav') {
+    state.navOpen = !state.navOpen;
+    renderSidebar();
+    return;
+  }
+  if (action === 'close-nav') {
+    state.navOpen = false;
+    renderSidebar();
+    return;
+  }
   if (action === 'toggle-auth-panel') {
     state.authPanelOpen = !state.authPanelOpen;
     renderAuthPanel();
-    renderHeader();
+    renderTopbar();
+    renderSidebar();
     return;
   }
   if (action === 'sign-out') {
+    clearAllSaveTimers();
     state.token = null;
     state.tokenExpiresAt = null;
     state.authPanelOpen = true;
-    setBanner('Signed out of the access manager.', 'info');
+    setBanner(null);
     render();
     return;
   }
@@ -302,8 +380,8 @@ function handleClick(event) {
     const tab = target.dataset.tab;
     if (tab && tab !== state.activeTab) {
       state.activeTab = tab;
-      renderTabs();
-      renderContent();
+      state.navOpen = false;
+      render();
       void ensureProfilesLoaded(activeTabPubkeys());
     }
     return;
@@ -315,18 +393,23 @@ function handleClick(event) {
     }
     return;
   }
-  if (action === 'save-list') {
+  if (action === 'reload-wot') {
+    void loadWot();
+    return;
+  }
+  if (action === 'open-add-modal') {
     const kind = target.dataset.list;
     if (kind) {
-      void saveList(kind);
+      openAddModal(kind);
     }
     return;
   }
-  if (action === 'add-pubkey') {
-    const kind = target.dataset.list;
-    if (kind) {
-      addDraftPubkey(kind);
-    }
+  if (action === 'close-modal') {
+    closeAddModal();
+    return;
+  }
+  if (action === 'submit-add-modal') {
+    submitModalPubkey();
     return;
   }
   if (action === 'remove-pubkey') {
@@ -335,10 +418,6 @@ function handleClick(event) {
     if (kind && pubkey) {
       removeDraftPubkey(kind, pubkey);
     }
-    return;
-  }
-  if (action === 'reload-wot') {
-    void loadWot();
     return;
   }
   if (action === 'queue-block') {
@@ -361,53 +440,109 @@ function handleInput(event) {
     state.privateKeyInput = target.value.trim().toLowerCase();
     return;
   }
-  const kind = target.dataset.listInput;
-  if (kind === 'allowlist' || kind === 'blocklist') {
-    const current = listStateFor(kind);
-    if (current) current.inputValue = target.value.trim().toLowerCase();
+  if (target.id === 'modal-pubkey-input') {
+    state.modal.inputValue = target.value.trim().toLowerCase();
   }
 }
 
 function handleKeyDown(event) {
   const target = event.target;
-  if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
-  const kind = target.dataset.listInput;
-  if ((kind === 'allowlist' || kind === 'blocklist') && event.key === 'Enter') {
+  if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) {
+    if (event.key === 'Escape' && state.modal.open) {
+      closeAddModal();
+    }
+    return;
+  }
+
+  if (event.key === 'Escape' && state.modal.open) {
+    closeAddModal();
+    return;
+  }
+
+  if (target.id === 'modal-pubkey-input' && event.key === 'Enter') {
     event.preventDefault();
-    addDraftPubkey(kind);
+    submitModalPubkey();
   }
 }
 
 function render() {
-  renderHeader();
+  renderSidebar();
+  renderTopbar();
   renderBanner();
   renderAuthPanel();
-  renderTabs();
   renderContent();
+  renderModal();
   if (state.token) {
     void ensureProfilesLoaded(activeTabPubkeys());
   }
 }
 
-function renderHeader() {
-  const actions = root.querySelector('.access-hero__actions');
-  if (!actions) return;
+function renderSidebar() {
+  const region = root.querySelector('#sidebar-region');
+  const backdrop = root.querySelector('#nav-backdrop');
+  if (!region || !backdrop) return;
   const authenticated = !!state.token;
-  actions.innerHTML = `
-    <div class="hero-status">
-      <span class="signer-status" data-state="${state.signerState}">
-        ${state.signerState === 'ready' ? 'Browser signer detected' : 'Browser signer unavailable'}
-      </span>
-      ${authenticated ? `<span class="session-pill">Operator session active</span>` : ''}
+  const tabs = getEnabledTabs();
+  region.className = `access-sidebar${state.navOpen ? ' is-open' : ''}`;
+  backdrop.className = `nav-backdrop${state.navOpen ? ' is-visible' : ''}`;
+  region.innerHTML = `
+    <div class="sidebar__header">
+      <button class="icon-button sidebar__close" type="button" data-action="close-nav" aria-label="Close navigation">×</button>
+      <p class="eyebrow">Public Gateway</p>
+      <h1>Access Manager</h1>
+      <p class="sidebar__subtitle">Live access lists and trust controls.</p>
     </div>
-    <button class="button-ghost" type="button" data-action="toggle-auth-panel">
-      ${authenticated ? 'Session' : 'Authenticate'}
-    </button>
+    <nav class="sidebar__nav" aria-label="Access manager lists">
+      ${tabs.map((tab) => `
+        <button
+          class="nav-item${tab.key === state.activeTab ? ' is-active' : ''}"
+          type="button"
+          data-action="switch-tab"
+          data-tab="${tab.key}"
+        >
+          <span>${escapeHtml(tab.label)}</span>
+          <span class="nav-item__meta">${escapeHtml(String(tabCount(tab.key)))}</span>
+        </button>
+      `).join('')}
+    </nav>
+    <div class="sidebar__footer">
+      <div class="sidebar__status">
+        <span class="signer-status" data-state="${state.signerState}">
+          ${state.signerState === 'ready' ? 'Browser signer detected' : 'Browser signer unavailable'}
+        </span>
+        ${authenticated ? '<span class="session-pill">Session active</span>' : '<span class="sidebar__muted">Authenticate as the operator</span>'}
+      </div>
+      <button class="button-ghost sidebar__session-button" type="button" data-action="toggle-auth-panel">
+        ${authenticated ? 'Session' : 'Authenticate'}
+      </button>
+    </div>
+  `;
+}
+
+function renderTopbar() {
+  const region = root.querySelector('#topbar-region');
+  if (!region) return;
+  const authenticated = !!state.token;
+  region.className = 'access-topbar';
+  region.innerHTML = `
+    <div class="topbar__leading">
+      <button class="icon-button topbar__menu" type="button" data-action="toggle-nav" aria-label="Open navigation">☰</button>
+      <div class="topbar__titles">
+        <p class="eyebrow">Public Gateway</p>
+        <h2>Access Manager</h2>
+      </div>
+    </div>
+    <div class="topbar__actions">
+      ${authenticated ? '<span class="session-pill session-pill--subtle">Operator</span>' : ''}
+      <button class="button-ghost" type="button" data-action="toggle-auth-panel">
+        ${authenticated ? 'Session' : 'Authenticate'}
+      </button>
+    </div>
   `;
 }
 
 function renderBanner() {
-  const banner = document.querySelector('#status-banner');
+  const banner = root.querySelector('#status-banner');
   if (!banner) return;
   if (!state.banner?.message) {
     banner.textContent = '';
@@ -421,28 +556,26 @@ function renderBanner() {
 }
 
 function renderAuthPanel() {
-  const panel = document.querySelector('#auth-panel');
+  const panel = root.querySelector('#auth-panel');
   if (!panel) return;
-  const authenticated = !!state.token;
-  const hidden = authenticated && !state.authPanelOpen;
-  panel.className = hidden ? 'panel-sheet hidden' : 'panel-sheet';
-  if (hidden) {
+  if (!state.authPanelOpen) {
     panel.innerHTML = '';
+    panel.className = 'auth-panel hidden';
     return;
   }
-  panel.innerHTML = `
+  const authenticated = !!state.token;
+  panel.className = 'auth-panel';
+  panel.innerHTML = authenticated ? renderSessionCard() : renderAuthenticationCard();
+}
+
+function renderAuthenticationCard() {
+  return `
     <section class="gateway-card session-card">
-      <div class="gateway-card__header">
+      <div class="session-card__header">
         <div>
-          <p class="eyebrow">Access Manager Session</p>
-          <h2>${authenticated ? 'Operator session' : 'Operator authentication'}</h2>
-          <p class="muted">
-            ${authenticated
-              ? 'Your admin token stays in browser memory only and expires automatically.'
-              : 'Use a browser signer when possible. The private-key fallback is available if a signer is not installed.'}
-          </p>
+          <h3>Authenticate</h3>
+          <p class="muted">Use the configured operator identity. Admin tokens stay in browser memory only and expire automatically.</p>
         </div>
-        ${authenticated ? '<button class="button-ghost" type="button" data-action="sign-out">Sign out</button>' : ''}
       </div>
       <div class="session-grid">
         <label>
@@ -450,24 +583,23 @@ function renderAuthPanel() {
           <input id="operator-pubkey-input" type="text" autocomplete="off" spellcheck="false" value="${escapeHtml(state.operatorInput)}">
         </label>
         <div class="session-meta">
-          <div class="meta-row"><span>Gateway policy</span><span>${escapeHtml(config.hostPolicy)}</span></div>
-          <div class="meta-row"><span>Session expires</span><span>${authenticated ? escapeHtml(formatTimestamp(state.tokenExpiresAt)) : 'Not authenticated'}</span></div>
+          <div class="session-meta__row"><span>Gateway policy</span><span>${escapeHtml(config.hostPolicy)}</span></div>
+          <div class="session-meta__row"><span>Session</span><span>Not authenticated</span></div>
         </div>
       </div>
-      <div class="button-row session-actions">
+      <div class="button-row button-row--inline">
         <button class="button-primary" type="button" data-action="authenticate-signer" ${state.authBusy || state.signerState !== 'ready' ? 'disabled' : ''}>
           ${state.authBusy ? 'Authenticating…' : 'Authenticate with signer'}
         </button>
       </div>
       <details class="advanced-panel"${state.privateKeyInput ? ' open' : ''}>
-        <summary>Advanced fallback: sign with the operator private key</summary>
+        <summary>Advanced fallback</summary>
         <div class="field-stack">
-          <p class="muted">Preferred flow: use a browser signer. The private-key fallback is never persisted and is cleared after successful authentication.</p>
           <label>
             Operator private key
             <textarea id="private-key-input" rows="3" autocomplete="off" spellcheck="false" placeholder="64-char hex private key">${escapeHtml(state.privateKeyInput)}</textarea>
           </label>
-          <div class="button-row">
+          <div class="button-row button-row--inline">
             <button class="button-secondary" type="button" data-action="authenticate-private-key" ${state.authBusy ? 'disabled' : ''}>Authenticate with private key</button>
             <button class="button-ghost" type="button" data-action="clear-private-key">Clear</button>
           </div>
@@ -477,41 +609,42 @@ function renderAuthPanel() {
   `;
 }
 
-function renderTabs() {
-  const region = document.querySelector('#tabs-region');
-  if (!region) return;
-  if (!state.token) {
-    region.innerHTML = '';
-    return;
-  }
-  const tabs = getEnabledTabs();
-  region.innerHTML = `
-    <div class="tabs-shell">
-      <div class="tab-strip" role="tablist" aria-label="Access manager lists">
-        ${tabs.map((tab) => `
-          <button
-            class="tab-button${tab.key === state.activeTab ? ' is-active' : ''}"
-            type="button"
-            role="tab"
-            aria-selected="${tab.key === state.activeTab ? 'true' : 'false'}"
-            data-action="switch-tab"
-            data-tab="${tab.key}"
-          >${escapeHtml(tab.label)}</button>
-        `).join('')}
+function renderSessionCard() {
+  return `
+    <section class="gateway-card session-card session-card--active">
+      <div class="session-card__header">
+        <div>
+          <h3>Session</h3>
+          <p class="muted">Operator access is active until ${escapeHtml(formatTimestamp(state.tokenExpiresAt))}.</p>
+        </div>
+        <div class="button-row button-row--inline">
+          <button class="button-ghost" type="button" data-action="toggle-auth-panel">Close</button>
+          <button class="button-ghost" type="button" data-action="sign-out">Sign out</button>
+        </div>
       </div>
-    </div>
+      <div class="session-grid">
+        <div class="session-meta">
+          <div class="session-meta__row"><span>Operator</span><code>${escapeHtml(shortPubkey(config.operatorPubkey || 'Unknown'))}</code></div>
+          <div class="session-meta__row"><span>Gateway policy</span><span>${escapeHtml(config.hostPolicy)}</span></div>
+        </div>
+        <div class="session-meta">
+          <div class="session-meta__row"><span>Session expires</span><span>${escapeHtml(formatTimestamp(state.tokenExpiresAt))}</span></div>
+          <div class="session-meta__row"><span>Browser signer</span><span>${state.signerState === 'ready' ? 'Detected' : 'Unavailable'}</span></div>
+        </div>
+      </div>
+    </section>
   `;
 }
 
 function renderContent() {
-  const region = document.querySelector('#content-region');
+  const region = root.querySelector('#content-region');
   if (!region) return;
   if (!state.token) {
     region.innerHTML = `
       <section class="gateway-card placeholder-card">
-        <div class="gateway-card__header">
-          <h2>Authenticate to manage gateway access</h2>
-          <p class="muted">Once authenticated as the configured operator, you can manage the live lists and inspect the current Web of Trust graph.</p>
+        <div class="placeholder-card__body">
+          <h3>Authenticate to manage gateway access</h3>
+          <p class="muted">Once authenticated as the configured operator, you can manage the live Allow List, inspect the Web of Trust graph, and maintain the Block List.</p>
         </div>
       </section>
     `;
@@ -519,18 +652,12 @@ function renderContent() {
   }
 
   if (state.activeTab === 'allowlist' && state.allowlist.enabled) {
-    region.innerHTML = renderListPanel('allowlist', {
-      title: TAB_LABELS.allowlist,
-      description: 'Review the live Allow List and add or remove users manually.'
-    });
+    region.innerHTML = renderListPanel('allowlist');
     return;
   }
 
   if (state.activeTab === 'blocklist' && state.blocklist.enabled) {
-    region.innerHTML = renderListPanel('blocklist', {
-      title: TAB_LABELS.blocklist,
-      description: 'Review the live Block List and deny access across all host policy modes.'
-    });
+    region.innerHTML = renderListPanel('blocklist');
     return;
   }
 
@@ -541,16 +668,17 @@ function renderContent() {
 
   region.innerHTML = `
     <section class="gateway-card placeholder-card">
-      <div class="gateway-card__header">
-        <h2>This tab is unavailable</h2>
+      <div class="placeholder-card__body">
+        <h3>This view is unavailable</h3>
         <p class="muted">The active gateway policy does not expose this list in the current deployment.</p>
       </div>
     </section>
   `;
 }
 
-function renderListPanel(kind, { title, description }) {
+function renderListPanel(kind) {
   const current = listStateFor(kind);
+  const title = TAB_LABELS[kind];
   const listRows = current.draftPubkeys.length
     ? current.draftPubkeys.map((pubkey) => renderPubkeyRow(pubkey, {
       actionLabel: 'Remove',
@@ -558,45 +686,38 @@ function renderListPanel(kind, { title, description }) {
       actionKind: kind,
       badges: kind === 'blocklist' ? [{ label: 'Denied', tone: 'danger' }] : []
     })).join('')
-    : '<div class="empty-state">This list is empty.</div>';
+    : '<div class="empty-state">No pubkeys yet.</div>';
+  const meta = renderInlineMeta([
+    countLabel(current.draftPubkeys.length, 'entry'),
+    humanizeSource(current.meta.source),
+    current.meta.updatedAt ? `Updated ${formatTimestamp(current.meta.updatedAt)}` : null
+  ]);
+  const saveStatus = saveStatusLabel(current);
 
   return `
-    <section class="gateway-card list-card">
-      <div class="gateway-card__header card-header--split">
-        <div>
-          <p class="eyebrow">${escapeHtml(title)}</p>
-          <h2>${escapeHtml(title)}</h2>
-          <p class="muted">${escapeHtml(description)}</p>
+    <section class="gateway-card list-surface">
+      <div class="view-toolbar">
+        <div class="view-toolbar__copy">
+          <h3>${escapeHtml(title)}</h3>
+          ${meta}
         </div>
-        <div class="count-pill">${countLabel(current.draftPubkeys.length)}</div>
+        <div class="view-toolbar__actions">
+          ${saveStatus ? `<span class="save-status${current.saveState === 'error' ? ' is-error' : ''}">${escapeHtml(saveStatus)}</span>` : ''}
+          <button
+            class="icon-button"
+            type="button"
+            data-action="reload-list"
+            data-list="${kind}"
+            ${current.loading || current.saving ? 'disabled' : ''}
+            aria-label="Reload ${escapeHtml(title)}"
+            title="Reload ${escapeHtml(title)}"
+          >↻</button>
+          <button class="button-primary" type="button" data-action="open-add-modal" data-list="${kind}" ${current.loading ? 'disabled' : ''}>Add Pubkey</button>
+        </div>
       </div>
-      <div class="gateway-card__body">
-        <div class="meta-grid">
-          <div class="meta-row"><span>Source</span><span>${escapeHtml(current.meta.source || 'Unknown')}</span></div>
-          <div class="meta-row"><span>Updated at</span><span>${escapeHtml(formatTimestamp(current.meta.updatedAt))}</span></div>
-          <div class="meta-row"><span>Updated by</span><span>${escapeHtml(shortPubkey(current.meta.updatedBy || 'Unknown'))}</span></div>
-        </div>
-        ${current.meta.lastError ? `<div class="inline-note inline-note--warning">${escapeHtml(current.meta.lastError)}</div>` : ''}
-        <div class="list-toolbar">
-          <label>
-            Add pubkey
-            <input
-              type="text"
-              autocomplete="off"
-              spellcheck="false"
-              data-list-input="${kind}"
-              placeholder="64-char hex pubkey"
-              value="${escapeHtml(current.inputValue)}"
-            >
-          </label>
-          <div class="button-row">
-            <button class="button-secondary" type="button" data-action="add-pubkey" data-list="${kind}" ${current.loading || current.saving ? 'disabled' : ''}>Add pubkey</button>
-            <button class="button-primary" type="button" data-action="save-list" data-list="${kind}" ${current.loading || current.saving || !isDirty(kind) ? 'disabled' : ''}>${current.saving ? `Saving ${TAB_LABELS[kind]}…` : `Save ${TAB_LABELS[kind]}`}</button>
-            <button class="button-ghost" type="button" data-action="reload-list" data-list="${kind}" ${current.loading || current.saving ? 'disabled' : ''}>Reload</button>
-          </div>
-        </div>
-        <div class="entry-list">${listRows}</div>
-      </div>
+      ${current.meta.lastError ? `<div class="inline-note inline-note--warning">${escapeHtml(current.meta.lastError)}</div>` : ''}
+      ${current.saveError ? `<div class="inline-note inline-note--error">${escapeHtml(current.saveError)}</div>` : ''}
+      <div class="entry-list">${listRows}</div>
     </section>
   `;
 }
@@ -605,34 +726,40 @@ function renderWotPanel() {
   const entries = state.wot.entries;
   const approvedCount = entries.filter((entry) => entry.approved).length;
   const body = entries.length
-    ? entries.map((entry) => renderWotRow(entry)).join('')
+    ? entries.map((entry, index) => renderWotRow(entry, index)).join('')
     : '<div class="empty-state">No Web of Trust entries are currently loaded.</div>';
+  const meta = renderInlineMeta([
+    countLabel(entries.length, 'entry'),
+    `${approvedCount} approved`,
+    state.wot.meta.loadedAt ? `Updated ${formatTimestamp(state.wot.meta.loadedAt)}` : null
+  ]);
+
   return `
-    <section class="gateway-card list-card">
-      <div class="gateway-card__header card-header--split">
-        <div>
-          <p class="eyebrow">${escapeHtml(TAB_LABELS.wot)}</p>
-          <h2>${escapeHtml(TAB_LABELS.wot)}</h2>
-          <p class="muted">Read-only snapshot ranked by proximity. Use the Block action to queue a pubkey for the Block List draft.</p>
+    <section class="gateway-card list-surface">
+      <div class="view-toolbar">
+        <div class="view-toolbar__copy">
+          <h3>${escapeHtml(TAB_LABELS.wot)}</h3>
+          ${meta}
         </div>
-        <div class="count-stack">
-          <div class="count-pill">${countLabel(entries.length)}</div>
-          <div class="count-pill count-pill--secondary">${approvedCount} approved</div>
+        <div class="view-toolbar__actions">
+          ${state.wot.loading ? '<span class="save-status">Refreshing…</span>' : ''}
+          <button
+            class="icon-button"
+            type="button"
+            data-action="reload-wot"
+            ${state.wot.loading ? 'disabled' : ''}
+            aria-label="Reload Web of Trust"
+            title="Reload Web of Trust"
+          >↻</button>
         </div>
       </div>
-      <div class="gateway-card__body">
-        <div class="meta-grid">
-          <div class="meta-row"><span>Root</span><span>${escapeHtml(shortPubkey(state.wot.meta.rootPubkey || 'Unknown'))}</span></div>
-          <div class="meta-row"><span>Max depth</span><span>${escapeHtml(state.wot.meta.maxDepth ?? 'Unknown')}</span></div>
-          <div class="meta-row"><span>Depth-2 follower threshold</span><span>${escapeHtml(state.wot.meta.minFollowersDepth2 ?? 'Unknown')}</span></div>
-          <div class="meta-row"><span>Loaded at</span><span>${escapeHtml(formatTimestamp(state.wot.meta.loadedAt))}</span></div>
-        </div>
-        ${state.wot.meta.lastError ? `<div class="inline-note inline-note--warning">${escapeHtml(state.wot.meta.lastError)}</div>` : ''}
-        <div class="button-row">
-          <button class="button-ghost" type="button" data-action="reload-wot" ${state.wot.loading ? 'disabled' : ''}>${state.wot.loading ? 'Refreshing…' : 'Refresh Web of Trust'}</button>
-        </div>
-        <div class="entry-list">${body}</div>
+      <div class="context-row">
+        <span class="context-chip">Root ${escapeHtml(shortPubkey(state.wot.meta.rootPubkey || 'Unknown'))}</span>
+        <span class="context-chip">Max depth ${escapeHtml(state.wot.meta.maxDepth ?? 'Unknown')}</span>
+        <span class="context-chip">Depth-2 threshold ${escapeHtml(state.wot.meta.minFollowersDepth2 ?? 'Unknown')}</span>
       </div>
+      ${state.wot.meta.lastError ? `<div class="inline-note inline-note--warning">${escapeHtml(state.wot.meta.lastError)}</div>` : ''}
+      <div class="entry-list">${body}</div>
     </section>
   `;
 }
@@ -655,11 +782,12 @@ function renderPubkeyRow(pubkey, {
   `;
 }
 
-function renderWotRow(entry) {
+function renderWotRow(entry, index) {
   const draftBlocked = state.blocklist.draftPubkeys.includes(entry.pubkey);
   const savedBlocked = state.blocklist.serverPubkeys.includes(entry.pubkey);
   const canBlock = state.blocklist.enabled && !draftBlocked && !savedBlocked;
   const badges = [
+    { label: `#${index + 1}` },
     { label: `Depth ${entry.depth ?? 'N/A'}` },
     { label: `${entry.followerCount} followers` },
     { label: entry.approved ? 'Approved' : 'Outside threshold', tone: entry.approved ? 'success' : 'warning' }
@@ -709,6 +837,121 @@ function renderIdentity(pubkey, profileState, badges = []) {
   `;
 }
 
+function renderModal() {
+  const region = root.querySelector('#modal-region');
+  if (!region) return;
+  if (!state.modal.open || !state.modal.kind) {
+    region.innerHTML = '';
+    return;
+  }
+  const title = state.modal.kind === 'allowlist' ? 'Add to Allow List' : 'Add to Block List';
+  region.innerHTML = `
+    <div class="modal-backdrop" data-action="close-modal"></div>
+    <section class="modal-sheet" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-sheet__header">
+        <div>
+          <h3 id="modal-title">${escapeHtml(title)}</h3>
+        </div>
+        <button class="icon-button" type="button" data-action="close-modal" aria-label="Close add dialog">×</button>
+      </div>
+      <div class="modal-sheet__body">
+        <label>
+          Pubkey
+          <input
+            id="modal-pubkey-input"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="64-char hex pubkey"
+            value="${escapeHtml(state.modal.inputValue)}"
+          >
+        </label>
+        <div class="button-row button-row--inline">
+          <button class="button-primary" type="button" data-action="submit-add-modal">Add Pubkey</button>
+          <button class="button-ghost" type="button" data-action="close-modal">Cancel</button>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function clearListSaveTimer(current) {
+  if (current?.saveTimer) {
+    clearTimeout(current.saveTimer);
+    current.saveTimer = null;
+  }
+}
+
+function clearAllSaveTimers() {
+  clearListSaveTimer(state.allowlist);
+  clearListSaveTimer(state.blocklist);
+}
+
+function scheduleListSave(kind, { immediate = false } = {}) {
+  const current = listStateFor(kind);
+  if (!current?.enabled || !state.token) return;
+  clearListSaveTimer(current);
+  if (!isDirtyState(current)) {
+    if (current.saveState !== 'error') {
+      current.saveState = current.serverPubkeys.length ? 'saved' : 'idle';
+    }
+    renderContent();
+    return;
+  }
+  if (!current.saving) {
+    current.saveState = 'queued';
+  }
+  current.saveTimer = window.setTimeout(() => {
+    current.saveTimer = null;
+    void flushListSave(kind);
+  }, immediate ? 0 : AUTOSAVE_DELAY_MS);
+  renderContent();
+}
+
+async function flushListSave(kind) {
+  const current = listStateFor(kind);
+  if (!state.token || !current?.enabled || current.loading || current.saving || !isDirtyState(current)) return;
+  const snapshot = [...current.draftPubkeys];
+  current.saving = true;
+  current.saveState = 'saving';
+  current.saveError = null;
+  renderContent();
+  try {
+    const response = await apiFetch(`/api/admin/${kind}`, {
+      method: 'PUT',
+      body: JSON.stringify({ pubkeys: snapshot })
+    });
+    const normalized = uniqueSortedPubkeys(response.pubkeys);
+    const draftUnchanged = JSON.stringify(current.draftPubkeys) === JSON.stringify(snapshot);
+    current.serverPubkeys = normalized;
+    current.meta = {
+      source: response.source || null,
+      updatedAt: response.updatedAt || null,
+      updatedBy: response.updatedBy || null,
+      lastError: response.lastError || null
+    };
+    if (draftUnchanged) {
+      current.draftPubkeys = [...normalized];
+    }
+    current.saveState = 'saved';
+    current.saveError = null;
+    setBanner(null);
+    void ensureProfilesLoaded(current.draftPubkeys);
+  } catch (error) {
+    if (error.status !== 401) {
+      current.saveState = 'error';
+      current.saveError = error?.message || `Failed to save ${TAB_LABELS[kind]}.`;
+      setBanner(current.saveError, 'error');
+    }
+  } finally {
+    current.saving = false;
+    render();
+    if (state.token && isDirty(kind)) {
+      scheduleListSave(kind, { immediate: true });
+    }
+  }
+}
+
 async function apiFetch(path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set('content-type', 'application/json');
@@ -727,6 +970,7 @@ async function apiFetch(path, options = {}) {
     payload = { raw: text };
   }
   if (response.status === 401 && state.token) {
+    clearAllSaveTimers();
     state.token = null;
     state.tokenExpiresAt = null;
     state.authPanelOpen = true;
@@ -830,7 +1074,7 @@ async function authenticateWithSigner() {
     state.token = verification.token;
     state.tokenExpiresAt = verification.expiresAt || null;
     state.authPanelOpen = false;
-    setBanner('Authenticated as the operator. Loading access lists…', 'success');
+    setBanner(null);
     await loadAllAccessData();
   } catch (error) {
     setBanner(error?.message || 'Failed to authenticate with browser signer.', 'error');
@@ -857,7 +1101,7 @@ async function authenticateWithPrivateKey() {
     state.tokenExpiresAt = verification.expiresAt || null;
     state.privateKeyInput = '';
     state.authPanelOpen = false;
-    setBanner('Authenticated with the local private-key fallback. Loading access lists…', 'success');
+    setBanner(null);
     await loadAllAccessData();
   } catch (error) {
     setBanner(error?.message || 'Failed to authenticate with the private-key fallback.', 'error');
@@ -872,14 +1116,16 @@ async function loadAllAccessData() {
   if (state.allowlist.enabled) tasks.push(loadList('allowlist'));
   if (state.blocklist.enabled) tasks.push(loadList('blocklist'));
   if (state.wot.enabled) tasks.push(loadWot());
-  await Promise.all(tasks);
+  await Promise.allSettled(tasks);
 }
 
 async function loadList(kind) {
   const current = listStateFor(kind);
   if (!state.token || !current?.enabled) return;
+  clearListSaveTimer(current);
   current.loading = true;
-  renderContent();
+  current.saveError = null;
+  render();
   try {
     const response = await apiFetch(`/api/admin/${kind}`, { method: 'GET' });
     current.serverPubkeys = uniqueSortedPubkeys(response.pubkeys);
@@ -890,47 +1136,18 @@ async function loadList(kind) {
       updatedBy: response.updatedBy || null,
       lastError: response.lastError || null
     };
-    if (response.lastError) {
-      setBanner(`${TAB_LABELS[kind]} loaded with a warning: ${response.lastError}`, 'info');
-    }
+    current.saveState = current.serverPubkeys.length ? 'saved' : 'idle';
+    current.saveError = null;
     void ensureProfilesLoaded(current.draftPubkeys);
   } catch (error) {
     if (error.status !== 401) {
-      setBanner(error?.message || `Failed to load ${TAB_LABELS[kind]}.`, 'error');
+      current.saveState = 'error';
+      current.saveError = error?.message || `Failed to load ${TAB_LABELS[kind]}.`;
+      setBanner(current.saveError, 'error');
     }
   } finally {
     current.loading = false;
-    renderContent();
-  }
-}
-
-async function saveList(kind) {
-  const current = listStateFor(kind);
-  if (!state.token || !current?.enabled) return;
-  current.saving = true;
-  renderContent();
-  try {
-    const response = await apiFetch(`/api/admin/${kind}`, {
-      method: 'PUT',
-      body: JSON.stringify({ pubkeys: current.draftPubkeys })
-    });
-    current.serverPubkeys = uniqueSortedPubkeys(response.pubkeys);
-    current.draftPubkeys = [...current.serverPubkeys];
-    current.meta = {
-      source: response.source || null,
-      updatedAt: response.updatedAt || null,
-      updatedBy: response.updatedBy || null,
-      lastError: response.lastError || null
-    };
-    setBanner(`${TAB_LABELS[kind]} saved. New gateway auth decisions will use this list immediately.`, 'success');
-    void ensureProfilesLoaded(current.draftPubkeys);
-  } catch (error) {
-    if (error.status !== 401) {
-      setBanner(error?.message || `Failed to save ${TAB_LABELS[kind]}.`, 'error');
-    }
-  } finally {
-    current.saving = false;
-    renderContent();
+    render();
   }
 }
 
@@ -962,26 +1179,30 @@ async function loadWot() {
   }
 }
 
-function addDraftPubkey(kind) {
+function submitModalPubkey() {
+  const kind = state.modal.kind;
   const current = listStateFor(kind);
   if (!current) return;
-  const normalized = normalizePubkey(current.inputValue);
+  const normalized = normalizePubkey(state.modal.inputValue);
   if (!normalized) {
     setBanner('Pubkeys must be 64-char lowercase hex strings.', 'error');
     return;
   }
   current.draftPubkeys = uniqueSortedPubkeys([...current.draftPubkeys, normalized]);
-  current.inputValue = '';
-  setBanner(null);
-  renderContent();
+  current.saveError = null;
+  closeAddModal();
+  render();
   void ensureProfilesLoaded(current.draftPubkeys);
+  scheduleListSave(kind);
 }
 
 function removeDraftPubkey(kind, pubkey) {
   const current = listStateFor(kind);
   if (!current) return;
   current.draftPubkeys = current.draftPubkeys.filter((entry) => entry !== pubkey);
-  renderContent();
+  current.saveError = null;
+  render();
+  scheduleListSave(kind);
 }
 
 function queuePubkeyForBlocklist(pubkey) {
@@ -990,17 +1211,10 @@ function queuePubkeyForBlocklist(pubkey) {
     return;
   }
   state.blocklist.draftPubkeys = uniqueSortedPubkeys([...state.blocklist.draftPubkeys, pubkey]);
-  if (!state.blocklist.serverPubkeys.includes(pubkey)) {
-    setBanner('Added to the Block List draft. Save the Block List to apply the change.', 'success');
-  }
-  renderContent();
-}
-
-function activeTabPubkeys() {
-  if (state.activeTab === 'allowlist') return state.allowlist.draftPubkeys;
-  if (state.activeTab === 'blocklist') return state.blocklist.draftPubkeys;
-  if (state.activeTab === 'wot') return state.wot.entries.map((entry) => entry.pubkey);
-  return [];
+  state.blocklist.saveError = null;
+  render();
+  void ensureProfilesLoaded(state.blocklist.draftPubkeys);
+  scheduleListSave('blocklist', { immediate: true });
 }
 
 function createSubId(prefix = 'kind0') {
