@@ -195,6 +195,24 @@ async function collectInteractiveAnswers(existing, initialOptions) {
       GATEWAY_BLINDPEER_PORT: blindpeerPort
     };
 
+    answers.GATEWAY_AUTH_BLOCKLIST_PUBKEYS = initialOptions.blocklistPubkeys ?? await promptText(
+      rl,
+      'Blocklist pubkeys (optional, comma-separated 64-char hex values)',
+      existing.GATEWAY_AUTH_BLOCKLIST_PUBKEYS || '',
+      (value) => validatePubkeyCsv(value, { allowEmpty: true }),
+      { allowEmpty: true }
+    );
+
+    if (profile === 'open') {
+      answers.GATEWAY_AUTH_OPERATOR_PUBKEY = initialOptions.operatorPubkey ?? await promptText(
+        rl,
+        'Operator pubkey for Access Manager (optional)',
+        existing.GATEWAY_AUTH_OPERATOR_PUBKEY || '',
+        (value) => value === '' || isHex64(value) || 'Enter a 64-character hex pubkey or leave blank',
+        { allowEmpty: true }
+      );
+    }
+
     if (profile === 'allowlist' || profile === 'allowlist+wot') {
       answers.GATEWAY_AUTH_ALLOWLIST_PUBKEYS = initialOptions.allowlistPubkeys || await promptText(
         rl,
@@ -262,9 +280,10 @@ function normalizeNonInteractiveAnswers(existing, options) {
     GATEWAY_DISCOVERY_DISPLAY_NAME: options.displayName || existing.GATEWAY_DISCOVERY_DISPLAY_NAME || '',
     GATEWAY_DISCOVERY_REGION: options.region ?? existing.GATEWAY_DISCOVERY_REGION ?? '',
     GATEWAY_NOSTR_DISCOVERY_RELAYS: options.discoveryRelays || existing.GATEWAY_NOSTR_DISCOVERY_RELAYS || DEFAULT_DISCOVERY_RELAYS.join(','),
-    GATEWAY_BLINDPEER_PORT: options.blindpeerPort || existing.GATEWAY_BLINDPEER_PORT || '31000',
-    GATEWAY_AUTH_ALLOWLIST_PUBKEYS: options.allowlistPubkeys || existing.GATEWAY_AUTH_ALLOWLIST_PUBKEYS || '',
-    GATEWAY_AUTH_OPERATOR_PUBKEY: options.operatorPubkey || existing.GATEWAY_AUTH_OPERATOR_PUBKEY || '',
+      GATEWAY_BLINDPEER_PORT: options.blindpeerPort || existing.GATEWAY_BLINDPEER_PORT || '31000',
+      GATEWAY_AUTH_ALLOWLIST_PUBKEYS: options.allowlistPubkeys || existing.GATEWAY_AUTH_ALLOWLIST_PUBKEYS || '',
+      GATEWAY_AUTH_BLOCKLIST_PUBKEYS: options.blocklistPubkeys || existing.GATEWAY_AUTH_BLOCKLIST_PUBKEYS || '',
+      GATEWAY_AUTH_OPERATOR_PUBKEY: options.operatorPubkey || existing.GATEWAY_AUTH_OPERATOR_PUBKEY || '',
     GATEWAY_AUTH_WOT_ROOT_PUBKEY: options.wotRootPubkey ?? existing.GATEWAY_AUTH_WOT_ROOT_PUBKEY ?? '',
     GATEWAY_AUTH_WOT_MAX_DEPTH: options.wotMaxDepth || existing.GATEWAY_AUTH_WOT_MAX_DEPTH || '1',
     GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2: options.wotMinFollowersDepth2 || existing.GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2 || '0',

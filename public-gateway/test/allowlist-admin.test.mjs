@@ -64,6 +64,9 @@ function createConfig({
   allowlistPubkeys = [],
   allowlistFile = null,
   allowlistRefreshMs = 50,
+  blocklistPubkeys = [],
+  blocklistFile = null,
+  blocklistRefreshMs = 50,
   wotMaxDepth = 2,
   wotMinFollowersDepth2 = 2
 } = {}) {
@@ -86,6 +89,9 @@ function createConfig({
       allowlistPubkeys,
       allowlistFile,
       allowlistRefreshMs,
+      blocklistPubkeys,
+      blocklistFile,
+      blocklistRefreshMs,
       memberDelegationMode: 'all-members',
       wotRootPubkey: ACCOUNTS.operator.pubkeyHex,
       wotMaxDepth,
@@ -126,8 +132,25 @@ function installFakeWotGraph(service, {
   distances = {},
   followerCounts = {}
 } = {}) {
+  const nodes = new Map([
+    [ACCOUNTS.operator.pubkeyHex, {
+      pubkey: ACCOUNTS.operator.pubkeyHex,
+      depth: 0,
+      followedBy: new Set()
+    }]
+  ]);
+  for (const [pubkey, depth] of Object.entries(distances)) {
+    nodes.set(pubkey, {
+      pubkey,
+      depth,
+      followedBy: new Set(
+        Array.from({ length: Math.max(0, Number(followerCounts[pubkey]) || 0) }, (_, index) => `${pubkey}:${index}`)
+      )
+    });
+  }
   service.wotState = {
     wot: {
+      nodes,
       getDistance(pubkey) {
         return Object.prototype.hasOwnProperty.call(distances, pubkey)
           ? distances[pubkey]
@@ -263,13 +286,44 @@ async function putAdminAllowlist(baseUrl, token, pubkeys) {
   });
 }
 
-test('file-backed allowlist bootstraps from env and serves the admin page', async () => {
+async function getAdminBlocklist(baseUrl, token) {
+  return fetchJson(`${baseUrl}/api/admin/blocklist`, {
+    method: 'GET',
+    headers: {
+      authorization: `Bearer ${token}`
+    }
+  });
+}
+
+async function putAdminBlocklist(baseUrl, token, pubkeys) {
+  return fetchJson(`${baseUrl}/api/admin/blocklist`, {
+    method: 'PUT',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({ pubkeys })
+  });
+}
+
+async function getAdminWot(baseUrl, token) {
+  return fetchJson(`${baseUrl}/api/admin/wot`, {
+    method: 'GET',
+    headers: {
+      authorization: `Bearer ${token}`
+    }
+  });
+}
+
+test('file-backed access manager bootstraps the allowlist and serves the admin page assets', async () => {
   const tempDir = await mkdtemp(join(tmpdir(), 'pg-allowlist-'));
   const allowlistFile = join(tempDir, 'allowlist.json');
+  const blocklistFile = join(tempDir, 'blocklist.json');
   const { service, baseUrl } = await createService({
     port: 0,
     hostPolicy: 'allowlist',
     allowlistFile,
+    blocklistFile,
     allowlistPubkeys: [
       ACCOUNTS.allowlistOnly.pubkeyHex.toUpperCase(),
       ACCOUNTS.allowlistOnly.pubkeyHex
@@ -282,7 +336,8 @@ test('file-backed allowlist bootstraps from env and serves the admin page', asyn
 
     const html = await fetchJson(`${baseUrl}/admin/allowlist`);
     assert.equal(html.response.status, 200);
-    assert.match(html.text, /Allowlist Pubkeys/);
+    assert.match(html.text, /Access Manager/);
+    assert.match(html.text, /Loading the access manager/);
 
     const hashesUtils = await fetchJson(`${baseUrl}/admin/allowlist/vendor/@noble/hashes/utils`);
     assert.equal(hashesUtils.response.status, 200);
@@ -298,6 +353,10 @@ test('file-backed allowlist bootstraps from env and serves the admin page', asyn
     assert.equal(list.payload.source, 'env-bootstrap');
     assert.equal(list.payload.count, 1);
     assert.deepEqual(list.payload.pubkeys, [ACCOUNTS.allowlistOnly.pubkeyHex]);
+
+    const blocklist = await getAdminBlocklist(baseUrl, token);
+    assert.equal(blocklist.response.status, 200);
+    assert.equal(blocklist.payload.count, 0);
   } finally {
     await service.stop();
     await rm(tempDir, { recursive: true, force: true });
@@ -343,10 +402,12 @@ test('allowlist policy updates live without a container restart', async () => {
 test('allowlist+wot keeps live allowlist updates and WoT approvals active together', async () => {
   const tempDir = await mkdtemp(join(tmpdir(), 'pg-allowlist-'));
   const allowlistFile = join(tempDir, 'allowlist.json');
+  const blocklistFile = join(tempDir, 'blocklist.json');
   const { service, baseUrl } = await createService({
     port: 0,
     hostPolicy: 'allowlist+wot',
     allowlistFile,
+    blocklistFile,
     allowlistPubkeys: []
   });
 
@@ -363,6 +424,14 @@ test('allowlist+wot keeps live allowlist updates and WoT approvals active togeth
     assert.equal(wotApproved.response.status, 200);
 
     const token = await authenticateAdmin(baseUrl);
+    const wotSnapshot = await getAdminWot(baseUrl, token);
+    assert.equal(wotSnapshot.response.status, 200);
+    assert.ok(Array.isArray(wotSnapshot.payload.pubkeys));
+    assert.equal(wotSnapshot.payload.pubkeys[0].pubkey, ACCOUNTS.operator.pubkeyHex);
+    assert.equal(wotSnapshot.payload.pubkeys[1].pubkey, ACCOUNTS.wotDepth1.pubkeyHex);
+    assert.equal(wotSnapshot.payload.pubkeys[1].depth, 1);
+    assert.equal(wotSnapshot.payload.pubkeys[1].approved, true);
+
     const update = await putAdminAllowlist(baseUrl, token, [ACCOUNTS.allowlistOnly.pubkeyHex]);
     assert.equal(update.response.status, 200);
 
@@ -376,20 +445,14 @@ test('allowlist+wot keeps live allowlist updates and WoT approvals active togeth
   }
 });
 
-test('wot-only policy ignores allowlist file mode and does not expose the admin UI', async () => {
+test('wot-only policy exposes the access manager and blocklist overrides WoT approval', async () => {
   const tempDir = await mkdtemp(join(tmpdir(), 'pg-allowlist-'));
-  const allowlistFile = join(tempDir, 'allowlist.json');
-  await writeFile(allowlistFile, JSON.stringify({
-    version: 1,
-    updatedAt: Date.now(),
-    updatedBy: ACCOUNTS.operator.pubkeyHex,
-    pubkeys: [ACCOUNTS.outsider.pubkeyHex]
-  }, null, 2));
+  const blocklistFile = join(tempDir, 'blocklist.json');
   const { service, baseUrl } = await createService({
     port: 0,
     hostPolicy: 'wot',
-    allowlistFile,
-    allowlistPubkeys: []
+    blocklistFile,
+    blocklistPubkeys: [ACCOUNTS.wotDepth1.pubkeyHex]
   });
 
   try {
@@ -400,12 +463,88 @@ test('wot-only policy ignores allowlist file mode and does not expose the admin 
     });
 
     const page = await fetchJson(`${baseUrl}/admin/allowlist`);
-    assert.equal(page.response.status, 404);
+    assert.equal(page.response.status, 200);
 
     const outsider = await probeGatewayAuth(baseUrl, ACCOUNTS.outsider);
     const wotApproved = await probeGatewayAuth(baseUrl, ACCOUNTS.wotDepth1);
     assert.equal(outsider.response.status, 403);
-    assert.equal(wotApproved.response.status, 200);
+    assert.equal(wotApproved.response.status, 403);
+
+    const token = await authenticateAdmin(baseUrl);
+    const blocklist = await getAdminBlocklist(baseUrl, token);
+    assert.equal(blocklist.response.status, 200);
+    assert.deepEqual(blocklist.payload.pubkeys, [ACCOUNTS.wotDepth1.pubkeyHex]);
+
+    const cleared = await putAdminBlocklist(baseUrl, token, []);
+    assert.equal(cleared.response.status, 200);
+
+    const wotApprovedAfterClear = await probeGatewayAuth(baseUrl, ACCOUNTS.wotDepth1);
+    assert.equal(wotApprovedAfterClear.response.status, 200);
+  } finally {
+    await service.stop();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('blocklist overrides open and allowlist approvals', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'pg-blocklist-'));
+  const blocklistFile = join(tempDir, 'blocklist.json');
+  const allowlistFile = join(tempDir, 'allowlist.json');
+
+  const openService = await createService({
+    port: 0,
+    hostPolicy: 'open',
+    blocklistFile,
+    blocklistPubkeys: [ACCOUNTS.outsider.pubkeyHex]
+  });
+
+  const allowlistService = await createService({
+    port: 0,
+    hostPolicy: 'allowlist',
+    allowlistFile,
+    allowlistPubkeys: [ACCOUNTS.allowlistOnly.pubkeyHex],
+    blocklistFile: join(tempDir, 'allowlist-blocklist.json'),
+    blocklistPubkeys: [ACCOUNTS.allowlistOnly.pubkeyHex]
+  });
+
+  try {
+    const openOutsider = await probeGatewayAuth(openService.baseUrl, ACCOUNTS.outsider);
+    const allowlisted = await probeGatewayAuth(allowlistService.baseUrl, ACCOUNTS.allowlistOnly);
+    assert.equal(openOutsider.response.status, 403);
+    assert.equal(allowlisted.response.status, 403);
+  } finally {
+    await openService.service.stop();
+    await allowlistService.service.stop();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('operator admin auth still works when the operator is blocklisted for host access', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'pg-blocklist-'));
+  const blocklistFile = join(tempDir, 'blocklist.json');
+  const { service, baseUrl } = await createService({
+    port: 0,
+    hostPolicy: 'wot',
+    blocklistFile,
+    blocklistPubkeys: [ACCOUNTS.operator.pubkeyHex]
+  });
+
+  try {
+    installFakeWotGraph(service, {
+      distances: {
+        [ACCOUNTS.wotDepth1.pubkeyHex]: 1
+      }
+    });
+
+    const token = await authenticateAdmin(baseUrl);
+    assert.ok(token);
+
+    const operatorHostAccess = await probeGatewayAuth(baseUrl, ACCOUNTS.operator);
+    assert.equal(operatorHostAccess.response.status, 403);
+
+    const blocklist = await getAdminBlocklist(baseUrl, token);
+    assert.equal(blocklist.response.status, 200);
+    assert.deepEqual(blocklist.payload.pubkeys, [ACCOUNTS.operator.pubkeyHex]);
   } finally {
     await service.stop();
     await rm(tempDir, { recursive: true, force: true });

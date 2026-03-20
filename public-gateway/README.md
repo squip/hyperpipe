@@ -89,6 +89,8 @@ docker run -p 4430:4430 \
   -e GATEWAY_AUTH_ALLOWLIST_PUBKEYS=<64-char-hex>,<64-char-hex> \
   -e GATEWAY_AUTH_ALLOWLIST_FILE=/data/config/allowlist.json \
   -e GATEWAY_AUTH_ALLOWLIST_REFRESH_MS=5000 \
+  -e GATEWAY_AUTH_BLOCKLIST_FILE=/data/config/blocklist.json \
+  -e GATEWAY_AUTH_BLOCKLIST_REFRESH_MS=5000 \
   hypertuna/public-gateway
 ```
 
@@ -98,7 +100,7 @@ The gateway now defaults to relay-scoped bearer auth for restricted hosting. `GA
 
 WoT host checks default to the discovery relay list, but can now be isolated with `GATEWAY_AUTH_WOT_RELAYS`. Use that when you want a smaller or more reliable relay set for auth decisions than the one you advertise for discovery. `GATEWAY_AUTH_WOT_LOAD_TIMEOUT_MS` and `GATEWAY_AUTH_WOT_REFRESH_MS` let you tune how aggressively the gateway fetches and refreshes the cached WoT graph.
 
-If you want to edit the allowlist live without restarting the container, set `GATEWAY_AUTH_ALLOWLIST_FILE`. When the host policy is `allowlist` or `allowlist+wot`, the gateway will hot-reload that file and expose an operator-only admin page at `/admin/allowlist`.
+If you want to manage access lists live without restarting the container, set `GATEWAY_AUTH_ALLOWLIST_FILE` and/or `GATEWAY_AUTH_BLOCKLIST_FILE`. The gateway will hot-reload those files and expose an operator-only access manager at `/admin/allowlist`.
 
 ### Configuration Reference
 
@@ -131,6 +133,9 @@ If you want to edit the allowlist live without restarting the container, set `GA
 | `GATEWAY_AUTH_ALLOWLIST_PUBKEYS` | Comma-separated 64-character hex pubkeys approved for `allowlist` or `allowlist+wot`. |
 | `GATEWAY_AUTH_ALLOWLIST_FILE` | Optional JSON file path for the live allowlist store. When set with `allowlist` or `allowlist+wot`, the gateway hot-reloads this file and exposes `/admin/allowlist`. |
 | `GATEWAY_AUTH_ALLOWLIST_REFRESH_MS` | How often to re-stat the allowlist file before auth checks and admin reads. Defaults to `5000`. |
+| `GATEWAY_AUTH_BLOCKLIST_PUBKEYS` | Optional comma-separated 64-character hex pubkeys denied across `open`, `allowlist`, `wot`, and `allowlist+wot`. |
+| `GATEWAY_AUTH_BLOCKLIST_FILE` | Optional JSON file path for the live blocklist store. When set, `/admin/allowlist` can manage the Block List without restarting the container. |
+| `GATEWAY_AUTH_BLOCKLIST_REFRESH_MS` | How often to re-stat the blocklist file before auth checks and admin reads. Defaults to `5000`. |
 | `GATEWAY_AUTH_WOT_ROOT_PUBKEY` | Optional 64-character hex WoT root. Falls back to `GATEWAY_AUTH_OPERATOR_PUBKEY` when omitted. |
 | `GATEWAY_AUTH_WOT_MAX_DEPTH` | Maximum allowed WoT distance from the root. Defaults to `1`. |
 | `GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2` | Optional follower threshold applied only to depth-2 approvals. Defaults to `0`. |
@@ -169,9 +174,10 @@ If you want to edit the allowlist live without restarting the container, set `GA
   - `GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2=2`
   - `GATEWAY_AUTH_MEMBER_DELEGATION=all-members`
 
-### Live Allowlist Admin
+### Access Manager
 
-- Live allowlist management is opt-in. Set `GATEWAY_AUTH_ALLOWLIST_FILE=/data/config/allowlist.json` and use `GATEWAY_AUTH_HOST_POLICY=allowlist` or `allowlist+wot`.
+- Live Allow List management is opt-in. Set `GATEWAY_AUTH_ALLOWLIST_FILE=/data/config/allowlist.json` and use `GATEWAY_AUTH_HOST_POLICY=allowlist` or `allowlist+wot`.
+- Live Block List management is opt-in. Set `GATEWAY_AUTH_BLOCKLIST_FILE=/data/config/blocklist.json`. Blocklisted pubkeys are denied across every host policy, including `open`.
 - The file format is:
 
 ```json
@@ -186,10 +192,11 @@ If you want to edit the allowlist live without restarting the container, set `GA
 ```
 
 - The gateway normalizes `pubkeys` to lowercase, unique, sorted 64-character hex strings.
-- If the file is missing on first boot and `GATEWAY_AUTH_ALLOWLIST_PUBKEYS` is non-empty, the gateway seeds the file from the env value once and then continues from the file.
-- The operator admin page lives at `/admin/allowlist`.
+- If the file is missing on first boot and the matching env list is non-empty, the gateway seeds the file from the env value once and then continues from the file.
+- The operator access manager lives at `/admin/allowlist`.
 - Admin auth is operator-only and uses a signed kind `22242` auth event with purpose `gateway:allowlist-admin`.
-- Admin bearer tokens are short-lived, in-memory only, and scoped to allowlist editing.
+- Admin bearer tokens are short-lived, in-memory only, and scoped to access-list editing.
+- The page exposes user-friendly tabs for **Allow List**, **Web of Trust**, and **Block List** when those features are enabled. It also uses the configured discovery relays to fetch kind `0` profile metadata for displayed pubkeys.
 
 ### Testing
 

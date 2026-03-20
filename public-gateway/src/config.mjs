@@ -84,6 +84,9 @@ const DEFAULT_CONFIG = {
     allowlistPubkeys: parseCsvList(process.env.GATEWAY_AUTH_ALLOWLIST_PUBKEYS),
     allowlistFile: process.env.GATEWAY_AUTH_ALLOWLIST_FILE || null,
     allowlistRefreshMs: parseEnvNumber('GATEWAY_AUTH_ALLOWLIST_REFRESH_MS', 5000),
+    blocklistPubkeys: parseCsvList(process.env.GATEWAY_AUTH_BLOCKLIST_PUBKEYS),
+    blocklistFile: process.env.GATEWAY_AUTH_BLOCKLIST_FILE || null,
+    blocklistRefreshMs: parseEnvNumber('GATEWAY_AUTH_BLOCKLIST_REFRESH_MS', 5000),
     wotRootPubkey: process.env.GATEWAY_AUTH_WOT_ROOT_PUBKEY || null,
     wotRelayUrls: parseCsvList(process.env.GATEWAY_AUTH_WOT_RELAYS),
     wotMaxDepth: parseEnvNumber('GATEWAY_AUTH_WOT_MAX_DEPTH', 1),
@@ -354,6 +357,17 @@ function normalizeAuthSettings(settings = {}) {
     : null;
   result.allowlistRefreshMs = Number.isFinite(Number(result.allowlistRefreshMs))
     ? Math.max(0, Math.trunc(Number(result.allowlistRefreshMs)))
+    : 5000;
+  result.blocklistPubkeys = Array.from(new Set(
+    (Array.isArray(result.blocklistPubkeys) ? result.blocklistPubkeys : [])
+      .map((value) => normalizeHexPubkey(value))
+      .filter(Boolean)
+  ));
+  result.blocklistFile = typeof result.blocklistFile === 'string' && result.blocklistFile.trim().length
+    ? result.blocklistFile.trim()
+    : null;
+  result.blocklistRefreshMs = Number.isFinite(Number(result.blocklistRefreshMs))
+    ? Math.max(0, Math.trunc(Number(result.blocklistRefreshMs)))
     : 5000;
   result.wotRootPubkey = normalizeHexPubkey(result.wotRootPubkey);
   result.wotRelayUrls = Array.from(new Set(

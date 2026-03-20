@@ -42,6 +42,9 @@ export const ENV_SECTIONS = [
       'GATEWAY_AUTH_ALLOWLIST_PUBKEYS',
       'GATEWAY_AUTH_ALLOWLIST_FILE',
       'GATEWAY_AUTH_ALLOWLIST_REFRESH_MS',
+      'GATEWAY_AUTH_BLOCKLIST_PUBKEYS',
+      'GATEWAY_AUTH_BLOCKLIST_FILE',
+      'GATEWAY_AUTH_BLOCKLIST_REFRESH_MS',
       'GATEWAY_AUTH_WOT_ROOT_PUBKEY',
       'GATEWAY_AUTH_WOT_MAX_DEPTH',
       'GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2',
@@ -105,6 +108,9 @@ export const FIELD_CLASSIFICATIONS = {
   GATEWAY_AUTH_OPERATOR_PUBKEY: 'prompted_profile',
   GATEWAY_AUTH_ALLOWLIST_FILE: 'derived',
   GATEWAY_AUTH_ALLOWLIST_REFRESH_MS: 'derived',
+  GATEWAY_AUTH_BLOCKLIST_PUBKEYS: 'prompted_profile_optional',
+  GATEWAY_AUTH_BLOCKLIST_FILE: 'derived',
+  GATEWAY_AUTH_BLOCKLIST_REFRESH_MS: 'derived',
   GATEWAY_AUTH_WOT_ROOT_PUBKEY: 'prompted_profile_optional',
   GATEWAY_AUTH_WOT_MAX_DEPTH: 'prompted_profile',
   GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2: 'prompted_profile',
@@ -138,6 +144,8 @@ const BASE_DEFAULTS = {
   STORAGE_DIR: '/data',
   GATEWAY_AUTH_ALLOWLIST_FILE: '',
   GATEWAY_AUTH_ALLOWLIST_REFRESH_MS: '5000',
+  GATEWAY_AUTH_BLOCKLIST_FILE: '/data/config/blocklist.json',
+  GATEWAY_AUTH_BLOCKLIST_REFRESH_MS: '5000',
   GATEWAY_FEATURE_HYPERBEE_RELAY: 'true',
   GATEWAY_RELAY_STORAGE: '/data/gateway-relay',
   GATEWAY_FEATURE_RELAY_DISPATCHER: 'false',
@@ -356,6 +364,16 @@ export function buildRuntimeConfig({ profile, answers = {}, existing = {} }) {
     answers.GATEWAY_AUTH_ALLOWLIST_REFRESH_MS || existing.GATEWAY_AUTH_ALLOWLIST_REFRESH_MS || BASE_DEFAULTS.GATEWAY_AUTH_ALLOWLIST_REFRESH_MS,
     5000
   );
+  merged.GATEWAY_AUTH_BLOCKLIST_PUBKEYS = csvToString(
+    normalizeCsv(answers.GATEWAY_AUTH_BLOCKLIST_PUBKEYS || existing.GATEWAY_AUTH_BLOCKLIST_PUBKEYS)
+  );
+  merged.GATEWAY_AUTH_BLOCKLIST_FILE = normalizeString(
+    existing.GATEWAY_AUTH_BLOCKLIST_FILE || BASE_DEFAULTS.GATEWAY_AUTH_BLOCKLIST_FILE
+  );
+  merged.GATEWAY_AUTH_BLOCKLIST_REFRESH_MS = normalizeNumberString(
+    answers.GATEWAY_AUTH_BLOCKLIST_REFRESH_MS || existing.GATEWAY_AUTH_BLOCKLIST_REFRESH_MS || BASE_DEFAULTS.GATEWAY_AUTH_BLOCKLIST_REFRESH_MS,
+    5000
+  );
   merged.GATEWAY_AUTH_WOT_ROOT_PUBKEY = normalizeString(
     answers.GATEWAY_AUTH_WOT_ROOT_PUBKEY || existing.GATEWAY_AUTH_WOT_ROOT_PUBKEY || merged.GATEWAY_AUTH_OPERATOR_PUBKEY
   ).toLowerCase();
@@ -385,7 +403,6 @@ export function buildRuntimeConfig({ profile, answers = {}, existing = {} }) {
     merged.GATEWAY_DISCOVERY_OPEN_ACCESS = 'true';
     merged.GATEWAY_AUTH_ALLOWLIST_PUBKEYS = '';
     merged.GATEWAY_AUTH_ALLOWLIST_FILE = '';
-    merged.GATEWAY_AUTH_OPERATOR_PUBKEY = '';
     merged.GATEWAY_AUTH_WOT_ROOT_PUBKEY = '';
     merged.GATEWAY_AUTH_WOT_RELAYS = '';
   } else if (normalizedProfile === 'allowlist') {
@@ -465,13 +482,19 @@ export function validateConfig(config = {}) {
   if (!isPositiveIntegerString(normalized.GATEWAY_AUTH_ALLOWLIST_REFRESH_MS)) {
     errors.push('GATEWAY_AUTH_ALLOWLIST_REFRESH_MS must be a positive integer');
   }
+  if (!isPositiveIntegerString(normalized.GATEWAY_AUTH_BLOCKLIST_REFRESH_MS)) {
+    errors.push('GATEWAY_AUTH_BLOCKLIST_REFRESH_MS must be a positive integer');
+  }
+  if (normalizeString(normalized.GATEWAY_AUTH_BLOCKLIST_PUBKEYS) && !isValidPubkeyList(normalized.GATEWAY_AUTH_BLOCKLIST_PUBKEYS)) {
+    errors.push('GATEWAY_AUTH_BLOCKLIST_PUBKEYS must be blank or a comma-separated list of 64-character hex pubkeys');
+  }
 
   if (profile === 'open') {
     if (normalizeString(normalized.GATEWAY_DISCOVERY_OPEN_ACCESS).toLowerCase() !== 'true') {
       errors.push('Open profile requires GATEWAY_DISCOVERY_OPEN_ACCESS=true');
     }
-    if (normalizeString(normalized.GATEWAY_AUTH_ALLOWLIST_PUBKEYS) || normalizeString(normalized.GATEWAY_AUTH_OPERATOR_PUBKEY)) {
-      warnings.push('Open profile ignores allowlist and WoT auth settings');
+    if (normalizeString(normalized.GATEWAY_AUTH_ALLOWLIST_PUBKEYS)) {
+      warnings.push('Open profile ignores allowlist settings');
     }
   }
 
@@ -508,6 +531,10 @@ export function validateConfig(config = {}) {
 
   if (normalizeString(normalized.GATEWAY_AUTH_WOT_ROOT_PUBKEY) && normalizeString(normalized.GATEWAY_AUTH_WOT_ROOT_PUBKEY) !== normalizeString(normalized.GATEWAY_AUTH_OPERATOR_PUBKEY) && !isHex64(normalized.GATEWAY_AUTH_WOT_ROOT_PUBKEY)) {
     errors.push('GATEWAY_AUTH_WOT_ROOT_PUBKEY must be a 64-character hex pubkey');
+  }
+
+  if (!normalizeString(normalized.GATEWAY_AUTH_BLOCKLIST_FILE)) {
+    warnings.push('GATEWAY_AUTH_BLOCKLIST_FILE is blank, so the live Block List manager will be disabled');
   }
 
   return { errors, warnings, profile, normalized };

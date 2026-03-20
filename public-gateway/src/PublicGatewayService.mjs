@@ -55,7 +55,7 @@ import { openHyperbeeReplicationChannel } from '../../shared/public-gateway/hype
 import BlindPeerService from './blind-peer/BlindPeerService.mjs';
 import BlindPeerReplicaManager from './blind-peer/BlindPeerReplicaManager.mjs';
 import { buildWotGraphFromRelays } from './utils/WotGraphLoader.mjs';
-import AllowlistStore from './utils/AllowlistStore.mjs';
+import PubkeyListStore from './utils/PubkeyListStore.mjs';
 
 const DELEGATION_FALLBACK_MS = 1500;
 const OPEN_JOIN_APPEND_CORES_PURPOSE = 'append-cores';
@@ -112,6 +112,12 @@ function escapeHtmlAttribute(value) {
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;');
+}
+
+function serializeJsonForInlineScript(value) {
+  return JSON.stringify(value ?? {})
+    .replaceAll('<', '\\u003c')
+    .replaceAll('-->', '--\\>');
 }
 
 function normalizeHexPubkey(value) {
@@ -426,11 +432,23 @@ class PublicGatewayService {
       Number(this.authConfig?.wotLoadTimeoutMs) || 30_000
     );
     this.allowlistStore = this.#allowlistStoreEnabled()
-      ? new AllowlistStore({
+      ? new PubkeyListStore({
         filePath: this.authConfig?.allowlistFile,
         refreshMs: this.authConfig?.allowlistRefreshMs,
         bootstrapPubkeys: this.authConfig?.allowlistPubkeys || [],
-        logger: this.logger
+        logger: this.logger,
+        kind: 'allowlist',
+        displayName: 'Allowlist'
+      })
+      : null;
+    this.blocklistStore = this.#blocklistStoreEnabled()
+      ? new PubkeyListStore({
+        filePath: this.authConfig?.blocklistFile,
+        refreshMs: this.authConfig?.blocklistRefreshMs,
+        bootstrapPubkeys: this.authConfig?.blocklistPubkeys || [],
+        logger: this.logger,
+        kind: 'blocklist',
+        displayName: 'Blocklist'
       })
       : null;
     this.explicitSharedSecretVersion = this.discoveryConfig?.sharedSecretVersion || null;
@@ -671,6 +689,14 @@ class PublicGatewayService {
         source: this.allowlistStore.snapshot().source
       });
     }
+    if (this.blocklistStore?.enabled) {
+      await this.blocklistStore.initialize();
+      this.logger?.info?.('[PublicGateway] Live blocklist store initialized', {
+        filePath: this.authConfig?.blocklistFile,
+        blocklistCount: this.blocklistStore.snapshot().count,
+        source: this.blocklistStore.snapshot().source
+      });
+    }
     await this.connectionPool.initialize();
     if (Number.isFinite(this.config?.registration?.relayGcAfterMs) && this.config.registration.relayGcAfterMs > 0) {
       this.logger?.info?.('[PublicGateway] Relay GC policy enabled', {
@@ -844,8 +870,8 @@ class PublicGatewayService {
 
   #setupHttpServer() {
     const app = this.app;
-    const requireAllowlistAdmin = (req, res, next) => {
-      if (!this.#allowlistAdminEnabled()) {
+    const requireAccessManager = (req, res, next) => {
+      if (!this.#accessManagerEnabled()) {
         return res.status(404).json({ error: 'not-found' });
       }
       this.#setNoStore(res);
@@ -883,7 +909,7 @@ class PublicGatewayService {
 
     app.use(
       '/admin/allowlist/assets',
-      requireAllowlistAdmin,
+      requireAccessManager,
       express.static(ADMIN_ASSET_DIR, {
         index: false,
         setHeaders: (res) => this.#setNoStore(res)
@@ -891,7 +917,7 @@ class PublicGatewayService {
     );
     app.use(
       '/admin/allowlist/vendor/@noble/curves',
-      requireAllowlistAdmin,
+      requireAccessManager,
       createExtensionlessJsModuleMiddleware(
         NOBLE_CURVES_ESM_DIR,
         (res) => this.#setNoStore(res)
@@ -903,7 +929,7 @@ class PublicGatewayService {
     );
     app.use(
       '/admin/allowlist/vendor/@noble/hashes',
-      requireAllowlistAdmin,
+      requireAccessManager,
       createExtensionlessJsModuleMiddleware(
         NOBLE_HASHES_ESM_DIR,
         (res) => this.#setNoStore(res)
@@ -997,6 +1023,9 @@ class PublicGatewayService {
     app.post('/api/admin/auth/verify', (req, res) => this.#handleAdminAuthVerify(req, res));
     app.get('/api/admin/allowlist', (req, res) => this.#handleAdminAllowlistGet(req, res));
     app.put('/api/admin/allowlist', (req, res) => this.#handleAdminAllowlistPut(req, res));
+    app.get('/api/admin/blocklist', (req, res) => this.#handleAdminBlocklistGet(req, res));
+    app.put('/api/admin/blocklist', (req, res) => this.#handleAdminBlocklistPut(req, res));
+    app.get('/api/admin/wot', (req, res) => this.#handleAdminWotGet(req, res));
     app.post('/api/auth/challenge', (req, res) => this.#handleAuthChallenge(req, res));
     app.post('/api/auth/verify', (req, res) => this.#handleAuthVerify(req, res));
     app.get('/api/relays/:relayKey/access/challenge', (req, res) => this.#handleRelayAccessChallenge(req, res));
@@ -1392,11 +1421,25 @@ class PublicGatewayService {
     return this.#allowlistPolicyEnabled() && typeof this.authConfig?.allowlistFile === 'string' && this.authConfig.allowlistFile.length > 0;
   }
 
-  #allowlistAdminEnabled() {
-    return this.#allowlistStoreEnabled()
+  #blocklistStoreEnabled() {
+    return typeof this.authConfig?.blocklistFile === 'string' && this.authConfig.blocklistFile.length > 0;
+  }
+
+  #blocklistPolicyEnabled() {
+    return this.#blocklistStoreEnabled() || (
+      Array.isArray(this.authConfig?.blocklistPubkeys)
+      && this.authConfig.blocklistPubkeys.length > 0
+    );
+  }
+
+  #accessManagerEnabled() {
+    return (
+      this.#allowlistStoreEnabled()
+      || this.#blocklistStoreEnabled()
+      || this.#wotPolicyEnabled()
+    )
       && !!this.sharedSecret
-      && !!normalizeHexPubkey(this.authConfig?.operatorPubkey)
-      && !!this.allowlistStore?.enabled;
+      && !!normalizeHexPubkey(this.authConfig?.operatorPubkey);
   }
 
   async #ensureAllowlistState({ force = false } = {}) {
@@ -1416,6 +1459,23 @@ class PublicGatewayService {
     return this.allowlistStore.ensureFresh({ force });
   }
 
+  async #ensureBlocklistState({ force = false } = {}) {
+    if (!this.blocklistStore?.enabled) {
+      return {
+        version: 1,
+        updatedAt: null,
+        updatedBy: null,
+        pubkeys: Array.isArray(this.authConfig?.blocklistPubkeys)
+          ? [...this.authConfig.blocklistPubkeys]
+          : [],
+        count: Array.isArray(this.authConfig?.blocklistPubkeys) ? this.authConfig.blocklistPubkeys.length : 0,
+        source: 'env',
+        lastError: null
+      };
+    }
+    return this.blocklistStore.ensureFresh({ force });
+  }
+
   async #isAllowlisted(subjectPubkey) {
     const normalizedSubjectPubkey = normalizeHexPubkey(subjectPubkey);
     if (!normalizedSubjectPubkey) return false;
@@ -1427,9 +1487,23 @@ class PublicGatewayService {
       && this.authConfig.allowlistPubkeys.includes(normalizedSubjectPubkey);
   }
 
+  async #isBlocklisted(subjectPubkey) {
+    const normalizedSubjectPubkey = normalizeHexPubkey(subjectPubkey);
+    if (!normalizedSubjectPubkey) return false;
+    if (this.blocklistStore?.enabled) {
+      await this.#ensureBlocklistState();
+      return this.blocklistStore.has(normalizedSubjectPubkey);
+    }
+    return Array.isArray(this.authConfig?.blocklistPubkeys)
+      && this.authConfig.blocklistPubkeys.includes(normalizedSubjectPubkey);
+  }
+
   #policySnapshot() {
     const allowlistSnapshot = this.allowlistStore?.enabled
       ? this.allowlistStore.snapshot()
+      : null;
+    const blocklistSnapshot = this.blocklistStore?.enabled
+      ? this.blocklistStore.snapshot()
       : null;
     return {
       hostPolicy: this.authConfig?.hostPolicy || 'open',
@@ -1438,6 +1512,9 @@ class PublicGatewayService {
       allowlistCount: allowlistSnapshot
         ? allowlistSnapshot.count
         : (Array.isArray(this.authConfig?.allowlistPubkeys) ? this.authConfig.allowlistPubkeys.length : 0),
+      blocklistCount: blocklistSnapshot
+        ? blocklistSnapshot.count
+        : (Array.isArray(this.authConfig?.blocklistPubkeys) ? this.authConfig.blocklistPubkeys.length : 0),
       wotRootPubkey: this.authConfig?.wotRootPubkey || null,
       wotMaxDepth: this.authConfig?.wotMaxDepth || null,
       wotMinFollowersDepth2: this.authConfig?.wotMinFollowersDepth2 || null
@@ -1592,12 +1669,84 @@ class PublicGatewayService {
     }
   }
 
+  #serializeWotSnapshot() {
+    const operatorPubkey = normalizeHexPubkey(this.authConfig?.operatorPubkey);
+    const rootPubkey = normalizeHexPubkey(this.authConfig?.wotRootPubkey || operatorPubkey);
+    const maxDepth = Math.max(1, Math.trunc(Number(this.authConfig?.wotMaxDepth) || 1));
+    const minFollowersDepth2 = Math.max(0, Math.trunc(Number(this.authConfig?.wotMinFollowersDepth2) || 0));
+    const relayUrls = this.#wotRelayUrls();
+    const graph = this.wotState?.wot || null;
+    const entries = graph?.nodes instanceof Map
+      ? Array.from(graph.nodes.values())
+      : [];
+
+    const pubkeys = entries
+      .map((node) => {
+        const pubkey = normalizeHexPubkey(node?.pubkey);
+        if (!pubkey) return null;
+        const depth = Number.isFinite(Number(node?.depth)) ? Math.max(0, Math.trunc(Number(node.depth))) : null;
+        const followerCount = node?.followedBy instanceof Set ? node.followedBy.size : 0;
+        const approved = depth !== null
+          && depth <= maxDepth
+          && (depth !== 2 || followerCount >= minFollowersDepth2);
+        return {
+          pubkey,
+          depth,
+          followerCount,
+          approved,
+          isOperator: !!operatorPubkey && pubkey === operatorPubkey,
+          isRoot: !!rootPubkey && pubkey === rootPubkey
+        };
+      })
+      .filter(Boolean)
+      .sort((left, right) => {
+        const depthDelta = (left.depth ?? Number.MAX_SAFE_INTEGER) - (right.depth ?? Number.MAX_SAFE_INTEGER);
+        if (depthDelta !== 0) return depthDelta;
+        const followerDelta = right.followerCount - left.followerCount;
+        if (followerDelta !== 0) return followerDelta;
+        return left.pubkey.localeCompare(right.pubkey);
+      });
+
+    return {
+      rootPubkey,
+      maxDepth,
+      minFollowersDepth2,
+      loadedAt: this.wotState?.loadedAt || null,
+      expiresAt: this.wotState?.expiresAt || null,
+      lastError: this.wotState?.lastError || null,
+      relayUrls,
+      pubkeys
+    };
+  }
+
   async #evaluateHostAccess(subjectPubkey, { scope = null, relayKey = null } = {}) {
     const normalizedSubjectPubkey = normalizeHexPubkey(subjectPubkey);
     if (!normalizedSubjectPubkey) {
       return { authorized: false, reason: 'gateway-host-unauthorized', source: 'invalid-pubkey' };
     }
     const hostPolicy = this.authConfig?.hostPolicy || 'open';
+    const blocklisted = this.#blocklistPolicyEnabled()
+      ? await this.#isBlocklisted(normalizedSubjectPubkey)
+      : false;
+    if (blocklisted) {
+      const approval = {
+        state: 'revoked',
+        scope: scope || null,
+        relayKey: relayKey || null,
+        source: 'blocklist',
+        policySnapshot: this.#policySnapshot(),
+        approvedAt: null,
+        revokedAt: Date.now()
+      };
+      if (typeof this.registrationStore?.upsertHostApproval === 'function') {
+        await this.registrationStore.upsertHostApproval(this.#currentGatewayId() || 'default', normalizedSubjectPubkey, approval).catch(() => {});
+      }
+      return {
+        authorized: false,
+        reason: 'gateway-host-unauthorized',
+        source: 'blocklist'
+      };
+    }
     const allowlisted = this.#allowlistPolicyEnabled()
       ? await this.#isAllowlisted(normalizedSubjectPubkey)
       : false;
@@ -4362,18 +4511,51 @@ class PublicGatewayService {
     });
   }
 
+  #accessManagerContext() {
+    return {
+      operatorPubkey: normalizeHexPubkey(this.authConfig?.operatorPubkey) || '',
+      relay: this.config?.publicBaseUrl || '',
+      purpose: ADMIN_ALLOWLIST_PURPOSE,
+      hostPolicy: this.authConfig?.hostPolicy || 'open',
+      discoveryRelayUrls: Array.from(new Set(
+        (Array.isArray(this.discoveryConfig?.nostrRelayUrls) ? this.discoveryConfig.nostrRelayUrls : [])
+          .map((value) => (typeof value === 'string' ? value.trim() : ''))
+          .filter(Boolean)
+      )),
+      allowlistEnabled: !!this.allowlistStore?.enabled,
+      blocklistEnabled: !!this.blocklistStore?.enabled,
+      wotEnabled: this.#wotPolicyEnabled()
+    };
+  }
+
+  async #authenticateAccessManagerRequest(req) {
+    const auth = await this.#authenticateGatewayRequest(req, {
+      requiredScope: ADMIN_ALLOWLIST_PURPOSE
+    });
+    const operatorPubkey = normalizeHexPubkey(this.authConfig?.operatorPubkey);
+    if (!auth || normalizeHexPubkey(auth.subjectPubkey) !== operatorPubkey) {
+      return null;
+    }
+    return auth;
+  }
+
   #renderAllowlistAdminPage() {
     const nonce = randomBytes(16).toString('base64');
-    const operatorPubkey = escapeHtmlAttribute(normalizeHexPubkey(this.authConfig?.operatorPubkey) || '');
-    const relay = escapeHtmlAttribute(this.config?.publicBaseUrl || '');
+    const context = this.#accessManagerContext();
+    const connectSrc = new Set(["'self'"]);
+    for (const relayUrl of context.discoveryRelayUrls) {
+      try {
+        connectSrc.add(new URL(relayUrl).origin);
+      } catch (_) {}
+    }
     const csp = [
       "default-src 'self'",
       "base-uri 'none'",
       "form-action 'self'",
       "frame-ancestors 'none'",
       "object-src 'none'",
-      "img-src 'self' data:",
-      "connect-src 'self'",
+      "img-src 'self' data: https:",
+      `connect-src ${Array.from(connectSrc).join(' ')}`,
       `script-src 'self' 'nonce-${nonce}'`,
       "style-src 'self'"
     ].join('; ');
@@ -4382,9 +4564,10 @@ class PublicGatewayService {
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Gateway Allowlist Admin</title>
+    <title>Access Manager</title>
     <meta http-equiv="Cache-Control" content="no-store">
     <link rel="stylesheet" href="/admin/allowlist/assets/allowlist-admin.css">
+    <script id="access-manager-config" type="application/json">${serializeJsonForInlineScript(context)}</script>
     <script type="importmap" nonce="${nonce}">
       {
         "imports": {
@@ -4400,16 +4583,11 @@ class PublicGatewayService {
     ></script>
   </head>
   <body>
-    <main
-      id="allowlist-admin-root"
-      data-operator-pubkey="${operatorPubkey}"
-      data-relay="${relay}"
-      data-purpose="${ADMIN_ALLOWLIST_PURPOSE}"
-    >
+    <main id="allowlist-admin-root">
       <section>
         <p>Public Gateway</p>
-        <h1>Allowlist Pubkeys</h1>
-        <p>Loading the live allowlist editor…</p>
+        <h1>Access Manager</h1>
+        <p>Loading the access manager…</p>
       </section>
       <noscript>This page requires JavaScript.</noscript>
     </main>
@@ -4419,7 +4597,7 @@ class PublicGatewayService {
   }
 
   async #handleAllowlistAdminPage(_req, res) {
-    if (!this.#allowlistAdminEnabled()) {
+    if (!this.#accessManagerEnabled()) {
       return res.status(404).send('Not Found');
     }
     this.#setNoStore(res);
@@ -4431,7 +4609,7 @@ class PublicGatewayService {
 
   async #handleAdminAuthChallenge(req, res) {
     this.#setNoStore(res);
-    if (!this.#allowlistAdminEnabled()) {
+    if (!this.#accessManagerEnabled()) {
       return res.status(404).json({ error: 'not-found' });
     }
     const pubkey = normalizeHexPubkey(req.body?.pubkey);
@@ -4453,7 +4631,7 @@ class PublicGatewayService {
 
   async #handleAdminAuthVerify(req, res) {
     this.#setNoStore(res);
-    if (!this.#allowlistAdminEnabled()) {
+    if (!this.#accessManagerEnabled()) {
       return res.status(404).json({ error: 'not-found' });
     }
     const authEvent = req.body?.authEvent;
@@ -4492,14 +4670,11 @@ class PublicGatewayService {
 
   async #handleAdminAllowlistGet(req, res) {
     this.#setNoStore(res);
-    if (!this.#allowlistAdminEnabled()) {
+    if (!this.#accessManagerEnabled() || !this.allowlistStore?.enabled) {
       return res.status(404).json({ error: 'not-found' });
     }
-    const auth = await this.#authenticateGatewayRequest(req, {
-      requiredScope: ADMIN_ALLOWLIST_PURPOSE
-    });
-    const operatorPubkey = normalizeHexPubkey(this.authConfig?.operatorPubkey);
-    if (!auth || normalizeHexPubkey(auth.subjectPubkey) !== operatorPubkey) {
+    const auth = await this.#authenticateAccessManagerRequest(req);
+    if (!auth) {
       return res.status(401).json({ error: 'gateway-admin-unauthorized' });
     }
     const snapshot = await this.#ensureAllowlistState();
@@ -4508,14 +4683,12 @@ class PublicGatewayService {
 
   async #handleAdminAllowlistPut(req, res) {
     this.#setNoStore(res);
-    if (!this.#allowlistAdminEnabled()) {
+    if (!this.#accessManagerEnabled() || !this.allowlistStore?.enabled) {
       return res.status(404).json({ error: 'not-found' });
     }
-    const auth = await this.#authenticateGatewayRequest(req, {
-      requiredScope: ADMIN_ALLOWLIST_PURPOSE
-    });
-    const operatorPubkey = normalizeHexPubkey(this.authConfig?.operatorPubkey);
-    if (!auth || normalizeHexPubkey(auth.subjectPubkey) !== operatorPubkey) {
+    const auth = await this.#authenticateAccessManagerRequest(req);
+    const operatorPubkey = normalizeHexPubkey(auth?.subjectPubkey);
+    if (!auth || !operatorPubkey) {
       return res.status(401).json({ error: 'gateway-admin-unauthorized' });
     }
     if (!Array.isArray(req.body?.pubkeys)) {
@@ -4544,6 +4717,73 @@ class PublicGatewayService {
       });
       return res.status(500).json({ error: 'allowlist-write-failed', message: error?.message || String(error) });
     }
+  }
+
+  async #handleAdminBlocklistGet(req, res) {
+    this.#setNoStore(res);
+    if (!this.#accessManagerEnabled() || !this.blocklistStore?.enabled) {
+      return res.status(404).json({ error: 'not-found' });
+    }
+    const auth = await this.#authenticateAccessManagerRequest(req);
+    if (!auth) {
+      return res.status(401).json({ error: 'gateway-admin-unauthorized' });
+    }
+    const snapshot = await this.#ensureBlocklistState();
+    return res.json(snapshot);
+  }
+
+  async #handleAdminBlocklistPut(req, res) {
+    this.#setNoStore(res);
+    if (!this.#accessManagerEnabled() || !this.blocklistStore?.enabled) {
+      return res.status(404).json({ error: 'not-found' });
+    }
+    const auth = await this.#authenticateAccessManagerRequest(req);
+    const operatorPubkey = normalizeHexPubkey(auth?.subjectPubkey);
+    if (!auth || !operatorPubkey) {
+      return res.status(401).json({ error: 'gateway-admin-unauthorized' });
+    }
+    if (!Array.isArray(req.body?.pubkeys)) {
+      return res.status(400).json({ error: 'pubkeys-array-required' });
+    }
+    const normalized = [];
+    for (const value of req.body.pubkeys) {
+      const pubkey = normalizeHexPubkey(value);
+      if (!pubkey) {
+        return res.status(400).json({ error: 'invalid-pubkey' });
+      }
+      normalized.push(pubkey);
+    }
+    try {
+      const snapshot = await this.blocklistStore.replacePubkeys(normalized, {
+        updatedBy: operatorPubkey
+      });
+      return res.json(snapshot);
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Failed to persist blocklist update', {
+        filePath: this.authConfig?.blocklistFile,
+        error: error?.message || error
+      });
+      return res.status(500).json({ error: 'blocklist-write-failed', message: error?.message || String(error) });
+    }
+  }
+
+  async #handleAdminWotGet(req, res) {
+    this.#setNoStore(res);
+    if (!this.#accessManagerEnabled() || !this.#wotPolicyEnabled()) {
+      return res.status(404).json({ error: 'not-found' });
+    }
+    const auth = await this.#authenticateAccessManagerRequest(req);
+    if (!auth) {
+      return res.status(401).json({ error: 'gateway-admin-unauthorized' });
+    }
+    try {
+      await this.#ensureWotGraph();
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Failed to refresh WoT graph for admin view', {
+        error: error?.message || error
+      });
+    }
+    return res.json(this.#serializeWotSnapshot());
   }
 
   async #handleRelayAccessChallenge(req, res) {

@@ -2,35 +2,99 @@ import { schnorr, secp256k1 } from '@noble/curves/secp256k1.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 
 const root = document.querySelector('#allowlist-admin-root');
+const configNode = document.querySelector('#access-manager-config');
 
 if (!root) {
-  throw new Error('Allowlist admin root element is missing.');
+  throw new Error('Access manager root element is missing.');
 }
 
-const OPERATOR_PUBKEY = normalizePubkey(root.dataset.operatorPubkey);
-const RELAY = typeof root.dataset.relay === 'string' ? root.dataset.relay.trim() : '';
-const PURPOSE = typeof root.dataset.purpose === 'string' ? root.dataset.purpose.trim() : 'gateway:allowlist-admin';
+if (!configNode) {
+  throw new Error('Access manager config is missing.');
+}
+
+const config = parseConfig(configNode.textContent || '{}');
+const TAB_LABELS = {
+  allowlist: 'Allow List',
+  wot: 'Web of Trust',
+  blocklist: 'Block List'
+};
+const PROFILE_TIMEOUT_MS = 4500;
+const INITIAL_ACTIVE_TAB = firstEnabledTabForConfig(config);
 
 const state = {
   token: null,
   tokenExpiresAt: null,
-  operatorPubkey: OPERATOR_PUBKEY,
+  authBusy: false,
   signerState: detectSignerState(),
-  saving: false,
-  loading: false,
-  draftPubkeys: [],
-  serverPubkeys: [],
-  metadata: {
-    source: null,
-    updatedAt: null,
-    updatedBy: null,
-    lastError: null
-  }
+  operatorInput: normalizePubkey(config.operatorPubkey) || '',
+  privateKeyInput: '',
+  authPanelOpen: true,
+  activeTab: INITIAL_ACTIVE_TAB,
+  banner: null,
+  allowlist: createListState(config.allowlistEnabled),
+  blocklist: createListState(config.blocklistEnabled),
+  wot: {
+    enabled: !!config.wotEnabled,
+    loading: false,
+    loaded: false,
+    entries: [],
+    meta: {
+      rootPubkey: null,
+      maxDepth: null,
+      minFollowersDepth2: null,
+      loadedAt: null,
+      expiresAt: null,
+      relayUrls: [],
+      lastError: null
+    }
+  },
+  profileCache: new Map()
 };
 
 renderShell();
 bindEvents();
 render();
+
+function parseConfig(raw) {
+  try {
+    const parsed = JSON.parse(raw || '{}');
+    return {
+      operatorPubkey: normalizePubkey(parsed.operatorPubkey) || '',
+      relay: typeof parsed.relay === 'string' ? parsed.relay.trim() : '',
+      purpose: typeof parsed.purpose === 'string' && parsed.purpose.trim()
+        ? parsed.purpose.trim()
+        : 'gateway:allowlist-admin',
+      hostPolicy: typeof parsed.hostPolicy === 'string' ? parsed.hostPolicy.trim().toLowerCase() : 'open',
+      allowlistEnabled: parsed.allowlistEnabled === true,
+      blocklistEnabled: parsed.blocklistEnabled === true,
+      wotEnabled: parsed.wotEnabled === true,
+      discoveryRelayUrls: Array.from(new Set(
+        (Array.isArray(parsed.discoveryRelayUrls) ? parsed.discoveryRelayUrls : [])
+          .map((value) => (typeof value === 'string' ? value.trim() : ''))
+          .filter(Boolean)
+      ))
+    };
+  } catch (error) {
+    throw new Error(`Invalid access manager config: ${error?.message || error}`);
+  }
+}
+
+function createListState(enabled) {
+  return {
+    enabled: !!enabled,
+    loading: false,
+    saving: false,
+    inputValue: '',
+    draftPubkeys: [],
+    serverPubkeys: [],
+    meta: {
+      source: null,
+      updatedAt: null,
+      updatedBy: null,
+      lastError: null
+    }
+  };
+}
 
 function normalizePubkey(value) {
   if (typeof value !== 'string') return null;
@@ -42,6 +106,38 @@ function normalizePrivateKey(value) {
   if (typeof value !== 'string') return null;
   const normalized = value.trim().toLowerCase();
   return /^[0-9a-f]{64}$/.test(normalized) ? normalized : null;
+}
+
+function normalizeImageUrl(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text) return null;
+  if (text.startsWith('data:')) return text;
+  try {
+    const parsed = new URL(text);
+    return parsed.protocol === 'https:' ? parsed.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeProfilePayload(value = {}) {
+  const displayName = [
+    value.display_name,
+    value.displayName,
+    value.name,
+    value.nip05
+  ].find((entry) => typeof entry === 'string' && entry.trim());
+  const subtitle = [
+    value.nip05,
+    value.name && displayName !== value.name ? value.name : null,
+    value.about
+  ].find((entry) => typeof entry === 'string' && entry.trim());
+  return {
+    displayName: displayName ? displayName.trim() : null,
+    subtitle: subtitle ? subtitle.trim() : null,
+    picture: normalizeImageUrl(value.picture || value.image || value.avatar || ''),
+    about: typeof value.about === 'string' && value.about.trim() ? value.about.trim() : null
+  };
 }
 
 function bytesToHex(bytes) {
@@ -56,6 +152,16 @@ function uniqueSortedPubkeys(values = []) {
       .map((value) => normalizePubkey(value))
       .filter(Boolean)
   )).sort();
+}
+
+function shortPubkey(pubkey) {
+  return typeof pubkey === 'string' && pubkey.length >= 16
+    ? `${pubkey.slice(0, 8)}…${pubkey.slice(-8)}`
+    : pubkey;
+}
+
+function countLabel(count, noun = 'pubkey') {
+  return `${count} ${count === 1 ? noun : `${noun}s`}`;
 }
 
 function formatTimestamp(timestamp) {
@@ -75,214 +181,532 @@ function detectSignerState() {
   return 'missing';
 }
 
-function isDirty() {
-  return JSON.stringify(state.draftPubkeys) !== JSON.stringify(state.serverPubkeys);
+function firstEnabledTabForConfig(currentConfig) {
+  if (currentConfig.allowlistEnabled) return 'allowlist';
+  if (currentConfig.wotEnabled) return 'wot';
+  if (currentConfig.blocklistEnabled) return 'blocklist';
+  return 'allowlist';
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
+function firstEnabledTab() {
+  const tabs = getEnabledTabs();
+  return tabs[0]?.key || 'allowlist';
+}
+
+function getEnabledTabs() {
+  const tabs = [];
+  if (state.allowlist.enabled) tabs.push({ key: 'allowlist', label: TAB_LABELS.allowlist });
+  if (state.wot.enabled) tabs.push({ key: 'wot', label: TAB_LABELS.wot });
+  if (state.blocklist.enabled) tabs.push({ key: 'blocklist', label: TAB_LABELS.blocklist });
+  return tabs;
+}
+
+function setBanner(message, tone = 'info') {
+  if (!message) {
+    state.banner = null;
+    renderBanner();
+    return;
+  }
+  state.banner = { message, tone };
+  renderBanner();
+}
+
+function getProfile(pubkey) {
+  return state.profileCache.get(pubkey) || null;
+}
+
+function setProfile(pubkey, value) {
+  state.profileCache.set(pubkey, value);
+}
+
+function listStateFor(kind) {
+  if (kind === 'allowlist') return state.allowlist;
+  if (kind === 'blocklist') return state.blocklist;
+  return null;
+}
+
+function isDirty(kind) {
+  const current = listStateFor(kind);
+  if (!current) return false;
+  return JSON.stringify(current.draftPubkeys) !== JSON.stringify(current.serverPubkeys);
 }
 
 function renderShell() {
   root.innerHTML = `
-    <div class="allowlist-shell">
-      <section class="gateway-card">
-        <header class="gateway-card__header">
+    <div class="access-shell">
+      <header class="access-hero">
+        <div class="access-hero__copy">
           <p class="eyebrow">Public Gateway</p>
-          <h1>Allowlist Pubkeys</h1>
-          <p class="muted">Edit the live allowlist without restarting the gateway container.</p>
-        </header>
-        <div id="status-banner" class="status-banner"></div>
-        <div class="gateway-card__body gateway-grid">
-          <section class="gateway-panel">
-            <div class="gateway-panel__header">
-              <div>
-                <h2>Operator Authentication</h2>
-                <p class="muted">Authenticate as the configured operator using a browser signer or an advanced local private-key fallback.</p>
-              </div>
-              <div id="signer-status" class="signer-status" data-state="missing">Browser signer unavailable</div>
-            </div>
-            <div class="field-stack">
-              <label>
-                Operator pubkey
-                <input id="operator-pubkey-input" type="text" autocomplete="off" spellcheck="false" value="${escapeHtml(state.operatorPubkey || '')}">
-              </label>
-              <div class="button-row">
-                <button id="authenticate-button" class="button-primary" type="button">Authenticate with signer</button>
-                <button id="reload-button" class="button-ghost hidden" type="button">Reload from server</button>
-              </div>
-            </div>
-            <div class="advanced-panel">
-              <details id="private-key-details">
-                <summary>Advanced fallback: sign with the operator private key</summary>
-                <div class="field-stack">
-                  <p class="muted">Preferred flow: use a NIP-07 browser signer. Only use the private-key fallback when a signer is unavailable.</p>
-                  <label>
-                    Operator private key
-                    <textarea id="private-key-input" rows="3" autocomplete="off" spellcheck="false" placeholder="64-char hex private key"></textarea>
-                  </label>
-                  <div class="button-row">
-                    <button id="private-key-auth-button" class="button-secondary" type="button">Authenticate with private key</button>
-                    <button id="private-key-clear-button" class="button-ghost" type="button">Clear</button>
-                  </div>
-                </div>
-              </details>
-            </div>
-          </section>
-
-          <section id="editor-panel" class="gateway-panel hidden">
-            <div class="gateway-panel__header">
-              <div>
-                <h2>Live Allowlist</h2>
-                <p class="muted">Changes apply to new gateway auth checks immediately after a successful save.</p>
-              </div>
-              <div id="allowlist-count" class="count-pill">0 pubkeys</div>
-            </div>
-            <div class="meta-grid">
-              <div class="meta-row"><span>Source</span><span id="meta-source">Unknown</span></div>
-              <div class="meta-row"><span>Updated at</span><span id="meta-updated-at">Never</span></div>
-              <div class="meta-row"><span>Updated by</span><span id="meta-updated-by">Unknown</span></div>
-            </div>
-            <div class="list-stack section-gap">
-              <div class="field-stack">
-                <label>
-                  Add pubkey
-                  <input id="pubkey-input" type="text" autocomplete="off" spellcheck="false" placeholder="64-char hex pubkey">
-                </label>
-                <div class="button-row">
-                  <button id="add-pubkey-button" class="button-secondary" type="button">Add pubkey</button>
-                  <button id="save-button" class="button-primary" type="button">Save allowlist</button>
-                </div>
-              </div>
-              <div id="pubkey-list" class="pubkey-list"></div>
-            </div>
-          </section>
+          <h1>Access Manager</h1>
+          <p class="muted">Manage your Allow List, Web of Trust, and Block List without restarting the gateway container.</p>
         </div>
-      </section>
+        <div class="access-hero__actions">
+          <button class="button-ghost" type="button" data-action="toggle-auth-panel">Authenticate</button>
+        </div>
+      </header>
+      <div id="status-banner" class="status-banner"></div>
+      <section id="auth-panel"></section>
+      <section id="tabs-region"></section>
+      <section id="content-region"></section>
     </div>
   `;
 }
 
 function bindEvents() {
-  document.querySelector('#authenticate-button')?.addEventListener('click', authenticateWithSigner);
-  document.querySelector('#private-key-auth-button')?.addEventListener('click', authenticateWithPrivateKey);
-  document.querySelector('#private-key-clear-button')?.addEventListener('click', clearPrivateKeyFallback);
-  document.querySelector('#reload-button')?.addEventListener('click', loadAllowlist);
-  document.querySelector('#add-pubkey-button')?.addEventListener('click', addDraftPubkey);
-  document.querySelector('#save-button')?.addEventListener('click', saveAllowlist);
-  document.querySelector('#pubkey-input')?.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      addDraftPubkey();
+  root.addEventListener('click', handleClick);
+  root.addEventListener('input', handleInput);
+  root.addEventListener('keydown', handleKeyDown);
+}
+
+function handleClick(event) {
+  const target = event.target.closest('[data-action]');
+  if (!target) return;
+  const action = target.dataset.action;
+
+  if (action === 'toggle-auth-panel') {
+    state.authPanelOpen = !state.authPanelOpen;
+    renderAuthPanel();
+    renderHeader();
+    return;
+  }
+  if (action === 'sign-out') {
+    state.token = null;
+    state.tokenExpiresAt = null;
+    state.authPanelOpen = true;
+    setBanner('Signed out of the access manager.', 'info');
+    render();
+    return;
+  }
+  if (action === 'authenticate-signer') {
+    void authenticateWithSigner();
+    return;
+  }
+  if (action === 'authenticate-private-key') {
+    void authenticateWithPrivateKey();
+    return;
+  }
+  if (action === 'clear-private-key') {
+    state.privateKeyInput = '';
+    renderAuthPanel();
+    return;
+  }
+  if (action === 'switch-tab') {
+    const tab = target.dataset.tab;
+    if (tab && tab !== state.activeTab) {
+      state.activeTab = tab;
+      renderTabs();
+      renderContent();
+      void ensureProfilesLoaded(activeTabPubkeys());
     }
-  });
-  document.querySelector('#pubkey-list')?.addEventListener('click', (event) => {
-    const button = event.target.closest('[data-remove-pubkey]');
-    if (!button) return;
-    removeDraftPubkey(button.getAttribute('data-remove-pubkey'));
-  });
+    return;
+  }
+  if (action === 'reload-list') {
+    const kind = target.dataset.list;
+    if (kind) {
+      void loadList(kind);
+    }
+    return;
+  }
+  if (action === 'save-list') {
+    const kind = target.dataset.list;
+    if (kind) {
+      void saveList(kind);
+    }
+    return;
+  }
+  if (action === 'add-pubkey') {
+    const kind = target.dataset.list;
+    if (kind) {
+      addDraftPubkey(kind);
+    }
+    return;
+  }
+  if (action === 'remove-pubkey') {
+    const kind = target.dataset.list;
+    const pubkey = target.dataset.pubkey;
+    if (kind && pubkey) {
+      removeDraftPubkey(kind, pubkey);
+    }
+    return;
+  }
+  if (action === 'reload-wot') {
+    void loadWot();
+    return;
+  }
+  if (action === 'queue-block') {
+    const pubkey = normalizePubkey(target.dataset.pubkey);
+    if (pubkey) {
+      queuePubkeyForBlocklist(pubkey);
+    }
+  }
+}
+
+function handleInput(event) {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
+
+  if (target.id === 'operator-pubkey-input') {
+    state.operatorInput = target.value.trim().toLowerCase();
+    return;
+  }
+  if (target.id === 'private-key-input') {
+    state.privateKeyInput = target.value.trim().toLowerCase();
+    return;
+  }
+  const kind = target.dataset.listInput;
+  if (kind === 'allowlist' || kind === 'blocklist') {
+    const current = listStateFor(kind);
+    if (current) current.inputValue = target.value.trim().toLowerCase();
+  }
+}
+
+function handleKeyDown(event) {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
+  const kind = target.dataset.listInput;
+  if ((kind === 'allowlist' || kind === 'blocklist') && event.key === 'Enter') {
+    event.preventDefault();
+    addDraftPubkey(kind);
+  }
 }
 
 function render() {
-  const banner = document.querySelector('#status-banner');
-  const signerStatus = document.querySelector('#signer-status');
-  const editorPanel = document.querySelector('#editor-panel');
-  const reloadButton = document.querySelector('#reload-button');
-  const saveButton = document.querySelector('#save-button');
-  const addButton = document.querySelector('#add-pubkey-button');
-  const authButton = document.querySelector('#authenticate-button');
-  const privateKeyAuthButton = document.querySelector('#private-key-auth-button');
-  const list = document.querySelector('#pubkey-list');
-  const count = document.querySelector('#allowlist-count');
-  const source = document.querySelector('#meta-source');
-  const updatedAt = document.querySelector('#meta-updated-at');
-  const updatedBy = document.querySelector('#meta-updated-by');
-
-  const authenticated = !!state.token;
-  const dirty = isDirty();
-
-  if (signerStatus) {
-    signerStatus.dataset.state = state.signerState;
-    signerStatus.textContent = state.signerState === 'ready'
-      ? 'Browser signer detected'
-      : 'Browser signer unavailable';
+  renderHeader();
+  renderBanner();
+  renderAuthPanel();
+  renderTabs();
+  renderContent();
+  if (state.token) {
+    void ensureProfilesLoaded(activeTabPubkeys());
   }
-
-  if (editorPanel) {
-    editorPanel.classList.toggle('hidden', !authenticated);
-  }
-  if (reloadButton) {
-    reloadButton.classList.toggle('hidden', !authenticated);
-    reloadButton.disabled = state.loading || state.saving;
-  }
-  if (authButton) {
-    authButton.disabled = state.loading || state.saving || state.signerState !== 'ready';
-  }
-  if (privateKeyAuthButton) {
-    privateKeyAuthButton.disabled = state.loading || state.saving;
-  }
-  if (saveButton) {
-    saveButton.disabled = !authenticated || state.loading || state.saving || !dirty;
-    saveButton.textContent = state.saving ? 'Saving…' : 'Save allowlist';
-  }
-  if (addButton) {
-    addButton.disabled = !authenticated || state.loading || state.saving;
-  }
-  if (count) {
-    count.textContent = `${state.draftPubkeys.length} ${state.draftPubkeys.length === 1 ? 'pubkey' : 'pubkeys'}`;
-  }
-  if (source) {
-    source.textContent = state.metadata.source || 'Unknown';
-  }
-  if (updatedAt) {
-    updatedAt.textContent = formatTimestamp(state.metadata.updatedAt);
-  }
-  if (updatedBy) {
-    updatedBy.textContent = state.metadata.updatedBy || 'Unknown';
-  }
-
-  if (banner && !banner.dataset.tone) {
-    banner.style.display = 'none';
-  } else if (banner) {
-    banner.style.display = 'block';
-  }
-
-  if (!list) return;
-  if (!authenticated) {
-    list.innerHTML = '';
-    return;
-  }
-  if (state.draftPubkeys.length === 0) {
-    list.innerHTML = '<div class="empty-state">The live allowlist is empty.</div>';
-    return;
-  }
-  list.innerHTML = state.draftPubkeys.map((pubkey) => `
-    <div class="pubkey-row">
-      <code>${escapeHtml(pubkey)}</code>
-      <button class="button-danger" type="button" data-remove-pubkey="${pubkey}">Remove</button>
-    </div>
-  `).join('');
 }
 
-function setBanner(message, tone = 'info') {
+function renderHeader() {
+  const actions = root.querySelector('.access-hero__actions');
+  if (!actions) return;
+  const authenticated = !!state.token;
+  actions.innerHTML = `
+    <div class="hero-status">
+      <span class="signer-status" data-state="${state.signerState}">
+        ${state.signerState === 'ready' ? 'Browser signer detected' : 'Browser signer unavailable'}
+      </span>
+      ${authenticated ? `<span class="session-pill">Operator session active</span>` : ''}
+    </div>
+    <button class="button-ghost" type="button" data-action="toggle-auth-panel">
+      ${authenticated ? 'Session' : 'Authenticate'}
+    </button>
+  `;
+}
+
+function renderBanner() {
   const banner = document.querySelector('#status-banner');
   if (!banner) return;
-  if (!message) {
+  if (!state.banner?.message) {
     banner.textContent = '';
     banner.removeAttribute('data-tone');
     banner.style.display = 'none';
     return;
   }
-  banner.textContent = message;
-  banner.dataset.tone = tone;
+  banner.textContent = state.banner.message;
+  banner.dataset.tone = state.banner.tone || 'info';
   banner.style.display = 'block';
 }
 
-function clearPrivateKeyFallback() {
-  const privateKeyInput = document.querySelector('#private-key-input');
-  const details = document.querySelector('#private-key-details');
-  if (privateKeyInput) {
-    privateKeyInput.value = '';
+function renderAuthPanel() {
+  const panel = document.querySelector('#auth-panel');
+  if (!panel) return;
+  const authenticated = !!state.token;
+  const hidden = authenticated && !state.authPanelOpen;
+  panel.className = hidden ? 'panel-sheet hidden' : 'panel-sheet';
+  if (hidden) {
+    panel.innerHTML = '';
+    return;
   }
-  if (details) {
-    details.open = false;
+  panel.innerHTML = `
+    <section class="gateway-card session-card">
+      <div class="gateway-card__header">
+        <div>
+          <p class="eyebrow">Access Manager Session</p>
+          <h2>${authenticated ? 'Operator session' : 'Operator authentication'}</h2>
+          <p class="muted">
+            ${authenticated
+              ? 'Your admin token stays in browser memory only and expires automatically.'
+              : 'Use a browser signer when possible. The private-key fallback is available if a signer is not installed.'}
+          </p>
+        </div>
+        ${authenticated ? '<button class="button-ghost" type="button" data-action="sign-out">Sign out</button>' : ''}
+      </div>
+      <div class="session-grid">
+        <label>
+          Operator pubkey
+          <input id="operator-pubkey-input" type="text" autocomplete="off" spellcheck="false" value="${escapeHtml(state.operatorInput)}">
+        </label>
+        <div class="session-meta">
+          <div class="meta-row"><span>Gateway policy</span><span>${escapeHtml(config.hostPolicy)}</span></div>
+          <div class="meta-row"><span>Session expires</span><span>${authenticated ? escapeHtml(formatTimestamp(state.tokenExpiresAt)) : 'Not authenticated'}</span></div>
+        </div>
+      </div>
+      <div class="button-row session-actions">
+        <button class="button-primary" type="button" data-action="authenticate-signer" ${state.authBusy || state.signerState !== 'ready' ? 'disabled' : ''}>
+          ${state.authBusy ? 'Authenticating…' : 'Authenticate with signer'}
+        </button>
+      </div>
+      <details class="advanced-panel"${state.privateKeyInput ? ' open' : ''}>
+        <summary>Advanced fallback: sign with the operator private key</summary>
+        <div class="field-stack">
+          <p class="muted">Preferred flow: use a browser signer. The private-key fallback is never persisted and is cleared after successful authentication.</p>
+          <label>
+            Operator private key
+            <textarea id="private-key-input" rows="3" autocomplete="off" spellcheck="false" placeholder="64-char hex private key">${escapeHtml(state.privateKeyInput)}</textarea>
+          </label>
+          <div class="button-row">
+            <button class="button-secondary" type="button" data-action="authenticate-private-key" ${state.authBusy ? 'disabled' : ''}>Authenticate with private key</button>
+            <button class="button-ghost" type="button" data-action="clear-private-key">Clear</button>
+          </div>
+        </div>
+      </details>
+    </section>
+  `;
+}
+
+function renderTabs() {
+  const region = document.querySelector('#tabs-region');
+  if (!region) return;
+  if (!state.token) {
+    region.innerHTML = '';
+    return;
   }
+  const tabs = getEnabledTabs();
+  region.innerHTML = `
+    <div class="tabs-shell">
+      <div class="tab-strip" role="tablist" aria-label="Access manager lists">
+        ${tabs.map((tab) => `
+          <button
+            class="tab-button${tab.key === state.activeTab ? ' is-active' : ''}"
+            type="button"
+            role="tab"
+            aria-selected="${tab.key === state.activeTab ? 'true' : 'false'}"
+            data-action="switch-tab"
+            data-tab="${tab.key}"
+          >${escapeHtml(tab.label)}</button>
+        `).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function renderContent() {
+  const region = document.querySelector('#content-region');
+  if (!region) return;
+  if (!state.token) {
+    region.innerHTML = `
+      <section class="gateway-card placeholder-card">
+        <div class="gateway-card__header">
+          <h2>Authenticate to manage gateway access</h2>
+          <p class="muted">Once authenticated as the configured operator, you can manage the live lists and inspect the current Web of Trust graph.</p>
+        </div>
+      </section>
+    `;
+    return;
+  }
+
+  if (state.activeTab === 'allowlist' && state.allowlist.enabled) {
+    region.innerHTML = renderListPanel('allowlist', {
+      title: TAB_LABELS.allowlist,
+      description: 'Review the live Allow List and add or remove users manually.'
+    });
+    return;
+  }
+
+  if (state.activeTab === 'blocklist' && state.blocklist.enabled) {
+    region.innerHTML = renderListPanel('blocklist', {
+      title: TAB_LABELS.blocklist,
+      description: 'Review the live Block List and deny access across all host policy modes.'
+    });
+    return;
+  }
+
+  if (state.activeTab === 'wot' && state.wot.enabled) {
+    region.innerHTML = renderWotPanel();
+    return;
+  }
+
+  region.innerHTML = `
+    <section class="gateway-card placeholder-card">
+      <div class="gateway-card__header">
+        <h2>This tab is unavailable</h2>
+        <p class="muted">The active gateway policy does not expose this list in the current deployment.</p>
+      </div>
+    </section>
+  `;
+}
+
+function renderListPanel(kind, { title, description }) {
+  const current = listStateFor(kind);
+  const listRows = current.draftPubkeys.length
+    ? current.draftPubkeys.map((pubkey) => renderPubkeyRow(pubkey, {
+      actionLabel: 'Remove',
+      action: 'remove-pubkey',
+      actionKind: kind,
+      badges: kind === 'blocklist' ? [{ label: 'Denied', tone: 'danger' }] : []
+    })).join('')
+    : '<div class="empty-state">This list is empty.</div>';
+
+  return `
+    <section class="gateway-card list-card">
+      <div class="gateway-card__header card-header--split">
+        <div>
+          <p class="eyebrow">${escapeHtml(title)}</p>
+          <h2>${escapeHtml(title)}</h2>
+          <p class="muted">${escapeHtml(description)}</p>
+        </div>
+        <div class="count-pill">${countLabel(current.draftPubkeys.length)}</div>
+      </div>
+      <div class="gateway-card__body">
+        <div class="meta-grid">
+          <div class="meta-row"><span>Source</span><span>${escapeHtml(current.meta.source || 'Unknown')}</span></div>
+          <div class="meta-row"><span>Updated at</span><span>${escapeHtml(formatTimestamp(current.meta.updatedAt))}</span></div>
+          <div class="meta-row"><span>Updated by</span><span>${escapeHtml(shortPubkey(current.meta.updatedBy || 'Unknown'))}</span></div>
+        </div>
+        ${current.meta.lastError ? `<div class="inline-note inline-note--warning">${escapeHtml(current.meta.lastError)}</div>` : ''}
+        <div class="list-toolbar">
+          <label>
+            Add pubkey
+            <input
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              data-list-input="${kind}"
+              placeholder="64-char hex pubkey"
+              value="${escapeHtml(current.inputValue)}"
+            >
+          </label>
+          <div class="button-row">
+            <button class="button-secondary" type="button" data-action="add-pubkey" data-list="${kind}" ${current.loading || current.saving ? 'disabled' : ''}>Add pubkey</button>
+            <button class="button-primary" type="button" data-action="save-list" data-list="${kind}" ${current.loading || current.saving || !isDirty(kind) ? 'disabled' : ''}>${current.saving ? `Saving ${TAB_LABELS[kind]}…` : `Save ${TAB_LABELS[kind]}`}</button>
+            <button class="button-ghost" type="button" data-action="reload-list" data-list="${kind}" ${current.loading || current.saving ? 'disabled' : ''}>Reload</button>
+          </div>
+        </div>
+        <div class="entry-list">${listRows}</div>
+      </div>
+    </section>
+  `;
+}
+
+function renderWotPanel() {
+  const entries = state.wot.entries;
+  const approvedCount = entries.filter((entry) => entry.approved).length;
+  const body = entries.length
+    ? entries.map((entry) => renderWotRow(entry)).join('')
+    : '<div class="empty-state">No Web of Trust entries are currently loaded.</div>';
+  return `
+    <section class="gateway-card list-card">
+      <div class="gateway-card__header card-header--split">
+        <div>
+          <p class="eyebrow">${escapeHtml(TAB_LABELS.wot)}</p>
+          <h2>${escapeHtml(TAB_LABELS.wot)}</h2>
+          <p class="muted">Read-only snapshot ranked by proximity. Use the Block action to queue a pubkey for the Block List draft.</p>
+        </div>
+        <div class="count-stack">
+          <div class="count-pill">${countLabel(entries.length)}</div>
+          <div class="count-pill count-pill--secondary">${approvedCount} approved</div>
+        </div>
+      </div>
+      <div class="gateway-card__body">
+        <div class="meta-grid">
+          <div class="meta-row"><span>Root</span><span>${escapeHtml(shortPubkey(state.wot.meta.rootPubkey || 'Unknown'))}</span></div>
+          <div class="meta-row"><span>Max depth</span><span>${escapeHtml(state.wot.meta.maxDepth ?? 'Unknown')}</span></div>
+          <div class="meta-row"><span>Depth-2 follower threshold</span><span>${escapeHtml(state.wot.meta.minFollowersDepth2 ?? 'Unknown')}</span></div>
+          <div class="meta-row"><span>Loaded at</span><span>${escapeHtml(formatTimestamp(state.wot.meta.loadedAt))}</span></div>
+        </div>
+        ${state.wot.meta.lastError ? `<div class="inline-note inline-note--warning">${escapeHtml(state.wot.meta.lastError)}</div>` : ''}
+        <div class="button-row">
+          <button class="button-ghost" type="button" data-action="reload-wot" ${state.wot.loading ? 'disabled' : ''}>${state.wot.loading ? 'Refreshing…' : 'Refresh Web of Trust'}</button>
+        </div>
+        <div class="entry-list">${body}</div>
+      </div>
+    </section>
+  `;
+}
+
+function renderPubkeyRow(pubkey, {
+  actionLabel,
+  action,
+  actionKind,
+  badges = []
+} = {}) {
+  const profile = getProfile(pubkey);
+  const identity = renderIdentity(pubkey, profile, badges);
+  return `
+    <article class="entry-row">
+      ${identity}
+      <div class="entry-actions">
+        <button class="button-danger" type="button" data-action="${action}" data-list="${actionKind}" data-pubkey="${pubkey}">${escapeHtml(actionLabel)}</button>
+      </div>
+    </article>
+  `;
+}
+
+function renderWotRow(entry) {
+  const draftBlocked = state.blocklist.draftPubkeys.includes(entry.pubkey);
+  const savedBlocked = state.blocklist.serverPubkeys.includes(entry.pubkey);
+  const canBlock = state.blocklist.enabled && !draftBlocked && !savedBlocked;
+  const badges = [
+    { label: `Depth ${entry.depth ?? 'N/A'}` },
+    { label: `${entry.followerCount} followers` },
+    { label: entry.approved ? 'Approved' : 'Outside threshold', tone: entry.approved ? 'success' : 'warning' }
+  ];
+  if (entry.isOperator) badges.push({ label: 'Operator', tone: 'success' });
+  if (entry.isRoot) badges.push({ label: 'Root', tone: 'success' });
+  if (savedBlocked || draftBlocked) badges.push({ label: 'On Block List', tone: 'danger' });
+  return `
+    <article class="entry-row">
+      ${renderIdentity(entry.pubkey, getProfile(entry.pubkey), badges)}
+      <div class="entry-actions">
+        <button
+          class="${canBlock ? 'button-danger' : 'button-ghost'}"
+          type="button"
+          data-action="queue-block"
+          data-pubkey="${entry.pubkey}"
+          ${canBlock ? '' : 'disabled'}
+        >${savedBlocked || draftBlocked ? 'On Block List' : (state.blocklist.enabled ? 'Block' : 'Block List disabled')}</button>
+      </div>
+    </article>
+  `;
+}
+
+function renderIdentity(pubkey, profileState, badges = []) {
+  const profile = profileState?.status === 'ready' ? profileState.profile : null;
+  const displayName = profile?.displayName || shortPubkey(pubkey);
+  const subtitle = profile?.subtitle || pubkey;
+  const avatar = profile?.picture
+    ? `<img class="identity-avatar__image" src="${escapeHtml(profile.picture)}" alt="">`
+    : `<span class="identity-avatar__fallback">${escapeHtml((displayName || '?').slice(0, 1).toUpperCase())}</span>`;
+  return `
+    <div class="identity">
+      <div class="identity-avatar">${avatar}</div>
+      <div class="identity-copy">
+        <div class="identity-title">${escapeHtml(displayName)}</div>
+        <div class="identity-subtitle">
+          <code>${escapeHtml(shortPubkey(pubkey))}</code>
+          ${subtitle && subtitle !== pubkey ? `<span>${escapeHtml(subtitle)}</span>` : ''}
+        </div>
+        ${badges.length ? `
+          <div class="badge-row">
+            ${badges.map((badge) => `<span class="badge${badge.tone ? ` badge--${badge.tone}` : ''}">${escapeHtml(badge.label)}</span>`).join('')}
+          </div>
+        ` : ''}
+      </div>
+    </div>
+  `;
 }
 
 async function apiFetch(path, options = {}) {
@@ -299,12 +723,13 @@ async function apiFetch(path, options = {}) {
   let payload = {};
   try {
     payload = text ? JSON.parse(text) : {};
-  } catch (_) {
+  } catch {
     payload = { raw: text };
   }
   if (response.status === 401 && state.token) {
     state.token = null;
     state.tokenExpiresAt = null;
+    state.authPanelOpen = true;
     setBanner('Admin session expired. Authenticate again to continue.', 'error');
     render();
   }
@@ -331,8 +756,8 @@ function buildUnsignedAuthEvent(pubkey, challenge) {
     pubkey,
     tags: [
       ['challenge', challenge],
-      ['relay', RELAY],
-      ['purpose', PURPOSE]
+      ['relay', config.relay],
+      ['purpose', config.purpose]
     ],
     content: ''
   };
@@ -390,14 +815,13 @@ async function verifyAdminEvent(authEvent) {
 }
 
 async function authenticateWithSigner() {
-  const operatorInput = document.querySelector('#operator-pubkey-input');
-  const requestedPubkey = normalizePubkey(operatorInput?.value);
-  if (!requestedPubkey || requestedPubkey !== OPERATOR_PUBKEY) {
+  const requestedPubkey = normalizePubkey(state.operatorInput);
+  if (!requestedPubkey || requestedPubkey !== config.operatorPubkey) {
     setBanner('The operator pubkey must match the configured gateway operator.', 'error');
     return;
   }
-  state.loading = true;
-  render();
+  state.authBusy = true;
+  renderAuthPanel();
   try {
     const challenge = await requestAdminChallenge(requestedPubkey);
     const unsignedEvent = buildUnsignedAuthEvent(requestedPubkey, challenge.challenge);
@@ -405,127 +829,324 @@ async function authenticateWithSigner() {
     const verification = await verifyAdminEvent(signedEvent);
     state.token = verification.token;
     state.tokenExpiresAt = verification.expiresAt || null;
-    setBanner('Authenticated as operator. Live allowlist loaded from the gateway.', 'success');
-    await loadAllowlist();
+    state.authPanelOpen = false;
+    setBanner('Authenticated as the operator. Loading access lists…', 'success');
+    await loadAllAccessData();
   } catch (error) {
     setBanner(error?.message || 'Failed to authenticate with browser signer.', 'error');
   } finally {
-    state.loading = false;
+    state.authBusy = false;
     render();
   }
 }
 
 async function authenticateWithPrivateKey() {
-  const operatorInput = document.querySelector('#operator-pubkey-input');
-  const privateKeyInput = document.querySelector('#private-key-input');
-  const requestedPubkey = normalizePubkey(operatorInput?.value);
-  if (!requestedPubkey || requestedPubkey !== OPERATOR_PUBKEY) {
+  const requestedPubkey = normalizePubkey(state.operatorInput);
+  if (!requestedPubkey || requestedPubkey !== config.operatorPubkey) {
     setBanner('The operator pubkey must match the configured gateway operator.', 'error');
     return;
   }
-  state.loading = true;
-  render();
+  state.authBusy = true;
+  renderAuthPanel();
   try {
     const challenge = await requestAdminChallenge(requestedPubkey);
     const unsignedEvent = buildUnsignedAuthEvent(requestedPubkey, challenge.challenge);
-    const signedEvent = await signEventWithPrivateKey(unsignedEvent, privateKeyInput?.value || '', requestedPubkey);
+    const signedEvent = await signEventWithPrivateKey(unsignedEvent, state.privateKeyInput, requestedPubkey);
     const verification = await verifyAdminEvent(signedEvent);
     state.token = verification.token;
     state.tokenExpiresAt = verification.expiresAt || null;
-    setBanner('Authenticated with the local private-key fallback.', 'success');
-    await loadAllowlist();
+    state.privateKeyInput = '';
+    state.authPanelOpen = false;
+    setBanner('Authenticated with the local private-key fallback. Loading access lists…', 'success');
+    await loadAllAccessData();
   } catch (error) {
-    setBanner(error?.message || 'Failed to authenticate with private key.', 'error');
+    setBanner(error?.message || 'Failed to authenticate with the private-key fallback.', 'error');
   } finally {
-    state.loading = false;
-    clearPrivateKeyFallback();
+    state.authBusy = false;
     render();
   }
 }
 
-async function loadAllowlist() {
-  if (!state.token) return;
-  state.loading = true;
-  render();
+async function loadAllAccessData() {
+  const tasks = [];
+  if (state.allowlist.enabled) tasks.push(loadList('allowlist'));
+  if (state.blocklist.enabled) tasks.push(loadList('blocklist'));
+  if (state.wot.enabled) tasks.push(loadWot());
+  await Promise.all(tasks);
+}
+
+async function loadList(kind) {
+  const current = listStateFor(kind);
+  if (!state.token || !current?.enabled) return;
+  current.loading = true;
+  renderContent();
   try {
-    const response = await apiFetch('/api/admin/allowlist', { method: 'GET' });
-    state.serverPubkeys = uniqueSortedPubkeys(response.pubkeys);
-    state.draftPubkeys = [...state.serverPubkeys];
-    state.metadata = {
+    const response = await apiFetch(`/api/admin/${kind}`, { method: 'GET' });
+    current.serverPubkeys = uniqueSortedPubkeys(response.pubkeys);
+    current.draftPubkeys = [...current.serverPubkeys];
+    current.meta = {
       source: response.source || null,
       updatedAt: response.updatedAt || null,
       updatedBy: response.updatedBy || null,
       lastError: response.lastError || null
     };
     if (response.lastError) {
-      setBanner(`Allowlist loaded with a warning: ${response.lastError}`, 'info');
+      setBanner(`${TAB_LABELS[kind]} loaded with a warning: ${response.lastError}`, 'info');
     }
+    void ensureProfilesLoaded(current.draftPubkeys);
   } catch (error) {
     if (error.status !== 401) {
-      setBanner(error?.message || 'Failed to load the live allowlist.', 'error');
+      setBanner(error?.message || `Failed to load ${TAB_LABELS[kind]}.`, 'error');
     }
   } finally {
-    state.loading = false;
-    render();
+    current.loading = false;
+    renderContent();
   }
 }
 
-function addDraftPubkey() {
-  const input = document.querySelector('#pubkey-input');
-  const normalized = normalizePubkey(input?.value);
-  if (!normalized) {
-    setBanner('Pubkeys must be 64-char lowercase hex strings.', 'error');
-    return;
-  }
-  state.draftPubkeys = uniqueSortedPubkeys([...state.draftPubkeys, normalized]);
-  if (input) {
-    input.value = '';
-    input.focus();
-  }
-  setBanner(null);
-  render();
-}
-
-function removeDraftPubkey(pubkey) {
-  state.draftPubkeys = state.draftPubkeys.filter((entry) => entry !== pubkey);
-  render();
-}
-
-async function saveAllowlist() {
-  if (!state.token) {
-    setBanner('Authenticate as the operator before saving.', 'error');
-    return;
-  }
-  state.saving = true;
-  render();
+async function saveList(kind) {
+  const current = listStateFor(kind);
+  if (!state.token || !current?.enabled) return;
+  current.saving = true;
+  renderContent();
   try {
-    const response = await apiFetch('/api/admin/allowlist', {
+    const response = await apiFetch(`/api/admin/${kind}`, {
       method: 'PUT',
-      body: JSON.stringify({ pubkeys: state.draftPubkeys })
+      body: JSON.stringify({ pubkeys: current.draftPubkeys })
     });
-    state.serverPubkeys = uniqueSortedPubkeys(response.pubkeys);
-    state.draftPubkeys = [...state.serverPubkeys];
-    state.metadata = {
+    current.serverPubkeys = uniqueSortedPubkeys(response.pubkeys);
+    current.draftPubkeys = [...current.serverPubkeys];
+    current.meta = {
       source: response.source || null,
       updatedAt: response.updatedAt || null,
       updatedBy: response.updatedBy || null,
       lastError: response.lastError || null
     };
-    setBanner('Allowlist saved. New gateway auth decisions will use this list immediately.', 'success');
+    setBanner(`${TAB_LABELS[kind]} saved. New gateway auth decisions will use this list immediately.`, 'success');
+    void ensureProfilesLoaded(current.draftPubkeys);
   } catch (error) {
     if (error.status !== 401) {
-      setBanner(error?.message || 'Failed to save the live allowlist.', 'error');
+      setBanner(error?.message || `Failed to save ${TAB_LABELS[kind]}.`, 'error');
     }
   } finally {
-    state.saving = false;
-    render();
+    current.saving = false;
+    renderContent();
   }
 }
 
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
+async function loadWot() {
+  if (!state.token || !state.wot.enabled) return;
+  state.wot.loading = true;
+  renderContent();
+  try {
+    const response = await apiFetch('/api/admin/wot', { method: 'GET' });
+    state.wot.entries = Array.isArray(response.pubkeys) ? response.pubkeys : [];
+    state.wot.meta = {
+      rootPubkey: normalizePubkey(response.rootPubkey) || null,
+      maxDepth: Number.isFinite(Number(response.maxDepth)) ? Number(response.maxDepth) : null,
+      minFollowersDepth2: Number.isFinite(Number(response.minFollowersDepth2)) ? Number(response.minFollowersDepth2) : null,
+      loadedAt: Number.isFinite(Number(response.loadedAt)) ? Number(response.loadedAt) : null,
+      expiresAt: Number.isFinite(Number(response.expiresAt)) ? Number(response.expiresAt) : null,
+      relayUrls: Array.isArray(response.relayUrls) ? response.relayUrls : [],
+      lastError: response.lastError || null
+    };
+    state.wot.loaded = true;
+    void ensureProfilesLoaded(state.wot.entries.map((entry) => entry.pubkey));
+  } catch (error) {
+    if (error.status !== 401) {
+      setBanner(error?.message || 'Failed to load the Web of Trust snapshot.', 'error');
+    }
+  } finally {
+    state.wot.loading = false;
+    renderContent();
+  }
+}
+
+function addDraftPubkey(kind) {
+  const current = listStateFor(kind);
+  if (!current) return;
+  const normalized = normalizePubkey(current.inputValue);
+  if (!normalized) {
+    setBanner('Pubkeys must be 64-char lowercase hex strings.', 'error');
+    return;
+  }
+  current.draftPubkeys = uniqueSortedPubkeys([...current.draftPubkeys, normalized]);
+  current.inputValue = '';
+  setBanner(null);
+  renderContent();
+  void ensureProfilesLoaded(current.draftPubkeys);
+}
+
+function removeDraftPubkey(kind, pubkey) {
+  const current = listStateFor(kind);
+  if (!current) return;
+  current.draftPubkeys = current.draftPubkeys.filter((entry) => entry !== pubkey);
+  renderContent();
+}
+
+function queuePubkeyForBlocklist(pubkey) {
+  if (!state.blocklist.enabled) {
+    setBanner('Block List management is not enabled for this deployment.', 'error');
+    return;
+  }
+  state.blocklist.draftPubkeys = uniqueSortedPubkeys([...state.blocklist.draftPubkeys, pubkey]);
+  if (!state.blocklist.serverPubkeys.includes(pubkey)) {
+    setBanner('Added to the Block List draft. Save the Block List to apply the change.', 'success');
+  }
+  renderContent();
+}
+
+function activeTabPubkeys() {
+  if (state.activeTab === 'allowlist') return state.allowlist.draftPubkeys;
+  if (state.activeTab === 'blocklist') return state.blocklist.draftPubkeys;
+  if (state.activeTab === 'wot') return state.wot.entries.map((entry) => entry.pubkey);
+  return [];
+}
+
+function createSubId(prefix = 'kind0') {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function selectPreferredEvent(existing, next) {
+  if (!existing) return next;
+  const existingCreatedAt = Number(existing.created_at) || 0;
+  const nextCreatedAt = Number(next.created_at) || 0;
+  if (nextCreatedAt > existingCreatedAt) return next;
+  if (nextCreatedAt < existingCreatedAt) return existing;
+  return String(next.id || '').localeCompare(String(existing.id || '')) > 0 ? next : existing;
+}
+
+async function fetchRelayProfiles(relayUrl, authors, timeoutMs = PROFILE_TIMEOUT_MS) {
+  return new Promise((resolvePromise) => {
+    const subId = createSubId('kind0');
+    const events = [];
+    let settled = false;
+    let socket = null;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify(['CLOSE', subId]));
+        }
+      } catch (_) {}
+      try {
+        socket?.close?.();
+      } catch (_) {}
+      resolvePromise({ relayUrl, events });
+    };
+
+    const timer = setTimeout(finish, timeoutMs);
+
+    try {
+      socket = new WebSocket(relayUrl);
+    } catch (_) {
+      finish();
+      return;
+    }
+
+    socket.addEventListener('open', () => {
+      try {
+        socket.send(JSON.stringify([
+          'REQ',
+          subId,
+          {
+            kinds: [0],
+            authors,
+            limit: Math.max(authors.length * 2, authors.length)
+          }
+        ]));
+      } catch (_) {
+        finish();
+      }
+    });
+
+    socket.addEventListener('message', (message) => {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(String(message.data));
+      } catch (_) {
+        return;
+      }
+      if (!Array.isArray(parsed) || parsed.length < 2) return;
+      const [type, incomingSubId, payload] = parsed;
+      if (incomingSubId !== subId) return;
+      if (type === 'EVENT' && payload && typeof payload === 'object') {
+        const pubkey = normalizePubkey(payload.pubkey);
+        if (pubkey && authors.includes(pubkey)) {
+          events.push(payload);
+        }
+        return;
+      }
+      if (type === 'EOSE' || type === 'CLOSED') {
+        finish();
+      }
+    });
+
+    socket.addEventListener('error', finish);
+    socket.addEventListener('close', finish);
+  });
+}
+
+async function fetchLatestProfiles(relayUrls, authors) {
+  const normalizedAuthors = uniqueSortedPubkeys(authors);
+  if (!normalizedAuthors.length || !relayUrls.length) {
+    return new Map();
+  }
+  const results = await Promise.all(
+    relayUrls.map((relayUrl) => fetchRelayProfiles(relayUrl, normalizedAuthors))
+  );
+  const latest = new Map();
+  for (const result of results) {
+    for (const event of result.events) {
+      const pubkey = normalizePubkey(event?.pubkey);
+      if (!pubkey) continue;
+      latest.set(pubkey, selectPreferredEvent(latest.get(pubkey), event));
+    }
+  }
+  return latest;
+}
+
+async function ensureProfilesLoaded(pubkeys) {
+  const targets = uniqueSortedPubkeys(pubkeys).filter((pubkey) => {
+    const profile = getProfile(pubkey);
+    return !profile || (profile.status !== 'loading' && profile.status !== 'ready' && profile.status !== 'missing');
+  });
+  if (!targets.length || !config.discoveryRelayUrls.length) return;
+
+  for (const pubkey of targets) {
+    setProfile(pubkey, { status: 'loading' });
+  }
+  renderContent();
+
+  try {
+    const latest = await fetchLatestProfiles(config.discoveryRelayUrls, targets);
+    for (const pubkey of targets) {
+      const event = latest.get(pubkey);
+      if (!event) {
+        setProfile(pubkey, { status: 'missing' });
+        continue;
+      }
+      let content = {};
+      try {
+        content = event.content ? JSON.parse(event.content) : {};
+      } catch {
+        content = {};
+      }
+      setProfile(pubkey, {
+        status: 'ready',
+        profile: normalizeProfilePayload(content)
+      });
+    }
+  } catch (_) {
+    for (const pubkey of targets) {
+      if (getProfile(pubkey)?.status === 'loading') {
+        setProfile(pubkey, { status: 'error' });
+      }
+    }
+  } finally {
+    renderContent();
+  }
 }
