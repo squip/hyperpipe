@@ -128,9 +128,49 @@ function clean(value: unknown): string {
     .trim()
 }
 
-function gatewayServerValue(draft: GroupCreateDraft): string {
+function isHex64(value: string | null | undefined): boolean {
+  return /^[a-f0-9]{64}$/i.test(String(value || '').trim())
+}
+
+function shortPubkey(value: string | null | undefined): string {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!isHex64(normalized)) return clean(value)
+  return `${normalized.slice(0, 8)}...${normalized.slice(-6)}`
+}
+
+function gatewayOperatorSummary(
+  gateway: DiscoveredGateway,
+  adminProfileByPubkey: Record<string, { name: string | null }>
+): string {
+  const operatorPubkey = String(gateway.operatorIdentity?.pubkey || '').trim().toLowerCase()
+  if (!isHex64(operatorPubkey)) return ''
+  const operatorName = clean(adminProfileByPubkey[operatorPubkey]?.name)
+  if (operatorName) {
+    return `operator ${operatorName} (${shortPubkey(operatorPubkey)})`
+  }
+  return `operator ${shortPubkey(operatorPubkey)}`
+}
+
+function gatewayServerValue(
+  draft: GroupCreateDraft,
+  gateways: DiscoveredGateway[],
+  adminProfileByPubkey: Record<string, { name: string | null }>
+): string {
   const id = clean(draft.gatewayId)
   const origin = clean(draft.gatewayOrigin)
+  const selectedGateway = gateways.find((gateway) => {
+    if (id && gateway.gatewayId === id.toLowerCase()) return true
+    return !id && origin && clean(gateway.publicUrl) === origin
+  })
+  if (selectedGateway) {
+    const title = clean(selectedGateway.displayName) || selectedGateway.gatewayId
+    const parts = [title]
+    const operator = gatewayOperatorSummary(selectedGateway, adminProfileByPubkey)
+    if (operator) parts.push(operator)
+    if (selectedGateway.region) parts.push(clean(selectedGateway.region))
+    parts.push(clean(selectedGateway.publicUrl))
+    return parts.filter(Boolean).join(' | ')
+  }
   if (id && origin) return `${id} @ ${origin}`
   if (origin) return origin
   if (id) return id
@@ -148,22 +188,28 @@ export function csvToUniqueList(value: string): string[] {
 
 export function gatewayPickerOptions(
   draft: GroupCreateDraft,
-  gateways: DiscoveredGateway[]
+  gateways: DiscoveredGateway[],
+  adminProfileByPubkey: Record<string, { name: string | null }> = {}
 ): CreateGatewayPickerOption[] {
   const selectedId = clean(draft.gatewayId).toLowerCase()
   const selectedOrigin = clean(draft.gatewayOrigin)
 
   return gateways.map((gateway) => {
     const title = clean(gateway.displayName) || gateway.gatewayId
+    const operator = gatewayOperatorSummary(gateway, adminProfileByPubkey)
     const selected = Boolean(
       (selectedId && gateway.gatewayId === selectedId)
       || (!selectedId && selectedOrigin && selectedOrigin === gateway.publicUrl)
     )
+    const labelParts = [`${selected ? '[x]' : '[ ]'} ${title}`]
+    if (operator) labelParts.push(operator)
+    if (gateway.region) labelParts.push(clean(gateway.region))
+    labelParts.push(clean(gateway.publicUrl))
     return {
       key: `group:gateway:${gateway.gatewayId}`,
       gatewayId: gateway.gatewayId,
       gatewayOrigin: gateway.publicUrl,
-      label: `${selected ? '[x]' : '[ ]'} ${title} - ${gateway.publicUrl}`,
+      label: labelParts.filter(Boolean).join(' | '),
       selected
     }
   })
@@ -187,7 +233,8 @@ export function chatRelayPickerOptions(
 export function groupCreateRows(
   draft: GroupCreateDraft,
   expandedBranch: CreateBranchKey | '',
-  _gateways: DiscoveredGateway[]
+  gateways: DiscoveredGateway[],
+  adminProfileByPubkey: Record<string, { name: string | null }> = {}
 ): CreateBrowseRow[] {
   const rows: CreateBrowseRow[] = [
     {
@@ -253,7 +300,7 @@ export function groupCreateRows(
       kind: 'branch-parent',
       branch,
       label: 'Gateway Server',
-      value: gatewayServerValue(draft),
+      value: gatewayServerValue(draft, gateways, adminProfileByPubkey),
       expanded
     })
     if (expanded) {

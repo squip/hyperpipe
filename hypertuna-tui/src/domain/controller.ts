@@ -32,6 +32,7 @@ import type {
   GroupDraftAttachment,
   GroupInvite,
   GroupSummary,
+  GatewayOperatorIdentity,
   InvitesInboxItem,
   ListService as IListService,
   LogLevel,
@@ -262,6 +263,51 @@ function defaultPerfMetrics(): PerfMetrics {
     renderPressure: 0,
     overlayEnabled: false
   }
+}
+
+function isHex64String(value: string | null | undefined): boolean {
+  return /^[a-f0-9]{64}$/i.test(String(value || '').trim())
+}
+
+function parseGatewayOperatorIdentity(input: unknown): GatewayOperatorIdentity | null {
+  if (!input || typeof input !== 'object') return null
+  const source = input as Record<string, unknown>
+  const pubkey = typeof source.pubkey === 'string' ? source.pubkey.trim().toLowerCase() : ''
+  if (!isHex64String(pubkey)) return null
+  const attestation = source.attestation && typeof source.attestation === 'object'
+    ? source.attestation as Record<string, unknown>
+    : null
+  const payload = attestation?.payload && typeof attestation.payload === 'object'
+    ? attestation.payload as Record<string, unknown>
+    : null
+  return {
+    pubkey,
+    attestation: attestation
+      ? {
+          version: Number.isFinite(Number(attestation.version)) ? Number(attestation.version) : null,
+          payload: payload
+            ? {
+                purpose: typeof payload.purpose === 'string' ? payload.purpose.trim() || null : null,
+                operatorPubkey: typeof payload.operatorPubkey === 'string'
+                  ? payload.operatorPubkey.trim().toLowerCase() || null
+                  : null,
+                gatewayId: typeof payload.gatewayId === 'string'
+                  ? payload.gatewayId.trim().toLowerCase() || null
+                  : null,
+                publicUrl: typeof payload.publicUrl === 'string' ? payload.publicUrl.trim() || null : null,
+                issuedAt: Number.isFinite(Number(payload.issuedAt)) ? Number(payload.issuedAt) : null,
+                expiresAt: Number.isFinite(Number(payload.expiresAt)) ? Number(payload.expiresAt) : null
+              }
+            : null,
+          signature: typeof attestation.signature === 'string' ? attestation.signature.trim() || null : null
+        }
+      : null
+  }
+}
+
+function cloneGatewayOperatorIdentity(identity: GatewayOperatorIdentity | null | undefined): GatewayOperatorIdentity | null {
+  if (!identity) return null
+  return parseGatewayOperatorIdentity(identity)
 }
 
 function defaultWorkerRecoveryState(): WorkerRecoveryState {
@@ -609,9 +655,18 @@ export class TuiController {
       },
       discoveryRelayUrls: [...this.state.discoveryRelayUrls],
       gatewayPeerCounts: { ...this.state.gatewayPeerCounts },
-      discoveredGateways: this.state.discoveredGateways.map((gateway) => ({ ...gateway })),
-      authorizedGateways: this.state.authorizedGateways.map((gateway) => ({ ...gateway })),
-      gatewayAccessCatalog: this.state.gatewayAccessCatalog.map((entry) => ({ ...entry })),
+      discoveredGateways: this.state.discoveredGateways.map((gateway) => ({
+        ...gateway,
+        operatorIdentity: cloneGatewayOperatorIdentity(gateway.operatorIdentity)
+      })),
+      authorizedGateways: this.state.authorizedGateways.map((gateway) => ({
+        ...gateway,
+        operatorIdentity: cloneGatewayOperatorIdentity(gateway.operatorIdentity)
+      })),
+      gatewayAccessCatalog: this.state.gatewayAccessCatalog.map((entry) => ({
+        ...entry,
+        operatorIdentity: cloneGatewayOperatorIdentity(entry.operatorIdentity)
+      })),
       feed: [...this.state.feed],
       feedSource: { ...this.state.feedSource },
       activeFeedRelays: [...this.state.activeFeedRelays],
@@ -1216,6 +1271,7 @@ export class TuiController {
             (state as { gatewayAccessCatalog?: unknown } | null | undefined)?.gatewayAccessCatalog
           )
           this.patchState({ discoveredGateways, authorizedGateways, gatewayAccessCatalog })
+          this.warmGatewayOperatorProfiles(authorizedGateways.length ? authorizedGateways : discoveredGateways)
           return
         }
 
@@ -2644,7 +2700,8 @@ export class TuiController {
         memberDelegationMode: typeof source.memberDelegationMode === 'string'
           ? source.memberDelegationMode.trim() || null
           : null,
-        operatorPubkey: typeof source.operatorPubkey === 'string' ? source.operatorPubkey.trim() || null : null
+        operatorPubkey: typeof source.operatorPubkey === 'string' ? source.operatorPubkey.trim() || null : null,
+        operatorIdentity: parseGatewayOperatorIdentity(source.operatorIdentity)
       }
       const previous = byId.get(gatewayId)
       if (!previous) {
@@ -2696,6 +2753,7 @@ export class TuiController {
             ? source.memberDelegationMode.trim() || null
             : null,
           authMethod: typeof source.authMethod === 'string' ? source.authMethod.trim() || null : null,
+          operatorIdentity: parseGatewayOperatorIdentity(source.operatorIdentity),
           policy: source.policy && typeof source.policy === 'object'
             ? {
                 hostPolicy: typeof (source.policy as Record<string, unknown>).hostPolicy === 'string'
@@ -2757,21 +2815,67 @@ export class TuiController {
     return this.findGatewayInList(this.state.authorizedGateways, gatewaySelector)
   }
 
+  private warmGatewayOperatorProfiles(gateways: DiscoveredGateway[]): void {
+    const pubkeys = Array.from(
+      new Set(
+        gateways
+          .map((gateway) => String(gateway.operatorIdentity?.pubkey || '').trim().toLowerCase())
+          .filter((pubkey) => isHex64String(pubkey))
+      )
+    )
+    if (!pubkeys.length) return
+    void this.ensureAdminProfiles(pubkeys).catch(() => {
+      // optional enrichment only
+    })
+  }
+
+  private async awaitWorkerMessage(
+    predicate: (event: Record<string, unknown>) => boolean,
+    sendAction: () => Promise<{ success: boolean; error?: string }>,
+    timeoutMs = 30_000
+  ): Promise<Record<string, unknown>> {
+    const timeout = Math.max(1_000, Math.min(timeoutMs, 300_000))
+    return await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const off = this.workerHost.onMessage((event) => {
+        const message = event as Record<string, unknown>
+        if (!predicate(message)) return
+        clearTimeout(timeoutId)
+        off()
+        resolve(message)
+      })
+
+      const timeoutId = setTimeout(() => {
+        off()
+        reject(new Error(`Timed out waiting for worker event after ${timeout}ms`))
+      }, timeout)
+
+      void sendAction()
+        .then((result) => {
+          if (result.success) return
+          clearTimeout(timeoutId)
+          off()
+          reject(new Error(result.error || 'Worker request failed'))
+        })
+        .catch((error) => {
+          clearTimeout(timeoutId)
+          off()
+          reject(error instanceof Error ? error : new Error(String(error)))
+        })
+    })
+  }
+
   async refreshGatewayCatalog(options?: { force?: boolean; timeoutMs?: number }): Promise<DiscoveredGateway[]> {
     if (!this.workerHost.isRunning()) {
       return this.state.authorizedGateways.length ? this.state.authorizedGateways : this.state.discoveredGateways
     }
 
     const timeoutMs = Number.isFinite(options?.timeoutMs) ? Number(options?.timeoutMs) : 4_500
-    if (options?.force) {
-      await this.workerHost.send({ type: 'refresh-public-gateway-all' }).catch(() => {})
-    }
-    await this.workerHost.send({ type: 'get-public-gateway-status' }).catch(() => {})
-
     try {
-      const event = await waitForWorkerEvent(
-        this.workerHost,
+      const event = await this.awaitWorkerMessage(
         (msg) => msg.type === 'public-gateway-status',
+        () => options?.force
+          ? this.workerHost.send({ type: 'refresh-public-gateway-all' })
+          : this.workerHost.send({ type: 'get-public-gateway-status' }),
         timeoutMs
       )
       const state = (event as { state?: unknown }).state
@@ -2785,6 +2889,7 @@ export class TuiController {
         (state as { gatewayAccessCatalog?: unknown } | null | undefined)?.gatewayAccessCatalog
       )
       this.patchState({ discoveredGateways, authorizedGateways, gatewayAccessCatalog })
+      this.warmGatewayOperatorProfiles(authorizedGateways.length ? authorizedGateways : discoveredGateways)
       return authorizedGateways.length ? authorizedGateways : discoveredGateways
     } catch {
       return this.state.authorizedGateways.length ? this.state.authorizedGateways : this.state.discoveredGateways

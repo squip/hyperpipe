@@ -28,12 +28,22 @@ describe('createFormAdapter', () => {
 
     const rows = groupCreateRows(draft, '', [
       { gatewayId: 'gw-1', publicUrl: 'https://gw-1.example' },
-      { gatewayId: 'gw-2', publicUrl: 'https://gw-2.example' }
-    ])
+      {
+        gatewayId: 'gw-2',
+        publicUrl: 'https://gw-2.example',
+        operatorIdentity: {
+          pubkey: 'a'.repeat(64)
+        }
+      }
+    ], {
+      ['a'.repeat(64)]: { name: 'Alice' }
+    })
 
     expect(rows.some((row) => row.kind === 'field' && row.label === 'Gateway Origin')).toBe(false)
     expect(rows.some((row) => row.kind === 'field' && row.label === 'Gateway ID')).toBe(false)
     expect(rows.some((row) => row.kind === 'branch-parent' && row.label === 'Gateway Server')).toBe(true)
+    const gatewayServerRow = rows.find((row) => row.kind === 'branch-parent' && row.label === 'Gateway Server')
+    expect(gatewayServerRow && 'value' in gatewayServerRow ? gatewayServerRow.value : '').toContain('Alice')
     expect(rows.some((row) => row.kind === 'branch-child')).toBe(false)
     expect(rows[rows.length - 1]?.kind).toBe('submit')
   })
@@ -113,10 +123,21 @@ describe('createFormAdapter', () => {
     }
 
     const gateways = gatewayPickerOptions(groupDraft, [
-      { gatewayId: 'gw-1', publicUrl: 'https://gw-1.example', displayName: 'Public Gateway' }
-    ])
+      {
+        gatewayId: 'gw-1',
+        publicUrl: 'https://gw-1.example',
+        displayName: 'Public Gateway',
+        operatorIdentity: {
+          pubkey: 'b'.repeat(64)
+        }
+      }
+    ], {
+      ['b'.repeat(64)]: { name: 'Operator Bob' }
+    })
     expect(gateways).toHaveLength(1)
     expect(gateways[0]?.selected).toBe(true)
+    expect(gateways[0]?.label).toContain('Operator Bob')
+    expect(gateways[0]?.label).toContain('operator')
 
     const chatDraft: ChatCreateDraft = {
       name: '',

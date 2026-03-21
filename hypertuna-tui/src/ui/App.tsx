@@ -2522,13 +2522,22 @@ export function App({
     if (!state || !isCreateNodeId(selectedNode)) return []
     const expandedBranch = createExpandedBranchByNode[selectedNode] || ''
     if (selectedNode === 'groups:create') {
-      return groupCreateRows(groupCreateDraft, expandedBranch, state.authorizedGateways || [])
+      return groupCreateRows(
+        groupCreateDraft,
+        expandedBranch,
+        state.authorizedGateways || [],
+        state.adminProfileByPubkey || {}
+      )
     }
     return chatCreateRows(chatCreateDraft, expandedBranch, state.relays || [])
   }, [state, selectedNode, groupCreateDraft, chatCreateDraft, createExpandedBranchByNode])
 
   const createGatewayOptions = useMemo<CreateGatewayPickerOption[]>(
-    () => gatewayPickerOptions(groupCreateDraft, state?.authorizedGateways || []),
+    () => gatewayPickerOptions(
+      groupCreateDraft,
+      state?.authorizedGateways || [],
+      state?.adminProfileByPubkey || {}
+    ),
     [groupCreateDraft, state]
   )
 
@@ -3419,8 +3428,11 @@ export function App({
     if (!controller) return
     try {
       setPaneActionMessage('Refreshing gateway catalog…')
-      const gateways = await controller.refreshGatewayCatalog({ force: true })
-      setPaneActionMessage(`Gateway catalog refreshed (${gateways.length} discovered)`)
+      await controller.refreshGatewayCatalog({ force: true })
+      const snapshot = controller.getState()
+      const approvedCount = Array.isArray(snapshot.authorizedGateways) ? snapshot.authorizedGateways.length : 0
+      const discoveredCount = Array.isArray(snapshot.discoveredGateways) ? snapshot.discoveredGateways.length : 0
+      setPaneActionMessage(`Gateway catalog refreshed (${approvedCount} approved, ${discoveredCount} discovered)`)
     } catch (error) {
       setPaneActionMessage(error instanceof Error ? error.message : String(error))
     }

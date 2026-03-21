@@ -61,6 +61,25 @@ function shortPubkeySeed(seed: string): string {
   return hex64(seed)
 }
 
+function mockGatewayOperatorIdentity(seed: string, gatewayId: string, publicUrl: string) {
+  const pubkey = shortPubkeySeed(seed)
+  return {
+    pubkey,
+    attestation: {
+      version: 1,
+      payload: {
+        purpose: 'gateway-operator-attestation',
+        operatorPubkey: pubkey,
+        gatewayId,
+        publicUrl,
+        issuedAt: nowMs() - 60_000,
+        expiresAt: nowMs() + 86_400_000
+      },
+      signature: `${hex64(`${seed}:${gatewayId}:${publicUrl}`)}${hex64(`${gatewayId}:${seed}`)}`
+    }
+  }
+}
+
 function makeEvent(args: {
   idSeed: string
   pubkey: string
@@ -292,9 +311,54 @@ function cloneState(state: ControllerState): ControllerState {
     },
     discoveryRelayUrls: [...state.discoveryRelayUrls],
     gatewayPeerCounts: { ...state.gatewayPeerCounts },
-    discoveredGateways: state.discoveredGateways.map((entry) => ({ ...entry })),
-    authorizedGateways: state.authorizedGateways.map((entry) => ({ ...entry })),
-    gatewayAccessCatalog: state.gatewayAccessCatalog.map((entry) => ({ ...entry })),
+    discoveredGateways: state.discoveredGateways.map((entry) => ({
+      ...entry,
+      operatorIdentity: entry.operatorIdentity
+        ? {
+            ...entry.operatorIdentity,
+            attestation: entry.operatorIdentity.attestation
+              ? {
+                  ...entry.operatorIdentity.attestation,
+                  payload: entry.operatorIdentity.attestation.payload
+                    ? { ...entry.operatorIdentity.attestation.payload }
+                    : null
+                }
+              : null
+          }
+        : null
+    })),
+    authorizedGateways: state.authorizedGateways.map((entry) => ({
+      ...entry,
+      operatorIdentity: entry.operatorIdentity
+        ? {
+            ...entry.operatorIdentity,
+            attestation: entry.operatorIdentity.attestation
+              ? {
+                  ...entry.operatorIdentity.attestation,
+                  payload: entry.operatorIdentity.attestation.payload
+                    ? { ...entry.operatorIdentity.attestation.payload }
+                    : null
+                }
+              : null
+          }
+        : null
+    })),
+    gatewayAccessCatalog: state.gatewayAccessCatalog.map((entry) => ({
+      ...entry,
+      operatorIdentity: entry.operatorIdentity
+        ? {
+            ...entry.operatorIdentity,
+            attestation: entry.operatorIdentity.attestation
+              ? {
+                  ...entry.operatorIdentity.attestation,
+                  payload: entry.operatorIdentity.attestation.payload
+                    ? { ...entry.operatorIdentity.attestation.payload }
+                    : null
+                }
+              : null
+          }
+        : null
+    })),
     feed: [...state.feed],
     feedSource: { ...state.feedSource },
     activeFeedRelays: [...state.activeFeedRelays],
@@ -499,6 +563,7 @@ export class MockController implements AppController {
       }
     ]
 
+    const mainGatewayOperator = mockGatewayOperatorIdentity('gateway-main-operator', 'gateway-main', 'https://hypertuna.com')
     const discoveredGateways: DiscoveredGateway[] = [
       {
         gatewayId: 'gateway-main',
@@ -507,7 +572,8 @@ export class MockController implements AppController {
         region: 'us-west',
         source: 'nostr:30078',
         isExpired: false,
-        lastSeenAt: nowMs()
+        lastSeenAt: nowMs(),
+        operatorIdentity: mainGatewayOperator
       },
       {
         gatewayId: 'gateway-134',
@@ -598,6 +664,17 @@ export class MockController implements AppController {
       readinessMessage: 'Ready',
       relays,
       discoveredGateways,
+      authorizedGateways: [discoveredGateways[0]],
+      gatewayAccessCatalog: [
+        {
+          gatewayId: discoveredGateways[0].gatewayId,
+          gatewayOrigin: discoveredGateways[0].publicUrl,
+          hostingState: 'approved',
+          reason: 'mock-approved',
+          lastCheckedAt: nowMs(),
+          operatorIdentity: mainGatewayOperator
+        }
+      ],
       feed,
       groups,
       myGroupList: [{ groupId: groups[0].id, relay: groups[0].relay }],
@@ -615,6 +692,13 @@ export class MockController implements AppController {
       chatRetryCount: 0,
       chatNextRetryAt: null,
       threadMessages,
+      adminProfileByPubkey: {
+        [String(mainGatewayOperator.pubkey || '').toLowerCase()]: {
+          name: 'Hypertuna Operator',
+          bio: 'Gateway operator',
+          followersCount: 42
+        }
+      },
       logs: [
         {
           ts: nowMs(),
@@ -1263,6 +1347,7 @@ export class MockController implements AppController {
 
   async refreshGatewayCatalog(_options?: { force?: boolean; timeoutMs?: number }): Promise<DiscoveredGateway[]> {
     if (!this.state.discoveredGateways.length) {
+      const operatorIdentity = mockGatewayOperatorIdentity('gateway-main-operator', 'gateway-main', 'https://hypertuna.com')
       const fallback: DiscoveredGateway[] = [
         {
           gatewayId: 'gateway-main',
@@ -1271,7 +1356,8 @@ export class MockController implements AppController {
           region: 'us-west',
           source: 'nostr:30078',
           isExpired: false,
-          lastSeenAt: nowMs()
+          lastSeenAt: nowMs(),
+          operatorIdentity
         }
       ]
       this.patch({
@@ -1282,8 +1368,17 @@ export class MockController implements AppController {
           gatewayOrigin: entry.publicUrl,
           hostingState: 'approved',
           reason: 'mock-approved',
-          lastCheckedAt: nowMs()
-        }))
+          lastCheckedAt: nowMs(),
+          operatorIdentity
+        })),
+        adminProfileByPubkey: {
+          ...this.state.adminProfileByPubkey,
+          [String(operatorIdentity.pubkey || '').toLowerCase()]: {
+            name: 'Hypertuna Operator',
+            bio: 'Gateway operator',
+            followersCount: 42
+          }
+        }
       })
     }
     return (this.state.authorizedGateways.length ? this.state.authorizedGateways : this.state.discoveredGateways)

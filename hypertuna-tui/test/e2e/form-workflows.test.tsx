@@ -139,6 +139,7 @@ describe.sequential('TUI e2e in-pane form workflows', () => {
       await pressKey(instance, '\u001b[B')
       await pressKey(instance, '\r')
       await waitFor(() => lastFrame(instance).includes('Editing Gateway Server: Gateway Picker'))
+      await waitFor(() => lastFrame(instance).includes('Hypertuna Operator'))
       await pressKey(instance, '\u001b')
 
       await pressKey(instance, '\u001b[B')
