@@ -2,6 +2,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { readFile, stat } from 'node:fs/promises';
 import { dirname, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
@@ -17,7 +18,8 @@ import {
   getEventsFromPeerHyperswarm,
   requestFileFromPeer
 } from '../../shared/public-gateway/HyperswarmClient.mjs';
-import { computeSecretHash } from '../../shared/public-gateway/GatewayDiscovery.mjs';
+import { computeSecretHash, deriveKeyPair } from '../../shared/public-gateway/GatewayDiscovery.mjs';
+import { verifyOperatorAttestation } from '../../shared/public-gateway/OperatorAttestation.mjs';
 import {
   issueClientToken,
   verifySignature,
@@ -414,6 +416,16 @@ class PublicGatewayService {
       }
     };
     this.discoveryConfig = config.discovery || {};
+    this.discoveryGatewayId = this.discoveryConfig?.keySeed
+      ? Buffer.from(deriveKeyPair(this.discoveryConfig.keySeed).publicKey).toString('hex')
+      : null;
+    this.operatorAttestationState = {
+      filePath: this.authConfig?.operatorAttestationFile || null,
+      mtimeMs: 0,
+      checkedAt: 0,
+      attestation: null,
+      lastError: null
+    };
     this.wotState = {
       wot: null,
       rootPubkey: null,
@@ -697,6 +709,7 @@ class PublicGatewayService {
         source: this.blocklistStore.snapshot().source
       });
     }
+    await this.#refreshOperatorAttestation({ force: true });
     await this.connectionPool.initialize();
     if (Number.isFinite(this.config?.registration?.relayGcAfterMs) && this.config.registration.relayGcAfterMs > 0) {
       this.logger?.info?.('[PublicGateway] Relay GC policy enabled', {
@@ -1324,8 +1337,129 @@ class PublicGatewayService {
     return entry;
   }
 
+  #operatorAttestationEnabled() {
+    return typeof this.authConfig?.operatorAttestationFile === 'string'
+      && this.authConfig.operatorAttestationFile.length > 0;
+  }
+
+  async #refreshOperatorAttestation({ force = false } = {}) {
+    const filePath = this.authConfig?.operatorAttestationFile;
+    if (!this.#operatorAttestationEnabled() || !filePath) {
+      this.operatorAttestationState = {
+        ...this.operatorAttestationState,
+        filePath: filePath || null,
+        attestation: null,
+        lastError: null
+      };
+      return null;
+    }
+
+    let stats = null;
+    try {
+      stats = await stat(filePath);
+    } catch (error) {
+      const message = error?.code === 'ENOENT'
+        ? 'operator-attestation-file-missing'
+        : (error?.message || String(error));
+      if (this.operatorAttestationState?.lastError !== message) {
+        this.logger?.warn?.('[PublicGateway] Operator attestation unavailable', { filePath, error: message });
+      }
+      this.operatorAttestationState = {
+        ...this.operatorAttestationState,
+        filePath,
+        checkedAt: Date.now(),
+        attestation: null,
+        lastError: message
+      };
+      return null;
+    }
+
+    const mtimeMs = Number.isFinite(stats?.mtimeMs) ? stats.mtimeMs : 0;
+    if (!force
+      && this.operatorAttestationState?.attestation
+      && this.operatorAttestationState?.mtimeMs === mtimeMs
+      && Number(this.operatorAttestationState.attestation?.payload?.expiresAt || 0) > Date.now()) {
+      this.operatorAttestationState = {
+        ...this.operatorAttestationState,
+        checkedAt: Date.now()
+      };
+      return this.operatorAttestationState.attestation;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(await readFile(filePath, 'utf8'));
+    } catch (error) {
+      const message = error?.message || String(error);
+      this.logger?.warn?.('[PublicGateway] Failed to parse operator attestation', { filePath, error: message });
+      this.operatorAttestationState = {
+        ...this.operatorAttestationState,
+        filePath,
+        mtimeMs,
+        checkedAt: Date.now(),
+        attestation: null,
+        lastError: message
+      };
+      return null;
+    }
+
+    const gatewayId = this.#currentGatewayId();
+    if (!gatewayId) {
+      this.operatorAttestationState = {
+        ...this.operatorAttestationState,
+        filePath,
+        mtimeMs,
+        checkedAt: Date.now(),
+        attestation: null,
+        lastError: 'gateway-id-unavailable'
+      };
+      return null;
+    }
+    const verification = verifyOperatorAttestation(parsed, {
+      expectedOperatorPubkey: this.authConfig?.operatorPubkey,
+      expectedGatewayId: gatewayId,
+      expectedPublicUrl: this.config?.publicBaseUrl,
+      now: Date.now(),
+      schnorrImpl: schnorr
+    });
+    if (!verification.ok) {
+      this.logger?.warn?.('[PublicGateway] Ignoring invalid operator attestation', {
+        filePath,
+        error: verification.error
+      });
+      this.operatorAttestationState = {
+        ...this.operatorAttestationState,
+        filePath,
+        mtimeMs,
+        checkedAt: Date.now(),
+        attestation: null,
+        lastError: verification.error
+      };
+      return null;
+    }
+
+    this.operatorAttestationState = {
+      ...this.operatorAttestationState,
+      filePath,
+      mtimeMs,
+      checkedAt: Date.now(),
+      attestation: verification.attestation,
+      lastError: null
+    };
+    return verification.attestation;
+  }
+
+  async #currentOperatorIdentity() {
+    const attestation = await this.#refreshOperatorAttestation();
+    if (!attestation?.payload?.operatorPubkey) return null;
+    return {
+      pubkey: attestation.payload.operatorPubkey,
+      attestation
+    };
+  }
+
   #currentGatewayId() {
-    return this.gatewayAdvertiser?.gatewayId || null;
+    return this.gatewayAdvertiser?.gatewayId || this.discoveryGatewayId || null;
   }
 
   #pruneAuthChallenges() {
@@ -4504,10 +4638,12 @@ class PublicGatewayService {
     }
 
     const issued = await this.#issueGatewayBearerToken({ subjectPubkey: pubkey, scope, relayKey });
+    const operatorIdentity = await this.#currentOperatorIdentity();
     return res.json({
       token: issued.token,
       expiresIn: issued.expiresIn,
-      expiresAt: issued.expiresAt
+      expiresAt: issued.expiresAt,
+      ...(operatorIdentity ? { operatorIdentity } : {})
     });
   }
 

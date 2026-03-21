@@ -254,7 +254,9 @@ class GatewayAdvertiser {
       authMethod,
       hostPolicy,
       memberDelegationMode,
-      operatorPubkey: authConfig?.operatorPubkey || null,
+      operatorPubkey: authConfig?.operatorAttestationFile
+        ? null
+        : (authConfig?.operatorPubkey || null),
       wotRootPubkey: authConfig?.wotRootPubkey || null,
       wotMaxDepth: toPositiveInt(authConfig?.wotMaxDepth),
       wotMinFollowersDepth2: Math.max(0, toPositiveInt(authConfig?.wotMinFollowersDepth2)),

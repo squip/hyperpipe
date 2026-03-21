@@ -1,10 +1,18 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
 import { schnorr } from '@noble/curves/secp256k1';
+import hyperCrypto from 'hypercore-crypto';
+import {
+  ATTESTATION_EXPIRY_WARNING_WINDOW_MS,
+  OPERATOR_ATTESTATION_PURPOSE,
+  createOperatorAttestationRequest,
+  verifyOperatorAttestation
+} from '../../shared/public-gateway/OperatorAttestation.mjs';
 import { parseEnvText } from './env-file.mjs';
 
 export const PROFILE_NAMES = ['open', 'allowlist', 'wot', 'allowlist+wot'];
+export const EXPOSURE_MODE_NAMES = ['https-acme', 'http'];
 
 export const DEFAULT_DISCOVERY_RELAYS = [
   'wss://relay.damus.io/',
@@ -15,7 +23,7 @@ export const DEFAULT_DISCOVERY_RELAYS = [
 export const ENV_SECTIONS = [
   {
     comment: 'Deploy metadata',
-    keys: ['DEPLOY_PROFILE', 'GATEWAY_HOST', 'LETSENCRYPT_EMAIL']
+    keys: ['DEPLOY_PROFILE', 'DEPLOY_EXPOSURE_MODE', 'GATEWAY_HOST', 'LETSENCRYPT_EMAIL']
   },
   {
     comment: 'Gateway base configuration',
@@ -26,6 +34,7 @@ export const ENV_SECTIONS = [
       'GATEWAY_DISCOVERY_OPEN_ACCESS',
       'GATEWAY_DISCOVERY_DISPLAY_NAME',
       'GATEWAY_DISCOVERY_REGION',
+      'GATEWAY_DISCOVERY_KEY_SEED',
       'GATEWAY_NOSTR_DISCOVERY_RELAYS',
       'GATEWAY_REGISTRATION_REDIS',
       'GATEWAY_REGISTRATION_REDIS_PREFIX',
@@ -39,6 +48,7 @@ export const ENV_SECTIONS = [
       'GATEWAY_AUTH_HOST_POLICY',
       'GATEWAY_AUTH_MEMBER_DELEGATION',
       'GATEWAY_AUTH_OPERATOR_PUBKEY',
+      'GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE',
       'GATEWAY_AUTH_ALLOWLIST_PUBKEYS',
       'GATEWAY_AUTH_ALLOWLIST_FILE',
       'GATEWAY_AUTH_ALLOWLIST_REFRESH_MS',
@@ -98,14 +108,17 @@ export const ENV_SECTIONS = [
 ];
 
 export const FIELD_CLASSIFICATIONS = {
+  DEPLOY_EXPOSURE_MODE: 'prompted',
   GATEWAY_HOST: 'prompted',
   LETSENCRYPT_EMAIL: 'prompted',
   DEPLOY_PROFILE: 'prompted',
   GATEWAY_DISCOVERY_DISPLAY_NAME: 'prompted',
   GATEWAY_DISCOVERY_REGION: 'prompted_optional',
   GATEWAY_NOSTR_DISCOVERY_RELAYS: 'prompted',
+  GATEWAY_DISCOVERY_KEY_SEED: 'generated',
   GATEWAY_AUTH_ALLOWLIST_PUBKEYS: 'prompted_profile',
   GATEWAY_AUTH_OPERATOR_PUBKEY: 'prompted_profile',
+  GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE: 'derived',
   GATEWAY_AUTH_ALLOWLIST_FILE: 'derived',
   GATEWAY_AUTH_ALLOWLIST_REFRESH_MS: 'derived',
   GATEWAY_AUTH_BLOCKLIST_PUBKEYS: 'prompted_profile_optional',
@@ -135,13 +148,16 @@ const PROFILE_PRESETS = Object.fromEntries(
 );
 
 const BASE_DEFAULTS = {
+  DEPLOY_EXPOSURE_MODE: 'https-acme',
   GATEWAY_DISCOVERY_ENABLED: 'true',
   GATEWAY_DISCOVERY_DISPLAY_NAME: '',
   GATEWAY_DISCOVERY_REGION: '',
+  GATEWAY_DISCOVERY_KEY_SEED: '',
   GATEWAY_NOSTR_DISCOVERY_RELAYS: DEFAULT_DISCOVERY_RELAYS.join(','),
   GATEWAY_REGISTRATION_REDIS: 'redis://redis:6379',
   GATEWAY_DEFAULT_TOKEN_TTL: '3600',
   STORAGE_DIR: '/data',
+  GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE: '',
   GATEWAY_AUTH_ALLOWLIST_FILE: '',
   GATEWAY_AUTH_ALLOWLIST_REFRESH_MS: '5000',
   GATEWAY_AUTH_BLOCKLIST_FILE: '/data/config/blocklist.json',
@@ -195,11 +211,32 @@ export function normalizeProfile(value) {
   return PROFILE_NAMES.includes(trimmed) ? trimmed : '';
 }
 
+export function normalizeExposureMode(value) {
+  const trimmed = normalizeString(value).toLowerCase();
+  return EXPOSURE_MODE_NAMES.includes(trimmed) ? trimmed : '';
+}
+
 export function deriveProfile(config = {}) {
   const explicit = normalizeProfile(config.DEPLOY_PROFILE);
   if (explicit) return explicit;
   const policy = normalizeString(config.GATEWAY_AUTH_HOST_POLICY).toLowerCase();
   return normalizeProfile(policy);
+}
+
+export function deriveExposureMode(config = {}) {
+  const explicit = normalizeExposureMode(config.DEPLOY_EXPOSURE_MODE);
+  if (explicit) return explicit;
+  const publicUrl = normalizeString(config.GATEWAY_PUBLIC_URL);
+  if (publicUrl) {
+    try {
+      const parsed = new URL(publicUrl);
+      if (parsed.protocol === 'http:') return 'http';
+      if (parsed.protocol === 'https:') return 'https-acme';
+    } catch {
+      return '';
+    }
+  }
+  return 'https-acme';
 }
 
 export function profilePreset(profile) {
@@ -244,15 +281,29 @@ function isValidPublicUrl(value) {
   const text = normalizeString(value);
   try {
     const parsed = new URL(text);
-    return parsed.protocol === 'https:' && Boolean(parsed.hostname);
+    return Boolean(parsed.hostname) && (parsed.protocol === 'https:' || parsed.protocol === 'http:');
   } catch {
     return false;
   }
 }
 
-function isValidHost(value) {
+function isValidLooseHost(value) {
   const text = normalizeHost(value);
   return Boolean(text) && !/[\/\s]/u.test(text);
+}
+
+function isValidIpv4(value) {
+  const text = normalizeHost(value);
+  const parts = text.split('.');
+  if (parts.length !== 4) return false;
+  return parts.every((part) => /^\d+$/u.test(part) && Number(part) >= 0 && Number(part) <= 255);
+}
+
+function isAcmeHostname(value) {
+  const text = normalizeHost(value).toLowerCase();
+  if (!text || isValidIpv4(text)) return false;
+  if (!text.includes('.')) return false;
+  return text.split('.').every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(label));
 }
 
 function isValidWsRelayList(value) {
@@ -284,12 +335,19 @@ function normalizeNumberString(value, fallback) {
   return String(Number.parseInt(text, 10));
 }
 
+function publicUrlForExposureMode(host, exposureMode) {
+  const normalizedHost = normalizeHost(host);
+  const protocol = exposureMode === 'http' ? 'http' : 'https';
+  return `${protocol}://${normalizedHost}`;
+}
+
 export function createGeneratedValues(existing = {}) {
   const relayAdminSecretKey = isHex64(existing.GATEWAY_RELAY_ADMIN_SECRET_KEY)
     ? existing.GATEWAY_RELAY_ADMIN_SECRET_KEY
     : generateHex(32);
   const relayAdminPublicKey = Buffer.from(schnorr.getPublicKey(Buffer.from(relayAdminSecretKey, 'hex'))).toString('hex');
   return {
+    GATEWAY_DISCOVERY_KEY_SEED: normalizeString(existing.GATEWAY_DISCOVERY_KEY_SEED) || generateHex(32),
     GATEWAY_REGISTRATION_SECRET: isHex64(existing.GATEWAY_REGISTRATION_SECRET)
       ? existing.GATEWAY_REGISTRATION_SECRET
       : generateHex(32),
@@ -303,18 +361,24 @@ export function createGeneratedValues(existing = {}) {
 
 function toDerivedValues(config) {
   return {
-    GATEWAY_PUBLIC_URL: `https://${normalizeHost(config.GATEWAY_HOST)}`,
+    GATEWAY_PUBLIC_URL: publicUrlForExposureMode(config.GATEWAY_HOST, deriveExposureMode(config)),
     GATEWAY_REGISTRATION_REDIS_PREFIX: `public-gateway:${normalizeHost(config.GATEWAY_HOST)}:`
   };
 }
 
 export function buildRuntimeConfig({ profile, answers = {}, existing = {} }) {
   const normalizedProfile = normalizeProfile(profile || answers.DEPLOY_PROFILE || existing.DEPLOY_PROFILE) || 'open';
+  const exposureMode = normalizeExposureMode(
+    answers.DEPLOY_EXPOSURE_MODE
+    || existing.DEPLOY_EXPOSURE_MODE
+    || deriveExposureMode(existing)
+    || BASE_DEFAULTS.DEPLOY_EXPOSURE_MODE
+  ) || BASE_DEFAULTS.DEPLOY_EXPOSURE_MODE;
   const preset = profilePreset(normalizedProfile);
   const generated = createGeneratedValues(existing);
 
   const host = normalizeHost(answers.GATEWAY_HOST || existing.GATEWAY_HOST);
-  const email = normalizeString(answers.LETSENCRYPT_EMAIL || existing.LETSENCRYPT_EMAIL);
+  const email = normalizeString(answers.LETSENCRYPT_EMAIL ?? existing.LETSENCRYPT_EMAIL ?? '');
   const discoveryRelays = csvToString(
     normalizeCsv(answers.GATEWAY_NOSTR_DISCOVERY_RELAYS || existing.GATEWAY_NOSTR_DISCOVERY_RELAYS || BASE_DEFAULTS.GATEWAY_NOSTR_DISCOVERY_RELAYS)
   );
@@ -336,8 +400,9 @@ export function buildRuntimeConfig({ profile, answers = {}, existing = {} }) {
     ...BASE_DEFAULTS,
     ...preset,
     ...generated,
+    DEPLOY_EXPOSURE_MODE: exposureMode,
     GATEWAY_HOST: host,
-    LETSENCRYPT_EMAIL: email,
+    LETSENCRYPT_EMAIL: exposureMode === 'https-acme' ? email : '',
     GATEWAY_DISCOVERY_DISPLAY_NAME: displayName,
     GATEWAY_DISCOVERY_REGION: region,
     GATEWAY_NOSTR_DISCOVERY_RELAYS: discoveryRelays
@@ -354,6 +419,14 @@ export function buildRuntimeConfig({ profile, answers = {}, existing = {} }) {
   merged.GATEWAY_AUTH_OPERATOR_PUBKEY = normalizeString(
     answers.GATEWAY_AUTH_OPERATOR_PUBKEY || existing.GATEWAY_AUTH_OPERATOR_PUBKEY
   ).toLowerCase();
+  const attestationEnabled = (
+    answers.ENABLE_OPERATOR_ATTESTATION !== undefined
+      ? String(answers.ENABLE_OPERATOR_ATTESTATION).trim() === 'true'
+      : Boolean(normalizeString(existing.GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE))
+  ) && Boolean(merged.GATEWAY_AUTH_OPERATOR_PUBKEY);
+  merged.GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE = attestationEnabled
+    ? '/app/public-gateway/artifacts/operator-attestation.json'
+    : '';
   merged.GATEWAY_AUTH_ALLOWLIST_FILE = normalizeString(
     existing.GATEWAY_AUTH_ALLOWLIST_FILE
     || (normalizedProfile === 'allowlist' || normalizedProfile === 'allowlist+wot'
@@ -436,18 +509,39 @@ export function validateConfig(config = {}) {
   if (normalizeProfile(normalized.GATEWAY_AUTH_HOST_POLICY) !== profile) {
     errors.push('GATEWAY_AUTH_HOST_POLICY must match DEPLOY_PROFILE');
   }
+  if (normalizeString(normalized.DEPLOY_EXPOSURE_MODE) && !normalizeExposureMode(normalized.DEPLOY_EXPOSURE_MODE)) {
+    errors.push('DEPLOY_EXPOSURE_MODE must be one of: https-acme, http');
+  }
 
-  if (!isValidHost(normalized.GATEWAY_HOST)) {
-    errors.push('GATEWAY_HOST must be a hostname without protocol or path');
+  const exposureMode = deriveExposureMode(normalized);
+
+  if (exposureMode === 'https-acme') {
+    if (!isAcmeHostname(normalized.GATEWAY_HOST)) {
+      errors.push('https-acme exposure requires GATEWAY_HOST to be a real hostname (not a raw IP)');
+    }
+    if (!isValidEmail(normalized.LETSENCRYPT_EMAIL)) {
+      errors.push('https-acme exposure requires LETSENCRYPT_EMAIL to be a valid email address');
+    }
+  } else if (exposureMode === 'http') {
+    if (!isValidLooseHost(normalized.GATEWAY_HOST)) {
+      errors.push('http exposure requires GATEWAY_HOST to be a hostname or IPv4 address without protocol or path');
+    }
+  } else {
+    errors.push('DEPLOY_EXPOSURE_MODE must be one of: https-acme, http');
   }
-  if (!isValidEmail(normalized.LETSENCRYPT_EMAIL)) {
-    errors.push('LETSENCRYPT_EMAIL must be a valid email address');
-  }
+
   if (!isValidPublicUrl(normalized.GATEWAY_PUBLIC_URL)) {
-    errors.push('GATEWAY_PUBLIC_URL must be an https URL');
+    errors.push('GATEWAY_PUBLIC_URL must be an http or https URL');
+  } else if (exposureMode === 'https-acme' && !normalizeString(normalized.GATEWAY_PUBLIC_URL).startsWith('https://')) {
+    errors.push('https-acme exposure requires GATEWAY_PUBLIC_URL to be an https URL');
+  } else if (exposureMode === 'http' && !normalizeString(normalized.GATEWAY_PUBLIC_URL).startsWith('http://')) {
+    errors.push('http exposure requires GATEWAY_PUBLIC_URL to be an http URL');
   }
   if (!normalizeString(normalized.GATEWAY_DISCOVERY_DISPLAY_NAME)) {
     errors.push('GATEWAY_DISCOVERY_DISPLAY_NAME is required');
+  }
+  if (!normalizeString(normalized.GATEWAY_DISCOVERY_KEY_SEED)) {
+    errors.push('GATEWAY_DISCOVERY_KEY_SEED is required');
   }
   if (!isValidWsRelayList(normalized.GATEWAY_NOSTR_DISCOVERY_RELAYS)) {
     errors.push('GATEWAY_NOSTR_DISCOVERY_RELAYS must be a comma-separated list of ws/wss URLs');
@@ -484,6 +578,12 @@ export function validateConfig(config = {}) {
   }
   if (!isPositiveIntegerString(normalized.GATEWAY_AUTH_BLOCKLIST_REFRESH_MS)) {
     errors.push('GATEWAY_AUTH_BLOCKLIST_REFRESH_MS must be a positive integer');
+  }
+  if (normalizeString(normalized.GATEWAY_AUTH_OPERATOR_PUBKEY) && !isHex64(normalized.GATEWAY_AUTH_OPERATOR_PUBKEY)) {
+    errors.push('GATEWAY_AUTH_OPERATOR_PUBKEY must be a 64-character hex pubkey');
+  }
+  if (normalizeString(normalized.GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE) && !normalizeString(normalized.GATEWAY_AUTH_OPERATOR_PUBKEY)) {
+    errors.push('GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE requires GATEWAY_AUTH_OPERATOR_PUBKEY');
   }
   if (normalizeString(normalized.GATEWAY_AUTH_BLOCKLIST_PUBKEYS) && !isValidPubkeyList(normalized.GATEWAY_AUTH_BLOCKLIST_PUBKEYS)) {
     errors.push('GATEWAY_AUTH_BLOCKLIST_PUBKEYS must be blank or a comma-separated list of 64-character hex pubkeys');
@@ -570,4 +670,39 @@ export function summarizeConfigChanges({ nextConfig, existing = {} }) {
   }
 
   return { provided, generated, derived };
+}
+
+export function deriveGatewayIdFromSeed(seed) {
+  const normalizedSeed = normalizeString(seed);
+  if (!normalizedSeed) return '';
+  const digest = createHash('sha256').update(normalizedSeed).digest();
+  const keyPair = hyperCrypto.keyPair(digest);
+  return Buffer.from(keyPair.publicKey).toString('hex');
+}
+
+export function buildOperatorAttestationRequestFromConfig(config = {}) {
+  return createOperatorAttestationRequest({
+    operatorPubkey: normalizeString(config.GATEWAY_AUTH_OPERATOR_PUBKEY).toLowerCase(),
+    gatewayId: deriveGatewayIdFromSeed(config.GATEWAY_DISCOVERY_KEY_SEED),
+    publicUrl: normalizeString(config.GATEWAY_PUBLIC_URL),
+    purpose: OPERATOR_ATTESTATION_PURPOSE
+  });
+}
+
+export function validateOperatorAttestationForConfig(config = {}, attestation = {}, now = Date.now()) {
+  const verification = verifyOperatorAttestation(attestation, {
+    expectedOperatorPubkey: config.GATEWAY_AUTH_OPERATOR_PUBKEY,
+    expectedGatewayId: deriveGatewayIdFromSeed(config.GATEWAY_DISCOVERY_KEY_SEED),
+    expectedPublicUrl: config.GATEWAY_PUBLIC_URL,
+    now,
+    schnorrImpl: schnorr
+  });
+  const warnings = [];
+  if (verification.ok && verification.payload.expiresAt <= now + ATTESTATION_EXPIRY_WARNING_WINDOW_MS) {
+    warnings.push('Operator attestation expires within 30 days');
+  }
+  return {
+    ...verification,
+    warnings
+  };
 }

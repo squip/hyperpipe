@@ -1,25 +1,4 @@
-version: '3.9'
-
 services:
-  proxy:
-    image: traefik:v3.0
-    command:
-      - --providers.docker=true
-      - --providers.docker.exposedbydefault=false
-      - --entrypoints.web.address=:80
-      - --entrypoints.websecure.address=:443
-      - --certificatesresolvers.le.acme.httpchallenge=true
-      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
-      - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL}
-      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - traefik-lets:/letsencrypt
-    restart: unless-stopped
-
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "300", "1"]
@@ -32,12 +11,13 @@ services:
       context: ..
       dockerfile: public-gateway/Dockerfile
     environment:
-      GATEWAY_PUBLIC_URL: https://${GATEWAY_HOST}
+      GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL}
       GATEWAY_REGISTRATION_SECRET: ${GATEWAY_REGISTRATION_SECRET}
       GATEWAY_DISCOVERY_ENABLED: "true"
       GATEWAY_DISCOVERY_OPEN_ACCESS: ${GATEWAY_DISCOVERY_OPEN_ACCESS:-false}
       GATEWAY_DISCOVERY_DISPLAY_NAME: ${GATEWAY_DISCOVERY_DISPLAY_NAME:-Public Gateway}
       GATEWAY_DISCOVERY_REGION: ${GATEWAY_DISCOVERY_REGION:-}
+      GATEWAY_DISCOVERY_KEY_SEED: ${GATEWAY_DISCOVERY_KEY_SEED}
       GATEWAY_NOSTR_DISCOVERY_RELAYS: ${GATEWAY_NOSTR_DISCOVERY_RELAYS}
       GATEWAY_REGISTRATION_REDIS: redis://redis:6379
       GATEWAY_REGISTRATION_REDIS_PREFIX: "public-gateway:${GATEWAY_HOST}:"
@@ -46,6 +26,7 @@ services:
       GATEWAY_AUTH_HOST_POLICY: ${GATEWAY_AUTH_HOST_POLICY:-open}
       GATEWAY_AUTH_MEMBER_DELEGATION: ${GATEWAY_AUTH_MEMBER_DELEGATION:-all-members}
       GATEWAY_AUTH_OPERATOR_PUBKEY: ${GATEWAY_AUTH_OPERATOR_PUBKEY}
+      GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE: ${GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE}
       GATEWAY_AUTH_ALLOWLIST_PUBKEYS: ${GATEWAY_AUTH_ALLOWLIST_PUBKEYS}
       GATEWAY_AUTH_ALLOWLIST_FILE: ${GATEWAY_AUTH_ALLOWLIST_FILE}
       GATEWAY_AUTH_ALLOWLIST_REFRESH_MS: ${GATEWAY_AUTH_ALLOWLIST_REFRESH_MS:-5000}
@@ -101,17 +82,10 @@ services:
     volumes:
       - public-gateway-data:/data
       - public-gateway-logs:/app/public-gateway/logs
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.gateway.rule=Host(`${GATEWAY_HOST}`)
-      - traefik.http.routers.gateway.entrypoints=websecure
-      - traefik.http.routers.gateway.tls=true
-      - traefik.http.routers.gateway.tls.certresolver=le
-      - traefik.http.services.gateway.loadbalancer.server.port=4430
+      - ./artifacts:/app/public-gateway/artifacts:ro
     restart: unless-stopped
 
 volumes:
-  traefik-lets:
   redis-data:
   public-gateway-data:
   public-gateway-logs:

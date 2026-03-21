@@ -102,6 +102,8 @@ WoT host checks default to the discovery relay list, but can now be isolated wit
 
 If you want to manage access lists live without restarting the container, set `GATEWAY_AUTH_ALLOWLIST_FILE` and/or `GATEWAY_AUTH_BLOCKLIST_FILE`. The gateway will hot-reload those files and expose an operator-only access manager at `/admin/allowlist`.
 
+If you want approved clients to receive verified operator identity metadata without storing the operator `nsec` on the gateway host, generate an offline-signed attestation artifact and point `GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE` at it. When attestation mode is enabled, the gateway stops advertising `operatorPubkey` in public discovery metadata and only returns the signed operator identity to already-approved clients through `/api/auth/verify`.
+
 ### Configuration Reference
 
 | Environment Variable | Description |
@@ -125,11 +127,13 @@ If you want to manage access lists live without restarting the container, set `G
 | `GATEWAY_DISCOVERY_ENABLED` | Enables gateway discovery announcements when set to `true`. |
 | `GATEWAY_DISCOVERY_DISPLAY_NAME` | Human-readable gateway name advertised over discovery. |
 | `GATEWAY_DISCOVERY_REGION` | Region label advertised over discovery. |
+| `GATEWAY_DISCOVERY_KEY_SEED` | Stable seed used to derive the gateway discovery identity and gateway ID. Keep this persistent across restarts if you use operator attestation. |
 | `GATEWAY_NOSTR_DISCOVERY_ENABLED` | Enables Nostr discovery publishing and subscription unless set to `false`. |
 | `GATEWAY_NOSTR_DISCOVERY_RELAYS` | Comma-separated Nostr relay URLs used for gateway discovery publishing. Also used as the WoT relay fallback when `GATEWAY_AUTH_WOT_RELAYS` is unset. |
 | `GATEWAY_AUTH_HOST_POLICY` | Host sponsorship policy: `open`, `allowlist`, `wot`, or `allowlist+wot`. |
 | `GATEWAY_AUTH_MEMBER_DELEGATION` | Relay member delegation policy: `none`, `closed-members`, or `all-members`. |
-| `GATEWAY_AUTH_OPERATOR_PUBKEY` | Operator pubkey in 64-character hex. Auto-approved and published in discovery metadata. |
+| `GATEWAY_AUTH_OPERATOR_PUBKEY` | Operator pubkey in 64-character hex. Auto-approved for WoT checks and used as the expected signer for optional operator attestation. |
+| `GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE` | Optional JSON attestation artifact signed offline by the operator key. When set, successful `/api/auth/verify` responses may include `operatorIdentity`, and public discovery omits `operatorPubkey`. |
 | `GATEWAY_AUTH_ALLOWLIST_PUBKEYS` | Comma-separated 64-character hex pubkeys approved for `allowlist` or `allowlist+wot`. |
 | `GATEWAY_AUTH_ALLOWLIST_FILE` | Optional JSON file path for the live allowlist store. When set with `allowlist` or `allowlist+wot`, the gateway hot-reloads this file and exposes `/admin/allowlist`. |
 | `GATEWAY_AUTH_ALLOWLIST_REFRESH_MS` | How often to re-stat the allowlist file before auth checks and admin reads. Defaults to `5000`. |
@@ -178,6 +182,7 @@ If you want to manage access lists live without restarting the container, set `G
 
 - Live Allow List management is opt-in. Set `GATEWAY_AUTH_ALLOWLIST_FILE=/data/config/allowlist.json` and use `GATEWAY_AUTH_HOST_POLICY=allowlist` or `allowlist+wot`.
 - Live Block List management is opt-in. Set `GATEWAY_AUTH_BLOCKLIST_FILE=/data/config/blocklist.json`. Blocklisted pubkeys are denied across every host policy, including `open`.
+- Verified operator identity is opt-in. Generate an offline attestation artifact and set `GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE=/app/public-gateway/artifacts/operator-attestation.json`.
 - The file format is:
 
 ```json

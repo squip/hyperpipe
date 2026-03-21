@@ -563,6 +563,12 @@ let gatewayLogsContainer = null
 let gatewayToggleLogsButton = null
 let publicGatewayEnableToggle = null
 let publicGatewaySelectionSelect = null
+let publicGatewayPicker = null
+let publicGatewayPickerButton = null
+let publicGatewayPickerLeading = null
+let publicGatewayPickerTitle = null
+let publicGatewayPickerSubtitle = null
+let publicGatewayPickerMenu = null
 let publicGatewayUrlInput = null
 let publicGatewaySecretInput = null
 let publicGatewaySaveButton = null
@@ -571,6 +577,7 @@ let publicGatewayManualFields = null
 let publicGatewaySelectionHelp = null
 let publicGatewaySelectionMeta = null
 const publicGatewayTokenRequests = new Map()
+let publicGatewayPickerOpen = false
 
 let publicGatewayConfig = {
   enabled: false,
@@ -591,6 +598,8 @@ let publicGatewayConfig = {
 }
 let publicGatewayState = null
 let publicGatewayDiscovered = []
+const publicGatewayOperatorProfiles = new Map()
+const publicGatewayOperatorProfileInflight = new Map()
 
 // Log functions
 function formatDuration(ms) {
@@ -620,6 +629,308 @@ function formatRelativeTime(value) {
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
   return new Date(timestamp).toLocaleString()
+}
+
+function normalizeHexPubkey(value) {
+  if (typeof value !== 'string') return ''
+  const trimmed = value.trim().toLowerCase()
+  return /^[0-9a-f]{64}$/.test(trimmed) ? trimmed : ''
+}
+
+function shortPubkey(value) {
+  const normalized = normalizeHexPubkey(value)
+  if (!normalized) return 'Unknown'
+  return `${normalized.slice(0, 8)}…${normalized.slice(-8)}`
+}
+
+function resolveOperatorIdentity(gateway) {
+  if (!gateway || typeof gateway !== 'object') return null
+  const identity = gateway.operatorIdentity && typeof gateway.operatorIdentity === 'object'
+    ? gateway.operatorIdentity
+    : null
+  const pubkey = normalizeHexPubkey(identity?.pubkey)
+  return pubkey ? { pubkey, attestation: identity.attestation || null } : null
+}
+
+function buildOperatorProfileRecord(pubkey, profile = null) {
+  const normalizedPubkey = normalizeHexPubkey(pubkey)
+  const displayName = typeof profile?.displayName === 'string' && profile.displayName.trim()
+    ? profile.displayName.trim()
+    : (typeof profile?.name === 'string' && profile.name.trim()
+      ? profile.name.trim()
+      : shortPubkey(normalizedPubkey))
+  const avatarUrl = profile
+    ? HypertunaUtils.resolvePfpUrl(profile.pictureTagUrl || profile.picture, profile.pictureIsHypertunaPfp)
+    : null
+  return {
+    pubkey: normalizedPubkey,
+    displayName,
+    avatarUrl: avatarUrl || null
+  }
+}
+
+async function ensureGatewayOperatorProfile(pubkey) {
+  const normalizedPubkey = normalizeHexPubkey(pubkey)
+  if (!normalizedPubkey) return null
+  if (publicGatewayOperatorProfiles.has(normalizedPubkey)) {
+    return publicGatewayOperatorProfiles.get(normalizedPubkey)
+  }
+  if (publicGatewayOperatorProfileInflight.has(normalizedPubkey)) {
+    return publicGatewayOperatorProfileInflight.get(normalizedPubkey)
+  }
+  const task = (async () => {
+    let profile = null
+    if (window.App?.nostr?.client && typeof window.App.nostr.client.fetchUserProfile === 'function') {
+      try {
+        profile = await window.App.nostr.client.fetchUserProfile(normalizedPubkey)
+      } catch (error) {
+        console.warn('[PublicGateway] Failed to resolve operator profile:', error)
+      }
+    }
+    const record = buildOperatorProfileRecord(normalizedPubkey, profile)
+    publicGatewayOperatorProfiles.set(normalizedPubkey, record)
+    return record
+  })()
+    .finally(() => {
+      publicGatewayOperatorProfileInflight.delete(normalizedPubkey)
+    })
+  publicGatewayOperatorProfileInflight.set(normalizedPubkey, task)
+  return task
+}
+
+async function warmGatewayOperatorProfiles(gateways = []) {
+  const pubkeys = Array.from(new Set(
+    (gateways || [])
+      .map((gateway) => resolveOperatorIdentity(gateway)?.pubkey || '')
+      .filter(Boolean)
+  ))
+  if (!pubkeys.length) return
+  await Promise.all(pubkeys.map((pubkey) => ensureGatewayOperatorProfile(pubkey)))
+  populatePublicGatewaySelectionOptions()
+  updatePublicGatewayFormState()
+}
+
+function operatorProfileForGateway(gateway) {
+  const pubkey = resolveOperatorIdentity(gateway)?.pubkey || ''
+  return pubkey ? (publicGatewayOperatorProfiles.get(pubkey) || buildOperatorProfileRecord(pubkey, null)) : null
+}
+
+function sanitizeGatewayUrl(value) {
+  if (typeof HypertunaUtils?.sanitizeBaseUrl === 'function') {
+    return HypertunaUtils.sanitizeBaseUrl(value)
+  }
+  if (typeof value !== 'string') return ''
+  return value.trim().replace(/\/+$/u, '')
+}
+
+function gatewayPublicUrl(gateway) {
+  if (!gateway || typeof gateway !== 'object') return ''
+  return sanitizeGatewayUrl(gateway.publicUrl || gateway.gatewayOrigin || '')
+}
+
+function gatewayDisplayName(gateway) {
+  if (!gateway || typeof gateway !== 'object') return 'Unknown Gateway'
+  return gateway.displayName || gateway.publicUrl || gateway.gatewayId || 'Unknown Gateway'
+}
+
+function gatewayStatusLabel(gateway) {
+  if (!gateway || typeof gateway !== 'object') return 'offline'
+  if (gateway.isExpired) return 'offline'
+  if (gateway.secretFetchError) return 'error'
+  if (!gateway.sharedSecret) return 'approval required'
+  return 'online'
+}
+
+function buildGatewayDescriptor(gateway, { includeOperator = true } = {}) {
+  const descriptors = []
+  const operatorProfile = includeOperator ? operatorProfileForGateway(gateway) : null
+  const operatorIdentity = includeOperator ? resolveOperatorIdentity(gateway) : null
+  if (operatorProfile?.displayName) descriptors.push(`by ${operatorProfile.displayName}`)
+  else if (operatorIdentity?.pubkey) descriptors.push(`by ${shortPubkey(operatorIdentity.pubkey)}`)
+  if (gateway?.region) descriptors.push(gateway.region)
+  descriptors.push(gatewayStatusLabel(gateway))
+  return descriptors.filter(Boolean).join(' • ')
+}
+
+function resolveDefaultGatewayEntry() {
+  const selectionMode = publicGatewayConfig.selectionMode || 'default'
+  const candidates = [
+    selectionMode === 'default' ? publicGatewayState?.baseUrl : null,
+    selectionMode === 'default' ? publicGatewayConfig.baseUrl : null,
+    publicGatewayConfig.preferredBaseUrl,
+    DEFAULT_PUBLIC_GATEWAY_URL
+  ]
+    .map((value) => sanitizeGatewayUrl(value))
+    .filter(Boolean)
+
+  for (const candidateUrl of candidates) {
+    const match = publicGatewayDiscovered.find((gateway) => gatewayPublicUrl(gateway) === candidateUrl)
+    if (match) return match
+  }
+  return null
+}
+
+function buildPublicGatewayOptionModels() {
+  const gateways = Array.isArray(publicGatewayDiscovered) ? [...publicGatewayDiscovered] : []
+  gateways.sort((a, b) => {
+    if (!!a.isExpired !== !!b.isExpired) return a.isExpired ? 1 : -1
+    return (b.lastSeenAt || 0) - (a.lastSeenAt || 0)
+  })
+
+  const defaultGateway = resolveDefaultGatewayEntry()
+  const items = [
+    {
+      value: 'default',
+      kind: 'default',
+      gateway: defaultGateway,
+      disabled: false,
+      title: defaultGateway ? gatewayDisplayName(defaultGateway) : 'Default (hypertuna.com)',
+      subtitle: defaultGateway
+        ? `Default route • ${buildGatewayDescriptor(defaultGateway)}`
+        : 'Use the recommended default gateway'
+    }
+  ]
+
+  for (const gateway of gateways) {
+    items.push({
+      value: `gateway:${gateway.gatewayId}`,
+      kind: 'gateway',
+      gateway,
+      disabled: !!gateway.isExpired || !gateway.sharedSecret,
+      title: gatewayDisplayName(gateway),
+      subtitle: buildGatewayDescriptor(gateway)
+    })
+  }
+
+  items.push({
+    value: 'manual',
+    kind: 'manual',
+    gateway: null,
+    disabled: false,
+    title: 'Manual Entry',
+    subtitle: 'Use a gateway URL and shared secret supplied by an administrator'
+  })
+
+  return items
+}
+
+function closePublicGatewayPicker() {
+  publicGatewayPickerOpen = false
+  if (publicGatewayPicker) {
+    publicGatewayPicker.classList.remove('open')
+  }
+  if (publicGatewayPickerButton) {
+    publicGatewayPickerButton.setAttribute('aria-expanded', 'false')
+  }
+  if (publicGatewayPickerMenu) {
+    publicGatewayPickerMenu.classList.add('hidden')
+  }
+}
+
+function renderGatewayPickerLeading(container, item) {
+  if (!container) return
+  container.innerHTML = ''
+  const gateway = item?.gateway || null
+  const operatorProfile = operatorProfileForGateway(gateway)
+  const operatorIdentity = resolveOperatorIdentity(gateway)
+  const displaySeed = operatorProfile?.displayName
+    || gatewayDisplayName(gateway)
+    || (item?.title || '')
+  container.className = 'public-gateway-picker-leading'
+
+  if (operatorProfile?.avatarUrl) {
+    const img = document.createElement('img')
+    img.src = operatorProfile.avatarUrl
+    img.alt = `${operatorProfile.displayName} avatar`
+    container.appendChild(img)
+    return
+  }
+
+  const initial = (displaySeed || 'G').trim().charAt(0).toUpperCase() || 'G'
+  container.textContent = initial
+  if (operatorIdentity?.pubkey) {
+    container.classList.add('verified')
+  }
+}
+
+function renderPublicGatewayPicker() {
+  if (!publicGatewayPickerButton || !publicGatewayPickerMenu || !publicGatewaySelectionSelect) return
+  const items = buildPublicGatewayOptionModels()
+  const selectedValue = publicGatewaySelectionSelect.value || 'default'
+  const selectedItem = items.find((item) => item.value === selectedValue) || items[0] || null
+
+  if (publicGatewayPickerTitle) {
+    publicGatewayPickerTitle.textContent = selectedItem?.title || 'Select a public gateway'
+  }
+  if (publicGatewayPickerSubtitle) {
+    publicGatewayPickerSubtitle.textContent = selectedItem?.subtitle || 'Select a public gateway'
+  }
+  renderGatewayPickerLeading(publicGatewayPickerLeading, selectedItem)
+
+  publicGatewayPickerMenu.innerHTML = ''
+  for (const item of items) {
+    const option = document.createElement('button')
+    option.type = 'button'
+    option.className = 'public-gateway-picker-option'
+    option.setAttribute('role', 'option')
+    option.dataset.value = item.value
+    option.setAttribute('aria-selected', item.value === selectedValue ? 'true' : 'false')
+    if (item.value === selectedValue) option.classList.add('selected')
+    if (item.disabled) {
+      option.disabled = true
+      option.classList.add('disabled')
+    }
+
+    const leading = document.createElement('span')
+    renderGatewayPickerLeading(leading, item)
+
+    const copy = document.createElement('span')
+    copy.className = 'public-gateway-picker-option-copy'
+
+    const title = document.createElement('span')
+    title.className = 'public-gateway-picker-option-title'
+    title.textContent = item.title
+
+    const subtitle = document.createElement('span')
+    subtitle.className = 'public-gateway-picker-option-subtitle'
+    subtitle.textContent = item.subtitle
+
+    copy.appendChild(title)
+    copy.appendChild(subtitle)
+    option.appendChild(leading)
+    option.appendChild(copy)
+
+    if (item.kind === 'default') {
+      const badge = document.createElement('span')
+      badge.className = 'public-gateway-picker-badge'
+      badge.textContent = 'Default'
+      option.appendChild(badge)
+    }
+
+    option.addEventListener('click', () => {
+      if (publicGatewaySelectionSelect.value !== item.value) {
+        publicGatewaySelectionSelect.value = item.value
+        handlePublicGatewaySelectionChange()
+      } else {
+        renderPublicGatewayPicker()
+      }
+      closePublicGatewayPicker()
+      publicGatewayPickerButton?.focus()
+    })
+
+    publicGatewayPickerMenu.appendChild(option)
+  }
+}
+
+function togglePublicGatewayPicker(forceOpen = null) {
+  if (!publicGatewayPickerButton || !publicGatewayPickerMenu) return
+  const nextOpen = forceOpen == null ? !publicGatewayPickerOpen : !!forceOpen
+  publicGatewayPickerOpen = nextOpen
+  if (publicGatewayPicker) {
+    publicGatewayPicker.classList.toggle('open', publicGatewayPickerOpen)
+  }
+  publicGatewayPickerButton.setAttribute('aria-expanded', publicGatewayPickerOpen ? 'true' : 'false')
+  publicGatewayPickerMenu.classList.toggle('hidden', !publicGatewayPickerOpen)
 }
 
 function loadPfpQueueFromStorage () {
@@ -672,9 +983,9 @@ function persistPfpQueue () {
 function buildPublicGatewaySummary() {
   const selectionMode = publicGatewayConfig.selectionMode || 'default'
   const selectedGatewayId = publicGatewayConfig.selectedGatewayId || null
-  const selectedGateway = selectedGatewayId
-    ? publicGatewayDiscovered.find((entry) => entry.gatewayId === selectedGatewayId)
-    : null
+  const selectedGateway = selectionMode === 'discovered' && selectedGatewayId
+    ? publicGatewayDiscovered.find((entry) => entry.gatewayId === selectedGatewayId) || null
+    : (selectionMode === 'default' ? resolveDefaultGatewayEntry() : null)
 
   const bridgeEnabled = !!publicGatewayConfig.enabled
   const remoteActive = !!publicGatewayState?.enabled
@@ -725,6 +1036,64 @@ function buildPublicGatewaySummary() {
     selectionMode,
     selectedGateway
   }
+}
+
+function renderPublicGatewaySelectionMeta(summary) {
+  if (!publicGatewaySelectionMeta) return
+  const text = summary?.text || ''
+  const selectedGateway = summary?.selectedGateway || null
+  const operatorIdentity = resolveOperatorIdentity(selectedGateway)
+  const operatorProfile = operatorProfileForGateway(selectedGateway)
+
+  publicGatewaySelectionMeta.innerHTML = ''
+
+  if (operatorIdentity && operatorProfile) {
+    const card = document.createElement('div')
+    card.className = 'public-gateway-selection-meta-card'
+
+    const operatorRow = document.createElement('div')
+    operatorRow.className = 'public-gateway-selection-operator'
+
+    const avatar = document.createElement('div')
+    avatar.className = 'public-gateway-selection-avatar'
+    if (operatorProfile.avatarUrl) {
+      const img = document.createElement('img')
+      img.src = operatorProfile.avatarUrl
+      img.alt = `${operatorProfile.displayName} avatar`
+      avatar.appendChild(img)
+    } else {
+      avatar.textContent = operatorProfile.displayName.charAt(0).toUpperCase()
+    }
+
+    const details = document.createElement('div')
+    details.className = 'public-gateway-selection-operator-details'
+
+    const name = document.createElement('div')
+    name.className = 'public-gateway-selection-operator-name'
+    name.textContent = operatorProfile.displayName
+
+    const pubkey = document.createElement('div')
+    pubkey.className = 'public-gateway-selection-operator-pubkey'
+    pubkey.textContent = `Verified operator • ${shortPubkey(operatorIdentity.pubkey)}`
+
+    details.appendChild(name)
+    details.appendChild(pubkey)
+    operatorRow.appendChild(avatar)
+    operatorRow.appendChild(details)
+    card.appendChild(operatorRow)
+
+    if (text) {
+      const summaryEl = document.createElement('div')
+      summaryEl.className = 'public-gateway-selection-meta-summary'
+      summaryEl.textContent = text
+      card.appendChild(summaryEl)
+    }
+
+    publicGatewaySelectionMeta.appendChild(card)
+    return
+  }
+
+  publicGatewaySelectionMeta.textContent = text
 }
 
 function formatRelayGatewayStats(relayInfo) {
@@ -1004,6 +1373,9 @@ function updatePublicGatewayFormState() {
   if (publicGatewaySelectionSelect) {
     publicGatewaySelectionSelect.disabled = false
   }
+  if (publicGatewayPickerButton) {
+    publicGatewayPickerButton.disabled = false
+  }
 
   if (publicGatewayManualFields) {
     publicGatewayManualFields.classList.toggle('hidden', selectionMode !== 'manual')
@@ -1043,15 +1415,17 @@ function updatePublicGatewayFormState() {
     if (selectionMode === 'manual') {
       publicGatewaySelectionHelp.textContent = 'Provide the gateway details and shared secret supplied by the administrator.'
     } else if (selectionMode === 'discovered') {
-      publicGatewaySelectionHelp.textContent = 'Open public gateways share their connection secret automatically when selected.'
+      publicGatewaySelectionHelp.textContent = 'Only gateways that approved your account are shown here.'
     } else {
       publicGatewaySelectionHelp.textContent = 'Hypertuna.com will be used by default unless it is unavailable.'
     }
   }
 
   if (publicGatewaySelectionMeta) {
-    publicGatewaySelectionMeta.textContent = summary.text
+    renderPublicGatewaySelectionMeta(summary)
   }
+
+  renderPublicGatewayPicker()
 }
 
 function handlePublicGatewaySelectionChange() {
@@ -1076,6 +1450,7 @@ function handlePublicGatewaySelectionChange() {
     publicGatewayConfig.baseUrl = DEFAULT_PUBLIC_GATEWAY_URL
   }
   updatePublicGatewayFormState()
+  renderPublicGatewayPicker()
 }
 
 function populatePublicGatewaySelectionOptions() {
@@ -1099,7 +1474,9 @@ function populatePublicGatewaySelectionOptions() {
     const option = document.createElement('option')
     option.value = `gateway:${gateway.gatewayId}`
     const name = gateway.displayName || gateway.publicUrl || gateway.gatewayId
+    const operatorProfile = operatorProfileForGateway(gateway)
     const descriptors = []
+    if (operatorProfile) descriptors.push(`by ${operatorProfile.displayName}`)
     if (gateway.region) descriptors.push(gateway.region)
     if (gateway.isExpired) descriptors.push('offline')
     else if (gateway.secretFetchError) descriptors.push('error')
@@ -1133,17 +1510,23 @@ function populatePublicGatewaySelectionOptions() {
   }
 
   publicGatewaySelectionSelect.value = targetValue
+  renderPublicGatewayPicker()
 }
 
 function renderPublicGatewayStatus(state) {
   publicGatewayState = state || null
-  publicGatewayDiscovered = Array.isArray(state?.discoveredGateways) ? state.discoveredGateways : []
+  publicGatewayDiscovered = Array.isArray(state?.authorizedGateways)
+    ? state.authorizedGateways
+    : (Array.isArray(state?.discoveredGateways) ? state.discoveredGateways : [])
   HypertunaUtils.updatePublicGatewayState(publicGatewayState, publicGatewayConfig)
   if (window.App?.updatePublicGatewayState) {
     window.App.updatePublicGatewayState(publicGatewayState)
   }
   populatePublicGatewaySelectionOptions()
   updatePublicGatewayFormState()
+  warmGatewayOperatorProfiles(publicGatewayDiscovered).catch((error) => {
+    console.warn('[PublicGateway] Failed to warm operator profiles:', error)
+  })
   const summary = buildPublicGatewaySummary()
   if (window.App?.refreshRelayGatewayCard) {
     try {
@@ -2855,6 +3238,29 @@ function setupEventListeners() {
   if (publicGatewaySelectionSelect) {
     publicGatewaySelectionSelect.addEventListener('change', handlePublicGatewaySelectionChange)
   }
+  if (publicGatewayPickerButton) {
+    publicGatewayPickerButton.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      togglePublicGatewayPicker()
+    })
+  }
+  if (publicGatewayPickerMenu) {
+    publicGatewayPickerMenu.addEventListener('click', (event) => {
+      event.stopPropagation()
+    })
+  }
+  document.addEventListener('click', (event) => {
+    if (!publicGatewayPickerOpen || !publicGatewayPicker) return
+    if (publicGatewayPicker.contains(event.target)) return
+    closePublicGatewayPicker()
+  })
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && publicGatewayPickerOpen) {
+      closePublicGatewayPicker()
+      publicGatewayPickerButton?.focus()
+    }
+  })
 
   if (publicGatewaySaveButton) {
     publicGatewaySaveButton.addEventListener('click', handlePublicGatewaySave)
@@ -2932,6 +3338,12 @@ function initializeDOMElements() {
   gatewayToggleLogsButton = document.getElementById('gateway-toggle-logs')
   publicGatewayEnableToggle = document.getElementById('public-gateway-enable')
   publicGatewaySelectionSelect = document.getElementById('public-gateway-selection')
+  publicGatewayPicker = document.getElementById('public-gateway-picker')
+  publicGatewayPickerButton = document.getElementById('public-gateway-picker-button')
+  publicGatewayPickerLeading = document.getElementById('public-gateway-picker-leading')
+  publicGatewayPickerTitle = document.getElementById('public-gateway-picker-title')
+  publicGatewayPickerSubtitle = document.getElementById('public-gateway-picker-subtitle')
+  publicGatewayPickerMenu = document.getElementById('public-gateway-picker-menu')
   publicGatewayUrlInput = document.getElementById('public-gateway-url')
   publicGatewaySecretInput = document.getElementById('public-gateway-secret')
   publicGatewaySaveButton = document.getElementById('public-gateway-save')
@@ -2967,6 +3379,12 @@ function initializeDOMElements() {
     gatewayToggleLogsButton,
     publicGatewayEnableToggle,
     publicGatewaySelectionSelect,
+    publicGatewayPicker,
+    publicGatewayPickerButton,
+    publicGatewayPickerLeading,
+    publicGatewayPickerTitle,
+    publicGatewayPickerSubtitle,
+    publicGatewayPickerMenu,
     publicGatewayUrlInput,
     publicGatewaySecretInput,
     publicGatewaySaveButton,

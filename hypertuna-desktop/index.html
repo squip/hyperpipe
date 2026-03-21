@@ -657,8 +657,31 @@
                                 </label>
                                 <div class="gateway-remote-form">
                                     <div class="form-group">
-                                        <label for="public-gateway-selection">Public Gateway</label>
-                                        <select id="public-gateway-selection" class="form-input"></select>
+                                        <label for="public-gateway-picker-button">Public Gateway</label>
+                                        <div id="public-gateway-picker" class="public-gateway-picker">
+                                            <select id="public-gateway-selection" class="form-input public-gateway-native-select visually-hidden" tabindex="-1" aria-hidden="true"></select>
+                                            <button
+                                                id="public-gateway-picker-button"
+                                                class="public-gateway-picker-button"
+                                                type="button"
+                                                aria-haspopup="listbox"
+                                                aria-expanded="false"
+                                                aria-label="Public Gateway"
+                                            >
+                                                <span id="public-gateway-picker-leading" class="public-gateway-picker-leading" aria-hidden="true"></span>
+                                                <span class="public-gateway-picker-copy">
+                                                    <span id="public-gateway-picker-title" class="public-gateway-picker-title">Default (hypertuna.com)</span>
+                                                    <span id="public-gateway-picker-subtitle" class="public-gateway-picker-subtitle">Select a public gateway</span>
+                                                </span>
+                                                <span class="public-gateway-picker-chevron" aria-hidden="true"></span>
+                                            </button>
+                                            <div
+                                                id="public-gateway-picker-menu"
+                                                class="public-gateway-picker-menu hidden"
+                                                role="listbox"
+                                                aria-label="Public Gateway Options"
+                                            ></div>
+                                        </div>
                                         <p id="public-gateway-selection-help" class="muted"></p>
                                     </div>
                                     <div id="public-gateway-manual-fields" class="public-gateway-manual-fields">

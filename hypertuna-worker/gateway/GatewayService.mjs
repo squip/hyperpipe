@@ -3,6 +3,7 @@ import WebSocket from 'ws';
 import url from 'node:url';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import { schnorr } from '@noble/curves/secp256k1';
 
 import LocalGatewayServer from './LocalGatewayServer.mjs';
 import {
@@ -25,6 +26,7 @@ import PublicGatewayHyperbeeAdapter from '../../shared/public-gateway/PublicGate
 import { activeRelays as relayManagerMap } from '../hypertuna-relay-manager-adapter.mjs';
 import { getRelayAuthStore } from '../relay-auth-store.mjs';
 import { updatePublicGatewaySettings } from '../../shared/config/PublicGatewaySettings.mjs';
+import { verifyOperatorAttestation } from '../../shared/public-gateway/OperatorAttestation.mjs';
 import HypercoreId from 'hypercore-id-encoding';
 import { resolveRelayMirrorCoreRefs } from '../relay-core-refs-store.mjs';
 import { getFile } from '../hyperdrive-manager.mjs';
@@ -50,6 +52,12 @@ function guessContentType(fileName = '') {
   if (lower.endsWith('.pdf')) return 'application/pdf';
   if (lower.endsWith('.txt')) return 'text/plain; charset=utf-8';
   return 'application/octet-stream';
+}
+
+function cloneJson(value) {
+  return value && typeof value === 'object'
+    ? JSON.parse(JSON.stringify(value))
+    : value;
 }
 
 class MessageQueue {
@@ -549,6 +557,31 @@ export class GatewayService extends EventEmitter {
     };
   }
 
+  #verifyGatewayOperatorIdentity(operatorIdentity = null, route = null) {
+    if (!operatorIdentity || typeof operatorIdentity !== 'object') return null;
+    const pubkey = typeof operatorIdentity.pubkey === 'string'
+      ? operatorIdentity.pubkey.trim().toLowerCase()
+      : '';
+    const attestation = operatorIdentity.attestation && typeof operatorIdentity.attestation === 'object'
+      ? operatorIdentity.attestation
+      : null;
+    if (!pubkey || !attestation) return null;
+    const verification = verifyOperatorAttestation(attestation, {
+      expectedOperatorPubkey: pubkey,
+      expectedGatewayId: route?.gatewayId || null,
+      expectedPublicUrl: route?.gatewayOrigin || null,
+      now: Date.now(),
+      schnorrImpl: schnorr
+    });
+    if (!verification.ok) {
+      return null;
+    }
+    return {
+      pubkey: verification.payload.operatorPubkey,
+      attestation: cloneJson(verification.attestation)
+    };
+  }
+
   async #resolveGatewayRoute({
     relayKey = null,
     metadata = null,
@@ -739,12 +772,25 @@ export class GatewayService extends EventEmitter {
         authMethod: route.authMethod || null,
         lastCheckedAt: Date.now(),
         reason: null,
-        hostingState: 'unknown'
+        hostingState: 'unknown',
+        operatorIdentity: null
       };
 
       try {
         if (route.openAccess === true || route.policy?.hostPolicy === 'open') {
-          const approved = { ...base, hostingState: 'approved', reason: 'open-access' };
+          let operatorIdentity = null;
+          if (route.authMethod === 'relay-scoped-bearer-v1') {
+            try {
+              const authClient = this.#getGatewayAuthClient(route.gatewayOrigin);
+              const authResponse = await authClient.issueBearerTokenResponse({
+                scope: 'gateway:relay-register',
+                relayKey: null,
+                forceRefresh: force
+              });
+              operatorIdentity = this.#verifyGatewayOperatorIdentity(authResponse?.operatorIdentity, route);
+            } catch (_) {}
+          }
+          const approved = { ...base, hostingState: 'approved', reason: 'open-access', operatorIdentity };
           this.gatewayAccessCatalog.set(catalogKey, approved);
           return approved;
         }
@@ -754,12 +800,17 @@ export class GatewayService extends EventEmitter {
           return unknown;
         }
         const authClient = this.#getGatewayAuthClient(route.gatewayOrigin);
-        await authClient.issueBearerToken({
+        const authResponse = await authClient.issueBearerTokenResponse({
           scope: 'gateway:relay-register',
           relayKey: null,
           forceRefresh: force
         });
-        const approved = { ...base, hostingState: 'approved', reason: 'gateway-host-approved' };
+        const approved = {
+          ...base,
+          hostingState: 'approved',
+          reason: 'gateway-host-approved',
+          operatorIdentity: this.#verifyGatewayOperatorIdentity(authResponse?.operatorIdentity, route)
+        };
         this.gatewayAccessCatalog.set(catalogKey, approved);
         return approved;
       } catch (error) {
@@ -2276,12 +2327,30 @@ export class GatewayService extends EventEmitter {
         .map((entry) => this.#gatewayAccessCatalogKey(entry))
         .filter(Boolean)
     );
+    const approvedCatalogByKey = new Map(
+      gatewayAccessCatalog
+        .filter((entry) => entry?.hostingState === 'approved')
+        .map((entry) => [
+          this.#gatewayAccessCatalogKey(entry),
+          entry
+        ])
+        .filter(([key]) => !!key)
+    );
     const authorizedGateways = (this.discoveredGateways || [])
       .filter((gateway) => approvedCatalogKeys.has(this.#gatewayAccessCatalogKey({
         gatewayId: gateway?.gatewayId || null,
         gatewayOrigin: gateway?.publicUrl || gateway?.gatewayOrigin || null
       })))
-      .map((gateway) => ({ ...gateway }));
+      .map((gateway) => {
+        const catalogEntry = approvedCatalogByKey.get(this.#gatewayAccessCatalogKey({
+          gatewayId: gateway?.gatewayId || null,
+          gatewayOrigin: gateway?.publicUrl || gateway?.gatewayOrigin || null
+        })) || null;
+        return {
+          ...gateway,
+          operatorIdentity: cloneJson(catalogEntry?.operatorIdentity || null)
+        };
+      });
 
     return {
       enabled,

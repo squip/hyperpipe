@@ -47,6 +47,12 @@ async function parseResponsePayload(response) {
   }
 }
 
+function clonePayload(value) {
+  return value && typeof value === 'object'
+    ? JSON.parse(JSON.stringify(value))
+    : value
+}
+
 export default class PublicGatewayAuthClient {
   constructor({
     baseUrl = null,
@@ -86,6 +92,11 @@ export default class PublicGatewayAuthClient {
   }
 
   async issueBearerToken({ scope = 'gateway:relay-register', relayKey = null, forceRefresh = false } = {}) {
+    const response = await this.issueBearerTokenResponse({ scope, relayKey, forceRefresh })
+    return response.token
+  }
+
+  async issueBearerTokenResponse({ scope = 'gateway:relay-register', relayKey = null, forceRefresh = false } = {}) {
     if (!this.isEnabled()) {
       throw new Error('public-gateway-auth-disabled')
     }
@@ -100,7 +111,7 @@ export default class PublicGatewayAuthClient {
     if (!forceRefresh) {
       const cached = this.tokenCache.get(cacheKey)
       if (cached && cached.token && cached.expiresAt > Date.now() + 2_000) {
-        return cached.token
+        return clonePayload(cached.response)
       }
     }
     const secretBytes = hexToBytes(nsecHex)
@@ -134,12 +145,23 @@ export default class PublicGatewayAuthClient {
     const expiresIn = Number.isFinite(Number(verifyPayload.expiresIn))
       ? Math.max(1, Math.trunc(Number(verifyPayload.expiresIn)))
       : 60
+    const response = {
+      token,
+      expiresIn,
+      expiresAt: Number.isFinite(Number(verifyPayload.expiresAt))
+        ? Math.trunc(Number(verifyPayload.expiresAt))
+        : (Date.now() + (expiresIn * 1000)),
+      operatorIdentity: verifyPayload.operatorIdentity && typeof verifyPayload.operatorIdentity === 'object'
+        ? clonePayload(verifyPayload.operatorIdentity)
+        : null
+    }
     this.tokenCache.set(cacheKey, {
       token,
-      expiresAt: Date.now() + (expiresIn * 1000),
-      subjectPubkey: pubkey
+      expiresAt: response.expiresAt,
+      subjectPubkey: pubkey,
+      response
     })
-    return token
+    return clonePayload(response)
   }
 
   #buildCachePrefix(scope, relayKey) {

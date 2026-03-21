@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, stat, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { schnorr } from '@noble/curves/secp256k1';
 
@@ -10,15 +10,20 @@ import { readEnvFile } from '../lib/env-file.mjs';
 import {
   resolveEnvFilePath,
   runApplyCommand,
+  runAttestOperatorCommand,
   runCheckCommand,
   runInitCommand,
   runSmokeCommand
 } from '../lib/commands.mjs';
+import { verifyOperatorAttestation } from '../../shared/public-gateway/OperatorAttestation.mjs';
 
 const OPERATOR_SECRET_HEX = '7'.repeat(64);
 const OPERATOR_PUBKEY = Buffer.from(
   schnorr.getPublicKey(Buffer.from(OPERATOR_SECRET_HEX, 'hex'))
 ).toString('hex');
+const DEPLOY_DIR = dirname(new URL('../lib/commands.mjs', import.meta.url).pathname);
+const DEFAULT_OPERATOR_ATTESTATION_REQUEST_FILE = join(DEPLOY_DIR, '..', 'artifacts', 'operator-attestation-request.json');
+const DEFAULT_OPERATOR_ATTESTATION_FILE = join(DEPLOY_DIR, '..', 'artifacts', 'operator-attestation.json');
 
 function createIo() {
   const stdout = [];
@@ -152,11 +157,99 @@ test('runInitCommand writes an env file and preserves generated values on rerun'
 
   const secondConfig = await readEnvFile(envFile);
   assert.equal(secondConfig.GATEWAY_DISCOVERY_DISPLAY_NAME, 'Updated Public Gateway');
+  assert.equal(secondConfig.DEPLOY_EXPOSURE_MODE, 'https-acme');
   assert.equal(secondConfig.GATEWAY_REGISTRATION_SECRET, firstConfig.GATEWAY_REGISTRATION_SECRET);
   assert.equal(secondConfig.GATEWAY_RELAY_NAMESPACE, firstConfig.GATEWAY_RELAY_NAMESPACE);
   assert.equal(secondConfig.GATEWAY_RELAY_REPLICATION_TOPIC, firstConfig.GATEWAY_RELAY_REPLICATION_TOPIC);
   assert.equal(secondConfig.GATEWAY_RELAY_ADMIN_PUBLIC_KEY, firstConfig.GATEWAY_RELAY_ADMIN_PUBLIC_KEY);
   assert.equal(secondConfig.GATEWAY_RELAY_ADMIN_SECRET_KEY, firstConfig.GATEWAY_RELAY_ADMIN_SECRET_KEY);
+});
+
+test('runInitCommand supports http exposure mode without letsencrypt email', async (t) => {
+  const dir = await createTempDir(t);
+  const envFile = join(dir, 'gateway.env');
+  const io = createIo();
+
+  await runInitCommand({
+    deployEnv: envFile,
+    nonInteractive: true,
+    profile: 'open',
+    exposureMode: 'http',
+    host: '203.0.113.10',
+    displayName: 'IP Gateway',
+    discoveryRelays: 'wss://relay.damus.io/,wss://relay.primal.net/'
+  }, io);
+
+  const config = await readEnvFile(envFile);
+  assert.equal(config.DEPLOY_EXPOSURE_MODE, 'http');
+  assert.equal(config.LETSENCRYPT_EMAIL, '');
+  assert.equal(config.GATEWAY_PUBLIC_URL, 'http://203.0.113.10');
+});
+
+test('runInitCommand generates an operator attestation request when enabled', async (t) => {
+  const dir = await createTempDir(t);
+  const envFile = join(dir, 'gateway.env');
+  const io = createIo();
+
+  t.after(async () => {
+    await rm(DEFAULT_OPERATOR_ATTESTATION_REQUEST_FILE, { force: true });
+    await rm(DEFAULT_OPERATOR_ATTESTATION_FILE, { force: true });
+  });
+
+  const result = await runInitCommand({
+    deployEnv: envFile,
+    nonInteractive: true,
+    profile: 'wot',
+    host: 'example.com',
+    email: 'admin@example.com',
+    displayName: 'Example Public Gateway',
+    discoveryRelays: 'wss://relay.damus.io/,wss://relay.primal.net/',
+    operatorPubkey: OPERATOR_PUBKEY,
+    enableOperatorAttestation: true,
+    wotMaxDepth: '2',
+    wotMinFollowersDepth2: '2',
+    authRelays: 'wss://relay.damus.io/,wss://relay.primal.net/'
+  }, io);
+
+  assert.equal(result.config.GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE, '/app/public-gateway/artifacts/operator-attestation.json');
+  const requestRaw = await readFile(DEFAULT_OPERATOR_ATTESTATION_REQUEST_FILE, 'utf8');
+  const request = JSON.parse(requestRaw);
+  assert.equal(request.payload.operatorPubkey, OPERATOR_PUBKEY);
+  assert.equal(request.payload.publicUrl, 'https://example.com');
+  assert.match(io.stdoutText, /Verified operator identity is enabled/u);
+});
+
+test('runAttestOperatorCommand signs an attestation artifact that verifies cleanly', async (t) => {
+  const dir = await createTempDir(t);
+  const io = createIo();
+  const requestPath = join(dir, 'operator-attestation-request.json');
+  const outputPath = join(dir, 'operator-attestation.json');
+  await writeFile(requestPath, JSON.stringify({
+    version: 1,
+    payload: {
+      purpose: 'gateway-operator-attestation',
+      operatorPubkey: OPERATOR_PUBKEY,
+      gatewayId: '2'.repeat(64),
+      publicUrl: 'https://gateway.example'
+    }
+  }, null, 2));
+
+  const result = await runAttestOperatorCommand({
+    request: requestPath,
+    out: outputPath,
+    expiresDays: '365',
+    operatorSecret: OPERATOR_SECRET_HEX
+  }, io);
+
+  const verification = verifyOperatorAttestation(result.attestation, {
+    expectedOperatorPubkey: OPERATOR_PUBKEY,
+    expectedGatewayId: '2'.repeat(64),
+    expectedPublicUrl: 'https://gateway.example',
+    schnorrImpl: schnorr
+  });
+  assert.equal(verification.ok, true);
+  const fileStats = await stat(outputPath);
+  assert.ok(fileStats.size > 0);
 });
 
 test('runCheckCommand reports a missing env file', async () => {
@@ -193,6 +286,49 @@ test('runCheckCommand fails cleanly when Docker is unavailable', async (t) => {
 
   assert.equal(result.ok, false);
   assert.match(result.errors.join('\n'), /Docker CLI is not available/u);
+});
+
+test('runCheckCommand validates operator attestation artifacts and warns near expiry', async (t) => {
+  const dir = await createTempDir(t);
+  const envFile = join(dir, 'gateway.env');
+  const io = createIo();
+
+  t.after(async () => {
+    await rm(DEFAULT_OPERATOR_ATTESTATION_REQUEST_FILE, { force: true });
+    await rm(DEFAULT_OPERATOR_ATTESTATION_FILE, { force: true });
+  });
+
+  const initResult = await runInitCommand({
+    deployEnv: envFile,
+    nonInteractive: true,
+    profile: 'wot',
+    host: 'example.com',
+    email: 'admin@example.com',
+    displayName: 'Example Public Gateway',
+    discoveryRelays: 'wss://relay.damus.io/,wss://relay.primal.net/',
+    operatorPubkey: OPERATOR_PUBKEY,
+    enableOperatorAttestation: true,
+    wotMaxDepth: '2',
+    wotMinFollowersDepth2: '2',
+    authRelays: 'wss://relay.damus.io/,wss://relay.primal.net/'
+  }, io);
+
+  await runAttestOperatorCommand({
+    request: DEFAULT_OPERATOR_ATTESTATION_REQUEST_FILE,
+    out: DEFAULT_OPERATOR_ATTESTATION_FILE,
+    operatorSecret: OPERATOR_SECRET_HEX,
+    expiresDays: '20'
+  }, io);
+
+  const execStub = createExecStub();
+  const result = await runCheckCommand({
+    deployEnv: envFile,
+    skipPortChecks: true
+  }, io, execStub);
+
+  assert.equal(initResult.config.GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE, '/app/public-gateway/artifacts/operator-attestation.json');
+  assert.equal(result.ok, true);
+  assert.match(result.warnings.join('\n'), /Operator attestation expires within 30 days/u);
 });
 
 test('runCheckCommand surfaces docker socket permission errors clearly', async (t) => {
@@ -304,6 +440,40 @@ test('runApplyCommand runs docker compose up after a successful check', async (t
       ({ command, args }) => command === 'docker' && args[0] === 'compose' && args.includes('up')
     )
   );
+  assert.ok(
+    execStub.calls.some(
+      ({ command, args }) => command === 'docker' && args[0] === 'compose' && args.some((arg) => String(arg).endsWith('/deploy/docker-compose.https-acme.yml'))
+    )
+  );
+});
+
+test('runCheckCommand selects the http compose override for http exposure mode', async (t) => {
+  const dir = await createTempDir(t);
+  const envFile = join(dir, 'gateway.env');
+  const io = createIo();
+
+  await runInitCommand({
+    deployEnv: envFile,
+    nonInteractive: true,
+    profile: 'open',
+    exposureMode: 'http',
+    host: '203.0.113.10',
+    displayName: 'IP Gateway',
+    discoveryRelays: 'wss://relay.damus.io/,wss://relay.primal.net/'
+  }, io);
+
+  const execStub = createExecStub();
+  const result = await runCheckCommand({
+    deployEnv: envFile,
+    skipPortChecks: true
+  }, io, execStub);
+
+  assert.equal(result.ok, true);
+  assert.ok(
+    execStub.calls.some(
+      ({ command, args }) => command === 'docker' && args[0] === 'compose' && args.some((arg) => String(arg).endsWith('/deploy/docker-compose.http.yml'))
+    )
+  );
 });
 
 test('runSmokeCommand checks container health and the open-profile secret endpoint', async (t) => {
@@ -340,6 +510,45 @@ test('runSmokeCommand checks container health and the open-profile secret endpoi
   assert.equal(result.health.body.status, 'ok');
   assert.ok(fetchCalls.some((url) => url.endsWith('/health')));
   assert.ok(fetchCalls.some((url) => url.includes('/.well-known/hypertuna-gateway-secret')));
+});
+
+test('runSmokeCommand uses http origin for http exposure mode', async (t) => {
+  const dir = await createTempDir(t);
+  const envFile = join(dir, 'gateway.env');
+  const io = createIo();
+
+  await runInitCommand({
+    deployEnv: envFile,
+    nonInteractive: true,
+    profile: 'allowlist+wot',
+    exposureMode: 'http',
+    host: '203.0.113.10',
+    displayName: 'IP Gateway',
+    discoveryRelays: 'wss://relay.damus.io/,wss://relay.primal.net/',
+    allowlistPubkeys: '2'.repeat(64),
+    operatorPubkey: OPERATOR_PUBKEY,
+    wotMaxDepth: '1',
+    wotMinFollowersDepth2: '0',
+    authRelays: 'wss://relay.damus.io/,wss://relay.primal.net/'
+  }, io);
+
+  const execStub = createExecStub({ containerStates: { 'public-gateway': 'running' } });
+  const fetchCalls = [];
+  const fetchStub = async (url) => {
+    const text = String(url);
+    fetchCalls.push(text);
+    if (text === 'http://203.0.113.10/health') return jsonResponse({ status: 'ok' });
+    throw new Error(`Unexpected fetch URL: ${text}`);
+  };
+
+  const result = await runSmokeCommand({
+    deployEnv: envFile,
+    skipPortChecks: true,
+    timeoutMs: '2000'
+  }, io, execStub, fetchStub);
+
+  assert.equal(result.gatewayOrigin, 'http://203.0.113.10');
+  assert.deepEqual(fetchCalls, ['http://203.0.113.10/health']);
 });
 
 test('runSmokeCommand can run deep auth validation from a local manifest', async (t) => {

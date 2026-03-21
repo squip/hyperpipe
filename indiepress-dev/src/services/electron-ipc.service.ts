@@ -92,6 +92,7 @@ export type PublicGatewayStatus = {
     hostPolicy?: string | null
     memberDelegationMode?: string | null
     operatorPubkey?: string | null
+    operatorIdentity?: GatewayOperatorIdentity | null
   }>
   authorizedGateways?: Array<{
     gatewayId: string
@@ -103,6 +104,7 @@ export type PublicGatewayStatus = {
     hostPolicy?: string | null
     memberDelegationMode?: string | null
     operatorPubkey?: string | null
+    operatorIdentity?: GatewayOperatorIdentity | null
   }>
   gatewayAccessCatalog?: Array<{
     gatewayId?: string | null
@@ -112,6 +114,7 @@ export type PublicGatewayStatus = {
     lastCheckedAt?: number | null
     memberDelegationMode?: string | null
     authMethod?: string | null
+    operatorIdentity?: GatewayOperatorIdentity | null
     policy?: {
       hostPolicy?: string | null
       authMethod?: string | null
@@ -132,6 +135,26 @@ export type PublicGatewayStatus = {
       error?: string
     }
   >
+}
+
+export type GatewayOperatorAttestationPayload = {
+  purpose?: string | null
+  operatorPubkey?: string | null
+  gatewayId?: string | null
+  publicUrl?: string | null
+  issuedAt?: number | null
+  expiresAt?: number | null
+}
+
+export type GatewayOperatorAttestation = {
+  version?: number | null
+  payload?: GatewayOperatorAttestationPayload | null
+  signature?: string | null
+}
+
+export type GatewayOperatorIdentity = {
+  pubkey?: string | null
+  attestation?: GatewayOperatorAttestation | null
 }
 
 export type MediaCommandPayload = {

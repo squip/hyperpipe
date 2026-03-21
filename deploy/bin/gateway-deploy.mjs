@@ -4,6 +4,7 @@ import { parseArgs } from 'node:util';
 
 import {
   runApplyCommand,
+  runAttestOperatorCommand,
   runCheckCommand,
   runInitCommand,
   runSmokeCommand,
@@ -14,6 +15,7 @@ function toOptionBag(values) {
   return {
     deployEnv: values['deploy-env'],
     profile: values.profile,
+    exposureMode: values['exposure-mode'],
     host: values.host,
     email: values.email,
     displayName: values['display-name'],
@@ -23,6 +25,7 @@ function toOptionBag(values) {
     allowlistPubkeys: values['allowlist-pubkeys'],
     blocklistPubkeys: values['blocklist-pubkeys'],
     operatorPubkey: values['operator-pubkey'],
+    enableOperatorAttestation: values['enable-operator-attestation'] === true,
     wotRootPubkey: values['wot-root-pubkey'],
     wotMaxDepth: values['wot-max-depth'],
     wotMinFollowersDepth2: values['wot-min-followers-depth2'],
@@ -33,6 +36,9 @@ function toOptionBag(values) {
     authManifest: values['auth-manifest'],
     policyColumn: values['policy-column'],
     out: values.out,
+    request: values.request,
+    expiresDays: values['expires-days'],
+    operatorSecret: values['operator-secret'],
     timeoutMs: values['timeout-ms'],
     scope: values.scope
   };
@@ -45,6 +51,7 @@ async function main() {
       help: { type: 'boolean', short: 'h' },
       'deploy-env': { type: 'string' },
       profile: { type: 'string' },
+      'exposure-mode': { type: 'string' },
       host: { type: 'string' },
       email: { type: 'string' },
       'display-name': { type: 'string' },
@@ -54,6 +61,7 @@ async function main() {
       'allowlist-pubkeys': { type: 'string' },
       'blocklist-pubkeys': { type: 'string' },
       'operator-pubkey': { type: 'string' },
+      'enable-operator-attestation': { type: 'boolean' },
       'wot-root-pubkey': { type: 'string' },
       'wot-max-depth': { type: 'string' },
       'wot-min-followers-depth2': { type: 'string' },
@@ -64,6 +72,9 @@ async function main() {
       'auth-manifest': { type: 'string' },
       'policy-column': { type: 'string' },
       out: { type: 'string' },
+      request: { type: 'string' },
+      'expires-days': { type: 'string' },
+      'operator-secret': { type: 'string' },
       'timeout-ms': { type: 'string' },
       scope: { type: 'string' }
     }
@@ -92,6 +103,10 @@ async function main() {
   }
   if (command === 'smoke') {
     await runSmokeCommand(options);
+    return;
+  }
+  if (command === 'attest-operator') {
+    await runAttestOperatorCommand(options);
     return;
   }
 

@@ -10,13 +10,16 @@
     "check": "node ./bin/gateway-deploy.mjs check",
     "apply": "node ./bin/gateway-deploy.mjs apply",
     "smoke": "node ./bin/gateway-deploy.mjs smoke",
+    "attest-operator": "node ./bin/gateway-deploy.mjs attest-operator",
     "deploy:init": "node ./bin/gateway-deploy.mjs init",
     "deploy:check": "node ./bin/gateway-deploy.mjs check",
     "deploy:apply": "node ./bin/gateway-deploy.mjs apply",
     "deploy:smoke": "node ./bin/gateway-deploy.mjs smoke",
+    "deploy:attest-operator": "node ./bin/gateway-deploy.mjs attest-operator",
     "test": "node --test ./test/*.test.mjs"
   },
   "dependencies": {
-    "@noble/curves": "^1.2.0"
+    "@noble/curves": "^1.2.0",
+    "hypercore-crypto": "^3.5.0"
   }
 }

@@ -8,7 +8,9 @@ This directory contains a standalone Docker Compose bundle and deploy CLI for se
    - Docker
    - Docker Compose plugin or `docker-compose`
    - Node.js 20+ for the deploy CLI
-   - a DNS A record pointing your chosen hostname at the target machine
+   - either:
+     - a DNS A record pointing your chosen hostname at the target machine for `https-acme`, or
+     - a public IP for `http`
 
 2. Install the deploy CLI dependencies:
    ```bash
@@ -21,17 +23,24 @@ This directory contains a standalone Docker Compose bundle and deploy CLI for se
    npm run deploy:init
    ```
 
-4. Validate the deploy bundle:
+4. If `deploy:init` enabled verified operator identity, sign the generated request on a trusted machine:
+   ```bash
+   npm run deploy:attest-operator -- \
+     --request ./artifacts/operator-attestation-request.json \
+     --out ./artifacts/operator-attestation.json
+   ```
+
+5. Validate the deploy bundle:
    ```bash
    npm run deploy:check
    ```
 
-5. Start the stack:
+6. Start the stack:
    ```bash
    npm run deploy:apply
    ```
 
-6. Run smoke checks:
+7. Run smoke checks:
    ```bash
    npm run deploy:smoke
    ```
@@ -56,13 +65,18 @@ npm run deploy:apply -- --deploy-env production
 
 Interactive setup wizard that:
 
-- prompts for foundational values such as host, email, profile, display name, region, and relay lists
+- prompts for foundational values such as auth profile, exposure mode, host, display name, region, and relay lists
 - applies one of the built-in auth profiles:
   - `open`
   - `allowlist`
   - `wot`
   - `allowlist+wot`
+- supports two deploy exposure modes:
+  - `https-acme` for domain + Let’s Encrypt
+  - `http` for public IP / plain HTTP
 - generates stable secrets and relay admin keys when missing
+- generates a stable discovery key seed so the gateway identity remains stable across restarts
+- can optionally generate an offline operator attestation request when an operator pubkey is configured
 - preserves existing values when re-run against the same env file
 
 ### `check`
@@ -70,17 +84,22 @@ Interactive setup wizard that:
 Runs deploy validation before you start containers:
 
 - schema validation for the selected profile
+- schema validation for the selected exposure mode
+- optional operator attestation artifact validation when `GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE` is enabled
 - Docker / Compose availability checks
 - Docker daemon reachability
-- best-effort port-availability warnings
-- `docker compose config` validation against `deploy/docker-compose.yml`
+- best-effort port-availability warnings for the selected exposure mode
+- `docker compose config` validation against the base compose file plus the selected exposure-mode override
 
 ### `apply`
 
 Runs `check` first, then executes:
 
 ```bash
-docker compose --env-file <selected-env> -f deploy/docker-compose.yml up -d --build
+docker compose --env-file <selected-env> \
+  -f deploy/docker-compose.yml \
+  -f deploy/docker-compose.<exposure-mode>.yml \
+  up -d --build
 ```
 
 ### `smoke`
@@ -102,6 +121,18 @@ npm run deploy:smoke -- \
 
 The manifest should follow the same shape used by the gateway auth fixture tooling: an `accounts` array with credential material and a `policyMatrix` describing expected `ALLOW` / `DENY` outcomes.
 
+### `attest-operator`
+
+Signs the operator attestation request on a trusted machine without storing the operator `nsec` on the gateway host.
+
+```bash
+npm run deploy:attest-operator -- \
+  --request ./artifacts/operator-attestation-request.json \
+  --out ./artifacts/operator-attestation.json
+```
+
+The command securely prompts for the operator `nsec` or 32-byte hex secret, verifies that it matches the requested `GATEWAY_AUTH_OPERATOR_PUBKEY`, and writes a signed JSON artifact that `deploy:check` validates before deployment.
+
 ## Profiles
 
 Profile defaults are stored in:
@@ -114,6 +145,25 @@ Profile defaults are stored in:
 The CLI writes explicit env values for discovery relays, auth relays, public URL, and auth policy so deployments do not inherit project-specific defaults accidentally.
 The checked-in profile files are also the source of truth for the profile presets loaded by the schema.
 
+## Exposure Modes
+
+The deploy bundle supports two exposure modes:
+
+- `https-acme`
+  - default mode
+  - expects `GATEWAY_HOST` to be a real domain hostname
+  - requires `LETSENCRYPT_EMAIL`
+  - derives `GATEWAY_PUBLIC_URL=https://<host>`
+  - uses Traefik + Let’s Encrypt and exposes ports `80` and `443`
+- `http`
+  - intended for public-IP or non-TLS setups
+  - allows `GATEWAY_HOST` to be a hostname or IPv4 address
+  - ignores `LETSENCRYPT_EMAIL`
+  - derives `GATEWAY_PUBLIC_URL=http://<host>`
+  - maps host port `80` directly to the gateway container
+
+`http` mode is convenient for VPS setups without a registered domain, but it leaves registration, admin auth, and access-manager traffic unencrypted.
+
 The deploy bundle now enables the live Block List store by default for every profile, and enables the live Allow List store by default for `allowlist` and `allowlist+wot`, with:
 
 - `GATEWAY_AUTH_ALLOWLIST_FILE=/data/config/allowlist.json`
@@ -123,11 +173,19 @@ The deploy bundle now enables the live Block List store by default for every pro
 
 If `GATEWAY_AUTH_OPERATOR_PUBKEY` is set, the gateway exposes the operator access manager at `/admin/allowlist`, including user-friendly **Allow List**, **Web of Trust**, and **Block List** tabs when those features are enabled by the active profile and env file.
 
+If you also enable verified operator identity during `init`, the CLI generates:
+
+- `deploy/artifacts/operator-attestation-request.json`
+- expected signed output at `deploy/artifacts/operator-attestation.json`
+
+That signed artifact is mounted read-only into the gateway container and is only returned to already-approved clients through `/api/auth/verify`.
+
 ## Portable Defaults
 
 The deploy CLI generates and persists the following values automatically when missing:
 
 - `GATEWAY_REGISTRATION_SECRET`
+- `GATEWAY_DISCOVERY_KEY_SEED`
 - `GATEWAY_RELAY_NAMESPACE`
 - `GATEWAY_RELAY_REPLICATION_TOPIC`
 - `GATEWAY_RELAY_ADMIN_PUBLIC_KEY`

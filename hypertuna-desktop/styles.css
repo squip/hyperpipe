@@ -2711,6 +2711,270 @@ members-list,.member-list {
     opacity: 0.6;
 }
 
+.public-gateway-picker {
+    position: relative;
+}
+
+.public-gateway-native-select {
+    pointer-events: none;
+}
+
+.public-gateway-picker-button {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 0.875rem;
+    padding: 0.875rem 1rem;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    color: var(--text-primary);
+    text-align: left;
+    cursor: pointer;
+    transition: border-color var(--transition-fast), box-shadow var(--transition-fast), background-color var(--transition-fast);
+}
+
+.public-gateway-picker-button:hover {
+    background: var(--surface-hover);
+}
+
+.public-gateway-picker-button:focus-visible,
+.public-gateway-picker.open .public-gateway-picker-button {
+    outline: none;
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
+}
+
+.public-gateway-picker-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+.public-gateway-picker-leading {
+    width: 2.5rem;
+    height: 2.5rem;
+    border-radius: 999px;
+    background: rgba(99, 102, 241, 0.12);
+    color: var(--primary-color);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    flex-shrink: 0;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}
+
+.public-gateway-picker-leading.verified {
+    box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.2);
+}
+
+.public-gateway-picker-leading img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.public-gateway-picker-copy {
+    min-width: 0;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+}
+
+.public-gateway-picker-title {
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.public-gateway-picker-subtitle {
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    line-height: 1.35;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.public-gateway-picker-chevron {
+    width: 0.65rem;
+    height: 0.65rem;
+    border-right: 2px solid var(--text-secondary);
+    border-bottom: 2px solid var(--text-secondary);
+    transform: rotate(45deg);
+    transition: transform var(--transition-fast);
+    flex-shrink: 0;
+    margin-right: 0.125rem;
+}
+
+.public-gateway-picker.open .public-gateway-picker-chevron {
+    transform: rotate(-135deg);
+}
+
+.public-gateway-picker-menu {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: calc(100% + 0.5rem);
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    padding: 0.5rem;
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-md) + 0.125rem);
+    background: var(--surface);
+    box-shadow: var(--shadow-lg);
+    max-height: min(22rem, 60vh);
+    overflow-y: auto;
+}
+
+.public-gateway-picker-option {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 0.8rem;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.public-gateway-picker-option:hover:not(:disabled),
+.public-gateway-picker-option:focus-visible {
+    background: var(--surface-hover);
+    border-color: rgba(99, 102, 241, 0.16);
+    outline: none;
+}
+
+.public-gateway-picker-option.selected {
+    background: rgba(99, 102, 241, 0.08);
+    border-color: rgba(99, 102, 241, 0.22);
+}
+
+.public-gateway-picker-option.disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+}
+
+.public-gateway-picker-option-copy {
+    min-width: 0;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 0.18rem;
+}
+
+.public-gateway-picker-option-title {
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.public-gateway-picker-option-subtitle {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    line-height: 1.35;
+}
+
+.public-gateway-picker-badge {
+    padding: 0.22rem 0.48rem;
+    border-radius: 999px;
+    background: rgba(99, 102, 241, 0.12);
+    color: var(--primary-color);
+    font-size: 0.74rem;
+    font-weight: 600;
+    flex-shrink: 0;
+}
+
+@media (max-width: 640px) {
+    .public-gateway-picker-button {
+        padding: 0.8rem 0.875rem;
+    }
+
+    .public-gateway-picker-menu {
+        left: -0.125rem;
+        right: -0.125rem;
+    }
+
+    .public-gateway-picker-option {
+        padding: 0.72rem 0.7rem;
+    }
+}
+
+#public-gateway-selection-meta {
+    min-height: 1.25rem;
+}
+
+.public-gateway-selection-meta-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.75rem 0.875rem;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-md);
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.public-gateway-selection-operator {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-width: 0;
+}
+
+.public-gateway-selection-avatar {
+    width: 2.25rem;
+    height: 2.25rem;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 600;
+    flex-shrink: 0;
+    overflow: hidden;
+}
+
+.public-gateway-selection-avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.public-gateway-selection-operator-details {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.public-gateway-selection-operator-name {
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.public-gateway-selection-operator-pubkey,
+.public-gateway-selection-meta-summary {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    line-height: 1.4;
+}
+
 .public-gateway-relay-list {
     display: flex;
     flex-direction: column;

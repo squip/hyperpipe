@@ -81,6 +81,7 @@ const DEFAULT_CONFIG = {
     hostPolicy: (process.env.GATEWAY_AUTH_HOST_POLICY || 'open').trim().toLowerCase(),
     memberDelegationMode: (process.env.GATEWAY_AUTH_MEMBER_DELEGATION || 'all-members').trim().toLowerCase(),
     operatorPubkey: process.env.GATEWAY_AUTH_OPERATOR_PUBKEY || null,
+    operatorAttestationFile: process.env.GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE || null,
     allowlistPubkeys: parseCsvList(process.env.GATEWAY_AUTH_ALLOWLIST_PUBKEYS),
     allowlistFile: process.env.GATEWAY_AUTH_ALLOWLIST_FILE || null,
     allowlistRefreshMs: parseEnvNumber('GATEWAY_AUTH_ALLOWLIST_REFRESH_MS', 5000),
@@ -347,6 +348,9 @@ function normalizeAuthSettings(settings = {}) {
     : 'all-members';
 
   result.operatorPubkey = normalizeHexPubkey(result.operatorPubkey);
+  result.operatorAttestationFile = typeof result.operatorAttestationFile === 'string' && result.operatorAttestationFile.trim().length
+    ? result.operatorAttestationFile.trim()
+    : null;
   result.allowlistPubkeys = Array.from(new Set(
     (Array.isArray(result.allowlistPubkeys) ? result.allowlistPubkeys : [])
       .map((value) => normalizeHexPubkey(value))
