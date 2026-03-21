@@ -420,6 +420,21 @@ function handleClick(event) {
     }
     return;
   }
+  if (action === 'copy-pubkey') {
+    const pubkey = target.dataset.pubkey;
+    if (pubkey) {
+      navigator.clipboard.writeText(pubkey).then(() => {
+        const original = target.textContent;
+        target.textContent = 'Copied!';
+        target.classList.add('is-copied');
+        setTimeout(() => {
+          target.textContent = original;
+          target.classList.remove('is-copied');
+        }, 1200);
+      }).catch(() => {});
+    }
+    return;
+  }
   if (action === 'queue-block') {
     const pubkey = normalizePubkey(target.dataset.pubkey);
     if (pubkey) {
@@ -490,7 +505,6 @@ function renderSidebar() {
       <button class="icon-button sidebar__close" type="button" data-action="close-nav" aria-label="Close navigation">×</button>
       <p class="eyebrow">Public Gateway</p>
       <h1>Access Manager</h1>
-      <p class="sidebar__subtitle">Live access lists and trust controls.</p>
     </div>
     <nav class="sidebar__nav" aria-label="Access manager lists">
       ${tabs.map((tab) => `
@@ -771,7 +785,7 @@ function renderPubkeyRow(pubkey, {
   badges = []
 } = {}) {
   const profile = getProfile(pubkey);
-  const identity = renderIdentity(pubkey, profile, badges);
+  const identity = renderIdentity(pubkey, profile, { badges });
   return `
     <article class="entry-row">
       ${identity}
@@ -794,10 +808,10 @@ function renderWotRow(entry, index) {
   ];
   if (entry.isOperator) badges.push({ label: 'Operator', tone: 'success' });
   if (entry.isRoot) badges.push({ label: 'Root', tone: 'success' });
-  if (savedBlocked || draftBlocked) badges.push({ label: 'On Block List', tone: 'danger' });
+  if (savedBlocked || draftBlocked) badges.push({ label: 'Blocked', tone: 'danger' });
   return `
     <article class="entry-row">
-      ${renderIdentity(entry.pubkey, getProfile(entry.pubkey), badges)}
+      ${renderIdentity(entry.pubkey, getProfile(entry.pubkey), { badges })}
       <div class="entry-actions">
         <button
           class="${canBlock ? 'button-danger' : 'button-ghost'}"
@@ -805,33 +819,34 @@ function renderWotRow(entry, index) {
           data-action="queue-block"
           data-pubkey="${entry.pubkey}"
           ${canBlock ? '' : 'disabled'}
-        >${savedBlocked || draftBlocked ? 'On Block List' : (state.blocklist.enabled ? 'Block' : 'Block List disabled')}</button>
+        >${savedBlocked || draftBlocked ? 'Blocked' : (state.blocklist.enabled ? 'Block' : 'Block List disabled')}</button>
       </div>
     </article>
   `;
 }
 
-function renderIdentity(pubkey, profileState, badges = []) {
+function renderIdentity(pubkey, profileState, { badges = [], meta = [] } = {}) {
   const profile = profileState?.status === 'ready' ? profileState.profile : null;
   const displayName = profile?.displayName || shortPubkey(pubkey);
-  const subtitle = profile?.subtitle || pubkey;
   const avatar = profile?.picture
     ? `<img class="identity-avatar__image" src="${escapeHtml(profile.picture)}" alt="">`
     : `<span class="identity-avatar__fallback">${escapeHtml((displayName || '?').slice(0, 1).toUpperCase())}</span>`;
+  const metaHtml = meta.length
+    ? meta.map((m) => `<span class="identity-meta__item">${escapeHtml(m)}</span>`).join('')
+    : '';
+  const badgeHtml = badges.length
+    ? `<div class="badge-row">${badges.map((badge) => `<span class="badge${badge.tone ? ` badge--${badge.tone}` : ''}">${escapeHtml(badge.label)}</span>`).join('')}</div>`
+    : '';
   return `
     <div class="identity">
       <div class="identity-avatar">${avatar}</div>
       <div class="identity-copy">
-        <div class="identity-title">${escapeHtml(displayName)}</div>
-        <div class="identity-subtitle">
-          <code>${escapeHtml(shortPubkey(pubkey))}</code>
-          ${subtitle && subtitle !== pubkey ? `<span>${escapeHtml(subtitle)}</span>` : ''}
+        <div class="identity-headline">
+          <span class="identity-title">${escapeHtml(displayName)}</span>
+          <code class="identity-pubkey" data-action="copy-pubkey" data-pubkey="${escapeHtml(pubkey)}" title="Click to copy full pubkey">${escapeHtml(shortPubkey(pubkey))}</code>
+          ${metaHtml ? `<span class="identity-meta">${metaHtml}</span>` : ''}
         </div>
-        ${badges.length ? `
-          <div class="badge-row">
-            ${badges.map((badge) => `<span class="badge${badge.tone ? ` badge--${badge.tone}` : ''}">${escapeHtml(badge.label)}</span>`).join('')}
-          </div>
-        ` : ''}
+        ${badgeHtml}
       </div>
     </div>
   `;
