@@ -114,6 +114,8 @@ export type GatewayAccessState = {
   } | null
 }
 
+export type GroupNotesLoadState = 'loading' | 'ready' | 'empty' | 'error'
+
 export type GroupSummary = {
   id: string
   relay?: string

@@ -31,6 +31,7 @@ import type {
   GroupFileRecord,
   GroupDraftAttachment,
   GroupInvite,
+  GroupNotesLoadState,
   GroupSummary,
   GatewayOperatorIdentity,
   InvitesInboxItem,
@@ -94,6 +95,7 @@ import {
 } from './parity/counters.js'
 import { parseGroupAdminsEvent, parseGroupMembersEvent } from '../lib/groups.js'
 import { createGroupFileMetadataDraftEvent } from '../lib/group-files.js'
+import { groupScopeKey } from '../lib/groupScope.js'
 import { getBaseRelayUrl } from '../lib/hypertuna-group-events.js'
 
 export type RuntimeOptions = {
@@ -185,6 +187,7 @@ export type ControllerState = {
   detailPaneOffsetBySection: Record<string, number>
   paneViewport: PaneViewportMap
   groupNotesByGroupKey: Record<string, GroupNoteRecord[]>
+  groupNotesLoadStateByGroupKey: Record<string, GroupNotesLoadState>
   groupFilesByGroupKey: Record<string, GroupFileRecord[]>
   adminProfileByPubkey: Record<string, {
     name: string | null
@@ -404,12 +407,6 @@ function normalizeFileRecordKey(file: GroupFileRecord): string {
   return `${file.groupId}:${file.eventId}`
 }
 
-function groupKey(groupId: string, relay?: string | null): string {
-  const normalizedGroupId = String(groupId || '').trim()
-  const normalizedRelay = relay ? getBaseRelayUrl(relay) : ''
-  return `${normalizedRelay}|${normalizedGroupId}`
-}
-
 function groupListEntryKey(entry: GroupListEntry): string {
   const groupId = String(entry.groupId || '').trim()
   const relay = String(entry.relay || '').trim()
@@ -590,6 +587,7 @@ export class TuiController {
     detailPaneOffsetBySection: {},
     paneViewport: {},
     groupNotesByGroupKey: {},
+    groupNotesLoadStateByGroupKey: {},
     groupFilesByGroupKey: {},
     adminProfileByPubkey: {},
     fileActionStatus: defaultFileActionStatus(),
@@ -713,6 +711,7 @@ export class TuiController {
       groupNotesByGroupKey: Object.fromEntries(
         Object.entries(this.state.groupNotesByGroupKey).map(([key, value]) => [key, value.map((row) => ({ ...row }))])
       ),
+      groupNotesLoadStateByGroupKey: { ...this.state.groupNotesLoadStateByGroupKey },
       groupFilesByGroupKey: Object.fromEntries(
         Object.entries(this.state.groupFilesByGroupKey).map(([key, value]) => [key, value.map((row) => ({ ...row }))])
       ),
@@ -2400,7 +2399,7 @@ export class TuiController {
     const next = this.applyFileControls(this.rawFiles)
     const grouped: Record<string, GroupFileRecord[]> = {}
     for (const record of next) {
-      const key = groupKey(record.groupId, record.groupRelay || null)
+      const key = groupScopeKey(record.groupId, record.groupRelay || null)
       const rows = grouped[key] || []
       rows.push(record)
       grouped[key] = rows
@@ -4446,7 +4445,7 @@ export class TuiController {
 
   async refreshJoinRequests(groupId: string, relay?: string): Promise<void> {
     await this.runTask('Refresh join requests', async () => {
-      const groupKey = relay ? `${relay}|${groupId}` : groupId
+      const key = groupScopeKey(groupId, relay || null)
       const requests = await this.groupService.loadJoinRequests(
         this.searchableRelayUrls(),
         groupId,
@@ -4457,7 +4456,7 @@ export class TuiController {
       this.patchState({
         groupJoinRequests: {
           ...this.state.groupJoinRequests,
-          [groupKey]: requests
+          [key]: requests
         }
       })
     }, { dedupeKey: `refresh:join-requests:${groupId}:${relay || ''}`, retries: 1 })
@@ -4561,12 +4560,12 @@ export class TuiController {
         `[invite-approval:${inviteApprovalTraceId}] invite sent elapsedMs=${Date.now() - approvalStartedAt} token=${token ? 'present' : 'none'}`
       )
 
-      const groupKey = relay ? `${relay}|${normalizedGroupId}` : normalizedGroupId
-      const next = (this.state.groupJoinRequests[groupKey] || []).filter((request) => request.pubkey !== normalizedPubkey)
+      const key = groupScopeKey(normalizedGroupId, relay || null)
+      const next = (this.state.groupJoinRequests[key] || []).filter((request) => request.pubkey !== normalizedPubkey)
       this.patchState({
         groupJoinRequests: {
           ...this.state.groupJoinRequests,
-          [groupKey]: next
+          [key]: next
         }
       })
     })
@@ -4575,12 +4574,12 @@ export class TuiController {
   async rejectJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void> {
     await this.runTask('Reject join request', async () => {
       await this.groupService.rejectJoinRequest(groupId, pubkey, relay)
-      const groupKey = relay ? `${relay}|${groupId}` : groupId
-      const next = (this.state.groupJoinRequests[groupKey] || []).filter((request) => request.pubkey !== pubkey)
+      const key = groupScopeKey(groupId, relay || null)
+      const next = (this.state.groupJoinRequests[key] || []).filter((request) => request.pubkey !== pubkey)
       this.patchState({
         groupJoinRequests: {
           ...this.state.groupJoinRequests,
-          [groupKey]: next
+          [key]: next
         }
       })
     })
@@ -5248,42 +5247,63 @@ export class TuiController {
   }
 
   async refreshGroupNotes(groupId: string, relay?: string): Promise<void> {
-    await this.runTask('Refresh group notes', async () => {
-      const normalizedGroupId = String(groupId || '').trim()
-      if (!normalizedGroupId) {
-        throw new Error('groupId is required')
+    const normalizedGroupId = String(groupId || '').trim()
+    if (!normalizedGroupId) {
+      throw new Error('groupId is required')
+    }
+    const key = groupScopeKey(normalizedGroupId, relay || null)
+    this.patchState({
+      groupNotesLoadStateByGroupKey: {
+        ...this.state.groupNotesLoadStateByGroupKey,
+        [key]: 'loading'
       }
-      const relayCandidates = relay ? uniqueRelayUrls([relay, ...this.searchableRelayUrls()]) : this.searchableRelayUrls()
-      const events = await this.feedService.fetchFeed(
-        relayCandidates,
-        {
-          kinds: [1],
-          '#h': [normalizedGroupId],
-          limit: 350
-        },
-        FEED_REFRESH_TIMEOUT_MS
-      )
-      const notes: GroupNoteRecord[] = events
-        .map((event) => ({
-          eventId: event.id,
-          groupId: normalizedGroupId,
-          relay: relay || null,
-          content: event.content || '',
-          createdAt: Number(event.created_at || 0),
-          authorPubkey: event.pubkey,
-          event
-        }))
-        .sort((left, right) => right.createdAt - left.createdAt)
-      const key = groupKey(normalizedGroupId, relay || null)
-      const next = {
-        ...this.state.groupNotesByGroupKey,
-        [key]: notes
-      }
+    })
+
+    try {
+      await this.runTask('Refresh group notes', async () => {
+        const relayCandidates = relay ? uniqueRelayUrls([relay, ...this.searchableRelayUrls()]) : this.searchableRelayUrls()
+        const events = await this.feedService.fetchFeed(
+          relayCandidates,
+          {
+            kinds: [1],
+            '#h': [normalizedGroupId],
+            limit: 350
+          },
+          FEED_REFRESH_TIMEOUT_MS
+        )
+        const notes: GroupNoteRecord[] = events
+          .map((event) => ({
+            eventId: event.id,
+            groupId: normalizedGroupId,
+            relay: relay || null,
+            content: event.content || '',
+            createdAt: Number(event.created_at || 0),
+            authorPubkey: event.pubkey,
+            event
+          }))
+          .sort((left, right) => right.createdAt - left.createdAt)
+        const next = {
+          ...this.state.groupNotesByGroupKey,
+          [key]: notes
+        }
+        this.patchState({
+          groupNotesByGroupKey: next,
+          groupNotesLoadStateByGroupKey: {
+            ...this.state.groupNotesLoadStateByGroupKey,
+            [key]: notes.length > 0 ? 'ready' : 'empty'
+          }
+        })
+        await this.ensureAdminProfiles(notes.map((entry) => entry.authorPubkey))
+      }, { dedupeKey: `refresh:group-notes:${normalizedGroupId}:${relay || ''}`, retries: 0 })
+    } catch (error) {
       this.patchState({
-        groupNotesByGroupKey: next
+        groupNotesLoadStateByGroupKey: {
+          ...this.state.groupNotesLoadStateByGroupKey,
+          [key]: 'error'
+        }
       })
-      await this.ensureAdminProfiles(notes.map((entry) => entry.authorPubkey))
-    }, { dedupeKey: `refresh:group-notes:${groupId}:${relay || ''}`, retries: 0 })
+      throw error
+    }
   }
 
   async refreshGroupFiles(groupId?: string): Promise<void> {
@@ -5303,7 +5323,7 @@ export class TuiController {
       }
       this.rawFiles = files.map((file) => ({ ...file }))
       if (groupId) {
-        const key = groupKey(groupId)
+        const key = groupScopeKey(groupId)
         this.patchState({
           groupFilesByGroupKey: {
             ...this.state.groupFilesByGroupKey,

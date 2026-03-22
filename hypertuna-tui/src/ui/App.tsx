@@ -20,6 +20,7 @@ import {
 } from '../lib/constants.js'
 import { shortId } from '../lib/format.js'
 import { uniqueRelayUrls } from '../lib/nostr.js'
+import { groupScopeKey, normalizeGroupScopeRelay } from '../lib/groupScope.js'
 import {
   buildCommandSnippet,
   executeCommand,
@@ -1623,12 +1624,6 @@ function defaultDetailsAction(node: NavNodeId): string {
   return ''
 }
 
-function groupKey(groupId: string, relay?: string | null): string {
-  const normalizedGroupId = String(groupId || '').trim()
-  const normalizedRelay = relay ? relay.trim() : ''
-  return `${normalizedRelay}|${normalizedGroupId}`
-}
-
 function displayNodeId(node: NavNodeId): string {
   if (node === 'groups') return 'P2P Relays'
   if (node === 'groups:browse') return 'relays:browse'
@@ -1641,9 +1636,9 @@ function displayNodeId(node: NavNodeId): string {
 function relayForGroup(state: ControllerState, group: any): any | null {
   if (!group) return null
   const groupId = String(group.id || '').trim()
-  const groupRelay = String(group.relay || '').trim()
+  const groupRelay = normalizeGroupScopeRelay(group.relay || null)
   return state.relays.find((relay) => String(relay.publicIdentifier || '').trim() === groupId)
-    || state.relays.find((relay) => String(relay.connectionUrl || '').trim() === groupRelay)
+    || state.relays.find((relay) => normalizeGroupScopeRelay(relay.connectionUrl || null) === groupRelay)
     || null
 }
 
@@ -1666,8 +1661,7 @@ function formatCompactLocalDateTime(unixSeconds: number | null | undefined): str
 
 function joinRequestsForGroup(state: ControllerState, group: any): GroupJoinRequest[] {
   if (!group?.id) return []
-  const relay = String(group.relay || '').trim()
-  const byRelayKey = relay ? `${relay}|${group.id}` : group.id
+  const byRelayKey = groupScopeKey(group.id, group.relay || null)
   return state.groupJoinRequests[byRelayKey] || state.groupJoinRequests[group.id] || []
 }
 
@@ -1689,8 +1683,8 @@ function groupDetailsRows(group: any): string[] {
 
 function fileRowsForGroup(state: ControllerState, group: any): any[] {
   if (!group) return []
-  const directKey = groupKey(group.id, group.relay || null)
-  const fallbackKey = groupKey(group.id, null)
+  const directKey = groupScopeKey(group.id, group.relay || null)
+  const fallbackKey = groupScopeKey(group.id, null)
   return (
     state.groupFilesByGroupKey[directKey]
     || state.groupFilesByGroupKey[fallbackKey]
@@ -1699,10 +1693,21 @@ function fileRowsForGroup(state: ControllerState, group: any): any[] {
   )
 }
 
+function noteLoadStateForGroup(state: ControllerState, group: any): string {
+  if (!group) return 'idle'
+  const directKey = groupScopeKey(group.id, group.relay || null)
+  const fallbackKey = groupScopeKey(group.id, null)
+  return (
+    state.groupNotesLoadStateByGroupKey[directKey]
+    || state.groupNotesLoadStateByGroupKey[fallbackKey]
+    || 'idle'
+  )
+}
+
 function noteRowsForGroup(state: ControllerState, group: any): any[] {
   if (!group) return []
-  const directKey = groupKey(group.id, group.relay || null)
-  const fallbackKey = groupKey(group.id, null)
+  const directKey = groupScopeKey(group.id, group.relay || null)
+  const fallbackKey = groupScopeKey(group.id, null)
   return (
     state.groupNotesByGroupKey[directKey]
     || state.groupNotesByGroupKey[fallbackKey]
@@ -1908,8 +1913,13 @@ function splitBottomRows(
       return members.length ? members.map((member: unknown) => `${member}`) : ['No member list available']
     }
     if (selectedAction.startsWith('Notes')) {
+      const noteLoadState = noteLoadStateForGroup(state, group)
       const notes = noteRowsForGroup(state, group)
-      if (!notes.length) return ['No relay notes loaded']
+      if (!notes.length) {
+        if (noteLoadState === 'loading') return ['Loading relay notes…']
+        if (noteLoadState === 'error') return ['Failed to load relay notes']
+        return ['No relay notes loaded']
+      }
       return notes.map((note) => `${new Date(note.createdAt * 1000).toLocaleString()} · ${formatPubkeyDisplay(state, note.authorPubkey, 8)} · ${shortText(note.content, 120)}`)
     }
     if (selectedAction.startsWith('Files')) {
@@ -2079,8 +2089,10 @@ async function refreshNode(controller: AppController, node: NavNodeId, selectedR
       await controller.refreshGroups()
       const group = selectedRow?.data as any
       if (group?.id) {
+        const relay = relayForGroup(controller.getState(), group)
+        const relayUrl = String(relay?.connectionUrl || group.relay || '').trim() || undefined
         await Promise.all([
-          controller.refreshGroupNotes(group.id, group.relay || undefined),
+          controller.refreshGroupNotes(group.id, relayUrl),
           controller.refreshGroupFiles(group.id)
         ])
       }
@@ -2723,17 +2735,18 @@ export function App({
     if (!actionName.startsWith('Notes') && !actionName.startsWith('Files') && !actionName.startsWith('Join Requests')) {
       return
     }
-    const relay = String(group.relay || '').trim()
-    const key = `${group.id}|${relay}|${actionName}`
+    const relay = relayForGroup(state, group)
+    const relayUrl = String(relay?.connectionUrl || group.relay || '').trim()
+    const key = `${group.id}|${normalizeGroupScopeRelay(relayUrl)}|${actionName}`
     if (myGroupPaneLoadKeyRef.current === key) return
     myGroupPaneLoadKeyRef.current = key
 
     if (actionName.startsWith('Notes')) {
-      controller.refreshGroupNotes(group.id, relay || undefined).catch(() => {})
+      controller.refreshGroupNotes(group.id, relayUrl || undefined).catch(() => {})
     } else if (actionName.startsWith('Files')) {
       controller.refreshGroupFiles(group.id).catch(() => {})
     } else if (actionName.startsWith('Join Requests')) {
-      controller.refreshJoinRequests(group.id, relay || undefined).catch(() => {})
+      controller.refreshJoinRequests(group.id, relayUrl || undefined).catch(() => {})
     }
   }, [state, selectedNode, selectedCenterRow, selectedRightTopAction])
 
@@ -3083,6 +3096,7 @@ export function App({
         })
       }
       if (selectedRightTopAction.startsWith('Notes')) {
+        const noteLoadState = noteLoadStateForGroup(state, group)
         const notes = noteRowsForGroup(state, group)
         return buildSegmentedTableRows({
           width: rightBottomWrapWidth,
@@ -3098,7 +3112,12 @@ export function App({
             note: shortText(note.content, 160)
           })),
           showHeader: true,
-          noItemsLabel: 'No relay notes loaded'
+          noItemsLabel:
+            noteLoadState === 'loading'
+              ? 'Loading relay notes…'
+              : noteLoadState === 'error'
+                ? 'Failed to load relay notes'
+                : 'No relay notes loaded'
         })
       }
       if (selectedRightTopAction.startsWith('Files')) {

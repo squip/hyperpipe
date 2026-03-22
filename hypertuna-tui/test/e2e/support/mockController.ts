@@ -36,6 +36,7 @@ import type {
   ThreadMessage
 } from '../../../src/domain/types.js'
 import { DEFAULT_DISCOVERY_RELAYS, FILE_FAMILY_ORDER, type NavNodeId } from '../../../src/lib/constants.js'
+import { groupScopeKey } from '../../../src/lib/groupScope.js'
 import { buildInvitesInbox } from '../../../src/domain/parity/groupFilters.js'
 import {
   selectChatPendingInviteCount,
@@ -194,10 +195,6 @@ function fileRecordKey(file: GroupFileRecord): string {
   return String(file.sha256 || file.eventId || `${file.groupId}:${file.fileName || ''}`).trim().toLowerCase()
 }
 
-function scopedGroupKey(groupId: string, relay?: string | null): string {
-  return `${String(relay || '').trim()}|${String(groupId || '').trim()}`
-}
-
 function emptyState(): ControllerState {
   return {
     initialized: false,
@@ -270,6 +267,7 @@ function emptyState(): ControllerState {
     detailPaneOffsetBySection: {},
     paneViewport: {},
     groupNotesByGroupKey: {},
+    groupNotesLoadStateByGroupKey: {},
     groupFilesByGroupKey: {},
     adminProfileByPubkey: {},
     fileActionStatus: defaultFileActionStatus(),
@@ -405,6 +403,7 @@ function cloneState(state: ControllerState): ControllerState {
     groupNotesByGroupKey: Object.fromEntries(
       Object.entries(state.groupNotesByGroupKey).map(([key, value]) => [key, value.map((entry) => ({ ...entry }))])
     ),
+    groupNotesLoadStateByGroupKey: { ...state.groupNotesLoadStateByGroupKey },
     groupFilesByGroupKey: Object.fromEntries(
       Object.entries(state.groupFilesByGroupKey).map(([key, value]) => [key, value.map((entry) => ({ ...entry }))])
     ),
@@ -480,7 +479,8 @@ export class MockController implements AppController {
       groupControls: state?.groupControls || defaultGroupControls(),
       fileControls: state?.fileControls || defaultFileControls(),
       detailPaneOffsetBySection: state?.detailPaneOffsetBySection || {},
-      composeDraft: state?.composeDraft || null
+      composeDraft: state?.composeDraft || null,
+      groupNotesLoadStateByGroupKey: state?.groupNotesLoadStateByGroupKey || {}
     }
     this.rawFeed = [...this.state.feed]
     this.rawGroups = [...(this.state.groupDiscover.length ? this.state.groupDiscover : this.state.groups)]
@@ -1146,10 +1146,14 @@ export class MockController implements AppController {
   async refreshGroupNotes(groupId: string, relay?: string): Promise<void> {
     const key = String(groupId || '').trim()
     if (!key) return
-    const scopedKey = scopedGroupKey(key, relay || null)
-    const existing = this.state.groupNotesByGroupKey[scopedKey]
-      || this.state.groupNotesByGroupKey[key]
-      || []
+    const scopedKey = groupScopeKey(key, relay || null)
+    this.patch({
+      groupNotesLoadStateByGroupKey: {
+        ...this.state.groupNotesLoadStateByGroupKey,
+        [scopedKey]: 'loading'
+      }
+    })
+    const existing = this.state.groupNotesByGroupKey[scopedKey] || []
     const notes = existing.length > 0
       ? existing
       : [{
@@ -1169,8 +1173,11 @@ export class MockController implements AppController {
     this.patch({
       groupNotesByGroupKey: {
         ...this.state.groupNotesByGroupKey,
-        [scopedKey]: notes.map((entry) => ({ ...entry })),
-        [key]: notes.map((entry) => ({ ...entry }))
+        [scopedKey]: notes.map((entry) => ({ ...entry }))
+      },
+      groupNotesLoadStateByGroupKey: {
+        ...this.state.groupNotesLoadStateByGroupKey,
+        [scopedKey]: notes.length > 0 ? 'ready' : 'empty'
       }
     })
   }
@@ -1200,12 +1207,15 @@ export class MockController implements AppController {
       authorPubkey: sessionPubkey,
       event
     }
-    const scopedKey = scopedGroupKey(groupId, relayUrl)
+    const scopedKey = groupScopeKey(groupId, relayUrl)
     this.patch({
       groupNotesByGroupKey: {
         ...this.state.groupNotesByGroupKey,
-        [scopedKey]: [record, ...(this.state.groupNotesByGroupKey[scopedKey] || [])],
-        [groupId]: [record, ...(this.state.groupNotesByGroupKey[groupId] || [])]
+        [scopedKey]: [record, ...(this.state.groupNotesByGroupKey[scopedKey] || [])]
+      },
+      groupNotesLoadStateByGroupKey: {
+        ...this.state.groupNotesLoadStateByGroupKey,
+        [scopedKey]: 'ready'
       }
     })
     return event
@@ -1903,7 +1913,7 @@ export class MockController implements AppController {
   }
 
   async refreshJoinRequests(groupId: string, relay?: string): Promise<void> {
-    const key = relay ? `${relay}|${groupId}` : groupId
+    const key = groupScopeKey(groupId, relay || null)
     const request: GroupJoinRequest = {
       id: `join-request-${hex64(`${key}:${nowMs()}`).slice(0, 10)}`,
       groupId,
@@ -1921,7 +1931,7 @@ export class MockController implements AppController {
   }
 
   async approveJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void> {
-    const key = relay ? `${relay}|${groupId}` : groupId
+    const key = groupScopeKey(groupId, relay || null)
     const next = (this.state.groupJoinRequests[key] || []).filter((row) => row.pubkey !== pubkey)
     this.patch({
       groupJoinRequests: {
@@ -1932,7 +1942,7 @@ export class MockController implements AppController {
   }
 
   async rejectJoinRequest(groupId: string, pubkey: string, relay?: string): Promise<void> {
-    const key = relay ? `${relay}|${groupId}` : groupId
+    const key = groupScopeKey(groupId, relay || null)
     const next = (this.state.groupJoinRequests[key] || []).filter((row) => row.pubkey !== pubkey)
     this.patch({
       groupJoinRequests: {
