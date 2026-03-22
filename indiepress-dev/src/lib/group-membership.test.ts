@@ -2,7 +2,8 @@ import {
   buildGroupMembershipSourcePlan,
   choosePreferredMembershipState,
   createGroupMembershipState,
-  resolveCanonicalGroupMembershipState
+  resolveCanonicalGroupMembershipState,
+  selectPreferredMembershipState
 } from '@/lib/group-membership'
 import type { Filter } from '@nostr/tools/filter'
 import type { Event } from '@nostr/tools/wasm'
@@ -309,5 +310,31 @@ describe('group membership resolver', () => {
     })
 
     expect(choosePreferredMembershipState(current, incoming)).toBe(current)
+  })
+
+  it('selects the strongest alias state when relay and fallback cache entries diverge', () => {
+    const completeFallback = createGroupMembershipState({
+      members: ['alice', 'bob', 'carol', 'dave'],
+      quality: 'complete',
+      hydrationSource: 'live-discovery',
+      selectedSnapshotSource: 'discovery',
+      selectedSnapshotCreatedAt: 500,
+      membershipEventsCount: 12,
+      updatedAt: 100
+    })
+    const incompleteRelay = createGroupMembershipState({
+      members: ['alice', 'bob'],
+      quality: 'warming',
+      hydrationSource: 'live-resolved-relay',
+      selectedSnapshotSource: 'resolved-relay',
+      selectedSnapshotCreatedAt: 450,
+      membershipEventsCount: 3,
+      updatedAt: 200
+    })
+
+    const preferred = selectPreferredMembershipState([incompleteRelay, completeFallback])
+
+    expect(preferred).toBe(completeFallback)
+    expect(preferred?.members).toEqual(['alice', 'bob', 'carol', 'dave'])
   })
 })

@@ -20,6 +20,7 @@ import {
   getPersistedGroupMembershipRelayBase,
   normalizeMembershipPubkeys,
   resolveCanonicalGroupMembershipState,
+  selectPreferredMembershipState,
   toGroupMembershipCacheKey,
   toPersistedGroupMembershipRecordKey,
   updatePersistedGroupMembershipRecord
@@ -478,6 +479,26 @@ const areSameMemberLists = (left: string[], right: string[]) => {
   return (
     normalizedLeft.length === normalizedRight.length &&
     normalizedLeft.every((value, idx) => value === normalizedRight[idx])
+  )
+}
+
+const areEquivalentMembershipStates = (
+  left: GroupMemberPreviewEntry | null | undefined,
+  right: GroupMemberPreviewEntry | null | undefined
+) => {
+  if (!left || !right) return left === right
+  return (
+    left.updatedAt === right.updatedAt &&
+    left.quality === right.quality &&
+    left.membershipStatus === right.membershipStatus &&
+    areSameMemberLists(left.members, right.members) &&
+    left.membershipEventsCount === right.membershipEventsCount &&
+    left.selectedSnapshotCreatedAt === right.selectedSnapshotCreatedAt &&
+    left.selectedSnapshotId === right.selectedSnapshotId &&
+    left.hydrationSource === right.hydrationSource &&
+    left.membershipFetchSource === right.membershipFetchSource &&
+    left.opsOverflowed === right.opsOverflowed &&
+    left.memberCount === right.memberCount
   )
 }
 
@@ -1089,25 +1110,20 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       setGroupMemberPreviewByKey((prev) => {
         if (!cacheKeys.length) return prev
+        const currentStates = cacheKeys
+          .map((cacheKey) => prev[cacheKey] || null)
+          .filter((state): state is GroupMemberPreviewEntry => !!state)
+        const preferredState = selectPreferredMembershipState([...currentStates, incomingState])
+        if (!preferredState) return prev
         const next = { ...prev }
         cacheKeys.forEach((cacheKey) => {
           const current = next[cacheKey] || null
-          const preferred = choosePreferredMembershipState(current, incomingState)
-          if (!preferred) return
-          if (
-            current &&
-            current.updatedAt === preferred.updatedAt &&
-            current.quality === preferred.quality &&
-            areSameMemberLists(current.members, preferred.members) &&
-            current.membershipEventsCount === preferred.membershipEventsCount &&
-            current.selectedSnapshotCreatedAt === preferred.selectedSnapshotCreatedAt &&
-            current.hydrationSource === preferred.hydrationSource
-          ) {
+          if (areEquivalentMembershipStates(current, preferredState)) {
             resolvedState = current
             return
           }
-          next[cacheKey] = preferred
-          resolvedState = preferred
+          next[cacheKey] = preferredState
+          resolvedState = preferredState
           changed = true
         })
         return changed ? next : prev
@@ -2479,13 +2495,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     (groupId: string, relay?: string) => {
       const normalizedGroupId = String(groupId || '').trim()
       if (!normalizedGroupId) return null
-      const relayKey = relay ? toGroupMemberPreviewKey(normalizedGroupId, relay) : null
-      const fallbackKey = toGroupMemberPreviewKey(normalizedGroupId)
-      const fromRelay = relayKey ? groupMemberPreviewByKey[relayKey] : null
-      const fromFallback = groupMemberPreviewByKey[fallbackKey]
-      return fromRelay || fromFallback || null
+      const cacheKeys = getGroupMembershipCacheKeys(normalizedGroupId, relay)
+      return selectPreferredMembershipState(
+        cacheKeys.map((cacheKey) => groupMemberPreviewByKey[cacheKey] || null)
+      )
     },
-    [groupMemberPreviewByKey]
+    [getGroupMembershipCacheKeys, groupMemberPreviewByKey]
   )
 
   const invalidateGroupMemberPreview = useCallback(

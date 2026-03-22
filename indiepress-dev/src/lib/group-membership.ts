@@ -380,6 +380,26 @@ export const choosePreferredMembershipState = (
   return incomingState.updatedAt >= currentState.updatedAt ? incomingState : currentState
 }
 
+export const selectPreferredMembershipState = (
+  candidates: Array<TGroupMembershipState | null | undefined>
+) => {
+  const orderedCandidates = candidates
+    .filter((candidate): candidate is TGroupMembershipState => !!candidate)
+    .sort((left, right) => {
+      const updatedAtDiff = (left.updatedAt || 0) - (right.updatedAt || 0)
+      if (updatedAtDiff !== 0) return updatedAtDiff
+      const snapshotDiff =
+        (left.selectedSnapshotCreatedAt || 0) - (right.selectedSnapshotCreatedAt || 0)
+      if (snapshotDiff !== 0) return snapshotDiff
+      return left.memberCount - right.memberCount
+    })
+
+  return orderedCandidates.reduce<TGroupMembershipState | null>(
+    (best, candidate) => choosePreferredMembershipState(best, candidate),
+    null
+  )
+}
+
 const fetchLatestSnapshotForSource = async (
   fetchEvents: ResolveCanonicalGroupMembershipStateArgs['fetchEvents'],
   groupId: string,
