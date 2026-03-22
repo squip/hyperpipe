@@ -44,6 +44,93 @@ export type TGroupGatewayAccess = {
 
 export type TGroupMembershipStatus = 'member' | 'not-member' | 'removed' | 'pending'
 
+export type TGroupMembershipQuality = 'complete' | 'warming' | 'partial'
+
+export type TGroupMembershipHydrationSource =
+  | 'live-resolved-relay'
+  | 'live-discovery'
+  | 'live-op-reconstruction'
+  | 'persisted-last-complete'
+  | 'persisted-last-known'
+  | 'optimistic'
+  | 'unknown'
+
+export type TGroupMembershipSnapshotSource =
+  | 'resolved-relay'
+  | 'discovery'
+  | 'op-only'
+  | 'persisted-last-complete'
+  | 'persisted-last-known'
+  | 'optimistic'
+  | 'unknown'
+
+export type TGroupMembershipFetchSource =
+  | 'group-relay'
+  | 'fallback-discovery'
+  | 'group-relay-empty'
+  | 'persisted-last-complete'
+  | 'persisted-last-known'
+  | 'optimistic'
+
+export type TGroupMembershipState = {
+  members: string[]
+  memberCount: number
+  membershipStatus: TGroupMembershipStatus
+  quality: TGroupMembershipQuality
+  hydrationSource: TGroupMembershipHydrationSource
+  updatedAt: number
+  selectedSnapshotId: string | null
+  selectedSnapshotCreatedAt: number | null
+  selectedSnapshotSource: TGroupMembershipSnapshotSource | null
+  sourcesUsed: TGroupMembershipSnapshotSource[]
+  relayReadyForReq: boolean
+  relayWritable: boolean
+  opsOverflowed: boolean
+  authoritative: boolean
+  source: TGroupMembershipSnapshotSource
+  membershipAuthoritative: boolean
+  membershipEventsCount: number
+  membersFromEventCount: number
+  membersSnapshotCreatedAt: number | null
+  membershipFetchTimedOutLike: boolean
+  membershipFetchSource: TGroupMembershipFetchSource
+}
+
+export type TPersistedGroupMembershipSnapshot = Pick<
+  TGroupMembershipState,
+  | 'members'
+  | 'memberCount'
+  | 'membershipStatus'
+  | 'quality'
+  | 'hydrationSource'
+  | 'updatedAt'
+  | 'selectedSnapshotId'
+  | 'selectedSnapshotCreatedAt'
+  | 'selectedSnapshotSource'
+  | 'sourcesUsed'
+  | 'relayReadyForReq'
+  | 'relayWritable'
+  | 'opsOverflowed'
+  | 'authoritative'
+  | 'source'
+  | 'membershipAuthoritative'
+  | 'membershipEventsCount'
+  | 'membersFromEventCount'
+  | 'membersSnapshotCreatedAt'
+  | 'membershipFetchTimedOutLike'
+  | 'membershipFetchSource'
+>
+
+export type TPersistedGroupMembershipRecord = {
+  key: string
+  accountPubkey: string
+  groupId: string
+  relayBase: string
+  lastKnown: TPersistedGroupMembershipSnapshot | null
+  lastComplete: TPersistedGroupMembershipSnapshot | null
+  persistedAt: number
+}
+
 export type TGroupMemberSnapshot = {
   pubkeys: string[]
   event: Event

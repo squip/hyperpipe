@@ -1,4 +1,5 @@
 import type { TGroupInvite } from '@/types/groups'
+import type { TGroupGatewayAccess } from '@/types/groups'
 
 type ClosedJoinSimulatorDeps = {
   groupId: string
@@ -15,6 +16,7 @@ type ClosedJoinSimulatorDeps = {
       token?: string
       relayKey?: string | null
       relayUrl?: string | null
+      gatewayAccess?: TGroupGatewayAccess | null
       blindPeer?: {
         publicKey?: string | null
         encryptionKey?: string | null

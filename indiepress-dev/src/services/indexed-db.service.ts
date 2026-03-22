@@ -1,4 +1,7 @@
 import { TRelayInfo } from '@/types'
+import {
+  TPersistedGroupMembershipRecord
+} from '@/types/groups'
 import { NostrUser } from '@nostr/gadgets/metadata'
 
 type TValue<T = any> = {
@@ -8,7 +11,8 @@ type TValue<T = any> = {
 }
 
 const StoreNames = {
-  RELAY_INFOS: 'relayInfos'
+  RELAY_INFOS: 'relayInfos',
+  GROUP_MEMBERSHIP_CACHE: 'groupMembershipCache'
 }
 
 class IndexedDbService {
@@ -27,7 +31,7 @@ class IndexedDbService {
   init(): Promise<void> {
     if (!this.initPromise) {
       this.initPromise = new Promise((resolve, reject) => {
-        const request = window.indexedDB.open('fevela', 9)
+        const request = window.indexedDB.open('fevela', 10)
 
         request.onerror = (event) => {
           reject(event)
@@ -42,6 +46,20 @@ class IndexedDbService {
           const db = request.result
           if (!db.objectStoreNames.contains(StoreNames.RELAY_INFOS)) {
             db.createObjectStore(StoreNames.RELAY_INFOS, { keyPath: 'key' })
+          }
+          if (!db.objectStoreNames.contains(StoreNames.GROUP_MEMBERSHIP_CACHE)) {
+            const store = db.createObjectStore(StoreNames.GROUP_MEMBERSHIP_CACHE, {
+              keyPath: 'key'
+            })
+            store.createIndex('accountPubkey', 'accountPubkey', { unique: false })
+          } else {
+            const transaction = request.transaction
+            if (transaction) {
+              const store = transaction.objectStore(StoreNames.GROUP_MEMBERSHIP_CACHE)
+              if (!store.indexNames.contains('accountPubkey')) {
+                store.createIndex('accountPubkey', 'accountPubkey', { unique: false })
+              }
+            }
           }
           this.db = db
         }
@@ -147,6 +165,132 @@ class IndexedDbService {
     })
   }
 
+  async getAllGroupMembershipCache(
+    accountPubkey: string
+  ): Promise<TPersistedGroupMembershipRecord[]> {
+    await this.initPromise
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        return reject('database not initialized')
+      }
+      const transaction = this.db.transaction(StoreNames.GROUP_MEMBERSHIP_CACHE, 'readonly')
+      const store = transaction.objectStore(StoreNames.GROUP_MEMBERSHIP_CACHE)
+      const index = store.index('accountPubkey')
+      const request = index.getAll(String(accountPubkey || '').trim())
+
+      request.onsuccess = () => {
+        transaction.commit()
+        resolve((request.result || []) as TPersistedGroupMembershipRecord[])
+      }
+
+      request.onerror = (event) => {
+        transaction.commit()
+        reject(event)
+      }
+    })
+  }
+
+  async getGroupMembershipCache(
+    accountPubkey: string,
+    groupId: string,
+    relayBase?: string | null
+  ): Promise<TPersistedGroupMembershipRecord | null> {
+    await this.initPromise
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        return reject('database not initialized')
+      }
+      const transaction = this.db.transaction(StoreNames.GROUP_MEMBERSHIP_CACHE, 'readonly')
+      const store = transaction.objectStore(StoreNames.GROUP_MEMBERSHIP_CACHE)
+      const key = `${String(accountPubkey || '').trim()}|${String(relayBase || '').trim()}|${String(groupId || '').trim()}`
+      const request = store.get(key)
+
+      request.onsuccess = () => {
+        transaction.commit()
+        resolve((request.result as TPersistedGroupMembershipRecord) || null)
+      }
+
+      request.onerror = (event) => {
+        transaction.commit()
+        reject(event)
+      }
+    })
+  }
+
+  async putGroupMembershipCache(record: TPersistedGroupMembershipRecord): Promise<void> {
+    await this.initPromise
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        return reject('database not initialized')
+      }
+      const transaction = this.db.transaction(StoreNames.GROUP_MEMBERSHIP_CACHE, 'readwrite')
+      const store = transaction.objectStore(StoreNames.GROUP_MEMBERSHIP_CACHE)
+      const putRequest = store.put({
+        ...record,
+        persistedAt: Date.now()
+      } as TPersistedGroupMembershipRecord)
+
+      putRequest.onsuccess = () => {
+        transaction.commit()
+        resolve()
+      }
+
+      putRequest.onerror = (event) => {
+        transaction.commit()
+        reject(event)
+      }
+    })
+  }
+
+  async deleteGroupMembershipCache(
+    accountPubkey: string,
+    groupId: string,
+    relayBase?: string | null
+  ): Promise<void> {
+    await this.initPromise
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        return reject('database not initialized')
+      }
+      const transaction = this.db.transaction(StoreNames.GROUP_MEMBERSHIP_CACHE, 'readwrite')
+      const store = transaction.objectStore(StoreNames.GROUP_MEMBERSHIP_CACHE)
+
+      if (relayBase) {
+        const key = `${String(accountPubkey || '').trim()}|${String(relayBase || '').trim()}|${String(groupId || '').trim()}`
+        const request = store.delete(key)
+        request.onsuccess = () => {
+          transaction.commit()
+          resolve()
+        }
+        request.onerror = (event) => {
+          transaction.commit()
+          reject(event)
+        }
+        return
+      }
+
+      const index = store.index('accountPubkey')
+      const request = index.openCursor(IDBKeyRange.only(String(accountPubkey || '').trim()))
+      request.onsuccess = (event) => {
+        const cursor = (event.target as IDBRequest<IDBCursorWithValue | null>).result
+        if (!cursor) {
+          transaction.commit()
+          resolve()
+          return
+        }
+        const value = cursor.value as TPersistedGroupMembershipRecord
+        if (String(value.groupId || '').trim() === String(groupId || '').trim()) {
+          cursor.delete()
+        }
+        cursor.continue()
+      }
+      request.onerror = (event) => {
+        transaction.commit()
+        reject(event)
+      }
+    })
+  }
+
   private formatValue<T>(key: string, value: T): TValue<T> {
     return {
       key,
@@ -164,7 +308,13 @@ class IndexedDbService {
     const stores = [
       {
         name: StoreNames.RELAY_INFOS,
-        expirationTimestamp: Date.now() - 1000 * 60 * 60 * 24 // 1 days
+        expirationTimestamp: Date.now() - 1000 * 60 * 60 * 24, // 1 day
+        getTimestamp: (value: TValue) => value.addedAt
+      },
+      {
+        name: StoreNames.GROUP_MEMBERSHIP_CACHE,
+        expirationTimestamp: Date.now() - 1000 * 60 * 60 * 24 * 30, // 30 days
+        getTimestamp: (value: TPersistedGroupMembershipRecord) => value.persistedAt
       }
     ]
     const transaction = this.db!.transaction(
@@ -172,7 +322,7 @@ class IndexedDbService {
       'readwrite'
     )
     await Promise.allSettled(
-      stores.map(({ name, expirationTimestamp }) => {
+      stores.map(({ name, expirationTimestamp, getTimestamp }) => {
         if (expirationTimestamp < 0) {
           return Promise.resolve()
         }
@@ -182,8 +332,9 @@ class IndexedDbService {
           request.onsuccess = (event) => {
             const cursor = (event.target as IDBRequest).result
             if (cursor) {
-              const value: TValue = cursor.value
-              if (value.addedAt < expirationTimestamp) {
+              const value = cursor.value
+              const timestamp = Number(getTimestamp(value))
+              if (Number.isFinite(timestamp) && timestamp < expirationTimestamp) {
                 cursor.delete()
               }
               cursor.continue()

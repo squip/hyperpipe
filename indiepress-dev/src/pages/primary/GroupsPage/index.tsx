@@ -479,11 +479,9 @@ const GroupsPage = forwardRef<
     ({ groupId, relay, fallbackMembers = [] }: { groupId: string; relay?: string; fallbackMembers?: string[] }) => {
       const preview = getGroupMemberPreview(groupId, relay)
       if (preview?.members?.length) return preview.members
-      const detailEntry = groupDetailCache[makeGroupKey(groupId, relay)]
-      if (detailEntry?.members?.length) return detailEntry.members
       return fallbackMembers
     },
-    [getGroupMemberPreview, groupDetailCache]
+    [getGroupMemberPreview]
   )
 
   const resolveRowAdmin = useCallback(

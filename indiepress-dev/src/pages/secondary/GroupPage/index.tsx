@@ -418,6 +418,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     fetchGroupDetail,
     getProvisionalGroupMetadata,
     getGroupMemberPreview,
+    hydrateGroupMemberPreview,
     sendJoinRequest,
     leaveGroup,
     invites,
@@ -648,6 +649,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     setGroupRelay(parsed.relay ?? relay ?? searchRelay)
     setGroupId(parsed.groupId || id)
   }, [id, relay])
+
+  useEffect(() => {
+    if (!groupId) return
+    hydrateGroupMemberPreview(groupId, effectiveGroupRelay).catch(() => {})
+  }, [effectiveGroupRelay, groupId, hydrateGroupMemberPreview])
 
   useEffect(() => {
     if (!groupId) return
@@ -1619,13 +1625,20 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     () => (groupId ? getGroupMemberPreview(groupId, effectiveGroupRelay) : null),
     [effectiveGroupRelay, getGroupMemberPreview, groupId]
   )
-  const summaryMembers = useMemo(() => {
+  const canonicalMembers = useMemo(() => {
+    const previewMembers = normalizePubkeyList(groupMemberPreview?.members || [])
+    if (previewMembers.length > 0) return previewMembers
     const detailMembers = normalizePubkeyList(effectiveDetail?.members || [])
     if (detailMembers.length > 0) return detailMembers
-    const inviteMembers = normalizePubkeyList(inviteData?.authorizedMemberPubkeys || [])
-    if (inviteMembers.length > 0) return inviteMembers
-    return normalizePubkeyList(groupMemberPreview?.members || [])
-  }, [effectiveDetail?.members, groupMemberPreview?.members, inviteData?.authorizedMemberPubkeys])
+    if (isInMyGroups) return detailMembers
+    return normalizePubkeyList(inviteData?.authorizedMemberPubkeys || [])
+  }, [
+    effectiveDetail?.members,
+    groupMemberPreview?.members,
+    inviteData?.authorizedMemberPubkeys,
+    isInMyGroups
+  ])
+  const summaryMembers = canonicalMembers
   const summaryFacepileMembers = summaryMembers.slice(0, 5)
 
   const adminPubkeys = useMemo(
@@ -1779,7 +1792,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
 
   const filteredMembers = useMemo(() => {
     const term = memberSearch.trim().toLowerCase()
-    const members = effectiveDetail?.members || []
+    const members = canonicalMembers
     if (!term) return members
     return members.filter((m) => {
       const normalized = m.toLowerCase()
@@ -1791,7 +1804,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       }
       return normalized.includes(term) || (npub ? npub.toLowerCase().includes(term) : false)
     })
-  }, [effectiveDetail?.members, memberSearch])
+  }, [canonicalMembers, memberSearch])
 
   const canInviteMembers = isOpenGroup || isAdmin
 
@@ -1822,7 +1835,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         name: effectiveDetail?.metadata?.name,
         about: effectiveDetail?.metadata?.about,
         picture: effectiveDetail?.metadata?.picture,
-        authorizedMemberPubkeys: effectiveDetail?.members || []
+        authorizedMemberPubkeys: canonicalMembers
       })
       toast.success(t('Invites sent'))
       setSelectedInvitees([])
@@ -2210,7 +2223,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                     className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none px-4 py-3"
                   >
                     {t('Members')}
-                    {effectiveDetail.members ? ` (${effectiveDetail.members.length})` : ''}
+                    {canonicalMembers.length ? ` (${canonicalMembers.length})` : ''}
                   </TabsTrigger>
                   <TabsTrigger
                     value="files"
