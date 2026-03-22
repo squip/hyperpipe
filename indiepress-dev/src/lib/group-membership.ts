@@ -38,6 +38,8 @@ export type ResolveCanonicalGroupMembershipStateArgs = {
   fetchEvents: (relayUrls: string[], filter: Filter) => Promise<Event[]>
   fetchJoinRequests?: () => Promise<Event[]>
   currentPubkey?: string | null
+  isCreator?: boolean
+  protectedState?: TGroupMembershipState | null
   expectCurrentPubkeyMember?: boolean
   relayReadyForReq?: boolean
   relayWritable?: boolean
@@ -52,11 +54,28 @@ export type ResolvedCanonicalGroupMembershipState = {
   selectedSnapshotEvent: Event | null
   membershipEvents: Event[]
   joinRequestEvents: Event[]
+  selectionDebug: {
+    usedProtectedState: boolean
+    skippedSuspiciousCandidateIds: string[]
+    protectedStateSnapshotId: string | null
+    candidates: Array<{
+      id: string | null
+      createdAt: number | null
+      source: TGroupMembershipSnapshotSource
+      authorPubkey: string | null
+      memberCount: number
+      authorityEligible: boolean
+      suspiciousCreatorSelfOnly: boolean
+      selected: boolean
+      skippedReason: string | null
+    }>
+  }
 }
 
 const MEMBERSHIP_FETCH_TIMEOUT_LIKE_MS = 9000
 const DEFAULT_OPS_PAGE_SIZE = 200
 const DEFAULT_OPS_MAX_PER_SOURCE = 2000
+const DEFAULT_SNAPSHOT_PAGE_SIZE = 10
 export const DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE = '__discovery__'
 
 const QUALITY_RANK: Record<TGroupMembershipQuality, number> = {
@@ -400,7 +419,78 @@ export const selectPreferredMembershipState = (
   )
 }
 
-const fetchLatestSnapshotForSource = async (
+export const isSuspiciousCreatorSelfMembershipDowngrade = (args: {
+  currentState?: TGroupMembershipState | null
+  incomingState?: TGroupMembershipState | null
+  currentPubkey?: string | null
+  isCreator?: boolean
+}) => {
+  const currentState = args.currentState || null
+  const incomingState = args.incomingState || null
+  const currentPubkey = String(args.currentPubkey || '').trim()
+  if (!args.isCreator || !currentState || !incomingState || !currentPubkey) return false
+  if (currentState.memberCount <= 1) return false
+  if (incomingState.memberCount !== 1) return false
+  if (!currentState.members.includes(currentPubkey)) return false
+  if (incomingState.members[0] !== currentPubkey) return false
+  const incomingFromResolvedRelay =
+    incomingState.selectedSnapshotSource === 'resolved-relay' ||
+    incomingState.membershipFetchSource === 'group-relay'
+  if (!incomingFromResolvedRelay) return false
+  if (incomingState.membershipEventsCount > 0) return false
+  if (
+    incomingState.membersFromEventCount > 0 &&
+    incomingState.membersFromEventCount !== incomingState.memberCount
+  ) {
+    return false
+  }
+  return currentState.memberCount > incomingState.memberCount
+}
+
+type SnapshotCandidate = {
+  source: GroupMembershipLiveSourceConfig
+  event: Event
+  members: string[]
+}
+
+const isSuspiciousCreatorSelfOnlySnapshotCandidate = (args: {
+  candidate?: SnapshotCandidate | null
+  currentPubkey?: string | null
+  isCreator?: boolean
+}) => {
+  const candidate = args.candidate || null
+  const currentPubkey = String(args.currentPubkey || '').trim()
+  if (!args.isCreator || !candidate || !currentPubkey) return false
+  if (candidate.source.key !== 'resolved-relay') return false
+  if (!candidate.source.snapshotAuthorityEligible) return false
+  if (String(candidate.event.pubkey || '').trim() !== currentPubkey) return false
+  return candidate.members.length === 1 && candidate.members[0] === currentPubkey
+}
+
+const hasProtectiveMembershipBaseline = (args: {
+  candidates: SnapshotCandidate[]
+  currentPubkey?: string | null
+  protectedState?: TGroupMembershipState | null
+  skipCandidate?: SnapshotCandidate | null
+}) => {
+  const currentPubkey = String(args.currentPubkey || '').trim()
+  const hasCandidateBaseline = args.candidates.some((candidate) => {
+    if (!candidate || candidate === args.skipCandidate) return false
+    if (candidate.members.length <= 1) return false
+    if (currentPubkey && !candidate.members.includes(currentPubkey)) return false
+    return true
+  })
+  if (hasCandidateBaseline) return true
+
+  const protectedState = args.protectedState || null
+  if (!protectedState) return false
+  if (protectedState.quality !== 'complete') return false
+  if (protectedState.memberCount <= 1) return false
+  if (currentPubkey && !protectedState.members.includes(currentPubkey)) return false
+  return true
+}
+
+const fetchSnapshotCandidatesForSource = async (
   fetchEvents: ResolveCanonicalGroupMembershipStateArgs['fetchEvents'],
   groupId: string,
   source: GroupMembershipLiveSourceConfig
@@ -408,18 +498,15 @@ const fetchLatestSnapshotForSource = async (
   if (!source.allowSnapshots || !source.relayUrls.length) return null
 
   const [dTagged, hTagged] = await Promise.all([
-    fetchEvents(source.relayUrls, { kinds: [39002], '#d': [groupId], limit: 10 }),
-    fetchEvents(source.relayUrls, { kinds: [39002], '#h': [groupId], limit: 10 })
+    fetchEvents(source.relayUrls, { kinds: [39002], '#d': [groupId], limit: DEFAULT_SNAPSHOT_PAGE_SIZE }),
+    fetchEvents(source.relayUrls, { kinds: [39002], '#h': [groupId], limit: DEFAULT_SNAPSHOT_PAGE_SIZE })
   ])
 
-  const latest =
-    dedupeEventsById([...dTagged, ...hTagged]).sort((left, right) => {
+  return dedupeEventsById([...dTagged, ...hTagged]).sort((left, right) => {
       const createdAtDiff = (right.created_at || 0) - (left.created_at || 0)
       if (createdAtDiff !== 0) return createdAtDiff
       return String(right.id || '').localeCompare(String(left.id || ''))
-    })[0] || null
-
-  return latest
+    })
 }
 
 const fetchMembershipOpsForSource = async (
@@ -505,6 +592,8 @@ export const resolveCanonicalGroupMembershipState = async ({
   fetchEvents,
   fetchJoinRequests,
   currentPubkey,
+  isCreator,
+  protectedState,
   expectCurrentPubkeyMember,
   relayReadyForReq,
   relayWritable,
@@ -529,13 +618,19 @@ export const resolveCanonicalGroupMembershipState = async ({
 
   const snapshotResults = await Promise.all(
     normalizedSources.map(async (source) => {
-      const event = await fetchLatestSnapshotForSource(fetchEvents, groupId, source).catch(() => null)
-      return { source, event }
+      const events = await fetchSnapshotCandidatesForSource(fetchEvents, groupId, source).catch(() => [])
+      return { source, events: Array.isArray(events) ? events : [] }
     })
   )
 
   const sortedSnapshotCandidates = snapshotResults
-    .filter((result): result is { source: GroupMembershipLiveSourceConfig; event: Event } => !!result.event)
+    .flatMap((result) =>
+      result.events.map((event) => ({
+        source: result.source,
+        event,
+        members: normalizeMembershipPubkeys(parseGroupMembersEvent(event))
+      }))
+    )
     .sort((left, right) => {
       const createdAtDiff = (right.event.created_at || 0) - (left.event.created_at || 0)
       if (createdAtDiff !== 0) return createdAtDiff
@@ -548,9 +643,81 @@ export const resolveCanonicalGroupMembershipState = async ({
       return String(right.event.id || '').localeCompare(String(left.event.id || ''))
     })
 
-  const authoritativeSnapshotCandidate =
-    sortedSnapshotCandidates.find((candidate) => candidate.source.snapshotAuthorityEligible) || null
-  const selectedSnapshotCandidate = authoritativeSnapshotCandidate || sortedSnapshotCandidates[0] || null
+  const skippedSuspiciousCandidateIds: string[] = []
+  const selectionDiagnostics = sortedSnapshotCandidates.map((candidate) => {
+    const suspiciousCreatorSelfOnly = isSuspiciousCreatorSelfOnlySnapshotCandidate({
+      candidate,
+      currentPubkey,
+      isCreator
+    })
+    const hasProtection = suspiciousCreatorSelfOnly
+      ? hasProtectiveMembershipBaseline({
+          candidates: sortedSnapshotCandidates,
+          currentPubkey,
+          protectedState,
+          skipCandidate: candidate
+        })
+      : false
+    return {
+      candidate,
+      suspiciousCreatorSelfOnly,
+      skippedReason: suspiciousCreatorSelfOnly && hasProtection ? 'creator-self-only-poisoned-snapshot' : null
+    }
+  })
+
+  const viableSelectionDiagnostics = selectionDiagnostics.filter((entry) => {
+    if (entry.skippedReason) {
+      if (entry.candidate.event.id) {
+        skippedSuspiciousCandidateIds.push(entry.candidate.event.id)
+      }
+      return false
+    }
+    return true
+  })
+
+  let selectedSnapshotCandidate =
+    viableSelectionDiagnostics.find((entry) => entry.candidate.source.snapshotAuthorityEligible)?.candidate ||
+    viableSelectionDiagnostics[0]?.candidate ||
+    null
+
+  const usedProtectedState =
+    !selectedSnapshotCandidate &&
+    hasProtectiveMembershipBaseline({
+      candidates: sortedSnapshotCandidates,
+      currentPubkey,
+      protectedState
+    })
+
+  if (usedProtectedState && protectedState) {
+    const state = createGroupMembershipState({
+      ...protectedState,
+      updatedAt: Date.now(),
+      membershipFetchTimedOutLike: Date.now() - startedAt >= MEMBERSHIP_FETCH_TIMEOUT_LIKE_MS
+    })
+
+    return {
+      state,
+      selectedSnapshotEvent: null,
+      membershipEvents: [],
+      joinRequestEvents: [],
+      selectionDebug: {
+        usedProtectedState: true,
+        skippedSuspiciousCandidateIds,
+        protectedStateSnapshotId: protectedState.selectedSnapshotId || null,
+        candidates: selectionDiagnostics.map((entry) => ({
+          id: entry.candidate.event.id || null,
+          createdAt: entry.candidate.event.created_at ?? null,
+          source: sourceToSnapshotSource(entry.candidate.source.key),
+          authorPubkey: String(entry.candidate.event.pubkey || '').trim() || null,
+          memberCount: entry.candidate.members.length,
+          authorityEligible: entry.candidate.source.snapshotAuthorityEligible,
+          suspiciousCreatorSelfOnly: entry.suspiciousCreatorSelfOnly,
+          selected: false,
+          skippedReason: entry.skippedReason
+        }))
+      }
+    }
+  }
   const selectedSnapshotEvent = selectedSnapshotCandidate?.event || null
 
   const opsResults = await Promise.all(
@@ -657,6 +824,22 @@ export const resolveCanonicalGroupMembershipState = async ({
     state,
     selectedSnapshotEvent,
     membershipEvents: effectiveMembershipEvents,
-    joinRequestEvents
+    joinRequestEvents,
+    selectionDebug: {
+      usedProtectedState: false,
+      skippedSuspiciousCandidateIds,
+      protectedStateSnapshotId: protectedState?.selectedSnapshotId || null,
+      candidates: selectionDiagnostics.map((entry) => ({
+        id: entry.candidate.event.id || null,
+        createdAt: entry.candidate.event.created_at ?? null,
+        source: sourceToSnapshotSource(entry.candidate.source.key),
+        authorPubkey: String(entry.candidate.event.pubkey || '').trim() || null,
+        memberCount: entry.candidate.members.length,
+        authorityEligible: entry.candidate.source.snapshotAuthorityEligible,
+        suspiciousCreatorSelfOnly: entry.suspiciousCreatorSelfOnly,
+        selected: entry.candidate === selectedSnapshotCandidate,
+        skippedReason: entry.skippedReason
+      }))
+    }
   }
 }

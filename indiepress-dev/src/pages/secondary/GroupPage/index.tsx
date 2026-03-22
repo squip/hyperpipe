@@ -385,6 +385,35 @@ const areComparablePubkeysEqual = (left: string[], right: string[]) => {
   return left.every((value, index) => value === right[index])
 }
 
+const isSuspiciousAdminOnlySelfDetailDowngrade = (args: {
+  prevMembers: string[]
+  nextMembers: string[]
+  prevAdmins: string[]
+  nextAdmins: string[]
+  prevMetadataPubkey?: string | null
+  nextMetadataPubkey?: string | null
+  pubkey?: string | null
+  membershipAuthoritative?: boolean
+  membershipFetchSource?: string | null
+  membershipEventsCount?: number
+}) => {
+  const pubkey = String(args.pubkey || '').trim()
+  if (!pubkey) return false
+  if (!args.membershipAuthoritative) return false
+  if (args.membershipFetchSource !== 'group-relay') return false
+  if (Number(args.membershipEventsCount || 0) > 0) return false
+  if (args.prevMembers.length <= 1) return false
+  if (args.nextMembers.length !== 1 || args.nextMembers[0] !== pubkey) return false
+
+  const isCreatorOrAdmin =
+    args.nextAdmins.includes(pubkey) ||
+    args.prevAdmins.includes(pubkey) ||
+    String(args.nextMetadataPubkey || '').trim() === pubkey ||
+    String(args.prevMetadataPubkey || '').trim() === pubkey
+
+  return isCreatorOrAdmin
+}
+
 const CLOSED_GROUP_JOIN_PENDING_STORAGE_PREFIX = 'hypertuna_group_closed_join_pending_v1'
 
 const normalizePubkeyList = (values: Array<string | null | undefined>) => {
@@ -745,8 +774,37 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
             !next.membershipAuthoritative &&
             (next.membershipFetchTimedOutLike ||
               (nextMembers.length === 1 && pubkey ? nextMembers[0] === pubkey : false))
+          const normalizedPrevAdmins = normalizeAdmins(prev?.admins)
+          const normalizedNextAdmins = normalizeAdmins(next.admins)
+          const shouldBlockSuspiciousAdminDowngrade =
+            isSameGroup &&
+            isSuspiciousAdminOnlySelfDetailDowngrade({
+              prevMembers: normalizedPrevMembers,
+              nextMembers,
+              prevAdmins: normalizedPrevAdmins,
+              nextAdmins: normalizedNextAdmins,
+              prevMetadataPubkey: prevMetadata?.event?.pubkey,
+              nextMetadataPubkey: next.metadata?.event?.pubkey,
+              pubkey,
+              membershipAuthoritative: next.membershipAuthoritative,
+              membershipFetchSource: next.membershipFetchSource || null,
+              membershipEventsCount: next.membershipEventsCount || 0
+            })
           if (shouldBlockMembershipDowngrade) {
             next.members = normalizedPrevMembers
+            if (prev?.membershipStatus) {
+              next.membershipStatus = prev.membershipStatus
+            }
+          }
+          if (shouldBlockSuspiciousAdminDowngrade) {
+            console.warn('[GroupPage] Preserving previous member list over suspicious admin self-only relay snapshot', {
+              groupId,
+              previousCount: normalizedPrevMembers.length,
+              incomingCount: nextMembers.length,
+              membershipFetchSource: next.membershipFetchSource || null
+            })
+            next.members = normalizedPrevMembers
+            next.membershipAuthoritative = false
             if (prev?.membershipStatus) {
               next.membershipStatus = prev.membershipStatus
             }
@@ -773,8 +831,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
 
           const prevComparableMembers = normalizeComparablePubkeys(normalizeMembers(prev?.members))
           const nextComparableMembers = normalizeComparablePubkeys(normalizeMembers(next.members))
-          const prevComparableAdmins = normalizeComparablePubkeys(normalizeAdmins(prev?.admins))
-          const nextComparableAdmins = normalizeComparablePubkeys(normalizeAdmins(next.admins))
+          const prevComparableAdmins = normalizeComparablePubkeys(normalizedPrevAdmins)
+          const nextComparableAdmins = normalizeComparablePubkeys(normalizedNextAdmins)
           const sameMembers = areComparablePubkeysEqual(
             prevComparableMembers,
             nextComparableMembers
@@ -804,7 +862,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       })
       .catch((err) => setError((err as Error).message))
       .finally(() => setIsLoading(false))
-  }, [fetchGroupDetail, groupId, effectiveGroupRelay])
+  }, [effectiveGroupRelay, fallbackMeta, fetchGroupDetail, groupId, isInMyGroups, pubkey])
 
   const groupKey = useMemo(
     () => makeGroupKey(groupId || '', effectiveGroupRelay),
@@ -1100,11 +1158,37 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
           if (!prev) return nextDetail
           const prevMembers = normalizeComparablePubkeys((prev.members || []) as string[])
           const incomingMembers = normalizeComparablePubkeys((nextDetail.members || []) as string[])
+          const prevAdmins = normalizeComparablePubkeys(
+            ((prev.admins || []).map((admin) => String(admin?.pubkey || '').trim()).filter(Boolean)) as string[]
+          )
+          const incomingAdmins = normalizeComparablePubkeys(
+            ((nextDetail.admins || []).map((admin) => String(admin?.pubkey || '').trim()).filter(Boolean)) as string[]
+          )
           const shouldKeepPrevMembers =
             prevMembers.length > 0 &&
             incomingMembers.length < prevMembers.length &&
             !nextDetail.membershipAuthoritative &&
             (nextDetail.membershipFetchTimedOutLike || incomingMembers.length === 0)
+          const shouldKeepPrevForSuspiciousAdminDowngrade = isSuspiciousAdminOnlySelfDetailDowngrade({
+            prevMembers,
+            nextMembers: incomingMembers,
+            prevAdmins,
+            nextAdmins: incomingAdmins,
+            prevMetadataPubkey: prev.metadata?.event?.pubkey,
+            nextMetadataPubkey: nextDetail.metadata?.event?.pubkey,
+            pubkey,
+            membershipAuthoritative: nextDetail.membershipAuthoritative,
+            membershipFetchSource: nextDetail.membershipFetchSource || null,
+            membershipEventsCount: nextDetail.membershipEventsCount || 0
+          })
+          if (shouldKeepPrevForSuspiciousAdminDowngrade) {
+            return {
+              ...nextDetail,
+              members: prev.members || [],
+              membershipAuthoritative: false,
+              membershipStatus: prev.membershipStatus || nextDetail.membershipStatus
+            }
+          }
           if (!shouldKeepPrevMembers) return nextDetail
           return {
             ...nextDetail,
@@ -1114,7 +1198,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         })
       })
       .catch(() => {})
-  }, [fetchGroupDetail, groupId, effectiveGroupRelay, joinFlow?.phase])
+  }, [effectiveGroupRelay, fetchGroupDetail, groupId, joinFlow?.phase, pubkey])
 
   const handleJoin = async () => {
     if (!groupId) return

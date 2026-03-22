@@ -1,5 +1,6 @@
 import {
   buildGroupMembershipSourcePlan,
+  isSuspiciousCreatorSelfMembershipDowngrade,
   choosePreferredMembershipState,
   createGroupMembershipState,
   resolveCanonicalGroupMembershipState,
@@ -193,6 +194,174 @@ describe('group membership resolver', () => {
     expect(result.state.selectedSnapshotId).toBe('resolved-snapshot')
   })
 
+  it('ignores a newer self-only resolved snapshot for creators when a fuller fallback snapshot exists', async () => {
+    const fetchEvents = buildFetchEventsMock({
+      'wss://resolved': [
+        makeEvent({
+          id: 'resolved-self-only',
+          kind: 39002,
+          createdAt: 300,
+          pubkey: 'alice',
+          tags: [
+            ['h', 'group-creator'],
+            ['d', 'group-creator'],
+            ['p', 'alice']
+          ]
+        })
+      ],
+      'wss://discovery': [
+        makeEvent({
+          id: 'discovery-full',
+          kind: 39002,
+          createdAt: 200,
+          tags: [
+            ['h', 'group-creator'],
+            ['d', 'group-creator'],
+            ['p', 'alice'],
+            ['p', 'bob'],
+            ['p', 'carol']
+          ]
+        })
+      ]
+    })
+
+    const result = await resolveCanonicalGroupMembershipState({
+      groupId: 'group-creator',
+      fetchEvents,
+      currentPubkey: 'alice',
+      isCreator: true,
+      relayReadyForReq: true,
+      sources: [
+        {
+          key: 'resolved-relay',
+          relayUrls: ['wss://resolved'],
+          snapshotAuthorityEligible: true,
+          allowSnapshots: true,
+          allowOps: true
+        },
+        {
+          key: 'discovery',
+          relayUrls: ['wss://discovery'],
+          snapshotAuthorityEligible: true,
+          allowSnapshots: true,
+          allowOps: true
+        }
+      ]
+    })
+
+    expect(result.state.members).toEqual(['alice', 'bob', 'carol'])
+    expect(result.state.selectedSnapshotId).toBe('discovery-full')
+    expect(result.state.hydrationSource).toBe('live-discovery')
+  })
+
+  it('uses an older fuller snapshot from the same resolved relay when the latest creator snapshot is self-only', async () => {
+    const fetchEvents = buildFetchEventsMock({
+      'wss://resolved': [
+        makeEvent({
+          id: 'resolved-self-only',
+          kind: 39002,
+          createdAt: 300,
+          pubkey: 'alice',
+          tags: [
+            ['h', 'group-same-relay'],
+            ['d', 'group-same-relay'],
+            ['p', 'alice']
+          ]
+        }),
+        makeEvent({
+          id: 'resolved-fuller',
+          kind: 39002,
+          createdAt: 200,
+          pubkey: 'other-author',
+          tags: [
+            ['h', 'group-same-relay'],
+            ['d', 'group-same-relay'],
+            ['p', 'alice'],
+            ['p', 'bob'],
+            ['p', 'carol'],
+            ['p', 'dave']
+          ]
+        })
+      ]
+    })
+
+    const result = await resolveCanonicalGroupMembershipState({
+      groupId: 'group-same-relay',
+      fetchEvents,
+      currentPubkey: 'alice',
+      isCreator: true,
+      relayReadyForReq: true,
+      sources: [
+        {
+          key: 'resolved-relay',
+          relayUrls: ['wss://resolved'],
+          snapshotAuthorityEligible: true,
+          allowSnapshots: true,
+          allowOps: true
+        }
+      ]
+    })
+
+    expect(result.state.members).toEqual(['alice', 'bob', 'carol', 'dave'])
+    expect(result.state.selectedSnapshotId).toBe('resolved-fuller')
+    expect(result.selectionDebug.skippedSuspiciousCandidateIds).toEqual(['resolved-self-only'])
+  })
+
+  it('preserves the protected complete state when the only live resolved snapshot is suspiciously self-only', async () => {
+    const fetchEvents = buildFetchEventsMock({
+      'wss://resolved': [
+        makeEvent({
+          id: 'resolved-self-only',
+          kind: 39002,
+          createdAt: 300,
+          pubkey: 'alice',
+          tags: [
+            ['h', 'group-protected'],
+            ['d', 'group-protected'],
+            ['p', 'alice']
+          ]
+        })
+      ]
+    })
+
+    const protectedState = createGroupMembershipState({
+      members: ['alice', 'bob', 'carol'],
+      membershipStatus: 'member',
+      quality: 'complete',
+      hydrationSource: 'persisted-last-complete',
+      selectedSnapshotId: 'persisted-complete',
+      selectedSnapshotCreatedAt: 250,
+      selectedSnapshotSource: 'persisted-last-complete',
+      source: 'persisted-last-complete',
+      membershipAuthoritative: true,
+      authoritative: true,
+      membershipFetchSource: 'persisted-last-complete'
+    })
+
+    const result = await resolveCanonicalGroupMembershipState({
+      groupId: 'group-protected',
+      fetchEvents,
+      currentPubkey: 'alice',
+      isCreator: true,
+      protectedState,
+      relayReadyForReq: true,
+      sources: [
+        {
+          key: 'resolved-relay',
+          relayUrls: ['wss://resolved'],
+          snapshotAuthorityEligible: true,
+          allowSnapshots: true,
+          allowOps: true
+        }
+      ]
+    })
+
+    expect(result.state.members).toEqual(['alice', 'bob', 'carol'])
+    expect(result.state.selectedSnapshotId).toBe('persisted-complete')
+    expect(result.selectionDebug.usedProtectedState).toBe(true)
+    expect(result.selectionDebug.skippedSuspiciousCandidateIds).toEqual(['resolved-self-only'])
+  })
+
   it('paginates membership ops beyond the old 50-event window', async () => {
     const ops = Array.from({ length: 60 }, (_, index) =>
       makeEvent({
@@ -336,5 +505,60 @@ describe('group membership resolver', () => {
 
     expect(preferred).toBe(completeFallback)
     expect(preferred?.members).toEqual(['alice', 'bob', 'carol', 'dave'])
+  })
+
+  it('flags suspicious creator self-only relay downgrades', () => {
+    const currentState = createGroupMembershipState({
+      members: ['alice', 'bob', 'carol'],
+      quality: 'complete',
+      hydrationSource: 'persisted-last-complete',
+      selectedSnapshotSource: 'persisted-last-complete',
+      membershipFetchSource: 'persisted-last-complete'
+    })
+    const incomingState = createGroupMembershipState({
+      members: ['alice'],
+      quality: 'complete',
+      hydrationSource: 'live-resolved-relay',
+      selectedSnapshotSource: 'resolved-relay',
+      membershipFetchSource: 'group-relay',
+      membershipEventsCount: 0
+    })
+
+    expect(
+      isSuspiciousCreatorSelfMembershipDowngrade({
+        currentState,
+        incomingState,
+        currentPubkey: 'alice',
+        isCreator: true
+      })
+    ).toBe(true)
+  })
+
+  it('flags suspicious creator self-only relay downgrades without depending on hydration source', () => {
+    const currentState = createGroupMembershipState({
+      members: ['alice', 'bob', 'carol'],
+      quality: 'complete',
+      hydrationSource: 'persisted-last-complete',
+      selectedSnapshotSource: 'persisted-last-complete',
+      membershipFetchSource: 'persisted-last-complete'
+    })
+    const incomingState = createGroupMembershipState({
+      members: ['alice'],
+      quality: 'warming',
+      hydrationSource: 'live-discovery',
+      selectedSnapshotSource: 'resolved-relay',
+      membershipFetchSource: 'group-relay',
+      membershipEventsCount: 0,
+      membersFromEventCount: 1
+    })
+
+    expect(
+      isSuspiciousCreatorSelfMembershipDowngrade({
+        currentState,
+        incomingState,
+        currentPubkey: 'alice',
+        isCreator: true
+      })
+    ).toBe(true)
   })
 })

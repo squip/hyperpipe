@@ -17,6 +17,7 @@ import {
   DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE,
   hydratePersistedGroupMembershipState,
   isDiscoveryPersistedGroupMembershipRelayBase,
+  isSuspiciousCreatorSelfMembershipDowngrade,
   getPersistedGroupMembershipRelayBase,
   normalizeMembershipPubkeys,
   resolveCanonicalGroupMembershipState,
@@ -74,11 +75,44 @@ import { useWorkerBridge } from './WorkerBridgeProvider'
 import type { TPublishOptions } from '@/types'
 import * as nip19 from '@nostr/tools/nip19'
 
-// Prevent repeated bootstrap publishes per group/relay when admin snapshots are missing.
-const adminRecoveryAttempts = new Set<string>()
 const DEFAULT_PUBLIC_GATEWAY_BASE = 'https://hypertuna.com'
 const INVITE_DISMISSED_STORAGE_PREFIX = 'hypertuna_group_invites_dismissed_v1'
 const INVITE_ACCEPTED_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_v1'
+
+const getSnapshotEventTaggedPubkeys = (event: Pick<TDraftEvent, 'tags'>) =>
+  normalizeMembershipPubkeys(
+    (Array.isArray(event.tags) ? event.tags : [])
+      .filter((tag) => tag[0] === 'p')
+      .map((tag) => tag[1])
+  )
+
+const getSnapshotEventAdminTaggedPubkeys = (event: Pick<TDraftEvent, 'tags'>) =>
+  normalizeMembershipPubkeys(
+    (Array.isArray(event.tags) ? event.tags : [])
+      .filter((tag) => tag[0] === 'p' && tag.slice(2).some((value) => String(value || '').trim() === 'admin'))
+      .map((tag) => tag[1])
+  )
+
+const logGroupSnapshotPublishAttempt = (args: {
+  reason: string
+  groupId: string
+  event: Pick<TDraftEvent, 'kind' | 'created_at' | 'tags'>
+  relayUrls: string[]
+}) => {
+  if (args.event.kind !== 39001 && args.event.kind !== 39002) return
+  const taggedPubkeys = getSnapshotEventTaggedPubkeys(args.event)
+  const adminTaggedPubkeys = getSnapshotEventAdminTaggedPubkeys(args.event)
+  console.info('[GroupsProvider] Publishing group snapshot event', {
+    reason: args.reason,
+    groupId: args.groupId,
+    kind: args.event.kind,
+    createdAt: args.event.created_at,
+    taggedPubkeysCount: taggedPubkeys.length,
+    adminTaggedPubkeysCount: adminTaggedPubkeys.length,
+    selfOnly: taggedPubkeys.length === 1,
+    relayTargets: args.relayUrls.length
+  })
+}
 const INVITE_ACCEPTED_GROUPS_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_groups_v1'
 const JOIN_REQUESTS_HANDLED_STORAGE_KEY = 'hypertuna_join_requests_handled_v1'
 const GROUP_MEMBER_PREVIEW_TTL_MS = 2 * 60 * 1000
@@ -995,6 +1029,22 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [resolveRelayUrl]
   )
 
+  const getCachedGroupMemberPreview = useCallback(
+    (
+      groupId: string,
+      relay: string | undefined,
+      source: Record<string, GroupMemberPreviewEntry>
+    ) => {
+      const normalizedGroupId = String(groupId || '').trim()
+      if (!normalizedGroupId) return null
+      const cacheKeys = getGroupMembershipCacheKeys(normalizedGroupId, relay)
+      return selectPreferredMembershipState(
+        cacheKeys.map((cacheKey) => source[cacheKey] || null)
+      )
+    },
+    [getGroupMembershipCacheKeys]
+  )
+
   const getGroupMembershipRelayBase = useCallback(
     (groupId: string, relay?: string, opts?: { discoveryOnly?: boolean }) => {
       const relayEntry = getRelayEntryForGroup(groupId)
@@ -1005,6 +1055,44 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       })
     },
     [getRelayEntryForGroup, resolveRelayUrl]
+  )
+
+  const getPersistedGroupMembershipBaseline = useCallback(
+    (
+      groupId: string,
+      relay: string | undefined,
+      opts?: {
+        discoveryOnly?: boolean
+      }
+    ) => {
+      if (!pubkey) return null
+      const normalizedGroupId = String(groupId || '').trim()
+      if (!normalizedGroupId) return null
+
+      const relayBases = new Set<string>([
+        getGroupMembershipRelayBase(normalizedGroupId, relay, {
+          discoveryOnly: opts?.discoveryOnly
+        })
+      ])
+      if (opts?.discoveryOnly !== true) {
+        relayBases.add(DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE)
+      }
+
+      const candidates = Array.from(relayBases)
+        .map((relayBase) => {
+          const recordKey = toPersistedGroupMembershipRecordKey(pubkey, normalizedGroupId, relayBase)
+          const record = groupMembershipPersistedRecordsRef.current[recordKey] || null
+          if (!record) return null
+          return (
+            hydratePersistedGroupMembershipState(record.lastComplete, 'persisted-last-complete') ||
+            hydratePersistedGroupMembershipState(record.lastKnown, 'persisted-last-known')
+          )
+        })
+        .filter((state): state is GroupMemberPreviewEntry => !!state)
+
+      return selectPreferredMembershipState(candidates)
+    },
+    [getGroupMembershipRelayBase, pubkey]
   )
 
   const getRelayRuntimeState = useCallback(
@@ -2054,6 +2142,29 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         normalizedGroupId,
         targetRelay || resolvedRelay || undefined
       )
+      const decodedGroupIdPubkey = (() => {
+        try {
+          if (normalizedGroupId.startsWith('npub')) {
+            const decoded = nip19.decode(normalizedGroupId)
+            if (decoded.type === 'npub') return decoded.data as string
+          }
+        } catch (_err) {
+          // ignore decode failures
+        }
+        return undefined
+      })()
+      const decodedMetadataPubkey = (() => {
+        try {
+          const dTag = provisionalMetadata?.event?.tags?.find?.((tag) => tag[0] === 'd')?.[1]
+          if (dTag?.startsWith?.('npub')) {
+            const decoded = nip19.decode(dTag)
+            if (decoded.type === 'npub') return decoded.data as string
+          }
+        } catch (_err) {
+          // ignore decode failures
+        }
+        return undefined
+      })()
       const discoveryPrivate = discoveryGroups.some((entry) => {
         if (entry.id !== normalizedGroupId) return false
         if (entry.isPublic !== false) return false
@@ -2062,20 +2173,41 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         return getBaseRelayUrl(entry.relay) === getBaseRelayUrl(targetRelay)
       })
       const knownPrivateGroup = provisionalMetadata?.isPublic === false || discoveryPrivate
+      const isCreator =
+        !!pubkey &&
+        ((!!provisionalMetadata?.event?.pubkey && provisionalMetadata.event.pubkey === pubkey) ||
+          (!!decodedGroupIdPubkey && decodedGroupIdPubkey === pubkey) ||
+          (!!decodedMetadataPubkey && decodedMetadataPubkey === pubkey))
       const canUseResolvedRelay =
         !opts?.discoveryOnly &&
         !!resolvedRelay &&
         (!relayLooksLoopback || hasActiveRelayConnection) &&
         (isInMyGroups || (!!opts?.preferRelay && relayHasAuthToken))
+      const availableDiscoveryRelays = discoveryRelays.length
+        ? discoveryRelays
+        : defaultDiscoveryRelays
 
       const sources: GroupMembershipLiveSourceConfig[] = buildGroupMembershipSourcePlan({
         discoveryOnly: opts?.discoveryOnly,
         knownPrivateGroup,
         canUseResolvedRelay,
         resolvedRelay,
-        discoveryRelays: discoveryRelays.length ? discoveryRelays : defaultDiscoveryRelays,
+        discoveryRelays: availableDiscoveryRelays,
         relayReadyForReq
       })
+      const cachedMembership = getCachedGroupMemberPreview(
+        normalizedGroupId,
+        resolvedRelay || relay,
+        groupMemberPreviewByKeyRef.current
+      )
+      const persistedMembership = getPersistedGroupMembershipBaseline(
+        normalizedGroupId,
+        resolvedRelay || relay,
+        {
+          discoveryOnly: opts?.discoveryOnly
+        }
+      )
+      const protectedState = selectPreferredMembershipState([cachedMembership, persistedMembership])
 
       const shadowLeaveEvents = knownPrivateGroup
         ? await fetchPrivateLeaveShadowEvents({
@@ -2090,11 +2222,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const joinRequestRelayUrls =
         canUseResolvedRelay && resolvedRelay
           ? [resolvedRelay]
-          : discoveryRelays.length
-            ? discoveryRelays
-            : defaultDiscoveryRelays
+          : availableDiscoveryRelays
 
-      const { state } = await resolveCanonicalGroupMembershipState({
+      const { state, selectionDebug } = await resolveCanonicalGroupMembershipState({
         groupId: normalizedGroupId,
         sources,
         fetchEvents: (relayUrls, filter) => client.fetchEvents(relayUrls, filter),
@@ -2108,6 +2238,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               })
           : undefined,
         currentPubkey: pubkey,
+        isCreator,
+        protectedState,
         expectCurrentPubkeyMember: isInMyGroups,
         relayReadyForReq,
         relayWritable,
@@ -2115,19 +2247,36 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         extraMembershipEventsSource: shadowLeaveEvents.length ? 'discovery' : undefined
       })
 
+      if (selectionDebug.usedProtectedState || selectionDebug.skippedSuspiciousCandidateIds.length) {
+        console.warn('[GroupsProvider] Quarantined suspicious relay membership snapshot', {
+          groupId: normalizedGroupId,
+          relay: resolvedRelay || relay || null,
+          isCreator,
+          protectedStateSnapshotId: selectionDebug.protectedStateSnapshotId,
+          skippedSuspiciousCandidateIds: selectionDebug.skippedSuspiciousCandidateIds,
+          chosenSnapshotId: state.selectedSnapshotId,
+          chosenSnapshotSource: state.selectedSnapshotSource,
+          chosenMemberCount: state.memberCount,
+          candidates: selectionDebug.candidates
+        })
+      }
+
       return {
         state,
         relayEntry,
         resolvedRelay,
         isInMyGroups,
         knownPrivateGroup,
-        relayHasAuthToken
+        relayHasAuthToken,
+        isCreator
       }
     },
     [
       discoveryGroups,
       discoveryRelays,
       fetchPrivateLeaveShadowEvents,
+      getCachedGroupMemberPreview,
+      getPersistedGroupMembershipBaseline,
       getProvisionalGroupMetadata,
       getRelayRuntimeState,
       myGroupList,
@@ -2150,10 +2299,40 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     ) => {
       const normalizedGroupId = String(groupId || '').trim()
       const resolved = await resolveLiveGroupMembershipState(normalizedGroupId, relay, opts)
+      const cachedMembership = getCachedGroupMemberPreview(
+        normalizedGroupId,
+        resolved.resolvedRelay || relay,
+        groupMemberPreviewByKeyRef.current
+      )
+      const persistedMembership = getPersistedGroupMembershipBaseline(
+        normalizedGroupId,
+        resolved.resolvedRelay || relay,
+        {
+          discoveryOnly: opts?.discoveryOnly
+        }
+      )
+      const protectionBaseline = selectPreferredMembershipState([cachedMembership, persistedMembership])
+      const nextVisibleState = isSuspiciousCreatorSelfMembershipDowngrade({
+        currentState: protectionBaseline,
+        incomingState: resolved.state,
+        currentPubkey: pubkey,
+        isCreator: resolved.isCreator
+      })
+        ? protectionBaseline
+        : resolved.state
+      if (nextVisibleState !== resolved.state) {
+        console.warn('[GroupsProvider] Preserving cached membership over suspicious creator self-only relay state', {
+          groupId: normalizedGroupId,
+          relay: resolved.resolvedRelay || relay || null,
+          cachedMemberCount: protectionBaseline?.memberCount || 0,
+          incomingMemberCount: resolved.state.memberCount,
+          incomingSource: resolved.state.hydrationSource
+        })
+      }
       const visibleState = applyGroupMembershipState(
         normalizedGroupId,
         resolved.resolvedRelay || relay,
-        resolved.state,
+        nextVisibleState,
         {
           persist: opts?.persist !== false,
           isJoinedGroup: resolved.isInMyGroups,
@@ -2165,10 +2344,16 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       return {
         ...resolved,
-        visibleState: visibleState || resolved.state
+        visibleState: visibleState || nextVisibleState || resolved.state
       }
     },
-    [applyGroupMembershipState, resolveLiveGroupMembershipState]
+    [
+      applyGroupMembershipState,
+      getCachedGroupMemberPreview,
+      getPersistedGroupMembershipBaseline,
+      pubkey,
+      resolveLiveGroupMembershipState
+    ]
   )
 
   const fetchGroupDetail = useCallback(
@@ -2201,13 +2386,21 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const knownPrivateGroup = provisionalMetadata?.isPublic === false || discoveryPrivate
 
       // Default: discovery only for list/facepile; if member/admin, stick to the resolved group relay only.
-      const groupRelays = preferRelay && resolved ? [resolved] : defaultDiscoveryRelays
+      const availableDiscoveryRelays = discoveryRelays.length
+        ? discoveryRelays
+        : defaultDiscoveryRelays
+      const groupRelays = preferRelay && resolved ? [resolved] : availableDiscoveryRelays
       const resolvedRelayList = resolved ? [resolved] : []
       const metadataRelays = opts?.discoveryOnly
-        ? discoveryRelays
+        ? availableDiscoveryRelays
         : (preferRelay && resolved) || (knownPrivateGroup && resolved)
           ? [resolved]
-          : Array.from(new Set([...resolvedRelayList, ...discoveryRelays]))
+          : Array.from(new Set([...resolvedRelayList, ...availableDiscoveryRelays]))
+      const adminRelays = opts?.discoveryOnly
+        ? availableDiscoveryRelays
+        : knownPrivateGroup
+          ? groupRelays
+          : Array.from(new Set([...resolvedRelayList, ...availableDiscoveryRelays]))
 
       const time = () => performance.now()
       const fetchDurations: Record<string, number> = {}
@@ -2298,7 +2491,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       const adminsPromise = (async () => {
         try {
-          return await fetchLatestByTags(groupRelays, 39001, ['d', 'h'])
+          return await fetchLatestByTags(adminRelays, 39001, ['d', 'h'])
         } catch (_e) {
           return null
         }
@@ -2392,33 +2585,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       const shouldInjectCreatorAdmin = isCreator && pubkey && admins.length === 0
       if (shouldInjectCreatorAdmin) {
-        const relayForBootstrap = resolved || targetRelay || null
-        const recoveryKey = `${relayForBootstrap || 'unknown-relay'}|${groupId}`
         console.warn('[GroupsProvider] creator detected but no admin snapshot; injecting self', {
           groupId,
-          relay: relayForBootstrap,
-          recoveryAttempted: adminRecoveryAttempts.has(recoveryKey)
+          relay: resolved || targetRelay || null
         })
         admins = [{ pubkey, roles: ['admin'] }]
-
-        if (relayForBootstrap && !adminRecoveryAttempts.has(recoveryKey)) {
-          adminRecoveryAttempts.add(recoveryKey)
-          try {
-            const { adminListEvent, memberListEvent } = buildHypertunaAdminBootstrapDraftEvents({
-              publicIdentifier: groupId,
-              adminPubkeyHex: pubkey,
-              name: metadata?.name || groupId
-            })
-            // Best-effort republish to the group relay so subsequent fetches have a 39001 snapshot.
-            publish(adminListEvent, { specifiedRelayUrls: [relayForBootstrap] }).catch(() => {})
-            publish(memberListEvent, { specifiedRelayUrls: [relayForBootstrap] }).catch(() => {})
-          } catch (err) {
-            console.warn('[GroupsProvider] failed to bootstrap admin/member snapshot', {
-              groupId,
-              err
-            })
-          }
-        }
       }
 
       console.info('[GroupsProvider] membership derivation', {
@@ -2766,6 +2937,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         content: ''
       }
 
+      logGroupSnapshotPublishAttempt({
+        reason: `republish-39002:${reason}`,
+        groupId,
+        event: membersEvent,
+        relayUrls
+      })
       await publish(membersEvent, { specifiedRelayUrls: relayUrls })
       console.info('[GroupsProvider] Republished 39002 members snapshot', {
         groupId,
@@ -3144,6 +3321,18 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           }
 
           try {
+            logGroupSnapshotPublishAttempt({
+              reason: 'leave-group-admin-snapshot:admins',
+              groupId,
+              event: adminsEvent,
+              relayUrls: snapshotRelayUrls
+            })
+            logGroupSnapshotPublishAttempt({
+              reason: 'leave-group-admin-snapshot:members',
+              groupId,
+              event: membersEvent,
+              relayUrls: snapshotRelayUrls
+            })
             await Promise.all([
               publish(adminsEvent, { specifiedRelayUrls: snapshotRelayUrls }),
               publish(membersEvent, { specifiedRelayUrls: snapshotRelayUrls })
@@ -3903,6 +4092,18 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const membershipSnapshotTargets = isPublic
         ? Array.from(new Set([bootstrapRelayUrl, ...BIG_RELAY_URLS]))
         : [bootstrapRelayUrl]
+      logGroupSnapshotPublishAttempt({
+        reason: 'create-hypertuna-group:bootstrap-admins',
+        groupId: publicIdentifier,
+        event: adminListEvent,
+        relayUrls: membershipSnapshotTargets
+      })
+      logGroupSnapshotPublishAttempt({
+        reason: 'create-hypertuna-group:bootstrap-members',
+        groupId: publicIdentifier,
+        event: memberListEvent,
+        relayUrls: membershipSnapshotTargets
+      })
       await Promise.all([
         publish(adminListEvent, { specifiedRelayUrls: membershipSnapshotTargets }),
         publish(memberListEvent, { specifiedRelayUrls: membershipSnapshotTargets })
@@ -4850,6 +5051,18 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         await publish(metadataEvent, { specifiedRelayUrls: metadataTargets })
 
         if (isPublic) {
+          logGroupSnapshotPublishAttempt({
+            reason: 'create-group:admins',
+            groupId,
+            event: adminsEvent,
+            relayUrls: Array.from(new Set([...localTargets, ...discoveryTargets]))
+          })
+          logGroupSnapshotPublishAttempt({
+            reason: 'create-group:members',
+            groupId,
+            event: membersEvent,
+            relayUrls: Array.from(new Set([...localTargets, ...discoveryTargets]))
+          })
           await publish(adminsEvent, {
             specifiedRelayUrls: Array.from(new Set([...localTargets, ...discoveryTargets]))
           })
@@ -4861,6 +5074,18 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           })
         } else {
           // private: 39001/02/03 only to local
+          logGroupSnapshotPublishAttempt({
+            reason: 'create-group-private:admins',
+            groupId,
+            event: adminsEvent,
+            relayUrls: localTargets
+          })
+          logGroupSnapshotPublishAttempt({
+            reason: 'create-group-private:members',
+            groupId,
+            event: membersEvent,
+            relayUrls: localTargets
+          })
           await publish(adminsEvent, { specifiedRelayUrls: localTargets })
           await publish(membersEvent, { specifiedRelayUrls: localTargets })
           await publish(rolesEvent, { specifiedRelayUrls: localTargets })

@@ -4492,6 +4492,33 @@ async function isRelayAuthProtected(identifier) {
 async function publishEventToRelay(identifier, event) {
   try {
     const canonicalIdentifier = normalizeRelayIdentifier(identifier);
+    if (event?.kind === KIND_GROUP_ADMIN_LIST || event?.kind === KIND_GROUP_MEMBER_LIST) {
+      const taggedPubkeys = Array.from(new Set(
+        (Array.isArray(event?.tags) ? event.tags : [])
+          .filter((tag) => tag[0] === 'p' && typeof tag[1] === 'string' && tag[1].trim())
+          .map((tag) => tag[1].trim().toLowerCase())
+      )).sort();
+      const adminTaggedPubkeys = Array.from(new Set(
+        (Array.isArray(event?.tags) ? event.tags : [])
+          .filter((tag) => (
+            tag[0] === 'p' &&
+            typeof tag[1] === 'string' &&
+            tag[1].trim() &&
+            tag.slice(2).some((value) => String(value || '').trim() === 'admin')
+          ))
+          .map((tag) => tag[1].trim().toLowerCase())
+      )).sort();
+      console.log('[RelayServer] Publishing group snapshot event', {
+        relayIdentifier: canonicalIdentifier,
+        kind: event.kind,
+        eventId: event.id || null,
+        createdAt: event.created_at || null,
+        taggedPubkeysCount: taggedPubkeys.length,
+        adminTaggedPubkeysCount: adminTaggedPubkeys.length,
+        selfOnly: taggedPubkeys.length === 1,
+        eventPubkey: normalizePubkeyHex(event.pubkey || null)
+      });
+    }
     console.log(`[RelayServer] Publishing event to relay ${canonicalIdentifier}:`, event);
     
     // Resolve public identifier to relay key if needed
