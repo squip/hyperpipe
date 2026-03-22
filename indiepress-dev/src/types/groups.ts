@@ -131,6 +131,14 @@ export type TPersistedGroupMembershipRecord = {
   persistedAt: number
 }
 
+export type TPersistedGroupMetadataRecord = {
+  key: string
+  accountPubkey: string
+  groupId: string
+  metadata: TGroupMetadata
+  persistedAt: number
+}
+
 export type TGroupMemberSnapshot = {
   pubkeys: string[]
   event: Event

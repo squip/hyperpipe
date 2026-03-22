@@ -48,6 +48,7 @@ import {
   TGroupMembershipStatus,
   TGroupMembershipState,
   TGroupMetadata,
+  TPersistedGroupMetadataRecord,
   TPersistedGroupMembershipRecord,
   TJoinRequest
 } from '@/types/groups'
@@ -127,7 +128,7 @@ type GroupMemberPreviewEntry = TGroupMembershipState
 
 type ProvisionalGroupMetadataEntry = {
   metadata: TGroupMetadata
-  source: 'invite' | 'create' | 'update'
+  source: 'invite' | 'create' | 'update' | 'persisted'
   updatedAt: number
 }
 
@@ -389,12 +390,48 @@ const toGroupMemberPreviewKey = (groupId: string, relay?: string) =>
   toGroupMembershipCacheKey(groupId, relay)
 const toProvisionalGroupMetadataKey = (groupId: string, relay?: string | null) =>
   `${relay ? getBaseRelayUrl(relay) : ''}|${groupId}`
+const toPersistedGroupMetadataRecordKey = (accountPubkey: string, groupId: string) =>
+  `${String(accountPubkey || '').trim()}|${String(groupId || '').trim()}`
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 const getLeavePublishRetryDelayMs = (attempts: number) =>
   Math.min(
     LEAVE_PUBLISH_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempts),
     LEAVE_PUBLISH_RETRY_MAX_DELAY_MS
   )
+
+const tryDecodeNpubToHex = (value?: string | null): string | undefined => {
+  const candidate = String(value || '').trim()
+  if (!candidate.startsWith('npub1')) return undefined
+  try {
+    const decoded = nip19.decode(candidate)
+    if (decoded.type === 'npub') return decoded.data as string
+  } catch (_err) {
+    // ignore decode failures
+  }
+  return undefined
+}
+
+const extractCreatorPubkeyHint = (value?: string | null): string | undefined => {
+  const raw = String(value || '').trim()
+  if (!raw) return undefined
+
+  const exact = tryDecodeNpubToHex(raw)
+  if (exact) return exact
+
+  const candidates = new Set<string>()
+  const colonIndex = raw.indexOf(':')
+  if (colonIndex > 0) candidates.add(raw.slice(0, colonIndex))
+  const slashIndex = raw.indexOf('/')
+  if (slashIndex > 0) candidates.add(raw.slice(0, slashIndex))
+  const match = raw.match(/(npub1[023456789acdefghjklmnpqrstuvwxyz]+)/i)
+  if (match?.[1]) candidates.add(match[1])
+
+  for (const candidate of candidates) {
+    const decoded = tryDecodeNpubToHex(candidate)
+    if (decoded) return decoded
+  }
+  return undefined
+}
 
 const createProvisionalGroupMetadata = (args: {
   groupId: string
@@ -408,6 +445,8 @@ const createProvisionalGroupMetadata = (args: {
   gatewayOrigin?: string | null
   directJoinOnly?: boolean
   createdAt?: number
+  creatorPubkey?: string | null
+  event?: TGroupMetadata['event'] | null
 }): TGroupMetadata | null => {
   const groupId = String(args.groupId || '').trim()
   if (!groupId) return null
@@ -440,15 +479,17 @@ const createProvisionalGroupMetadata = (args: {
   if (gatewayId) tags.push([HYPERTUNA_GATEWAY_ID_TAG, gatewayId])
   if (gatewayOrigin) tags.push([HYPERTUNA_GATEWAY_ORIGIN_TAG, gatewayOrigin])
   if (args.directJoinOnly === true) tags.push([HYPERTUNA_DIRECT_JOIN_ONLY_TAG, '1'])
-  const event = {
-    id: `provisional:${groupId}:${createdAt}`,
-    pubkey: '',
-    created_at: createdAt,
-    kind: ExtendedKind.GROUP_METADATA,
-    tags,
-    content: '',
-    sig: ''
-  } as any
+  const event =
+    args.event ||
+    ({
+      id: `provisional:${groupId}:${createdAt}`,
+      pubkey: String(args.creatorPubkey || '').trim(),
+      created_at: createdAt,
+      kind: ExtendedKind.GROUP_METADATA,
+      tags,
+      content: '',
+      sig: ''
+    } as any)
   return {
     id: groupId,
     relay: args.relay ? getBaseRelayUrl(args.relay) : undefined,
@@ -797,7 +838,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const groupMembershipPersistedRecordsRef = useRef<Record<string, TPersistedGroupMembershipRecord>>(
     {}
   )
+  const groupMetadataPersistedRecordsRef = useRef<Record<string, TPersistedGroupMetadataRecord>>({})
   const groupMembershipLazyHydrateInFlightRef = useRef<Set<string>>(new Set())
+  const groupMetadataLazyHydrateInFlightRef = useRef<Set<string>>(new Set())
   const inviteRefreshInFlightRef = useRef(false)
 
   const workerRelayUrlMap = useMemo(() => {
@@ -904,6 +947,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       gatewayOrigin?: string | null
       directJoinOnly?: boolean
       createdAt?: number
+      creatorPubkey?: string | null
+      event?: TGroupMetadata['event'] | null
       source: ProvisionalGroupMetadataEntry['source']
     }) => {
       const groupId = String(args.groupId || '').trim()
@@ -924,7 +969,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         gatewayId: args.gatewayId,
         gatewayOrigin: args.gatewayOrigin,
         directJoinOnly: args.directJoinOnly,
-        createdAt: args.createdAt
+        createdAt: args.createdAt,
+        creatorPubkey: args.creatorPubkey,
+        event: args.event
       })
       if (!metadata) return
 
@@ -995,6 +1042,68 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       return best ? best.metadata : null
     },
     [provisionalGroupMetadataByKey, resolveRelayUrl]
+  )
+
+  const persistGroupMetadata = useCallback(
+    async (metadata: TGroupMetadata | null | undefined, relay?: string) => {
+      if (!pubkey || !metadata?.id) return
+      const creatorPubkey = String(metadata.event?.pubkey || '').trim()
+      if (!creatorPubkey) return
+      const record: TPersistedGroupMetadataRecord = {
+        key: toPersistedGroupMetadataRecordKey(pubkey, metadata.id),
+        accountPubkey: pubkey,
+        groupId: metadata.id,
+        metadata: {
+          ...metadata,
+          relay: metadata.relay || (relay ? getBaseRelayUrl(relay) : undefined)
+        },
+        persistedAt: Date.now()
+      }
+      groupMetadataPersistedRecordsRef.current[record.key] = record
+      await indexedDb.putGroupMetadataCache(record)
+    },
+    [pubkey]
+  )
+
+  const hydratePersistedGroupMetadata = useCallback(
+    async (groupId: string) => {
+      if (!pubkey) return null
+      const normalizedGroupId = String(groupId || '').trim()
+      if (!normalizedGroupId) return null
+      const recordKey = toPersistedGroupMetadataRecordKey(pubkey, normalizedGroupId)
+      const existing = groupMetadataPersistedRecordsRef.current[recordKey] || null
+      if (existing?.metadata) return existing.metadata
+      if (groupMetadataLazyHydrateInFlightRef.current.has(recordKey)) return null
+
+      groupMetadataLazyHydrateInFlightRef.current.add(recordKey)
+      try {
+        const record = await indexedDb.getGroupMetadataCache(pubkey, normalizedGroupId)
+        if (!record?.metadata) return null
+        groupMetadataPersistedRecordsRef.current[record.key] = record
+        upsertProvisionalGroupMetadata({
+          groupId: record.groupId,
+          relay: record.metadata.relay,
+          name: record.metadata.name,
+          about: record.metadata.about,
+          picture: record.metadata.picture,
+          isPublic: record.metadata.isPublic,
+          isOpen: record.metadata.isOpen,
+          gatewayId: record.metadata.gatewayId,
+          gatewayOrigin: record.metadata.gatewayOrigin,
+          directJoinOnly: record.metadata.directJoinOnly,
+          createdAt: record.metadata.event?.created_at,
+          creatorPubkey: record.metadata.event?.pubkey,
+          event: record.metadata.event,
+          source: 'persisted'
+        })
+        return record.metadata
+      } catch (_err) {
+        return null
+      } finally {
+        groupMetadataLazyHydrateInFlightRef.current.delete(recordKey)
+      }
+    },
+    [pubkey, upsertProvisionalGroupMetadata]
   )
 
   const getRelayEntryForGroup = useCallback(
@@ -1507,6 +1616,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     groupMemberPreviewInFlightRef.current.clear()
     groupMembershipPersistedRecordsRef.current = {}
     groupMembershipLazyHydrateInFlightRef.current.clear()
+    groupMetadataPersistedRecordsRef.current = {}
+    groupMetadataLazyHydrateInFlightRef.current.clear()
     setProvisionalGroupMetadataByKey({})
   }, [pubkey])
 
@@ -1564,6 +1675,64 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           return changed ? next : prev
         })
         setGroupMemberPreviewVersion((prev) => prev + 1)
+      })
+      .catch(() => {})
+
+    return () => {
+      cancelled = true
+    }
+  }, [pubkey])
+
+  useEffect(() => {
+    if (!pubkey) return
+    let cancelled = false
+
+    indexedDb
+      .getAllGroupMetadataCache(pubkey)
+      .then((records) => {
+        if (cancelled) return
+        const nextRecords: Record<string, TPersistedGroupMetadataRecord> = {}
+        records.forEach((record) => {
+          nextRecords[record.key] = record
+        })
+        groupMetadataPersistedRecordsRef.current = nextRecords
+
+        if (!records.length) return
+        setProvisionalGroupMetadataByKey((prev) => {
+          let changed = false
+          const next = { ...prev }
+          records.forEach((record) => {
+            const metadata = record.metadata
+            if (!metadata?.id) return
+            const keys = new Set<string>([toProvisionalGroupMetadataKey(metadata.id)])
+            if (metadata.relay) keys.add(toProvisionalGroupMetadataKey(metadata.id, metadata.relay))
+            keys.forEach((key) => {
+              const current = next[key]
+              const currentTs = current?.metadata?.event?.created_at || 0
+              const incomingTs = metadata.event?.created_at || 0
+              if (current && currentTs > incomingTs) return
+              if (
+                current &&
+                currentTs === incomingTs &&
+                current.metadata.event?.pubkey === metadata.event?.pubkey &&
+                current.metadata.name === metadata.name &&
+                (current.metadata.about || '') === (metadata.about || '') &&
+                (current.metadata.picture || '') === (metadata.picture || '') &&
+                current.metadata.isPublic === metadata.isPublic &&
+                current.metadata.isOpen === metadata.isOpen
+              ) {
+                return
+              }
+              next[key] = {
+                metadata,
+                source: 'persisted',
+                updatedAt: Date.now()
+              }
+              changed = true
+            })
+          })
+          return changed ? next : prev
+        })
       })
       .catch(() => {})
 
@@ -2138,33 +2307,24 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         hasActiveRelayConnection
       } = getRelayRuntimeState(normalizedGroupId, targetRelay)
       const isInMyGroups = myGroupList.some((entry) => entry.groupId === normalizedGroupId)
-      const provisionalMetadata = getProvisionalGroupMetadata(
+      let provisionalMetadata = getProvisionalGroupMetadata(
         normalizedGroupId,
         targetRelay || resolvedRelay || undefined
       )
-      const decodedGroupIdPubkey = (() => {
-        try {
-          if (normalizedGroupId.startsWith('npub')) {
-            const decoded = nip19.decode(normalizedGroupId)
-            if (decoded.type === 'npub') return decoded.data as string
-          }
-        } catch (_err) {
-          // ignore decode failures
+      if (!provisionalMetadata?.event?.pubkey) {
+        const hydratedMetadata = await hydratePersistedGroupMetadata(normalizedGroupId)
+        if (hydratedMetadata) {
+          provisionalMetadata = hydratedMetadata
         }
-        return undefined
-      })()
-      const decodedMetadataPubkey = (() => {
-        try {
-          const dTag = provisionalMetadata?.event?.tags?.find?.((tag) => tag[0] === 'd')?.[1]
-          if (dTag?.startsWith?.('npub')) {
-            const decoded = nip19.decode(dTag)
-            if (decoded.type === 'npub') return decoded.data as string
-          }
-        } catch (_err) {
-          // ignore decode failures
-        }
-        return undefined
-      })()
+      }
+      const creatorPubkeyHint =
+        String(provisionalMetadata?.event?.pubkey || '').trim() ||
+        extractCreatorPubkeyHint(normalizedGroupId) ||
+        extractCreatorPubkeyHint(provisionalMetadata?.id) ||
+        extractCreatorPubkeyHint(
+          provisionalMetadata?.event?.tags?.find?.((tag) => tag[0] === 'd')?.[1] || null
+        ) ||
+        undefined
       const discoveryPrivate = discoveryGroups.some((entry) => {
         if (entry.id !== normalizedGroupId) return false
         if (entry.isPublic !== false) return false
@@ -2176,8 +2336,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const isCreator =
         !!pubkey &&
         ((!!provisionalMetadata?.event?.pubkey && provisionalMetadata.event.pubkey === pubkey) ||
-          (!!decodedGroupIdPubkey && decodedGroupIdPubkey === pubkey) ||
-          (!!decodedMetadataPubkey && decodedMetadataPubkey === pubkey))
+          (!!creatorPubkeyHint && creatorPubkeyHint === pubkey))
       const canUseResolvedRelay =
         !opts?.discoveryOnly &&
         !!resolvedRelay &&
@@ -2279,6 +2438,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       getPersistedGroupMembershipBaseline,
       getProvisionalGroupMetadata,
       getRelayRuntimeState,
+      hydratePersistedGroupMetadata,
       myGroupList,
       pubkey
     ]
@@ -2372,10 +2532,16 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         !!resolved &&
         (!relayLooksLoopback || hasActiveRelayConnection) &&
         (isInMyGroups || (!!opts?.preferRelay && relayHasAuthToken))
-      const provisionalMetadata = getProvisionalGroupMetadata(
+      let provisionalMetadata = getProvisionalGroupMetadata(
         groupId,
         targetRelay || resolved || undefined
       )
+      if (!provisionalMetadata?.event?.pubkey) {
+        const hydratedMetadata = await hydratePersistedGroupMetadata(groupId)
+        if (hydratedMetadata) {
+          provisionalMetadata = hydratedMetadata
+        }
+      }
       const discoveryPrivate = discoveryGroups.some((entry) => {
         if (entry.id !== groupId) return false
         if (entry.isPublic !== false) return false
@@ -2509,28 +2675,39 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         membershipPromise
       ])
 
-      const membershipState = membershipResult.visibleState
-      const groupIdPubkey = (() => {
-        try {
-          if (groupId?.startsWith('npub')) {
-            const decoded = nip19.decode(groupId)
-            if (decoded.type === 'npub') return decoded.data as string
-          }
-          const dTag = metadataEvt?.tags?.find((t) => t[0] === 'd')?.[1]
-          if (dTag?.startsWith?.('npub')) {
-            const decoded = nip19.decode(dTag)
-            if (decoded.type === 'npub') return decoded.data as string
-          }
-        } catch (_err) {
-          // ignore decode failures
-        }
-        return undefined
-      })()
+      let membershipState = membershipResult.visibleState
+      const groupIdPubkey =
+        extractCreatorPubkeyHint(groupId) ||
+        extractCreatorPubkeyHint(metadataEvt?.tags?.find((t) => t[0] === 'd')?.[1] || null) ||
+        undefined
       const creatorPubkey = metadataEvt?.pubkey
       const isCreator =
         !!pubkey &&
         ((!!creatorPubkey && creatorPubkey === pubkey) ||
           (!!groupIdPubkey && groupIdPubkey === pubkey))
+      const creatorProtectionBaseline = selectPreferredMembershipState([
+        getCachedGroupMemberPreview(groupId, resolved || targetRelay || undefined, groupMemberPreviewByKeyRef.current),
+        getPersistedGroupMembershipBaseline(groupId, resolved || targetRelay || undefined)
+      ])
+      if (
+        isSuspiciousCreatorSelfMembershipDowngrade({
+          currentState: creatorProtectionBaseline,
+          incomingState: membershipState,
+          currentPubkey: pubkey,
+          isCreator
+        }) &&
+        creatorProtectionBaseline
+      ) {
+        console.warn('[GroupsProvider] Corrected creator self-only membership detail with protected baseline', {
+          groupId,
+          relay: resolved || targetRelay || null,
+          incomingSnapshotId: membershipState.selectedSnapshotId,
+          incomingMemberCount: membershipState.memberCount,
+          baselineSnapshotId: creatorProtectionBaseline.selectedSnapshotId,
+          baselineMemberCount: creatorProtectionBaseline.memberCount
+        })
+        membershipState = creatorProtectionBaseline
+      }
       let coercedMembershipStatus =
         membershipState.membershipStatus === 'not-member' &&
         pubkey &&
@@ -2579,8 +2756,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           gatewayOrigin: metadata.gatewayOrigin,
           directJoinOnly: metadata.directJoinOnly,
           createdAt: metadata.event?.created_at,
+          creatorPubkey: metadataEvt.pubkey,
+          event: metadataEvt,
           source: 'update'
         })
+        persistGroupMetadata(
+          {
+            ...metadata,
+            relay: resolved || targetRelay || metadata.relay
+          },
+          resolved || targetRelay || undefined
+        ).catch(() => {})
       }
 
       const shouldInjectCreatorAdmin = isCreator && pubkey && admins.length === 0
@@ -2652,9 +2838,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [
       discoveryGroups,
       discoveryRelays,
+      getCachedGroupMemberPreview,
+      getPersistedGroupMembershipBaseline,
       getProvisionalGroupMetadata,
       getRelayRuntimeState,
+      hydratePersistedGroupMetadata,
       myGroupList,
+      persistGroupMetadata,
       pubkey,
       resolveAndApplyGroupMembershipState,
       resolveRelayUrl,
@@ -3561,6 +3751,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             gatewayOrigin: metadata.gatewayOrigin,
             directJoinOnly: metadata.directJoinOnly,
             createdAt: metadata.event?.created_at,
+            creatorPubkey: metadata.event?.pubkey,
+            event: metadata.event,
             source: 'update'
           })
         })
@@ -3982,6 +4174,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         gatewayId: normalizedGatewayId,
         gatewayOrigin: normalizedGatewayOrigin,
         directJoinOnly: normalizedDirectJoinOnly,
+        creatorPubkey: pubkey,
         source: 'create'
       })
 
@@ -4006,6 +4199,23 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           leaseReplicaPeerKeys,
           writerIssuerPubkey
         })
+      persistGroupMetadata(
+        createProvisionalGroupMetadata({
+          groupId: publicIdentifier,
+          relay: relayWsUrl,
+          name,
+          about,
+          picture,
+          isPublic,
+          isOpen,
+          gatewayId: normalizedGatewayId,
+          gatewayOrigin: normalizedGatewayOrigin,
+          directJoinOnly: normalizedDirectJoinOnly,
+          createdAt: metadataEvent.created_at,
+          creatorPubkey: pubkey
+        }),
+        relayWsUrl
+      ).catch(() => {})
       const { adminListEvent, memberListEvent } = buildHypertunaAdminBootstrapDraftEvents({
         publicIdentifier,
         adminPubkeyHex: pubkey,
@@ -4114,6 +4324,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [
       createRelay,
       myGroupList,
+      persistGroupMetadata,
       pubkey,
       publish,
       resolveRelayUrl,
@@ -4734,8 +4945,26 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           gatewayId: cachedMetadata?.gatewayId || null,
           gatewayOrigin: cachedMetadata?.gatewayOrigin || null,
           directJoinOnly: cachedMetadata?.directJoinOnly === true,
+          creatorPubkey: pubkey,
           source: 'update'
         })
+        persistGroupMetadata(
+          createProvisionalGroupMetadata({
+            groupId,
+            relay: resolved || relay || undefined,
+            name,
+            about,
+            picture,
+            isPublic: typeof data.isPublic === 'boolean' ? data.isPublic : cachedMetadata?.isPublic,
+            isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : cachedMetadata?.isOpen,
+            gatewayId: cachedMetadata?.gatewayId || null,
+            gatewayOrigin: cachedMetadata?.gatewayOrigin || null,
+            directJoinOnly: cachedMetadata?.directJoinOnly === true,
+            createdAt: metadataEvent.created_at,
+            creatorPubkey: pubkey
+          }),
+          resolved || relay || undefined
+        ).catch(() => {})
 
         // Optimistically update discoveryGroups cache
         setDiscoveryGroups((prev) =>
@@ -4764,6 +4993,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     [
       discoveryGroups,
       getProvisionalGroupMetadata,
+      persistGroupMetadata,
       pubkey,
       publish,
       refreshDiscovery,
@@ -5103,8 +5333,23 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           isPublic,
           isOpen,
           createdAt,
+          creatorPubkey: pubkey,
           source: 'create'
         })
+        persistGroupMetadata(
+          createProvisionalGroupMetadata({
+            groupId,
+            relay: localTargets[0],
+            name,
+            about,
+            picture,
+            isPublic,
+            isOpen,
+            createdAt,
+            creatorPubkey: pubkey
+          }),
+          localTargets[0]
+        ).catch(() => {})
         await saveMyGroupList(updatedList)
         return { groupId, relay: localTargets[0] }
       },
@@ -5151,6 +5396,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       pubkey,
       discoveryRelays,
       publish,
+      persistGroupMetadata,
       resolveRelayUrl,
       createHypertunaRelayGroup,
       upsertProvisionalGroupMetadata

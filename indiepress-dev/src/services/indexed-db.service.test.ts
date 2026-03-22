@@ -7,6 +7,7 @@ import {
   updatePersistedGroupMembershipRecord
 } from '@/lib/group-membership'
 import indexedDb from '@/services/indexed-db.service'
+import type { TGroupMetadata } from '@/types/groups'
 
 describe('group membership persistence', () => {
   it('hydrates from lastComplete on boot', async () => {
@@ -227,5 +228,77 @@ describe('group membership persistence', () => {
     )
     expect(joinedRecord?.lastComplete?.members).toEqual(['alice', 'bob'])
     expect(discoveryRecord?.lastComplete?.members).toEqual(['alice', 'bob', 'carol'])
+  })
+})
+
+describe('group metadata persistence', () => {
+  const buildMetadata = (groupId: string, creatorPubkey: string, relay?: string): TGroupMetadata => ({
+    id: groupId,
+    relay,
+    name: `Group ${groupId}`,
+    about: 'about',
+    picture: 'https://example.com/picture.png',
+    isPublic: true,
+    isOpen: true,
+    tags: [],
+    event: {
+      id: `evt-${groupId}`,
+      pubkey: creatorPubkey,
+      created_at: 1774217000,
+      kind: 39000,
+      tags: [
+        ['d', groupId],
+        ['h', groupId],
+        ['name', `Group ${groupId}`],
+        ['public'],
+        ['open']
+      ],
+      content: '',
+      sig: 'sig'
+    } as any
+  })
+
+  it('hydrates persisted metadata with creator pubkey', async () => {
+    const accountPubkey = `account-${Date.now()}-metadata`
+    const metadata = buildMetadata('group-metadata-boot', 'creator-pubkey', 'wss://relay.example')
+
+    await indexedDb.putGroupMetadataCache({
+      key: `${accountPubkey}|group-metadata-boot`,
+      accountPubkey,
+      groupId: metadata.id,
+      metadata,
+      persistedAt: Date.now()
+    })
+
+    const loaded = await indexedDb.getGroupMetadataCache(accountPubkey, metadata.id)
+
+    expect(loaded?.metadata.event.pubkey).toBe('creator-pubkey')
+    expect(loaded?.metadata.name).toBe('Group group-metadata-boot')
+  })
+
+  it('isolates metadata caches per account', async () => {
+    const groupId = `group-metadata-shared-${Date.now()}`
+    await indexedDb.putGroupMetadataCache({
+      key: `account-a|${groupId}`,
+      accountPubkey: 'account-a',
+      groupId,
+      metadata: buildMetadata(groupId, 'creator-a'),
+      persistedAt: Date.now()
+    })
+    await indexedDb.putGroupMetadataCache({
+      key: `account-b|${groupId}`,
+      accountPubkey: 'account-b',
+      groupId,
+      metadata: buildMetadata(groupId, 'creator-b'),
+      persistedAt: Date.now()
+    })
+
+    const recordsA = await indexedDb.getAllGroupMetadataCache('account-a')
+    const recordsB = await indexedDb.getAllGroupMetadataCache('account-b')
+
+    expect(recordsA.some((record) => record.groupId === groupId && record.metadata.event.pubkey === 'creator-a')).toBe(true)
+    expect(recordsB.some((record) => record.groupId === groupId && record.metadata.event.pubkey === 'creator-b')).toBe(true)
+    expect(recordsA.every((record) => record.accountPubkey === 'account-a')).toBe(true)
+    expect(recordsB.every((record) => record.accountPubkey === 'account-b')).toBe(true)
   })
 })

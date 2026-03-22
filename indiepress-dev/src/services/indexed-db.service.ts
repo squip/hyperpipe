@@ -1,6 +1,7 @@
 import { TRelayInfo } from '@/types'
 import {
-  TPersistedGroupMembershipRecord
+  TPersistedGroupMembershipRecord,
+  TPersistedGroupMetadataRecord
 } from '@/types/groups'
 import { NostrUser } from '@nostr/gadgets/metadata'
 
@@ -12,7 +13,8 @@ type TValue<T = any> = {
 
 const StoreNames = {
   RELAY_INFOS: 'relayInfos',
-  GROUP_MEMBERSHIP_CACHE: 'groupMembershipCache'
+  GROUP_MEMBERSHIP_CACHE: 'groupMembershipCache',
+  GROUP_METADATA_CACHE: 'groupMetadataCache'
 }
 
 class IndexedDbService {
@@ -31,7 +33,7 @@ class IndexedDbService {
   init(): Promise<void> {
     if (!this.initPromise) {
       this.initPromise = new Promise((resolve, reject) => {
-        const request = window.indexedDB.open('fevela', 10)
+        const request = window.indexedDB.open('fevela', 11)
 
         request.onerror = (event) => {
           reject(event)
@@ -56,6 +58,20 @@ class IndexedDbService {
             const transaction = request.transaction
             if (transaction) {
               const store = transaction.objectStore(StoreNames.GROUP_MEMBERSHIP_CACHE)
+              if (!store.indexNames.contains('accountPubkey')) {
+                store.createIndex('accountPubkey', 'accountPubkey', { unique: false })
+              }
+            }
+          }
+          if (!db.objectStoreNames.contains(StoreNames.GROUP_METADATA_CACHE)) {
+            const store = db.createObjectStore(StoreNames.GROUP_METADATA_CACHE, {
+              keyPath: 'key'
+            })
+            store.createIndex('accountPubkey', 'accountPubkey', { unique: false })
+          } else {
+            const transaction = request.transaction
+            if (transaction) {
+              const store = transaction.objectStore(StoreNames.GROUP_METADATA_CACHE)
               if (!store.indexNames.contains('accountPubkey')) {
                 store.createIndex('accountPubkey', 'accountPubkey', { unique: false })
               }
@@ -291,6 +307,103 @@ class IndexedDbService {
     })
   }
 
+  async getAllGroupMetadataCache(accountPubkey: string): Promise<TPersistedGroupMetadataRecord[]> {
+    await this.initPromise
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        return reject('database not initialized')
+      }
+      const transaction = this.db.transaction(StoreNames.GROUP_METADATA_CACHE, 'readonly')
+      const store = transaction.objectStore(StoreNames.GROUP_METADATA_CACHE)
+      const index = store.index('accountPubkey')
+      const request = index.getAll(String(accountPubkey || '').trim())
+
+      request.onsuccess = () => {
+        transaction.commit()
+        resolve((request.result || []) as TPersistedGroupMetadataRecord[])
+      }
+
+      request.onerror = (event) => {
+        transaction.commit()
+        reject(event)
+      }
+    })
+  }
+
+  async getGroupMetadataCache(
+    accountPubkey: string,
+    groupId: string
+  ): Promise<TPersistedGroupMetadataRecord | null> {
+    await this.initPromise
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        return reject('database not initialized')
+      }
+      const transaction = this.db.transaction(StoreNames.GROUP_METADATA_CACHE, 'readonly')
+      const store = transaction.objectStore(StoreNames.GROUP_METADATA_CACHE)
+      const key = `${String(accountPubkey || '').trim()}|${String(groupId || '').trim()}`
+      const request = store.get(key)
+
+      request.onsuccess = () => {
+        transaction.commit()
+        resolve((request.result as TPersistedGroupMetadataRecord) || null)
+      }
+
+      request.onerror = (event) => {
+        transaction.commit()
+        reject(event)
+      }
+    })
+  }
+
+  async putGroupMetadataCache(record: TPersistedGroupMetadataRecord): Promise<void> {
+    await this.initPromise
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        return reject('database not initialized')
+      }
+      const transaction = this.db.transaction(StoreNames.GROUP_METADATA_CACHE, 'readwrite')
+      const store = transaction.objectStore(StoreNames.GROUP_METADATA_CACHE)
+      const putRequest = store.put({
+        ...record,
+        persistedAt: Date.now()
+      } as TPersistedGroupMetadataRecord)
+
+      putRequest.onsuccess = () => {
+        transaction.commit()
+        resolve()
+      }
+
+      putRequest.onerror = (event) => {
+        transaction.commit()
+        reject(event)
+      }
+    })
+  }
+
+  async deleteGroupMetadataCache(accountPubkey: string, groupId: string): Promise<void> {
+    await this.initPromise
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        return reject('database not initialized')
+      }
+      const transaction = this.db.transaction(StoreNames.GROUP_METADATA_CACHE, 'readwrite')
+      const store = transaction.objectStore(StoreNames.GROUP_METADATA_CACHE)
+      const key = `${String(accountPubkey || '').trim()}|${String(groupId || '').trim()}`
+      const request = store.delete(key)
+
+      request.onsuccess = () => {
+        transaction.commit()
+        resolve()
+      }
+
+      request.onerror = (event) => {
+        transaction.commit()
+        reject(event)
+      }
+    })
+  }
+
   private formatValue<T>(key: string, value: T): TValue<T> {
     return {
       key,
@@ -315,6 +428,11 @@ class IndexedDbService {
         name: StoreNames.GROUP_MEMBERSHIP_CACHE,
         expirationTimestamp: Date.now() - 1000 * 60 * 60 * 24 * 30, // 30 days
         getTimestamp: (value: TPersistedGroupMembershipRecord) => value.persistedAt
+      },
+      {
+        name: StoreNames.GROUP_METADATA_CACHE,
+        expirationTimestamp: Date.now() - 1000 * 60 * 60 * 24 * 30, // 30 days
+        getTimestamp: (value: TPersistedGroupMetadataRecord) => value.persistedAt
       }
     ]
     const transaction = this.db!.transaction(
