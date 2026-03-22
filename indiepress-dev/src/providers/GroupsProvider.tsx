@@ -11,9 +11,13 @@ import {
   buildGroupIdForCreation
 } from '@/lib/groups'
 import {
+  buildGroupMembershipSourcePlan,
   choosePreferredMembershipState,
   createGroupMembershipState,
+  DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE,
   hydratePersistedGroupMembershipState,
+  isDiscoveryPersistedGroupMembershipRelayBase,
+  getPersistedGroupMembershipRelayBase,
   normalizeMembershipPubkeys,
   resolveCanonicalGroupMembershipState,
   toGroupMembershipCacheKey,
@@ -971,10 +975,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   )
 
   const getGroupMembershipRelayBase = useCallback(
-    (groupId: string, relay?: string) => {
+    (groupId: string, relay?: string, opts?: { discoveryOnly?: boolean }) => {
       const relayEntry = getRelayEntryForGroup(groupId)
       const resolvedRelay = resolveRelayUrl(relay || relayEntry?.connectionUrl || undefined)
-      return String(getBaseRelayUrl(resolvedRelay || relay || '') || '').trim()
+      return getPersistedGroupMembershipRelayBase({
+        relayBase: String(getBaseRelayUrl(resolvedRelay || relay || '') || '').trim(),
+        discoveryOnly: opts?.discoveryOnly
+      })
     },
     [getRelayEntryForGroup, resolveRelayUrl]
   )
@@ -1011,12 +1018,21 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       opts?: {
         isJoinedGroup?: boolean
         isActiveGroup?: boolean
+        persistDiscover?: boolean
+        discoveryOnly?: boolean
         lastKnownState?: GroupMemberPreviewEntry | null
       }
     ) => {
       if (!pubkey || !visibleState) return
-      if (!opts?.isJoinedGroup && !opts?.isActiveGroup) return
-      const relayBase = getGroupMembershipRelayBase(groupId, relay)
+      const shouldPersist =
+        opts?.isJoinedGroup === true || opts?.isActiveGroup === true || opts?.persistDiscover === true
+      if (!shouldPersist) return
+      if (opts?.persistDiscover && visibleState.memberCount === 0 && visibleState.quality === 'partial') {
+        return
+      }
+      const relayBase = getGroupMembershipRelayBase(groupId, relay, {
+        discoveryOnly: opts?.discoveryOnly
+      })
       const recordKey = toPersistedGroupMembershipRecordKey(pubkey, groupId, relayBase)
       const currentRecord = groupMembershipPersistedRecordsRef.current[recordKey] || null
       const lastKnownState = opts?.lastKnownState || visibleState
@@ -1039,9 +1055,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   )
 
   const deletePersistedGroupMembershipState = useCallback(
-    async (groupId: string, relay?: string) => {
+    async (groupId: string, relay?: string, opts?: { discoveryOnly?: boolean }) => {
       if (!pubkey) return
-      const relayBase = getGroupMembershipRelayBase(groupId, relay)
+      const relayBase = getGroupMembershipRelayBase(groupId, relay, {
+        discoveryOnly: opts?.discoveryOnly
+      })
       const recordKey = toPersistedGroupMembershipRecordKey(pubkey, groupId, relayBase)
       delete groupMembershipPersistedRecordsRef.current[recordKey]
       await indexedDb.deleteGroupMembershipCache(pubkey, groupId, relayBase || undefined)
@@ -1058,6 +1076,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         persist?: boolean
         isJoinedGroup?: boolean
         isActiveGroup?: boolean
+        persistDiscover?: boolean
+        discoveryOnly?: boolean
       }
     ) => {
       if (!incomingState) return null
@@ -1115,25 +1135,52 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const normalizedGroupId = String(groupId || '').trim()
       if (!normalizedGroupId) return
       const relayBase = getGroupMembershipRelayBase(normalizedGroupId, relay)
-      const recordKey = toPersistedGroupMembershipRecordKey(pubkey, normalizedGroupId, relayBase)
-      if (groupMembershipLazyHydrateInFlightRef.current.has(recordKey)) return
-      groupMembershipLazyHydrateInFlightRef.current.add(recordKey)
+      const joined = myGroupList.some((entry) => entry.groupId === normalizedGroupId)
+      const relayBasesToTry = joined
+        ? [relayBase]
+        : Array.from(
+            new Set([relayBase, DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE].filter(Boolean))
+          )
+      const recordKeysToTry = relayBasesToTry.map((candidateRelayBase) =>
+        toPersistedGroupMembershipRecordKey(pubkey, normalizedGroupId, candidateRelayBase)
+      )
+      const inFlightKey = recordKeysToTry[0]
+      if (groupMembershipLazyHydrateInFlightRef.current.has(inFlightKey)) return
+      groupMembershipLazyHydrateInFlightRef.current.add(inFlightKey)
       try {
-        const record =
-          groupMembershipPersistedRecordsRef.current[recordKey] ||
-          (await indexedDb.getGroupMembershipCache(pubkey, normalizedGroupId, relayBase || undefined))
+        let record =
+          recordKeysToTry
+            .map((recordKey) => groupMembershipPersistedRecordsRef.current[recordKey] || null)
+            .find(Boolean) || null
+        if (!record) {
+          for (const candidateRelayBase of relayBasesToTry) {
+            record = await indexedDb.getGroupMembershipCache(
+              pubkey,
+              normalizedGroupId,
+              candidateRelayBase || undefined
+            )
+            if (record) break
+          }
+        }
         if (!record) return
-        groupMembershipPersistedRecordsRef.current[recordKey] = record
+        groupMembershipPersistedRecordsRef.current[record.key] = record
         const seededState =
           hydratePersistedGroupMembershipState(record.lastComplete, 'persisted-last-complete') ||
           hydratePersistedGroupMembershipState(record.lastKnown, 'persisted-last-known')
         if (!seededState) return
-        applyGroupMembershipState(normalizedGroupId, relay, seededState, {
-          persist: false,
-          isJoinedGroup: myGroupList.some((entry) => entry.groupId === normalizedGroupId)
-        })
+        applyGroupMembershipState(
+          normalizedGroupId,
+          isDiscoveryPersistedGroupMembershipRelayBase(record.relayBase) ? undefined : relay,
+          seededState,
+          {
+            persist: false,
+            isJoinedGroup: joined,
+            persistDiscover: !joined && isDiscoveryPersistedGroupMembershipRelayBase(record.relayBase),
+            discoveryOnly: isDiscoveryPersistedGroupMembershipRelayBase(record.relayBase)
+          }
+        )
       } finally {
-        groupMembershipLazyHydrateInFlightRef.current.delete(recordKey)
+        groupMembershipLazyHydrateInFlightRef.current.delete(inFlightKey)
       }
     },
     [applyGroupMembershipState, getGroupMembershipRelayBase, myGroupList, pubkey]
@@ -1382,7 +1429,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               ) ||
               hydratePersistedGroupMembershipState(record.lastKnown, 'persisted-last-known')
             if (!state) return null
-            return { key: toGroupMemberPreviewKey(record.groupId, record.relayBase), state }
+            return {
+              key: isDiscoveryPersistedGroupMembershipRelayBase(record.relayBase)
+                ? toGroupMemberPreviewKey(record.groupId)
+                : toGroupMemberPreviewKey(record.groupId, record.relayBase),
+              state
+            }
           })
           .filter((entry): entry is { key: string; state: GroupMemberPreviewEntry } => !!entry)
 
@@ -2000,35 +2052,14 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         (!relayLooksLoopback || hasActiveRelayConnection) &&
         (isInMyGroups || (!!opts?.preferRelay && relayHasAuthToken))
 
-      const sources: GroupMembershipLiveSourceConfig[] = []
-      if (knownPrivateGroup) {
-        if (canUseResolvedRelay && resolvedRelay) {
-          sources.push({
-            key: 'resolved-relay' as const,
-            relayUrls: [resolvedRelay],
-            snapshotAuthorityEligible: relayReadyForReq,
-            allowSnapshots: true,
-            allowOps: true
-          })
-        }
-      } else {
-        if (canUseResolvedRelay && resolvedRelay) {
-          sources.push({
-            key: 'resolved-relay' as const,
-            relayUrls: [resolvedRelay],
-            snapshotAuthorityEligible: relayReadyForReq,
-            allowSnapshots: true,
-            allowOps: true
-          })
-        }
-        sources.push({
-          key: 'discovery' as const,
-          relayUrls: discoveryRelays.length ? discoveryRelays : defaultDiscoveryRelays,
-          snapshotAuthorityEligible: true,
-          allowSnapshots: true,
-          allowOps: true
-        })
-      }
+      const sources: GroupMembershipLiveSourceConfig[] = buildGroupMembershipSourcePlan({
+        discoveryOnly: opts?.discoveryOnly,
+        knownPrivateGroup,
+        canUseResolvedRelay,
+        resolvedRelay,
+        discoveryRelays: discoveryRelays.length ? discoveryRelays : defaultDiscoveryRelays,
+        relayReadyForReq
+      })
 
       const shadowLeaveEvents = knownPrivateGroup
         ? await fetchPrivateLeaveShadowEvents({
@@ -2098,6 +2129,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         reason?: string
         persist?: boolean
         isActiveGroup?: boolean
+        persistDiscover?: boolean
       }
     ) => {
       const normalizedGroupId = String(groupId || '').trim()
@@ -2109,7 +2141,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         {
           persist: opts?.persist !== false,
           isJoinedGroup: resolved.isInMyGroups,
-          isActiveGroup: opts?.isActiveGroup === true
+          isActiveGroup: opts?.isActiveGroup === true,
+          persistDiscover: opts?.persistDiscover === true,
+          discoveryOnly: opts?.discoveryOnly === true
         }
       )
 
@@ -2521,9 +2555,6 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       if (!opts?.force && cached && now - cached.updatedAt < ttlMs) {
         return cached.members
       }
-      if (reason === 'groups-page-row-list' && !isMyGroup) {
-        return cached?.members || []
-      }
 
       const inFlightKey = `${relayCacheKey}|${opts?.force ? 'force' : 'normal'}`
       const existingPromise = groupMemberPreviewInFlightRef.current.get(inFlightKey)
@@ -2535,7 +2566,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             discoveryOnly: !isMyGroup,
             preferRelay: true,
             reason,
-            persist: true
+            persist: true,
+            persistDiscover: !isMyGroup && reason === 'groups-page-row-list'
           })
           console.info('[GroupsProvider] Refreshed member preview cache', {
             groupId: normalizedGroupId,

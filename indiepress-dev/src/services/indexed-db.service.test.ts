@@ -1,4 +1,5 @@
 import {
+  DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE,
   choosePreferredMembershipState,
   createGroupMembershipState,
   hydratePersistedGroupMembershipState,
@@ -168,5 +169,63 @@ describe('group membership persistence', () => {
     expect(recordsB.some((record) => record.groupId === groupId && record.lastKnown?.members[0] === 'bob')).toBe(true)
     expect(recordsA.every((record) => record.accountPubkey === 'account-a')).toBe(true)
     expect(recordsB.every((record) => record.accountPubkey === 'account-b')).toBe(true)
+  })
+
+  it('keeps discovery cache records separate from joined relay records', async () => {
+    const accountPubkey = `account-${Date.now()}-discovery-scope`
+    const groupId = 'group-discovery-scope'
+    const joinedState = createGroupMembershipState({
+      members: ['alice', 'bob'],
+      quality: 'complete',
+      hydrationSource: 'live-resolved-relay'
+    })
+    const discoveryState = createGroupMembershipState({
+      members: ['alice', 'bob', 'carol'],
+      quality: 'complete',
+      hydrationSource: 'live-discovery'
+    })
+
+    await indexedDb.putGroupMembershipCache(
+      updatePersistedGroupMembershipRecord(null, {
+        accountPubkey,
+        groupId,
+        relayBase: 'wss://relay.example',
+        lastKnown: joinedState,
+        lastComplete: joinedState
+      })
+    )
+    await indexedDb.putGroupMembershipCache(
+      updatePersistedGroupMembershipRecord(null, {
+        accountPubkey,
+        groupId,
+        relayBase: DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE,
+        lastKnown: discoveryState,
+        lastComplete: discoveryState
+      })
+    )
+
+    const joinedRecord = await indexedDb.getGroupMembershipCache(
+      accountPubkey,
+      groupId,
+      'wss://relay.example'
+    )
+    const discoveryRecord = await indexedDb.getGroupMembershipCache(
+      accountPubkey,
+      groupId,
+      DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE
+    )
+
+    expect(joinedRecord?.key).toBe(
+      toPersistedGroupMembershipRecordKey(accountPubkey, groupId, 'wss://relay.example')
+    )
+    expect(discoveryRecord?.key).toBe(
+      toPersistedGroupMembershipRecordKey(
+        accountPubkey,
+        groupId,
+        DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE
+      )
+    )
+    expect(joinedRecord?.lastComplete?.members).toEqual(['alice', 'bob'])
+    expect(discoveryRecord?.lastComplete?.members).toEqual(['alice', 'bob', 'carol'])
   })
 })

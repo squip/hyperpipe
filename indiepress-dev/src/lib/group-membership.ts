@@ -23,6 +23,15 @@ export type GroupMembershipLiveSourceConfig = {
   allowOps?: boolean
 }
 
+export type BuildGroupMembershipSourcePlanArgs = {
+  discoveryOnly?: boolean
+  knownPrivateGroup?: boolean
+  canUseResolvedRelay?: boolean
+  resolvedRelay?: string | null
+  discoveryRelays?: string[]
+  relayReadyForReq?: boolean
+}
+
 export type ResolveCanonicalGroupMembershipStateArgs = {
   groupId: string
   sources: GroupMembershipLiveSourceConfig[]
@@ -48,6 +57,7 @@ export type ResolvedCanonicalGroupMembershipState = {
 const MEMBERSHIP_FETCH_TIMEOUT_LIKE_MS = 9000
 const DEFAULT_OPS_PAGE_SIZE = 200
 const DEFAULT_OPS_MAX_PER_SOURCE = 2000
+export const DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE = '__discovery__'
 
 const QUALITY_RANK: Record<TGroupMembershipQuality, number> = {
   partial: 1,
@@ -117,6 +127,78 @@ export const toPersistedGroupMembershipRecordKey = (
   relayBase?: string | null
 ) =>
   `${String(accountPubkey || '').trim()}|${String(relayBase || '').trim()}|${String(groupId || '').trim()}`
+
+export const getPersistedGroupMembershipRelayBase = (args: {
+  relayBase?: string | null
+  discoveryOnly?: boolean
+}) =>
+  args.discoveryOnly ? DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE : String(args.relayBase || '').trim()
+
+export const isDiscoveryPersistedGroupMembershipRelayBase = (relayBase?: string | null) =>
+  String(relayBase || '').trim() === DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE
+
+export const buildGroupMembershipSourcePlan = (
+  args: BuildGroupMembershipSourcePlanArgs
+): GroupMembershipLiveSourceConfig[] => {
+  const discoveryOnly = args.discoveryOnly === true
+  const knownPrivateGroup = args.knownPrivateGroup === true
+  const canUseResolvedRelay = args.canUseResolvedRelay === true
+  const resolvedRelay = String(args.resolvedRelay || '').trim()
+  const discoveryRelays = Array.from(
+    new Set(
+      (Array.isArray(args.discoveryRelays) ? args.discoveryRelays : [])
+        .map((relayUrl) => String(relayUrl || '').trim())
+        .filter(Boolean)
+    )
+  )
+
+  const sources: GroupMembershipLiveSourceConfig[] = []
+  if (discoveryOnly) {
+    if (!knownPrivateGroup && discoveryRelays.length > 0) {
+      sources.push({
+        key: 'discovery',
+        relayUrls: discoveryRelays,
+        snapshotAuthorityEligible: true,
+        allowSnapshots: true,
+        allowOps: true
+      })
+    }
+    return sources
+  }
+
+  if (knownPrivateGroup) {
+    if (canUseResolvedRelay && resolvedRelay) {
+      sources.push({
+        key: 'resolved-relay',
+        relayUrls: [resolvedRelay],
+        snapshotAuthorityEligible: args.relayReadyForReq === true,
+        allowSnapshots: true,
+        allowOps: true
+      })
+    }
+    return sources
+  }
+
+  if (canUseResolvedRelay && resolvedRelay) {
+    sources.push({
+      key: 'resolved-relay',
+      relayUrls: [resolvedRelay],
+      snapshotAuthorityEligible: args.relayReadyForReq === true,
+      allowSnapshots: true,
+      allowOps: true
+    })
+  }
+  if (discoveryRelays.length > 0) {
+    sources.push({
+      key: 'discovery',
+      relayUrls: discoveryRelays,
+      snapshotAuthorityEligible: true,
+      allowSnapshots: true,
+      allowOps: true
+    })
+  }
+  return sources
+}
 
 export const createGroupMembershipState = (
   args: Partial<TGroupMembershipState> & {

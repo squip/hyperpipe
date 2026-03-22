@@ -1,4 +1,5 @@
 import {
+  buildGroupMembershipSourcePlan,
   choosePreferredMembershipState,
   createGroupMembershipState,
   resolveCanonicalGroupMembershipState
@@ -56,6 +57,27 @@ const buildFetchEventsMock = (eventsByRelay: Record<string, Event[]>) => {
 }
 
 describe('group membership resolver', () => {
+  it('uses discovery relays only for discover-feed membership resolution', () => {
+    const sources = buildGroupMembershipSourcePlan({
+      discoveryOnly: true,
+      knownPrivateGroup: false,
+      canUseResolvedRelay: true,
+      resolvedRelay: 'wss://resolved',
+      discoveryRelays: ['wss://discovery-a', 'wss://discovery-b'],
+      relayReadyForReq: true
+    })
+
+    expect(sources).toEqual([
+      {
+        key: 'discovery',
+        relayUrls: ['wss://discovery-a', 'wss://discovery-b'],
+        snapshotAuthorityEligible: true,
+        allowSnapshots: true,
+        allowOps: true
+      }
+    ])
+  })
+
   it('keeps the discovery member set when the resolved relay is not ready', async () => {
     const fetchEvents = buildFetchEventsMock({
       'wss://resolved': [

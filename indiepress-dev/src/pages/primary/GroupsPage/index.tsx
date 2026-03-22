@@ -13,7 +13,7 @@ import { useFetchProfile } from '@/hooks'
 import { useGroups } from '@/providers/GroupsProvider'
 import { useNostr } from '@/providers/NostrProvider'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
-import { TGroupInvite } from '@/types/groups'
+import type { TGroupInvite, TGroupMembershipState } from '@/types/groups'
 import { TPageRef } from '@/types'
 import dayjs from 'dayjs'
 import { ArrowDown, ArrowUp, ArrowUpDown, Link2, Loader2, Users, X } from 'lucide-react'
@@ -94,6 +94,19 @@ type ActiveGroupTarget = {
   fallbackCreatedAt: number | null
 }
 
+type MemberPreviewTarget = {
+  key: string
+  groupId: string
+  relay?: string
+}
+
+type GroupRowMembership = {
+  state: TGroupMembershipState | null
+  members: string[]
+  memberCount: number
+  unknown: boolean
+}
+
 const GROUP_DETAIL_CACHE_TTL_MS = 2 * 60 * 1000
 const MEMBER_PREVIEW_REFRESH_TTL_MS = 90 * 1000
 const GROUP_DETAIL_FETCH_CONCURRENCY = 3
@@ -168,27 +181,42 @@ function StatusBadge({ label }: { label: string }) {
   )
 }
 
-function MembersCell({ members }: { members: string[] }) {
+function MembersCell({
+  members,
+  count,
+  unknown
+}: {
+  members: string[]
+  count?: number
+  unknown?: boolean
+}) {
   const compact = useMemo(
     () => new Intl.NumberFormat(undefined, { notation: 'compact' }),
     []
   )
+  const resolvedCount = typeof count === 'number' && Number.isFinite(count) ? count : members.length
 
-  if (!members.length) {
+  if (unknown) {
+    return <span className="text-xs text-muted-foreground">-</span>
+  }
+
+  if (!resolvedCount) {
     return <span className="text-xs text-muted-foreground">0</span>
   }
 
   const preview = members.slice(0, 3)
   return (
     <div className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-1">
-      <div className="flex -space-x-2">
-        {preview.map((pubkey) => (
-          <div key={pubkey} className="h-5 w-5 overflow-hidden rounded-full bg-muted ring-2 ring-background">
-            <SimpleUserAvatar userId={pubkey} size="small" className="h-full w-full rounded-full" />
-          </div>
-        ))}
-      </div>
-      <span className="text-xs font-medium">{compact.format(members.length)}</span>
+      {preview.length ? (
+        <div className="flex -space-x-2">
+          {preview.map((pubkey) => (
+            <div key={pubkey} className="h-5 w-5 overflow-hidden rounded-full bg-muted ring-2 ring-background">
+              <SimpleUserAvatar userId={pubkey} size="small" className="h-full w-full rounded-full" />
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <span className="text-xs font-medium">{compact.format(resolvedCount)}</span>
     </div>
   )
 }
@@ -348,6 +376,31 @@ const GroupsPage = forwardRef<
     return Array.from(targetMap.values())
   }, [myRows])
 
+  const memberPreviewTargets = useMemo(() => {
+    const targetMap = new Map<string, MemberPreviewTarget>()
+    const sourceRows: MemberPreviewTarget[] = myRows.map((row) => ({
+      key: row.key,
+      groupId: row.groupId,
+      relay: row.relay
+    }))
+
+    if (tab === 'discover') {
+      sourceRows.push(
+        ...discoverRows.map((row) => ({
+          key: row.key,
+          groupId: row.groupId,
+          relay: row.relay
+        }))
+      )
+    }
+
+    for (const row of sourceRows) {
+      if (targetMap.has(row.key)) continue
+      targetMap.set(row.key, row)
+    }
+    return Array.from(targetMap.values())
+  }, [discoverRows, myRows, tab])
+
   useEffect(() => {
     if (!isGroupsPageActive || enrichmentTargets.length === 0) return
     const generation = Date.now()
@@ -434,10 +487,10 @@ const GroupsPage = forwardRef<
   }, [enrichmentTargets, fetchGroupDetail, groupDetailCache, isGroupsPageActive, myGroupKeys])
 
   useEffect(() => {
-    if (!isGroupsPageActive || enrichmentTargets.length === 0) return
+    if (!isGroupsPageActive || memberPreviewTargets.length === 0) return
     let cancelled = false
     const now = Date.now()
-    const queue = enrichmentTargets.filter((target) => {
+    const queue = memberPreviewTargets.filter((target) => {
       const cached = getGroupMemberPreview(target.groupId, target.relay)
       if (!cached) return true
       return now - cached.updatedAt > MEMBER_PREVIEW_REFRESH_TTL_MS
@@ -468,18 +521,47 @@ const GroupsPage = forwardRef<
       cancelled = true
     }
   }, [
-    enrichmentTargets,
+    memberPreviewTargets,
     getGroupMemberPreview,
     groupMemberPreviewVersion,
     isGroupsPageActive,
     refreshGroupMemberPreview
   ])
 
-  const resolveRowMembers = useCallback(
-    ({ groupId, relay, fallbackMembers = [] }: { groupId: string; relay?: string; fallbackMembers?: string[] }) => {
+  const resolveRowMembership = useCallback(
+    ({
+      groupId,
+      relay,
+      fallbackMembers = []
+    }: {
+      groupId: string
+      relay?: string
+      fallbackMembers?: string[]
+    }): GroupRowMembership => {
       const preview = getGroupMemberPreview(groupId, relay)
-      if (preview?.members?.length) return preview.members
-      return fallbackMembers
+      const normalizedFallbackMembers = Array.isArray(fallbackMembers) ? fallbackMembers : []
+      const previewLooksUnknown =
+        !!preview &&
+        preview.memberCount === 0 &&
+        preview.quality === 'partial' &&
+        !preview.selectedSnapshotId &&
+        preview.membershipEventsCount === 0
+
+      if (preview && !(previewLooksUnknown && normalizedFallbackMembers.length > 0)) {
+        return {
+          state: preview,
+          members: preview.members,
+          memberCount: preview.memberCount,
+          unknown: previewLooksUnknown
+        }
+      }
+
+      return {
+        state: null,
+        members: normalizedFallbackMembers,
+        memberCount: normalizedFallbackMembers.length,
+        unknown: normalizedFallbackMembers.length === 0
+      }
     },
     [getGroupMemberPreview]
   )
@@ -562,8 +644,8 @@ const GroupsPage = forwardRef<
 
   const sortedDiscoverRows = useMemo(() => {
     return [...filteredDiscoverRows].sort((left, right) => {
-      const leftMembers = resolveRowMembers({ groupId: left.groupId, relay: left.relay }).length
-      const rightMembers = resolveRowMembers({ groupId: right.groupId, relay: right.relay }).length
+      const leftMembers = resolveRowMembership({ groupId: left.groupId, relay: left.relay }).memberCount
+      const rightMembers = resolveRowMembership({ groupId: right.groupId, relay: right.relay }).memberCount
       const leftPeers = resolvePeerCount({ groupId: left.groupId, relay: left.relay })
       const rightPeers = resolvePeerCount({ groupId: right.groupId, relay: right.relay })
       const leftAdmin = resolveRowAdmin({
@@ -607,12 +689,12 @@ const GroupsPage = forwardRef<
           return compareNumbers(leftMembers, rightMembers, discoverSort.direction)
       }
     })
-  }, [discoverSort, filteredDiscoverRows, resolvePeerCount, resolveRowAdmin, resolveRowCreatedAt, resolveRowMembers])
+  }, [discoverSort, filteredDiscoverRows, resolvePeerCount, resolveRowAdmin, resolveRowCreatedAt, resolveRowMembership])
 
   const sortedMyRows = useMemo(() => {
     return [...filteredMyRows].sort((left, right) => {
-      const leftMembers = resolveRowMembers({ groupId: left.groupId, relay: left.relay }).length
-      const rightMembers = resolveRowMembers({ groupId: right.groupId, relay: right.relay }).length
+      const leftMembers = resolveRowMembership({ groupId: left.groupId, relay: left.relay }).memberCount
+      const rightMembers = resolveRowMembership({ groupId: right.groupId, relay: right.relay }).memberCount
       const leftPeers = resolvePeerCount({ groupId: left.groupId, relay: left.relay })
       const rightPeers = resolvePeerCount({ groupId: right.groupId, relay: right.relay })
       const leftAdmin = resolveRowAdmin({
@@ -656,20 +738,20 @@ const GroupsPage = forwardRef<
           return compareNumbers(leftCreatedAt, rightCreatedAt, mySort.direction)
       }
     })
-  }, [filteredMyRows, mySort, resolvePeerCount, resolveRowAdmin, resolveRowCreatedAt, resolveRowMembers])
+  }, [filteredMyRows, mySort, resolvePeerCount, resolveRowAdmin, resolveRowCreatedAt, resolveRowMembership])
 
   const sortedInviteRows = useMemo(() => {
     return [...filteredInviteRows].sort((left, right) => {
-      const leftMembers = resolveRowMembers({
+      const leftMembers = resolveRowMembership({
         groupId: left.groupId,
         relay: left.relay,
         fallbackMembers: left.invite.authorizedMemberPubkeys || []
-      }).length
-      const rightMembers = resolveRowMembers({
+      }).memberCount
+      const rightMembers = resolveRowMembership({
         groupId: right.groupId,
         relay: right.relay,
         fallbackMembers: right.invite.authorizedMemberPubkeys || []
-      }).length
+      }).memberCount
       const leftPeers = resolvePeerCount({ groupId: left.groupId, relay: left.relay })
       const rightPeers = resolvePeerCount({ groupId: right.groupId, relay: right.relay })
       const leftAdmin = resolveRowAdmin({
@@ -711,7 +793,7 @@ const GroupsPage = forwardRef<
           return compareNumbers(left.inviteDate, right.inviteDate, inviteSort.direction)
       }
     })
-  }, [filteredInviteRows, inviteSort, resolvePeerCount, resolveRowAdmin, resolveRowMembers])
+  }, [filteredInviteRows, inviteSort, resolvePeerCount, resolveRowAdmin, resolveRowMembership])
 
   const handleUseInvite = async (inv: TGroupInvite) => {
     if (!inv) return
@@ -964,10 +1046,11 @@ const GroupsPage = forwardRef<
                 relay: row.relay,
                 fallbackAdminPubkey: row.fallbackAdminPubkey
               })
-              const members = resolveRowMembers({
+              const membership = resolveRowMembership({
                 groupId: row.groupId,
                 relay: row.relay
               })
+              const members = membership.members
               const peers = resolvePeerCount({ groupId: row.groupId, relay: row.relay })
               const initials = (row.name || 'GR').slice(0, 2).toUpperCase()
               return (
@@ -1024,7 +1107,7 @@ const GroupsPage = forwardRef<
                     )}
                   </td>
                   <td className="px-3 py-3 align-top">
-                    <MembersCell members={members} />
+                    <MembersCell members={members} count={membership.memberCount} unknown={membership.unknown} />
                   </td>
                   <td className="px-3 py-3 align-top text-xs text-muted-foreground">
                     {new Intl.NumberFormat(undefined, { notation: 'compact' }).format(peers)}
@@ -1156,11 +1239,12 @@ const GroupsPage = forwardRef<
                   relay: row.relay,
                   fallbackAdminPubkey: row.invitedBy
                 })
-                const members = resolveRowMembers({
+                const membership = resolveRowMembership({
                   groupId: row.groupId,
                   relay: row.relay,
                   fallbackMembers: row.invite.authorizedMemberPubkeys || []
                 })
+                const members = membership.members
                 const peers = resolvePeerCount({ groupId: row.groupId, relay: row.relay })
                 const initials = (row.name || 'GR').slice(0, 2).toUpperCase()
                 return (
@@ -1211,7 +1295,11 @@ const GroupsPage = forwardRef<
                       )}
                     </td>
                     <td className="px-3 py-3 align-top">
-                      <MembersCell members={members} />
+                      <MembersCell
+                        members={members}
+                        count={membership.memberCount}
+                        unknown={membership.unknown}
+                      />
                     </td>
                     <td className="px-3 py-3 align-top text-xs text-muted-foreground">
                       {new Intl.NumberFormat(undefined, { notation: 'compact' }).format(peers)}
