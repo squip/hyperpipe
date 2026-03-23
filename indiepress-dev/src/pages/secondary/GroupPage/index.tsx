@@ -1,6 +1,7 @@
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { GROUP_PAGE_PRESENCE_TTL_MS, useGroupPresence } from '@/hooks/useGroupPresence'
 import SecondaryPageLayout from '@/layouts/SecondaryPageLayout'
 import { useGroups } from '@/providers/GroupsProvider'
 import { TFeedSubRequest, TPageRef } from '@/types'
@@ -103,6 +104,43 @@ function getRefreshRelayReasonCode(value: unknown): string | null {
   const nestedReason = (nested as { reason?: unknown }).reason
   if (typeof nestedReason === 'string' && nestedReason.trim()) return nestedReason.trim()
   return null
+}
+
+function GroupPresenceChip({
+  count,
+  status,
+  t
+}: {
+  count: number | null
+  status: 'idle' | 'scanning' | 'ready' | 'error' | 'unknown'
+  t: (key: string, opts?: any) => string
+}) {
+  if (status === 'scanning') {
+    return (
+      <div className="inline-flex items-center gap-2 rounded-full bg-muted px-2.5 py-1">
+        <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+        <span className="text-xs font-semibold text-muted-foreground">
+          {t('Scanning for peers…')}
+        </span>
+      </div>
+    )
+  }
+
+  if (status !== 'ready' || !Number.isFinite(count)) {
+    return null
+  }
+
+  const resolvedCount = Math.max(0, Number(count))
+  const dotClass = resolvedCount > 0 ? 'bg-emerald-500' : 'bg-muted-foreground/40'
+
+  return (
+    <div className="inline-flex items-center gap-2 rounded-full bg-muted px-2.5 py-1">
+      <span className={`inline-flex h-2.5 w-2.5 rounded-full ${dotClass}`} />
+      <span className="text-xs font-semibold text-muted-foreground">
+        {resolvedCount} {resolvedCount === 1 ? t('peer online') : t('peers online')}
+      </span>
+    </div>
+  )
 }
 
 type MemberActionsMenuProps = {
@@ -1230,6 +1268,9 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const handleJoin = async () => {
     if (!groupId) return
     try {
+      if (showZeroPeerJoinWarning) {
+        toast.warning(t('No usable peers are currently online. Join may fail until a peer or gateway comes online.'))
+      }
       const metadataHints = toJoinFlowHintFields(detail?.metadata)
       const inviteHints = toJoinFlowHintFields(inviteData)
       const relayUrlForJoin = resolvedGroupRelay || effectiveGroupRelay || null
@@ -1600,6 +1641,38 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     canRequestToJoinClosedGroup && effectiveMembershipStatus === 'pending'
   const inviteOpenJoin = !!inviteData && !inviteToken && inviteData.fileSharing !== false
   const openJoinAllowed = inviteOpenJoin || effectiveDetail?.metadata?.isOpen === true
+  const groupPresenceInput = useMemo(() => {
+    if (!groupId) return null
+    const metadataHints = toJoinFlowHintFields(effectiveDetail?.metadata)
+    const inviteHints = toJoinFlowHintFields(inviteData)
+    return {
+      groupId,
+      relay: effectiveGroupRelay,
+      gatewayId: metadataHints.gatewayId || inviteHints.gatewayId || null,
+      gatewayOrigin: metadataHints.gatewayOrigin || inviteHints.gatewayOrigin || null,
+      directJoinOnly:
+        metadataHints.directJoinOnly === true || inviteHints.directJoinOnly === true,
+      discoveryTopic: metadataHints.discoveryTopic || inviteHints.discoveryTopic || null,
+      hostPeerKeys: normalizePubkeyList([
+        ...(metadataHints.hostPeerKeys || []),
+        ...(inviteHints.hostPeerKeys || [])
+      ]),
+      leaseReplicaPeerKeys: normalizePubkeyList([
+        ...(metadataHints.leaseReplicaPeerKeys || []),
+        ...(inviteHints.leaseReplicaPeerKeys || [])
+      ])
+    }
+  }, [effectiveDetail?.metadata, effectiveGroupRelay, groupId, inviteData])
+  const groupPresence = useGroupPresence(groupPresenceInput, {
+    enabled: !!groupId,
+    ttlMs: GROUP_PAGE_PRESENCE_TTL_MS,
+    priority: 2
+  })
+  const showZeroPeerJoinWarning =
+    !isMember &&
+    groupPresence.status === 'ready' &&
+    Number.isFinite(groupPresence.count) &&
+    Number(groupPresence.count) === 0
   const inviteMemberSet = useMemo(
     () => new Set((effectiveDetail?.members || []).filter((member) => !!member)),
     [effectiveDetail?.members]
@@ -2215,28 +2288,31 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                   {effectiveDetail.metadata.about}
                 </div>
               )}
-              {summaryMembers.length > 0 && (
-                <div className="w-full">
-                  <div className="inline-flex items-center gap-2 rounded-full bg-muted px-2.5 py-1">
-                    <div className="flex -space-x-1.5">
-                      {summaryFacepileMembers.map((memberPubkey) => (
-                        <div
-                          key={memberPubkey}
-                          className="inline-flex h-6 w-6 overflow-hidden rounded-full ring-1 ring-background"
-                        >
-                          <UserAvatar
-                            userId={memberPubkey}
-                            size="small"
-                            className="h-6 w-6 rounded-full"
-                          />
-                        </div>
-                      ))}
+              {(summaryMembers.length > 0 || groupPresence.status === 'scanning' || groupPresence.status === 'ready') && (
+                <div className="w-full flex flex-wrap items-center gap-2">
+                  {summaryMembers.length > 0 ? (
+                    <div className="inline-flex items-center gap-2 rounded-full bg-muted px-2.5 py-1">
+                      <div className="flex -space-x-1.5">
+                        {summaryFacepileMembers.map((memberPubkey) => (
+                          <div
+                            key={memberPubkey}
+                            className="inline-flex h-6 w-6 overflow-hidden rounded-full ring-1 ring-background"
+                          >
+                            <UserAvatar
+                              userId={memberPubkey}
+                              size="small"
+                              className="h-6 w-6 rounded-full"
+                            />
+                          </div>
+                        ))}
+                      </div>
+                      <span className="text-xs font-semibold text-muted-foreground">
+                        {summaryMembers.length}{' '}
+                        {summaryMembers.length === 1 ? t('member') : t('members')}
+                      </span>
                     </div>
-                    <span className="text-xs font-semibold text-muted-foreground">
-                      {summaryMembers.length}{' '}
-                      {summaryMembers.length === 1 ? t('member') : t('members')}
-                    </span>
-                  </div>
+                  ) : null}
+                  <GroupPresenceChip count={groupPresence.count} status={groupPresence.status} t={t} />
                 </div>
               )}
               <div className="overflow-x-auto sm:overflow-visible w-full">
@@ -2281,6 +2357,16 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                 </div>
               </div>
               <div className="w-full">
+                {showZeroPeerJoinWarning ? (
+                  <div className="mb-3 inline-flex w-full items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700">
+                    <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>
+                      {t(
+                        'No usable peers are currently online. Join may fail until a peer or gateway comes online.'
+                      )}
+                    </span>
+                  </div>
+                ) : null}
                 {isMember ? (
                   <Button
                     variant="secondary"

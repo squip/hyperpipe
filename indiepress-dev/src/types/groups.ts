@@ -139,6 +139,50 @@ export type TPersistedGroupMetadataRecord = {
   persistedAt: number
 }
 
+export type TGroupPresenceSource =
+  | 'gateway'
+  | 'direct-probe'
+  | 'local-worker'
+  | 'mixed'
+  | 'unknown'
+
+export type TGroupPresenceStatus =
+  | 'idle'
+  | 'scanning'
+  | 'ready'
+  | 'error'
+  | 'unknown'
+
+export type TGroupPresenceInput = {
+  groupId: string
+  relay?: string
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
+  discoveryTopic?: string | null
+  hostPeerKeys?: string[]
+  leaseReplicaPeerKeys?: string[]
+}
+
+export type TGroupPresenceState = {
+  count: number | null
+  status: TGroupPresenceStatus
+  source: TGroupPresenceSource
+  gatewayIncluded: boolean
+  gatewayHealthy: boolean
+  lastUpdatedAt: number | null
+  unknown: boolean
+  error?: string | null
+}
+
+export type TGroupPresenceProbeResult = TGroupPresenceState & {
+  verifiedAt: number | null
+  usablePeerCount: number | null
+  aggregatePeerCount: number | null
+  registeredPeerCount: number | null
+  staleRegisteredPeerCount: number | null
+}
+
 export type TGroupMemberSnapshot = {
   pubkeys: string[]
   event: Event

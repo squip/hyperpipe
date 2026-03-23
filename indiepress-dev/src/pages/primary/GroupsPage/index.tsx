@@ -10,10 +10,16 @@ import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
 import { toGroup } from '@/lib/link'
 import { usePrimaryPage, useSecondaryPage } from '@/PageManager'
 import { useFetchProfile } from '@/hooks'
+import {
+  DISCOVER_GROUPS_PRESENCE_TTL_MS,
+  MY_GROUPS_PRESENCE_TTL_MS,
+  useGroupPresenceMap
+} from '@/hooks/useGroupPresence'
+import { compareGroupPresenceStates, createGroupPresenceState } from '@/lib/group-presence'
 import { useGroups } from '@/providers/GroupsProvider'
 import { useNostr } from '@/providers/NostrProvider'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
-import type { TGroupInvite, TGroupMembershipState } from '@/types/groups'
+import type { TGroupInvite, TGroupMembershipState, TGroupPresenceState } from '@/types/groups'
 import { TPageRef } from '@/types'
 import dayjs from 'dayjs'
 import { ArrowDown, ArrowUp, ArrowUpDown, Link2, Loader2, Users, X } from 'lucide-react'
@@ -40,7 +46,7 @@ type GroupRow = {
   isPublic: boolean
   createdAt: number | null
   fallbackAdminPubkey: string | null
-}
+} & TJoinFlowHintFields
 
 type InviteRow = {
   key: string
@@ -54,7 +60,7 @@ type InviteRow = {
   isPublic: boolean
   inviteDate: number
   invitedBy: string
-}
+} & TJoinFlowHintFields
 
 type TJoinFlowHintFields = {
   discoveryTopic?: string | null
@@ -221,6 +227,23 @@ function MembersCell({
   )
 }
 
+function PeersCell({ state }: { state: TGroupPresenceState }) {
+  const compact = useMemo(
+    () => new Intl.NumberFormat(undefined, { notation: 'compact' }),
+    []
+  )
+
+  if (state.status === 'scanning') {
+    return <span className="text-xs text-muted-foreground">Scanning…</span>
+  }
+
+  if (state.status === 'ready' && Number.isFinite(state.count)) {
+    return <span className="text-xs text-muted-foreground">{compact.format(Number(state.count || 0))}</span>
+  }
+
+  return <span className="text-xs text-muted-foreground">-</span>
+}
+
 function InviteSenderLabel({ userId }: { userId: string }) {
   const { profile } = useFetchProfile(userId)
   const fallback = `${userId.slice(0, 8)}...${userId.slice(-4)}`
@@ -254,7 +277,7 @@ const GroupsPage = forwardRef<
     refreshGroupMemberPreview,
     groupMemberPreviewVersion
   } = useGroups()
-  const { startJoinFlow, sendToWorker, getRelayPeerCount } = useWorkerBridge()
+  const { startJoinFlow, sendToWorker } = useWorkerBridge()
   const { pubkey } = useNostr()
   const { current: currentPrimaryPage, display: primaryDisplay } = usePrimaryPage()
   const isGroupsPageActive = currentPrimaryPage === 'groups' && primaryDisplay
@@ -309,7 +332,13 @@ const GroupsPage = forwardRef<
         isOpen: group.isOpen !== false,
         isPublic: group.isPublic !== false,
         createdAt: group.event?.created_at || null,
-        fallbackAdminPubkey: group.event?.pubkey || null
+        fallbackAdminPubkey: group.event?.pubkey || null,
+        discoveryTopic: group.discoveryTopic || null,
+        gatewayId: group.gatewayId || null,
+        gatewayOrigin: group.gatewayOrigin || null,
+        directJoinOnly: group.directJoinOnly === true,
+        hostPeerKeys: group.hostPeerKeys || [],
+        leaseReplicaPeerKeys: group.leaseReplicaPeerKeys || []
       }))
   }, [discoveryGroups, inviteGroupIds, myGroupList])
 
@@ -326,7 +355,13 @@ const GroupsPage = forwardRef<
         isOpen: meta?.isOpen !== false,
         isPublic: meta?.isPublic !== false,
         createdAt: meta?.event?.created_at || null,
-        fallbackAdminPubkey: meta?.event?.pubkey || null
+        fallbackAdminPubkey: meta?.event?.pubkey || null,
+        discoveryTopic: meta?.discoveryTopic || null,
+        gatewayId: meta?.gatewayId || null,
+        gatewayOrigin: meta?.gatewayOrigin || null,
+        directJoinOnly: meta?.directJoinOnly === true,
+        hostPeerKeys: meta?.hostPeerKeys || [],
+        leaseReplicaPeerKeys: meta?.leaseReplicaPeerKeys || []
       }
     })
   }, [myGroupList, resolveGroupMeta])
@@ -347,7 +382,13 @@ const GroupsPage = forwardRef<
         isOpen: invite.fileSharing !== false,
         isPublic: invite.isPublic !== false,
         inviteDate: invite.event.created_at,
-        invitedBy: invite.event.pubkey
+        invitedBy: invite.event.pubkey,
+        discoveryTopic: invite.discoveryTopic || null,
+        gatewayId: invite.gatewayId || null,
+        gatewayOrigin: invite.gatewayOrigin || null,
+        directJoinOnly: invite.directJoinOnly === true,
+        hostPeerKeys: invite.hostPeerKeys || [],
+        leaseReplicaPeerKeys: invite.leaseReplicaPeerKeys || []
       }
     })
   }, [invites, resolveRelayUrl])
@@ -582,22 +623,84 @@ const GroupsPage = forwardRef<
     [groupDetailCache]
   )
 
-  const resolvePeerCount = useCallback(
-    ({ groupId, relay }: { groupId: string; relay?: string }) => {
-      const resolvedRelay = relay ? resolveRelayUrl(relay) : undefined
-      const candidates = [
-        getRelayPeerCount(groupId),
-        getRelayPeerCount(relay),
-        getRelayPeerCount(resolvedRelay)
-      ]
-      let best = 0
-      for (const candidate of candidates) {
-        if (typeof candidate !== 'number' || !Number.isFinite(candidate)) continue
-        if (candidate > best) best = candidate
-      }
-      return best
+  const myPresenceInputs = useMemo(
+    () =>
+      myRows.map((row) => ({
+        groupId: row.groupId,
+        relay: row.relay,
+        gatewayId: row.gatewayId || null,
+        gatewayOrigin: row.gatewayOrigin || null,
+        directJoinOnly: row.directJoinOnly === true,
+        discoveryTopic: row.discoveryTopic || null,
+        hostPeerKeys: row.hostPeerKeys || [],
+        leaseReplicaPeerKeys: row.leaseReplicaPeerKeys || []
+      })),
+    [myRows]
+  )
+
+  const discoverPresenceInputs = useMemo(
+    () =>
+      discoverRows.map((row) => ({
+        groupId: row.groupId,
+        relay: row.relay,
+        gatewayId: row.gatewayId || null,
+        gatewayOrigin: row.gatewayOrigin || null,
+        directJoinOnly: row.directJoinOnly === true,
+        discoveryTopic: row.discoveryTopic || null,
+        hostPeerKeys: row.hostPeerKeys || [],
+        leaseReplicaPeerKeys: row.leaseReplicaPeerKeys || []
+      })),
+    [discoverRows]
+  )
+
+  const invitePresenceInputs = useMemo(
+    () =>
+      inviteRows.map((row) => ({
+        groupId: row.groupId,
+        relay: row.relay,
+        gatewayId: row.gatewayId || null,
+        gatewayOrigin: row.gatewayOrigin || null,
+        directJoinOnly: row.directJoinOnly === true,
+        discoveryTopic: row.discoveryTopic || null,
+        hostPeerKeys: row.hostPeerKeys || [],
+        leaseReplicaPeerKeys: row.leaseReplicaPeerKeys || []
+      })),
+    [inviteRows]
+  )
+
+  const myPresenceMap = useGroupPresenceMap(myPresenceInputs, {
+    enabled: isGroupsPageActive && tab === 'my',
+    ttlMs: MY_GROUPS_PRESENCE_TTL_MS,
+    priority: 1
+  })
+  const discoverPresenceMap = useGroupPresenceMap(discoverPresenceInputs, {
+    enabled: isGroupsPageActive && tab === 'discover',
+    ttlMs: DISCOVER_GROUPS_PRESENCE_TTL_MS,
+    priority: 0
+  })
+  const invitePresenceMap = useGroupPresenceMap(invitePresenceInputs, {
+    enabled: isGroupsPageActive && tab === 'invites',
+    ttlMs: DISCOVER_GROUPS_PRESENCE_TTL_MS,
+    priority: 0
+  })
+
+  const resolvePeerPresence = useCallback(
+    ({
+      groupId,
+      scope
+    }: {
+      groupId: string
+      scope: 'my' | 'discover' | 'invites'
+    }) => {
+      const map =
+        scope === 'my'
+          ? myPresenceMap
+          : scope === 'discover'
+            ? discoverPresenceMap
+            : invitePresenceMap
+      return map.get(groupId) || createGroupPresenceState({ status: 'unknown', unknown: true })
     },
-    [getRelayPeerCount, resolveRelayUrl]
+    [discoverPresenceMap, invitePresenceMap, myPresenceMap]
   )
 
   const filteredDiscoverRows = useMemo(() => {
@@ -646,8 +749,8 @@ const GroupsPage = forwardRef<
     return [...filteredDiscoverRows].sort((left, right) => {
       const leftMembers = resolveRowMembership({ groupId: left.groupId, relay: left.relay }).memberCount
       const rightMembers = resolveRowMembership({ groupId: right.groupId, relay: right.relay }).memberCount
-      const leftPeers = resolvePeerCount({ groupId: left.groupId, relay: left.relay })
-      const rightPeers = resolvePeerCount({ groupId: right.groupId, relay: right.relay })
+      const leftPeers = resolvePeerPresence({ groupId: left.groupId, scope: 'discover' })
+      const rightPeers = resolvePeerPresence({ groupId: right.groupId, scope: 'discover' })
       const leftAdmin = resolveRowAdmin({
         groupId: left.groupId,
         relay: left.relay,
@@ -683,20 +786,20 @@ const GroupsPage = forwardRef<
         case 'createdAt':
           return compareNumbers(leftCreatedAt, rightCreatedAt, discoverSort.direction)
         case 'peers':
-          return compareNumbers(leftPeers, rightPeers, discoverSort.direction)
+          return compareGroupPresenceStates(leftPeers, rightPeers, discoverSort.direction)
         case 'members':
         default:
           return compareNumbers(leftMembers, rightMembers, discoverSort.direction)
       }
     })
-  }, [discoverSort, filteredDiscoverRows, resolvePeerCount, resolveRowAdmin, resolveRowCreatedAt, resolveRowMembership])
+  }, [discoverSort, filteredDiscoverRows, resolvePeerPresence, resolveRowAdmin, resolveRowCreatedAt, resolveRowMembership])
 
   const sortedMyRows = useMemo(() => {
     return [...filteredMyRows].sort((left, right) => {
       const leftMembers = resolveRowMembership({ groupId: left.groupId, relay: left.relay }).memberCount
       const rightMembers = resolveRowMembership({ groupId: right.groupId, relay: right.relay }).memberCount
-      const leftPeers = resolvePeerCount({ groupId: left.groupId, relay: left.relay })
-      const rightPeers = resolvePeerCount({ groupId: right.groupId, relay: right.relay })
+      const leftPeers = resolvePeerPresence({ groupId: left.groupId, scope: 'my' })
+      const rightPeers = resolvePeerPresence({ groupId: right.groupId, scope: 'my' })
       const leftAdmin = resolveRowAdmin({
         groupId: left.groupId,
         relay: left.relay,
@@ -732,13 +835,13 @@ const GroupsPage = forwardRef<
         case 'members':
           return compareNumbers(leftMembers, rightMembers, mySort.direction)
         case 'peers':
-          return compareNumbers(leftPeers, rightPeers, mySort.direction)
+          return compareGroupPresenceStates(leftPeers, rightPeers, mySort.direction)
         case 'createdAt':
         default:
           return compareNumbers(leftCreatedAt, rightCreatedAt, mySort.direction)
       }
     })
-  }, [filteredMyRows, mySort, resolvePeerCount, resolveRowAdmin, resolveRowCreatedAt, resolveRowMembership])
+  }, [filteredMyRows, mySort, resolvePeerPresence, resolveRowAdmin, resolveRowCreatedAt, resolveRowMembership])
 
   const sortedInviteRows = useMemo(() => {
     return [...filteredInviteRows].sort((left, right) => {
@@ -752,8 +855,8 @@ const GroupsPage = forwardRef<
         relay: right.relay,
         fallbackMembers: right.invite.authorizedMemberPubkeys || []
       }).memberCount
-      const leftPeers = resolvePeerCount({ groupId: left.groupId, relay: left.relay })
-      const rightPeers = resolvePeerCount({ groupId: right.groupId, relay: right.relay })
+      const leftPeers = resolvePeerPresence({ groupId: left.groupId, scope: 'invites' })
+      const rightPeers = resolvePeerPresence({ groupId: right.groupId, scope: 'invites' })
       const leftAdmin = resolveRowAdmin({
         groupId: left.groupId,
         relay: left.relay,
@@ -780,7 +883,7 @@ const GroupsPage = forwardRef<
         case 'members':
           return compareNumbers(leftMembers, rightMembers, inviteSort.direction)
         case 'peers':
-          return compareNumbers(leftPeers, rightPeers, inviteSort.direction)
+          return compareGroupPresenceStates(leftPeers, rightPeers, inviteSort.direction)
         case 'invitedBy':
           return compareStrings(left.invitedBy.toLowerCase(), right.invitedBy.toLowerCase(), inviteSort.direction)
         case 'inviteAge': {
@@ -793,7 +896,7 @@ const GroupsPage = forwardRef<
           return compareNumbers(left.inviteDate, right.inviteDate, inviteSort.direction)
       }
     })
-  }, [filteredInviteRows, inviteSort, resolvePeerCount, resolveRowAdmin, resolveRowMembership])
+  }, [filteredInviteRows, inviteSort, resolvePeerPresence, resolveRowAdmin, resolveRowMembership])
 
   const handleUseInvite = async (inv: TGroupInvite) => {
     if (!inv) return
@@ -1051,7 +1154,7 @@ const GroupsPage = forwardRef<
                 relay: row.relay
               })
               const members = membership.members
-              const peers = resolvePeerCount({ groupId: row.groupId, relay: row.relay })
+              const peers = resolvePeerPresence({ groupId: row.groupId, scope: mode === 'my' ? 'my' : 'discover' })
               const initials = (row.name || 'GR').slice(0, 2).toUpperCase()
               return (
                 <tr
@@ -1109,8 +1212,8 @@ const GroupsPage = forwardRef<
                   <td className="px-3 py-3 align-top">
                     <MembersCell members={members} count={membership.memberCount} unknown={membership.unknown} />
                   </td>
-                  <td className="px-3 py-3 align-top text-xs text-muted-foreground">
-                    {new Intl.NumberFormat(undefined, { notation: 'compact' }).format(peers)}
+                  <td className="px-3 py-3 align-top">
+                    <PeersCell state={peers} />
                   </td>
                 </tr>
               )
@@ -1245,7 +1348,7 @@ const GroupsPage = forwardRef<
                   fallbackMembers: row.invite.authorizedMemberPubkeys || []
                 })
                 const members = membership.members
-                const peers = resolvePeerCount({ groupId: row.groupId, relay: row.relay })
+                const peers = resolvePeerPresence({ groupId: row.groupId, scope: 'invites' })
                 const initials = (row.name || 'GR').slice(0, 2).toUpperCase()
                 return (
                   <tr key={row.key} className="border-t transition-colors hover:bg-accent/30">
@@ -1301,8 +1404,8 @@ const GroupsPage = forwardRef<
                         unknown={membership.unknown}
                       />
                     </td>
-                    <td className="px-3 py-3 align-top text-xs text-muted-foreground">
-                      {new Intl.NumberFormat(undefined, { notation: 'compact' }).format(peers)}
+                    <td className="px-3 py-3 align-top">
+                      <PeersCell state={peers} />
                     </td>
                     <td className="px-3 py-3 align-top text-xs text-muted-foreground">
                       <FormattedTimestamp timestamp={row.inviteDate} />

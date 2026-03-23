@@ -71,6 +71,7 @@ const JOIN_TRACE_RELAY_IDENTIFIER_HEADER = 'x-hypertuna-relay-identifier';
 const JOIN_TRACE_ROUTE_HEADER = 'x-hypertuna-trace-route';
 const JOIN_TRACE_PURPOSE_HEADER = 'x-hypertuna-trace-purpose';
 const GATEWAY_REQUEST_ID_HEADER = 'x-hypertuna-gateway-request-id';
+const DEFAULT_RELAY_PRESENCE_FRESHNESS_MS = 2 * 60 * 1000;
 const AUTHORITATIVE_MIRROR_FAST_FORWARD_SOURCES = new Set([
   'blind-peer-mirror',
   'blind-peer-rehydrated',
@@ -1042,6 +1043,7 @@ class PublicGatewayService {
     app.post('/api/auth/challenge', (req, res) => this.#handleAuthChallenge(req, res));
     app.post('/api/auth/verify', (req, res) => this.#handleAuthVerify(req, res));
     app.get('/api/relays/:relayKey/access/challenge', (req, res) => this.#handleRelayAccessChallenge(req, res));
+    app.get('/api/relays/:relayKey/presence', (req, res) => this.#handleRelayPresence(req, res));
     app.post('/api/relays/:relayKey/open-join/pool', (req, res) => this.#handleOpenJoinPoolUpdate(req, res));
     app.get('/api/relays/:relayKey/open-join/challenge', (req, res) => this.#handleOpenJoinChallenge(req, res));
     app.post('/api/relays/:relayKey/open-join', (req, res) => this.#handleOpenJoinRequest(req, res));
@@ -1167,6 +1169,98 @@ class PublicGatewayService {
       next.lastPeerSeenAt = now;
     }
     return next;
+  }
+
+  #getRelayPresenceFreshnessMs() {
+    const configured = Number(this.config?.presence?.peerFreshnessMs);
+    if (!Number.isFinite(configured) || configured <= 0) {
+      return DEFAULT_RELAY_PRESENCE_FRESHNESS_MS;
+    }
+    return Math.max(1000, Math.trunc(configured));
+  }
+
+  #isPeerFreshForPresence(peerKey, {
+    relayKey = null,
+    now = Date.now(),
+    freshnessMs = this.#getRelayPresenceFreshnessMs()
+  } = {}) {
+    if (!peerKey || typeof peerKey !== 'string') return false;
+    const metadata = this.peerMetadata.get(peerKey);
+    if (!metadata || metadata.unreachableSince) return false;
+
+    const relays = metadata.relays instanceof Set
+      ? metadata.relays
+      : new Set(Array.isArray(metadata.relays) ? metadata.relays : []);
+    if (relayKey && relays.has(relayKey)) {
+      return true;
+    }
+
+    const freshnessCandidates = [
+      metadata.lastHealthyAt,
+      metadata.lastSeen,
+      metadata.lastRegistrationAt,
+      metadata.lastHandshakeAt
+    ]
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0);
+
+    if (!freshnessCandidates.length) return false;
+    const freshestAt = Math.max(...freshnessCandidates);
+    return (now - freshestAt) <= freshnessMs;
+  }
+
+  #buildRelayPresenceSnapshot(registration, relayKey, now = Date.now()) {
+    const resolvedRelayKey = relayKey
+      || registration?.relayKey
+      || registration?.identifier
+      || registration?.metadata?.identifier
+      || null;
+    const storedPeers = Array.from(new Set(this.#getPeersFromRegistration(registration)));
+    const livePeers = resolvedRelayKey
+      ? Array.from(new Set(this.#getLivePeersForRelay(resolvedRelayKey)))
+      : [];
+    const freshnessMs = this.#getRelayPresenceFreshnessMs();
+    const usablePeerSet = new Set();
+    const staleRegisteredPeerSet = new Set();
+
+    for (const peerKey of livePeers) {
+      if (this.#isPeerFreshForPresence(peerKey, {
+        relayKey: resolvedRelayKey,
+        now,
+        freshnessMs
+      })) {
+        usablePeerSet.add(peerKey);
+      }
+    }
+
+    for (const peerKey of storedPeers) {
+      if (this.#isPeerFreshForPresence(peerKey, {
+        relayKey: resolvedRelayKey,
+        now,
+        freshnessMs
+      })) {
+        usablePeerSet.add(peerKey);
+        continue;
+      }
+      staleRegisteredPeerSet.add(peerKey);
+    }
+
+    const directJoinOnly = registration?.metadata?.directJoinOnly === true;
+    const gatewayHealthy = !directJoinOnly;
+    const gatewayIncluded = gatewayHealthy;
+    const usablePeerCount = usablePeerSet.size;
+
+    return {
+      aggregatePeerCount: usablePeerCount + (gatewayIncluded ? 1 : 0),
+      usablePeerCount,
+      gatewayIncluded,
+      gatewayHealthy,
+      relayRegistered: true,
+      verifiedAt: now,
+      registeredPeerCount: storedPeers.length,
+      staleRegisteredPeerCount: staleRegisteredPeerSet.size,
+      source: 'gateway'
+    };
   }
 
   async #runRelayGarbageCollection() {
@@ -2111,6 +2205,27 @@ class PublicGatewayService {
     const direct = await this.registrationStore.getRelay(identifier);
     if (direct) {
       return { relayKey: identifier, record: direct };
+    }
+
+    return null;
+  }
+
+  async #resolveRelayRegistration(identifier) {
+    if (!identifier) return null;
+    const resolved = await this.#resolveOpenJoinRegistration(identifier);
+    if (resolved?.relayKey && resolved?.record) {
+      return resolved;
+    }
+
+    const aliasRelayKey = await this.#resolveRelayAlias(identifier);
+    if (aliasRelayKey && this.#isHexRelayKey(aliasRelayKey)) {
+      const record = await this.registrationStore.getRelay(aliasRelayKey);
+      if (record) {
+        return {
+          relayKey: aliasRelayKey,
+          record
+        };
+      }
     }
 
     return null;
@@ -4982,6 +5097,41 @@ class PublicGatewayService {
       challenge,
       expiresAt
     });
+  }
+
+  async #handleRelayPresence(req, res) {
+    const identifier = req.params?.relayKey;
+    if (!identifier) {
+      return res.status(400).json({ error: 'relayKey is required' });
+    }
+
+    try {
+      const resolved = await this.#resolveRelayRegistration(identifier);
+      if (!resolved?.relayKey || !resolved?.record) {
+        return res.status(404).json({
+          error: 'relay-not-found',
+          relayRegistered: false,
+          gatewayHealthy: false,
+          gatewayIncluded: false
+        });
+      }
+
+      const { relayKey, record } = resolved;
+      const publicIdentifier = record?.metadata?.identifier || relayKey;
+      const snapshot = this.#buildRelayPresenceSnapshot(record, relayKey);
+
+      return res.json({
+        relayKey,
+        publicIdentifier,
+        ...snapshot
+      });
+    } catch (error) {
+      this.logger?.warn?.('[PublicGateway] Failed to resolve relay presence', {
+        identifier,
+        error: error?.message || error
+      });
+      return res.status(500).json({ error: 'relay-presence-failed' });
+    }
   }
 
   async #handleRelayMemberAuthorize(req, res) {

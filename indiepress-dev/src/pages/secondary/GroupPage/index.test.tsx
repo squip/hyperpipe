@@ -142,7 +142,22 @@ vi.mock('@/providers/WorkerBridgeProvider', () => ({
     relays: [],
     sendToWorker: vi.fn(async () => ({})),
     relayServerReady: false,
-    refreshRelaySubscriptions: vi.fn(async () => ({}))
+    refreshRelaySubscriptions: vi.fn(async () => ({})),
+    probeGroupPresence: vi.fn(async () => ({
+      count: 2,
+      status: 'ready',
+      source: 'gateway',
+      gatewayIncluded: true,
+      gatewayHealthy: true,
+      lastUpdatedAt: Date.now(),
+      unknown: false,
+      error: null,
+      verifiedAt: Date.now(),
+      usablePeerCount: 1,
+      aggregatePeerCount: 2,
+      registeredPeerCount: 1,
+      staleRegisteredPeerCount: 0
+    }))
   })
 }))
 
@@ -173,11 +188,12 @@ vi.mock('@/devtools/closedJoinSimulator', () => ({
 import GroupPage from '@/pages/secondary/GroupPage'
 
 describe('GroupPage canonical membership rendering', () => {
-  it('uses one canonical member set for the header, badge, and member list', async () => {
+  it('uses one canonical member set for the header, badge, member list, and peers chip', async () => {
     render(<GroupPage id="group-1" relay="wss://relay.example" />)
 
     expect(await screen.findByText(/3 members/i)).toBeInTheDocument()
     expect(screen.getByText('Members (3)')).toBeInTheDocument()
+    expect(await screen.findByText(/2 peers online/i)).toBeInTheDocument()
 
     await waitFor(() => {
       expect(screen.getAllByText('alice').length).toBeGreaterThan(0)

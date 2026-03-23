@@ -19,7 +19,7 @@ import {
 } from '@/services/electron-ipc.service'
 import { isElectron } from '@/lib/platform'
 import { useNostr } from '@/providers/NostrProvider'
-import type { TGroupGatewayAccess } from '@/types/groups'
+import type { TGroupGatewayAccess, TGroupPresenceInput, TGroupPresenceProbeResult } from '@/types/groups'
 
 type WorkerStatusPhase =
   | 'starting'
@@ -214,6 +214,7 @@ type WorkerBridgeContextValue = {
   getRelayPeerCount: (identifier?: string | null) => number
   getRelayPeerSet: (identifier?: string | null) => Set<string>
   isMemberOnline: (pubkey: string, identifier?: string | null) => boolean
+  probeGroupPresence: (args: TGroupPresenceInput & { timeoutMs?: number }) => Promise<TGroupPresenceProbeResult>
   startWorker: () => Promise<void>
   stopWorker: () => Promise<void>
   restartWorker: () => Promise<void>
@@ -1736,6 +1737,80 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
     [startWorkerInternal, statusV1]
   )
 
+  const probeGroupPresenceInternal = useCallback(
+    async ({
+      groupId,
+      relay,
+      gatewayId,
+      gatewayOrigin,
+      directJoinOnly,
+      discoveryTopic,
+      hostPeerKeys,
+      leaseReplicaPeerKeys,
+      timeoutMs = 8_000
+    }: TGroupPresenceInput & { timeoutMs?: number }): Promise<TGroupPresenceProbeResult> => {
+      const unknownResult: TGroupPresenceProbeResult = {
+        count: null,
+        status: 'unknown',
+        source: 'unknown',
+        gatewayIncluded: false,
+        gatewayHealthy: false,
+        lastUpdatedAt: null,
+        unknown: true,
+        error: null,
+        verifiedAt: null,
+        usablePeerCount: null,
+        aggregatePeerCount: null,
+        registeredPeerCount: null,
+        staleRegisteredPeerCount: null
+      }
+
+      if (!isElectron()) {
+        return {
+          ...unknownResult,
+          error: 'electron-ipc-unavailable'
+        }
+      }
+      if (!statusV1) {
+        await startWorkerInternal({ resetRestartAttempts: false })
+      }
+
+      const result = await electronIpc.sendToWorkerAwait({
+        message: {
+          type: 'probe-group-presence',
+          data: {
+            groupId,
+            relay,
+            gatewayId,
+            gatewayOrigin,
+            directJoinOnly,
+            discoveryTopic,
+            hostPeerKeys,
+            leaseReplicaPeerKeys,
+            timeoutMs
+          }
+        },
+        timeoutMs: Number.isFinite(timeoutMs)
+          ? Math.max(1_000, Math.min(Number(timeoutMs), 30_000))
+          : 8_000
+      })
+
+      if (result && typeof result === 'object' && 'success' in result && (result as any).success === false) {
+        throw new Error((result as any).error || 'Worker rejected message')
+      }
+
+      const data = (result as any)?.data ?? result
+      if (!data || typeof data !== 'object') {
+        return {
+          ...unknownResult,
+          error: 'group-presence-empty-response'
+        }
+      }
+      return data as TGroupPresenceProbeResult
+    },
+    [startWorkerInternal, statusV1]
+  )
+
   const value = useMemo<WorkerBridgeContextValue>(
     () => ({
       isElectron: isElectron(),
@@ -1760,6 +1835,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       getRelayPeerCount,
       getRelayPeerSet,
       isMemberOnline,
+      probeGroupPresence: probeGroupPresenceInternal,
       startWorker: async () => {
         setSessionStopRequested(false)
         await startWorkerInternal({ resetRestartAttempts: true })
@@ -1835,6 +1911,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
       ready,
       relayServerReady,
       relays,
+      probeGroupPresenceInternal,
       refreshRelaySubscriptionsInternal,
       sessionStopRequested,
       setAutostartEnabled,

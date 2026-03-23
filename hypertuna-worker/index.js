@@ -226,6 +226,18 @@ const JOIN_PROBE_TIMEOUT_MS = resolveTimeoutEnvMs('JOIN_PROBE_TIMEOUT_MS', 1500,
 })
 const JOIN_MAX_PROBE_CANDIDATES = 12
 const JOIN_RECENT_FAILURE_DEMOTE_MS = 10 * 60 * 1000
+const GROUP_PRESENCE_GATEWAY_TIMEOUT_MS = resolveTimeoutEnvMs('GROUP_PRESENCE_GATEWAY_TIMEOUT_MS', 5000, {
+  minMs: 250
+})
+const GROUP_PRESENCE_DISCOVERY_TIMEOUT_MS = resolveTimeoutEnvMs('GROUP_PRESENCE_DISCOVERY_TIMEOUT_MS', 4000, {
+  minMs: 250
+})
+const GROUP_PRESENCE_PROBE_TIMEOUT_MS = resolveTimeoutEnvMs(
+  'GROUP_PRESENCE_PROBE_TIMEOUT_MS',
+  JOIN_PROBE_TIMEOUT_MS,
+  { minMs: 100 }
+)
+const GROUP_PRESENCE_MAX_PROBE_CANDIDATES = 8
 const JOIN_EXECUTION_BUDGET_MS = resolveTimeoutEnvMs('JOIN_EXECUTION_BUDGET_MS', 44000, {
   minMs: 1000
 })
@@ -1259,6 +1271,291 @@ function withTimeout(promise, timeoutMs, errorMessage = 'Operation timed out') {
         reject(error)
       })
   })
+}
+
+function createGroupPresenceResult({
+  count = null,
+  status = 'unknown',
+  source = 'unknown',
+  gatewayIncluded = false,
+  gatewayHealthy = false,
+  verifiedAt = null,
+  usablePeerCount = null,
+  aggregatePeerCount = null,
+  registeredPeerCount = null,
+  staleRegisteredPeerCount = null,
+  error = null
+} = {}) {
+  const normalizedCount = Number.isFinite(count) ? Math.max(0, Math.trunc(count)) : null
+  const normalizedAggregate = Number.isFinite(aggregatePeerCount)
+    ? Math.max(0, Math.trunc(aggregatePeerCount))
+    : normalizedCount
+  const normalizedUsable = Number.isFinite(usablePeerCount)
+    ? Math.max(0, Math.trunc(usablePeerCount))
+    : normalizedCount
+  const normalizedVerifiedAt = Number.isFinite(verifiedAt) ? Math.trunc(verifiedAt) : null
+  return {
+    count: normalizedAggregate,
+    status,
+    source,
+    gatewayIncluded: gatewayIncluded === true,
+    gatewayHealthy: gatewayHealthy === true,
+    lastUpdatedAt: normalizedVerifiedAt,
+    unknown: status === 'unknown' || normalizedAggregate === null,
+    error: typeof error === 'string' && error.trim() ? error.trim() : null,
+    verifiedAt: normalizedVerifiedAt,
+    usablePeerCount: normalizedUsable,
+    aggregatePeerCount: normalizedAggregate,
+    registeredPeerCount: Number.isFinite(registeredPeerCount)
+      ? Math.max(0, Math.trunc(registeredPeerCount))
+      : null,
+    staleRegisteredPeerCount: Number.isFinite(staleRegisteredPeerCount)
+      ? Math.max(0, Math.trunc(staleRegisteredPeerCount))
+      : null
+  }
+}
+
+async function fetchGatewayRelayPresence({
+  gatewayOrigin = null,
+  relayIdentifier = null,
+  timeoutMs = GROUP_PRESENCE_GATEWAY_TIMEOUT_MS
+} = {}) {
+  const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin)
+  const normalizedRelayIdentifier = normalizeRoutePublicIdentifier(relayIdentifier)
+  if (!normalizedGatewayOrigin || !normalizedRelayIdentifier) {
+    throw new Error('gateway-presence-invalid-input')
+  }
+
+  const url = new URL(
+    `/api/relays/${encodeURIComponent(normalizedRelayIdentifier)}/presence`,
+    normalizedGatewayOrigin
+  )
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), Math.max(250, timeoutMs))
+  timer.unref?.()
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        accept: 'application/json'
+      },
+      signal: controller.signal
+    })
+    const payload = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      throw new Error(
+        typeof payload?.error === 'string' && payload.error.trim()
+          ? payload.error.trim()
+          : `gateway-presence-status-${response.status}`
+      )
+    }
+    return createGroupPresenceResult({
+      count: payload?.aggregatePeerCount,
+      status: 'ready',
+      source: 'gateway',
+      gatewayIncluded: payload?.gatewayIncluded === true,
+      gatewayHealthy: payload?.gatewayHealthy === true,
+      verifiedAt: payload?.verifiedAt,
+      usablePeerCount: payload?.usablePeerCount,
+      aggregatePeerCount: payload?.aggregatePeerCount,
+      registeredPeerCount: payload?.registeredPeerCount,
+      staleRegisteredPeerCount: payload?.staleRegisteredPeerCount
+    })
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error('gateway-presence-timeout')
+    }
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function probeGroupPresenceDirect({
+  publicIdentifier = null,
+  discoveryTopic = null,
+  hostPeerKeys = [],
+  leaseReplicaPeerKeys = []
+} = {}) {
+  const normalizedPublicIdentifier = normalizeRoutePublicIdentifier(publicIdentifier)
+  if (!normalizedPublicIdentifier) {
+    return createGroupPresenceResult({
+      status: 'unknown',
+      source: 'direct-probe',
+      error: 'group-presence-missing-identifier'
+    })
+  }
+  if (!relayServer?.probeJoinCapabilities) {
+    return createGroupPresenceResult({
+      status: 'unknown',
+      source: 'direct-probe',
+      error: 'relay-server-not-ready'
+    })
+  }
+
+  const normalizedHostPeerKeys = normalizePeerKeyList(hostPeerKeys)
+  const normalizedLeaseReplicaPeerKeys = normalizePeerKeyList(leaseReplicaPeerKeys)
+  let normalizedDiscoveryTopic =
+    typeof discoveryTopic === 'string' && discoveryTopic.trim()
+      ? discoveryTopic.trim()
+      : null
+  if (!normalizedDiscoveryTopic && relayServer?.deriveRelayDiscoveryTopic) {
+    normalizedDiscoveryTopic = relayServer.deriveRelayDiscoveryTopic(normalizedPublicIdentifier)
+  }
+
+  let topicPeerKeys = []
+  let discoveryError = null
+  if (normalizedDiscoveryTopic && relayServer?.discoverPeersOnTopic) {
+    try {
+      const discoveredPeers = await withTimeout(
+        relayServer.discoverPeersOnTopic({
+          topicHex: normalizedDiscoveryTopic,
+          timeoutMs: GROUP_PRESENCE_DISCOVERY_TIMEOUT_MS,
+          maxPeers: GROUP_PRESENCE_MAX_PROBE_CANDIDATES
+        }),
+        GROUP_PRESENCE_DISCOVERY_TIMEOUT_MS + 250,
+        'group-presence-discovery-timeout'
+      )
+      topicPeerKeys = normalizePeerKeyList(discoveredPeers || [])
+    } catch (error) {
+      discoveryError = error?.message || String(error)
+      console.warn('[Worker] group presence discovery failed', {
+        publicIdentifier: normalizedPublicIdentifier,
+        discoveryTopic: previewValue(normalizedDiscoveryTopic, 16),
+        error: discoveryError
+      })
+    }
+  }
+
+  const {
+    candidatePeers
+  } = buildProbeCandidatePeers({
+    hostPeerKeys: normalizedHostPeerKeys,
+    leaseReplicaPeerKeys: normalizedLeaseReplicaPeerKeys,
+    topicPeerKeys,
+    capabilityByPeer: {},
+    maxCandidates: GROUP_PRESENCE_MAX_PROBE_CANDIDATES
+  })
+
+  const hadProbeInputs =
+    normalizedHostPeerKeys.length > 0
+    || normalizedLeaseReplicaPeerKeys.length > 0
+    || !!normalizedDiscoveryTopic
+
+  if (!candidatePeers.length) {
+    if (discoveryError && !hadProbeInputs) {
+      return createGroupPresenceResult({
+        status: 'error',
+        source: 'direct-probe',
+        error: discoveryError
+      })
+    }
+    return createGroupPresenceResult({
+      count: hadProbeInputs ? 0 : null,
+      status: hadProbeInputs ? 'ready' : 'unknown',
+      source: 'direct-probe',
+      verifiedAt: Date.now(),
+      usablePeerCount: hadProbeInputs ? 0 : null,
+      aggregatePeerCount: hadProbeInputs ? 0 : null,
+      error: discoveryError
+    })
+  }
+
+  const probeResults = await Promise.all(
+    candidatePeers.map(async (peerKey) => {
+      const result = await withTimeout(
+        relayServer.probeJoinCapabilities({
+          peerKey,
+          publicIdentifier: normalizedPublicIdentifier,
+          timeoutMs: GROUP_PRESENCE_PROBE_TIMEOUT_MS
+        }),
+        GROUP_PRESENCE_PROBE_TIMEOUT_MS + 250,
+        `group-presence-probe-timeout (${peerKey.slice(0, 8)})`
+      ).catch((error) => ({
+        success: false,
+        supported: false,
+        statusCode: null,
+        error: error?.message || String(error)
+      }))
+
+      return {
+        peerKey,
+        success: result?.success === true
+      }
+    })
+  )
+
+  const responsivePeers = normalizePeerKeyList(
+    probeResults
+      .filter((result) => result.success === true)
+      .map((result) => result.peerKey)
+  )
+
+  return createGroupPresenceResult({
+    count: responsivePeers.length,
+    status: 'ready',
+    source: 'direct-probe',
+    verifiedAt: Date.now(),
+    usablePeerCount: responsivePeers.length,
+    aggregatePeerCount: responsivePeers.length,
+    error: discoveryError
+  })
+}
+
+async function probeGroupPresence(payload = {}) {
+  const data = payload && typeof payload === 'object' ? payload : {}
+  const publicIdentifier = normalizeRoutePublicIdentifier(
+    data.publicIdentifier || data.groupId || null
+  )
+  if (!publicIdentifier) {
+    return createGroupPresenceResult({
+      status: 'unknown',
+      source: 'unknown',
+      error: 'group-presence-missing-identifier'
+    })
+  }
+
+  const gatewayRouteInput = normalizeGatewayRouteInput(data)
+  let gatewayError = null
+
+  if (!gatewayRouteInput.directJoinOnly && gatewayRouteInput.gatewayOrigin) {
+    try {
+      const gatewayPresence = await fetchGatewayRelayPresence({
+        gatewayOrigin: gatewayRouteInput.gatewayOrigin,
+        relayIdentifier: publicIdentifier,
+        timeoutMs: Number.isFinite(Number(data.timeoutMs))
+          ? Number(data.timeoutMs)
+          : GROUP_PRESENCE_GATEWAY_TIMEOUT_MS
+      })
+      if (gatewayPresence.gatewayHealthy) {
+        return gatewayPresence
+      }
+      gatewayError = gatewayPresence.error || 'gateway-presence-unhealthy'
+    } catch (error) {
+      gatewayError = error?.message || String(error)
+      console.warn('[Worker] gateway presence probe failed', {
+        publicIdentifier,
+        gatewayOrigin: gatewayRouteInput.gatewayOrigin,
+        error: gatewayError
+      })
+    }
+  }
+
+  const directResult = await probeGroupPresenceDirect({
+    publicIdentifier,
+    discoveryTopic: data.discoveryTopic || null,
+    hostPeerKeys: data.hostPeerKeys || [],
+    leaseReplicaPeerKeys: data.leaseReplicaPeerKeys || []
+  })
+
+  if (gatewayError && !directResult.error) {
+    return {
+      ...directResult,
+      error: gatewayError
+    }
+  }
+  return directResult
 }
 
 function normalizeOpenJoinCoreEntry(entry) {
@@ -10285,6 +10582,25 @@ async function handleMessageObject(message) {
             throw new Error('gateway-member-grant-missing')
           }
           sendWorkerResponse(requestId, { success: true, data: responseData })
+        } catch (error) {
+          sendWorkerResponse(requestId, {
+            success: false,
+            error: error?.message || String(error)
+          })
+        }
+      }
+      break
+
+    case 'probe-group-presence':
+      {
+        const requestId = extractMessageRequestId(message)
+        const payload = (message && typeof message === 'object' ? message.data : null) || {}
+        try {
+          const result = await probeGroupPresence(payload)
+          sendWorkerResponse(requestId, {
+            success: true,
+            data: result
+          })
         } catch (error) {
           sendWorkerResponse(requestId, {
             success: false,
