@@ -3,7 +3,7 @@ import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import SecondaryPageLayout from '@/layouts/SecondaryPageLayout'
 import { useGroups } from '@/providers/GroupsProvider'
-import { TPageRef } from '@/types'
+import { TFeedSubRequest, TPageRef } from '@/types'
 import { useTranslation } from 'react-i18next'
 import { forwardRef, useEffect, useMemo, useRef, useState } from 'react'
 import { Event as NostrEvent } from '@nostr/tools/wasm'
@@ -78,6 +78,16 @@ type TJoinFlowHintFields = {
 const RELAY_SUBSCRIPTION_REFRESH_NO_CLIENT_RETRY_ATTEMPTS = 6
 const RELAY_SUBSCRIPTION_REFRESH_RETRY_BASE_DELAY_MS = 250
 const RELAY_SUBSCRIPTION_REFRESH_RETRY_MAX_DELAY_MS = 1500
+const GROUP_PAGE_FEED_GROUP_KINDS = [
+  39000, 39001, 39002, 39003, 9000, 9001, 9002, 9005, 9007, 9008, 9009, 9021, 9022
+]
+const GROUP_PAGE_FEED_TIMELINE_KINDS = [
+  1, 6, 20, 21, 22, 1063, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089
+]
+const GROUP_PAGE_FEED_ALL_KINDS = [
+  ...GROUP_PAGE_FEED_GROUP_KINDS,
+  ...GROUP_PAGE_FEED_TIMELINE_KINDS
+]
 
 function toJoinFlowHintFields(value: unknown): TJoinFlowHintFields {
   if (!value || typeof value !== 'object') return {}
@@ -1042,31 +1052,50 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
         shouldWaitForLocalRelayReady ||
         (!activeGroupRelay && BIG_RELAY_URLS.length === 0))
   )
+  const shouldWarmHydrateLocalGroupNotes = Boolean(groupId && isInMyGroups)
 
   const groupSubRequests = useMemo(
-    () =>
-      groupId
-        ? shouldGateGroupSubRequests
-          ? []
-          : [
-              {
-                source: 'relays' as const,
-                urls: activeGroupRelay ? [activeGroupRelay] : BIG_RELAY_URLS,
-                filter: {
-                  '#h': [groupId],
-                  kinds: [
-                    // Core group metadata / membership / admin
-                    39000, 39001, 39002, 39003,
-                    // Hypertuna/NIP-29 flows
-                    9000, 9001, 9002, 9005, 9007, 9008, 9009, 9021, 9022,
-                    // Timeline kinds (retain existing set)
-                    1, 6, 20, 21, 22, 1063, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089
-                  ]
-                }
-              }
-            ]
-        : [],
-    [groupId, activeGroupRelay, shouldGateGroupSubRequests, joinRelayRefreshNonce]
+    (): TFeedSubRequest[] => {
+      if (!groupId) return []
+
+      const filter = {
+        '#h': [groupId],
+        kinds: GROUP_PAGE_FEED_ALL_KINDS
+      }
+      const requests: TFeedSubRequest[] = []
+
+      if (shouldWarmHydrateLocalGroupNotes) {
+        requests.push({
+          source: 'local',
+          filter
+        })
+      }
+
+      if (shouldGateGroupSubRequests) {
+        return requests
+      }
+
+      requests.push({
+        source: 'relays',
+        urls: activeGroupRelay ? [activeGroupRelay] : BIG_RELAY_URLS,
+        filter,
+        warmHydrateFromLocalCache: shouldWarmHydrateLocalGroupNotes && Boolean(activeGroupRelay),
+        relaySinceOverlapSeconds: 10
+      })
+
+      return requests
+    },
+    [
+      groupId,
+      activeGroupRelay,
+      shouldGateGroupSubRequests,
+      shouldWarmHydrateLocalGroupNotes,
+      joinRelayRefreshNonce
+    ]
+  )
+  const hasGroupRelaySubRequest = useMemo(
+    () => groupSubRequests.some((request) => request.source === 'relays'),
+    [groupSubRequests]
   )
 
   const groupFileSubRequests = useMemo(
@@ -1093,7 +1122,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   }, [groupId, activeGroupRelay])
 
   useEffect(() => {
-    if (!groupId || !activeGroupRelay || groupSubRequests.length === 0) return
+    if (!groupId || !activeGroupRelay || !hasGroupRelaySubRequest) return
     const warmupKey = `${groupId}|${activeGroupRelay}`
     if (groupRelayWarmupKeyRef.current === warmupKey) return
     groupRelayWarmupKeyRef.current = warmupKey
@@ -1101,9 +1130,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     client
       .loadMoreTimeline(groupSubRequests, {
         '#h': [groupId],
-        kinds: [
-          9000, 9001, 1, 6, 20, 21, 22, 1063, 1068, 1111, 1222, 1244, 9802, 30023, 31987, 39089
-        ],
+        kinds: [9000, 9001, ...GROUP_PAGE_FEED_TIMELINE_KINDS],
         limit: 1
       })
       .then((_events) => {
@@ -1120,7 +1147,7 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
     return () => {
       active = false
     }
-  }, [groupId, activeGroupRelay, groupSubRequests])
+  }, [groupId, activeGroupRelay, groupSubRequests, hasGroupRelaySubRequest])
 
   const isHypertunaGroup = useMemo(() => {
     const tags = detail?.metadata?.event?.tags

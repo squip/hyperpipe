@@ -1,4 +1,5 @@
 import GroupFilesTable from '@/components/GroupFilesTable'
+import { extendFeedSubRequestsWithLocal } from '@/lib/feed-subrequests'
 import { GroupFileRecord, parseGroupFileRecordFromEvent } from '@/lib/group-files'
 import { useNostr } from '@/providers/NostrProvider'
 import client from '@/services/client.service'
@@ -44,34 +45,6 @@ function buildCacheKey(groupId: string, subRequests: TFeedSubRequest[]) {
   return `${groupId}|${relayUrls || 'local'}`
 }
 
-function buildFilterSignature(filter: Record<string, unknown>) {
-  return JSON.stringify(filter)
-}
-
-function extendWithLocalSubRequests(subRequests: TFeedSubRequest[]) {
-  const localBySignature = new Map<string, Extract<TFeedSubRequest, { source: 'local' }>>()
-  const relayRequests: Extract<TFeedSubRequest, { source: 'relays' }>[] = []
-
-  for (const request of subRequests) {
-    if (request.source === 'local') {
-      localBySignature.set(buildFilterSignature(request.filter), request)
-      continue
-    }
-    relayRequests.push(request)
-  }
-
-  for (const request of relayRequests) {
-    const signature = buildFilterSignature(request.filter)
-    if (localBySignature.has(signature)) continue
-    localBySignature.set(signature, {
-      source: 'local',
-      filter: request.filter
-    })
-  }
-
-  return [...localBySignature.values(), ...relayRequests]
-}
-
 export default function GroupFilesList({
   groupId,
   subRequests,
@@ -87,7 +60,7 @@ export default function GroupFilesList({
   const [loading, setLoading] = useState(false)
 
   const scopedSubRequests = useMemo(
-    () => extendWithLocalSubRequests(subRequests),
+    () => extendFeedSubRequestsWithLocal(subRequests),
     [subRequests]
   )
 

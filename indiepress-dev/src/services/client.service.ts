@@ -1,4 +1,8 @@
 import { BIG_RELAY_URLS, DEFAULT_RELAY_LIST, ExtendedKind } from '@/constants'
+import {
+  applyWarmHydrationCursorToRelayFilter,
+  DEFAULT_WARM_HYDRATION_OVERLAP_SECONDS
+} from '@/lib/feed-subrequests'
 import { isValidPubkey } from '@/lib/pubkey'
 import { tagNameEquals } from '@/lib/tag'
 import { isLocalNetworkUrl, normalizeUrl } from '@/lib/url'
@@ -509,12 +513,15 @@ class ClientService extends EventTarget {
       .filter(
         (req): req is Extract<TFeedSubRequest, { source: 'relays' }> => req.source === 'relays'
       )
-      .map(({ urls, filter }) => ({
+      .map(({ urls, filter, warmHydrateFromLocalCache, relaySinceOverlapSeconds }) => ({
         urls: this.resolveFetchRelayUrls(urls),
         filter: {
           ...filter,
           ...filterModification
-        }
+        },
+        warmHydrateFromLocalCache: warmHydrateFromLocalCache === true,
+        relaySinceOverlapSeconds:
+          typeof relaySinceOverlapSeconds === 'number' ? relaySinceOverlapSeconds : undefined
       }))
       .filter(({ urls }) => urls.length > 0)
     const relayUrls = Array.from(
@@ -630,78 +637,110 @@ class ClientService extends EventTarget {
         : new Promise<NostrEvent[]>((resolve) => {
             let eosed = false
 
-            // keep track of relay URLs so onclose callbacks can map reasons to relays
-            const closeUrls: string[] = []
+            const startNetworkSubscription = async () => {
+              let effectiveRelayRequests = relayRequests.map(
+                ({ urls, filter }) => ({ urls, filter })
+              )
 
-            let events: NostrEvent[] = []
-            subc = pool.subscribeMap(
-              relayRequests.flatMap(({ urls: requestUrls, filter }) =>
-                requestUrls.flatMap((url) => {
-                  if (!closeUrls.includes(url)) closeUrls.push(url)
-                  return { url, filter }
-                })
-              ),
-              {
-                label: resolvedTimelineLabel,
-                onevent: (evt) => {
-                  if (!eosed) {
-                    events.push(evt)
-                  } else {
-                    onNew(evt)
-                  }
-
-                  // Always persist relay timeline events locally.
-                  // Group relays are often relay-only subscriptions, so gating this on localFilters
-                  // causes click-through fetches (NotePage, replies, etc.) to miss cached events.
-                  this.addEventToCache(evt)
-                },
-                oneose() {
-                  eosed = true
-                  resolve(events)
-                  events = []
-                },
-                onauth: (async (authEvt) => {
-                  // already logged in
-                  if (this.signer) {
-                    const evt = await this.signer!.signEvent(authEvt)
-                    if (!evt) {
-                      throw new Error('sign event failed')
-                    }
-                    return evt as VerifiedEvent
-                  }
-
-                  // open login dialog
-                  if (startLogin) {
-                    startLogin()
-                  }
-
-                  throw new Error(
-                    "<not logged in, can't auth to relay during this.subscribeTimeline>"
+              if (
+                localFilters.length > 0 &&
+                relayRequests.some((request) => request.warmHydrateFromLocalCache)
+              ) {
+                const [, newestLocalEvent] = await local.catch(() => [[], undefined, []] as const)
+                if (abort.signal.aborted) {
+                  resolve([])
+                  return
+                }
+                if (newestLocalEvent) {
+                  effectiveRelayRequests = relayRequests.map(
+                    ({ urls, filter, warmHydrateFromLocalCache, relaySinceOverlapSeconds }) => ({
+                      urls,
+                      filter: warmHydrateFromLocalCache
+                        ? applyWarmHydrationCursorToRelayFilter(
+                            filter,
+                            newestLocalEvent.created_at,
+                            relaySinceOverlapSeconds ?? DEFAULT_WARM_HYDRATION_OVERLAP_SECONDS
+                          )
+                        : filter
+                    })
                   )
-                }) as (event: EventTemplate) => Promise<VerifiedEvent>,
-                onclose: (reasons) => {
-                  this.applyFetchCloseReasons(closeUrls.length ? closeUrls : relayUrls, reasons)
-                  const closeReport = reasons.map((reason, index) => ({
-                    url: closeUrls[index] || relayUrls[index],
-                    reason
-                  }))
-                  debugTimeline('[subscribeTimeline] onclose', {
-                    label: resolvedTimelineLabel,
-                    subscriptionId,
-                    reasons: closeReport
-                  })
-                  if (onClose) {
-                    for (let i = 0; i < reasons.length; i++) {
-                      const reason = reasons[i]
-                      const url = closeUrls[i] || relayUrls[i]
-                      if (!url) continue
-                      onClose(url, reason)
-                    }
-                  }
-                  resolve(events)
                 }
               }
-            )
+
+              const closeUrls: string[] = []
+              let events: NostrEvent[] = []
+
+              subc = pool.subscribeMap(
+                effectiveRelayRequests.flatMap(({ urls: requestUrls, filter }) =>
+                  requestUrls.flatMap((url) => {
+                    if (!closeUrls.includes(url)) closeUrls.push(url)
+                    return { url, filter }
+                  })
+                ),
+                {
+                  label: resolvedTimelineLabel,
+                  onevent: (evt) => {
+                    if (!eosed) {
+                      events.push(evt)
+                    } else {
+                      onNew(evt)
+                    }
+
+                    // Always persist relay timeline events locally.
+                    // Group relays are often relay-only subscriptions, so gating this on localFilters
+                    // causes click-through fetches (NotePage, replies, etc.) to miss cached events.
+                    this.addEventToCache(evt)
+                  },
+                  oneose() {
+                    eosed = true
+                    resolve(events)
+                    events = []
+                  },
+                  onauth: (async (authEvt) => {
+                    // already logged in
+                    if (this.signer) {
+                      const evt = await this.signer!.signEvent(authEvt)
+                      if (!evt) {
+                        throw new Error('sign event failed')
+                      }
+                      return evt as VerifiedEvent
+                    }
+
+                    // open login dialog
+                    if (startLogin) {
+                      startLogin()
+                    }
+
+                    throw new Error(
+                      "<not logged in, can't auth to relay during this.subscribeTimeline>"
+                    )
+                  }) as (event: EventTemplate) => Promise<VerifiedEvent>,
+                  onclose: (reasons) => {
+                    this.applyFetchCloseReasons(closeUrls.length ? closeUrls : relayUrls, reasons)
+                    const closeReport = reasons.map((reason, index) => ({
+                      url: closeUrls[index] || relayUrls[index],
+                      reason
+                    }))
+                    debugTimeline('[subscribeTimeline] onclose', {
+                      label: resolvedTimelineLabel,
+                      subscriptionId,
+                      reasons: closeReport
+                    })
+                    if (onClose) {
+                      for (let i = 0; i < reasons.length; i++) {
+                        const reason = reasons[i]
+                        const url = closeUrls[i] || relayUrls[i]
+                        if (!url) continue
+                        onClose(url, reason)
+                      }
+                    }
+                    resolve(events)
+                  }
+                }
+              )
+            }
+
+            void startNetworkSubscription()
           })
 
     if (localFilters.length > 0 && relayRequests.length > 0) {
@@ -811,26 +850,82 @@ class ClientService extends EventTarget {
       .filter(
         (req): req is Extract<TFeedSubRequest, { source: 'relays' }> => req.source === 'relays'
       )
-      .map(({ urls, filter }) => ({
+      .map(({ urls, filter, warmHydrateFromLocalCache, relaySinceOverlapSeconds }) => ({
         urls: this.resolveFetchRelayUrls(urls),
         filter: {
           ...filter,
           ...filterModification
-        }
+        },
+        warmHydrateFromLocalCache: warmHydrateFromLocalCache === true,
+        relaySinceOverlapSeconds:
+          typeof relaySinceOverlapSeconds === 'number' ? relaySinceOverlapSeconds : undefined
       }))
       .filter(({ urls }) => urls.length > 0)
-    const relayUrls = Array.from(
-      new Set(relayRequests.flatMap(({ urls }) => urls))
-    )
+
+    // do local requests
+    const local =
+      localFilters.length === 0
+        ? Promise.resolve({ events: [] as NostrEvent[], newestEvent: undefined as NostrEvent | undefined })
+        : (async () => {
+            const events: NostrEvent[] = new Array(200)
+            let f = 0
+            let newestEvent: NostrEvent | undefined
+            for (let i = 0; i < localFilters.length; i++) {
+              const filter = localFilters[i]
+              for await (const event of store.queryEvents(filter, 5_000)) {
+                events[f] = event
+                f++
+                if (!newestEvent || newestEvent.created_at < event.created_at) {
+                  newestEvent = event
+                }
+              }
+            }
+            events.length = f
+            return { events, newestEvent }
+          })()
+
+    const shouldApplyWarmHydrationCursor =
+      typeof filterModification.until !== 'number' &&
+      localFilters.length > 0 &&
+      relayRequests.some((request) => request.warmHydrateFromLocalCache)
 
     // do relay requests
     const network =
       relayRequests.length === 0
         ? Promise.resolve([])
-        : await new Promise<NostrEvent[]>((resolve) => {
+        : await new Promise<NostrEvent[]>(async (resolve) => {
+            const localNewestEvent = shouldApplyWarmHydrationCursor
+              ? (await local.catch(() => ({
+                  events: [] as NostrEvent[],
+                  newestEvent: undefined as NostrEvent | undefined
+                }))).newestEvent
+              : undefined
+            const effectiveRelayRequests = relayRequests.map(
+              ({ urls, filter, warmHydrateFromLocalCache, relaySinceOverlapSeconds }) => ({
+                urls,
+                filter:
+                  warmHydrateFromLocalCache && localNewestEvent
+                    ? applyWarmHydrationCursorToRelayFilter(
+                        filter,
+                        localNewestEvent.created_at,
+                        relaySinceOverlapSeconds ?? DEFAULT_WARM_HYDRATION_OVERLAP_SECONDS
+                      )
+                    : filter
+              })
+            )
+            const relayUrls = Array.from(
+              new Set(effectiveRelayRequests.flatMap(({ urls }) => urls))
+            )
+            if (relayUrls.length === 0) {
+              resolve([])
+              return
+            }
+
             const events: NostrEvent[] = []
             const subc = pool.subscribeMap(
-              relayRequests.flatMap(({ urls, filter }) => urls.flatMap((url) => ({ url, filter }))),
+              effectiveRelayRequests.flatMap(({ urls, filter }) =>
+                urls.flatMap((url) => ({ url, filter }))
+              ),
               {
                 label: 'f-more',
                 onevent: (evt) => {
@@ -877,25 +972,8 @@ class ClientService extends EventTarget {
             )
           })
 
-    // do local requests
-    const local =
-      localFilters.length === 0
-        ? Promise.resolve([])
-        : (async () => {
-            const events: NostrEvent[] = new Array(200)
-            let f = 0
-            for (let i = 0; i < localFilters.length; i++) {
-              const filter = localFilters[i]
-              for await (const event of store.queryEvents(filter, 5_000)) {
-                events[f] = event
-                f++
-              }
-            }
-            events.length = f
-            return events
-          })()
-
-    return Promise.all([local, network]).then(([eventsL, eventsN]) => {
+    return Promise.all([local, network]).then(([localResult, eventsN]) => {
+      const eventsL = localResult.events
       if (eventsL.length > 0 && eventsN.length > 0) {
         eventsL.push(...eventsN)
         eventsL.sort((a, b) => b.created_at - a.created_at)

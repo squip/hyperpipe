@@ -16,6 +16,8 @@ export type TFeedSubRequest =
       source: 'relays'
       urls: string[]
       filter: Omit<Filter, 'since' | 'until'>
+      warmHydrateFromLocalCache?: boolean
+      relaySinceOverlapSeconds?: number
     }
 
 export type TMailboxRelayScope = 'read' | 'write' | 'both'
