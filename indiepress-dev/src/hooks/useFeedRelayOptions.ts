@@ -53,6 +53,20 @@ type FeedGroupRelayState = {
   readyForReq: boolean
 }
 
+function buildGroupRelayOptionDisplayMeta(
+  groupState: FeedGroupRelayState | null,
+  fallback?: RelayDisplayMeta
+): RelayDisplayMeta | undefined {
+  if (!groupState) return fallback
+  return {
+    label: groupState.label || fallback?.label || undefined,
+    imageUrl: groupState.imageUrl || fallback?.imageUrl || null,
+    hideUrl: true,
+    isGroupRelay: true,
+    subtitle: fallback?.subtitle
+  }
+}
+
 export type FeedRelaySelectionState = {
   relayIdentity: string | null
   relayUrl: string | null
@@ -159,8 +173,9 @@ export default function useFeedRelayOptions() {
 
       dedupeRelayTargetsByIdentity(urls || []).forEach(({ relayUrl, relayIdentity }) => {
         const groupState = groupRelayStateByIdentity.get(relayIdentity) || null
-        const displayMeta =
+        const fallbackDisplayMeta =
           groupRelayDisplayMeta[relayIdentity] || groupRelayDisplayMeta[relayUrl] || undefined
+        const displayMeta = buildGroupRelayOptionDisplayMeta(groupState, fallbackDisplayMeta)
         optionByIdentity.set(relayIdentity, {
           relayUrl,
           relayIdentity,
@@ -174,11 +189,12 @@ export default function useFeedRelayOptions() {
 
       groupRelayStates.forEach((state) => {
         const existing = optionByIdentity.get(state.relayIdentity)
-        const displayMeta =
+        const fallbackDisplayMeta =
           groupRelayDisplayMeta[state.relayIdentity]
           || groupRelayDisplayMeta[state.relayUrl]
           || existing?.displayMeta
           || undefined
+        const displayMeta = buildGroupRelayOptionDisplayMeta(state, fallbackDisplayMeta)
         if (!optionByIdentity.has(state.relayIdentity)) {
           order.push(state.relayIdentity)
         }
