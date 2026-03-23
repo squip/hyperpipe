@@ -1,12 +1,11 @@
 import NormalFeed from '@/components/NormalFeed'
 import useFeedRelayOptions from '@/hooks/useFeedRelayOptions'
+import { buildRelayFeedSubRequests } from '@/lib/feed-subrequests'
 import { dedupeRelayUrlsByIdentity } from '@/lib/relay-targets'
 import { useFeed } from '@/providers/FeedProvider'
 import { useMemo } from 'react'
-import { useTranslation } from 'react-i18next'
 
 export default function RelaysFeed() {
-  const { t } = useTranslation()
   const { feedInfo, relayUrls } = useFeed()
   const { getRelaySelectionState } = useFeedRelayOptions()
 
@@ -26,23 +25,32 @@ export default function RelaysFeed() {
   }, [activeRelaySelection?.relayUrl, feedInfo.feedType, relayUrls])
 
   const subRequests = useMemo(
-    () =>
-      effectiveRelayUrls.length > 0
-        ? [{ source: 'relays' as const, urls: effectiveRelayUrls, filter: {} }]
-        : [],
-    [effectiveRelayUrls]
+    () => {
+      if (feedInfo.feedType === 'relay' && activeRelaySelection?.isLocalGroupRelay) {
+        return buildRelayFeedSubRequests({
+          relayUrls: effectiveRelayUrls,
+          groupId: activeRelaySelection.groupState?.groupId,
+          warmHydrateLocalGroupRelay: true,
+          relayReadyForReq: activeRelaySelection.isReadyForReq,
+          relaySinceOverlapSeconds: 10
+        })
+      }
+
+      return buildRelayFeedSubRequests({
+        relayUrls: effectiveRelayUrls
+      })
+    },
+    [
+      activeRelaySelection?.groupState?.groupId,
+      activeRelaySelection?.isLocalGroupRelay,
+      activeRelaySelection?.isReadyForReq,
+      effectiveRelayUrls,
+      feedInfo.feedType
+    ]
   )
 
   if (feedInfo.feedType !== 'relay' && feedInfo.feedType !== 'relays') {
     return null
-  }
-
-  if (
-    feedInfo.feedType === 'relay'
-    && activeRelaySelection?.isWorkerManagedGroupRelay
-    && !activeRelaySelection.isReadyForReq
-  ) {
-    return <div className="text-center text-sm text-muted-foreground">{t('loading...')}</div>
   }
 
   if (!subRequests.length) {

@@ -33,6 +33,61 @@ export function extendFeedSubRequestsWithLocal(
   return [...localBySignature.values(), ...relayRequests]
 }
 
+export function buildRelayFeedSubRequests({
+  relayUrls,
+  groupId,
+  warmHydrateLocalGroupRelay = false,
+  relayReadyForReq = true,
+  relaySinceOverlapSeconds = DEFAULT_WARM_HYDRATION_OVERLAP_SECONDS
+}: {
+  relayUrls: string[]
+  groupId?: string | null
+  warmHydrateLocalGroupRelay?: boolean
+  relayReadyForReq?: boolean
+  relaySinceOverlapSeconds?: number
+}): TFeedSubRequest[] {
+  if (!relayUrls.length && !groupId) return []
+
+  const normalizedGroupId = typeof groupId === 'string' ? groupId.trim() : ''
+
+  if (!warmHydrateLocalGroupRelay || !normalizedGroupId) {
+    return relayUrls.length > 0
+      ? [
+          {
+            source: 'relays',
+            urls: relayUrls,
+            filter: {}
+          }
+        ]
+      : []
+  }
+
+  const subRequests: TFeedSubRequest[] = [
+    {
+      source: 'local',
+      filter: {
+        '#h': [normalizedGroupId]
+      }
+    }
+  ]
+
+  if (!relayReadyForReq || relayUrls.length === 0) {
+    return subRequests
+  }
+
+  subRequests.push({
+    source: 'relays',
+    urls: relayUrls,
+    filter: {
+      '#h': [normalizedGroupId]
+    },
+    warmHydrateFromLocalCache: true,
+    relaySinceOverlapSeconds
+  })
+
+  return subRequests
+}
+
 export function applyWarmHydrationCursorToRelayFilter(
   filter: Filter,
   newestLocalCreatedAt: number | null | undefined,

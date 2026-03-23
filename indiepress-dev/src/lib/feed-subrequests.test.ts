@@ -1,5 +1,6 @@
 import {
   applyWarmHydrationCursorToRelayFilter,
+  buildRelayFeedSubRequests,
   extendFeedSubRequestsWithLocal
 } from '@/lib/feed-subrequests'
 import { TFeedSubRequest } from '@/types'
@@ -99,5 +100,51 @@ describe('feed subrequest utilities', () => {
       kinds: [1, 6],
       since: 250
     })
+  })
+
+  it('builds local-only feed subrequests for a local group relay that is not ready yet', () => {
+    expect(
+      buildRelayFeedSubRequests({
+        relayUrls: ['wss://local-group-relay'],
+        groupId: 'group-1',
+        warmHydrateLocalGroupRelay: true,
+        relayReadyForReq: false
+      })
+    ).toEqual([
+      {
+        source: 'local',
+        filter: {
+          '#h': ['group-1']
+        }
+      }
+    ])
+  })
+
+  it('builds local-plus-relay feed subrequests for a ready local group relay', () => {
+    expect(
+      buildRelayFeedSubRequests({
+        relayUrls: ['wss://local-group-relay'],
+        groupId: 'group-1',
+        warmHydrateLocalGroupRelay: true,
+        relayReadyForReq: true,
+        relaySinceOverlapSeconds: 7
+      })
+    ).toEqual([
+      {
+        source: 'local',
+        filter: {
+          '#h': ['group-1']
+        }
+      },
+      {
+        source: 'relays',
+        urls: ['wss://local-group-relay'],
+        filter: {
+          '#h': ['group-1']
+        },
+        warmHydrateFromLocalCache: true,
+        relaySinceOverlapSeconds: 7
+      }
+    ])
   })
 })

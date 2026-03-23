@@ -59,6 +59,7 @@ export type FeedRelaySelectionState = {
   relayUrl: string | null
   option: FeedRelayOption | null
   groupState: FeedGroupRelayState | null
+  isLocalGroupRelay: boolean
   isWorkerManagedGroupRelay: boolean
   isReadyForReq: boolean
 }
@@ -138,7 +139,6 @@ export default function useFeedRelayOptions() {
   const groupRelayStateByIdentity = useMemo(() => {
     const map = new Map<string, FeedGroupRelayState>()
     groupRelayStates.forEach((state) => {
-      if (!state.workerManaged) return
       map.set(state.relayIdentity, state)
     })
     return map
@@ -218,6 +218,7 @@ export default function useFeedRelayOptions() {
           relayUrl: normalizedRelay || resolvedInput || null,
           option: null,
           groupState: null,
+          isLocalGroupRelay: false,
           isWorkerManagedGroupRelay: false,
           isReadyForReq: true
         }
@@ -230,7 +231,8 @@ export default function useFeedRelayOptions() {
         relayUrl: option?.relayUrl || groupState?.relayUrl || normalizedRelay || resolvedInput || null,
         option,
         groupState,
-        isWorkerManagedGroupRelay: !!groupState,
+        isLocalGroupRelay: !!groupState,
+        isWorkerManagedGroupRelay: groupState ? groupState.workerManaged : false,
         isReadyForReq: groupState ? groupState.readyForReq : true
       }
     },
