@@ -14,6 +14,7 @@ import {
   TAccount,
   TAccountPointer,
   TFeedInfo,
+  TLocalGroupRelayFeedSelection,
   TLinkPreviewMode,
   TMediaAutoLoadPolicy,
   TMediaUploadServiceConfig,
@@ -43,6 +44,90 @@ export type GroupLeavePublishRetryEntry = {
   nextAttemptAt: number
   lastError?: string | null
   updatedAt: number
+}
+
+function isLocalRelayProxyUrl(relay?: string | null) {
+  if (!relay) return false
+  try {
+    const parsed = new URL(relay)
+    return (
+      (parsed.protocol === 'ws:' || parsed.protocol === 'wss:')
+      && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')
+    )
+  } catch (_err) {
+    return /^wss?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?(?:\/|$)/i.test(String(relay || ''))
+  }
+}
+
+function sanitizeLocalGroupRelaySelection(
+  selection?: TLocalGroupRelayFeedSelection | null
+): TLocalGroupRelayFeedSelection | null {
+  const groupId = String(selection?.groupId || '').trim()
+  if (!groupId) return null
+  const relayIdentity =
+    typeof selection?.relayIdentity === 'string' && selection.relayIdentity.trim()
+      ? selection.relayIdentity.trim()
+      : null
+  return relayIdentity ? { groupId, relayIdentity } : { groupId }
+}
+
+function extractLocalGroupRelaySelectionFromRelayUrl(
+  relay?: string | null
+): TLocalGroupRelayFeedSelection | null {
+  const input = String(relay || '').trim()
+  if (!input || !isLocalRelayProxyUrl(input)) return null
+
+  try {
+    const parsed = new URL(input)
+    const pathSegments = parsed.pathname.split('/').filter(Boolean)
+    if (pathSegments.length < 2) return null
+    const owner = pathSegments[0]?.trim()
+    const slug = pathSegments[1]?.trim()
+    if (!owner || !slug || !/^npub1/i.test(owner)) return null
+    return { groupId: `${owner}:${slug}` }
+  } catch (_err) {
+    const match = input.match(/(?:127\.0\.0\.1|localhost)(?::\d+)?\/([^/?#]+)\/([^/?#]+)/i)
+    if (!match) return null
+    const owner = String(match[1] || '').trim()
+    const slug = String(match[2] || '').trim()
+    if (!owner || !slug || !/^npub1/i.test(owner)) return null
+    return { groupId: `${owner}:${slug}` }
+  }
+}
+
+function normalizeStoredFeedInfo(info?: TFeedInfo | null): TFeedInfo | undefined {
+  if (!info || typeof info !== 'object') return undefined
+  if (info.feedType === 'following') {
+    return { feedType: 'following' }
+  }
+  if (info.feedType === 'relays') {
+    return {
+      feedType: 'relays',
+      ...(typeof info.id === 'string' && info.id.trim() ? { id: info.id.trim() } : {})
+    }
+  }
+  if (info.feedType !== 'relay') return undefined
+
+  const localGroupRelay =
+    sanitizeLocalGroupRelaySelection(info.localGroupRelay || null)
+    || extractLocalGroupRelaySelectionFromRelayUrl(info.id)
+  if (localGroupRelay) {
+    return {
+      feedType: 'relay',
+      localGroupRelay
+    }
+  }
+
+  const relayId = typeof info.id === 'string' ? info.id.trim() : ''
+  if (!relayId) return undefined
+  return {
+    feedType: 'relay',
+    id: relayId
+  }
+}
+
+function areFeedInfosEqual(a?: TFeedInfo, b?: TFeedInfo) {
+  return JSON.stringify(a || null) === JSON.stringify(b || null)
 }
 
 class LocalStorageService {
@@ -444,11 +529,36 @@ class LocalStorageService {
   }
 
   getFeedInfo(pubkey: string) {
-    return this.accountFeedInfoMap[pubkey]
+    const key = pubkey || 'default'
+    const current = this.accountFeedInfoMap[key]
+    const normalized = normalizeStoredFeedInfo(current)
+
+    if (!normalized) {
+      if (typeof current !== 'undefined') {
+        delete this.accountFeedInfoMap[key]
+        window.localStorage.setItem(
+          StorageKey.ACCOUNT_FEED_INFO_MAP,
+          JSON.stringify(this.accountFeedInfoMap)
+        )
+      }
+      return undefined
+    }
+
+    if (!areFeedInfosEqual(current, normalized)) {
+      this.accountFeedInfoMap[key] = normalized
+      window.localStorage.setItem(
+        StorageKey.ACCOUNT_FEED_INFO_MAP,
+        JSON.stringify(this.accountFeedInfoMap)
+      )
+    }
+
+    return normalized
   }
 
   setFeedInfo(info: TFeedInfo, pubkey?: string | null) {
-    this.accountFeedInfoMap[pubkey ?? 'default'] = info
+    const normalized = normalizeStoredFeedInfo(info)
+    if (!normalized) return
+    this.accountFeedInfoMap[pubkey ?? 'default'] = normalized
     window.localStorage.setItem(
       StorageKey.ACCOUNT_FEED_INFO_MAP,
       JSON.stringify(this.accountFeedInfoMap)

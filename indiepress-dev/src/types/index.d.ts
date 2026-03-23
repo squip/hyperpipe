@@ -111,7 +111,16 @@ export type TAccount = {
 export type TAccountPointer = Pick<TAccount, 'pubkey' | 'signerType'>
 
 export type TFeedType = 'following' | 'relays' | 'relay'
-export type TFeedInfo = { feedType: TFeedType; id?: string }
+export type TLocalGroupRelayFeedSelection = {
+  groupId: string
+  relayIdentity?: string | null
+}
+
+export type TFeedInfo = {
+  feedType: TFeedType
+  id?: string
+  localGroupRelay?: TLocalGroupRelayFeedSelection | null
+}
 
 export type TLanguage = 'en' | 'zh' | 'pl'
 

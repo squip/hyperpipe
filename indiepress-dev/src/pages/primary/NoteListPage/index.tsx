@@ -1,6 +1,7 @@
 import { useSecondaryPage } from '@/PageManager'
 import PostEditor from '@/components/PostEditor'
 import RelayInfo from '@/components/RelayInfo'
+import useFeedRelayOptions from '@/hooks/useFeedRelayOptions'
 import { Button } from '@/components/ui/button'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
 import { toSearch } from '@/lib/link'
@@ -16,6 +17,7 @@ import {
   SetStateAction,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState
 } from 'react'
@@ -24,14 +26,47 @@ import FeedButton from './FeedButton'
 import FollowingFeed from './FollowingFeed'
 import RelaysFeed from './RelaysFeed'
 
+function isLocalRelayProxyUrl(relay?: string | null) {
+  if (!relay) return false
+  try {
+    const parsed = new URL(relay)
+    return parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost'
+  } catch (_err) {
+    return /^wss?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?/i.test(relay)
+  }
+}
+
 const NoteListPage = forwardRef((_, ref) => {
   const { t } = useTranslation()
   const { addRelayUrls, removeRelayUrls } = useCurrentRelays()
   const layoutRef = useRef<TPageRef>(null)
   const { pubkey, checkLogin } = useNostr()
   const { feedInfo, relayUrls, isReady } = useFeed()
+  const { getGroupRelaySelectionState, getRelaySelectionState } = useFeedRelayOptions()
   const [showRelayDetails, setShowRelayDetails] = useState(false)
   useImperativeHandle(ref, () => layoutRef.current)
+  const activeRelaySelection = useMemo(
+    () =>
+      feedInfo.feedType === 'relay'
+        ? feedInfo.localGroupRelay?.groupId
+          ? getGroupRelaySelectionState(feedInfo.localGroupRelay.groupId)
+          : getRelaySelectionState(feedInfo.id || null)
+        : null,
+    [
+      feedInfo.feedType,
+      feedInfo.id,
+      feedInfo.localGroupRelay?.groupId,
+      getGroupRelaySelectionState,
+      getRelaySelectionState
+    ]
+  )
+  const shouldDeferCurrentRelayRegistration =
+    feedInfo.feedType === 'relay' &&
+    ((Boolean(feedInfo.localGroupRelay?.groupId) && !activeRelaySelection?.isReadyForReq) ||
+      (!feedInfo.localGroupRelay?.groupId &&
+        isLocalRelayProxyUrl(feedInfo.id || activeRelaySelection?.relayUrl) &&
+        !activeRelaySelection?.isReadyForReq))
+  const effectiveCurrentRelayUrls = shouldDeferCurrentRelayRegistration ? [] : relayUrls
 
   useEffect(() => {
     if (layoutRef.current) {
@@ -40,13 +75,13 @@ const NoteListPage = forwardRef((_, ref) => {
   }, [JSON.stringify(relayUrls), feedInfo])
 
   useEffect(() => {
-    if (relayUrls.length) {
-      addRelayUrls(relayUrls)
+    if (effectiveCurrentRelayUrls.length) {
+      addRelayUrls(effectiveCurrentRelayUrls)
       return () => {
-        removeRelayUrls(relayUrls)
+        removeRelayUrls(effectiveCurrentRelayUrls)
       }
     }
-  }, [relayUrls])
+  }, [addRelayUrls, effectiveCurrentRelayUrls, removeRelayUrls])
 
   let content: React.ReactNode = null
   if (!isReady) {

@@ -54,7 +54,7 @@ const FeedSwitcherTrigger = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivEle
     const { t } = useTranslation()
     const { feedInfo, relayUrls } = useFeed()
     const { relaySets } = useFavoriteRelays()
-    const { getRelaySelectionState } = useFeedRelayOptions()
+    const { getGroupRelaySelectionState, getRelaySelectionState } = useFeedRelayOptions()
     const activeRelaySet = useMemo(() => {
       return feedInfo.feedType === 'relays' && feedInfo.id
         ? relaySets.find((set) => set.id === feedInfo.id)
@@ -63,16 +63,21 @@ const FeedSwitcherTrigger = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivEle
     const activeRelaySelection = useMemo(
       () =>
         feedInfo.feedType === 'relay'
-          ? getRelaySelectionState(feedInfo.id || null)
+          ? feedInfo.localGroupRelay?.groupId
+            ? getGroupRelaySelectionState(feedInfo.localGroupRelay.groupId)
+            : getRelaySelectionState(feedInfo.id || null)
           : null,
-      [feedInfo.feedType, feedInfo.id, getRelaySelectionState]
+      [
+        feedInfo.feedType,
+        feedInfo.id,
+        feedInfo.localGroupRelay?.groupId,
+        getGroupRelaySelectionState,
+        getRelaySelectionState
+      ]
     )
     const title = useMemo(() => {
       if (feedInfo.feedType === 'following') {
         return t('Following')
-      }
-      if (relayUrls.length === 0) {
-        return t('Choose a relay')
       }
       if (feedInfo.feedType === 'relay') {
         const groupLabel = activeRelaySelection?.groupState?.label?.trim()
@@ -81,7 +86,13 @@ const FeedSwitcherTrigger = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivEle
             ? groupLabel
             : `${groupLabel} (${t('loading...')})`
         }
+        if (relayUrls.length === 0 && feedInfo.localGroupRelay?.groupId) {
+          return `${feedInfo.localGroupRelay.groupId.split(':')[1] || t('loading...')} (${t('loading...')})`
+        }
         return simplifyUrl(activeRelaySelection?.relayUrl || feedInfo.id || '')
+      }
+      if (relayUrls.length === 0) {
+        return t('Choose a relay')
       }
       if (feedInfo.feedType === 'relays') {
         return activeRelaySet?.name ?? activeRelaySet?.id

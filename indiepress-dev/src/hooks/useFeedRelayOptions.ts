@@ -2,7 +2,6 @@ import {
   buildGroupRelayDisplayMetaMap,
   buildGroupRelayTargets,
   dedupeRelayTargetsByIdentity,
-  dedupeRelayUrlsByIdentity,
   getRelayIdentity,
   normalizeRelayTransportUrl,
   type GroupRelayTarget,
@@ -64,6 +63,21 @@ export type FeedRelaySelectionState = {
   isReadyForReq: boolean
 }
 
+function emptyFeedRelaySelection(
+  overrides: Partial<FeedRelaySelectionState> = {}
+): FeedRelaySelectionState {
+  return {
+    relayIdentity: null,
+    relayUrl: null,
+    option: null,
+    groupState: null,
+    isLocalGroupRelay: false,
+    isWorkerManagedGroupRelay: false,
+    isReadyForReq: true,
+    ...overrides
+  }
+}
+
 export default function useFeedRelayOptions() {
   const { urls } = useFavoriteRelays()
   const { relays: workerRelays } = useWorkerBridge()
@@ -117,23 +131,9 @@ export default function useFeedRelayOptions() {
     })
   }, [groupRelayTargets, resolveRelayUrl, workerRelays])
 
-  const workerManagedGroupRelayTargets = useMemo<GroupRelayTarget[]>(
-    () =>
-      groupRelayStates
-        .filter((state) => state.workerManaged)
-        .map((state) => ({
-          groupId: state.groupId,
-          relayUrl: state.relayUrl,
-          relayIdentity: state.relayIdentity,
-          label: state.label,
-          imageUrl: state.imageUrl || null
-        })),
-    [groupRelayStates]
-  )
-
   const groupRelayDisplayMeta = useMemo(
-    () => buildGroupRelayDisplayMetaMap(workerManagedGroupRelayTargets),
-    [workerManagedGroupRelayTargets]
+    () => buildGroupRelayDisplayMetaMap(groupRelayTargets),
+    [groupRelayTargets]
   )
 
   const groupRelayStateByIdentity = useMemo(() => {
@@ -144,39 +144,59 @@ export default function useFeedRelayOptions() {
     return map
   }, [groupRelayStates])
 
-  const readyGroupRelayUrls = useMemo(
-    () =>
-      dedupeRelayUrlsByIdentity(
-        groupRelayStates
-          .filter((state) => state.workerManaged && state.readyForReq)
-          .map((state) => state.relayUrl)
-      ),
-    [groupRelayStates]
-  )
-
-  const mergedRelayUrls = useMemo(
-    () => dedupeRelayUrlsByIdentity([...(urls || []), ...readyGroupRelayUrls]),
-    [readyGroupRelayUrls, urls]
-  )
+  const groupRelayStateByGroupId = useMemo(() => {
+    const map = new Map<string, FeedGroupRelayState>()
+    groupRelayStates.forEach((state) => {
+      map.set(state.groupId, state)
+    })
+    return map
+  }, [groupRelayStates])
 
   const relayOptions = useMemo<FeedRelayOption[]>(
-    () =>
-      dedupeRelayTargetsByIdentity(mergedRelayUrls)
-        .map(({ relayUrl, relayIdentity }) => {
-          const groupState = groupRelayStateByIdentity.get(relayIdentity)
-          const displayMeta =
-            groupRelayDisplayMeta[relayIdentity] || groupRelayDisplayMeta[relayUrl] || undefined
-          return {
-            relayUrl,
-            relayIdentity,
-            isGroupRelay: !!groupState,
-            readyForReq: groupState ? groupState.readyForReq : true,
-            groupId: groupState?.groupId,
-            displayMeta
-          }
+    () => {
+      const optionByIdentity = new Map<string, FeedRelayOption>()
+      const order: string[] = []
+
+      dedupeRelayTargetsByIdentity(urls || []).forEach(({ relayUrl, relayIdentity }) => {
+        const groupState = groupRelayStateByIdentity.get(relayIdentity) || null
+        const displayMeta =
+          groupRelayDisplayMeta[relayIdentity] || groupRelayDisplayMeta[relayUrl] || undefined
+        optionByIdentity.set(relayIdentity, {
+          relayUrl,
+          relayIdentity,
+          isGroupRelay: !!groupState,
+          readyForReq: groupState ? groupState.readyForReq : true,
+          groupId: groupState?.groupId,
+          displayMeta
         })
-        .filter((option) => !option.isGroupRelay || option.readyForReq),
-    [groupRelayDisplayMeta, groupRelayStateByIdentity, mergedRelayUrls]
+        order.push(relayIdentity)
+      })
+
+      groupRelayStates.forEach((state) => {
+        const existing = optionByIdentity.get(state.relayIdentity)
+        const displayMeta =
+          groupRelayDisplayMeta[state.relayIdentity]
+          || groupRelayDisplayMeta[state.relayUrl]
+          || existing?.displayMeta
+          || undefined
+        if (!optionByIdentity.has(state.relayIdentity)) {
+          order.push(state.relayIdentity)
+        }
+        optionByIdentity.set(state.relayIdentity, {
+          relayUrl: existing?.relayUrl || state.relayUrl,
+          relayIdentity: state.relayIdentity,
+          isGroupRelay: true,
+          readyForReq: state.readyForReq,
+          groupId: state.groupId,
+          displayMeta
+        })
+      })
+
+      return order
+        .map((relayIdentity) => optionByIdentity.get(relayIdentity))
+        .filter((option): option is FeedRelayOption => !!option)
+    },
+    [groupRelayDisplayMeta, groupRelayStateByIdentity, groupRelayStates, urls]
   )
 
   const relayOptionByIdentity = useMemo(() => {
@@ -213,15 +233,9 @@ export default function useFeedRelayOptions() {
         (normalizedRelay && getRelayIdentity(normalizedRelay))
         || (relay ? getRelayIdentity(relay) : null)
       if (!relayIdentity) {
-        return {
-          relayIdentity: null,
-          relayUrl: normalizedRelay || resolvedInput || null,
-          option: null,
-          groupState: null,
-          isLocalGroupRelay: false,
-          isWorkerManagedGroupRelay: false,
-          isReadyForReq: true
-        }
+        return emptyFeedRelaySelection({
+          relayUrl: normalizedRelay || resolvedInput || null
+        })
       }
 
       const option = relayOptionByIdentity.get(relayIdentity) || null
@@ -239,11 +253,36 @@ export default function useFeedRelayOptions() {
     [groupRelayStateByIdentity, relayOptionByIdentity, resolveRelayUrl]
   )
 
+  const getGroupRelaySelectionState = useCallback(
+    (groupId?: string | null): FeedRelaySelectionState => {
+      const normalizedGroupId = String(groupId || '').trim()
+      if (!normalizedGroupId) {
+        return emptyFeedRelaySelection({
+          isReadyForReq: false
+        })
+      }
+
+      const groupState = groupRelayStateByGroupId.get(normalizedGroupId) || null
+      const option = groupState ? relayOptionByIdentity.get(groupState.relayIdentity) || null : null
+      return emptyFeedRelaySelection({
+        relayIdentity: option?.relayIdentity || groupState?.relayIdentity || null,
+        relayUrl: option?.relayUrl || groupState?.relayUrl || null,
+        option,
+        groupState,
+        isLocalGroupRelay: true,
+        isWorkerManagedGroupRelay: groupState ? groupState.workerManaged : false,
+        isReadyForReq: groupState ? groupState.readyForReq : false
+      })
+    },
+    [groupRelayStateByGroupId, relayOptionByIdentity]
+  )
+
   return {
     relayOptions,
     groupRelayDisplayMeta,
     readinessByRelayIdentity,
     readinessByGroupId,
-    getRelaySelectionState
+    getRelaySelectionState,
+    getGroupRelaySelectionState
   }
 }

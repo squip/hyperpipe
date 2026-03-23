@@ -16,9 +16,14 @@ export default function FeedSwitcher({ close }: { close?: () => void }) {
   const { pubkey } = useNostr()
   const { relaySets } = useFavoriteRelays()
   const { feedInfo, switchFeed } = useFeed()
-  const { relayOptions, getRelaySelectionState } = useFeedRelayOptions()
-  const activeRelayIdentity =
-    feedInfo.feedType === 'relay' ? getRelaySelectionState(feedInfo.id || null).relayIdentity : null
+  const { relayOptions, getGroupRelaySelectionState, getRelaySelectionState } = useFeedRelayOptions()
+  const activeRelaySelection =
+    feedInfo.feedType === 'relay'
+      ? feedInfo.localGroupRelay?.groupId
+        ? getGroupRelaySelectionState(feedInfo.localGroupRelay.groupId)
+        : getRelaySelectionState(feedInfo.id || null)
+      : null
+  const activeRelayIdentity = activeRelaySelection?.relayIdentity || null
 
   return (
     <div className="space-y-2">
@@ -66,9 +71,27 @@ export default function FeedSwitcher({ close }: { close?: () => void }) {
       {relayOptions.map((relayOption) => (
         <FeedSwitcherItem
           key={relayOption.relayIdentity}
-          isActive={feedInfo.feedType === 'relay' && activeRelayIdentity === relayOption.relayIdentity}
+          isActive={
+            feedInfo.feedType === 'relay'
+            && (
+              activeRelayIdentity === relayOption.relayIdentity
+              || (
+                !!feedInfo.localGroupRelay?.groupId
+                && relayOption.groupId === feedInfo.localGroupRelay.groupId
+              )
+            )
+          }
           onClick={() => {
-            switchFeed('relay', { relay: relayOption.relayUrl })
+            switchFeed('relay', {
+              relay: relayOption.relayUrl,
+              localGroupRelay:
+                relayOption.isGroupRelay && relayOption.groupId
+                  ? {
+                      groupId: relayOption.groupId,
+                      relayIdentity: relayOption.relayIdentity
+                    }
+                  : null
+            })
             close?.()
           }}
         >
@@ -80,6 +103,7 @@ export default function FeedSwitcher({ close }: { close?: () => void }) {
 }
 
 function FeedRelayOptionRow({ relayOption }: { relayOption: FeedRelayOption }) {
+  const { t } = useTranslation()
   const meta = relayOption.displayMeta
   if (!meta) {
     return (
@@ -92,6 +116,12 @@ function FeedRelayOptionRow({ relayOption }: { relayOption: FeedRelayOption }) {
 
   const label = meta.label?.trim() || simplifyUrl(relayOption.relayUrl)
   const initials = label.slice(0, 2).toUpperCase()
+  const secondaryLabel =
+    !relayOption.readyForReq && relayOption.isGroupRelay
+      ? t('loading...')
+      : !meta.hideUrl
+        ? simplifyUrl(relayOption.relayUrl)
+        : null
   return (
     <div className="flex min-w-0 items-center gap-2 w-full">
       {meta.imageUrl ? (
@@ -104,10 +134,8 @@ function FeedRelayOptionRow({ relayOption }: { relayOption: FeedRelayOption }) {
       )}
       <div className="min-w-0">
         <div className="truncate">{label}</div>
-        {!meta.hideUrl ? (
-          <div className="truncate text-[11px] text-muted-foreground">
-            {simplifyUrl(relayOption.relayUrl)}
-          </div>
+        {secondaryLabel ? (
+          <div className="truncate text-[11px] text-muted-foreground">{secondaryLabel}</div>
         ) : null}
       </div>
     </div>
