@@ -150,7 +150,7 @@ if [[ ${#PRESERVE_PATHS[@]} -gt 0 ]]; then
 
   PRESERVE_STASH_MSG="sync-preserve:${BRANCH}:$(date +%s):$$"
   set +e
-  STASH_OUTPUT="$(git stash push --include-untracked -m "${PRESERVE_STASH_MSG}" -- "${PRESERVE_PATHS[@]}" 2>&1)"
+  STASH_OUTPUT="$(git stash push --all -m "${PRESERVE_STASH_MSG}" -- "${PRESERVE_PATHS[@]}" 2>&1)"
   STASH_EXIT=$?
   set -e
 
