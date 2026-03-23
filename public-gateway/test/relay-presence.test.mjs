@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import PublicGatewayService from '../src/PublicGatewayService.mjs';
 import MemoryRegistrationStore from '../src/stores/MemoryRegistrationStore.mjs';
+import { createSignature } from '../../shared/auth/PublicGatewayTokens.mjs';
 
 function createLogger() {
   const noop = () => {};
@@ -157,6 +158,78 @@ test('relay presence does not include the gateway for direct-join-only groups', 
     assert.equal(payload.aggregatePeerCount, 1);
     assert.equal(payload.gatewayIncluded, false);
     assert.equal(payload.gatewayHealthy, false);
+  } finally {
+    await service.stop();
+  }
+});
+
+test('relay registration refresh preserves existing relay peers for presence resolution', async () => {
+  const { service, registrationStore, baseUrl } = await createService({
+    peerFreshnessMs: 5_000
+  });
+
+  try {
+    const relayKey = 'c'.repeat(64);
+    const publicIdentifier = 'npub1presence:refresh-preserve';
+    const now = Date.now();
+    await registrationStore.upsertRelay(relayKey, {
+      relayKey,
+      peers: ['peer-refresh'],
+      metadata: {
+        identifier: publicIdentifier,
+        directJoinOnly: false,
+        peerStates: {
+          'peer-refresh': {
+            lastSeen: now - 250,
+            lastHealthyAt: now - 250,
+            unreachableSince: null
+          }
+        }
+      },
+      registeredAt: now - 1_000
+    });
+
+    service.peerMetadata.set('peer-refresh', {
+      relays: new Set([relayKey]),
+      lastHealthyAt: now - 250,
+      lastSeen: now - 250,
+      lastRegistrationAt: now - 250,
+      lastHandshakeAt: now - 250
+    });
+
+    const registration = {
+      relayKey,
+      metadata: {
+        identifier: publicIdentifier,
+        directJoinOnly: false,
+        name: 'Refresh Preserve'
+      }
+    };
+    const signature = createSignature(registration, 'test-shared-secret');
+    const registerResponse = await fetch(`${baseUrl}/api/relays`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        registration,
+        signature
+      })
+    });
+    assert.equal(registerResponse.status, 200);
+
+    const stored = await registrationStore.getRelay(relayKey);
+    assert.deepEqual(stored?.peers, ['peer-refresh']);
+    assert.ok(stored?.metadata?.peerStates?.['peer-refresh']);
+
+    const presenceResponse = await fetch(`${baseUrl}/api/relays/${relayKey}/presence`);
+    assert.equal(presenceResponse.status, 200);
+    const payload = await presenceResponse.json();
+
+    assert.equal(payload.usablePeerCount, 1);
+    assert.equal(payload.aggregatePeerCount, 2);
+    assert.equal(payload.gatewayIncluded, true);
+    assert.equal(payload.registeredPeerCount, 1);
   } finally {
     await service.stop();
   }

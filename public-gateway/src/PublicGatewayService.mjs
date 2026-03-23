@@ -1263,6 +1263,61 @@ class PublicGatewayService {
     };
   }
 
+  #mergeRelayRegistrationSnapshot(existing = null, incoming = {}, now = Date.now()) {
+    const existingPeers = this.#getPeersFromRegistration(existing);
+    const incomingPeers = this.#getPeersFromRegistration(incoming);
+    const mergedPeers = Array.from(new Set([
+      ...existingPeers,
+      ...incomingPeers
+    ]));
+
+    const existingMetadata = existing?.metadata && typeof existing.metadata === 'object'
+      ? existing.metadata
+      : {};
+    const incomingMetadata = incoming?.metadata && typeof incoming.metadata === 'object'
+      ? incoming.metadata
+      : {};
+    const existingPeerStates = existingMetadata.peerStates && typeof existingMetadata.peerStates === 'object'
+      ? existingMetadata.peerStates
+      : {};
+    const incomingPeerStates = incomingMetadata.peerStates && typeof incomingMetadata.peerStates === 'object'
+      ? incomingMetadata.peerStates
+      : {};
+
+    const mergedMetadata = {
+      ...existingMetadata,
+      ...incomingMetadata
+    };
+    if (Object.keys(existingPeerStates).length || Object.keys(incomingPeerStates).length) {
+      mergedMetadata.peerStates = {
+        ...existingPeerStates,
+        ...incomingPeerStates
+      };
+    }
+
+    const merged = {
+      ...(existing && typeof existing === 'object' ? existing : {}),
+      ...(incoming && typeof incoming === 'object' ? incoming : {}),
+      relayKey: incoming?.relayKey || existing?.relayKey || null,
+      peers: mergedPeers,
+      metadata: mergedMetadata,
+      registeredAt: existing?.registeredAt || incoming?.registeredAt || now,
+      updatedAt: now
+    };
+
+    if (incoming?.relayCores == null && existing?.relayCores != null) {
+      merged.relayCores = existing.relayCores;
+    }
+    if (incoming?.gatewayReplica == null && existing?.gatewayReplica != null) {
+      merged.gatewayReplica = existing.gatewayReplica;
+    }
+    if (incoming?.blindPeer == null && existing?.blindPeer != null) {
+      merged.blindPeer = existing.blindPeer;
+    }
+
+    return merged;
+  }
+
   async #runRelayGarbageCollection() {
     const gcAfterMs = Number(this.config?.registration?.relayGcAfterMs);
     if (!Number.isFinite(gcAfterMs) || gcAfterMs <= 0) return;
@@ -5120,6 +5175,17 @@ class PublicGatewayService {
       const publicIdentifier = record?.metadata?.identifier || relayKey;
       const snapshot = this.#buildRelayPresenceSnapshot(record, relayKey);
 
+      this.logger?.info?.({
+        identifier,
+        relayKey,
+        publicIdentifier,
+        storedPeerCount: this.#getPeersFromRegistration(record).length,
+        livePeerCount: this.#getLivePeersForRelay(relayKey).length,
+        usablePeerCount: snapshot.usablePeerCount,
+        aggregatePeerCount: snapshot.aggregatePeerCount,
+        gatewayIncluded: snapshot.gatewayIncluded
+      }, '[PublicGateway] Resolved relay presence');
+
       return res.json({
         relayKey,
         publicIdentifier,
@@ -5978,9 +6044,7 @@ class PublicGatewayService {
       const mergeRelayCores = relayCoreModeRaw === 'merge'
         || relayCoreModeRaw === 'append'
         || registration?.mergeRelayCores === true;
-      const existing = mergeRelayCores
-        ? await this.registrationStore.getRelay(registration.relayKey)
-        : null;
+      const existing = await this.registrationStore.getRelay(registration.relayKey);
       const upsertPayload = relayCoreMetadata
         ? { ...registration, relayCores: relayCoreMetadata }
         : { ...registration };
@@ -5992,7 +6056,19 @@ class PublicGatewayService {
         });
         upsertPayload.relayCores = mergeResult.merged;
       }
-      const stamped = this.#stampRelayActivity(upsertPayload, this.#resolveRelayPeerCount(upsertPayload));
+      const mergedRegistration = this.#mergeRelayRegistrationSnapshot(existing, upsertPayload, Date.now());
+      const existingPeerCount = this.#getPeersFromRegistration(existing).length;
+      const incomingPeerCount = this.#getPeersFromRegistration(upsertPayload).length;
+      if (existingPeerCount > 0 && incomingPeerCount === 0) {
+        this.logger?.info?.({
+          relayKey: registration.relayKey,
+          preservedPeerCount: existingPeerCount
+        }, '[PublicGateway] Preserved existing relay peers during registration refresh');
+      }
+      const stamped = this.#stampRelayActivity(
+        mergedRegistration,
+        this.#resolveRelayPeerCount(mergedRegistration)
+      );
       await this.registrationStore.upsertRelay(registration.relayKey, stamped);
       const membershipMode = typeof registration?.membershipMode === 'string'
         ? registration.membershipMode.trim().toLowerCase()

@@ -1333,6 +1333,7 @@ async function fetchGatewayRelayPresence({
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), Math.max(250, timeoutMs))
   timer.unref?.()
+  const startedAt = Date.now()
 
   try {
     const response = await fetch(url, {
@@ -1350,6 +1351,17 @@ async function fetchGatewayRelayPresence({
           : `gateway-presence-status-${response.status}`
       )
     }
+    const elapsedMs = Date.now() - startedAt
+    console.log('[Worker] gateway presence probe succeeded', {
+      publicIdentifier: normalizedRelayIdentifier,
+      gatewayOrigin: normalizedGatewayOrigin,
+      usablePeerCount: Number.isFinite(payload?.usablePeerCount) ? payload.usablePeerCount : null,
+      aggregatePeerCount: Number.isFinite(payload?.aggregatePeerCount)
+        ? payload.aggregatePeerCount
+        : null,
+      gatewayIncluded: payload?.gatewayIncluded === true,
+      elapsedMs
+    })
     return createGroupPresenceResult({
       count: payload?.aggregatePeerCount,
       status: 'ready',

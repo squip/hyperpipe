@@ -8,6 +8,8 @@ export const GROUP_PAGE_PRESENCE_TTL_MS = 15_000
 export const MY_GROUPS_PRESENCE_TTL_MS = 20_000
 export const DISCOVER_GROUPS_PRESENCE_TTL_MS = 30_000
 export const MAX_CONCURRENT_GROUP_PRESENCE_REQUESTS = 3
+const GROUP_PRESENCE_GATEWAY_FALLBACK_GRACE_MS = 60_000
+const GROUP_PRESENCE_GATEWAY_FALLBACK_RETRY_MS = 5_000
 
 type GroupPresenceListener = () => void
 
@@ -211,6 +213,62 @@ function shouldRefreshGroupPresence(entry: GroupPresenceCacheEntry | undefined) 
   return false
 }
 
+function isGatewayBackedPresenceInput(input: TGroupPresenceInput | null | undefined) {
+  if (!input) return false
+  return input.directJoinOnly !== true && !!String(input.gatewayOrigin || '').trim()
+}
+
+function isGatewayFallbackError(error: string | null | undefined) {
+  const normalized = String(error || '').trim().toLowerCase()
+  if (!normalized) return false
+  return (
+    normalized === 'fetch failed'
+    || normalized.startsWith('gateway-presence-')
+  )
+}
+
+export function selectGroupPresenceStateUpdate({
+  existingState,
+  nextState,
+  query,
+  now = Date.now()
+}: {
+  existingState?: TGroupPresenceState | null
+  nextState: TGroupPresenceState
+  query: TGroupPresenceInput
+  now?: number
+}) {
+  const shouldPreserveExistingGatewayReadyState =
+    isGatewayBackedPresenceInput(query)
+    && existingState?.status === 'ready'
+    && existingState?.source === 'gateway'
+    && Number.isFinite(existingState?.count)
+    && nextState.status === 'ready'
+    && nextState.source === 'direct-probe'
+    && Number.isFinite(nextState.count)
+    && Number(existingState.count) > Number(nextState.count)
+    && isGatewayFallbackError(nextState.error)
+    && Number.isFinite(existingState.lastUpdatedAt)
+    && now - Number(existingState.lastUpdatedAt) <= GROUP_PRESENCE_GATEWAY_FALLBACK_GRACE_MS
+
+  if (shouldPreserveExistingGatewayReadyState) {
+    return {
+      state: createGroupPresenceState({
+        ...existingState,
+        error: nextState.error || existingState?.error || null
+      }),
+      expiresAt: now + GROUP_PRESENCE_GATEWAY_FALLBACK_RETRY_MS,
+      preservedGatewayState: true
+    }
+  }
+
+  return {
+    state: nextState,
+    expiresAt: now,
+    preservedGatewayState: false
+  }
+}
+
 function runGroupPresenceQueue() {
   while (
     activeGroupPresenceRequests < MAX_CONCURRENT_GROUP_PRESENCE_REQUESTS
@@ -228,13 +286,29 @@ function runGroupPresenceQueue() {
           ...job.query,
           timeoutMs: job.timeoutMs
         })
-        const state = normalizeGroupPresenceProbeResult(result)
+        const nextState = normalizeGroupPresenceProbeResult(result)
+        const existingState = groupPresenceCache.get(job.key)?.state || null
+        const selected = selectGroupPresenceStateUpdate({
+          existingState,
+          nextState,
+          query: job.query
+        })
+        if (selected.preservedGatewayState) {
+          console.warn('[GroupPresence] Preserving previous gateway-backed presence over reduced fallback probe result', {
+            groupId: job.query.groupId,
+            previousCount: existingState?.count ?? null,
+            fallbackCount: nextState.count,
+            error: nextState.error || null
+          })
+        }
         setGroupPresenceCacheEntry(job.key, {
           query: job.query,
-          state,
-          expiresAt: Date.now() + Math.max(1_000, job.ttlMs)
+          state: selected.state,
+          expiresAt: selected.preservedGatewayState
+            ? selected.expiresAt
+            : Date.now() + Math.max(1_000, job.ttlMs)
         })
-        return state
+        return selected.state
       } catch (error) {
         const existing = groupPresenceCache.get(job.key)
         if (!existing || existing.state.status !== 'ready') {
