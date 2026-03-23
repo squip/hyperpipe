@@ -1595,10 +1595,12 @@ export class GatewayService extends EventEmitter {
       return;
     }
 
-    if (!this.#isPublicGatewayRelayKey(relayKey) && (metadataCopy?.isHosted === false || metadataCopy?.isJoined === true)) {
+    if (!this.#isPublicGatewayRelayKey(relayKey)
+      && metadataCopy?.isHosted === false
+      && metadataCopy?.isJoined !== true) {
       this.publicGatewayRelayState.delete(relayKey);
       this.#clearRelayToken(relayKey);
-      this.log('debug', `[PublicGateway] Skipping registration for joined relay ${relayKey}`, {
+      this.log('debug', `[PublicGateway] Skipping registration for non-hosted relay ${relayKey}`, {
         isHosted: metadataCopy?.isHosted ?? null,
         isJoined: metadataCopy?.isJoined ?? null
       });
