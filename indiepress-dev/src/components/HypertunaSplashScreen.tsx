@@ -19,9 +19,9 @@ type CanvasMetrics = {
   dpr: number
   cols: number
   rows: number
-  fontSize: number
-  charWidth: number
-  lineHeight: number
+  textFontSize: number
+  cellWidth: number
+  cellHeight: number
 }
 
 const FONT_FAMILY =
@@ -33,10 +33,10 @@ function clamp(value: number, min: number, max: number) {
 
 function measureCanvasMetrics(width: number, height: number, dpr: number): CanvasMetrics {
   const fontSize = clamp(Math.floor(Math.min(width / 42, height / 18)), 14, 26)
-  const charWidth = fontSize * 0.62
-  const lineHeight = Math.max(fontSize * 1.08, fontSize + 2)
-  const cols = Math.max(48, Math.floor(width / charWidth))
-  const rows = Math.max(20, Math.floor(height / lineHeight))
+  const cellWidth = fontSize * 0.62
+  const cellHeight = Math.max(fontSize * 1.08, fontSize + 2)
+  const cols = Math.max(48, Math.floor(width / cellWidth))
+  const rows = Math.max(20, Math.floor(height / cellHeight))
 
   return {
     width,
@@ -44,9 +44,92 @@ function measureCanvasMetrics(width: number, height: number, dpr: number): Canva
     dpr,
     cols,
     rows,
-    fontSize,
-    charWidth,
-    lineHeight
+    textFontSize: fontSize,
+    cellWidth,
+    cellHeight
+  }
+}
+
+function getCellBounds(metrics: CanvasMetrics, col: number, row: number) {
+  const x = Math.round(col * metrics.cellWidth)
+  const y = Math.round(row * metrics.cellHeight)
+  const nextX = Math.round((col + 1) * metrics.cellWidth)
+  const nextY = Math.round((row + 1) * metrics.cellHeight)
+  return {
+    x,
+    y,
+    width: Math.max(1, nextX - x),
+    height: Math.max(1, nextY - y)
+  }
+}
+
+function fillDitherCell(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  color: string,
+  alpha: number,
+  spacing: number
+) {
+  ctx.save()
+  ctx.fillStyle = color
+  ctx.globalAlpha = alpha
+  for (let offsetY = 0; offsetY < height; offsetY += spacing) {
+    for (let offsetX = (Math.floor(offsetY / spacing) % 2) * spacing; offsetX < width; offsetX += spacing * 2) {
+      ctx.fillRect(x + offsetX, y + offsetY, Math.max(1, Math.ceil(spacing / 1.5)), Math.max(1, Math.ceil(spacing / 1.5)))
+    }
+  }
+  ctx.restore()
+}
+
+function drawRasterCell(
+  ctx: CanvasRenderingContext2D,
+  metrics: CanvasMetrics,
+  char: string,
+  color: string,
+  col: number,
+  row: number
+) {
+  const { x, y, width, height } = getCellBounds(metrics, col, row)
+
+  switch (char) {
+    case '█':
+      ctx.fillStyle = color
+      ctx.fillRect(x, y, width, height)
+      return
+    case '▓':
+      ctx.fillStyle = color
+      ctx.globalAlpha = 0.35
+      ctx.fillRect(x, y, width, height)
+      ctx.globalAlpha = 1
+      fillDitherCell(ctx, x, y, width, height, color, 0.9, Math.max(2, Math.floor(width / 3)))
+      return
+    case '░':
+      fillDitherCell(ctx, x, y, width, height, color, 0.8, Math.max(2, Math.floor(width / 2.6)))
+      return
+    case '·': {
+      const size = Math.max(1, Math.floor(Math.min(width, height) * 0.28))
+      const dotX = x + Math.floor((width - size) / 2)
+      const dotY = y + Math.floor((height - size) / 2)
+      ctx.fillStyle = color
+      ctx.fillRect(dotX, dotY, size, size)
+      return
+    }
+    case '─': {
+      const lineHeight = Math.max(1, Math.floor(height * 0.18))
+      const lineY = y + Math.floor((height - lineHeight) / 2)
+      ctx.fillStyle = color
+      ctx.fillRect(x, lineY, width, lineHeight)
+      return
+    }
+    default:
+      ctx.fillStyle = color
+      ctx.font = `${Math.max(10, Math.floor(metrics.textFontSize * 0.92))}px ${FONT_FAMILY}`
+      ctx.textBaseline = 'top'
+      ctx.textAlign = 'left'
+      ctx.fillText(char, x, y + Math.max(0, Math.floor((height - metrics.textFontSize) / 2)))
   }
 }
 
@@ -67,19 +150,14 @@ function drawFrame(
   ctx.clearRect(0, 0, metrics.width, metrics.height)
   ctx.fillStyle = '#000000'
   ctx.fillRect(0, 0, metrics.width, metrics.height)
-  ctx.font = `${metrics.fontSize}px ${FONT_FAMILY}`
-  ctx.textBaseline = 'top'
-  ctx.textAlign = 'left'
 
   const grid = renderHypertunaSplashGrid(state)
   for (let row = 0; row < grid.length; row += 1) {
-    const y = row * metrics.lineHeight
     const rowCells = grid[row]
     for (let col = 0; col < rowCells.length; col += 1) {
       const cell = rowCells[col]
       if (!cell) continue
-      ctx.fillStyle = cell.color
-      ctx.fillText(cell.char, col * metrics.charWidth, y)
+      drawRasterCell(ctx, metrics, cell.char, cell.color, col, row)
     }
   }
 }
