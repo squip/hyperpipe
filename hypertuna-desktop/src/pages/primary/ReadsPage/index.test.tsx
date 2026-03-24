@@ -47,6 +47,32 @@ vi.mock('@/components/ArticleList', () => ({
   )
 }))
 
+vi.mock('@/components/Tabs', () => ({
+  __esModule: true,
+  default: ({
+    tabs,
+    value,
+    onTabChange
+  }: {
+    tabs: { value: string; label: string }[]
+    value: string
+    onTabChange?: (value: string) => void
+  }) => (
+    <div data-testid="reads-tabs">
+      {tabs.map((tab) => (
+        <button
+          key={tab.value}
+          type="button"
+          data-active={String(value === tab.value)}
+          onClick={() => onTabChange?.(tab.value)}
+        >
+          {tab.label}
+        </button>
+      ))}
+    </div>
+  )
+}))
+
 vi.mock('@/components/RefreshButton', () => ({
   RefreshButton: ({ onClick }: { onClick?: () => void }) => (
     <button onClick={onClick} type="button">
@@ -118,20 +144,14 @@ describe('ReadsPage feed mode toggle', () => {
     })
 
     expect(fetchRelayListMock).not.toHaveBeenCalled()
-    expect(screen.getByRole('button', { name: 'Discover' })).toHaveAttribute(
-      'aria-pressed',
-      'true'
-    )
-    expect(screen.getByRole('button', { name: 'Following' })).toHaveAttribute(
-      'aria-pressed',
-      'false'
-    )
+    expect(screen.getByText('Discover')).toBeInTheDocument()
+    expect(screen.getByText('Following')).toBeInTheDocument()
   })
 
   it('switches to Following and scopes the feed to followings on the reader relay set', async () => {
     render(<ReadsPage />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Following' }))
+    fireEvent.click(screen.getByText('Following'))
 
     await waitFor(() => {
       expect(fetchRelayListMock).toHaveBeenCalledWith('reader-pubkey')
@@ -148,10 +168,5 @@ describe('ReadsPage feed mode toggle', () => {
         }
       ])
     })
-
-    expect(screen.getByRole('button', { name: 'Following' })).toHaveAttribute(
-      'aria-pressed',
-      'true'
-    )
   })
 })

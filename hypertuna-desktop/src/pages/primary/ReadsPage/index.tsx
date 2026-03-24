@@ -1,7 +1,7 @@
 import { BIG_RELAY_URLS } from '@/constants'
-import { Button } from '@/components/ui/button'
+import TabsBar, { TTabDefinition } from '@/components/Tabs'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
-import { cn, isTouchDevice } from '@/lib/utils'
+import { isTouchDevice } from '@/lib/utils'
 import ArticleList, { TArticleListRef, TArticleSubRequest } from '@/components/ArticleList'
 import { RefreshButton } from '@/components/RefreshButton'
 import { TPageRef } from '@/types'
@@ -12,6 +12,11 @@ import { useFetchFollowings } from '@/hooks'
 import client from '@/services/client.service'
 
 type ReadsFeedMode = 'discover' | 'following'
+
+const READS_TABS: TTabDefinition[] = [
+  { value: 'discover', label: 'Discover' },
+  { value: 'following', label: 'Following' }
+]
 
 function buildDiscoverSubRequests(): TArticleSubRequest[] {
   return [
@@ -88,6 +93,20 @@ const ReadsPage = forwardRef((_, ref) => {
     }
   }, [canUseFollowing, feedMode, followings, pubkey])
 
+  const renderTabs = (
+    <TabsBar
+      tabs={READS_TABS}
+      value={feedMode}
+      onTabChange={(tab) => {
+        if (tab === 'following' && !canUseFollowing) return
+        setFeedMode(tab as ReadsFeedMode)
+      }}
+      options={!supportTouch ? <RefreshButton onClick={() => articleListRef.current?.refresh()} /> : null}
+      topOffset="0"
+      reserveOptionsSpace={!supportTouch}
+    />
+  )
+
   let content: React.ReactNode = null
 
   if (subRequests.length === 0) {
@@ -105,17 +124,14 @@ const ReadsPage = forwardRef((_, ref) => {
       pageName="reads"
       ref={layoutRef}
       titlebar={
-        <ReadsPageTitlebar
-          articleListRef={articleListRef}
-          supportTouch={supportTouch}
-          feedMode={feedMode}
-          canUseFollowing={canUseFollowing}
-          onFeedModeChange={setFeedMode}
-        />
+        <ReadsPageTitlebar feedMode={feedMode} />
       }
       displayScrollToTopButton
     >
-      {content}
+      <div>
+        {renderTabs}
+        {content}
+      </div>
     </PrimaryPageLayout>
   )
 })
@@ -125,55 +141,21 @@ ReadsPage.displayName = 'ReadsPage'
 export default ReadsPage
 
 function ReadsPageTitlebar({
-  articleListRef,
-  supportTouch,
-  feedMode,
-  canUseFollowing,
-  onFeedModeChange
+  feedMode
 }: {
-  articleListRef: React.RefObject<TArticleListRef>
-  supportTouch: boolean
   feedMode: ReadsFeedMode
-  canUseFollowing: boolean
-  onFeedModeChange: (mode: ReadsFeedMode) => void
 }) {
   const { t } = useTranslation()
   const subtitle =
-    feedMode === 'following' && canUseFollowing
+    feedMode === 'following'
       ? t('From people you follow')
       : t('Public articles')
 
   return (
-    <div className="flex gap-2 items-center h-full justify-between min-w-0">
-      <div className="flex-1 pl-4 min-w-0">
+    <div className="flex gap-1 items-center h-full justify-between px-3">
+      <div className="flex-1 min-w-0">
         <div className="font-semibold text-lg">{t('Reads')}</div>
         <div className="text-xs text-muted-foreground">{subtitle}</div>
-      </div>
-      <div className="shrink-0 flex gap-1 items-center">
-        <div className="flex items-center gap-1 rounded-lg bg-muted/70 p-1">
-          <Button
-            type="button"
-            variant={feedMode === 'discover' ? 'secondary' : 'ghost'}
-            size="sm"
-            className={cn('h-8 rounded-md px-3', feedMode !== 'discover' && 'text-muted-foreground')}
-            aria-pressed={feedMode === 'discover'}
-            onClick={() => onFeedModeChange('discover')}
-          >
-            {t('Discover')}
-          </Button>
-          <Button
-            type="button"
-            variant={feedMode === 'following' ? 'secondary' : 'ghost'}
-            size="sm"
-            className={cn('h-8 rounded-md px-3', feedMode !== 'following' && 'text-muted-foreground')}
-            aria-pressed={feedMode === 'following'}
-            disabled={!canUseFollowing}
-            onClick={() => onFeedModeChange('following')}
-          >
-            {t('Following')}
-          </Button>
-        </div>
-        {!supportTouch && <RefreshButton onClick={() => articleListRef.current?.refresh()} />}
       </div>
     </div>
   )
