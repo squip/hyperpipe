@@ -2,10 +2,10 @@
 
 ## Status
 Implemented foundation:
-- Plugin supervisor in Electron main process (`hypertuna-desktop/plugin-supervisor.cjs`)
-- Out-of-process plugin runner (`hypertuna-desktop/plugin-runner.cjs`)
-- Renderer plugin route/nav registry (`indiepress-dev/src/providers/PluginRegistryProvider.tsx`)
-- Dynamic plugin route support (`indiepress-dev/src/routes.tsx`)
+- Plugin supervisor in Electron main process (`hypertuna-desktop/electron/plugin-supervisor.cjs`)
+- Out-of-process plugin runner (`hypertuna-desktop/electron/plugin-runner.cjs`)
+- Renderer plugin route/nav registry (`hypertuna-desktop/src/providers/PluginRegistryProvider.tsx`)
+- Dynamic plugin route support (`hypertuna-desktop/src/routes.tsx`)
 - Worker media capability layer (`hypertuna-worker/media/*.mjs`)
 - `.htplugin.tgz` archive installation/extraction path (`plugin-install-archive`)
 - Marketplace discovery ingestion path (`plugin-marketplace-discover`)

@@ -14,9 +14,9 @@ Observed identifiers from the logs (2026-01-30 UTC):
 ## System Components (with code references)
 
 Renderer (Electron UI):
-- **Group join UI**: `indiepress-dev/src/pages/secondary/GroupPage/index.tsx:736` (invokes `startJoinFlow` with open-join flags).
-- **Worker bridge**: `indiepress-dev/src/providers/WorkerBridgeProvider.tsx:540` (packages join payload, discovers host peers, IPC to worker).
-- **Group creation / metadata**: `indiepress-dev/src/providers/GroupsProvider.tsx:1028` and `indiepress-dev/src/providers/GroupsProvider.tsx:1696` (creates hosted relay and publishes metadata including `open/closed`).
+- **Group join UI**: `hypertuna-desktop/src/pages/secondary/GroupPage/index.tsx:736` (invokes `startJoinFlow` with open-join flags).
+- **Worker bridge**: `hypertuna-desktop/src/providers/WorkerBridgeProvider.tsx:540` (packages join payload, discovers host peers, IPC to worker).
+- **Group creation / metadata**: `hypertuna-desktop/src/providers/GroupsProvider.tsx:1028` and `hypertuna-desktop/src/providers/GroupsProvider.tsx:1696` (creates hosted relay and publishes metadata including `open/closed`).
 
 Worker (local worker process):
 - **Open-join pool provisioning**: `hypertuna-worker/index.js:776` (`ensureOpenJoinWriterPool`).
@@ -110,7 +110,7 @@ From `public-gateway/src/config.mjs`:
 
 ### 0) Create group and hosted relay
 - UI calls `createRelay` to spin up a hosted relay with `isOpen` and `fileSharing` flags.
-  - Renderer: `GroupsProvider.createHypertunaRelayGroup` calls `createRelay` (`indiepress-dev/src/providers/GroupsProvider.tsx:1028`).
+  - Renderer: `GroupsProvider.createHypertunaRelayGroup` calls `createRelay` (`hypertuna-desktop/src/providers/GroupsProvider.tsx:1028`).
   - Worker IPC: `create-relay` message handled in `hypertuna-worker/index.js:3753`.
   - Relay server: `pear-relay-server.createRelay` logs creation and registers with gateway (`hypertuna-worker/pear-relay-server.mjs:3151`).
 
@@ -135,8 +135,8 @@ From `public-gateway/src/config.mjs`:
 
 ### 3) Join request (renderer -> worker)
 - GroupPage triggers worker join flow, passing `openJoin: true` and no invite material.
-  - `GroupPage.handleJoin` (`indiepress-dev/src/pages/secondary/GroupPage/index.tsx:736`).
-  - WorkerBridge packages join payload, attempts host peer lookup, and IPCs `start-join-flow` (`indiepress-dev/src/providers/WorkerBridgeProvider.tsx:540`).
+  - `GroupPage.handleJoin` (`hypertuna-desktop/src/pages/secondary/GroupPage/index.tsx:736`).
+  - WorkerBridge packages join payload, attempts host peer lookup, and IPCs `start-join-flow` (`hypertuna-desktop/src/providers/WorkerBridgeProvider.tsx:540`).
 
 Log evidence:
 - Worker log shows `start-join-flow` with `openJoin: true`, no writer core/secret, and no host peers (`worker.log:2399-2422`).
@@ -185,7 +185,7 @@ Public gateway log (2026-01-30T21:11:14Z):
 - Core append: `public-gateway.log:100-101` -> `PublicGatewayService.#handleOpenJoinAppendCores` (`public-gateway/src/PublicGatewayService.mjs:4102`).
 
 Worker log (2026-01-30T21:11:14-15Z):
-- Join flow start: `worker.log:2399` -> `GroupPage.handleJoin` (`indiepress-dev/src/pages/secondary/GroupPage/index.tsx:736`) and `WorkerBridgeProvider.startJoinFlow` (`indiepress-dev/src/providers/WorkerBridgeProvider.tsx:540`).
+- Join flow start: `worker.log:2399` -> `GroupPage.handleJoin` (`hypertuna-desktop/src/pages/secondary/GroupPage/index.tsx:736`) and `WorkerBridgeProvider.startJoinFlow` (`hypertuna-desktop/src/providers/WorkerBridgeProvider.tsx:540`).
 - Open-join bootstrap: `worker.log:2425-2455` -> `fetchOpenJoinBootstrap` (`hypertuna-worker/index.js:1409`).
 - Blind-peer hydration: `worker.log:2476-2547` -> `start-join-flow` blind-peer fallback (`hypertuna-worker/index.js:4081`) and `BlindPeeringManager` (`hypertuna-worker/blind-peering-manager.mjs:320`, `:680`).
 - Open-join offline join: `worker.log:2563-2598` -> `startJoinAuthentication` (`hypertuna-worker/pear-relay-server.mjs:3340`, `:3750`).

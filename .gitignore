@@ -50,14 +50,6 @@ public-gateway/node_modules/
 public-gateway/package-lock.json
 shared/package-lock.json
 shared/node_modules/
-hypertuna-desktop/test/*
-!hypertuna-desktop/test/index.test.js
-!hypertuna-desktop/test/nostr-events.test.js
-!hypertuna-desktop/test/websocket-relay-manager.test.js
-!hypertuna-desktop/test/nostr-group-client.test.js
-!hypertuna-desktop/test/plugin-marketplace-lifecycle.test.js
-!hypertuna-desktop/test/plugin-archive-safety.test.js
-!hypertuna-desktop/test/plugin-sdk-cli.test.js
 hypertuna-desktop/package-lock.json
 legacy-pear-codebase/
 hyperswarm-documentation/

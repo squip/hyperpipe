@@ -9,14 +9,14 @@ Note: the `test12` logs show **invite writer provisioning** events but do **not*
 ## System Components (with code references)
 
 Renderer (Electron UI):
-- **Join action orchestration**: `GroupPage.handleJoin` (`indiepress-dev/src/pages/secondary/GroupPage/index.tsx:736`).
-- **Closed vs open determination**: `openJoinAllowed` and `isOpenGroup` gate flags (`indiepress-dev/src/pages/secondary/GroupPage/index.tsx:904`).
-- **Join requests**: `GroupsProvider.sendJoinRequest` publishes kind 9021 (`indiepress-dev/src/providers/GroupsProvider.tsx:1113`).
-- **Invite ingestion (9009 decrypt + payload parse)**: `GroupsProvider.refreshInvites` (`indiepress-dev/src/providers/GroupsProvider.tsx:464`).
-- **Invite build + dispatch**: `GroupsProvider.sendInvites` (`indiepress-dev/src/providers/GroupsProvider.tsx:1149`).
-- **Join approval -> invite**: `GroupsProvider.approveJoinRequest` (`indiepress-dev/src/providers/GroupsProvider.tsx:1315`).
-- **Mirror metadata fetch for invites**: `fetchInviteMirrorMetadata` (`indiepress-dev/src/providers/GroupsProvider.tsx:333`).
-- **Worker join bridge**: `WorkerBridgeProvider.startJoinFlowInternal` (`indiepress-dev/src/providers/WorkerBridgeProvider.tsx:509`).
+- **Join action orchestration**: `GroupPage.handleJoin` (`hypertuna-desktop/src/pages/secondary/GroupPage/index.tsx:736`).
+- **Closed vs open determination**: `openJoinAllowed` and `isOpenGroup` gate flags (`hypertuna-desktop/src/pages/secondary/GroupPage/index.tsx:904`).
+- **Join requests**: `GroupsProvider.sendJoinRequest` publishes kind 9021 (`hypertuna-desktop/src/providers/GroupsProvider.tsx:1113`).
+- **Invite ingestion (9009 decrypt + payload parse)**: `GroupsProvider.refreshInvites` (`hypertuna-desktop/src/providers/GroupsProvider.tsx:464`).
+- **Invite build + dispatch**: `GroupsProvider.sendInvites` (`hypertuna-desktop/src/providers/GroupsProvider.tsx:1149`).
+- **Join approval -> invite**: `GroupsProvider.approveJoinRequest` (`hypertuna-desktop/src/providers/GroupsProvider.tsx:1315`).
+- **Mirror metadata fetch for invites**: `fetchInviteMirrorMetadata` (`hypertuna-desktop/src/providers/GroupsProvider.tsx:333`).
+- **Worker join bridge**: `WorkerBridgeProvider.startJoinFlowInternal` (`hypertuna-desktop/src/providers/WorkerBridgeProvider.tsx:509`).
 
 Worker (local worker process):
 - **Join flow orchestrator**: `start-join-flow` handler (`hypertuna-worker/index.js:3900`).
@@ -119,29 +119,29 @@ From `public-gateway/src/config.mjs`:
 
 ### 0) Create group and hosted relay (closed)
 - UI creates hosted relay with `isOpen: false` via worker IPC.
-  - Renderer: `GroupsProvider.createHypertunaRelayGroup` calls `createRelay` with `isOpen` (`indiepress-dev/src/providers/GroupsProvider.tsx:1028`).
+  - Renderer: `GroupsProvider.createHypertunaRelayGroup` calls `createRelay` with `isOpen` (`hypertuna-desktop/src/providers/GroupsProvider.tsx:1028`).
   - Worker: IPC `create-relay` handler (`hypertuna-worker/index.js:3753`) forwards to `pear-relay-server.createRelay` (`hypertuna-worker/pear-relay-server.mjs:3151`).
 
 ### 1) Join request (no invite yet)
 Two paths exist:
-- **Pure Nostr request**: `sendJoinRequest` publishes kind 9021 to relay/discovery (`indiepress-dev/src/providers/GroupsProvider.tsx:1113`).
+- **Pure Nostr request**: `sendJoinRequest` publishes kind 9021 to relay/discovery (`hypertuna-desktop/src/providers/GroupsProvider.tsx:1113`).
 - **Worker join request**: `startJoinAuthentication` sends `/post/join/:identifier` to a host peer, which publishes 9021 to the relay (`hypertuna-worker/pear-relay-server.mjs:3340`, `:1246`).
   - For closed relays, the host **returns `pending`** and does **not** issue a challenge (`hypertuna-worker/pear-relay-server.mjs:1297`).
 
 ### 2) Admin approval -> invite issuance
 - Admin approval path creates a token, publishes `9000` (member+token), provisions writer material (optional), fetches mirror metadata, and publishes encrypted `9009` invite.
-  - `GroupsProvider.approveJoinRequest` (`indiepress-dev/src/providers/GroupsProvider.tsx:1315`).
+  - `GroupsProvider.approveJoinRequest` (`hypertuna-desktop/src/providers/GroupsProvider.tsx:1315`).
   - Worker provisioning: `provision-writer-for-invitee` (`hypertuna-worker/index.js:4208` -> `hypertuna-worker/pear-relay-server.mjs:4175`).
-  - Mirror metadata: `fetchInviteMirrorMetadata` (`indiepress-dev/src/providers/GroupsProvider.tsx:333`).
-  - Invite payload fields: `buildInvitePayload` includes token, relayKey, blindPeer, cores, writerSecret (`indiepress-dev/src/providers/GroupsProvider.tsx:169`).
+  - Mirror metadata: `fetchInviteMirrorMetadata` (`hypertuna-desktop/src/providers/GroupsProvider.tsx:333`).
+  - Invite payload fields: `buildInvitePayload` includes token, relayKey, blindPeer, cores, writerSecret (`hypertuna-desktop/src/providers/GroupsProvider.tsx:169`).
 
 ### 3) Invite ingestion (joiner)
 - Joiner decrypts `9009` invite and extracts token, relayKey, blind peer, core refs, writer secret/core.
-  - `GroupsProvider.refreshInvites` (`indiepress-dev/src/providers/GroupsProvider.tsx:464`).
+  - `GroupsProvider.refreshInvites` (`hypertuna-desktop/src/providers/GroupsProvider.tsx:464`).
 
 ### 4) Start join flow (joiner -> worker)
-- `GroupPage.handleJoin` invokes worker join when invite data exists (`indiepress-dev/src/pages/secondary/GroupPage/index.tsx:736`).
-- WorkerBridge packages invite material + host peers (if known) and sends `start-join-flow` (`indiepress-dev/src/providers/WorkerBridgeProvider.tsx:509`).
+- `GroupPage.handleJoin` invokes worker join when invite data exists (`hypertuna-desktop/src/pages/secondary/GroupPage/index.tsx:736`).
+- WorkerBridge packages invite material + host peers (if known) and sends `start-join-flow` (`hypertuna-desktop/src/providers/WorkerBridgeProvider.tsx:509`).
 
 ### 5) Worker join flow (mirror + blind-peer fallback)
 - Worker resolves host peers, augments missing mirror data via `fetchRelayMirrorMetadata`, and prehydrates blind-peer mirrors if available.
@@ -174,13 +174,13 @@ From `test-logs/CLOSED-JOIN-WORKFLOW/test12/worker.log`:
 ## Gaps / Incomplete Wiring (Observed)
 
 1) **Closed join without invite when host is offline**
-   - If `startJoinFlow` is chosen (Electron path), there is no fallback to publish `9021` via discovery when no host peers are found; the join request is only sent via `/post/join` to a host peer. If no peers are reachable, the request never lands. See `GroupPage.handleJoin` (`indiepress-dev/src/pages/secondary/GroupPage/index.tsx:736`) + `startJoinAuthentication` (`hypertuna-worker/pear-relay-server.mjs:3340`).
+   - If `startJoinFlow` is chosen (Electron path), there is no fallback to publish `9021` via discovery when no host peers are found; the join request is only sent via `/post/join` to a host peer. If no peers are reachable, the request never lands. See `GroupPage.handleJoin` (`hypertuna-desktop/src/pages/secondary/GroupPage/index.tsx:736`) + `startJoinAuthentication` (`hypertuna-worker/pear-relay-server.mjs:3340`).
 
 2) **Invite fallback requires a relay key**
    - The invite-token fallback path fails if the relay key cannot be resolved from `relayKey`, `publicIdentifier` (local-only), or the relay URL path. `getRelayKeyFromPublicIdentifier` only checks local profiles (`hypertuna-worker/relay-lookup-utils.mjs:44`), and the fallback throws if no key is found (`hypertuna-worker/pear-relay-server.mjs:3505`).
 
 3) **Multi-invite writer provisioning is skipped**
-   - `sendInvites` only provisions writer material when `invitees.length === 1`, so multi-invite sends omit `writerSecret`/`writerCore` and can yield read-only joins or writer activation failures (`indiepress-dev/src/providers/GroupsProvider.tsx:1173`).
+   - `sendInvites` only provisions writer material when `invitees.length === 1`, so multi-invite sends omit `writerSecret`/`writerCore` and can yield read-only joins or writer activation failures (`hypertuna-desktop/src/providers/GroupsProvider.tsx:1173`).
 
 4) **Closed relay mirror metadata may expire when host is offline**
    - `GatewayService` unregisters relays when closed and no peers are connected (`hypertuna-worker/gateway/GatewayService.mjs:1138`), so mirror metadata relies on cached payloads (`GATEWAY_MIRROR_METADATA_TTL`). After TTL, `/mirror` fetches for offline closed relays may fail.
