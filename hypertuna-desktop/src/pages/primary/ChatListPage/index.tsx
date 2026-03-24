@@ -1,5 +1,6 @@
 import UserAvatar, { SimpleUserAvatar } from '@/components/UserAvatar'
 import { FormattedTimestamp } from '@/components/FormattedTimestamp'
+import TitlebarInfoButton from '@/components/TitlebarInfoButton'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
 import PostRelaySelector from '@/components/PostEditor/PostRelaySelector'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
@@ -539,6 +540,10 @@ function ChatListPageTitlebar() {
         <MessageSquare />
         <div className="text-lg font-semibold">{t('Chat')}</div>
       </div>
+      <TitlebarInfoButton
+        label="Chat info"
+        content="Decentralized, end-to-end encrypted group messaging over Marmot protocol (MLS + Nostr)"
+      />
     </div>
   )
 }

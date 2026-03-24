@@ -1,5 +1,6 @@
 import { FormattedTimestamp } from '@/components/FormattedTimestamp'
 import GroupCreateDialog from '@/components/GroupCreateDialog'
+import TitlebarInfoButton from '@/components/TitlebarInfoButton'
 import Username from '@/components/Username'
 import { SimpleUserAvatar } from '@/components/UserAvatar'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
@@ -1494,11 +1495,17 @@ function GroupsPageTitlebar() {
   const { t } = useTranslation()
 
   return (
-    <div className="flex gap-2 items-center h-full pl-3 [&_svg]:text-muted-foreground">
-      <Users />
-      <div className="text-lg font-semibold" style={{ fontSize: 'var(--title-font-size, 18px)' }}>
-        {t('Groups')}
+    <div className="flex items-center justify-between h-full pl-3 pr-2">
+      <div className="flex gap-2 items-center [&_svg]:text-muted-foreground">
+        <Users />
+        <div className="text-lg font-semibold" style={{ fontSize: 'var(--title-font-size, 18px)' }}>
+          {t('Groups')}
+        </div>
       </div>
+      <TitlebarInfoButton
+        label="Groups info"
+        content="P2P nostr communities built on Hyperpipe relays."
+      />
     </div>
   )
 }
