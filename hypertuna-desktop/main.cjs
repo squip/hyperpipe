@@ -470,7 +470,8 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1600,
     height: 1022,
-    backgroundColor: '#1F2430',
+    show: false,
+    backgroundColor: '#000000',
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       nodeIntegration: false,
@@ -480,15 +481,18 @@ function createWindow() {
   });
 
   mainWindow.once('ready-to-show', () => {
-    if (!pendingWorkerMessages.length) return;
-    pendingWorkerMessages.forEach((message) => {
-      mainWindow.webContents.send('worker-message', message);
-      const messageType = typeof message?.type === 'string' ? message.type : '';
-      if (messageType.startsWith('media-') || messageType.startsWith('p2p-')) {
-        mainWindow.webContents.send('media-event', message);
-      }
-    });
-    pendingWorkerMessages = [];
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.show();
+    if (pendingWorkerMessages.length) {
+      pendingWorkerMessages.forEach((message) => {
+        mainWindow.webContents.send('worker-message', message);
+        const messageType = typeof message?.type === 'string' ? message.type : '';
+        if (messageType.startsWith('media-') || messageType.startsWith('p2p-')) {
+          mainWindow.webContents.send('media-event', message);
+        }
+      });
+      pendingWorkerMessages = [];
+    }
   });
 
   mainWindow.on('closed', () => {
