@@ -20,7 +20,6 @@ import {
   ChevronRight,
   List,
   LogOut,
-  NotebookPen,
   Server,
   Settings,
   UserRound,
@@ -88,11 +87,6 @@ const MePage = forwardRef((_, ref) => {
         {featureFlags.lists && (
           <Item onClick={() => navigate('lists')}>
             <List /> {t('Lists')}
-          </Item>
-        )}
-        {featureFlags.notepad && (
-          <Item onClick={() => navigate('notepad')}>
-            <NotebookPen /> {t('Notepad')}
           </Item>
         )}
         {featureFlags.bookmarks && (

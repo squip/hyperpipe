@@ -28,7 +28,6 @@ import ChatPage from './pages/secondary/ChatPage'
 import ListsIndexPage from './pages/secondary/ListsIndexPage'
 import ListPage from './pages/secondary/ListPage'
 import ListEditorPage from './pages/secondary/ListEditorPage'
-import NotepadNotePage from './pages/secondary/NotepadNotePage'
 import GroupPage from './pages/secondary/GroupPage'
 import NotFoundPage from './pages/secondary/NotFoundPage'
 import LocalPeerNodeSettingsPage from './pages/secondary/LocalPeerNodeSettingsPage'
@@ -79,7 +78,6 @@ function buildCoreRoutes(): RouteDefinition[] {
       path: '/lists/:id/edit',
       element: featureFlags.lists ? <ListEditorPage listId="" /> : <NotFoundPage />
     },
-    { path: '/notepad/:id', element: featureFlags.notepad ? <NotepadNotePage /> : <NotFoundPage /> },
     { path: '/groups/:id', element: <GroupPage id="" /> }
   ]
 }

@@ -1,23 +1,20 @@
-export type RendererFeature = 'explore' | 'notepad' | 'lists' | 'bookmarks'
+export type RendererFeature = 'explore' | 'lists' | 'bookmarks'
 
 const FEATURE_DEFAULTS: Record<RendererFeature, boolean> = {
-  // Pass-1 defaults: hide Explore + Notepad, keep Lists + Bookmarks enabled.
+  // Pass-1 defaults: hide Explore, keep Lists + Bookmarks enabled.
   explore: false,
-  notepad: false,
   lists: true,
   bookmarks: true
 }
 
 const FEATURE_ENV_KEYS: Record<RendererFeature, string> = {
   explore: 'VITE_FEATURE_EXPLORE_ENABLED',
-  notepad: 'VITE_FEATURE_NOTEPAD_ENABLED',
   lists: 'VITE_FEATURE_LISTS_ENABLED',
   bookmarks: 'VITE_FEATURE_BOOKMARKS_ENABLED'
 }
 
 const FEATURE_STORAGE_KEYS: Record<RendererFeature, string> = {
   explore: 'hypertuna_feature_explore_enabled',
-  notepad: 'hypertuna_feature_notepad_enabled',
   lists: 'hypertuna_feature_lists_enabled',
   bookmarks: 'hypertuna_feature_bookmarks_enabled'
 }
@@ -63,7 +60,6 @@ export function isRendererFeatureEnabled(feature: RendererFeature): boolean {
 export function getRendererFeatureFlags(): Record<RendererFeature, boolean> {
   return {
     explore: resolveFeatureFlag('explore'),
-    notepad: resolveFeatureFlag('notepad'),
     lists: resolveFeatureFlag('lists'),
     bookmarks: resolveFeatureFlag('bookmarks')
   }

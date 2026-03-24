@@ -26,7 +26,6 @@ import { UserPreferencesProvider } from '@/providers/UserPreferencesProvider'
 import { UserTrustProvider } from '@/providers/UserTrustProvider'
 import { ZapProvider } from '@/providers/ZapProvider'
 import { MessengerProvider } from '@/providers/MessengerProvider'
-import { NotepadProvider } from '@/providers/NotepadProvider'
 import { PluginRegistryProvider } from '@/providers/PluginRegistryProvider'
 import { PageManager } from './PageManager'
 import { GroupFilesProvider } from './providers/GroupFilesProvider'
@@ -59,15 +58,13 @@ export default function App(): JSX.Element {
                                               <KindFilterProvider>
                                                 <GroupedNotesProvider>
                                                   <MessengerProvider>
-                                                    <NotepadProvider>
-                                                      <GroupsProvider>
-                                                        <GroupFilesProvider>
-                                                          <PluginRegistryProvider>
-                                                            <PageManager />
-                                                          </PluginRegistryProvider>
-                                                        </GroupFilesProvider>
-                                                      </GroupsProvider>
-                                                    </NotepadProvider>
+                                                    <GroupsProvider>
+                                                      <GroupFilesProvider>
+                                                        <PluginRegistryProvider>
+                                                          <PageManager />
+                                                        </PluginRegistryProvider>
+                                                      </GroupFilesProvider>
+                                                    </GroupsProvider>
                                                   </MessengerProvider>
                                                   <Toaster />
                                                   <LinkPreviewHoverUI />

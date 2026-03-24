@@ -101,7 +101,6 @@ export const toListsIndex = () => '/lists'
 export const toList = (id: string) => `/lists/${id}`
 export const toCreateList = () => '/lists/create'
 export const toEditList = (id: string) => `/lists/${id}/edit`
-export const toNotepad = (id: string) => `/notepad/${id}`
 export const toGroup = (id: string, relay?: string) => {
   const path = `/groups/${id}`
   if (!relay) return path

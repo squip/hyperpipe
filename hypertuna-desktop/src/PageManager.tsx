@@ -33,7 +33,6 @@ import ListsPage from './pages/primary/ListsPage'
 import RelayPage from './pages/primary/RelayPage'
 import SearchPage from './pages/primary/SearchPage'
 import SettingsPage from './pages/primary/SettingsPage'
-import NotepadPage from './pages/primary/NotepadPage'
 import GroupsPage from './pages/primary/GroupsPage'
 import FilesPage from './pages/primary/FilesPage'
 import { NotificationProvider } from './providers/NotificationProvider'
@@ -73,7 +72,6 @@ const PRIMARY_PAGE_REF_MAP = {
   relay: createRef<TPageRef>(),
   search: createRef<TPageRef>(),
   bookmark: createRef<TPageRef>(),
-  notepad: createRef<TPageRef>(),
   settings: createRef<TPageRef>()
 }
 
@@ -91,13 +89,11 @@ const PRIMARY_PAGE_MAP = {
   relay: <RelayPage ref={PRIMARY_PAGE_REF_MAP.relay} />,
   search: <SearchPage ref={PRIMARY_PAGE_REF_MAP.search} />,
   bookmark: <BookmarkPage ref={PRIMARY_PAGE_REF_MAP.bookmark} />,
-  notepad: <NotepadPage ref={PRIMARY_PAGE_REF_MAP.notepad} />,
   settings: <SettingsPage ref={PRIMARY_PAGE_REF_MAP.settings} />
 }
 
 const PRIMARY_PAGE_FEATURES: Partial<Record<TPrimaryPageName, RendererFeature>> = {
   explore: 'explore',
-  notepad: 'notepad',
   lists: 'lists',
   bookmark: 'bookmarks'
 }

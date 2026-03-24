@@ -2,8 +2,7 @@ import {
   APP_WINDOW_GLOBAL,
   BIG_RELAY_URLS,
   DEFAULT_RELAY_LIST,
-  ExtendedKind,
-  LEGACY_APP_WINDOW_GLOBAL
+  ExtendedKind
 } from '@/constants'
 import {
   applyWarmHydrationCursorToRelayFilter,
@@ -1540,8 +1539,5 @@ const instance = ClientService.getInstance()
 
 ;(window as any)[APP_WINDOW_GLOBAL] = (window as any)[APP_WINDOW_GLOBAL] || {}
 ;(window as any)[APP_WINDOW_GLOBAL].client = instance
-;(window as any)[LEGACY_APP_WINDOW_GLOBAL] =
-  (window as any)[LEGACY_APP_WINDOW_GLOBAL] || (window as any)[APP_WINDOW_GLOBAL]
-;(window as any)[LEGACY_APP_WINDOW_GLOBAL].client = instance
 
 export default instance

@@ -20,7 +20,6 @@ import GroupsButton from './GroupsButton'
 import FilesButton from './FilesButton'
 import ReadsButton from './ReadsButton'
 import SearchButton from './SearchButton'
-import NotepadButton from './NotepadButton'
 import SidebarItem from './SidebarItem'
 
 export default function PrimaryPageSidebar() {
@@ -58,7 +57,6 @@ export default function PrimaryPageSidebar() {
         <GroupsButton collapse={sidebarCollapse} />
         <FilesButton collapse={sidebarCollapse} />
         {featureFlags.lists && <ListsButton collapse={sidebarCollapse} />}
-        {featureFlags.notepad && <NotepadButton collapse={sidebarCollapse} />}
         {featureFlags.bookmarks && pubkey && <BookmarkButton collapse={sidebarCollapse} />}
         <SearchButton collapse={sidebarCollapse} />
         {pluginNavItems.map((item) => {
