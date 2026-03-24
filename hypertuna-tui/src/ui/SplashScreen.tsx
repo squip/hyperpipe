@@ -4,7 +4,8 @@ import chalk from 'chalk'
 import {
   advanceHypertunaSplashState,
   createHypertunaSplashState,
-  HYPERTUNA_SPLASH_FRAME_INTERVAL_MS,
+  getHypertunaSplashTargetFrame,
+  HYPERTUNA_SPLASH_DESKTOP_DURATION_MS,
   HYPERTUNA_SPLASH_TOTAL_FRAMES,
   renderHypertunaSplashGrid
 } from '../../../shared/ui/hypertunaSplash.js'
@@ -12,6 +13,8 @@ import {
 type SplashScreenProps = {
   onComplete: () => void
 }
+
+const REDRAW_INTERVAL_MS = 33
 
 function renderGrid(grid: ReturnType<typeof renderHypertunaSplashGrid>): string {
   return grid
@@ -32,6 +35,7 @@ export function SplashScreen({ onComplete }: SplashScreenProps): React.JSX.Eleme
   const stateRef = useRef<ReturnType<typeof createHypertunaSplashState> | null>(null)
   const completionScheduledRef = useRef(false)
   const onCompleteRef = useRef(onComplete)
+  const startedAtRef = useRef<number | null>(null)
 
   useEffect(() => {
     onCompleteRef.current = onComplete
@@ -42,6 +46,7 @@ export function SplashScreen({ onComplete }: SplashScreenProps): React.JSX.Eleme
     const termRows = Number(stdout.rows || 24)
 
     stateRef.current = createHypertunaSplashState(termCols, termRows)
+    startedAtRef.current = Date.now()
 
     process.stdout.write('\x1B[?25l')
     setOutput(renderGrid(renderHypertunaSplashGrid(stateRef.current)))
@@ -50,8 +55,13 @@ export function SplashScreen({ onComplete }: SplashScreenProps): React.JSX.Eleme
       const state = stateRef.current
       if (!state) return
 
-      const nextFrame = Math.min(HYPERTUNA_SPLASH_TOTAL_FRAMES, state.frame + 1)
-      advanceHypertunaSplashState(state, nextFrame)
+      const startedAt = startedAtRef.current ?? Date.now()
+      const elapsedMs = Date.now() - startedAt
+      const targetFrame = getHypertunaSplashTargetFrame(
+        elapsedMs,
+        HYPERTUNA_SPLASH_DESKTOP_DURATION_MS
+      )
+      advanceHypertunaSplashState(state, targetFrame)
       setOutput(renderGrid(renderHypertunaSplashGrid(state)))
 
       if (state.frame >= HYPERTUNA_SPLASH_TOTAL_FRAMES && !completionScheduledRef.current) {
@@ -62,7 +72,7 @@ export function SplashScreen({ onComplete }: SplashScreenProps): React.JSX.Eleme
           onCompleteRef.current()
         }, 220)
       }
-    }, HYPERTUNA_SPLASH_FRAME_INTERVAL_MS)
+    }, REDRAW_INTERVAL_MS)
 
     return () => {
       clearInterval(interval)
