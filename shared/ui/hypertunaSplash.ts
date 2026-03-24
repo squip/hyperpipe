@@ -5,6 +5,18 @@ export type HypertunaSplashRenderCell = {
   color: string
 }
 
+export type HyperpipeWordmarkCell = {
+  col: number
+  row: number
+  color: string
+}
+
+export type HyperpipeWordmarkLayout = {
+  width: number
+  height: number
+  cells: HyperpipeWordmarkCell[]
+}
+
 type PipeCell = {
   ch: string
   color: string | null
@@ -115,6 +127,7 @@ export const HYPERTUNA_SPLASH_TOTAL_FRAMES = PHASE_TIMES.settle + HOLD_FRAMES
 export const HYPERTUNA_SPLASH_TUI_DURATION_MS =
   HYPERTUNA_SPLASH_TOTAL_FRAMES * HYPERTUNA_SPLASH_FRAME_INTERVAL_MS + 220
 export const HYPERTUNA_SPLASH_DESKTOP_DURATION_MS = 5600
+export const HYPERPIPE_WORDMARK_LETTER_GAP = 2
 
 function shadePipeRow(width: number): PipeCell[] {
   const cells: PipeCell[] = []
@@ -222,6 +235,43 @@ function getTextTargets(
   }
 
   return targets
+}
+
+function getWordmarkColor(col: number, row: number, index: number): string {
+  const hash = (col * 73856093) ^ (row * 19349663) ^ (index * 83492791)
+  return PARTICLE_COLORS[Math.abs(hash) % PARTICLE_COLORS.length]
+}
+
+export function getHyperpipeWordmarkLayout(
+  letterGap = HYPERPIPE_WORDMARK_LETTER_GAP
+): HyperpipeWordmarkLayout {
+  const cells: HyperpipeWordmarkCell[] = []
+  let currentCol = 0
+
+  for (const ch of WORD) {
+    const glyph = FONT[ch]
+    const glyphWidth = glyph[0].length
+
+    for (let row = 0; row < glyph.length; row += 1) {
+      for (let col = 0; col < glyphWidth; col += 1) {
+        if (glyph[row][col] !== '#') continue
+
+        cells.push({
+          col: currentCol + col,
+          row,
+          color: getWordmarkColor(currentCol + col, row, cells.length)
+        })
+      }
+    }
+
+    currentCol += glyphWidth + letterGap
+  }
+
+  return {
+    width: Math.max(0, currentCol - letterGap),
+    height: Math.max(...WORD.map((ch) => FONT[ch].length)),
+    cells
+  }
 }
 
 function createParticle(
