@@ -63,6 +63,8 @@ import { generateImageByPubkey } from '@/lib/pubkey'
 import React from 'react'
 import { TJoinRequest } from '@/types/groups'
 import { registerClosedJoinSimulator } from '@/devtools/closedJoinSimulator'
+import HypertunaJoinFlowProgress from '@/components/HypertunaJoinFlowProgress'
+import { formatJoinFlowErrorMessage } from '@/lib/join-flow-ui'
 // import { registerJoinWorkflowSimulator } from '@/devtools/joinWorkflowSimulator'
 
 type TJoinFlowHintFields = {
@@ -1376,7 +1378,11 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
       await sendJoinRequest(groupId, effectiveGroupRelay, inviteToken)
       setDetail((prev) => (prev ? { ...prev, membershipStatus: 'pending' } : prev))
     } catch (err) {
-      setError((err as Error).message)
+      const message = formatJoinFlowErrorMessage({
+        error: err instanceof Error ? err.message : String(err)
+      })
+      setError(message)
+      toast.error(message)
     }
   }
 
@@ -2392,11 +2398,8 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
                   </Button>
                 )}
               </div>
-              {joinFlow && joinFlow.phase !== 'idle' && joinFlow.phase !== 'success' && (
-                <div className="text-xs text-muted-foreground">
-                  Hypertuna join flow: <span className="capitalize">{joinFlow.phase}</span>
-                  {joinFlow.error ? ` — ${joinFlow.error}` : ''}
-                </div>
+              {isJoinFlowBusy && joinFlow && (
+                <HypertunaJoinFlowProgress phase={joinFlow.phase} />
               )}
             </CardContent>
           </Card>

@@ -16,6 +16,8 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Switch } from '@/components/ui/switch'
 import { useGroups } from '@/providers/GroupsProvider'
+import HypertunaJoinFlowProgress from '@/components/HypertunaJoinFlowProgress'
+import { formatJoinFlowErrorMessage } from '@/lib/join-flow-ui'
 
 export default function RelayManagerPanel() {
   const [busy, setBusy] = useState(false)
@@ -165,7 +167,7 @@ export default function RelayManagerPanel() {
         await refreshRelays()
       }
     } catch (err: any) {
-      setError(err?.message || 'Failed to join relay')
+      setError(formatJoinFlowErrorMessage({ error: err?.message || 'Failed to join relay' }))
     } finally {
       setJoinBusy(false)
     }
@@ -304,13 +306,15 @@ export default function RelayManagerPanel() {
                 placeholder="Token if required"
               />
             </div>
-            {joinFlow && (
-              <div className="rounded-md border border-border/50 bg-muted/30 p-2 text-xs space-y-1">
-                <div className="font-medium">Join flow</div>
-                <div className="text-muted-foreground capitalize">Phase: {joinFlow.phase}</div>
-                {joinFlow.error && <div className="text-red-500">{joinFlow.error}</div>}
-              </div>
-            )}
+            {joinFlow
+              && (joinFlow.phase === 'starting'
+                || joinFlow.phase === 'request'
+                || joinFlow.phase === 'verify'
+                || joinFlow.phase === 'complete') && (
+                <div className="rounded-md border border-border/50 bg-muted/30 p-2">
+                  <HypertunaJoinFlowProgress phase={joinFlow.phase} />
+                </div>
+              )}
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setJoinOpen(false)}>
                 Cancel

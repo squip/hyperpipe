@@ -20,6 +20,8 @@ import {
 import { isElectron } from '@/lib/platform'
 import { useNostr } from '@/providers/NostrProvider'
 import type { TGroupGatewayAccess, TGroupPresenceInput, TGroupPresenceProbeResult } from '@/types/groups'
+import { toast } from 'sonner'
+import { formatJoinFlowErrorMessage } from '@/lib/join-flow-ui'
 
 type WorkerStatusPhase =
   | 'starting'
@@ -117,6 +119,7 @@ type JoinFlowState = {
   authToken?: string | null
   relayUrl?: string | null
   error?: string | null
+  reason?: string | null
   writable?: boolean
   expectedWriterActive?: boolean | null
   writableAt?: number | null
@@ -684,7 +687,8 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           phase: 'starting',
           startedAt: Date.now(),
           updatedAt: Date.now(),
-          error: null
+          error: null,
+          reason: null
         }
       }))
 
@@ -1262,6 +1266,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   authToken: current?.authToken ?? null,
                   relayUrl: current?.relayUrl ?? null,
                   error: null,
+                  reason: null,
                   mode: current?.mode ?? null,
                   provisional: current?.provisional ?? null
                 }
@@ -1289,6 +1294,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   authToken: msg?.data?.authToken || null,
                   relayUrl: msg?.data?.relayUrl || null,
                   error: null,
+                  reason: null,
                   mode: msg?.data?.mode ?? current?.mode ?? null,
                   provisional: msg?.data?.provisional ?? current?.provisional ?? null
                 }
@@ -1301,6 +1307,14 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
           case 'join-auth-error': {
             const identifier = msg?.data?.publicIdentifier
             const errorText = msg?.data?.error || 'Join authentication failed'
+            const reason =
+              typeof msg?.data?.reason === 'string' && msg.data.reason.trim()
+                ? msg.data.reason.trim()
+                : null
+            const userErrorMessage = formatJoinFlowErrorMessage({
+              reason,
+              error: errorText
+            })
             if (!identifier) break
             let shouldSetLastError = true
             setJoinFlows((prev) => {
@@ -1325,13 +1339,15 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
                   authToken: current?.authToken ?? null,
                   relayUrl: current?.relayUrl ?? null,
                   error: errorText,
+                  reason,
                   mode: current?.mode ?? null,
                   provisional: current?.provisional ?? null
                 }
               }
             })
             if (shouldSetLastError) {
-              setLastError(errorText)
+              setLastError(userErrorMessage)
+              toast.error(userErrorMessage, { id: `join-flow-error-${identifier}` })
             }
             break
           }
