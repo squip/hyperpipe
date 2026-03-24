@@ -124,7 +124,7 @@ const ReadsPage = forwardRef((_, ref) => {
       pageName="reads"
       ref={layoutRef}
       titlebar={
-        <ReadsPageTitlebar feedMode={feedMode} />
+        <ReadsPageTitlebar />
       }
       displayScrollToTopButton
     >
@@ -140,22 +140,13 @@ ReadsPage.displayName = 'ReadsPage'
 
 export default ReadsPage
 
-function ReadsPageTitlebar({
-  feedMode
-}: {
-  feedMode: ReadsFeedMode
-}) {
+function ReadsPageTitlebar() {
   const { t } = useTranslation()
-  const subtitle =
-    feedMode === 'following'
-      ? t('From people you follow')
-      : t('Public articles')
 
   return (
     <div className="flex gap-1 items-center h-full justify-between px-3">
       <div className="flex-1 min-w-0">
-        <div className="font-semibold text-lg">{t('Reads')}</div>
-        <div className="text-xs text-muted-foreground">{subtitle}</div>
+        <div className="font-semibold text-lg">{t('Articles')}</div>
       </div>
     </div>
   )

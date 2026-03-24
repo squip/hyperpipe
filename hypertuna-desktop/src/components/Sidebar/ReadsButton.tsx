@@ -7,7 +7,7 @@ export default function ReadsButton({ collapse }: { collapse: boolean }) {
 
   return (
     <SidebarItem
-      title="Reads"
+      title="Articles"
       onClick={() => navigate('reads')}
       active={display && current === 'reads'}
       collapse={collapse}

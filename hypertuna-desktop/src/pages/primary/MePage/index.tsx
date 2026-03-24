@@ -82,7 +82,7 @@ const MePage = forwardRef((_, ref) => {
           <Server /> {t('Relays')}
         </Item>
         <Item onClick={() => navigate('reads')}>
-          <BookOpen /> {t('Reads')}
+          <BookOpen /> {t('Articles')}
         </Item>
         {featureFlags.lists && (
           <Item onClick={() => navigate('lists')}>
