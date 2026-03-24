@@ -7,6 +7,13 @@ describe('local storage feed selection persistence', () => {
     storage.init()
   })
 
+  it('uses the hypertuna appearance defaults when no overrides are stored', () => {
+    expect(storage.getThemeSetting()).toBe('pure-black')
+    expect(storage.getPrimaryColor()).toBe('EMERALD')
+    expect(storage.getEnableSingleColumnLayout()).toBe(false)
+    expect(storage.getDesktopPrimaryColumnWidth()).toBeCloseTo((1067 / (1067 + 586)) * 100, 5)
+  })
+
   it('persists local group relay selections by stable group id instead of localhost url', () => {
     storage.setFeedInfo(
       {

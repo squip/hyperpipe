@@ -1,4 +1,4 @@
-import { PRIMARY_COLORS, StorageKey, TPrimaryColor } from '@/constants'
+import { PRIMARY_COLORS, TPrimaryColor } from '@/constants'
 import storage from '@/services/local-storage.service'
 import { TTheme, TThemeSetting } from '@/types'
 import { createContext, useContext, useEffect, useState } from 'react'
@@ -25,13 +25,9 @@ const updateCSSVariables = (color: TPrimaryColor, currentTheme: TTheme) => {
 }
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [themeSetting, setThemeSetting] = useState<TThemeSetting>(
-    (localStorage.getItem(StorageKey.THEME_SETTING) as TThemeSetting) ?? 'system'
-  )
+  const [themeSetting, setThemeSetting] = useState<TThemeSetting>(storage.getThemeSetting())
   const [theme, setTheme] = useState<TTheme>('light')
-  const [primaryColor, setPrimaryColor] = useState<TPrimaryColor>(
-    (localStorage.getItem(StorageKey.PRIMARY_COLOR) as TPrimaryColor) ?? 'DEFAULT'
-  )
+  const [primaryColor, setPrimaryColor] = useState<TPrimaryColor>(storage.getPrimaryColor())
 
   useEffect(() => {
     if (themeSetting !== 'system') {

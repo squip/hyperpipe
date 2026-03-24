@@ -8,6 +8,15 @@ export const APP_ISSUES_URL = `${APP_REPOSITORY_URL}/issues/new`
 export const APP_SHARE_BASE_URL =
   (import.meta.env.VITE_PUBLIC_SHARE_BASE_URL as string | undefined) || APP_PUBLIC_URL
 export const APP_WINDOW_GLOBAL = 'hypertuna'
+export const DEFAULT_THEME_SETTING = 'pure-black'
+export const DEFAULT_PRIMARY_COLOR = 'EMERALD' as const
+export const DEFAULT_ENABLE_SINGLE_COLUMN_LAYOUT = false
+export const DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH = 1067
+export const DEFAULT_DESKTOP_SECONDARY_COLUMN_WIDTH = 586
+export const DEFAULT_DESKTOP_COLUMN_TOTAL_WIDTH =
+  DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH + DEFAULT_DESKTOP_SECONDARY_COLUMN_WIDTH
+export const DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT =
+  (DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH / DEFAULT_DESKTOP_COLUMN_TOTAL_WIDTH) * 100
 
 // Compatibility holdouts limited to the hosted translation service contract.
 export const HOSTED_TRANSLATION_SERVICE_ID = 'fevela' as const
@@ -66,6 +75,7 @@ export const StorageKey = {
   SIDEBAR_COLLAPSE: 'sidebarCollapse',
   PRIMARY_COLOR: 'primaryColor',
   ENABLE_SINGLE_COLUMN_LAYOUT: 'enableSingleColumnLayout',
+  DESKTOP_PRIMARY_COLUMN_WIDTH: 'desktopPrimaryColumnWidth',
   SHOW_LINK_PREVIEWS: 'showLinkPreviews',
   FAVORITE_LISTS: 'favoriteLists',
   FAVORITE_GROUPS: 'favoriteGroups',

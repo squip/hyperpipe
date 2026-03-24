@@ -1,5 +1,9 @@
 import {
+  DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT,
+  DEFAULT_ENABLE_SINGLE_COLUMN_LAYOUT,
+  DEFAULT_PRIMARY_COLOR,
   DEFAULT_NIP_96_SERVICE,
+  DEFAULT_THEME_SETTING,
   ExtendedKind,
   HOSTED_TRANSLATION_SERVICE_ID,
   LINK_PREVIEW_MODE,
@@ -135,7 +139,7 @@ class LocalStorageService {
   static instance: LocalStorageService
 
   private relaySets: TRelaySet[] = []
-  private themeSetting: TThemeSetting = 'system'
+  private themeSetting: TThemeSetting = DEFAULT_THEME_SETTING
   private accounts: TAccount[] = []
   private currentAccount: TAccount | null = null
   private noteListMode: TNoteListMode = 'posts'
@@ -160,8 +164,9 @@ class LocalStorageService {
   private groupedNotesSettings: TStoredGroupedNotesSettings | null = null
   private shownCreateWalletGuideToastPubkeys: Set<string> = new Set()
   private sidebarCollapse: boolean = false
-  private primaryColor: TPrimaryColor = 'DEFAULT'
-  private enableSingleColumnLayout: boolean = false
+  private primaryColor: TPrimaryColor = DEFAULT_PRIMARY_COLOR
+  private enableSingleColumnLayout: boolean = DEFAULT_ENABLE_SINGLE_COLUMN_LAYOUT
+  private desktopPrimaryColumnWidth: number = DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT
   private linkPreviewMode: TLinkPreviewMode = LINK_PREVIEW_MODE.ENABLED
   private favoriteListsMap: Record<string, string[]> = {}
   private favoriteGroupsMap: Record<string, string[]> = {}
@@ -180,7 +185,8 @@ class LocalStorageService {
 
   init() {
     this.themeSetting =
-      (window.localStorage.getItem(StorageKey.THEME_SETTING) as TThemeSetting) ?? 'system'
+      (window.localStorage.getItem(StorageKey.THEME_SETTING) as TThemeSetting)
+      ?? DEFAULT_THEME_SETTING
     const accountsStr = window.localStorage.getItem(StorageKey.ACCOUNTS)
     this.accounts = accountsStr ? JSON.parse(accountsStr) : []
     const currentAccountStr = window.localStorage.getItem(StorageKey.CURRENT_ACCOUNT)
@@ -389,10 +395,27 @@ class LocalStorageService {
     this.sidebarCollapse = window.localStorage.getItem(StorageKey.SIDEBAR_COLLAPSE) === 'true'
 
     this.primaryColor =
-      (window.localStorage.getItem(StorageKey.PRIMARY_COLOR) as TPrimaryColor) ?? 'DEFAULT'
+      (window.localStorage.getItem(StorageKey.PRIMARY_COLOR) as TPrimaryColor)
+      ?? DEFAULT_PRIMARY_COLOR
 
+    const storedEnableSingleColumnLayout = window.localStorage.getItem(
+      StorageKey.ENABLE_SINGLE_COLUMN_LAYOUT
+    )
     this.enableSingleColumnLayout =
-      window.localStorage.getItem(StorageKey.ENABLE_SINGLE_COLUMN_LAYOUT) === 'true'
+      storedEnableSingleColumnLayout === null
+        ? DEFAULT_ENABLE_SINGLE_COLUMN_LAYOUT
+        : storedEnableSingleColumnLayout === 'true'
+
+    const storedDesktopPrimaryColumnWidth = window.localStorage.getItem(
+      StorageKey.DESKTOP_PRIMARY_COLUMN_WIDTH
+    )
+    const legacyDesktopPrimaryColumnWidth = window.localStorage.getItem('column-width')
+    const parsedDesktopPrimaryColumnWidth = parseFloat(
+      storedDesktopPrimaryColumnWidth ?? legacyDesktopPrimaryColumnWidth ?? ''
+    )
+    this.desktopPrimaryColumnWidth = Number.isFinite(parsedDesktopPrimaryColumnWidth)
+      ? Math.max(20, Math.min(80, parsedDesktopPrimaryColumnWidth))
+      : DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT
 
     // Migration logic for old boolean showLinkPreviews to new enum linkPreviewMode
     const storedLinkPreviewMode = window.localStorage.getItem(StorageKey.SHOW_LINK_PREVIEWS)
@@ -743,6 +766,16 @@ class LocalStorageService {
   setEnableSingleColumnLayout(enable: boolean) {
     this.enableSingleColumnLayout = enable
     window.localStorage.setItem(StorageKey.ENABLE_SINGLE_COLUMN_LAYOUT, enable.toString())
+  }
+
+  getDesktopPrimaryColumnWidth() {
+    return this.desktopPrimaryColumnWidth
+  }
+
+  setDesktopPrimaryColumnWidth(width: number) {
+    const clampedWidth = Math.max(20, Math.min(80, width))
+    this.desktopPrimaryColumnWidth = clampedWidth
+    window.localStorage.setItem(StorageKey.DESKTOP_PRIMARY_COLUMN_WIDTH, clampedWidth.toString())
   }
 
   getLinkPreviewMode() {

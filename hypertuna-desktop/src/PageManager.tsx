@@ -1,4 +1,5 @@
 import Sidebar from '@/components/Sidebar'
+import { DEFAULT_DESKTOP_COLUMN_TOTAL_WIDTH } from '@/constants'
 import { isRendererFeatureEnabled } from '@/lib/features'
 import type { RendererFeature } from '@/lib/features'
 import { cn } from '@/lib/utils'
@@ -41,6 +42,7 @@ import { useScreenSize } from './providers/ScreenSizeProvider'
 import { useTheme } from './providers/ThemeProvider'
 import { useUserPreferences } from './providers/UserPreferencesProvider'
 import { getRoutes } from './routes'
+import storage from './services/local-storage.service'
 import modalManager from './services/modal-manager.service'
 
 export type TPrimaryPageName = keyof typeof PRIMARY_PAGE_MAP
@@ -130,17 +132,14 @@ export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
   const { themeSetting } = useTheme()
   const { enableSingleColumnLayout } = useUserPreferences()
   const ignorePopStateRef = useRef(false)
-  const [leftColumnWidth, setLeftColumnWidth] = useState(() => {
-    const stored = localStorage.getItem('column-width')
-    return stored ? parseFloat(stored) : 50
-  })
+  const [leftColumnWidth, setLeftColumnWidth] = useState(() => storage.getDesktopPrimaryColumnWidth())
   const [isResizing, setIsResizing] = useState(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const handleRef = useRef<HTMLDivElement>(null)
   const rafRef = useRef<number | null>(null)
 
   useEffect(() => {
-    localStorage.setItem('column-width', leftColumnWidth.toString())
+    storage.setDesktopPrimaryColumnWidth(leftColumnWidth)
   }, [leftColumnWidth])
 
   useEffect(() => {
@@ -523,6 +522,7 @@ export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
                     themeSetting === 'pure-black' ? '' : 'gap-2 pr-2 py-2'
                   )}
                   style={{
+                    maxWidth: `${DEFAULT_DESKTOP_COLUMN_TOTAL_WIDTH}px`,
                     gridTemplateColumns: `${leftColumnWidth}% ${100 - leftColumnWidth}%`,
                     userSelect: isResizing ? 'none' : 'auto',
                     cursor: isResizing ? 'col-resize' : 'auto'
