@@ -32,6 +32,7 @@ import type {
   GroupDraftAttachment,
   GroupInvite,
   GroupNotesLoadState,
+  GroupPresenceState,
   GroupSummary,
   GatewayOperatorIdentity,
   InvitesInboxItem,
@@ -463,6 +464,11 @@ const GROUP_METADATA_TIMEOUT_MS = 2_500
 const LOCAL_PROFILE_CACHE_TTL_MS = 5_000
 const CREATE_RELAY_RECONCILE_TIMEOUT_MS = 90_000
 const CREATE_RELAY_RECONCILE_POLL_MS = 1_500
+const GROUP_PRESENCE_SELECTED_TTL_MS = 15_000
+const GROUP_PRESENCE_MY_GROUP_TTL_MS = 20_000
+const GROUP_PRESENCE_DISCOVER_TTL_MS = 30_000
+const GROUP_PRESENCE_VISIBLE_WINDOW = 6
+const GROUP_PRESENCE_DISCOVER_CONCURRENCY = 3
 
 type LocalRelayProfileSnapshot = {
   relayKey: string
@@ -515,6 +521,9 @@ export class TuiController {
   private profileNameCache = new Map<string, string>()
   private localProfileCache: { loadedAt: number; entries: LocalRelayProfileSnapshot[] } | null = null
   private gatewayPeerRelayMap: Record<string, string[]> = {}
+  private groupPresenceCache = new Map<string, GroupPresenceState>()
+  private groupPresenceExpiresAt = new Map<string, number>()
+  private groupPresenceInFlight = new Map<string, Promise<GroupPresenceState>>()
 
   private state: ControllerState = {
     initialized: false,
@@ -672,7 +681,10 @@ export class TuiController {
         ...this.state.feedControls,
         kindFilter: this.state.feedControls.kindFilter ? [...this.state.feedControls.kindFilter] : null
       },
-      groups: this.state.groups.map((group) => ({ ...group })),
+      groups: this.state.groups.map((group) => ({
+        ...group,
+        peerPresence: group.peerPresence ? { ...group.peerPresence } : undefined
+      })),
       groupControls: { ...this.state.groupControls },
       invites: this.state.invites.map((invite) => ({ ...invite })),
       files: this.state.files.map((file) => ({ ...file })),
@@ -687,8 +699,14 @@ export class TuiController {
       threadMessages: this.state.threadMessages.map((message) => ({ ...message })),
       searchResults: this.state.searchResults.map((result) => ({ ...result })),
       myGroupList: this.state.myGroupList.map((entry) => ({ ...entry })),
-      groupDiscover: this.state.groupDiscover.map((group) => ({ ...group })),
-      myGroups: this.state.myGroups.map((group) => ({ ...group })),
+      groupDiscover: this.state.groupDiscover.map((group) => ({
+        ...group,
+        peerPresence: group.peerPresence ? { ...group.peerPresence } : undefined
+      })),
+      myGroups: this.state.myGroups.map((group) => ({
+        ...group,
+        peerPresence: group.peerPresence ? { ...group.peerPresence } : undefined
+      })),
       groupInvites: this.state.groupInvites.map((invite) => ({ ...invite })),
       groupJoinRequests: Object.fromEntries(
         Object.entries(this.state.groupJoinRequests).map(([key, value]) => [key, value.map((row) => ({ ...row }))])
@@ -916,7 +934,7 @@ export class TuiController {
       }
 
       const relay = this.resolveRelayUrl(entry.relay) || String(entry.relay || '').trim() || undefined
-      myGroups.push({
+      myGroups.push(this.applyGroupPresenceToGroup({
         id: groupId,
         relay,
         name: this.fallbackGroupNameFromIdentifier(groupId),
@@ -925,9 +943,8 @@ export class TuiController {
         isOpen: true,
         members: [],
         membersCount: 0,
-        peersOnline: this.resolveGroupPeerCount(groupId, relay),
         createdAt: null
-      })
+      }))
     }
 
     const invitesInbox = buildInvitesInbox({
@@ -1377,6 +1394,12 @@ export class TuiController {
       chatRetryCount: 0,
       chatNextRetryAt: null
     })
+  }
+
+  private resetGroupPresenceState(): void {
+    this.groupPresenceCache.clear()
+    this.groupPresenceExpiresAt.clear()
+    this.groupPresenceInFlight.clear()
   }
 
   private chatRetryDelayMs(retryCount: number): number {
@@ -1986,6 +2009,7 @@ export class TuiController {
       })
       if (this.state.currentAccountPubkey === pubkey) {
         await this.stopWorker()
+        this.resetGroupPresenceState()
         this.patchState({ session: null })
       }
     })
@@ -1996,6 +2020,7 @@ export class TuiController {
       if (this.state.session && this.state.session.pubkey !== pubkey) {
         await this.workerHost.stop().catch(() => {})
         this.resetChatRuntimeState()
+        this.resetGroupPresenceState()
         this.patchState({ session: null, lifecycle: 'stopped', readinessMessage: 'Stopped' })
       }
       await this.accountService.setCurrentAccount(pubkey)
@@ -2028,6 +2053,7 @@ export class TuiController {
       this.clearRecoveryTimer()
       await this.workerHost.stop().catch(() => {})
       this.resetChatRuntimeState()
+      this.resetGroupPresenceState()
       this.patchState({
         session: null,
         lifecycle: 'stopped',
@@ -2118,6 +2144,9 @@ export class TuiController {
   async setSelectedNode(nodeId: NavNodeId): Promise<void> {
     if (this.state.selectedNode === nodeId) return
     this.patchState({ selectedNode: nodeId })
+    if (nodeId === 'groups:browse' || nodeId === 'groups:my') {
+      void this.refreshVisibleGroupPresence().catch(() => {})
+    }
     await this.persistAccountScopedUiState({ selectedNode: nodeId })
   }
 
@@ -2219,6 +2248,9 @@ export class TuiController {
       [key]: normalizedIndex
     }
     this.patchState({ rightTopSelectionByNode: next })
+    if (key === 'groups:browse' || key === 'groups:my') {
+      void this.refreshVisibleGroupPresence().catch(() => {})
+    }
     await this.persistAccountScopedUiState({ rightTopSelectionByNode: next })
   }
 
@@ -2303,8 +2335,20 @@ export class TuiController {
       const rightCreatedAt = Number(right.createdAt || right.event?.created_at || 0)
       const leftMembers = Number(left.membersCount || left.members?.length || 0)
       const rightMembers = Number(right.membersCount || right.members?.length || 0)
-      const leftPeers = Number(left.peersOnline || 0)
-      const rightPeers = Number(right.peersOnline || 0)
+      const leftPresence = left.peerPresence || this.groupPresenceForGroup(left.id, left.relay)
+      const rightPresence = right.peerPresence || this.groupPresenceForGroup(right.id, right.relay)
+      const leftPeers = Number.isFinite(leftPresence.count) ? Number(leftPresence.count) : -1
+      const rightPeers = Number.isFinite(rightPresence.count) ? Number(rightPresence.count) : -1
+      const leftPresenceBucket = leftPresence.status === 'ready' && Number.isFinite(leftPresence.count)
+        ? 0
+        : leftPresence.status === 'scanning'
+          ? 1
+          : 2
+      const rightPresenceBucket = rightPresence.status === 'ready' && Number.isFinite(rightPresence.count)
+        ? 0
+        : rightPresence.status === 'scanning'
+          ? 1
+          : 2
 
       switch (controls.sortKey) {
         case 'name':
@@ -2320,6 +2364,9 @@ export class TuiController {
         case 'createdAt':
           return direction * (leftCreatedAt - rightCreatedAt)
         case 'peers':
+          if (leftPresenceBucket !== rightPresenceBucket) {
+            return leftPresenceBucket - rightPresenceBucket
+          }
           return direction * (leftPeers - rightPeers)
         case 'members':
         default:
@@ -2383,16 +2430,16 @@ export class TuiController {
   }
 
   private syncGroupView(): void {
-    const withLivePeers = this.rawGroupDiscover.map((group) => ({
+    const withLivePeers = this.rawGroupDiscover.map((group) => this.applyGroupPresenceToGroup({
       ...group,
-      membersCount: Number(group.membersCount || group.members?.length || 0),
-      peersOnline: this.resolveGroupPeerCount(group.id, group.relay)
+      membersCount: Number(group.membersCount || group.members?.length || 0)
     }))
     const next = this.applyGroupControls(withLivePeers)
     this.patchState({
       groups: next,
       groupDiscover: next
     })
+    void this.refreshVisibleGroupPresence().catch(() => {})
   }
 
   private syncFilesView(): void {
@@ -3028,45 +3075,213 @@ export class TuiController {
     })
   }
 
-  private resolveGroupPeerCount(groupId: string, relay?: string): number {
-    const candidates = new Set<string>()
+  private groupPresenceKey(groupId?: string | null, relay?: string | null): string {
     const normalizedGroupId = String(groupId || '').trim()
-    if (normalizedGroupId) {
-      candidates.add(normalizedGroupId)
-      candidates.add(normalizedGroupId.replace(':', '/'))
-      candidates.add(normalizedGroupId.replace('/', ':'))
+    if (normalizedGroupId) return normalizedGroupId
+    return this.normalizeRelayForCompare(relay || undefined)
+  }
+
+  private createGroupPresenceState(input: Partial<GroupPresenceState> = {}): GroupPresenceState {
+    const count = Number.isFinite(Number(input.count)) ? Math.max(0, Math.trunc(Number(input.count))) : null
+    const lastUpdatedAt = Number.isFinite(Number(input.lastUpdatedAt))
+      ? Math.trunc(Number(input.lastUpdatedAt))
+      : null
+    const verifiedAt = Number.isFinite(Number(input.verifiedAt))
+      ? Math.trunc(Number(input.verifiedAt))
+      : null
+    const status = (() => {
+      const value = String(input.status || 'unknown').trim()
+      return ['idle', 'scanning', 'ready', 'error', 'unknown'].includes(value)
+        ? value as GroupPresenceState['status']
+        : 'unknown'
+    })()
+    const source = (() => {
+      const value = String(input.source || 'unknown').trim()
+      return ['gateway', 'direct-probe', 'mixed', 'unknown'].includes(value)
+        ? value as GroupPresenceState['source']
+        : 'unknown'
+    })()
+    return {
+      count,
+      status,
+      source,
+      gatewayIncluded: input.gatewayIncluded === true,
+      gatewayHealthy: input.gatewayHealthy === true,
+      lastUpdatedAt,
+      verifiedAt,
+      unknown: input.unknown === true || status === 'unknown' || count === null,
+      error: typeof input.error === 'string' && input.error.trim() ? input.error.trim() : null
     }
-    const normalizedRelay = this.normalizeRelayForCompare(relay || undefined)
-    if (normalizedRelay) {
-      candidates.add(normalizedRelay)
-      const resolved = this.resolveRelayUrl(normalizedRelay)
-      if (resolved) {
-        candidates.add(resolved)
-        candidates.add(this.normalizeRelayForCompare(resolved))
+  }
+
+  private groupPresenceForGroup(groupId?: string | null, relay?: string | null): GroupPresenceState {
+    const key = this.groupPresenceKey(groupId, relay)
+    if (!key) return this.createGroupPresenceState({ status: 'unknown' })
+    return this.groupPresenceCache.get(key) || this.createGroupPresenceState({ status: 'unknown' })
+  }
+
+  private applyGroupPresenceToGroup(group: GroupSummary): GroupSummary {
+    const presence = this.groupPresenceForGroup(group.id, group.relay)
+    return {
+      ...group,
+      peerPresence: presence,
+      peersOnline: presence.status === 'ready' && Number.isFinite(presence.count)
+        ? Number(presence.count)
+        : 0
+    }
+  }
+
+  private shouldPreservePreviousGroupPresence(
+    previous: GroupPresenceState | null | undefined,
+    next: GroupPresenceState
+  ): boolean {
+    if (!previous || previous.status !== 'ready' || !Number.isFinite(previous.count)) return false
+    if (previous.gatewayIncluded !== true || previous.gatewayHealthy !== true) return false
+    if (next.status !== 'ready' || !Number.isFinite(next.count)) return false
+    if (Number(next.count) >= Number(previous.count)) return false
+    if (next.source !== 'direct-probe') return false
+    if (next.gatewayIncluded === true || next.gatewayHealthy === true) return false
+    return Boolean(next.error)
+  }
+
+  private mergeGroupPresenceState(
+    previous: GroupPresenceState | null | undefined,
+    next: GroupPresenceState
+  ): GroupPresenceState {
+    if (this.shouldPreservePreviousGroupPresence(previous, next)) {
+      return {
+        ...previous!,
+        error: next.error || previous?.error || null,
+        lastUpdatedAt: next.lastUpdatedAt || previous?.lastUpdatedAt || null,
+        verifiedAt: next.verifiedAt || previous?.verifiedAt || null
       }
     }
+    return next
+  }
 
-    let best = 0
-    for (const candidate of candidates) {
-      const direct = this.state.gatewayPeerCounts[candidate]
-      if (Number.isFinite(direct)) {
-        best = Math.max(best, Number(direct))
-      }
+  private groupPresenceTtlForNode(nodeId: NavNodeId): number {
+    if (nodeId === 'groups:my') return GROUP_PRESENCE_MY_GROUP_TTL_MS
+    if (nodeId === 'groups:browse') return GROUP_PRESENCE_DISCOVER_TTL_MS
+    return GROUP_PRESENCE_SELECTED_TTL_MS
+  }
+
+  private buildGroupPresencePayload(group: GroupSummary): Record<string, unknown> {
+    return {
+      publicIdentifier: group.id,
+      relayUrl: group.relay || undefined,
+      gatewayOrigin: group.gatewayOrigin || undefined,
+      gatewayId: group.gatewayId || undefined,
+      directJoinOnly: group.directJoinOnly === true,
+      discoveryTopic: group.discoveryTopic || undefined,
+      hostPeerKeys: Array.isArray(group.hostPeerKeys) ? group.hostPeerKeys : undefined,
+      leaseReplicaPeerKeys: Array.isArray(group.leaseReplicaPeerKeys) ? group.leaseReplicaPeerKeys : undefined
+    }
+  }
+
+  private selectedGroupRowsForNode(nodeId: NavNodeId): GroupSummary[] {
+    if (nodeId === 'groups:my') return this.state.myGroups
+    if (nodeId === 'groups:browse') return this.state.groups
+    return []
+  }
+
+  private visibleGroupPresenceTargets(nodeId: NavNodeId): GroupSummary[] {
+    const rows = this.selectedGroupRowsForNode(nodeId)
+      .filter((group) => Boolean(String(group.id || '').trim()))
+    if (!rows.length) return []
+    const selectedIndex = Math.max(
+      0,
+      Math.min(
+        Math.trunc(this.state.rightTopSelectionByNode[nodeId] || 0),
+        Math.max(0, rows.length - 1)
+      )
+    )
+    const start = Math.max(0, selectedIndex - 2)
+    const end = Math.min(rows.length, start + GROUP_PRESENCE_VISIBLE_WINDOW)
+    return rows.slice(start, end)
+  }
+
+  private async refreshGroupPresence(
+    group: GroupSummary,
+    options: { ttlMs?: number; force?: boolean; reason?: string } = {}
+  ): Promise<GroupPresenceState> {
+    const key = this.groupPresenceKey(group.id, group.relay)
+    if (!key) return this.createGroupPresenceState({ status: 'unknown' })
+    const ttlMs = Number.isFinite(Number(options.ttlMs))
+      ? Math.max(1_000, Math.trunc(Number(options.ttlMs)))
+      : GROUP_PRESENCE_DISCOVER_TTL_MS
+    const cached = this.groupPresenceCache.get(key) || null
+    const expiresAt = this.groupPresenceExpiresAt.get(key) || 0
+    if (!options.force && cached && expiresAt > Date.now() && cached.status !== 'error') {
+      return cached
+    }
+    const existing = this.groupPresenceInFlight.get(key)
+    if (existing) return await existing
+    if (!this.workerHost.isRunning() || this.state.lifecycle !== 'ready') {
+      return cached || this.createGroupPresenceState({ status: 'unknown' })
     }
 
-    if (best > 0) return best
-
-    for (const [key, value] of Object.entries(this.state.gatewayPeerCounts)) {
-      if (!Number.isFinite(value)) continue
-      for (const candidate of candidates) {
-        if (!candidate) continue
-        if (key.includes(candidate) || candidate.includes(key)) {
-          best = Math.max(best, Number(value))
-        }
+    const request = (async () => {
+      try {
+        const result = await this.workerHost.request<GroupPresenceState>({
+          type: 'probe-group-presence',
+          data: this.buildGroupPresencePayload(group)
+        }, 12_000)
+        const next = this.mergeGroupPresenceState(
+          cached,
+          this.createGroupPresenceState(result || {})
+        )
+        this.groupPresenceCache.set(key, next)
+        this.groupPresenceExpiresAt.set(key, Date.now() + ttlMs)
+        this.syncGroupView()
+        return next
+      } catch (error) {
+        const fallback = cached || this.createGroupPresenceState({
+          status: 'error',
+          error: error instanceof Error ? error.message : String(error)
+        })
+        this.groupPresenceCache.set(key, fallback)
+        this.groupPresenceExpiresAt.set(key, Date.now() + Math.min(ttlMs, 5_000))
+        if (!cached) this.syncGroupView()
+        return fallback
+      } finally {
+        this.groupPresenceInFlight.delete(key)
       }
-    }
+    })()
 
-    return best
+    this.groupPresenceInFlight.set(key, request)
+    if (!cached) {
+      this.groupPresenceCache.set(key, this.createGroupPresenceState({ status: 'scanning' }))
+      this.syncGroupView()
+    }
+    return await request
+  }
+
+  private async refreshVisibleGroupPresence(): Promise<void> {
+    const nodeId = this.state.selectedNode
+    if (nodeId !== 'groups:browse' && nodeId !== 'groups:my') return
+    const targets = this.visibleGroupPresenceTargets(nodeId)
+    if (!targets.length) return
+    const ttlMs = this.groupPresenceTtlForNode(nodeId)
+    const concurrency = nodeId === 'groups:browse'
+      ? Math.min(GROUP_PRESENCE_DISCOVER_CONCURRENCY, targets.length)
+      : targets.length
+    let cursor = 0
+    await Promise.all(Array.from({ length: concurrency }, async () => {
+      while (cursor < targets.length) {
+        const nextIndex = cursor
+        cursor += 1
+        const group = targets[nextIndex]
+        if (!group) continue
+        await this.refreshGroupPresence(group, { ttlMs, reason: `visible:${nodeId}` }).catch(() => {})
+      }
+    }))
+  }
+
+  private resolveGroupPeerCount(groupId: string, relay?: string): number {
+    const presence = this.groupPresenceForGroup(groupId, relay)
+    return presence.status === 'ready' && Number.isFinite(presence.count)
+      ? Number(presence.count)
+      : 0
   }
 
   private inferGatewayBaseUrl(): string {
@@ -3200,9 +3415,9 @@ export class TuiController {
         adminPubkey: profile.adminPubkey || null,
         members: [...profile.members],
         membersCount: profile.membersCount,
-        peersOnline: this.resolveGroupPeerCount(profile.publicIdentifier, profile.relayUrl),
         createdAt: profile.createdAt
       }))
+      .map((group) => this.applyGroupPresenceToGroup(group))
   }
 
   private getWorkerReadableRelayUrls(): string[] {
@@ -3476,6 +3691,7 @@ export class TuiController {
       this.patchState({ lifecycle: 'stopping', readinessMessage: 'Stopping worker…' })
       await this.workerHost.stop()
       this.resetChatRuntimeState()
+      this.resetGroupPresenceState()
       this.patchState({ lifecycle: 'stopped', readinessMessage: 'Stopped' })
     })
   }
@@ -3660,7 +3876,6 @@ export class TuiController {
           adminName: null,
           members: session?.pubkey ? [session.pubkey] : [],
           membersCount: session?.pubkey ? 1 : 0,
-          peersOnline: 0,
           createdAt: eventNow()
         }
         this.rawGroupDiscover = [provisional, ...this.rawGroupDiscover]
@@ -4069,10 +4284,9 @@ export class TuiController {
     if (!groups.length) return []
     const groupIds = Array.from(new Set(groups.map((group) => String(group.id || '').trim()).filter(Boolean)))
     if (!groupIds.length) {
-      return groups.map((group) => ({
+      return groups.map((group) => this.applyGroupPresenceToGroup({
         ...group,
         membersCount: Number(group.membersCount || group.members?.length || 0),
-        peersOnline: this.resolveGroupPeerCount(group.id, group.relay),
         createdAt: group.createdAt || group.event?.created_at || null
       }))
     }
@@ -4082,10 +4296,9 @@ export class TuiController {
     const relays = this.searchableRelayUrls(MAX_GROUP_ENRICH_RELAYS)
     const limit = Math.max(120, targetGroupIds.length * 3)
     if (!relays.length || !targetGroupIds.length) {
-      return groups.map((group) => ({
+      return groups.map((group) => this.applyGroupPresenceToGroup({
         ...group,
         membersCount: Number(group.membersCount || group.members?.length || 0),
-        peersOnline: this.resolveGroupPeerCount(group.id, group.relay),
         createdAt: group.createdAt || group.event?.created_at || null
       }))
     }
@@ -4170,12 +4383,11 @@ export class TuiController {
 
     return groups.map((group) => {
       if (!targetGroupSet.has(group.id)) {
-        return {
+        return this.applyGroupPresenceToGroup({
           ...group,
           membersCount: Number(group.membersCount || group.members?.length || 0),
-          peersOnline: this.resolveGroupPeerCount(group.id, group.relay),
           createdAt: group.createdAt || group.event?.created_at || null
-        }
+        })
       }
       const adminEvent = latestAdminByGroup.get(group.id)
       const memberEvent = latestMembersByGroup.get(group.id)
@@ -4183,17 +4395,15 @@ export class TuiController {
       const members = memberEvent ? parseGroupMembersEvent(memberEvent) : []
       const adminPubkey = admins[0]?.pubkey || group.adminPubkey || group.event?.pubkey || null
       const adminName = adminPubkey ? (this.profileNameCache.get(String(adminPubkey).toLowerCase()) || null) : null
-      const peersOnline = this.resolveGroupPeerCount(group.id, group.relay)
       const createdAt = group.createdAt || group.event?.created_at || null
-      return {
+      return this.applyGroupPresenceToGroup({
         ...group,
         adminPubkey,
         adminName,
         members,
         membersCount: members.length,
-        peersOnline,
         createdAt
-      }
+      })
     })
   }
 

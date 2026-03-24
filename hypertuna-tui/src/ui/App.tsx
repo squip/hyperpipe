@@ -3,7 +3,7 @@ import { Box, Text, useApp, useInput, useStdout } from 'ink'
 import Spinner from 'ink-spinner'
 import TextInput from 'ink-text-input'
 import { TuiController, type ControllerState, type RuntimeOptions } from '../domain/controller.js'
-import type { GroupJoinRequest } from '../domain/types.js'
+import type { GroupJoinRequest, GroupPresenceState } from '../domain/types.js'
 import { copy as copyToClipboard } from '../runtime/clipboard.js'
 import {
   DEFAULT_DISCOVERY_RELAYS,
@@ -770,6 +770,7 @@ function rightTopTableColumnsForNode(node: NavNodeId): TableColumn[] | null {
       { key: 'visibility', label: 'Vis', minWidth: 7, priority: 1, align: 'center' },
       { key: 'membership', label: 'Join', minWidth: 7, priority: 1, align: 'center' },
       { key: 'members', label: 'Members', minWidth: 7, priority: 2, align: 'center' },
+      { key: 'peers', label: 'Peers', minWidth: 8, priority: 2, align: 'center' },
       { key: 'status', label: 'Status', minWidth: 10, priority: 3, align: 'center' }
     ]
   }
@@ -844,7 +845,7 @@ function projectRightTopTableRow(
       return { name: `${lead} ${row.label}`, mime: '', size: '', relay: '', by: '' }
     }
     if (node === 'groups:browse' || node === 'groups:my') {
-      return { name: `${lead} ${row.label}`, visibility: '', membership: '', members: '', status: '' }
+      return { name: `${lead} ${row.label}`, visibility: '', membership: '', members: '', peers: '', status: '' }
     }
     return { name: `${lead} ${row.label}` }
   }
@@ -870,6 +871,7 @@ function projectRightTopTableRow(
       visibility,
       membership,
       members: `${members}`,
+      peers: formatGroupPresenceCompact(group),
       status
     }
   }
@@ -1646,6 +1648,39 @@ function groupDisplayName(group: any): string {
   return String(group?.name || group?.id || '-')
 }
 
+function groupPresenceState(group: any): GroupPresenceState | null {
+  if (!group?.peerPresence || typeof group.peerPresence !== 'object') return null
+  return group.peerPresence as GroupPresenceState
+}
+
+function formatGroupPresenceCompact(group: any): string {
+  const presence = groupPresenceState(group)
+  if (presence?.status === 'scanning') return 'Scanning…'
+  if (presence?.status === 'ready' && Number.isFinite(presence.count)) return `${Number(presence.count)}`
+  if (Number.isFinite(group?.peersOnline) && Number(group.peersOnline) > 0) return `${Number(group.peersOnline)}`
+  return '-'
+}
+
+function formatGroupPresenceDetail(group: any): string {
+  const presence = groupPresenceState(group)
+  if (presence?.status === 'scanning') return 'scanning for peers...'
+  if (presence?.status === 'ready' && Number.isFinite(presence.count)) return `${Number(presence.count)}`
+  if (Number.isFinite(group?.peersOnline) && Number(group.peersOnline) > 0) return `${Number(group.peersOnline)}`
+  return '-'
+}
+
+function groupJoinPresenceWarning(group: any): string | null {
+  const presence = groupPresenceState(group)
+  if (!presence) return null
+  if (presence.status === 'ready' && Number(presence.count) === 0) {
+    return 'warning: no verified peers online right now'
+  }
+  if (presence.status === 'scanning') {
+    return 'availability: scanning for peers...'
+  }
+  return null
+}
+
 function formatCompactLocalDateTime(unixSeconds: number | null | undefined): string {
   const seconds = Number(unixSeconds ?? 0)
   if (!Number.isFinite(seconds) || seconds <= 0) return '-'
@@ -1677,7 +1712,7 @@ function groupDetailsRows(group: any): string[] {
     `membership: ${group.isOpen === false ? 'closed' : 'open'}`,
     `admin: ${group.adminName || group.adminPubkey || '-'}`,
     `members: ${members}`,
-    `peers online: ${group.peersOnline || 0}`
+    `peers online: ${formatGroupPresenceDetail(group)}`
   ]
 }
 
@@ -1876,11 +1911,13 @@ function splitBottomRows(
       ]
     }
     if (selectedAction.startsWith('Join Relay')) {
+      const warning = groupJoinPresenceWarning(group)
       return [
         paneActionMessage || 'Press Enter to join this relay',
         `relay: ${group.name || group.id}`,
         `visibility: ${group.isPublic === false ? 'private' : 'public'}`,
-        `membership: ${group.isOpen === false ? 'closed' : 'open'}`
+        `membership: ${group.isOpen === false ? 'closed' : 'open'}`,
+        ...(warning ? [warning] : [])
       ]
     }
     if (selectedAction.startsWith('Request Invite')) {

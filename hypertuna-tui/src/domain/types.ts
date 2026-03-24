@@ -138,9 +138,26 @@ export type GroupSummary = {
   adminName?: string | null
   members?: string[]
   membersCount?: number
+  peerPresence?: GroupPresenceState
   peersOnline?: number
   createdAt?: number | null
   event?: Event
+}
+
+export type GroupPresenceStatus = 'idle' | 'scanning' | 'ready' | 'error' | 'unknown'
+
+export type GroupPresenceSource = 'gateway' | 'direct-probe' | 'mixed' | 'unknown'
+
+export type GroupPresenceState = {
+  count: number | null
+  status: GroupPresenceStatus
+  source: GroupPresenceSource
+  gatewayIncluded: boolean
+  gatewayHealthy: boolean
+  lastUpdatedAt: number | null
+  verifiedAt: number | null
+  unknown: boolean
+  error?: string | null
 }
 
 export type GroupInvite = {

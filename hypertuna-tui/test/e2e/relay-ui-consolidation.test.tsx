@@ -101,6 +101,27 @@ describe.sequential('TUI relay UI consolidation', () => {
     }
   })
 
+  it('renders the shared peers column in relay browse tables', async () => {
+    const controller = MockController.withSeedData(BASE_OPTIONS)
+    await controller.setSelectedNode('groups:browse')
+    const instance = render(
+      <App
+        options={BASE_OPTIONS}
+        controllerFactory={() => controller}
+      />
+    )
+
+    try {
+      await waitFor(() => frame(instance).includes('Command'))
+      await sleep(80)
+      const output = frame(instance)
+      expect(output).toContain('Peers')
+      expect(output).toContain('Seed Group A')
+    } finally {
+      instance.unmount()
+    }
+  })
+
   it('expands parent rows into child actions and executes child leaves', async () => {
     const controller = MockController.withSeedData(BASE_OPTIONS)
     await controller.setSelectedNode('groups:browse')
