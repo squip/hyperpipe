@@ -3543,6 +3543,14 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null, optio
         publicIdentifier: publicIdentifier || null,
         allowFallback: false
       })
+      const resolvedGatewayOrigin =
+        typeof routing?.route?.gatewayOrigin === 'string' && routing.route.gatewayOrigin.trim()
+          ? routing.route.gatewayOrigin.trim()
+          : (Array.isArray(routing?.origins) && routing.origins[0] ? routing.origins[0] : null)
+      const resolvedGatewayId =
+        typeof routing?.route?.gatewayId === 'string' && routing.route.gatewayId.trim()
+          ? routing.route.gatewayId.trim()
+          : null
       const directJoinOnly = routing.directJoinOnly === true
       const hasGatewayOrigins = Array.isArray(routing.origins) && routing.origins.length > 0
       if (!directJoinOnly && !hasGatewayOrigins) {
@@ -3555,8 +3563,11 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null, optio
 
       const baseMetadata = {
         identifier: primaryIdentifier,
+        publicIdentifier: publicIdentifier || null,
         name,
         description,
+        gatewayId: resolvedGatewayId || undefined,
+        gatewayOrigin: resolvedGatewayOrigin || undefined,
         gatewayPath: gatewayPath || normalizeGatewayPathFragment(primaryIdentifier),
         connectionUrl: effectiveConnectionUrl,
         isPublic,
@@ -3587,8 +3598,11 @@ async function buildGatewayRelayMetadataSnapshot(precomputedRelays = null, optio
         const aliasConnectionUrl = `${buildGatewayWebsocketBase(config)}/${aliasPath || relayKey}`
         const aliasMetadata = {
           identifier: relayKey,
+          publicIdentifier: publicIdentifier || null,
           name,
           description,
+          gatewayId: resolvedGatewayId || undefined,
+          gatewayOrigin: resolvedGatewayOrigin || undefined,
           gatewayPath: aliasPath || relayKey,
           connectionUrl: aliasConnectionUrl,
           isPublic,

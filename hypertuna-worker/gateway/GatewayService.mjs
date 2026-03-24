@@ -1609,6 +1609,31 @@ export class GatewayService extends EventEmitter {
     }
 
     const route = await this.#resolveGatewayRoute({ relayKey, metadata: metadataCopy });
+    const normalizedPublicIdentifier =
+      typeof metadataCopy?.publicIdentifier === 'string' && metadataCopy.publicIdentifier.trim()
+        ? metadataCopy.publicIdentifier.trim()
+        : (
+          typeof metadataCopy?.identifier === 'string'
+          && metadataCopy.identifier.trim()
+          && !/^[a-fA-F0-9]{64}$/.test(metadataCopy.identifier.trim())
+            ? metadataCopy.identifier.trim()
+            : null
+        );
+    if (route?.gatewayId && !metadataCopy?.gatewayId) {
+      metadataCopy.gatewayId = route.gatewayId;
+    }
+    if (route?.gatewayOrigin && !metadataCopy?.gatewayOrigin) {
+      metadataCopy.gatewayOrigin = route.gatewayOrigin;
+    }
+    if (normalizedPublicIdentifier && !metadataCopy?.publicIdentifier) {
+      metadataCopy.publicIdentifier = normalizedPublicIdentifier;
+    }
+    const relayStateIdentity = {
+      gatewayId: route?.gatewayId || metadataCopy?.gatewayId || null,
+      gatewayOrigin: route?.gatewayOrigin || metadataCopy?.gatewayOrigin || null,
+      publicIdentifier: normalizedPublicIdentifier || metadataCopy?.publicIdentifier || null,
+      name: metadataCopy?.name || null
+    };
     const bridgeClient = await this.#getGatewayBridgeClient(route);
     if (!bridgeClient?.isEnabled?.()) {
       this.publicGatewayRelayState.set(relayKey, {
@@ -1618,7 +1643,8 @@ export class GatewayService extends EventEmitter {
         lastSyncedAt: Date.now(),
         message: 'Gateway route unavailable or unauthorized',
         metadata: metadataCopy,
-        peers
+        peers,
+        ...relayStateIdentity
       });
       this.#clearRelayToken(relayKey);
       this.#emitPublicGatewayStatus();
@@ -1665,7 +1691,8 @@ export class GatewayService extends EventEmitter {
             localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
               ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
               : null,
-            requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
+            requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true,
+            ...relayStateIdentity
           });
         } catch (error) {
           this.publicGatewayRelayState.set(relayKey, {
@@ -1681,7 +1708,8 @@ export class GatewayService extends EventEmitter {
             localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
               ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
               : null,
-            requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
+            requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true,
+            ...relayStateIdentity
           });
           this.log('warn', `[PublicGateway] Failed to register offline relay ${relayKey}: ${error.message}`);
         }
@@ -1704,7 +1732,8 @@ export class GatewayService extends EventEmitter {
           localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
             ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
             : null,
-          requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
+          requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true,
+          ...relayStateIdentity
         });
       } catch (error) {
         this.publicGatewayRelayState.set(relayKey, {
@@ -1720,7 +1749,8 @@ export class GatewayService extends EventEmitter {
           localConnectionUrl: this.#isPublicGatewayRelayKey(relayKey)
             ? `${(this.config?.urls?.hostname || this.gatewayServer?.getServerUrls()?.hostname || 'ws://127.0.0.1:8443').replace(/\/$/, '')}/${this.#getPublicGatewayRelayPath()}`
             : null,
-          requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
+          requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true,
+          ...relayStateIdentity
         });
         this.log('warn', `[PublicGateway] Failed to unregister relay ${relayKey}: ${error.message}`);
       }
@@ -1823,7 +1853,8 @@ export class GatewayService extends EventEmitter {
         tokenRefreshWindowSeconds: registrationResult.hyperbee?.tokenRefreshWindowSeconds ?? null,
         dispatcher: registrationResult.hyperbee?.dispatcher || null,
         localConnectionUrl: localConnectionUrl || tokenInfo?.localConnectionUrl || null,
-        requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true
+        requiresAuth: this.#isPublicGatewayRelayKey(relayKey) ? false : metadataCopy?.requiresAuth ?? true,
+        ...relayStateIdentity
       });
       if (this.#isPublicGatewayRelayKey(relayKey)) {
         this.log('info', '[PublicGateway] Public gateway relay bridge ready', {
@@ -1849,7 +1880,8 @@ export class GatewayService extends EventEmitter {
         metadata: metadataCopy,
         peers,
         blindPeer: this.blindPeerSummary || null,
-        relayCores: relayCores || []
+        relayCores: relayCores || [],
+        ...relayStateIdentity
       });
       this.log('warn', `[PublicGateway] Failed to sync relay ${relayKey}: ${error.message}`);
       this.#scheduleRelayTokenRetry(relayKey);
@@ -2303,15 +2335,58 @@ export class GatewayService extends EventEmitter {
   }
 
   getPublicGatewayState() {
+    const gatewayAccessCatalog = Array.from(this.gatewayAccessCatalog.values())
+      .map((entry) => ({ ...(entry || {}) }))
+      .sort((left, right) => {
+        const byState = String(left.hostingState || '').localeCompare(String(right.hostingState || ''));
+        if (byState !== 0) return byState;
+        return String(left.gatewayOrigin || left.gatewayId || '').localeCompare(String(right.gatewayOrigin || right.gatewayId || ''));
+      });
+    const gatewayByOrigin = new Map();
+    const gatewayById = new Map();
+
+    for (const gateway of this.discoveredGateways || []) {
+      const normalizedOrigin = this.#normalizeGatewayOrigin(gateway?.publicUrl || gateway?.gatewayOrigin || null);
+      const normalizedId = this.#normalizeGatewayId(gateway?.gatewayId || null);
+      if (normalizedOrigin && !gatewayByOrigin.has(normalizedOrigin)) {
+        gatewayByOrigin.set(normalizedOrigin, gateway);
+      }
+      if (normalizedId && !gatewayById.has(normalizedId)) {
+        gatewayById.set(normalizedId, gateway);
+      }
+    }
+
+    for (const entry of gatewayAccessCatalog) {
+      const normalizedOrigin = this.#normalizeGatewayOrigin(entry?.gatewayOrigin || null);
+      const normalizedId = this.#normalizeGatewayId(entry?.gatewayId || null);
+      if (normalizedOrigin && !gatewayByOrigin.has(normalizedOrigin)) {
+        gatewayByOrigin.set(normalizedOrigin, entry);
+      }
+      if (normalizedId && !gatewayById.has(normalizedId)) {
+        gatewayById.set(normalizedId, entry);
+      }
+    }
+
     const relays = {};
     for (const [key, value] of this.publicGatewayRelayState.entries()) {
       const metadata = value?.metadata && typeof value.metadata === 'object' ? value.metadata : {};
+      const rawGatewayOrigin = this.#normalizeGatewayOrigin(value?.gatewayOrigin || metadata?.gatewayOrigin || null);
+      const rawGatewayId = this.#normalizeGatewayId(value?.gatewayId || metadata?.gatewayId || null);
+      const matchedGateway = rawGatewayOrigin
+        ? (gatewayByOrigin.get(rawGatewayOrigin) || null)
+        : (rawGatewayId ? (gatewayById.get(rawGatewayId) || null) : null);
+      const canonicalGatewayOrigin = this.#normalizeGatewayOrigin(
+        matchedGateway?.publicUrl || matchedGateway?.gatewayOrigin || rawGatewayOrigin || null
+      );
+      const canonicalGatewayId = this.#normalizeGatewayId(
+        matchedGateway?.gatewayId || rawGatewayId || null
+      );
       relays[key] = {
         ...value,
         message: typeof value?.message === 'string' ? value.message : null,
-        gatewayId: value?.gatewayId || metadata?.gatewayId || null,
-        gatewayOrigin: value?.gatewayOrigin || metadata?.gatewayOrigin || null,
-        publicIdentifier: value?.publicIdentifier || metadata?.identifier || null,
+        gatewayId: canonicalGatewayId,
+        gatewayOrigin: canonicalGatewayOrigin,
+        publicIdentifier: value?.publicIdentifier || metadata?.publicIdentifier || metadata?.identifier || null,
         name: value?.name || metadata?.name || null,
         error:
           value?.error
@@ -2327,13 +2402,6 @@ export class GatewayService extends EventEmitter {
     const summaryKeys = summary?.publicKey ? [summary.publicKey] : [];
     const blindPeerKeys = summaryKeys.length ? summaryKeys : defaultKeys;
     const combinedBlindPeerKeys = Array.from(new Set([...manualKeys, ...blindPeerKeys]));
-    const gatewayAccessCatalog = Array.from(this.gatewayAccessCatalog.values())
-      .map((entry) => ({ ...(entry || {}) }))
-      .sort((left, right) => {
-        const byState = String(left.hostingState || '').localeCompare(String(right.hostingState || ''));
-        if (byState !== 0) return byState;
-        return String(left.gatewayOrigin || left.gatewayId || '').localeCompare(String(right.gatewayOrigin || right.gatewayId || ''));
-      });
     const approvedCatalogKeys = new Set(
       gatewayAccessCatalog
         .filter((entry) => entry?.hostingState === 'approved')
@@ -3597,6 +3665,17 @@ export class GatewayService extends EventEmitter {
         }
         if (!nextMetadata.identifier) {
           nextMetadata.identifier = normalizedIdentifier;
+        }
+        if (typeof relayObj.publicIdentifier === 'string' && relayObj.publicIdentifier.trim()) {
+          nextMetadata.publicIdentifier = relayObj.publicIdentifier.trim();
+        }
+        const relayGatewayId = this.#normalizeGatewayId(relayObj.gatewayId || null);
+        if (relayGatewayId) {
+          nextMetadata.gatewayId = relayGatewayId;
+        }
+        const relayGatewayOrigin = this.#normalizeGatewayOrigin(relayObj.gatewayOrigin || null);
+        if (relayGatewayOrigin) {
+          nextMetadata.gatewayOrigin = relayGatewayOrigin;
         }
 
         const gatewayPath = this._normalizeGatewayPath(normalizedIdentifier, relayObj.gatewayPath, relayObj.connectionUrl);

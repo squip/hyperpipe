@@ -43,12 +43,33 @@ type GatewayCardSeed = {
   relays: PublicGatewayRelaySummary[]
 }
 
+function getRelayStatusRank(statusLabel: string) {
+  switch (String(statusLabel || '').trim().toLowerCase()) {
+    case 'connected':
+      return 0
+    case 'pending':
+      return 1
+    case 'offline':
+      return 2
+    case 'error':
+      return 3
+    default:
+      return 4
+  }
+}
+
 function normalizeGatewayKey(gatewayId?: string | null, gatewayOrigin?: string | null) {
-  const id = String(gatewayId || '').trim().toLowerCase()
-  if (id) return `id:${id}`
   const origin = String(gatewayOrigin || '').trim().toLowerCase().replace(/\/$/, '')
   if (origin) return `origin:${origin}`
+  const id = String(gatewayId || '').trim().toLowerCase()
+  if (id) return `id:${id}`
   return null
+}
+
+function isInternalPublicGatewayRelay(relayKey?: string | null, entry?: PublicGatewayRelayEntry | null) {
+  const normalizedRelayKey = String(relayKey || '').trim().toLowerCase()
+  const publicIdentifier = String(entry?.publicIdentifier || '').trim().toLowerCase()
+  return normalizedRelayKey.startsWith('public-gateway:') || publicIdentifier.startsWith('public-gateway:')
 }
 
 function formatGatewayStatus(hostingState?: string | null): Pick<PublicGatewayCard, 'statusLabel' | 'badgeVariant' | 'detail'> {
@@ -222,9 +243,10 @@ function addRelayToCard(
   const existing = cards.get(key)
   const relayName = String(entry?.name || '').trim()
   const publicIdentifier = String(entry?.publicIdentifier || '').trim()
+  const canonicalRelayKey = publicIdentifier || relayKey
   const relayLabel = relayName || publicIdentifier || relayKey
   const relaySummary: PublicGatewayRelaySummary = {
-    key: relayKey,
+    key: canonicalRelayKey,
     label: relayLabel,
     subtitle: relayName && publicIdentifier && relayName !== publicIdentifier ? publicIdentifier : null,
     statusLabel: formatRelayStatus(entry?.status),
@@ -233,7 +255,26 @@ function addRelayToCard(
   }
 
   if (existing) {
-    existing.relays.push(relaySummary)
+    const duplicateIndex = existing.relays.findIndex((candidate) => candidate.key === canonicalRelayKey)
+    if (duplicateIndex >= 0) {
+      const previous = existing.relays[duplicateIndex]
+      existing.relays[duplicateIndex] = {
+        ...previous,
+        label:
+          previous.label === previous.key && relaySummary.label !== relaySummary.key
+            ? relaySummary.label
+            : previous.label || relaySummary.label,
+        subtitle: previous.subtitle || relaySummary.subtitle,
+        statusLabel:
+          getRelayStatusRank(relaySummary.statusLabel) < getRelayStatusRank(previous.statusLabel)
+            ? relaySummary.statusLabel
+            : previous.statusLabel,
+        lastSyncedAt: Math.max(previous.lastSyncedAt || 0, relaySummary.lastSyncedAt || 0) || null,
+        error: previous.error || relaySummary.error
+      }
+    } else {
+      existing.relays.push(relaySummary)
+    }
     cards.set(key, existing)
     return
   }
@@ -276,6 +317,7 @@ export function buildPublicGatewayPanelModel(status: PublicGatewayStatus | null 
   authorizedGateways.forEach((entry) => addGatewayFromCatalog(cards, entry, true))
 
   relayEntries.forEach(([relayKey, entry]) => {
+    if (isInternalPublicGatewayRelay(relayKey, entry)) return
     const key =
       normalizeGatewayKey(entry?.gatewayId, entry?.gatewayOrigin)
       || 'unknown-gateway'
