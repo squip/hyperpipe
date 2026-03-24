@@ -1,4 +1,4 @@
-import { FEVELA_API_BASE_URL } from '@/constants'
+import { HOSTED_TRANSLATION_API_BASE_URL } from '@/constants'
 import client from '@/services/client.service'
 import { TTranslationAccount } from '@/types'
 
@@ -25,7 +25,7 @@ class TranslationService {
     let auth: string | undefined
     if (!apiKey) {
       auth = await client.signHttpAuth(
-        new URL(path, FEVELA_API_BASE_URL).toString(),
+        new URL(path, HOSTED_TRANSLATION_API_BASE_URL).toString(),
         method,
         'Auth to get translation service account'
       )
@@ -113,7 +113,7 @@ class TranslationService {
       _auth = `Bearer ${act.api_key}`
     }
 
-    const url = new URL(path, FEVELA_API_BASE_URL).toString()
+    const url = new URL(path, HOSTED_TRANSLATION_API_BASE_URL).toString()
     const response = await fetch(url, {
       method,
       headers: { 'Content-Type': 'application/json', Authorization: _auth },

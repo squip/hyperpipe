@@ -1,5 +1,9 @@
 import { Label } from '@/components/ui/label'
 import {
+  HOSTED_TRANSLATION_SERVICE_ID,
+  HOSTED_TRANSLATION_SERVICE_LABEL
+} from '@/constants'
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -53,19 +57,23 @@ const TranslationPage = forwardRef(({ index }: { index?: number }, ref) => {
             defaultValue={config.service}
             value={config.service}
             onValueChange={(newService) => {
-              updateConfig({ service: newService as 'fevela' | 'libre_translate' })
+              updateConfig({
+                service: newService as typeof HOSTED_TRANSLATION_SERVICE_ID | 'libre_translate'
+              })
             }}
           >
             <SelectTrigger id="translation-service-select" className="w-[180px]">
               <SelectValue placeholder={t('Select Translation Service')} />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="fevela">Fevela</SelectItem>
+              <SelectItem value={HOSTED_TRANSLATION_SERVICE_ID}>
+                {HOSTED_TRANSLATION_SERVICE_LABEL}
+              </SelectItem>
               <SelectItem value="libre_translate">LibreTranslate</SelectItem>
             </SelectContent>
           </Select>
         </div>
-        {config.service === 'fevela' ? <FevelaTranslate /> : <LibreTranslate />}
+        {config.service === HOSTED_TRANSLATION_SERVICE_ID ? <FevelaTranslate /> : <LibreTranslate />}
       </div>
     </SecondaryPageLayout>
   )

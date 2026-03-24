@@ -1,4 +1,4 @@
-import { ExtendedKind } from '@/constants'
+import { ExtendedKind, HOSTED_TRANSLATION_SERVICE_ID } from '@/constants'
 import { getPollMetadataFromEvent } from '@/lib/event-metadata'
 import libreTranslate from '@/services/libre-translate.service'
 import storage from '@/services/local-storage.service'
@@ -37,7 +37,9 @@ export const useTranslationService = () => {
 
 export function TranslationServiceProvider({ children }: { children: React.ReactNode }) {
   const { i18n } = useTranslation()
-  const [config, setConfig] = useState<TTranslationServiceConfig>({ service: 'fevela' })
+  const [config, setConfig] = useState<TTranslationServiceConfig>({
+    service: HOSTED_TRANSLATION_SERVICE_ID
+  })
   const { pubkey, startLogin } = useNostr()
   const [translatedEventIdSet, setTranslatedEventIdSet] = useState<Set<string>>(new Set())
 
@@ -48,7 +50,7 @@ export function TranslationServiceProvider({ children }: { children: React.React
   }, [pubkey])
 
   const getAccount = async (): Promise<TTranslationAccount | void> => {
-    if (config.service !== 'fevela') return
+    if (config.service !== HOSTED_TRANSLATION_SERVICE_ID) return
     if (!pubkey) {
       startLogin()
       return
@@ -57,7 +59,7 @@ export function TranslationServiceProvider({ children }: { children: React.React
   }
 
   const regenerateApiKey = async (): Promise<string | undefined> => {
-    if (config.service !== 'fevela') return
+    if (config.service !== HOSTED_TRANSLATION_SERVICE_ID) return
     if (!pubkey) {
       startLogin()
       return
@@ -72,7 +74,7 @@ export function TranslationServiceProvider({ children }: { children: React.React
   }
 
   const translate = async (text: string, target: string): Promise<string> => {
-    if (config.service === 'fevela') {
+    if (config.service === HOSTED_TRANSLATION_SERVICE_ID) {
       return await translation.translate(text, target)
     } else {
       return await libreTranslate.translate(text, target, config.server, config.api_key)
@@ -147,7 +149,7 @@ export function TranslationServiceProvider({ children }: { children: React.React
   }
 
   const translateEvent = async (event: Event): Promise<Event | void> => {
-    if (config.service === 'fevela' && !pubkey) {
+    if (config.service === HOSTED_TRANSLATION_SERVICE_ID && !pubkey) {
       startLogin()
       return
     }

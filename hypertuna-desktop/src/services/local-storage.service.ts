@@ -1,6 +1,7 @@
 import {
   DEFAULT_NIP_96_SERVICE,
   ExtendedKind,
+  HOSTED_TRANSLATION_SERVICE_ID,
   LINK_PREVIEW_MODE,
   MEDIA_AUTO_LOAD_POLICY,
   NOTIFICATION_LIST_STYLE,
@@ -608,7 +609,7 @@ class LocalStorageService {
   }
 
   getTranslationServiceConfig(pubkey?: string | null) {
-    return this.translationServiceConfigMap[pubkey ?? '_'] ?? { service: 'fevela' }
+    return this.translationServiceConfigMap[pubkey ?? '_'] ?? { service: HOSTED_TRANSLATION_SERVICE_ID }
   }
 
   setTranslationServiceConfig(config: TTranslationServiceConfig, pubkey?: string | null) {

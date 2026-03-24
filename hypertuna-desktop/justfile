@@ -13,7 +13,7 @@ build:
 
 deploy target: build
     @echo "\nDeploying application..."
-    rsync -av --delete --progress dist/ {{target}}:~/fevela/
+    rsync -av --delete --progress dist/ {{target}}:~/hypertuna/
     @just purge-cache
 
 purge-cache:

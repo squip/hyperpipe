@@ -1,3 +1,4 @@
+import { LEGACY_NOTEPAD_CACHE_DB_NAME } from '@/constants'
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { useNostr } from './NostrProvider'
 import { NotepadService } from '@/services/notepad.service'
@@ -63,7 +64,7 @@ export function NotepadProvider({ children }: { children: React.ReactNode }) {
       let ndk: NDK | null = null
       let cacheAdapter: any = null
       try {
-        cacheAdapter = new NDKCacheAdapterDexie({ dbName: 'fevela-notepad' })
+        cacheAdapter = new NDKCacheAdapterDexie({ dbName: LEGACY_NOTEPAD_CACHE_DB_NAME })
       } catch (err) {
         console.warn('Notepad cache adapter unavailable', err)
       }

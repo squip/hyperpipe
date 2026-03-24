@@ -82,7 +82,7 @@ function buildMarioPipe(lipW, bodyW, bodyRows) {
 function renderPipeSvg({ monochrome = false, background = false }) {
   const pipe = buildMarioPipe(18, 14, 13)
   const viewBox = 1024
-  const cellSize = 44
+  const cellSize = 40
   const pipeWidth = pipe.width * cellSize
   const pipeHeight = pipe.height * cellSize
   const offsetX = Math.round((viewBox - pipeWidth) / 2)

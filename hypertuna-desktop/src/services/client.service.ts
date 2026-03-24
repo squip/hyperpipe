@@ -1,4 +1,10 @@
-import { BIG_RELAY_URLS, DEFAULT_RELAY_LIST, ExtendedKind } from '@/constants'
+import {
+  APP_WINDOW_GLOBAL,
+  BIG_RELAY_URLS,
+  DEFAULT_RELAY_LIST,
+  ExtendedKind,
+  LEGACY_APP_WINDOW_GLOBAL
+} from '@/constants'
 import {
   applyWarmHydrationCursorToRelayFilter,
   DEFAULT_WARM_HYDRATION_OVERLAP_SECONDS
@@ -1532,7 +1538,10 @@ class ClientService extends EventTarget {
 
 const instance = ClientService.getInstance()
 
-;(window as any).fevela = (window as any).fevela || {}
-;(window as any).fevela.client = instance
+;(window as any)[APP_WINDOW_GLOBAL] = (window as any)[APP_WINDOW_GLOBAL] || {}
+;(window as any)[APP_WINDOW_GLOBAL].client = instance
+;(window as any)[LEGACY_APP_WINDOW_GLOBAL] =
+  (window as any)[LEGACY_APP_WINDOW_GLOBAL] || (window as any)[APP_WINDOW_GLOBAL]
+;(window as any)[LEGACY_APP_WINDOW_GLOBAL].client = instance
 
 export default instance

@@ -1,5 +1,5 @@
 import { Button } from '@/components/ui/button'
-import { APP_DISPLAY_NAME, FEVELA_PUBKEY } from '@/constants'
+import { APP_DISPLAY_NAME, SUPPORT_PUBKEY } from '@/constants'
 import { cn } from '@/lib/utils'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -51,7 +51,7 @@ export default function Donation({ className }: { className?: string }) {
       <ZapDialog
         open={open}
         setOpen={setOpen}
-        pubkey={FEVELA_PUBKEY}
+        pubkey={SUPPORT_PUBKEY}
         defaultAmount={donationAmount}
       />
     </div>

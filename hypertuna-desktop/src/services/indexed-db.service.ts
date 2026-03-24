@@ -1,3 +1,4 @@
+import { LEGACY_APP_INDEXED_DB_NAME } from '@/constants'
 import { TRelayInfo } from '@/types'
 import {
   TPersistedGroupMembershipRecord,
@@ -33,7 +34,7 @@ class IndexedDbService {
   init(): Promise<void> {
     if (!this.initPromise) {
       this.initPromise = new Promise((resolve, reject) => {
-        const request = window.indexedDB.open('fevela', 11)
+        const request = window.indexedDB.open(LEGACY_APP_INDEXED_DB_NAME, 11)
 
         request.onerror = (event) => {
           reject(event)

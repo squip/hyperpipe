@@ -1,4 +1,4 @@
-import { APP_DISPLAY_NAME, BIG_RELAY_URLS, DEV_PUBKEY, FEVELA_PUBKEY } from '@/constants'
+import { APP_DISPLAY_NAME, BIG_RELAY_URLS, DEV_PUBKEY, SUPPORT_PUBKEY } from '@/constants'
 import { getZapInfoFromEvent } from '@/lib/event-metadata'
 import { init, launchPaymentModal } from '@getalby/bitcoin-connect-react'
 import { bech32 } from '@scure/base'
@@ -17,7 +17,7 @@ import { pool } from '@nostr/gadgets/global'
 
 export type TRecentSupporter = { pubkey: string; amount: number; comment?: string }
 
-const OFFICIAL_PUBKEYS = [FEVELA_PUBKEY, DEV_PUBKEY]
+const OFFICIAL_PUBKEYS = [SUPPORT_PUBKEY, DEV_PUBKEY]
 
 class LightningService {
   static instance: LightningService

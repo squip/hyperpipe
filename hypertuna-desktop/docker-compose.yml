@@ -1,8 +1,9 @@
 version: '3.8'
 
+# Legacy FEVELA_* environment variable names are still accepted here for compatibility.
 services:
-  fevela:
-    container_name: fevela-nginx
+  hypertuna:
+    container_name: hypertuna-nginx
     build:
       context: .
       dockerfile: Dockerfile
@@ -12,7 +13,7 @@ services:
       - '8089:80'
     restart: unless-stopped
     networks:
-      - fevela
+      - hypertuna
 
   proxy-server:
     image: ghcr.io/danvergara/jumble-proxy-server:latest
@@ -24,7 +25,7 @@ services:
     ports:
       - '8090:8080'
     networks:
-      - fevela
+      - hypertuna
 
 networks:
-  fevela:
+  hypertuna:

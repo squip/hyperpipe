@@ -1,6 +1,7 @@
+# Legacy FEVELA_* environment variable names are still accepted here for compatibility.
 services:
-  fevela:
-    container_name: fevela-nginx
+  hypertuna:
+    container_name: hypertuna-nginx
     build:
       context: .
       dockerfile: Dockerfile
@@ -10,7 +11,7 @@ services:
       - '8089:80'
     restart: unless-stopped
     networks:
-      - fevela
+      - hypertuna
 
   proxy-server:
     image: ghcr.io/danvergara/jumble-proxy-server:latest
@@ -22,11 +23,11 @@ services:
     ports:
       - '8090:8080'
     networks:
-      - fevela
+      - hypertuna
 
   nostr-relay:
     image: scsibug/nostr-rs-relay:latest
-    container_name: fevela-nostr-relay
+    container_name: hypertuna-nostr-relay
     ports:
       - '7000:8080'
     environment:
@@ -34,11 +35,11 @@ services:
     volumes:
       - relay-data:/usr/src/app/db
     networks:
-      - fevela
+      - hypertuna
     restart: unless-stopped
 
 volumes:
   relay-data:
 
 networks:
-  fevela:
+  hypertuna:

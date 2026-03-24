@@ -7,8 +7,21 @@ export const APP_REPOSITORY_URL = 'https://github.com/squip/hypertuna-electron-d
 export const APP_ISSUES_URL = `${APP_REPOSITORY_URL}/issues/new`
 export const APP_SHARE_BASE_URL =
   (import.meta.env.VITE_PUBLIC_SHARE_BASE_URL as string | undefined) || APP_PUBLIC_URL
+export const APP_WINDOW_GLOBAL = 'hypertuna'
+export const LEGACY_APP_WINDOW_GLOBAL = 'fevela'
 
-export const FEVELA_API_BASE_URL = 'https://api.fevela.social'
+// Compatibility holdouts. These values are persisted in browser storage or expected by remote
+// services, so they stay stable until a deliberate migration moves existing user data over.
+export const HOSTED_TRANSLATION_SERVICE_ID = 'fevela' as const
+export const HOSTED_TRANSLATION_SERVICE_LABEL = 'Hypertuna Hosted'
+export const HOSTED_TRANSLATION_API_BASE_URL = 'https://api.fevela.social'
+export const LEGACY_APP_INDEXED_DB_NAME = 'fevela'
+export const LEGACY_NOTEPAD_CACHE_DB_NAME = 'fevela-notepad'
+export const SUPPORT_PUBKEY = '8adab951da7d88367ed86731eeb7b4e2f8582efaac81a6459a5d580213b89a6e'
+
+// Deprecated aliases kept to avoid a broad mechanical rename in unrelated files.
+export const FEVELA_API_BASE_URL = HOSTED_TRANSLATION_API_BASE_URL
+export const FEVELA_PUBKEY = SUPPORT_PUBKEY
 
 export const DEFAULT_FAVORITE_RELAYS = [
   'wss://nostr.wine/',
@@ -140,7 +153,6 @@ export const EMOJI_REGEX =
 export const YOUTUBE_URL_REGEX =
   /https?:\/\/(?:(?:www|m)\.)?(?:youtube\.com\/(?:watch\?[^#\s]*|embed\/[\w-]+|shorts\/[\w-]+|live\/[\w-]+)|youtu\.be\/[\w-]+)(?:\?[^#\s]*)?(?:#[^\s]*)?/gi
 
-export const FEVELA_PUBKEY = '8adab951da7d88367ed86731eeb7b4e2f8582efaac81a6459a5d580213b89a6e'
 export const DEV_PUBKEY = '7bdef7be22dd8e59f4600e044aa53a1cf975a9dc7d27df5833bc77db784a5805'
 
 export const NIP_96_SERVICE = [

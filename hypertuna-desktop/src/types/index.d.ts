@@ -1,6 +1,7 @@
 import { Event, VerifiedEvent } from '@nostr/tools/wasm'
 import { Filter } from '@nostr/tools/filter'
 import {
+  HOSTED_TRANSLATION_SERVICE_ID,
   LINK_PREVIEW_MODE,
   MEDIA_AUTO_LOAD_POLICY,
   NOTIFICATION_LIST_STYLE,
@@ -156,7 +157,7 @@ export type TTranslationAccount = {
 
 export type TTranslationServiceConfig =
   | {
-      service: 'fevela'
+      service: typeof HOSTED_TRANSLATION_SERVICE_ID
     }
   | {
       service: 'libre_translate'
