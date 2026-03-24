@@ -80,9 +80,10 @@ export const toSearch = (params?: TSearchParams) => {
   return `/search?${query.toString()}`
 }
 export const toSettings = () => '/settings'
-export const toRelaySettings = (tag?: 'mailbox' | 'favorite-relays') => {
+export const toRelaySettings = (tag?: 'mailbox' | 'favorite-relays' | 'discovery-relays') => {
   return '/settings/relays' + (tag ? '#' + tag : '')
 }
+export const toLocalPeerNodeSettings = () => '/settings/local-peer-node'
 export const toWallet = () => '/settings/wallet'
 export const toPostSettings = () => '/settings/posts'
 export const toGeneralSettings = () => '/settings/general'

@@ -3,6 +3,7 @@ import Donation from '@/components/Donation'
 import {
   toAppearanceSettings,
   toGeneralSettings,
+  toLocalPeerNodeSettings,
   toPluginSettings,
   toPostSettings,
   toRelaySettings,
@@ -22,12 +23,14 @@ import {
   Palette,
   PencilLine,
   Puzzle,
+  Cpu,
   Server,
   Settings2,
   Wallet
 } from 'lucide-react'
 import { forwardRef, HTMLProps, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { isElectron } from '@/lib/platform'
 
 export default function Settings() {
   const { t } = useTranslation()
@@ -59,6 +62,15 @@ export default function Settings() {
         </div>
         <ChevronRight />
       </SettingItem>
+      {isElectron() && (
+        <SettingItem className="clickable" onClick={() => push(toLocalPeerNodeSettings())}>
+          <div className="flex items-center gap-4">
+            <Cpu />
+            <div>Local Peer Node</div>
+          </div>
+          <ChevronRight />
+        </SettingItem>
+      )}
       {!!pubkey && (
         <SettingItem className="clickable" onClick={() => push(toTranslation())}>
           <div className="flex items-center gap-4">

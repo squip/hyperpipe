@@ -1,29 +1,30 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import { isElectron } from '@/lib/platform'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { ChevronDown, ChevronRight } from 'lucide-react'
+import { buildPublicGatewayPanelModel } from '@/lib/local-peer-node-ui'
 
 export default function PublicGatewayPanel() {
-  const { publicGatewayStatus, lastError, sendToWorker } = useWorkerBridge()
+  const { publicGatewayStatus, sendToWorker } = useWorkerBridge()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [expandedCards, setExpandedCards] = useState<Record<string, boolean>>({})
 
   if (!isElectron()) {
     return (
       <div className="rounded-lg border border-border/50 bg-muted/40 p-4">
-        <div className="font-semibold mb-1">Public gateway</div>
+        <div className="font-semibold mb-1">Public gateways</div>
         <div className="text-sm text-muted-foreground">
-          Desktop-only: configure public gateway access in the Electron app.
+          Desktop-only: view public gateway access in the Electron app.
         </div>
       </div>
     )
   }
 
   const status = publicGatewayStatus
-  const accessCatalog = Array.isArray(status?.gatewayAccessCatalog) ? status.gatewayAccessCatalog : []
-  const authorizedGateways = Array.isArray(status?.authorizedGateways) ? status.authorizedGateways : []
-  const discoveredGateways = Array.isArray(status?.discoveredGateways) ? status.discoveredGateways : []
+  const panelModel = useMemo(() => buildPublicGatewayPanelModel(status), [status])
 
   const refreshStatus = async () => {
     setBusy(true)
@@ -37,110 +38,118 @@ export default function PublicGatewayPanel() {
     }
   }
 
-  const resyncAll = async () => {
-    setBusy(true)
-    setError(null)
-    try {
-      await sendToWorker({ type: 'refresh-public-gateway-all' })
-      await refreshStatus().catch(() => {})
-    } catch (err: any) {
-      setError(err?.message || 'Failed to refresh')
-    } finally {
-      setBusy(false)
-    }
-  }
-
   return (
     <div className="rounded-lg border border-border/50 bg-muted/30 p-4 space-y-3">
       <div className="flex items-center justify-between gap-2">
-        <div className="font-semibold">Public gateway</div>
-        <div className="flex items-center gap-2">
-          <Button size="sm" variant="outline" onClick={refreshStatus} disabled={busy}>
-            {busy ? 'Refreshing…' : 'Refresh'}
-          </Button>
-          <Button size="sm" variant="outline" onClick={resyncAll} disabled={busy}>
-            Resync all
-          </Button>
-        </div>
+        <div className="font-semibold">Public gateways</div>
+        <Button size="sm" variant="outline" onClick={refreshStatus} disabled={busy}>
+          {busy ? 'Refreshing…' : 'Refresh'}
+        </Button>
       </div>
-      {(error || lastError) && (
-        <div className="text-sm text-red-500">{error || lastError}</div>
+      {error && (
+        <div className="text-sm text-red-500">{error}</div>
       )}
-      <div className="flex items-center gap-2 text-sm">
-        <Badge variant={status?.enabled ? 'default' : 'outline'}>
-          {status?.enabled ? 'Enabled' : 'Disabled'}
-        </Badge>
-        {status?.authMethod && <Badge variant="outline">{status.authMethod}</Badge>}
-        {status?.baseUrl && <div className="text-muted-foreground">{status.baseUrl}</div>}
+      <div className="text-sm text-muted-foreground">
+        Approved gateways: {panelModel.approvedCount}
+        {panelModel.lastUpdatedAt
+          ? ` • Last updated ${new Date(panelModel.lastUpdatedAt).toLocaleString()}`
+          : ''}
       </div>
-      <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-3">
-        <div>Discovered: {discoveredGateways.length}</div>
-        <div>Approved for hosting: {authorizedGateways.length}</div>
-        <div>Last update: {status?.lastUpdatedAt ? new Date(status.lastUpdatedAt).toLocaleString() : 'n/a'}</div>
-      </div>
-      <div className="space-y-1">
-        <div className="text-sm font-medium">Gateway access</div>
-        {!accessCatalog.length ? (
-          <div className="text-xs text-muted-foreground">
-            No gateway access state cached yet. Refresh to probe discovered gateways.
-          </div>
-        ) : (
-          <div className="space-y-1 text-xs">
-            {accessCatalog.map((entry, index) => (
-              <div key={`${entry.gatewayId || entry.gatewayOrigin || 'gateway'}:${index}`} className="rounded-md border border-border/50 bg-background/60 p-2">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="font-medium truncate">{entry.gatewayOrigin || entry.gatewayId || 'Gateway'}</div>
-                  <Badge
-                    variant={
-                      entry.hostingState === 'approved'
-                        ? 'default'
-                        : entry.hostingState === 'denied'
-                          ? 'destructive'
-                          : 'outline'
-                    }
-                    className="capitalize"
-                  >
-                    {entry.hostingState || 'unknown'}
-                  </Badge>
-                </div>
-                <div className="text-muted-foreground">
-                  Policy: {entry.policy?.hostPolicy || 'unknown'}
-                  {entry.memberDelegationMode ? ` • Delegation: ${entry.memberDelegationMode}` : ''}
-                </div>
-                {entry.reason && <div className="text-muted-foreground">Reason: {entry.reason}</div>}
-                {entry.lastCheckedAt && (
-                  <div className="text-muted-foreground">
-                    Checked: {new Date(entry.lastCheckedAt).toLocaleString()}
+      {panelModel.warning && (
+        <div className="rounded-md border border-border/50 bg-background/60 px-3 py-2 text-sm text-muted-foreground">
+          {panelModel.warning}
+        </div>
+      )}
+      {!panelModel.cards.length ? (
+        <div className="rounded-md border border-border/50 bg-background/60 p-3 text-sm text-muted-foreground">
+          No public gateway status has been loaded yet.
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {panelModel.cards.map((card) => {
+            const isExpanded = expandedCards[card.key] ?? false
+            return (
+              <div
+                key={card.key}
+                className="rounded-lg border border-border/50 bg-background/60 p-3 space-y-3"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="font-medium truncate">{card.title}</div>
+                    {card.subtitle && (
+                      <div className="text-xs text-muted-foreground break-all">{card.subtitle}</div>
+                    )}
+                    {card.detail && (
+                      <div className="mt-1 text-sm text-muted-foreground">{card.detail}</div>
+                    )}
+                    {card.lastCheckedAt && (
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        Last checked {new Date(card.lastCheckedAt).toLocaleString()}
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-      <div className="space-y-1">
-        <div className="text-sm font-medium">Registered relays</div>
-        {!status?.relays || !Object.keys(status.relays).length ? (
-          <div className="text-xs text-muted-foreground">No relays reported.</div>
-        ) : (
-          <div className="space-y-1 text-xs">
-            {Object.entries(status.relays).map(([id, entry]) => (
-              <div key={id} className="rounded-md border border-border/50 bg-background/60 p-2">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="font-medium truncate">{id}</div>
-                  <Badge variant="outline" className="capitalize">
-                    {entry?.status || 'unknown'}
-                  </Badge>
+                  <Badge variant={card.badgeVariant}>{card.statusLabel}</Badge>
                 </div>
-                {entry?.error && <div className="text-red-500">{entry.error}</div>}
-                {entry?.lastSyncedAt && (
-                  <div className="text-muted-foreground">Last sync: {entry.lastSyncedAt}</div>
+
+                {card.relays.length > 0 ? (
+                  <div className="space-y-2">
+                    <button
+                      type="button"
+                      className="flex w-full items-center justify-between rounded-md border border-border/50 bg-muted/20 px-3 py-2 text-left"
+                      onClick={() =>
+                        setExpandedCards((prev) => ({
+                          ...prev,
+                          [card.key]: !isExpanded
+                        }))
+                      }
+                    >
+                      <span className="text-sm font-medium">Registered relays ({card.relays.length})</span>
+                      {isExpanded ? (
+                        <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                      ) : (
+                        <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                      )}
+                    </button>
+
+                    {isExpanded && (
+                      <div className="space-y-2">
+                        {card.relays.map((relay) => (
+                          <div
+                            key={relay.key}
+                            className="rounded-md border border-border/50 bg-background/80 px-3 py-2"
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="truncate text-sm font-medium">{relay.label}</div>
+                                {relay.subtitle && (
+                                  <div className="truncate text-xs text-muted-foreground">
+                                    {relay.subtitle}
+                                  </div>
+                                )}
+                                {relay.lastSyncedAt && (
+                                  <div className="text-xs text-muted-foreground">
+                                    Last sync {new Date(relay.lastSyncedAt).toLocaleString()}
+                                  </div>
+                                )}
+                                {relay.error && (
+                                  <div className="text-xs text-red-500">{relay.error}</div>
+                                )}
+                              </div>
+                              <Badge variant="outline">{relay.statusLabel}</Badge>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-sm text-muted-foreground">No registered relays here yet.</div>
                 )}
               </div>
-            ))}
-          </div>
-        )}
-      </div>
+            )
+          })}
+        </div>
+      )}
     </div>
   )
 }

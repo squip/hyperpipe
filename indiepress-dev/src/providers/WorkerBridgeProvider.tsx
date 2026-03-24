@@ -286,6 +286,14 @@ function isHex64(value: unknown): value is string {
 }
 
 function readAutostartEnabled(): boolean {
+  if (!import.meta.env.DEV) {
+    try {
+      window.localStorage.removeItem(AUTOSTART_KEY)
+    } catch (_) {
+      // ignore storage cleanup failures
+    }
+    return true
+  }
   try {
     const stored = window.localStorage.getItem(AUTOSTART_KEY)
     if (stored == null) return true
@@ -568,10 +576,15 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
   }, [])
 
   const setAutostartEnabled = useCallback((enabled: boolean) => {
-    autostartEnabledRef.current = enabled
-    setAutostartEnabledState(enabled)
+    const next = import.meta.env.DEV ? enabled : true
+    autostartEnabledRef.current = next
+    setAutostartEnabledState(next)
     try {
-      window.localStorage.setItem(AUTOSTART_KEY, enabled ? '1' : '0')
+      if (import.meta.env.DEV) {
+        window.localStorage.setItem(AUTOSTART_KEY, next ? '1' : '0')
+      } else {
+        window.localStorage.removeItem(AUTOSTART_KEY)
+      }
     } catch (err) {
       void err
     }

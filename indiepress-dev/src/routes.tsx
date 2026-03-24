@@ -31,6 +31,7 @@ import ListEditorPage from './pages/secondary/ListEditorPage'
 import NotepadNotePage from './pages/secondary/NotepadNotePage'
 import GroupPage from './pages/secondary/GroupPage'
 import NotFoundPage from './pages/secondary/NotFoundPage'
+import LocalPeerNodeSettingsPage from './pages/secondary/LocalPeerNodeSettingsPage'
 
 export type RouteDefinition = {
   path: string
@@ -60,6 +61,7 @@ function buildCoreRoutes(): RouteDefinition[] {
     { path: '/search', element: <SearchPage /> },
     { path: '/settings', element: <SettingsPage /> },
     { path: '/settings/relays', element: <RelaySettingsPage /> },
+    { path: '/settings/local-peer-node', element: <LocalPeerNodeSettingsPage /> },
     { path: '/settings/wallet', element: <WalletPage /> },
     { path: '/settings/posts', element: <PostSettingsPage /> },
     { path: '/settings/general', element: <GeneralSettingsPage /> },

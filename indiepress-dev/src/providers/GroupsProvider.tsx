@@ -75,6 +75,7 @@ import { randomString } from '@/lib/random'
 import { useWorkerBridge } from './WorkerBridgeProvider'
 import type { TPublishOptions } from '@/types'
 import * as nip19 from '@nostr/tools/nip19'
+import { normalizeUrl } from '@/lib/url'
 
 const DEFAULT_PUBLIC_GATEWAY_BASE = 'https://hypertuna.com'
 const INVITE_DISMISSED_STORAGE_PREFIX = 'hypertuna_group_invites_dismissed_v1'
@@ -184,6 +185,9 @@ type TGroupsContext = {
   discoveryError: string | null
   invitesError: string | null
   joinRequestsError: string | null
+  discoveryRelays: string[]
+  setDiscoveryRelays: (relays: string[]) => void
+  resetDiscoveryRelays: () => void
   refreshDiscovery: () => Promise<void>
   refreshInvites: () => Promise<void>
   dismissInvite: (inviteId: string) => void
@@ -325,6 +329,9 @@ export const useGroups = () => {
       discoveryError: null,
       invitesError: null,
       joinRequestsError: null,
+      discoveryRelays: [...defaultDiscoveryRelays],
+      setDiscoveryRelays: () => {},
+      resetDiscoveryRelays: () => {},
       refreshDiscovery: async () => {},
       refreshInvites: async () => {},
       dismissInvite: () => {},
@@ -792,16 +799,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const [discoveryError, setDiscoveryError] = useState<string | null>(null)
   const [invitesError, setInvitesError] = useState<string | null>(null)
   const [joinRequestsError, setJoinRequestsError] = useState<string | null>(null)
-  const [discoveryRelays, setDiscoveryRelays] = useState<string[]>(() => {
+  const [discoveryRelays, setDiscoveryRelaysState] = useState<string[]>(() => {
     const stored = localStorageService.getGroupDiscoveryRelays()
     const base = stored.length ? stored : defaultDiscoveryRelays
-    return Array.from(
-      new Set(
-        [...base, ...defaultDiscoveryRelays]
-          .map((url) => String(url || '').trim())
-          .filter(Boolean)
-      )
-    )
+    return Array.from(new Set(base.map((url) => normalizeUrl(String(url || '').trim())).filter(Boolean)))
   })
   const [handledJoinRequests, setHandledJoinRequests] = useState<Record<string, Set<string>>>(
     () => {
@@ -830,6 +831,21 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const [provisionalGroupMetadataByKey, setProvisionalGroupMetadataByKey] = useState<
     Record<string, ProvisionalGroupMetadataEntry>
   >({})
+
+  const setDiscoveryRelays = useCallback((nextRelays: string[]) => {
+    const sanitized = Array.from(
+      new Set(
+        (Array.isArray(nextRelays) ? nextRelays : [])
+          .map((relay) => normalizeUrl(String(relay || '').trim()))
+          .filter(Boolean)
+      )
+    )
+    setDiscoveryRelaysState(sanitized.length ? sanitized : [...defaultDiscoveryRelays])
+  }, [])
+
+  const resetDiscoveryRelays = useCallback(() => {
+    setDiscoveryRelaysState([...defaultDiscoveryRelays])
+  }, [])
   const dismissedInviteIdsRef = useRef<Set<string>>(new Set())
   const acceptedInviteIdsRef = useRef<Set<string>>(new Set())
   const acceptedInviteGroupIdsRef = useRef<Set<string>>(new Set())
@@ -5182,6 +5198,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       discoveryError,
       invitesError,
       joinRequestsError,
+      discoveryRelays,
+      setDiscoveryRelays,
+      resetDiscoveryRelays,
       refreshDiscovery,
       refreshInvites,
       dismissInvite,
@@ -5214,7 +5233,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         const { name, about, picture, isPublic, isOpen, relays } = data
         if (!pubkey) throw new Error('Not logged in')
 
-        const discoveryTargets = discoveryRelays
+        const discoveryTargets = discoveryRelays.length ? discoveryRelays : defaultDiscoveryRelays
         const localTargets = relays?.length ? relays : discoveryRelays
         const groupId = buildGroupIdForCreation(pubkey, name)
         const createdAt = Math.floor(Date.now() / 1000)
@@ -5366,6 +5385,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       discoveryError,
       invitesError,
       joinRequestsError,
+      discoveryRelays,
+      setDiscoveryRelays,
+      resetDiscoveryRelays,
       refreshDiscovery,
       refreshInvites,
       dismissInvite,
@@ -5394,7 +5416,6 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       deleteEvent,
       toggleFavorite,
       pubkey,
-      discoveryRelays,
       publish,
       persistGroupMetadata,
       resolveRelayUrl,

@@ -42,6 +42,7 @@ export type GatewayLogEntry = {
 export type GatewayStatus = {
   running: boolean
   host?: string
+  hostname?: string
   port?: number
   wsBase?: string
   urls?: Record<string, string>
@@ -82,6 +83,9 @@ export type PublicGatewayStatus = {
   wsBase?: string
   defaultTokenTtl?: number
   lastUpdatedAt?: number
+  discoveryWarning?: string | null
+  discoveryUnavailableReason?: string | null
+  disabledReason?: string | null
   discoveredGateways?: Array<{
     gatewayId: string
     publicUrl: string
@@ -133,6 +137,11 @@ export type PublicGatewayStatus = {
       lastSyncedAt?: number
       tokenTtl?: number
       error?: string
+      message?: string | null
+      gatewayId?: string | null
+      gatewayOrigin?: string | null
+      publicIdentifier?: string | null
+      name?: string | null
     }
   >
 }

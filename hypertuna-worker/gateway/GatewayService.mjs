@@ -2305,7 +2305,18 @@ export class GatewayService extends EventEmitter {
   getPublicGatewayState() {
     const relays = {};
     for (const [key, value] of this.publicGatewayRelayState.entries()) {
-      relays[key] = { ...value };
+      const metadata = value?.metadata && typeof value.metadata === 'object' ? value.metadata : {};
+      relays[key] = {
+        ...value,
+        message: typeof value?.message === 'string' ? value.message : null,
+        gatewayId: value?.gatewayId || metadata?.gatewayId || null,
+        gatewayOrigin: value?.gatewayOrigin || metadata?.gatewayOrigin || null,
+        publicIdentifier: value?.publicIdentifier || metadata?.identifier || null,
+        name: value?.name || metadata?.name || null,
+        error:
+          value?.error
+          || (value?.status === 'error' && typeof value?.message === 'string' ? value.message : null)
+      };
     }
 
     const config = this.publicGatewaySettings || {};

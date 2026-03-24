@@ -194,22 +194,19 @@ export default function ArticleMarkdownEditor({
   const [linkText, setLinkText] = useState('')
   const { signEvent } = useNostr()
   const editorRef = useRef<ReturnType<typeof useEditor> | null>(null)
+  const debugUiEnabled = Boolean(import.meta.env.DEV)
   const [debugEnabled, setDebugEnabled] = useState(() => {
-    if (typeof window === 'undefined') return false
+    if (typeof window === 'undefined' || !import.meta.env.DEV) return false
     const stored = localStorage.getItem('article-editor-debug')
-    if (stored === 'true') return true
-    if (stored === 'false') return false
-    return Boolean(import.meta.env.DEV)
+    return stored === 'true'
   })
   const [debugEntries, setDebugEntries] = useState<
     { id: string; time: string; message: string; data?: unknown }[]
   >([])
   const [debugPanelOpen, setDebugPanelOpen] = useState(() => {
-    if (typeof window === 'undefined') return false
+    if (typeof window === 'undefined' || !import.meta.env.DEV) return false
     const stored = localStorage.getItem('article-editor-debug')
-    if (stored === 'true') return true
-    if (stored === 'false') return false
-    return Boolean(import.meta.env.DEV)
+    return stored === 'true'
   })
   const lastMetadataSnapshotRef = useRef<MetadataSnapshot | null>(null)
   const lastMetadataActionRef = useRef<string | null>(null)
@@ -250,11 +247,12 @@ export default function ArticleMarkdownEditor({
   )
 
   useEffect(() => {
+    if (!debugUiEnabled) return
     localStorage.setItem('article-editor-debug', debugEnabled ? 'true' : 'false')
     if (debugEnabled) {
       setDebugPanelOpen(true)
     }
-  }, [debugEnabled])
+  }, [debugEnabled, debugUiEnabled])
 
   const [isTouchSmallScreen, setIsTouchSmallScreen] = useState(() => {
     if (typeof window === 'undefined') return false
@@ -1771,15 +1769,17 @@ export default function ArticleMarkdownEditor({
         data-metadata-mode={metadataMode}
         className={editorContentClass}
       />
-      <DebugConsole
-        enabled={debugEnabled}
-        setEnabled={setDebugEnabled}
-        open={debugPanelOpen}
-        setOpen={setDebugPanelOpen}
-        entries={debugEntries}
-        onClear={() => setDebugEntries([])}
-        onSimulateEvent={simulateArticleEvent}
-      />
+      {debugUiEnabled && (debugEnabled || debugPanelOpen) && (
+        <DebugConsole
+          enabled={debugEnabled}
+          setEnabled={setDebugEnabled}
+          open={debugPanelOpen}
+          setOpen={setDebugPanelOpen}
+          entries={debugEntries}
+          onClear={() => setDebugEntries([])}
+          onSimulateEvent={simulateArticleEvent}
+        />
+      )}
     </div>
   )
 }
