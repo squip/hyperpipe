@@ -1,22 +1,25 @@
-export type RendererFeature = 'explore' | 'lists' | 'bookmarks'
+export type RendererFeature = 'explore' | 'lists' | 'bookmarks' | 'plugins'
 
 const FEATURE_DEFAULTS: Record<RendererFeature, boolean> = {
   // Pass-1 defaults: hide Explore, keep Lists + Bookmarks enabled.
   explore: false,
   lists: true,
-  bookmarks: true
+  bookmarks: true,
+  plugins: false
 }
 
 const FEATURE_ENV_KEYS: Record<RendererFeature, string> = {
   explore: 'VITE_FEATURE_EXPLORE_ENABLED',
   lists: 'VITE_FEATURE_LISTS_ENABLED',
-  bookmarks: 'VITE_FEATURE_BOOKMARKS_ENABLED'
+  bookmarks: 'VITE_FEATURE_BOOKMARKS_ENABLED',
+  plugins: 'VITE_FEATURE_PLUGINS_ENABLED'
 }
 
 const FEATURE_STORAGE_KEYS: Record<RendererFeature, string> = {
   explore: 'hypertuna_feature_explore_enabled',
   lists: 'hypertuna_feature_lists_enabled',
-  bookmarks: 'hypertuna_feature_bookmarks_enabled'
+  bookmarks: 'hypertuna_feature_bookmarks_enabled',
+  plugins: 'hyperpipe_feature_plugins_enabled'
 }
 
 function parseBooleanFlag(value: unknown): boolean | undefined {
@@ -61,7 +64,8 @@ export function getRendererFeatureFlags(): Record<RendererFeature, boolean> {
   return {
     explore: resolveFeatureFlag('explore'),
     lists: resolveFeatureFlag('lists'),
-    bookmarks: resolveFeatureFlag('bookmarks')
+    bookmarks: resolveFeatureFlag('bookmarks'),
+    plugins: resolveFeatureFlag('plugins')
   }
 }
 

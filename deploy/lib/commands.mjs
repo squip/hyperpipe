@@ -39,7 +39,7 @@ const DEFAULT_OPERATOR_ATTESTATION_FILE = join(ARTIFACTS_DIR, 'operator-attestat
 const BASE_COMPOSE_FILE = join(DEPLOY_DIR, 'docker-compose.yml');
 const HTTPS_ACME_COMPOSE_FILE = join(DEPLOY_DIR, 'docker-compose.https-acme.yml');
 const HTTP_COMPOSE_FILE = join(DEPLOY_DIR, 'docker-compose.http.yml');
-const DEFAULT_SECRET_PATH = '/.well-known/hypertuna-gateway-secret';
+const DEFAULT_SECRET_PATH = '/.well-known/hyperpipe-gateway-secret';
 
 function log(io, message) {
   io?.stdout?.write?.(`${message}\n`);

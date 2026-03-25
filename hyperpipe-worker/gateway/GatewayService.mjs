@@ -396,14 +396,14 @@ export class GatewayService extends EventEmitter {
     }
 
     if (!config.preferredBaseUrl) {
-      config.preferredBaseUrl = config.baseUrl || envBaseUrl || 'https://hypertuna.com';
+      config.preferredBaseUrl = config.baseUrl || envBaseUrl || '';
     }
 
     if (config.selectionMode === 'default') {
-      config.baseUrl = config.preferredBaseUrl || envBaseUrl || 'https://hypertuna.com';
+      config.baseUrl = '';
       config.selectedGatewayId = null;
     } else if (config.selectionMode === 'manual' && !config.baseUrl) {
-      config.baseUrl = envBaseUrl || config.preferredBaseUrl || 'https://hypertuna.com';
+      config.baseUrl = envBaseUrl || config.preferredBaseUrl || '';
     }
 
     if (envBaseUrl && envSecret) {
@@ -417,7 +417,7 @@ export class GatewayService extends EventEmitter {
     }
 
     if (!config.baseUrl && config.selectionMode !== 'default') {
-      config.baseUrl = config.preferredBaseUrl || envBaseUrl || 'https://hypertuna.com';
+      config.baseUrl = config.preferredBaseUrl || envBaseUrl || '';
     }
 
     const blindPeerConfig = this.#normalizeBlindPeerConfig(rawConfig, this.publicGatewaySettings);
@@ -1374,13 +1374,15 @@ export class GatewayService extends EventEmitter {
         return config;
       }
     } else {
-      const preferredUrl = config.preferredBaseUrl || config.baseUrl || 'https://hypertuna.com';
-      let entry = this.discoveryClient.findGatewayByUrl(preferredUrl);
-      if (entry && entry.isExpired) {
-        entry = null;
-      }
+      const preferredUrl = config.preferredBaseUrl || config.baseUrl || '';
+      if (preferredUrl) {
+        let entry = this.discoveryClient.findGatewayByUrl(preferredUrl);
+        if (entry && entry.isExpired) {
+          entry = null;
+        }
 
-      resolvedEntry = await resolveEntryForSelection(entry);
+        resolvedEntry = await resolveEntryForSelection(entry);
+      }
 
       if (!resolvedEntry) {
         const candidates = (this.discoveryClient.getGateways() || [])

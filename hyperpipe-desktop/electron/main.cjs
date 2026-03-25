@@ -23,6 +23,25 @@ let publicGatewayStatusCache = null;
 let currentWorkerUserKey = null;
 let pluginSupervisor = null;
 
+function parseBooleanEnvFlag(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on', 'enabled'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off', 'disabled'].includes(normalized)) return false;
+  return null;
+}
+
+function arePluginsEnabled() {
+  const explicitFlag = parseBooleanEnvFlag(process.env.HYPERPIPE_FEATURE_PLUGINS_ENABLED);
+  if (explicitFlag !== null) return explicitFlag;
+
+  const viteFlag = parseBooleanEnvFlag(process.env.VITE_FEATURE_PLUGINS_ENABLED);
+  if (viteFlag !== null) return viteFlag;
+
+  return false;
+}
+
 function isHex64(value) {
   return typeof value === 'string' && /^[a-fA-F0-9]{64}$/.test(value);
 }
@@ -174,6 +193,9 @@ async function ensureStorageDir() {
 }
 
 async function ensurePluginSupervisor() {
+  if (!arePluginsEnabled()) {
+    throw new Error('Plugins are disabled');
+  }
   if (pluginSupervisor) return pluginSupervisor;
   pluginSupervisor = new PluginSupervisor({
     storagePath,
@@ -462,6 +484,10 @@ async function authorizePluginWorkerMessage(rawMessage, { defaultSourceType = 'h
       delete message.permissions;
     }
     return { success: true, message };
+  }
+
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
   }
 
   const supervisor = await ensurePluginSupervisor();
@@ -932,17 +958,33 @@ ipcMain.handle('media-command', async (_event, payload) => {
 });
 
 ipcMain.handle('plugin-list', async () => {
+  if (!arePluginsEnabled()) {
+    return { success: true, plugins: [] };
+  }
   const supervisor = await ensurePluginSupervisor();
   return { success: true, plugins: supervisor.listPlugins() };
 });
 
 ipcMain.handle('plugin-get-ui-contributions', async () => {
+  if (!arePluginsEnabled()) {
+    return {
+      success: true,
+      plugins: [],
+      navItems: [],
+      routes: [],
+      collisions: [],
+      blockedContributions: []
+    };
+  }
   const supervisor = await ensurePluginSupervisor();
   const data = supervisor.getUiContributions();
   return { success: true, ...data };
 });
 
 ipcMain.handle('plugin-reference-list', async () => {
+  if (!arePluginsEnabled()) {
+    return { success: true, plugins: [], warnings: [] };
+  }
   try {
     const definitions = await loadReferencePluginDefinitions();
     return {
@@ -961,6 +1003,9 @@ ipcMain.handle('plugin-reference-list', async () => {
 });
 
 ipcMain.handle('plugin-reference-install', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const request = payload && typeof payload === 'object' ? payload : {};
   const pluginId = asString(request.pluginId).toLowerCase();
   if (!pluginId) {
@@ -1015,56 +1060,89 @@ ipcMain.handle('plugin-reference-install', async (_event, payload) => {
 });
 
 ipcMain.handle('plugin-discover', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const supervisor = await ensurePluginSupervisor();
   return supervisor.discoverPlugin(payload || {});
 });
 
 ipcMain.handle('plugin-install', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const supervisor = await ensurePluginSupervisor();
   return supervisor.installPlugin(payload || {});
 });
 
 ipcMain.handle('plugin-install-archive', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const supervisor = await ensurePluginSupervisor();
   return supervisor.installPluginArchive(payload || {});
 });
 
 ipcMain.handle('plugin-preview-archive', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const supervisor = await ensurePluginSupervisor();
   return supervisor.previewPluginArchive(payload || {});
 });
 
 ipcMain.handle('plugin-uninstall', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const supervisor = await ensurePluginSupervisor();
   return supervisor.uninstallPlugin(payload || {});
 });
 
 ipcMain.handle('plugin-enable', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const supervisor = await ensurePluginSupervisor();
   return supervisor.enablePlugin(payload || {});
 });
 
 ipcMain.handle('plugin-disable', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const supervisor = await ensurePluginSupervisor();
   return supervisor.disablePlugin(payload || {});
 });
 
 ipcMain.handle('plugin-approve-version', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const supervisor = await ensurePluginSupervisor();
   return supervisor.approveVersion(payload || {});
 });
 
 ipcMain.handle('plugin-reject-version', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const supervisor = await ensurePluginSupervisor();
   return supervisor.rejectVersion(payload || {});
 });
 
 ipcMain.handle('plugin-elevate-tier', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const supervisor = await ensurePluginSupervisor();
   return supervisor.elevateTier(payload || {});
 });
 
 ipcMain.handle('plugin-get-audit', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: true, entries: [] };
+  }
   const supervisor = await ensurePluginSupervisor();
   const pluginId = typeof payload === 'string' ? payload : payload?.pluginId;
   const limit = typeof payload?.limit === 'number' ? payload.limit : 200;
@@ -1072,11 +1150,17 @@ ipcMain.handle('plugin-get-audit', async (_event, payload) => {
 });
 
 ipcMain.handle('plugin-invoke', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const supervisor = await ensurePluginSupervisor();
   return supervisor.invokePlugin(payload || {});
 });
 
 ipcMain.handle('plugin-marketplace-discover', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const supervisor = await ensurePluginSupervisor();
   const discoveryPayload = payload && typeof payload === 'object' ? payload : {};
   const workerDiscovery = await sendWorkerRequestAwait(
@@ -1118,6 +1202,9 @@ ipcMain.handle('plugin-marketplace-discover', async (_event, payload) => {
 });
 
 ipcMain.handle('plugin-marketplace-install', async (_event, payload) => {
+  if (!arePluginsEnabled()) {
+    return { success: false, error: 'Plugins are disabled' };
+  }
   const supervisor = await ensurePluginSupervisor();
   const installPayload = payload && typeof payload === 'object' ? payload : {};
   const listing = installPayload.listing && typeof installPayload.listing === 'object'
@@ -1418,7 +1505,9 @@ ipcMain.handle('read-file-buffer', async (_event, filePath) => {
 
 app.whenReady().then(async () => {
   await ensureStorageDir();
-  await ensurePluginSupervisor();
+  if (arePluginsEnabled()) {
+    await ensurePluginSupervisor();
+  }
   if (process.platform === 'darwin' && app.dock && existsSync(getRuntimeIconPath())) {
     app.dock.setIcon(getRuntimeIconPath());
   }

@@ -4,8 +4,8 @@ const DEFAULT_SETTINGS = Object.freeze({
   enabled: true,
   selectionMode: 'default',
   selectedGatewayId: null,
-  preferredBaseUrl: 'https://hypertuna.com',
-  baseUrl: 'https://hypertuna.com',
+  preferredBaseUrl: null,
+  baseUrl: '',
   sharedSecret: '',
   delegateReqToPeers: false,
   blindPeerEnabled: false,
@@ -292,7 +292,7 @@ function withDefaults(raw = {}) {
   const hasLegacySecret = typeof normalized.sharedSecret === 'string' && normalized.sharedSecret.trim().length > 0;
 
   if (!merged.selectionMode || !VALID_SELECTION_MODES.has(merged.selectionMode)) {
-    if ((merged.baseUrl && merged.baseUrl !== DEFAULT_SETTINGS.baseUrl) || hasLegacySecret) {
+    if (merged.baseUrl || hasLegacySecret) {
       merged.selectionMode = 'manual';
     } else {
       merged.selectionMode = 'default';
@@ -302,7 +302,7 @@ function withDefaults(raw = {}) {
   if (merged.selectionMode === 'default') {
     merged.selectedGatewayId = null;
     merged.preferredBaseUrl = merged.preferredBaseUrl || DEFAULT_SETTINGS.preferredBaseUrl;
-    merged.baseUrl = merged.preferredBaseUrl || DEFAULT_SETTINGS.baseUrl;
+    merged.baseUrl = '';
   }
 
   if (merged.selectionMode === 'manual') {

@@ -2329,10 +2329,6 @@ function collectPublicGatewayOrigins() {
   addOrigin(settings.resolvedWsUrl)
   addOrigin(publicGatewayStatusCache?.wsBase)
 
-  if (origins.size === 0) {
-    origins.add('https://hypertuna.com')
-  }
-
   return Array.from(origins)
 }
 

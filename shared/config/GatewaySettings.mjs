@@ -1,5 +1,5 @@
 const DEFAULT_SETTINGS = Object.freeze({
-  gatewayUrl: 'https://hypertuna.com',
+  gatewayUrl: '',
   proxyHost: '127.0.0.1:8443',
   proxyWebsocketProtocol: 'ws'
 });

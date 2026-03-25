@@ -77,7 +77,6 @@ import type { TPublishOptions } from '@/types'
 import * as nip19 from '@nostr/tools/nip19'
 import { normalizeUrl } from '@/lib/url'
 
-const DEFAULT_PUBLIC_GATEWAY_BASE = 'https://hypertuna.com'
 const INVITE_DISMISSED_STORAGE_PREFIX = 'hypertuna_group_invites_dismissed_v1'
 const INVITE_ACCEPTED_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_v1'
 
@@ -1495,7 +1494,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
   const fetchInviteMirrorMetadata = useCallback(
     async (relayIdentifier: string, resolved?: string | null): Promise<InviteMirrorMetadata> => {
-      const origins: string[] = [DEFAULT_PUBLIC_GATEWAY_BASE]
+      const origins: string[] = []
       if (resolved) {
         try {
           const baseUrl = new URL(resolved)
@@ -1505,9 +1504,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             origins.push(hostOrigin)
           }
         } catch (_err) {
-          // fall back to default only
+          return null
         }
       }
+
+      if (!origins.length) return null
 
       for (const origin of origins) {
         try {

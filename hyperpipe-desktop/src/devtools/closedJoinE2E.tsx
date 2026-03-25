@@ -11,8 +11,6 @@ import type { Filter } from '@nostr/tools/filter'
 import type { TGroupInvite } from '@/types/groups'
 import { StorageKey } from '@/constants'
 
-const DEFAULT_GATEWAY_BASE = 'https://hypertuna.com'
-
 type AccountSeed = {
   pubkey: string
   npub: string
@@ -462,7 +460,15 @@ export default function ClosedJoinE2EBridge(): null {
     }
 
     const fetchMirrorMetadata = async (identifier: string, requestTimeoutMs = 15_000) => {
-      const base = gatewayRef.current?.baseUrl || DEFAULT_GATEWAY_BASE
+      const configuredBase =
+        gatewayRef.current?.baseUrl ||
+        (typeof import.meta !== 'undefined'
+          ? ((import.meta.env.VITE_CLOSED_JOIN_E2E_GATEWAY_BASE as string | undefined) || '')
+          : '')
+      const base = configuredBase.trim()
+      if (!base) {
+        throw new Error('No mirror gateway base configured')
+      }
       const trimmedBase = base.endsWith('/') ? base.slice(0, -1) : base
       const url = `${trimmedBase}/api/relays/${encodeURIComponent(identifier)}/mirror`
       const controller = new AbortController()
@@ -486,7 +492,12 @@ export default function ClosedJoinE2EBridge(): null {
 
     const waitForMirror = async (identifier: string, expectedCore?: string | null, timeoutMs = 120_000) => {
       const normalizedExpected = normalizeRelayKey(expectedCore)
-      const base = gatewayRef.current?.baseUrl || DEFAULT_GATEWAY_BASE
+      const configuredBase =
+        gatewayRef.current?.baseUrl ||
+        (typeof import.meta !== 'undefined'
+          ? ((import.meta.env.VITE_CLOSED_JOIN_E2E_GATEWAY_BASE as string | undefined) || '')
+          : '')
+      const base = configuredBase.trim() || null
       const startedAt = Date.now()
       let attempt = 0
       console.info('[ClosedJoinE2E] Waiting for mirror metadata', {
@@ -495,6 +506,9 @@ export default function ClosedJoinE2EBridge(): null {
         base,
         timeoutMs
       })
+      if (!base) {
+        throw new Error('No mirror gateway base configured')
+      }
       return waitFor(
         'mirror-metadata',
         async () => {

@@ -497,7 +497,7 @@ test('runSmokeCommand checks container health and the open-profile secret endpoi
     const text = String(url);
     fetchCalls.push(text);
     if (text.endsWith('/health')) return jsonResponse({ status: 'ok' });
-    if (text.includes('/.well-known/hypertuna-gateway-secret')) return jsonResponse({ secret: 'ok' });
+    if (text.includes('/.well-known/hyperpipe-gateway-secret')) return jsonResponse({ secret: 'ok' });
     throw new Error(`Unexpected fetch URL: ${text}`);
   };
 
@@ -509,7 +509,7 @@ test('runSmokeCommand checks container health and the open-profile secret endpoi
 
   assert.equal(result.health.body.status, 'ok');
   assert.ok(fetchCalls.some((url) => url.endsWith('/health')));
-  assert.ok(fetchCalls.some((url) => url.includes('/.well-known/hypertuna-gateway-secret')));
+  assert.ok(fetchCalls.some((url) => url.includes('/.well-known/hyperpipe-gateway-secret')));
 });
 
 test('runSmokeCommand uses http origin for http exposure mode', async (t) => {

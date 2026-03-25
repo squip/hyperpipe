@@ -36,7 +36,7 @@ export default function RelayManagerPanel() {
   const { createHyperpipeRelayGroup } = useGroups()
   const { relays, joinFlows, lastError, sendToWorker, startJoinFlow, clearJoinFlow } = useWorkerBridge()
   const desktopDownloadUrl = useMemo(
-    () => import.meta.env.VITE_DESKTOP_DOWNLOAD_URL || 'https://hypertuna.com/download',
+    () => import.meta.env.VITE_DESKTOP_DOWNLOAD_URL || 'https://hyperpipe.io',
     []
   )
 

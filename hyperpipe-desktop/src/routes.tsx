@@ -66,7 +66,7 @@ function buildCoreRoutes(): RouteDefinition[] {
     { path: '/settings/general', element: <GeneralSettingsPage /> },
     { path: '/settings/appearance', element: <AppearanceSettingsPage /> },
     { path: '/settings/translation', element: <TranslationPage /> },
-    { path: '/settings/plugins', element: <PluginManagerPage /> },
+    { path: '/settings/plugins', element: featureFlags.plugins ? <PluginManagerPage /> : <NotFoundPage /> },
     { path: '/profile-editor', element: <ProfileEditorPage /> },
     { path: '/mutes', element: <MuteListPage /> },
     { path: '/rizful', element: <RizfulPage /> },
@@ -94,6 +94,11 @@ function buildRouteList(definitions: RouteDefinition[]): ResolvedRoute[] {
 }
 
 export function setPluginRoutes(routes: RouteDefinition[]) {
+  if (!getRendererFeatureFlags().plugins) {
+    pluginRoutes = []
+    cachedRoutes = null
+    return
+  }
   pluginRoutes = Array.isArray(routes)
     ? routes
       .filter((route) => route && typeof route.path === 'string')

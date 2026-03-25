@@ -955,10 +955,6 @@ async function collectGatewayHttpOrigins() {
     // ignore load failures; fall back to cached
   }
 
-  if (!origins.size) {
-    origins.add('https://hypertuna.com');
-  }
-
   return Array.from(origins);
 }
 
@@ -970,6 +966,9 @@ async function fetchMirrorMetadataFromGateway(identifier, { reason = 'join-fallb
   }
 
   const origins = await collectGatewayHttpOrigins();
+  if (!origins.length) {
+    return { status: 'skipped', reason: 'gateway-origin-unavailable' };
+  }
   let lastError = null;
 
   for (const origin of origins) {

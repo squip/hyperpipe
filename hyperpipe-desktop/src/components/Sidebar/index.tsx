@@ -28,7 +28,8 @@ export default function PrimaryPageSidebar() {
   const { pubkey } = useNostr()
   const featureFlags = getRendererFeatureFlags()
   const { push } = useSecondaryPage()
-  const { navItems: pluginNavItems } = usePluginRegistry()
+  const { navItems: rawPluginNavItems } = usePluginRegistry()
+  const pluginNavItems = featureFlags.plugins ? rawPluginNavItems : []
   const currentPath = typeof window !== 'undefined' ? window.location.pathname : ''
 
   if (isSmallScreen) return null

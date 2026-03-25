@@ -1,4 +1,5 @@
 import { createContext, ReactNode, useCallback, useContext, useEffect, useMemo, useState } from 'react'
+import { isRendererFeatureEnabled } from '@/lib/features'
 import PluginPageHost from '@/plugins/PluginPageHost'
 import type {
   InstalledPluginDescriptor,
@@ -52,6 +53,7 @@ function normalizeNavItem(item: PluginNavItemContribution): PluginNavItemContrib
 }
 
 export function PluginRegistryProvider({ children }: { children: ReactNode }) {
+  const pluginsEnabled = isRendererFeatureEnabled('plugins')
   const [loaded, setLoaded] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -60,7 +62,7 @@ export function PluginRegistryProvider({ children }: { children: ReactNode }) {
   const [routes, setRoutes] = useState<PluginRouteContribution[]>([])
 
   const refresh = useCallback(async () => {
-    if (!electronIpc.isElectron()) {
+    if (!pluginsEnabled || !electronIpc.isElectron()) {
       setPlugins([])
       setNavItems([])
       setRoutes([])
@@ -102,25 +104,35 @@ export function PluginRegistryProvider({ children }: { children: ReactNode }) {
       setLoading(false)
       setLoaded(true)
     }
-  }, [])
+  }, [pluginsEnabled])
 
   useEffect(() => {
+    if (!pluginsEnabled) {
+      setPlugins([])
+      setNavItems([])
+      setRoutes([])
+      setPluginRoutes([])
+      setError(null)
+      setLoaded(true)
+      setLoading(false)
+      return
+    }
     refresh().catch((err) => {
       setError((err as Error)?.message || 'Failed to initialize plugin registry')
       setLoaded(true)
       setLoading(false)
     })
-  }, [refresh])
+  }, [pluginsEnabled, refresh])
 
   useEffect(() => {
-    if (!electronIpc.isElectron()) return
+    if (!pluginsEnabled || !electronIpc.isElectron()) return
     const off = electronIpc.onPluginEvent(() => {
       refresh().catch(() => {})
     })
     return () => {
       off()
     }
-  }, [refresh])
+  }, [pluginsEnabled, refresh])
 
   const value = useMemo<PluginRegistryContextValue>(
     () => ({

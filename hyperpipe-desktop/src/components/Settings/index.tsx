@@ -9,6 +9,7 @@ import {
   toRelaySettings,
   toWallet
 } from '@/lib/link'
+import { getRendererFeatureFlags } from '@/lib/features'
 import { cn } from '@/lib/utils'
 import { useSecondaryPage } from '@/PageManager'
 import { useNostr } from '@/providers/NostrProvider'
@@ -34,6 +35,7 @@ export default function Settings() {
   const { t } = useTranslation()
   const { pubkey, nsec, ncryptsec } = useNostr()
   const { push } = useSecondaryPage()
+  const featureFlags = getRendererFeatureFlags()
   const [copiedNsec, setCopiedNsec] = useState(false)
   const [copiedNcryptsec, setCopiedNcryptsec] = useState(false)
 
@@ -87,13 +89,15 @@ export default function Settings() {
           <ChevronRight />
         </SettingItem>
       )}
-      <SettingItem className="clickable" onClick={() => push(toPluginSettings())}>
-        <div className="flex items-center gap-4">
-          <Puzzle />
-          <div>{t('Plugins')}</div>
-        </div>
-        <ChevronRight />
-      </SettingItem>
+      {featureFlags.plugins && (
+        <SettingItem className="clickable" onClick={() => push(toPluginSettings())}>
+          <div className="flex items-center gap-4">
+            <Puzzle />
+            <div>{t('Plugins')}</div>
+          </div>
+          <ChevronRight />
+        </SettingItem>
+      )}
       {!!nsec && (
         <SettingItem
           className="clickable"
