@@ -71,17 +71,17 @@ services:
       # Metrics
       GATEWAY_METRICS_ENABLED: ${GATEWAY_METRICS_ENABLED:-true}
       # Stdout/stderr file rotation
-      GATEWAY_LOG_DIR: /app/public-gateway/logs
-      GATEWAY_LOG_PREFIX: public-gateway
-      GATEWAY_LOG_ROTATE_MS: "1200000"
-      GATEWAY_LOG_RETENTION_MS: "604800000"
+      GATEWAY_LOG_DIR: ${GATEWAY_LOG_DIR:-/app/public-gateway/logs}
+      GATEWAY_LOG_PREFIX: ${GATEWAY_LOG_PREFIX:-public-gateway}
+      GATEWAY_LOG_ROTATE_MS: ${GATEWAY_LOG_ROTATE_MS:-1200000}
+      GATEWAY_LOG_RETENTION_MS: ${GATEWAY_LOG_RETENTION_MS:-10800000}
     ports:
       - "${GATEWAY_BLINDPEER_PORT}:${GATEWAY_BLINDPEER_PORT}/udp"
     depends_on:
       - redis
     volumes:
       - public-gateway-data:/data
-      - public-gateway-logs:/app/public-gateway/logs
+      - ${GATEWAY_LOG_MOUNT_SOURCE:-public-gateway-logs}:${GATEWAY_LOG_DIR:-/app/public-gateway/logs}
       - ./artifacts:/app/public-gateway/artifacts:ro
     restart: unless-stopped
 

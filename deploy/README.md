@@ -68,6 +68,16 @@ To serve the separate `hyperpipe.io` website from the same VPS, set these env va
 
 The website source stays outside this repository. The deploy bundle only mounts a prebuilt static directory from `HYPERPIPE_SITE_ROOT`.
 
+Gateway log rotation is controlled with:
+
+- `GATEWAY_LOG_MOUNT_SOURCE`
+- `GATEWAY_LOG_DIR`
+- `GATEWAY_LOG_PREFIX`
+- `GATEWAY_LOG_ROTATE_MS`
+- `GATEWAY_LOG_RETENTION_MS`
+
+If you want gateway logs to appear in a host folder instead of a Docker named volume, set `GATEWAY_LOG_MOUNT_SOURCE` to an absolute path such as `/home/squip/public-gateway-logs`.
+
 ## Commands
 
 ### `init`

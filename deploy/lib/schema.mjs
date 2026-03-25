@@ -103,6 +103,7 @@ export const ENV_SECTIONS = [
     keys: [
       'GATEWAY_OPEN_JOIN_POOL_TTL',
       'GATEWAY_METRICS_ENABLED',
+      'GATEWAY_LOG_MOUNT_SOURCE',
       'GATEWAY_LOG_DIR',
       'GATEWAY_LOG_PREFIX',
       'GATEWAY_LOG_ROTATE_MS',
@@ -188,10 +189,11 @@ const BASE_DEFAULTS = {
   GATEWAY_BLINDPEER_TRUSTED_PATH: '/data/blind-peer/trusted-peers.json',
   GATEWAY_OPEN_JOIN_POOL_TTL: '0',
   GATEWAY_METRICS_ENABLED: 'true',
+  GATEWAY_LOG_MOUNT_SOURCE: 'public-gateway-logs',
   GATEWAY_LOG_DIR: '/app/public-gateway/logs',
   GATEWAY_LOG_PREFIX: 'public-gateway',
   GATEWAY_LOG_ROTATE_MS: '1200000',
-  GATEWAY_LOG_RETENTION_MS: '604800000'
+  GATEWAY_LOG_RETENTION_MS: '10800000'
 };
 
 function normalizeString(value) {
