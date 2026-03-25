@@ -25,11 +25,16 @@ import {
   TMediaUploadServiceConfig,
   TNoteListMode,
   TNotificationStyle,
+  TMutedList,
   TRelaySet,
   TThemeSetting,
   TTranslationServiceConfig
 } from '@/types'
 import { TStoredGroupedNotesSettings } from '@/providers/GroupedNotesProvider'
+import {
+  TSharedFeedFilterPage,
+  TStoredSharedFeedFilterSettings
+} from '@/lib/shared-feed-filters'
 
 export type ArchivedGroupFilesEntry = {
   groupId: string
@@ -162,6 +167,11 @@ class LocalStorageService {
   private notificationListStyle: TNotificationStyle = NOTIFICATION_LIST_STYLE.DETAILED
   private mediaAutoLoadPolicy: TMediaAutoLoadPolicy = MEDIA_AUTO_LOAD_POLICY.ALWAYS
   private groupedNotesSettings: TStoredGroupedNotesSettings | null = null
+  private sharedFeedFilterSettingsMap: Record<
+    string,
+    Partial<Record<TSharedFeedFilterPage, TStoredSharedFeedFilterSettings>>
+  > = {}
+  private muteListCacheMap: Record<string, TMutedList> = {}
   private shownCreateWalletGuideToastPubkeys: Set<string> = new Set()
   private sidebarCollapse: boolean = false
   private primaryColor: TPrimaryColor = DEFAULT_PRIMARY_COLOR
@@ -383,6 +393,24 @@ class LocalStorageService {
       } catch {
         // Invalid JSON, ignore and use defaults
         this.groupedNotesSettings = null
+      }
+    }
+    const sharedFeedFilterSettingsStr = window.localStorage.getItem(
+      StorageKey.SHARED_FEED_FILTER_SETTINGS
+    )
+    if (sharedFeedFilterSettingsStr) {
+      try {
+        this.sharedFeedFilterSettingsMap = JSON.parse(sharedFeedFilterSettingsStr)
+      } catch {
+        this.sharedFeedFilterSettingsMap = {}
+      }
+    }
+    const muteListCacheStr = window.localStorage.getItem(StorageKey.MUTE_LIST_CACHE)
+    if (muteListCacheStr) {
+      try {
+        this.muteListCacheMap = JSON.parse(muteListCacheStr)
+      } catch {
+        this.muteListCacheMap = {}
       }
     }
     const shownCreateWalletGuideToastPubkeysStr = window.localStorage.getItem(
@@ -724,6 +752,53 @@ class LocalStorageService {
   setGroupedNotesSettings(settings: TStoredGroupedNotesSettings) {
     this.groupedNotesSettings = settings
     window.localStorage.setItem(StorageKey.GROUPED_NOTES_SETTINGS, JSON.stringify(settings))
+  }
+
+  getSharedFeedFilterSettings(
+    pubkey: string | null | undefined,
+    page: TSharedFeedFilterPage
+  ) {
+    const key = pubkey || '_global'
+    return this.sharedFeedFilterSettingsMap[key]?.[page] || null
+  }
+
+  setSharedFeedFilterSettings(
+    pubkey: string | null | undefined,
+    page: TSharedFeedFilterPage,
+    settings: TStoredSharedFeedFilterSettings
+  ) {
+    const key = pubkey || '_global'
+    const current = this.sharedFeedFilterSettingsMap[key] || {}
+    this.sharedFeedFilterSettingsMap[key] = {
+      ...current,
+      [page]: settings
+    }
+    window.localStorage.setItem(
+      StorageKey.SHARED_FEED_FILTER_SETTINGS,
+      JSON.stringify(this.sharedFeedFilterSettingsMap)
+    )
+  }
+
+  getMuteListCache(pubkey: string | null | undefined) {
+    const key = pubkey || '_global'
+    const cached = this.muteListCacheMap[key]
+    return {
+      public: Array.isArray(cached?.public) ? cached.public.filter(Boolean) : [],
+      private: Array.isArray(cached?.private) ? cached.private.filter(Boolean) : []
+    }
+  }
+
+  setMuteListCache(pubkey: string | null | undefined, muteList: TMutedList) {
+    const key = pubkey || '_global'
+    this.muteListCacheMap[key] = {
+      public: Array.isArray(muteList.public)
+        ? Array.from(new Set(muteList.public.filter(Boolean)))
+        : [],
+      private: Array.isArray(muteList.private)
+        ? Array.from(new Set(muteList.private.filter(Boolean)))
+        : []
+    }
+    window.localStorage.setItem(StorageKey.MUTE_LIST_CACHE, JSON.stringify(this.muteListCacheMap))
   }
 
   hasShownCreateWalletGuideToast(pubkey: string) {

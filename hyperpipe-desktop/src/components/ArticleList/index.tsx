@@ -1,6 +1,8 @@
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { matchesMutedWordList } from '@/lib/shared-feed-filters'
 import { isTouchDevice } from '@/lib/utils'
+import { useMuteList } from '@/providers/MuteListProvider'
 import client from '@/services/client.service'
 import { TFeedSubRequest } from '@/types'
 import { Event } from '@nostr/tools/wasm'
@@ -29,14 +31,21 @@ export type TArticleSubRequest = {
 const ArticleList = forwardRef(
   (
     {
-      subRequests
+      subRequests,
+      mutedWords = '',
+      maxItemsPerAuthor = 0,
+      sinceTimestamp
     }: {
       subRequests: TArticleSubRequest[]
+      mutedWords?: string
+      maxItemsPerAuthor?: number
+      sinceTimestamp?: number
     },
     ref
   ) => {
     const { t } = useTranslation()
     const { startLogin } = useNostr()
+    const { mutePubkeySet } = useMuteList()
     const [articles, setArticles] = useState<Event[]>([])
     const [loading, setLoading] = useState(true)
     const [hasMore, setHasMore] = useState<boolean>(true)
@@ -84,7 +93,8 @@ const ArticleList = forwardRef(
           buildSubRequests,
           {
             kinds: [30023],
-            limit: LIMIT
+            limit: LIMIT,
+            ...(sinceTimestamp ? { since: sinceTimestamp } : {})
           },
           {
             onEvents: (events, isFinal) => {
@@ -114,7 +124,7 @@ const ArticleList = forwardRef(
       return () => {
         subscription?.then((subc) => subc?.close())
       }
-    }, [buildSubRequests, refreshCount, startLogin])
+    }, [buildSubRequests, refreshCount, sinceTimestamp, startLogin])
 
     useEffect(() => {
       const options = {
@@ -139,7 +149,8 @@ const ArticleList = forwardRef(
           {
             until: articles.length ? articles[articles.length - 1].created_at - 1 : dayjs().unix(),
             limit: LIMIT,
-            kinds: [30023]
+            kinds: [30023],
+            ...(sinceTimestamp ? { since: sinceTimestamp } : {})
           },
           {
             startLogin
@@ -170,7 +181,7 @@ const ArticleList = forwardRef(
           observerInstance.unobserve(currentBottomRef)
         }
       }
-    }, [loading, hasMore, articles, showCount, buildSubRequests, startLogin])
+    }, [articles, buildSubRequests, hasMore, loading, showCount, sinceTimestamp, startLogin])
 
     const displayedArticles = useMemo(() => {
       const filteredTitles = ['Untitled', 'Untitled Draft', 'Draft', 'Test', 'Testing']
@@ -192,6 +203,18 @@ const ArticleList = forwardRef(
           const title = titleTag?.[1] || 'Untitled'
           return !filteredTitles.includes(title)
         })
+        .filter((event) => !mutePubkeySet.has(event.pubkey))
+        .filter((event) => {
+          if (!mutedWords.trim()) return true
+
+          const title = event.tags.find((tag) => tag[0] === 'title')?.[1] || ''
+          const summary = event.tags.find((tag) => tag[0] === 'summary')?.[1] || ''
+          const hashtags = event.tags
+            .filter((tag) => tag[0] === 't' && tag[1])
+            .map((tag) => tag[1])
+
+          return !matchesMutedWordList([title, summary, event.content, ...hashtags], mutedWords)
+        })
         .sort((a, b) => {
           const aPublishedAt =
             parseInt(a.tags.find((tag) => tag[0] === 'published_at')?.[1] || '0') ||
@@ -201,8 +224,13 @@ const ArticleList = forwardRef(
             b.created_at
           return bPublishedAt - aPublishedAt
         })
+        .filter((event, _, source) => {
+          if (maxItemsPerAuthor <= 0) return true
+          const count = source.filter((candidate) => candidate.pubkey === event.pubkey).length
+          return count <= maxItemsPerAuthor
+        })
         .slice(0, showCount)
-    }, [articles, showCount])
+    }, [articles, maxItemsPerAuthor, mutedWords, mutePubkeySet, showCount])
 
     const handleRefresh = async () => {
       refresh()

@@ -3,6 +3,7 @@ import UserAvatar from '@/components/UserAvatar'
 import Username from '@/components/Username'
 import NoteList from '@/components/NoteList'
 import ProfileList from '@/components/ProfileList'
+import SharedFeedFilterMenu from '@/components/SharedFeedFilterMenu'
 import TabsBar, { TTabDefinition } from '@/components/Tabs'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -10,12 +11,10 @@ import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   DropdownMenu,
-  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuLabel,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
 import {
@@ -38,9 +37,22 @@ import { useNostr } from '@/providers/NostrProvider'
 import { useScreenSize } from '@/providers/ScreenSizeProvider'
 import { useGroups } from '@/providers/GroupsProvider'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
+import { useMuteList } from '@/providers/MuteListProvider'
+import useSharedFeedFilterSettings from '@/hooks/useSharedFeedFilterSettings'
 import { TPageRef } from '@/types'
 import client from '@/services/client.service'
 import { ExtendedKind, BIG_RELAY_URLS } from '@/constants'
+import {
+  areStringArraysEqual,
+  createDefaultSharedFeedFilterSettings,
+  getSelectedAuthorPubkeys,
+  getSharedFeedFilterSinceTimestamp,
+  isRelaySelectionActive,
+  isSharedFeedFilterActive,
+  matchesMutedWordList,
+  type TFeedFilterListOption,
+  type TFeedFilterRelayOption
+} from '@/lib/shared-feed-filters'
 import {
   buildGroupRelayDisplayMetaMap,
   buildGroupRelayTargets,
@@ -64,9 +76,9 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import {
   ArrowLeft,
+  ArrowUpDown,
   Check,
   Edit,
-  ListFilter,
   Loader2,
   PencilLine,
   Plus,
@@ -80,8 +92,6 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import ListEditorForm from '@/components/ListEditorForm'
 import { Event } from '@nostr/tools/wasm'
 import PullToRefresh from 'react-simple-pull-to-refresh'
-import RelayIcon from '@/components/RelayIcon'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 
 type TSortBy = 'recent' | 'zaps'
 type TDiscoverRelayOption = {
@@ -103,11 +113,15 @@ const ListsPage = forwardRef((_, ref) => {
   const { push } = useSecondaryPage()
   const { lists, isLoading: isLoadingMyLists, deleteList, fetchLists } = useLists()
   const { followings = [], followMultiple, unfollowMultiple } = useFollowList()
+  const { mutePubkeySet } = useMuteList()
   const { isSmallScreen } = useScreenSize()
-  const [selectedDiscoverRelayIdentities, setSelectedDiscoverRelayIdentities] = useState<string[]>(
-    []
-  )
-  const [relayFilterEdited, setRelayFilterEdited] = useState(false)
+  const {
+    settings: sharedFilterSettings,
+    setSettings: setSharedFilterSettings,
+    resetSettings: resetSharedFilterSettings,
+    timeFrameOptions,
+    hasSavedSettings
+  } = useSharedFeedFilterSettings('lists')
 
   const [searchQuery, setSearchQuery] = useState('')
   const [isSearching, setIsSearching] = useState(false)
@@ -217,26 +231,83 @@ const ListsPage = forwardRef((_, ref) => {
     [discoverFetchRelayUrls, groupRelayDisplayMeta]
   )
 
+  const sharedRelayOptions = useMemo<TFeedFilterRelayOption[]>(
+    () =>
+      discoverRelayOptions.map((option) => ({
+        relayIdentity: option.relayIdentity,
+        relayUrl: option.relayUrl,
+        label: option.meta?.label?.trim() || simplifyUrl(option.relayUrl),
+        subtitle: option.meta?.hideUrl ? null : simplifyUrl(option.relayUrl),
+        imageUrl: option.meta?.imageUrl || null,
+        hideUrl: option.meta?.hideUrl
+      })),
+    [discoverRelayOptions]
+  )
+
+  const sharedListOptions = useMemo<TFeedFilterListOption[]>(
+    () =>
+      lists.map((list) => ({
+        key: `${list.event.pubkey}:${list.id}`,
+        label: list.title,
+        authorPubkeys: list.pubkeys || [],
+        description: list.description || null
+      })),
+    [lists]
+  )
+
+  const defaultSharedFilterSettings = useMemo(
+    () =>
+      createDefaultSharedFeedFilterSettings(
+        'lists',
+        timeFrameOptions,
+        sharedRelayOptions.map((option) => option.relayIdentity)
+      ),
+    [sharedRelayOptions, timeFrameOptions]
+  )
+
+  const effectiveSelectedRelayIdentities = useMemo(
+    () =>
+      sharedFilterSettings.selectedRelayIdentities.length === 0 && !hasSavedSettings
+        ? sharedRelayOptions.map((option) => option.relayIdentity)
+        : sharedFilterSettings.selectedRelayIdentities,
+    [hasSavedSettings, sharedFilterSettings.selectedRelayIdentities, sharedRelayOptions]
+  )
+
   useEffect(() => {
     setShowSearchBar(!isSmallScreen)
   }, [isSmallScreen])
 
   useEffect(() => {
+    if (!discoverRelayOptions.length) return
+
     const availableIdentities = discoverRelayOptions.map((option) => option.relayIdentity)
     const availableSet = new Set(availableIdentities)
 
-    if (!relayFilterEdited) {
-      setSelectedDiscoverRelayIdentities((previous) =>
-        areStringArraysEqual(previous, availableIdentities) ? previous : availableIdentities
+    if (!hasSavedSettings && sharedFilterSettings.selectedRelayIdentities.length === 0) {
+      setSharedFilterSettings(
+        createDefaultSharedFeedFilterSettings('lists', timeFrameOptions, availableIdentities)
       )
       return
     }
 
-    setSelectedDiscoverRelayIdentities((previous) => {
-      const filtered = previous.filter((relayIdentity) => availableSet.has(relayIdentity))
-      return areStringArraysEqual(previous, filtered) ? previous : filtered
-    })
-  }, [discoverRelayOptions, relayFilterEdited])
+    const filteredSelections = sharedFilterSettings.selectedRelayIdentities.filter((relayIdentity) =>
+      availableSet.has(relayIdentity)
+    )
+
+    if (!areStringArraysEqual(filteredSelections, sharedFilterSettings.selectedRelayIdentities)) {
+      setSharedFilterSettings({
+        ...sharedFilterSettings,
+        selectedRelayIdentities: filteredSelections
+      })
+    }
+  }, [
+    discoverRelayOptions,
+    hasSavedSettings,
+    setSharedFilterSettings,
+    sharedFilterSettings,
+    sharedFilterSettings.selectedRelayIdentities,
+    timeFrameOptions
+  ])
 
   useEffect(() => {
     setFavoriteLists(localStorageService.getFavoriteLists(pubkey))
@@ -936,39 +1007,134 @@ const ListsPage = forwardRef((_, ref) => {
     return Array.from(latestByKey.values())
   }, [allPublicLists, lists])
 
-  const selectedDiscoverRelaySet = useMemo(
-    () => new Set(selectedDiscoverRelayIdentities),
-    [selectedDiscoverRelayIdentities]
+  const selectedAuthorPubkeySet = useMemo(
+    () => getSelectedAuthorPubkeys(sharedListOptions, sharedFilterSettings.selectedListKeys),
+    [sharedFilterSettings.selectedListKeys, sharedListOptions]
   )
 
-  const filteredDiscoverListObjects = useMemo(() => {
-    if (!selectedDiscoverRelayIdentities.length) return []
-    return discoverListObjects.filter((list) => {
-      const relayUrls = dedupeRelayUrlsByIdentity([
-        ...(list.relayUrls || []),
-        ...client.getSeenEventRelayUrls(list.event.id, list.event)
-      ])
-      if (!relayUrls.length) return false
-      return relayUrls.some((relayUrl) => {
-        const relayIdentity = getRelayIdentity(relayUrl)
-        if (!relayIdentity) return false
-        return selectedDiscoverRelaySet.has(relayIdentity)
+  const sinceTimestamp = useMemo(
+    () => getSharedFeedFilterSinceTimestamp(sharedFilterSettings),
+    [sharedFilterSettings]
+  )
+
+  const relayFilterActive = useMemo(
+    () =>
+      isRelaySelectionActive(
+        effectiveSelectedRelayIdentities,
+        sharedRelayOptions.map((option) => option.relayIdentity)
+      ),
+    [effectiveSelectedRelayIdentities, sharedRelayOptions]
+  )
+
+  const filterListObjects = useCallback(
+    (listItems: TStarterPack[]) => {
+      const selectedRelaySet = new Set(effectiveSelectedRelayIdentities)
+
+      let filteredItems = listItems.filter((list) => {
+        if (
+          sharedFilterSettings.recencyEnabled
+          && sinceTimestamp
+          && list.event.created_at < sinceTimestamp
+        ) {
+          return false
+        }
+
+        if (mutePubkeySet.has(list.event.pubkey)) {
+          return false
+        }
+
+        if (
+          sharedFilterSettings.selectedListKeys.length > 0
+          && !selectedAuthorPubkeySet.has(list.event.pubkey)
+        ) {
+          return false
+        }
+
+        if (relayFilterActive) {
+          const relayUrls = dedupeRelayUrlsByIdentity([
+            ...(list.relayUrls || []),
+            ...client.getSeenEventRelayUrls(list.event.id, list.event)
+          ])
+          if (!relayUrls.length) return false
+          const hasMatchingRelay = relayUrls.some((relayUrl) => {
+            const relayIdentity = getRelayIdentity(relayUrl)
+            return relayIdentity ? selectedRelaySet.has(relayIdentity) : false
+          })
+          if (!hasMatchingRelay) {
+            return false
+          }
+        }
+
+        if (
+          matchesMutedWordList(
+            [list.title, list.description, list.id, list.event.content],
+            sharedFilterSettings.mutedWords
+          )
+        ) {
+          return false
+        }
+
+        return true
       })
-    })
-  }, [discoverListObjects, selectedDiscoverRelayIdentities.length, selectedDiscoverRelaySet])
+
+      if (sharedFilterSettings.maxItemsPerAuthor > 0) {
+        const countsByAuthor = new Map<string, number>()
+        filteredItems.forEach((list) => {
+          countsByAuthor.set(list.event.pubkey, (countsByAuthor.get(list.event.pubkey) || 0) + 1)
+        })
+        filteredItems = filteredItems.filter(
+          (list) =>
+            (countsByAuthor.get(list.event.pubkey) || 0) <= sharedFilterSettings.maxItemsPerAuthor
+        )
+      }
+
+      return filteredItems
+    },
+    [
+      effectiveSelectedRelayIdentities,
+      mutePubkeySet,
+      relayFilterActive,
+      selectedAuthorPubkeySet,
+      sharedFilterSettings.maxItemsPerAuthor,
+      sharedFilterSettings.mutedWords,
+      sharedFilterSettings.recencyEnabled,
+      sharedFilterSettings.selectedListKeys.length,
+      sinceTimestamp
+    ]
+  )
+
+  const filteredDiscoverListObjects = useMemo(
+    () => filterListObjects(discoverListObjects),
+    [discoverListObjects, filterListObjects]
+  )
+
+  const filteredFavoriteListObjects = useMemo(
+    () => filterListObjects(favoriteListObjects),
+    [favoriteListObjects, filterListObjects]
+  )
+
+  const filteredMyListObjects = useMemo(
+    () => filterListObjects(myListObjects),
+    [filterListObjects, myListObjects]
+  )
+
+  const filteredSearchResults = useMemo(
+    () => filterListObjects(searchResults),
+    [filterListObjects, searchResults]
+  )
 
   const visibleListObjectsForSort = useMemo(() => {
-    if (searchQuery.trim()) return searchResults
-    if (activeSection === 'favorites') return favoriteListObjects
-    if (activeSection === 'my') return myListObjects
+    if (searchQuery.trim()) return filteredSearchResults
+    if (activeSection === 'favorites') return filteredFavoriteListObjects
+    if (activeSection === 'my') return filteredMyListObjects
     return filteredDiscoverListObjects
   }, [
     activeSection,
-    favoriteListObjects,
+    filteredFavoriteListObjects,
     filteredDiscoverListObjects,
-    myListObjects,
+    filteredMyListObjects,
+    filteredSearchResults,
     searchQuery,
-    searchResults
   ])
 
   const selectedListNoteAuthors = selectedList?.pubkeys ?? []
@@ -1042,18 +1208,18 @@ const ListsPage = forwardRef((_, ref) => {
 
     switch (activeSection) {
       case 'favorites':
-        return renderListGroup(favoriteListObjects)
+        return renderListGroup(filteredFavoriteListObjects)
       case 'my':
-        return renderListGroup(myListObjects)
+        return renderListGroup(filteredMyListObjects)
       default:
         return renderListGroup(filteredDiscoverListObjects)
     }
   }, [
     activeSection,
     filteredDiscoverListObjects,
-    favoriteListObjects,
+    filteredFavoriteListObjects,
     isLoadingPublicLists,
-    myListObjects,
+    filteredMyListObjects,
     isLoadingMyLists,
     listStatsVersion,
     sortBy,
@@ -1062,27 +1228,22 @@ const ListsPage = forwardRef((_, ref) => {
     isSmallScreen
   ])
 
-  const toggleDiscoverRelay = (relayIdentity: string, checked: boolean) => {
-    setRelayFilterEdited(true)
-    setSelectedDiscoverRelayIdentities((previous) => {
-      const next = new Set(previous)
-      if (checked) {
-        next.add(relayIdentity)
-      } else {
-        next.delete(relayIdentity)
-      }
-      return Array.from(next)
-    })
-  }
+  const isSharedFilterMenuActive = isSharedFeedFilterActive(
+    {
+      ...sharedFilterSettings,
+      selectedRelayIdentities: effectiveSelectedRelayIdentities
+    },
+    defaultSharedFilterSettings
+  )
 
-  const filterControl = (
+  const sortControl = (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon">
-          <ListFilter className="w-4 h-4" />
+        <Button variant="ghost" size="icon" title={t('Sort') as string}>
+          <ArrowUpDown className="w-4 h-4" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-72">
+      <DropdownMenuContent align="end" className="w-56">
         <DropdownMenuLabel>{t('Sort')}</DropdownMenuLabel>
         <DropdownMenuRadioGroup
           value={sortBy}
@@ -1091,26 +1252,24 @@ const ListsPage = forwardRef((_, ref) => {
           <DropdownMenuRadioItem value="recent">{t('Most recent')}</DropdownMenuRadioItem>
           <DropdownMenuRadioItem value="zaps">{t('Most zapped')}</DropdownMenuRadioItem>
         </DropdownMenuRadioGroup>
-        {activeSection === 'discover' && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuLabel>{t('Relays')}</DropdownMenuLabel>
-            {discoverRelayOptions.map((option) => (
-              <DropdownMenuCheckboxItem
-                key={option.relayIdentity}
-                checked={selectedDiscoverRelaySet.has(option.relayIdentity)}
-                onSelect={(e) => e.preventDefault()}
-                onCheckedChange={(checked) =>
-                  toggleDiscoverRelay(option.relayIdentity, checked === true)
-                }
-              >
-                <RelayFilterOption option={option} />
-              </DropdownMenuCheckboxItem>
-            ))}
-          </>
-        )}
       </DropdownMenuContent>
     </DropdownMenu>
+  )
+
+  const sharedFilterControl = (
+    <SharedFeedFilterMenu
+      settings={{
+        ...sharedFilterSettings,
+        selectedRelayIdentities: effectiveSelectedRelayIdentities
+      }}
+      defaultSettings={defaultSharedFilterSettings}
+      timeFrameOptions={timeFrameOptions}
+      relayOptions={sharedRelayOptions}
+      listOptions={sharedListOptions}
+      isActive={isSharedFilterMenuActive}
+      onApply={setSharedFilterSettings}
+      onReset={(nextSettings) => resetSharedFilterSettings(nextSettings)}
+    />
   )
 
   const tabs = useMemo<TTabDefinition[]>(
@@ -1128,7 +1287,7 @@ const ListsPage = forwardRef((_, ref) => {
         tabs={tabs}
         value={activeSection}
         onTabChange={(tab) => setActiveSection(tab as 'discover' | 'favorites' | 'my')}
-        options={isSmallScreen ? filterControl : null}
+        options={isSmallScreen ? <div className="flex items-center gap-1">{sortControl}{sharedFilterControl}</div> : null}
         topOffset="0"
         reserveOptionsSpace={!isSmallScreen}
       />
@@ -1146,7 +1305,8 @@ const ListsPage = forwardRef((_, ref) => {
           className="pl-9"
         />
       </div>
-      {!isSmallScreen && !searchQuery && filterControl}
+      {!isSmallScreen && sortControl}
+      {!isSmallScreen && sharedFilterControl}
       {!isSmallScreen && (
         <Button onClick={startCreateList} size="default">
           <Plus className="w-4 h-4 mr-1" />
@@ -1173,14 +1333,14 @@ const ListsPage = forwardRef((_, ref) => {
               {isSearching && (
                 <div className="text-center text-muted-foreground py-8">{t('Searching...')}</div>
               )}
-              {!isSearching && (!searchResults || searchResults.length === 0) && (
+              {!isSearching && (!filteredSearchResults || filteredSearchResults.length === 0) && (
                 <div className="text-center text-muted-foreground py-8">
                   {t('No starter packs found')}
                 </div>
               )}
-              {searchResults && searchResults.length > 0 && (
+              {filteredSearchResults && filteredSearchResults.length > 0 && (
                 <div className={isSmallScreen ? 'divide-y border-y' : 'grid gap-3'}>
-                  {sortLists(searchResults).map((list) =>
+                  {sortLists(filteredSearchResults).map((list) =>
                     renderListCard(list, list?.event?.pubkey === pubkey)
                   )}
                 </div>
@@ -1284,38 +1444,4 @@ function ListsPageTitlebar({
       ) : null}
     </div>
   )
-}
-
-function RelayFilterOption({ option }: { option: TDiscoverRelayOption }) {
-  const meta = option.meta
-  const isGroupRelay = !!meta?.isGroupRelay || !!meta?.hideUrl
-  const label = meta?.label?.trim() || simplifyUrl(option.relayUrl)
-  const initials = label.slice(0, 2).toUpperCase()
-
-  if (isGroupRelay) {
-    return (
-      <div className="flex min-w-0 items-center gap-2">
-        <Avatar className="h-5 w-5 shrink-0">
-          {meta?.imageUrl ? <AvatarImage src={meta.imageUrl} alt={label} /> : null}
-          <AvatarFallback className="text-[9px] font-semibold">{initials}</AvatarFallback>
-        </Avatar>
-        <div className="truncate">{label}</div>
-      </div>
-    )
-  }
-
-  return (
-    <div className="flex min-w-0 items-center gap-2">
-      <RelayIcon url={option.relayUrl} />
-      <div className="truncate">{simplifyUrl(option.relayUrl)}</div>
-    </div>
-  )
-}
-
-function areStringArraysEqual(left: string[], right: string[]) {
-  if (left.length !== right.length) return false
-  for (let i = 0; i < left.length; i++) {
-    if (left[i] !== right[i]) return false
-  }
-  return true
 }

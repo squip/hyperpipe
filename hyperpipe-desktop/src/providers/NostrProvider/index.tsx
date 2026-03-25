@@ -205,10 +205,11 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
 	      setNcryptsec(null)
 	      setNotificationsSeenAt(-1)
 
-	      if (!account) {
-	        setNsecHex(null)
-	        return
-	      }
+      if (!account) {
+        setNsecHex(null)
+        setMuteList({ private: [], public: [] })
+        return
+      }
 
       const storedNsec = storage.getAccountNsec(account.pubkey)
       if (storedNsec) {
@@ -224,6 +225,7 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
       }
 
       const storedNotificationsSeenAt = storage.getLastReadNotificationTime(account.pubkey)
+      setMuteList(storage.getMuteListCache(account.pubkey))
 
       // current account replaceables
       const relayList = await client.fetchRelayList(account.pubkey)
@@ -233,7 +235,10 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
       loadBookmarks(account.pubkey).then(({ items }) => setBookmarkList(items))
       loadEmojis(account.pubkey).then(({ items }) => setUserEmojiList(items))
       loadPins(account.pubkey).then(({ items }) => setPinList(items))
-      client.fetchMuteList(account.pubkey, nip04Decrypt).then(setMuteList)
+      client.fetchMuteList(account.pubkey, nip04Decrypt).then((nextMuteList) => {
+        storage.setMuteListCache(account.pubkey, nextMuteList)
+        setMuteList(nextMuteList)
+      })
       loadFavoriteRelays(account.pubkey).then(({ items }) => setFavoriteRelays(items))
 
       // first fetch with no network
@@ -746,6 +751,7 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
 
   const updateMuteListEvent = async (muteListEvent: Event) => {
     const muteList = await client.fetchMuteList(muteListEvent.pubkey, nip04Decrypt, muteListEvent)
+    storage.setMuteListCache(muteListEvent.pubkey, muteList)
     setMuteList(muteList)
   }
 

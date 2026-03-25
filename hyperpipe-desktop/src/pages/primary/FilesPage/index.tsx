@@ -1,11 +1,34 @@
 import GroupFilesTable from '@/components/GroupFilesTable'
+import SharedFeedFilterMenu from '@/components/SharedFeedFilterMenu'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import useSharedFeedFilterSettings from '@/hooks/useSharedFeedFilterSettings'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
+import {
+  areStringArraysEqual,
+  createDefaultSharedFeedFilterSettings,
+  getSelectedAuthorPubkeys,
+  getSharedFeedFilterSinceTimestamp,
+  isRelaySelectionActive,
+  isSharedFeedFilterActive,
+  matchesMutedWordList,
+  type TFeedFilterListOption,
+  type TFeedFilterRelayOption
+} from '@/lib/shared-feed-filters'
+import {
+  buildGroupRelayDisplayMetaMap,
+  buildGroupRelayTargets,
+  dedupeRelayTargetsByIdentity,
+  getRelayIdentity
+} from '@/lib/relay-targets'
+import { simplifyUrl } from '@/lib/url'
 import { useGroupFiles } from '@/providers/GroupFilesProvider'
+import { useGroups } from '@/providers/GroupsProvider'
+import { useLists } from '@/providers/ListsProvider'
+import { useMuteList } from '@/providers/MuteListProvider'
 import { TPageRef } from '@/types'
 import { Files, Loader2, Search } from 'lucide-react'
-import { forwardRef, useImperativeHandle, useRef, useState } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 const FilesPage = forwardRef<TPageRef>((_, ref) => {
@@ -13,8 +36,198 @@ const FilesPage = forwardRef<TPageRef>((_, ref) => {
   useImperativeHandle(ref, () => layoutRef.current!)
   const { t } = useTranslation()
   const { records, isLoading, refresh, lastUpdated } = useGroupFiles()
+  const { lists } = useLists()
+  const { mutePubkeySet } = useMuteList()
+  const { myGroupList, discoveryGroups, getProvisionalGroupMetadata, resolveRelayUrl } = useGroups()
+  const {
+    settings,
+    setSettings,
+    resetSettings,
+    timeFrameOptions,
+    hasSavedSettings
+  } = useSharedFeedFilterSettings('files')
   const [search, setSearch] = useState('')
   const [refreshing, setRefreshing] = useState(false)
+
+  const groupRelayTargets = useMemo(
+    () =>
+      buildGroupRelayTargets({
+        myGroupList,
+        resolveRelayUrl,
+        getProvisionalGroupMetadata,
+        discoveryGroups
+      }),
+    [discoveryGroups, getProvisionalGroupMetadata, myGroupList, resolveRelayUrl]
+  )
+
+  const relayDisplayMeta = useMemo(
+    () => buildGroupRelayDisplayMetaMap(groupRelayTargets),
+    [groupRelayTargets]
+  )
+
+  const relayOptions = useMemo<TFeedFilterRelayOption[]>(
+    () =>
+      dedupeRelayTargetsByIdentity(groupRelayTargets.map((target) => target.relayUrl)).map(
+        (target) => {
+          const meta = relayDisplayMeta[target.relayIdentity] || relayDisplayMeta[target.relayUrl]
+          return {
+            relayIdentity: target.relayIdentity,
+            relayUrl: target.relayUrl,
+            label: meta?.label?.trim() || simplifyUrl(target.relayUrl),
+            subtitle: meta?.hideUrl ? null : simplifyUrl(target.relayUrl),
+            imageUrl: meta?.imageUrl || null,
+            hideUrl: meta?.hideUrl
+          }
+        }
+      ),
+    [groupRelayTargets, relayDisplayMeta]
+  )
+
+  const listOptions = useMemo<TFeedFilterListOption[]>(
+    () =>
+      lists.map((list) => ({
+        key: `${list.event.pubkey}:${list.id}`,
+        label: list.title,
+        authorPubkeys: list.pubkeys || [],
+        description: list.description || null
+      })),
+    [lists]
+  )
+
+  const defaultFilterSettings = useMemo(
+    () =>
+      createDefaultSharedFeedFilterSettings(
+        'files',
+        timeFrameOptions,
+        relayOptions.map((option) => option.relayIdentity)
+      ),
+    [relayOptions, timeFrameOptions]
+  )
+
+  const effectiveSelectedRelayIdentities = useMemo(
+    () =>
+      settings.selectedRelayIdentities.length === 0 && !hasSavedSettings
+        ? relayOptions.map((option) => option.relayIdentity)
+        : settings.selectedRelayIdentities,
+    [hasSavedSettings, relayOptions, settings.selectedRelayIdentities]
+  )
+
+  useEffect(() => {
+    if (!relayOptions.length) return
+
+    if (!hasSavedSettings && settings.selectedRelayIdentities.length === 0) {
+      setSettings(defaultFilterSettings)
+      return
+    }
+
+    const availableIdentitySet = new Set(relayOptions.map((option) => option.relayIdentity))
+    const filteredSelections = settings.selectedRelayIdentities.filter((relayIdentity) =>
+      availableIdentitySet.has(relayIdentity)
+    )
+
+    if (!areStringArraysEqual(filteredSelections, settings.selectedRelayIdentities)) {
+      setSettings({
+        ...settings,
+        selectedRelayIdentities: filteredSelections
+      })
+    }
+  }, [
+    defaultFilterSettings,
+    hasSavedSettings,
+    relayOptions,
+    setSettings,
+    settings,
+    settings.selectedRelayIdentities
+  ])
+
+  const selectedAuthorPubkeySet = useMemo(
+    () => getSelectedAuthorPubkeys(listOptions, settings.selectedListKeys),
+    [listOptions, settings.selectedListKeys]
+  )
+
+  const sinceTimestamp = useMemo(
+    () => getSharedFeedFilterSinceTimestamp(settings),
+    [settings]
+  )
+
+  const relayFilterActive = useMemo(
+    () =>
+      isRelaySelectionActive(
+        effectiveSelectedRelayIdentities,
+        relayOptions.map((option) => option.relayIdentity)
+      ),
+    [effectiveSelectedRelayIdentities, relayOptions]
+  )
+
+  const filteredRecords = useMemo(() => {
+    const selectedRelaySet = new Set(effectiveSelectedRelayIdentities)
+    let nextRecords = records.filter((record) => {
+      if (settings.recencyEnabled && sinceTimestamp && record.uploadedAt < sinceTimestamp) {
+        return false
+      }
+
+      if (mutePubkeySet.has(record.uploadedBy)) {
+        return false
+      }
+
+      if (settings.selectedListKeys.length > 0 && !selectedAuthorPubkeySet.has(record.uploadedBy)) {
+        return false
+      }
+
+      if (relayFilterActive) {
+        const relayIdentity = record.groupRelay ? getRelayIdentity(record.groupRelay) : null
+        if (!relayIdentity || !selectedRelaySet.has(relayIdentity)) {
+          return false
+        }
+      }
+
+      if (
+        matchesMutedWordList(
+          [record.fileName, record.alt, record.summary, record.groupName, record.groupId],
+          settings.mutedWords
+        )
+      ) {
+        return false
+      }
+
+      return true
+    })
+
+    if (settings.maxItemsPerAuthor > 0) {
+      const countsByAuthor = new Map<string, number>()
+      nextRecords.forEach((record) => {
+        countsByAuthor.set(record.uploadedBy, (countsByAuthor.get(record.uploadedBy) || 0) + 1)
+      })
+      nextRecords = nextRecords.filter(
+        (record) => (countsByAuthor.get(record.uploadedBy) || 0) <= settings.maxItemsPerAuthor
+      )
+    }
+
+    return nextRecords
+  }, [
+    effectiveSelectedRelayIdentities,
+    mutePubkeySet,
+    records,
+    relayFilterActive,
+    selectedAuthorPubkeySet,
+    settings.maxItemsPerAuthor,
+    settings.mutedWords,
+    settings.recencyEnabled,
+    settings.selectedListKeys.length,
+    sinceTimestamp
+  ])
+
+  const isFilterActive = useMemo(
+    () =>
+      isSharedFeedFilterActive(
+        {
+          ...settings,
+          selectedRelayIdentities: effectiveSelectedRelayIdentities
+        },
+        defaultFilterSettings
+      ),
+    [defaultFilterSettings, effectiveSelectedRelayIdentities, settings]
+  )
 
   const handleRefresh = async () => {
     if (refreshing) return
@@ -44,6 +257,19 @@ const FilesPage = forwardRef<TPageRef>((_, ref) => {
               className="pl-9"
             />
           </div>
+          <SharedFeedFilterMenu
+            settings={{
+              ...settings,
+              selectedRelayIdentities: effectiveSelectedRelayIdentities
+            }}
+            defaultSettings={defaultFilterSettings}
+            timeFrameOptions={timeFrameOptions}
+            relayOptions={relayOptions}
+            listOptions={listOptions}
+            isActive={isFilterActive}
+            onApply={setSettings}
+            onReset={(nextSettings) => resetSettings(nextSettings)}
+          />
           <Button
             variant="ghost"
             size="icon"
@@ -55,7 +281,7 @@ const FilesPage = forwardRef<TPageRef>((_, ref) => {
           </Button>
         </div>
         <GroupFilesTable
-          records={records}
+          records={filteredRecords}
           loading={isLoading}
           showGroupColumn
           searchQuery={search}

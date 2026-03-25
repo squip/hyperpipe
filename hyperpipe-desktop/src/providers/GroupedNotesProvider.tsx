@@ -1,27 +1,7 @@
 import { createContext, useContext, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { createTimeFrameOptions, type TStoredTimeFrame, type TTimeFrame } from '@/lib/time-frame'
 import storage from '@/services/local-storage.service'
-
-export type TTimeFrame = {
-  value: number
-  unit: 'hours' | 'days'
-  label: string
-}
-
-export const createTimeFrameOptions = (t: (key: string) => string): TTimeFrame[] => [
-  // Hours: 1-24
-  ...Array.from({ length: 24 }, (_, i) => ({
-    value: i + 1,
-    unit: 'hours' as const,
-    label: `${i + 1} ${t('GroupedNotesHours')}`
-  })),
-  // Days: 2-30
-  ...Array.from({ length: 29 }, (_, i) => ({
-    value: i + 2,
-    unit: 'days' as const,
-    label: `${i + 2} ${t('GroupedNotesDays')}`
-  }))
-]
 
 export type TGroupedNotesSettings = {
   enabled: boolean
@@ -33,11 +13,6 @@ export type TGroupedNotesSettings = {
   showOnlyFirstLevelReplies: boolean
   showPreview: boolean
   hideShortNotes: boolean
-}
-
-export type TStoredTimeFrame = {
-  value: number
-  unit: 'hours' | 'days'
 }
 
 export type TStoredGroupedNotesSettings = {
@@ -144,9 +119,4 @@ export function GroupedNotesProvider({ children }: { children: React.ReactNode }
       {children}
     </GroupedNotesContext.Provider>
   )
-}
-
-export function getTimeFrameInMs(timeFrame: TTimeFrame): number {
-  const multiplier = timeFrame.unit === 'hours' ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000
-  return timeFrame.value * multiplier
 }

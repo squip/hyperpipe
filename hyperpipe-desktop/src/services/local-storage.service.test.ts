@@ -74,4 +74,54 @@ describe('local storage feed selection persistence', () => {
       }
     })
   })
+
+  it('persists shared feed filter settings per account and page', () => {
+    storage.setSharedFeedFilterSettings('user-3', 'reads', {
+      recencyEnabled: true,
+      timeFrame: { value: 24, unit: 'hours' },
+      maxItemsPerAuthor: 3,
+      mutedWords: 'spam, ads',
+      selectedRelayIdentities: ['relay-a', 'relay-b'],
+      selectedListKeys: ['user-3:trusted-authors']
+    })
+
+    expect(storage.getSharedFeedFilterSettings('user-3', 'reads')).toEqual({
+      recencyEnabled: true,
+      timeFrame: { value: 24, unit: 'hours' },
+      maxItemsPerAuthor: 3,
+      mutedWords: 'spam, ads',
+      selectedRelayIdentities: ['relay-a', 'relay-b'],
+      selectedListKeys: ['user-3:trusted-authors']
+    })
+
+    storage.init()
+
+    expect(storage.getSharedFeedFilterSettings('user-3', 'reads')).toEqual({
+      recencyEnabled: true,
+      timeFrame: { value: 24, unit: 'hours' },
+      maxItemsPerAuthor: 3,
+      mutedWords: 'spam, ads',
+      selectedRelayIdentities: ['relay-a', 'relay-b'],
+      selectedListKeys: ['user-3:trusted-authors']
+    })
+  })
+
+  it('persists and de-duplicates the per-account mute list cache', () => {
+    storage.setMuteListCache('user-4', {
+      public: ['pub-a', 'pub-a', 'pub-b'],
+      private: ['pub-c', 'pub-c']
+    })
+
+    expect(storage.getMuteListCache('user-4')).toEqual({
+      public: ['pub-a', 'pub-b'],
+      private: ['pub-c']
+    })
+
+    storage.init()
+
+    expect(storage.getMuteListCache('user-4')).toEqual({
+      public: ['pub-a', 'pub-b'],
+      private: ['pub-c']
+    })
+  })
 })

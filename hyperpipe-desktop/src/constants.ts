@@ -71,6 +71,8 @@ export const StorageKey = {
   NOTIFICATION_LIST_STYLE: 'notificationListStyle',
   MEDIA_AUTO_LOAD_POLICY: 'mediaAutoLoadPolicy',
   GROUPED_NOTES_SETTINGS: 'groupedNotesSettings',
+  SHARED_FEED_FILTER_SETTINGS: 'sharedFeedFilterSettings',
+  MUTE_LIST_CACHE: 'muteListCache',
   SHOWN_CREATE_WALLET_GUIDE_TOAST_PUBKEYS: 'shownCreateWalletGuideToastPubkeys',
   SIDEBAR_COLLAPSE: 'sidebarCollapse',
   PRIMARY_COLOR: 'primaryColor',

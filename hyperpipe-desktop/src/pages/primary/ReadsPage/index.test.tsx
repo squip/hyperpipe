@@ -5,6 +5,32 @@ import { vi } from 'vitest'
 
 let pubkeyMock: string | null = 'reader-pubkey'
 let followingsMock: string[] = ['followed-pubkey']
+let listsMock: Array<{
+  id: string
+  title: string
+  description?: string
+  pubkeys: string[]
+  event: { pubkey: string }
+}> = []
+
+const timeFrameOptionsMock = Array.from({ length: 24 }, (_, index) => ({
+  label: `${index + 1} hours`,
+  value: index + 1,
+  unit: 'hours' as const
+}))
+
+let sharedFilterSettingsMock = {
+  recencyEnabled: true,
+  timeFrame: timeFrameOptionsMock[23],
+  maxItemsPerAuthor: 0,
+  mutedWords: '',
+  selectedRelayIdentities: [] as string[],
+  selectedListKeys: [] as string[]
+}
+let hasSavedSettingsMock = false
+
+const setSharedFilterSettingsMock = vi.fn()
+const resetSharedFilterSettingsMock = vi.fn()
 
 const fetchRelayListMock = vi.fn(async () => ({
   read: ['wss://reader-relay.example/'],
@@ -13,8 +39,26 @@ const fetchRelayListMock = vi.fn(async () => ({
 }))
 
 const articleListMock = vi.fn(
-  ({ subRequests }: { subRequests: unknown[] }) => (
-    <div data-testid="article-list" data-requests={JSON.stringify(subRequests)} />
+  ({
+    subRequests,
+    sinceTimestamp,
+    mutedWords,
+    maxItemsPerAuthor
+  }: {
+    subRequests: unknown[]
+    sinceTimestamp?: number
+    mutedWords?: string
+    maxItemsPerAuthor?: number
+  }) => (
+    <div
+      data-testid="article-list"
+      data-props={JSON.stringify({
+        subRequests,
+        sinceTimestamp,
+        mutedWords,
+        maxItemsPerAuthor
+      })}
+    />
   )
 )
 
@@ -41,7 +85,12 @@ vi.mock('@/layouts/PrimaryPageLayout', () => ({
 vi.mock('@/components/ArticleList', () => ({
   default: React.forwardRef(
     (
-      props: { subRequests: unknown[] },
+      props: {
+        subRequests: unknown[]
+        sinceTimestamp?: number
+        mutedWords?: string
+        maxItemsPerAuthor?: number
+      },
       _ref: React.ForwardedRef<unknown>
     ) => articleListMock(props)
   )
@@ -81,6 +130,10 @@ vi.mock('@/components/RefreshButton', () => ({
   )
 }))
 
+vi.mock('@/components/SharedFeedFilterMenu', () => ({
+  default: () => <div data-testid="shared-feed-filter-menu" />
+}))
+
 vi.mock('@/providers/NostrProvider', () => ({
   useNostr: () => ({
     pubkey: pubkeyMock,
@@ -88,10 +141,26 @@ vi.mock('@/providers/NostrProvider', () => ({
   })
 }))
 
+vi.mock('@/providers/ListsProvider', () => ({
+  useLists: () => ({
+    lists: listsMock
+  })
+}))
+
 vi.mock('@/hooks', () => ({
   useFetchFollowings: () => ({
     followings: followingsMock,
     isFetching: false
+  })
+}))
+
+vi.mock('@/hooks/useSharedFeedFilterSettings', () => ({
+  default: () => ({
+    settings: sharedFilterSettingsMock,
+    setSettings: setSharedFilterSettingsMock,
+    resetSettings: resetSharedFilterSettingsMock,
+    timeFrameOptions: timeFrameOptionsMock,
+    hasSavedSettings: hasSavedSettingsMock
   })
 }))
 
@@ -117,30 +186,53 @@ vi.mock('@/lib/utils', async () => {
 
 import ReadsPage from '@/pages/primary/ReadsPage'
 
-function getRenderedSubRequests() {
-  const raw = screen.getByTestId('article-list').getAttribute('data-requests')
+function getRenderedArticleListProps() {
+  const raw = screen.getByTestId('article-list').getAttribute('data-props')
   return raw ? JSON.parse(raw) : null
 }
 
-describe('ReadsPage feed mode toggle', () => {
+describe('ReadsPage shared feed filters', () => {
   beforeEach(() => {
+    vi.spyOn(Date, 'now').mockReturnValue(new Date('2026-03-25T12:00:00Z').getTime())
+
     pubkeyMock = 'reader-pubkey'
     followingsMock = ['followed-pubkey']
+    listsMock = []
+    hasSavedSettingsMock = false
+    sharedFilterSettingsMock = {
+      recencyEnabled: true,
+      timeFrame: timeFrameOptionsMock[23],
+      maxItemsPerAuthor: 0,
+      mutedWords: '',
+      selectedRelayIdentities: [],
+      selectedListKeys: []
+    }
     fetchRelayListMock.mockClear()
     articleListMock.mockClear()
+    setSharedFilterSettingsMock.mockClear()
+    resetSharedFilterSettingsMock.mockClear()
   })
 
-  it('defaults to Discover and uses the public article feed', async () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('defaults to Discover, uses the public article feed, and applies a 24 hour recency filter', async () => {
     render(<ReadsPage />)
 
     await waitFor(() => {
-      expect(getRenderedSubRequests()).toEqual([
-        {
-          source: 'relays',
-          urls: BIG_RELAY_URLS,
-          filter: {}
-        }
-      ])
+      expect(getRenderedArticleListProps()).toEqual({
+        subRequests: [
+          {
+            source: 'relays',
+            urls: BIG_RELAY_URLS,
+            filter: {}
+          }
+        ],
+        sinceTimestamp: Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000),
+        mutedWords: '',
+        maxItemsPerAuthor: 0
+      })
     })
 
     expect(fetchRelayListMock).not.toHaveBeenCalled()
@@ -158,7 +250,44 @@ describe('ReadsPage feed mode toggle', () => {
     })
 
     await waitFor(() => {
-      expect(getRenderedSubRequests()).toEqual([
+      expect(getRenderedArticleListProps()?.subRequests).toEqual([
+        {
+          source: 'relays',
+          urls: ['wss://reader-relay.example/', ...BIG_RELAY_URLS].slice(0, 8),
+          filter: {
+            authors: ['followed-pubkey']
+          }
+        }
+      ])
+    })
+  })
+
+  it('intersects following authors with the selected personal list author set', async () => {
+    followingsMock = ['followed-pubkey', 'another-followed-pubkey']
+    listsMock = [
+      {
+        id: 'trusted-authors',
+        title: 'Trusted Authors',
+        pubkeys: ['followed-pubkey', 'outside-followings'],
+        event: { pubkey: 'reader-pubkey' }
+      }
+    ]
+    hasSavedSettingsMock = false
+    sharedFilterSettingsMock = {
+      recencyEnabled: true,
+      timeFrame: timeFrameOptionsMock[23],
+      maxItemsPerAuthor: 0,
+      mutedWords: '',
+      selectedRelayIdentities: [],
+      selectedListKeys: ['reader-pubkey:trusted-authors']
+    }
+
+    render(<ReadsPage />)
+
+    fireEvent.click(screen.getByText('Following'))
+
+    await waitFor(() => {
+      expect(getRenderedArticleListProps()?.subRequests).toEqual([
         {
           source: 'relays',
           urls: ['wss://reader-relay.example/', ...BIG_RELAY_URLS].slice(0, 8),

@@ -187,7 +187,7 @@ type TGroupsContext = {
   discoveryRelays: string[]
   setDiscoveryRelays: (relays: string[]) => void
   resetDiscoveryRelays: () => void
-  refreshDiscovery: () => Promise<void>
+  refreshDiscovery: (relayUrls?: string[]) => Promise<void>
   refreshInvites: () => Promise<void>
   dismissInvite: (inviteId: string) => void
   markInviteAccepted: (inviteId: string, groupId?: string) => void
@@ -1777,18 +1777,27 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     }
   }, [handledJoinRequests])
 
-  const refreshDiscovery = useCallback(async () => {
+  const refreshDiscovery = useCallback(async (relayUrls?: string[]) => {
     setIsLoadingDiscovery(true)
     setDiscoveryError(null)
     try {
+      if (Array.isArray(relayUrls) && relayUrls.length === 0) {
+        setDiscoveryGroups([])
+        return
+      }
+
+      const fetchRelayUrls = Array.isArray(relayUrls)
+        ? relayUrls
+        : discoveryRelays
+
       const [metadataEvents, relayEvents] = await Promise.all([
-        client.fetchEvents(discoveryRelays, {
+        client.fetchEvents(fetchRelayUrls, {
           kinds: [ExtendedKind.GROUP_METADATA],
           '#i': [HYPERPIPE_IDENTIFIER_TAG],
           since: 1764892800, // 2025-12-05T00:00:00Z - temporary cutoff to filter legacy noise
           limit: 200
         }),
-        client.fetchEvents(discoveryRelays, {
+        client.fetchEvents(fetchRelayUrls, {
           kinds: [KIND_HYPERPIPE_RELAY],
           '#i': [HYPERPIPE_IDENTIFIER_TAG],
           limit: 300

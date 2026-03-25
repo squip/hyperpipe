@@ -1,7 +1,8 @@
 import { createMuteListDraftEvent } from '@/lib/draft-event'
 import client from '@/services/client.service'
+import storage from '@/services/local-storage.service'
 import dayjs from 'dayjs'
-import { createContext, useCallback, useContext, useMemo, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { useNostr } from './NostrProvider'
@@ -39,22 +40,29 @@ export function MuteListProvider({ children }: { children: React.ReactNode }) {
   } = useNostr()
   const [changing, setChanging] = useState(false)
   const [lastPublished, setLastPublished] = useState(0)
+  const [optimisticMuteList, setOptimisticMuteList] = useState<TMutedList | null>(null)
+
+  const effectiveMuteList = optimisticMuteList || muteList
+
+  useEffect(() => {
+    setOptimisticMuteList(null)
+  }, [accountPubkey])
 
   const getMutePubkeys = () => {
-    return [...muteList.public, ...muteList.private]
+    return [...effectiveMuteList.public, ...effectiveMuteList.private]
   }
 
   const mutePubkeySet = useMemo(() => {
-    return new Set([...muteList.private, ...muteList.public])
-  }, [muteList])
+    return new Set([...effectiveMuteList.private, ...effectiveMuteList.public])
+  }, [effectiveMuteList])
 
   const getMuteType = useCallback(
     (pubkey: string): 'public' | 'private' | null => {
-      if (muteList.public.includes(pubkey)) return 'public'
-      if (muteList.private.includes(pubkey)) return 'private'
+      if (effectiveMuteList.public.includes(pubkey)) return 'public'
+      if (effectiveMuteList.private.includes(pubkey)) return 'private'
       return null
     },
-    [muteList]
+    [effectiveMuteList]
   )
 
   const publishNewMuteListEvent = async (list: TMutedList) => {
@@ -73,7 +81,7 @@ export function MuteListProvider({ children }: { children: React.ReactNode }) {
     const event = await publish(newMuteListDraftEvent)
     toast.success(t('Successfully updated mute list'))
     setLastPublished(dayjs().unix())
-    updateMuteListEvent(event)
+    await updateMuteListEvent(event)
 
     return event
   }
@@ -87,29 +95,53 @@ export function MuteListProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
+  const cloneMuteList = useCallback(
+    (value: TMutedList): TMutedList => ({
+      public: [...value.public],
+      private: [...value.private]
+    }),
+    []
+  )
+
+  const resolveSourceMuteList = useCallback(async () => {
+    const cached = cloneMuteList(effectiveMuteList)
+    if (cached.public.length > 0 || cached.private.length > 0 || !accountPubkey) {
+      return cached
+    }
+
+    const fetched = await client.fetchMuteList(accountPubkey, nip04Decrypt)
+    storage.setMuteListCache(accountPubkey, fetched)
+    return fetched
+  }, [accountPubkey, cloneMuteList, effectiveMuteList, nip04Decrypt])
+
   const mutePublicly = async (pubkey: string) => {
     if (!accountPubkey || changing) return
 
     setChanging(true)
     try {
-      const muteList = await client.fetchMuteList(accountPubkey, nip04Decrypt)
-      checkMuteList(muteList)
+      const nextMuteList = await resolveSourceMuteList()
+      checkMuteList(nextMuteList)
 
-      if (!muteList.public.includes(pubkey)) {
+      if (!nextMuteList.public.includes(pubkey)) {
         // add to public
-        muteList.public.push(pubkey)
+        nextMuteList.public.push(pubkey)
 
         {
           // and remove from private
-          const idx = muteList.private.indexOf(pubkey)
+          const idx = nextMuteList.private.indexOf(pubkey)
           if (idx !== -1) {
-            muteList.private.splice(idx, 1)
+            nextMuteList.private.splice(idx, 1)
           }
         }
 
-        publishNewMuteListEvent(muteList)
+        setOptimisticMuteList(nextMuteList)
+        storage.setMuteListCache(accountPubkey, nextMuteList)
+        await publishNewMuteListEvent(nextMuteList)
+        setOptimisticMuteList(null)
       }
     } catch (error) {
+      storage.setMuteListCache(accountPubkey, muteList)
+      setOptimisticMuteList(null)
       toast.error(t('Failed to mute user publicly') + ': ' + (error as Error).message)
     } finally {
       setChanging(false)
@@ -121,24 +153,29 @@ export function MuteListProvider({ children }: { children: React.ReactNode }) {
 
     setChanging(true)
     try {
-      const muteList = await client.fetchMuteList(accountPubkey, nip04Decrypt)
-      checkMuteList(muteList)
+      const nextMuteList = await resolveSourceMuteList()
+      checkMuteList(nextMuteList)
 
-      if (!muteList.private.includes(pubkey)) {
+      if (!nextMuteList.private.includes(pubkey)) {
         // add to private
-        muteList.private.push(pubkey)
+        nextMuteList.private.push(pubkey)
 
         {
           // and remove from public
-          const idx = muteList.public.indexOf(pubkey)
+          const idx = nextMuteList.public.indexOf(pubkey)
           if (idx !== -1) {
-            muteList.public.splice(idx, 1)
+            nextMuteList.public.splice(idx, 1)
           }
         }
 
-        publishNewMuteListEvent(muteList)
+        setOptimisticMuteList(nextMuteList)
+        storage.setMuteListCache(accountPubkey, nextMuteList)
+        await publishNewMuteListEvent(nextMuteList)
+        setOptimisticMuteList(null)
       }
     } catch (error) {
+      storage.setMuteListCache(accountPubkey, muteList)
+      setOptimisticMuteList(null)
       toast.error(t('Failed to mute user privately') + ': ' + (error as Error).message)
     } finally {
       setChanging(false)
@@ -150,28 +187,35 @@ export function MuteListProvider({ children }: { children: React.ReactNode }) {
 
     setChanging(true)
     try {
-      const muteList = await client.fetchMuteList(accountPubkey, nip04Decrypt)
-      checkMuteList(muteList)
+      const nextMuteList = await resolveSourceMuteList()
+      checkMuteList(nextMuteList)
 
       let modified = false
       {
-        const idx = muteList.private.indexOf(pubkey)
+        const idx = nextMuteList.private.indexOf(pubkey)
         if (idx !== -1) {
-          muteList.private.splice(idx, 1)
+          nextMuteList.private.splice(idx, 1)
           modified = true
         }
       }
       {
-        const idx = muteList.public.indexOf(pubkey)
+        const idx = nextMuteList.public.indexOf(pubkey)
         if (idx !== -1) {
-          muteList.public.splice(idx, 1)
+          nextMuteList.public.splice(idx, 1)
           modified = true
         }
       }
 
       if (modified) {
-        publishNewMuteListEvent(muteList)
+        setOptimisticMuteList(nextMuteList)
+        storage.setMuteListCache(accountPubkey, nextMuteList)
+        await publishNewMuteListEvent(nextMuteList)
+        setOptimisticMuteList(null)
       }
+    } catch (error) {
+      storage.setMuteListCache(accountPubkey, muteList)
+      setOptimisticMuteList(null)
+      toast.error(t('Failed to unmute user') + ': ' + (error as Error).message)
     } finally {
       setChanging(false)
     }

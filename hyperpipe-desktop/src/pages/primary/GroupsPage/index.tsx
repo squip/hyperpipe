@@ -1,5 +1,6 @@
 import { FormattedTimestamp } from '@/components/FormattedTimestamp'
 import GroupCreateDialog from '@/components/GroupCreateDialog'
+import SharedFeedFilterMenu from '@/components/SharedFeedFilterMenu'
 import TitlebarInfoButton from '@/components/TitlebarInfoButton'
 import Username from '@/components/Username'
 import { SimpleUserAvatar } from '@/components/UserAvatar'
@@ -9,8 +10,22 @@ import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
 import { toGroup } from '@/lib/link'
+import {
+  areStringArraysEqual,
+  createDefaultSharedFeedFilterSettings,
+  getSelectedAuthorPubkeys,
+  getSharedFeedFilterSinceTimestamp,
+  isRelaySelectionActive,
+  isSharedFeedFilterActive,
+  matchesMutedWordList,
+  type TFeedFilterListOption,
+  type TFeedFilterRelayOption
+} from '@/lib/shared-feed-filters'
+import { dedupeRelayTargetsByIdentity, getRelayIdentity } from '@/lib/relay-targets'
+import { simplifyUrl } from '@/lib/url'
 import { usePrimaryPage, useSecondaryPage } from '@/PageManager'
 import { useFetchProfile } from '@/hooks'
+import useSharedFeedFilterSettings from '@/hooks/useSharedFeedFilterSettings'
 import {
   DISCOVER_GROUPS_PRESENCE_TTL_MS,
   MY_GROUPS_PRESENCE_TTL_MS,
@@ -18,6 +33,8 @@ import {
 } from '@/hooks/useGroupPresence'
 import { compareGroupPresenceStates, createGroupPresenceState } from '@/lib/group-presence'
 import { useGroups } from '@/providers/GroupsProvider'
+import { useLists } from '@/providers/ListsProvider'
+import { useMuteList } from '@/providers/MuteListProvider'
 import { useNostr } from '@/providers/NostrProvider'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
 import type { TGroupInvite, TGroupMembershipState, TGroupPresenceState } from '@/types/groups'
@@ -272,6 +289,7 @@ const GroupsPage = forwardRef<
     isLoadingDiscovery,
     discoveryError,
     invitesError,
+    discoveryRelays,
     resolveRelayUrl,
     fetchGroupDetail,
     getGroupMemberPreview,
@@ -280,6 +298,15 @@ const GroupsPage = forwardRef<
   } = useGroups()
   const { startJoinFlow, sendToWorker } = useWorkerBridge()
   const { pubkey } = useNostr()
+  const { lists } = useLists()
+  const { mutePubkeySet } = useMuteList()
+  const {
+    settings: sharedFilterSettings,
+    setSettings: setSharedFilterSettings,
+    resetSettings: resetSharedFilterSettings,
+    timeFrameOptions,
+    hasSavedSettings
+  } = useSharedFeedFilterSettings('groups')
   const { current: currentPrimaryPage, display: primaryDisplay } = usePrimaryPage()
   const isGroupsPageActive = currentPrimaryPage === 'groups' && primaryDisplay
   const [tab, setTab] = useState<TTab>(initialTab || 'discover')
@@ -296,11 +323,109 @@ const GroupsPage = forwardRef<
   const { push } = useSecondaryPage()
 
   const inviteGroupIds = useMemo(() => new Set(invites.map((inv) => inv.groupId)), [invites])
+  const discoveryRelayOptions = useMemo<TFeedFilterRelayOption[]>(
+    () =>
+      dedupeRelayTargetsByIdentity(discoveryRelays).map((target) => ({
+        relayIdentity: target.relayIdentity,
+        relayUrl: target.relayUrl,
+        label: simplifyUrl(target.relayUrl)
+      })),
+    [discoveryRelays]
+  )
+  const sharedListOptions = useMemo<TFeedFilterListOption[]>(
+    () =>
+      lists.map((list) => ({
+        key: `${list.event.pubkey}:${list.id}`,
+        label: list.title,
+        authorPubkeys: list.pubkeys || [],
+        description: list.description || null
+      })),
+    [lists]
+  )
+  const defaultSharedFilterSettings = useMemo(
+    () =>
+      createDefaultSharedFeedFilterSettings(
+        'groups',
+        timeFrameOptions,
+        discoveryRelayOptions.map((option) => option.relayIdentity)
+      ),
+    [discoveryRelayOptions, timeFrameOptions]
+  )
+  const effectiveSelectedRelayIdentities = useMemo(
+    () =>
+      sharedFilterSettings.selectedRelayIdentities.length === 0 && !hasSavedSettings
+        ? discoveryRelayOptions.map((option) => option.relayIdentity)
+        : sharedFilterSettings.selectedRelayIdentities,
+    [discoveryRelayOptions, hasSavedSettings, sharedFilterSettings.selectedRelayIdentities]
+  )
+  const selectedAuthorPubkeySet = useMemo(
+    () => getSelectedAuthorPubkeys(sharedListOptions, sharedFilterSettings.selectedListKeys),
+    [sharedFilterSettings.selectedListKeys, sharedListOptions]
+  )
+  const sinceTimestamp = useMemo(
+    () => getSharedFeedFilterSinceTimestamp(sharedFilterSettings),
+    [sharedFilterSettings]
+  )
+  const relayFilterActive = useMemo(
+    () =>
+      isRelaySelectionActive(
+        effectiveSelectedRelayIdentities,
+        discoveryRelayOptions.map((option) => option.relayIdentity)
+      ),
+    [discoveryRelayOptions, effectiveSelectedRelayIdentities]
+  )
+  const selectedDiscoveryRelayUrls = useMemo(() => {
+    const selectedRelaySet = new Set(effectiveSelectedRelayIdentities)
+    return discoveryRelayOptions
+      .filter((option) => selectedRelaySet.has(option.relayIdentity))
+      .map((option) => option.relayUrl)
+  }, [discoveryRelayOptions, effectiveSelectedRelayIdentities])
+  const isSharedFilterMenuActive = useMemo(
+    () =>
+      isSharedFeedFilterActive(
+        {
+          ...sharedFilterSettings,
+          selectedRelayIdentities: effectiveSelectedRelayIdentities
+        },
+        defaultSharedFilterSettings
+      ),
+    [defaultSharedFilterSettings, effectiveSelectedRelayIdentities, sharedFilterSettings]
+  )
 
   useEffect(() => {
     if (!initialTab) return
     setTab(initialTab)
   }, [initialTab, tabRequestId])
+
+  useEffect(() => {
+    if (!discoveryRelayOptions.length) return
+
+    if (!hasSavedSettings && sharedFilterSettings.selectedRelayIdentities.length === 0) {
+      setSharedFilterSettings(defaultSharedFilterSettings)
+      return
+    }
+
+    const availableIdentitySet = new Set(
+      discoveryRelayOptions.map((option) => option.relayIdentity)
+    )
+    const filteredSelections = sharedFilterSettings.selectedRelayIdentities.filter((relayIdentity) =>
+      availableIdentitySet.has(relayIdentity)
+    )
+
+    if (!areStringArraysEqual(filteredSelections, sharedFilterSettings.selectedRelayIdentities)) {
+      setSharedFilterSettings({
+        ...sharedFilterSettings,
+        selectedRelayIdentities: filteredSelections
+      })
+    }
+  }, [
+    defaultSharedFilterSettings,
+    discoveryRelayOptions,
+    hasSavedSettings,
+    setSharedFilterSettings,
+    sharedFilterSettings,
+    sharedFilterSettings.selectedRelayIdentities
+  ])
 
   const resolveGroupMeta = useCallback(
     (groupId: string, relay?: string) => {
@@ -624,6 +749,34 @@ const GroupsPage = forwardRef<
     [groupDetailCache]
   )
 
+  const handleApplySharedFilters = useCallback(
+    (nextSettings: typeof sharedFilterSettings) => {
+      setSharedFilterSettings(nextSettings)
+      const nextSelectedRelaySet = new Set(nextSettings.selectedRelayIdentities)
+      const nextSelectedRelayUrls = discoveryRelayOptions
+        .filter((option) => nextSelectedRelaySet.has(option.relayIdentity))
+        .map((option) => option.relayUrl)
+      void refreshDiscovery(nextSelectedRelayUrls)
+    },
+    [discoveryRelayOptions, refreshDiscovery, setSharedFilterSettings]
+  )
+
+  const handleResetSharedFilters = useCallback(
+    (nextSettings: typeof sharedFilterSettings) => {
+      resetSharedFilterSettings(nextSettings)
+      void refreshDiscovery(discoveryRelayOptions.map((option) => option.relayUrl))
+    },
+    [discoveryRelayOptions, refreshDiscovery, resetSharedFilterSettings]
+  )
+
+  const handleRefreshDiscovery = useCallback(() => {
+    if (relayFilterActive) {
+      void refreshDiscovery(selectedDiscoveryRelayUrls)
+      return
+    }
+    void refreshDiscovery()
+  }, [refreshDiscovery, relayFilterActive, selectedDiscoveryRelayUrls])
+
   const myPresenceInputs = useMemo(
     () =>
       myRows.map((row) => ({
@@ -706,17 +859,103 @@ const GroupsPage = forwardRef<
 
   const filteredDiscoverRows = useMemo(() => {
     const query = normalizeSearch(search)
-    if (!query) return discoverRows
-    return discoverRows.filter((row) => {
+    const selectedRelaySet = new Set(effectiveSelectedRelayIdentities)
+
+    let nextRows = discoverRows.filter((row) => {
       const admin = resolveRowAdmin({
         groupId: row.groupId,
         relay: row.relay,
         fallbackAdminPubkey: row.fallbackAdminPubkey
       })
+      const createdAt = resolveRowCreatedAt({
+        groupId: row.groupId,
+        relay: row.relay,
+        fallbackCreatedAt: row.createdAt
+      })
+
+      if (
+        sharedFilterSettings.recencyEnabled
+        && sinceTimestamp
+        && createdAt
+        && createdAt < sinceTimestamp
+      ) {
+        return false
+      }
+
+      if (admin && mutePubkeySet.has(admin)) {
+        return false
+      }
+
+      if (
+        sharedFilterSettings.selectedListKeys.length > 0
+        && (!admin || !selectedAuthorPubkeySet.has(admin))
+      ) {
+        return false
+      }
+
+      if (relayFilterActive) {
+        const relayUrl = row.relay ? resolveRelayUrl(row.relay) || row.relay : undefined
+        const relayIdentity = relayUrl ? getRelayIdentity(relayUrl) : null
+        if (!relayIdentity || !selectedRelaySet.has(relayIdentity)) {
+          return false
+        }
+      }
+
+      if (
+        matchesMutedWordList(
+          [row.name, row.about, row.groupId],
+          sharedFilterSettings.mutedWords
+        )
+      ) {
+        return false
+      }
+
+      if (!query) return true
+
       const values = [row.name, row.about, row.groupId, admin]
       return values.some((value) => normalizeSearch(value).includes(query))
     })
-  }, [discoverRows, resolveRowAdmin, search])
+
+    if (sharedFilterSettings.maxItemsPerAuthor > 0) {
+      const countsByAdmin = new Map<string, number>()
+      nextRows.forEach((row) => {
+        const admin = resolveRowAdmin({
+          groupId: row.groupId,
+          relay: row.relay,
+          fallbackAdminPubkey: row.fallbackAdminPubkey
+        })
+        if (admin) {
+          countsByAdmin.set(admin, (countsByAdmin.get(admin) || 0) + 1)
+        }
+      })
+      nextRows = nextRows.filter((row) => {
+        const admin = resolveRowAdmin({
+          groupId: row.groupId,
+          relay: row.relay,
+          fallbackAdminPubkey: row.fallbackAdminPubkey
+        })
+        if (!admin) return true
+        return (countsByAdmin.get(admin) || 0) <= sharedFilterSettings.maxItemsPerAuthor
+      })
+    }
+
+    return nextRows
+  }, [
+    discoverRows,
+    effectiveSelectedRelayIdentities,
+    mutePubkeySet,
+    relayFilterActive,
+    resolveRelayUrl,
+    resolveRowAdmin,
+    resolveRowCreatedAt,
+    search,
+    selectedAuthorPubkeySet,
+    sharedFilterSettings.maxItemsPerAuthor,
+    sharedFilterSettings.mutedWords,
+    sharedFilterSettings.recencyEnabled,
+    sharedFilterSettings.selectedListKeys.length,
+    sinceTimestamp
+  ])
 
   const filteredMyRows = useMemo(() => {
     const query = normalizeSearch(search)
@@ -1445,7 +1684,32 @@ const GroupsPage = forwardRef<
             onChange={(event) => setSearch(event.target.value)}
             className="flex-1"
           />
-          <Button variant="ghost" size="icon" onClick={() => refreshDiscovery()}>
+          {tab === 'discover' ? (
+            <SharedFeedFilterMenu
+              settings={{
+                ...sharedFilterSettings,
+                selectedRelayIdentities: effectiveSelectedRelayIdentities
+              }}
+              defaultSettings={defaultSharedFilterSettings}
+              timeFrameOptions={timeFrameOptions}
+              relayOptions={discoveryRelayOptions}
+              listOptions={sharedListOptions}
+              isActive={isSharedFilterMenuActive}
+              onApply={handleApplySharedFilters}
+              onReset={handleResetSharedFilters}
+            />
+          ) : null}
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => {
+              if (tab === 'invites') {
+                void refreshInvites()
+                return
+              }
+              handleRefreshDiscovery()
+            }}
+          >
             <Loader2 className="w-4 h-4" />
           </Button>
           <Button onClick={() => setShowCreate(true)}>{t('Create')}</Button>

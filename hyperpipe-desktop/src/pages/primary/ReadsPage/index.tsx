@@ -1,15 +1,29 @@
-import { BIG_RELAY_URLS } from '@/constants'
-import TabsBar, { TTabDefinition } from '@/components/Tabs'
-import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
-import { isTouchDevice } from '@/lib/utils'
 import ArticleList, { TArticleListRef, TArticleSubRequest } from '@/components/ArticleList'
+import SharedFeedFilterMenu from '@/components/SharedFeedFilterMenu'
+import TabsBar, { TTabDefinition } from '@/components/Tabs'
 import { RefreshButton } from '@/components/RefreshButton'
+import { BIG_RELAY_URLS } from '@/constants'
+import { useFetchFollowings } from '@/hooks'
+import useSharedFeedFilterSettings from '@/hooks/useSharedFeedFilterSettings'
+import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
+import {
+  areStringArraysEqual,
+  createDefaultSharedFeedFilterSettings,
+  getSelectedAuthorPubkeys,
+  getSharedFeedFilterSinceTimestamp,
+  isSharedFeedFilterActive,
+  type TFeedFilterListOption,
+  type TFeedFilterRelayOption
+} from '@/lib/shared-feed-filters'
+import { dedupeRelayTargetsByIdentity } from '@/lib/relay-targets'
+import { simplifyUrl } from '@/lib/url'
+import { isTouchDevice } from '@/lib/utils'
+import { useLists } from '@/providers/ListsProvider'
+import { useNostr } from '@/providers/NostrProvider'
+import client from '@/services/client.service'
 import { TPageRef } from '@/types'
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useNostr } from '@/providers/NostrProvider'
-import { useFetchFollowings } from '@/hooks'
-import client from '@/services/client.service'
 
 type ReadsFeedMode = 'discover' | 'following'
 
@@ -18,29 +32,67 @@ const READS_TABS: TTabDefinition[] = [
   { value: 'following', label: 'Following' }
 ]
 
-function buildDiscoverSubRequests(): TArticleSubRequest[] {
-  return [
-    {
-      source: 'relays',
-      urls: BIG_RELAY_URLS,
-      filter: {}
-    }
-  ]
-}
-
 const ReadsPage = forwardRef((_, ref) => {
   const { t } = useTranslation()
   const layoutRef = useRef<TPageRef>(null)
   const articleListRef = useRef<TArticleListRef>(null)
   const { pubkey } = useNostr()
+  const { lists } = useLists()
   const { followings } = useFetchFollowings(pubkey)
+  const {
+    settings,
+    setSettings,
+    resetSettings,
+    timeFrameOptions,
+    hasSavedSettings
+  } = useSharedFeedFilterSettings('reads')
   const [feedMode, setFeedMode] = useState<ReadsFeedMode>('discover')
-  const [subRequests, setSubRequests] = useState<TArticleSubRequest[]>([])
+  const [baseRelayUrls, setBaseRelayUrls] = useState<string[]>(BIG_RELAY_URLS)
+  const [isResolvingRelayUrls, setIsResolvingRelayUrls] = useState(false)
   const supportTouch = useMemo(() => isTouchDevice(), [])
   const hasFollowings = followings.length > 0
   const canUseFollowing = Boolean(pubkey) && hasFollowings
 
   useImperativeHandle(ref, () => layoutRef.current)
+
+  const listOptions = useMemo<TFeedFilterListOption[]>(
+    () =>
+      lists.map((list) => ({
+        key: `${list.event.pubkey}:${list.id}`,
+        label: list.title,
+        authorPubkeys: list.pubkeys || [],
+        description: list.description || null
+      })),
+    [lists]
+  )
+
+  const relayOptions = useMemo<TFeedFilterRelayOption[]>(
+    () =>
+      dedupeRelayTargetsByIdentity(baseRelayUrls).map((target) => ({
+        relayIdentity: target.relayIdentity,
+        relayUrl: target.relayUrl,
+        label: simplifyUrl(target.relayUrl)
+      })),
+    [baseRelayUrls]
+  )
+
+  const defaultFilterSettings = useMemo(
+    () =>
+      createDefaultSharedFeedFilterSettings(
+        'reads',
+        timeFrameOptions,
+        relayOptions.map((option) => option.relayIdentity)
+      ),
+    [relayOptions, timeFrameOptions]
+  )
+
+  const effectiveSelectedRelayIdentities = useMemo(
+    () =>
+      settings.selectedRelayIdentities.length === 0 && !hasSavedSettings
+        ? relayOptions.map((option) => option.relayIdentity)
+        : settings.selectedRelayIdentities,
+    [hasSavedSettings, relayOptions, settings.selectedRelayIdentities]
+  )
 
   useEffect(() => {
     if (!canUseFollowing && feedMode === 'following') {
@@ -51,47 +103,125 @@ const ReadsPage = forwardRef((_, ref) => {
   useEffect(() => {
     let cancelled = false
 
-    const applySubRequests = (nextRequests: TArticleSubRequest[]) => {
-      if (!cancelled) {
-        setSubRequests(nextRequests)
-      }
-    }
-
-    const init = async () => {
-      applySubRequests([])
-
+    const resolveRelayUrls = async () => {
       if (feedMode !== 'following' || !pubkey || !canUseFollowing) {
-        applySubRequests(buildDiscoverSubRequests())
+        setBaseRelayUrls(BIG_RELAY_URLS)
+        setIsResolvingRelayUrls(false)
         return
       }
 
+      setIsResolvingRelayUrls(true)
+
       try {
         const relayList = await client.fetchRelayList(pubkey)
-        const relayUrls = Array.from(new Set(relayList.read.concat(BIG_RELAY_URLS))).slice(0, 8)
-
-        applySubRequests([
-          {
-            source: 'relays',
-            urls: relayUrls,
-            filter: {
-              authors: followings
-            }
-          }
-        ])
+        if (cancelled) return
+        setBaseRelayUrls(Array.from(new Set(relayList.read.concat(BIG_RELAY_URLS))).slice(0, 8))
       } catch (error) {
         console.error('Failed to initialize following Reads feed', error)
         if (!cancelled) {
           setFeedMode('discover')
+          setBaseRelayUrls(BIG_RELAY_URLS)
+        }
+      } finally {
+        if (!cancelled) {
+          setIsResolvingRelayUrls(false)
         }
       }
     }
 
-    void init()
+    void resolveRelayUrls()
 
     return () => {
       cancelled = true
     }
-  }, [canUseFollowing, feedMode, followings, pubkey])
+  }, [canUseFollowing, feedMode, pubkey])
+
+  useEffect(() => {
+    if (!relayOptions.length) return
+
+    if (!hasSavedSettings && settings.selectedRelayIdentities.length === 0) {
+      setSettings(defaultFilterSettings)
+      return
+    }
+
+    const availableIdentitySet = new Set(relayOptions.map((option) => option.relayIdentity))
+    const filteredSelections = settings.selectedRelayIdentities.filter((relayIdentity) =>
+      availableIdentitySet.has(relayIdentity)
+    )
+
+    if (!areStringArraysEqual(filteredSelections, settings.selectedRelayIdentities)) {
+      setSettings({
+        ...settings,
+        selectedRelayIdentities: filteredSelections
+      })
+    }
+  }, [
+    defaultFilterSettings,
+    hasSavedSettings,
+    relayOptions,
+    setSettings,
+    settings,
+    settings.selectedRelayIdentities
+  ])
+
+  const selectedRelayUrls = useMemo(() => {
+    const selectedRelaySet = new Set(effectiveSelectedRelayIdentities)
+    return relayOptions
+      .filter((option) => selectedRelaySet.has(option.relayIdentity))
+      .map((option) => option.relayUrl)
+  }, [effectiveSelectedRelayIdentities, relayOptions])
+
+  const selectedAuthorPubkeySet = useMemo(
+    () => getSelectedAuthorPubkeys(listOptions, settings.selectedListKeys),
+    [listOptions, settings.selectedListKeys]
+  )
+
+  const effectiveAuthors = useMemo(() => {
+    if (feedMode === 'following') {
+      if (settings.selectedListKeys.length === 0) {
+        return followings
+      }
+
+      return followings.filter((pubkey) => selectedAuthorPubkeySet.has(pubkey))
+    }
+
+    return Array.from(selectedAuthorPubkeySet)
+  }, [feedMode, followings, selectedAuthorPubkeySet, settings.selectedListKeys.length])
+
+  const subRequests = useMemo<TArticleSubRequest[]>(() => {
+    if (isResolvingRelayUrls || selectedRelayUrls.length === 0) {
+      return []
+    }
+
+    if (settings.selectedListKeys.length > 0 && effectiveAuthors.length === 0) {
+      return []
+    }
+
+    return [
+      {
+        source: 'relays',
+        urls: selectedRelayUrls,
+        filter: effectiveAuthors.length > 0 ? { authors: effectiveAuthors } : {}
+      }
+    ]
+  }, [effectiveAuthors, isResolvingRelayUrls, selectedRelayUrls, settings.selectedListKeys.length])
+
+  const sinceTimestamp = useMemo(
+    () => getSharedFeedFilterSinceTimestamp(settings),
+    [settings]
+  )
+
+  const isFilterActive = useMemo(
+    () =>
+      isSharedFeedFilterActive(
+        {
+          ...settings,
+          selectedRelayIdentities: effectiveSelectedRelayIdentities
+        },
+        defaultFilterSettings
+      ),
+    [defaultFilterSettings, effectiveSelectedRelayIdentities, settings]
+  )
 
   const renderTabs = (
     <TabsBar
@@ -101,7 +231,24 @@ const ReadsPage = forwardRef((_, ref) => {
         if (tab === 'following' && !canUseFollowing) return
         setFeedMode(tab as ReadsFeedMode)
       }}
-      options={!supportTouch ? <RefreshButton onClick={() => articleListRef.current?.refresh()} /> : null}
+      options={(
+        <div className="flex items-center gap-1">
+          {!supportTouch && <RefreshButton onClick={() => articleListRef.current?.refresh()} />}
+          <SharedFeedFilterMenu
+            settings={{
+              ...settings,
+              selectedRelayIdentities: effectiveSelectedRelayIdentities
+            }}
+            defaultSettings={defaultFilterSettings}
+            timeFrameOptions={timeFrameOptions}
+            relayOptions={relayOptions}
+            listOptions={listOptions}
+            isActive={isFilterActive}
+            onApply={setSettings}
+            onReset={(nextSettings) => resetSettings(nextSettings)}
+          />
+        </div>
+      )}
       topOffset="0"
       reserveOptionsSpace={!supportTouch}
     />
@@ -109,23 +256,35 @@ const ReadsPage = forwardRef((_, ref) => {
 
   let content: React.ReactNode = null
 
-  if (subRequests.length === 0) {
+  if (isResolvingRelayUrls) {
     content = (
       <div className="text-center text-sm text-muted-foreground py-8">
         {t('Loading articles...')}
       </div>
     )
+  } else if (subRequests.length === 0) {
+    content = (
+      <div className="text-center text-sm text-muted-foreground py-8">
+        {t('No articles found')}
+      </div>
+    )
   } else {
-    content = <ArticleList ref={articleListRef} subRequests={subRequests} />
+    content = (
+      <ArticleList
+        ref={articleListRef}
+        subRequests={subRequests}
+        sinceTimestamp={sinceTimestamp}
+        mutedWords={settings.mutedWords}
+        maxItemsPerAuthor={settings.maxItemsPerAuthor}
+      />
+    )
   }
 
   return (
     <PrimaryPageLayout
       pageName="reads"
       ref={layoutRef}
-      titlebar={
-        <ReadsPageTitlebar />
-      }
+      titlebar={<ReadsPageTitlebar />}
       displayScrollToTopButton
     >
       <div>
