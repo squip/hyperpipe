@@ -1,7 +1,7 @@
 import { Duplex } from 'node:stream';
 import * as c from 'compact-encoding';
 
-const REPLICATION_PROTOCOL = 'hypertuna-hyperbee-replication';
+const REPLICATION_PROTOCOL = 'hyperpipe-hyperbee-replication';
 const REPLICATION_PROTOCOL_VERSION = 1;
 
 class ProtomuxChannelStream extends Duplex {

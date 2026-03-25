@@ -493,7 +493,7 @@ class HyperswarmConnection {
 class RelayProtocolWithGateway extends RelayProtocol {
   _setupChannel() {
     this.channel = this.mux.createChannel({
-      protocol: 'hypertuna-relay-v2',
+      protocol: 'hyperpipe-relay-v2',
       id: null,
       handshake: c.json,
       onopen: this._onopen.bind(this),
@@ -606,10 +606,10 @@ class EnhancedHyperswarmPool {
       this.logger?.info?.('Registered inbound hyperswarm connection', { peer: publicKey });
     });
 
-    const topic = crypto.hash(Buffer.from('hypertuna-relay-network'));
+    const topic = crypto.hash(Buffer.from('hyperpipe-relay-network'));
     this.topicDiscovery = this.swarm.join(topic, { server: false, client: true });
     await this.topicDiscovery.flushed();
-    this.logger?.info?.('Hyperswarm topic joined', { topic: 'hypertuna-relay-network' });
+    this.logger?.info?.('Hyperswarm topic joined', { topic: 'hyperpipe-relay-network' });
     this._startHealthMonitor();
     this.initialized = true;
   }
@@ -617,10 +617,10 @@ class EnhancedHyperswarmPool {
   async ensureTopicJoined() {
     if (!this.initialized) await this.initialize();
     if (!this.topicDiscovery) {
-      const topic = crypto.hash(Buffer.from('hypertuna-relay-network'));
+      const topic = crypto.hash(Buffer.from('hyperpipe-relay-network'));
       this.topicDiscovery = this.swarm.join(topic, { server: false, client: true });
       await this.topicDiscovery.flushed();
-      this.logger?.info?.('Hyperswarm topic rejoined', { topic: 'hypertuna-relay-network' });
+      this.logger?.info?.('Hyperswarm topic rejoined', { topic: 'hyperpipe-relay-network' });
     }
   }
   

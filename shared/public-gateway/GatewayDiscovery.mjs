@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import hyperCrypto from 'hypercore-crypto';
 import * as c from 'compact-encoding';
 
-const DISCOVERY_TOPIC_SEED = 'hypertuna-public-gateway-discovery-v1';
+const DISCOVERY_TOPIC_SEED = 'hyperpipe-public-gateway-discovery-v1';
 const DISCOVERY_TOPIC = hyperCrypto.hash(Buffer.from(DISCOVERY_TOPIC_SEED));
 
 const announcementEncoding = {

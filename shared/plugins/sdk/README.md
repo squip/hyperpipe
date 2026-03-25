@@ -1,6 +1,6 @@
 # htplugin CLI
 
-Plugin SDK/CLI for creating and packaging Hypertuna plugins.
+Plugin SDK/CLI for creating and packaging Hyperpipe plugins.
 
 ## Commands
 

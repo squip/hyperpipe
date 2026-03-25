@@ -9,35 +9,35 @@ Usage:
 Sync the current local branch (or --branch) to a remote VPS checkout by:
 1) verifying local HEAD is pushed to origin
 2) resetting remote checkout to origin/<branch>
-3) optionally reinstalling hypertuna-worker + hypertuna-tui dependencies
+3) optionally reinstalling hyperpipe-worker + hyperpipe-tui dependencies
 4) printing final branch/head/status verification
 
 Options:
   --branch <name>        Branch to sync (default: current local branch)
   --host <ssh-target>    SSH target (default: squip@24.199.122.164)
   --repo <remote-path>   Remote repo path
-                         (default: /home/squip/hypertuna-tui-direct-join-test/hypertuna-electron-dev-phase9)
+                         (default: /home/squip/hyperpipe-tui-direct-join-test/hyperpipe-electron-dev-phase9)
   --node-version <ver>   Node version for nvm use on VPS (default: 23.11.0)
   --skip-install         Skip npm install/ci on VPS
   --preserve-path <path> Preserve a remote repo path across sync (repeatable)
                          Example:
                            --preserve-path deploy/docker-compose.yml \
-                           --preserve-path public-gateway/src/utils/stdout-log-rotator.mjs
+                           --preserve-path hyperpipe-gateway/src/utils/stdout-log-rotator.mjs
   --allow-unpushed       Allow syncing even if local HEAD != origin/<branch>
   -h, --help             Show this help
 
 Examples:
   ./sync_vps_branch.sh
   ./sync_vps_branch.sh --branch direct-join-integration-phase9
-  ./sync_vps_branch.sh --branch public-gateway-router-phase8 \
+  ./sync_vps_branch.sh --branch hyperpipe-gateway-router-phase8 \
     --preserve-path deploy/docker-compose.yml \
-    --preserve-path public-gateway/src/utils/stdout-log-rotator.mjs
-  ./sync_vps_branch.sh --repo /home/squip/hypertuna-tui-direct-join-test/hypertuna-electron-dev
+    --preserve-path hyperpipe-gateway/src/utils/stdout-log-rotator.mjs
+  ./sync_vps_branch.sh --repo /home/squip/hyperpipe-tui-direct-join-test/hyperpipe-electron-dev
 USAGE
 }
 
 HOST="squip@24.199.122.164"
-REMOTE_REPO="/home/squip/hypertuna-tui-direct-join-test/hypertuna-electron-dev-phase9"
+REMOTE_REPO="/home/squip/hyperpipe-tui-direct-join-test/hyperpipe-electron-dev-phase9"
 NODE_VERSION="23.11.0"
 SKIP_INSTALL="0"
 ALLOW_UNPUSHED="0"
@@ -200,8 +200,8 @@ if [[ "${SKIP_INSTALL}" != "1" ]]; then
     echo "Warning: nvm not found at ${HOME}/.nvm/nvm.sh; using system node." >&2
   fi
 
-  if [[ -d hypertuna-worker ]]; then
-    cd hypertuna-worker
+  if [[ -d hyperpipe-worker ]]; then
+    cd hyperpipe-worker
     if [[ -f package-lock.json ]]; then
       npm ci --no-audit --no-fund
     else
@@ -210,8 +210,8 @@ if [[ "${SKIP_INSTALL}" != "1" ]]; then
     cd ..
   fi
 
-  if [[ -d hypertuna-tui ]]; then
-    cd hypertuna-tui
+  if [[ -d hyperpipe-tui ]]; then
+    cd hyperpipe-tui
     if [[ -f package-lock.json ]]; then
       npm ci --no-audit --no-fund
     else

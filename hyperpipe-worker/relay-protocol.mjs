@@ -1,21 +1,43 @@
+// ./hyperpipe-worker/relay-protocol.mjs - Relay protocol for full HTTP-like communication
 import Protomux from 'protomux';
-import * as c from 'compact-encoding';
+import c from 'compact-encoding';
 import { EventEmitter } from 'node:events';
+import b4a from 'b4a';
+import process from 'node:process';
 
-const REQUEST_TIMEOUT = 30000; // 30 seconds
+function resolveRequestTimeoutMs() {
+  const raw = process.env.RELAY_PROTOCOL_REQUEST_TIMEOUT_MS;
+  if (typeof raw !== 'string' || !raw.trim()) return 30000;
+  const normalized = raw.trim().toLowerCase();
+  if (
+    normalized === '0'
+    || normalized === 'false'
+    || normalized === 'off'
+    || normalized === 'disabled'
+    || normalized === 'none'
+  ) {
+    return null;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 30000;
+  return Math.floor(parsed);
+}
 
+const REQUEST_TIMEOUT = resolveRequestTimeoutMs();
+
+// Custom encoding for HTTP-like messages
 const httpMessageEncoding = {
   preencode(state, m) {
     c.string.preencode(state, m.method || 'GET');
     c.string.preencode(state, m.path || '/');
     c.string.preencode(state, JSON.stringify(m.headers || {}));
-    c.buffer.preencode(state, m.body || Buffer.alloc(0));
+    c.buffer.preencode(state, m.body || b4a.alloc(0));
   },
   encode(state, m) {
     c.string.encode(state, m.method || 'GET');
     c.string.encode(state, m.path || '/');
     c.string.encode(state, JSON.stringify(m.headers || {}));
-    c.buffer.encode(state, m.body || Buffer.alloc(0));
+    c.buffer.encode(state, m.body || b4a.alloc(0));
   },
   decode(state) {
     return {
@@ -31,12 +53,12 @@ const httpResponseEncoding = {
   preencode(state, m) {
     c.uint.preencode(state, m.statusCode || 200);
     c.string.preencode(state, JSON.stringify(m.headers || {}));
-    c.buffer.preencode(state, m.body || Buffer.alloc(0));
+    c.buffer.preencode(state, m.body || b4a.alloc(0));
   },
   encode(state, m) {
     c.uint.encode(state, m.statusCode || 200);
     c.string.encode(state, JSON.stringify(m.headers || {}));
-    c.buffer.encode(state, m.body || Buffer.alloc(0));
+    c.buffer.encode(state, m.body || b4a.alloc(0));
   },
   decode(state) {
     return {
@@ -53,7 +75,6 @@ export class RelayProtocol extends EventEmitter {
     
     this.isServer = isServer;
     this.handshakeData = handshakeData || {};
-    this.stream = stream;
     this.mux = Protomux.from(stream);
     this.channel = null;
     this.requests = new Map(); // For tracking pending requests
@@ -127,31 +148,37 @@ export class RelayProtocol extends EventEmitter {
   }
   
   _onopen(handshake) {
+    console.log('[RelayProtocol] Channel opened with handshake:', handshake);
     this.emit('open', handshake);
   }
   
   _onclose() {
+    console.log('[RelayProtocol] Channel closed');
     this.emit('close');
     
     // Reject all pending requests
     for (const [id, request] of this.requests) {
+      if (request.timeout) clearTimeout(request.timeout);
       request.reject(new Error('Channel closed'));
     }
     this.requests.clear();
   }
   
   _ondestroy() {
+    console.log('[RelayProtocol] Channel destroyed');
     this.emit('destroy');
   }
   
   _onrequest(message) {
+    console.log('[RelayProtocol] Received request:', message.method, message.path);
+    
     // Convert the message to HTTP-like format
     const request = {
       id: message.id,
       method: message.method,
       path: message.path,
       headers: message.headers || {},
-      body: message.body ? Buffer.from(message.body) : Buffer.alloc(0)
+      body: message.body ? b4a.from(message.body) : b4a.alloc(0)
     };
     
     // Check if we have a handler for this path pattern
@@ -212,14 +239,15 @@ export class RelayProtocol extends EventEmitter {
         id: request.id,
         statusCode: response.statusCode || 200,
         headers: response.headers || {},
-        body: response.body || Buffer.alloc(0)
+        body: response.body || b4a.alloc(0)
       });
     } catch (err) {
+      console.error('[RelayProtocol] Handler error:', err);
       this.sendResponse({
         id: request.id,
         statusCode: 500,
         headers: { 'content-type': 'application/json' },
-        body: Buffer.from(JSON.stringify({ error: err.message }))
+        body: b4a.from(JSON.stringify({ error: err.message }))
       });
     }
   }
@@ -230,10 +258,11 @@ export class RelayProtocol extends EventEmitter {
       clearTimeout(request.timeout);
       this.requests.delete(message.id);
       
+      // Convert body back to Buffer if needed
       const response = {
         statusCode: message.statusCode,
         headers: message.headers || {},
-        body: message.body ? Buffer.from(message.body) : Buffer.alloc(0)
+        body: message.body ? b4a.from(message.body) : b4a.alloc(0)
       };
       
       request.resolve(response);
@@ -241,10 +270,13 @@ export class RelayProtocol extends EventEmitter {
   }
   
   _onwsframe(message) {
+    console.log('[RelayProtocol] Received WebSocket frame');
     this.emit('wsframe', message);
   }
   
   _onhealthcheck(message) {
+    console.log('[RelayProtocol] Received health check');
+    // Immediately respond to health checks
     this.sendHealthResponse({
       id: message.id,
       status: 'healthy',
@@ -266,6 +298,7 @@ export class RelayProtocol extends EventEmitter {
   }
 
   _ontelemetry(message) {
+    console.log('[RelayProtocol] Received telemetry payload');
     this.emit('telemetry', message);
   }
   
@@ -277,6 +310,12 @@ export class RelayProtocol extends EventEmitter {
   // Send an HTTP-like request
   async sendRequest(request) {
     const id = this.requestId++;
+    const hasOverrideTimeout =
+      request && Object.prototype.hasOwnProperty.call(request, 'timeoutMs');
+    const overrideTimeoutRaw = hasOverrideTimeout ? Number(request.timeoutMs) : null;
+    const effectiveTimeoutMs = hasOverrideTimeout
+      ? (Number.isFinite(overrideTimeoutRaw) && overrideTimeoutRaw > 0 ? Math.floor(overrideTimeoutRaw) : null)
+      : REQUEST_TIMEOUT;
     const message = {
       id,
       method: request.method || 'GET',
@@ -286,17 +325,20 @@ export class RelayProtocol extends EventEmitter {
     };
     
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.requests.delete(id);
-        reject(new Error('Request timeout'));
-      }, REQUEST_TIMEOUT);
+      const timeout = Number.isFinite(effectiveTimeoutMs) && effectiveTimeoutMs > 0
+        ? setTimeout(() => {
+          this.requests.delete(id);
+          reject(new Error('Request timeout'));
+        }, effectiveTimeoutMs)
+        : null;
+      if (timeout?.unref) timeout.unref();
       
       this.requests.set(id, { resolve, reject, timeout });
       
       try {
         this.channel.messages[0].send(message);
       } catch (err) {
-        clearTimeout(timeout);
+        if (timeout) clearTimeout(timeout);
         this.requests.delete(id);
         reject(err);
       }
@@ -339,7 +381,7 @@ export class RelayProtocol extends EventEmitter {
       const timeout = setTimeout(() => {
         this.requests.delete(id);
         reject(new Error('Health check timeout'));
-      }, 5000);
+      }, 5000); // 5 second timeout for health checks
       
       this.requests.set(id, { resolve, reject, timeout });
       
@@ -371,18 +413,9 @@ export class RelayProtocol extends EventEmitter {
     }
   }
   
-  // Register request handler
-  registerHandler(path, handler) {
-    this.handle(path, handler);
-  }
-  
-  // Destroy protocol
   destroy() {
     if (this.channel) {
       this.channel.close();
     }
-    this.requests.clear();
   }
 }
-
-export default RelayProtocol;

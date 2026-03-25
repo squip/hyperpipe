@@ -1,5 +1,5 @@
 const GATEWAY_ANNOUNCEMENT_KIND = 30078;
-const GATEWAY_ANNOUNCEMENT_TAG = 'hypertuna-public-gateway';
+const GATEWAY_ANNOUNCEMENT_TAG = 'hyperpipe-public-gateway';
 const DEFAULT_GATEWAY_DISCOVERY_RELAYS = Object.freeze([
   'wss://relay.damus.io/',
   'wss://relay.primal.net/',

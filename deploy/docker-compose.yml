@@ -9,7 +9,7 @@ services:
   public-gateway:
     build:
       context: ..
-      dockerfile: public-gateway/Dockerfile
+      dockerfile: hyperpipe-gateway/Dockerfile
     environment:
       GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL}
       GATEWAY_REGISTRATION_SECRET: ${GATEWAY_REGISTRATION_SECRET}
