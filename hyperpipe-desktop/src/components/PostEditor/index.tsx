@@ -1,16 +1,6 @@
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle
-} from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle
-} from '@/components/ui/sheet'
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useScreenSize } from '@/providers/ScreenSizeProvider'
 import postEditor from '@/services/post-editor.service'
@@ -41,7 +31,10 @@ export type PostEditorProps = {
   articleOptions?: {
     existingEvent?: Event
     extraTags?: string[][]
-    onPublish?: (draftEvent: any, options: { isDraft: boolean; relayUrls: string[] }) => Promise<void>
+    onPublish?: (
+      draftEvent: any,
+      options: { isDraft: boolean; relayUrls: string[] }
+    ) => Promise<void>
   }
   tabPreset?: 'default' | 'personal'
   groupContext?: {
@@ -79,7 +72,7 @@ export default function PostEditor({
   }, [parentEvent, tabPreset, t])
 
   const [tab, setTab] = useState<'post' | 'article'>(
-    parentEvent ? 'post' : tabsConfig[0]?.value ?? defaultTab
+    parentEvent ? 'post' : (tabsConfig[0]?.value ?? defaultTab)
   )
 
   useEffect(() => {
@@ -100,6 +93,7 @@ export default function PostEditor({
 
   // Layout instrumentation: log scroll parents and sticky positions on desktop.
   useEffect(() => {
+    if (!open) return
     if (isSmallScreen) return
     if (typeof window === 'undefined') return
 
@@ -129,13 +123,16 @@ export default function PostEditor({
       const toolbarRect = toolbar?.getBoundingClientRect()
       const vpStyle = viewport ? getComputedStyle(viewport) : null
       const rootStyle = root ? getComputedStyle(root) : null
-      const relaySelector = document.querySelector('[data-post-relay-selector]') as HTMLElement | null
+      const relaySelector = document.querySelector(
+        '[data-post-relay-selector]'
+      ) as HTMLElement | null
       const cancelButton = document.querySelector('[data-post-cancel-button]') as HTMLElement | null
-      const publishButton = document.querySelector('[data-post-publish-button]') as HTMLElement | null
+      const publishButton = document.querySelector(
+        '[data-post-publish-button]'
+      ) as HTMLElement | null
       const relayRect = relaySelector?.getBoundingClientRect()
       const cancelRect = cancelButton?.getBoundingClientRect()
       const publishRect = publishButton?.getBoundingClientRect()
-      // eslint-disable-next-line no-console
       console.log('[PostEditor] layout', {
         label,
         viewportOverflowY: vpStyle?.overflowY,
@@ -169,7 +166,7 @@ export default function PostEditor({
       viewport?.removeEventListener('scroll', handleScroll)
       document.removeEventListener('scroll', docScroll)
     }
-  }, [isSmallScreen, tab])
+  }, [isSmallScreen, open, tab])
 
   const renderTabs = (variant: 'sheet' | 'dialog') => {
     const TabsWrapper = variant === 'sheet' ? SheetHeader : DialogHeader
@@ -205,17 +202,13 @@ export default function PostEditor({
             {singleLabel ?? <Title parentEvent={parentEvent} tab={tab} />}
           </TitleWrapper>
         )}
-        {canToggleTabs
-          ? (
-            <TitleWrapper className="sr-only">
-              {tab === 'post' ? t('New Post') : t('New Article')}
-            </TitleWrapper>
-          )
-          : singleLabel && (
-            <TitleWrapper className="sr-only">
-              {singleLabel}
-            </TitleWrapper>
-          )}
+        {canToggleTabs ? (
+          <TitleWrapper className="sr-only">
+            {tab === 'post' ? t('New Post') : t('New Article')}
+          </TitleWrapper>
+        ) : (
+          singleLabel && <TitleWrapper className="sr-only">{singleLabel}</TitleWrapper>
+        )}
       </TabsWrapper>
     )
   }
@@ -235,26 +228,26 @@ export default function PostEditor({
           }}
         >
           {parentEvent || tab === 'post' ? (
-          <PostContent
-            defaultContent={defaultContent}
-            parentEvent={parentEvent}
-            close={() => setOpen(false)}
-            openFrom={openFrom}
-            groupContext={groupContext}
-            renderSections={({ header, body, footer }) => (
-              <PostEditorFrame
-                maxHeightClass="max-h-[calc(100vh-140px)]"
-                header={
+            <PostContent
+              defaultContent={defaultContent}
+              parentEvent={parentEvent}
+              close={() => setOpen(false)}
+              openFrom={openFrom}
+              groupContext={groupContext}
+              renderSections={({ header, body, footer }) => (
+                <PostEditorFrame
+                  maxHeightClass="max-h-[calc(100vh-140px)]"
+                  header={
                     <>
                       {renderTabs('sheet')}
                       {header ? <div>{header}</div> : null}
                     </>
                   }
                   body={body}
-                footer={footer}
-              />
-            )}
-          />
+                  footer={footer}
+                />
+              )}
+            />
           ) : (
             <ArticleContent
               close={() => setOpen(false)}
@@ -380,7 +373,11 @@ function PostEditorFrame({
 
   return (
     <div
-      className={cn('flex h-full w-full min-w-0 max-w-full flex-col overflow-x-hidden', maxHeightClass, className)}
+      className={cn(
+        'flex h-full w-full min-w-0 max-w-full flex-col overflow-x-hidden',
+        maxHeightClass,
+        className
+      )}
       style={style}
     >
       <div ref={headerRef} className="min-w-0 max-w-full px-4 pt-4 pb-2 space-y-3 min-h-[64px]">
@@ -393,7 +390,9 @@ function PostEditorFrame({
       >
         <div className="min-w-0 max-w-full overflow-x-hidden space-y-3 px-2 py-3">{body}</div>
       </ScrollArea>
-      {footer ? <div className="min-w-0 max-w-full overflow-x-hidden px-4 py-3">{footer}</div> : null}
+      {footer ? (
+        <div className="min-w-0 max-w-full overflow-x-hidden px-4 py-3">{footer}</div>
+      ) : null}
     </div>
   )
 }

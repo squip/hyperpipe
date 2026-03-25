@@ -18,7 +18,16 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
-import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle
+} from '@/components/ui/alert-dialog'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
 import { toCreateList, toEditList } from '@/lib/link'
 import localStorageService from '@/services/local-storage.service'
@@ -42,10 +51,30 @@ import {
   type RelayDisplayMeta
 } from '@/lib/relay-targets'
 import { simplifyUrl } from '@/lib/url'
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState
+} from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { ArrowLeft, Check, Edit, ListFilter, Loader2, PencilLine, Plus, Search, Star, Trash2, UserPlus } from 'lucide-react'
+import {
+  ArrowLeft,
+  Check,
+  Edit,
+  ListFilter,
+  Loader2,
+  PencilLine,
+  Plus,
+  Search,
+  Star,
+  Trash2,
+  UserPlus
+} from 'lucide-react'
 import { Sheet, SheetContent } from '@/components/ui/sheet'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import ListEditorForm from '@/components/ListEditorForm'
@@ -61,6 +90,7 @@ type TDiscoverRelayOption = {
   meta?: RelayDisplayMeta
 }
 const GROUP_RELAY_READY_TTL_MS = 30_000
+const LIST_NOTE_FEED_KINDS = [1, 6]
 
 const ListsPage = forwardRef((_, ref) => {
   const { t } = useTranslation()
@@ -74,7 +104,9 @@ const ListsPage = forwardRef((_, ref) => {
   const { lists, isLoading: isLoadingMyLists, deleteList, fetchLists } = useLists()
   const { followings = [], followMultiple, unfollowMultiple } = useFollowList()
   const { isSmallScreen } = useScreenSize()
-  const [selectedDiscoverRelayIdentities, setSelectedDiscoverRelayIdentities] = useState<string[]>([])
+  const [selectedDiscoverRelayIdentities, setSelectedDiscoverRelayIdentities] = useState<string[]>(
+    []
+  )
   const [relayFilterEdited, setRelayFilterEdited] = useState(false)
 
   const [searchQuery, setSearchQuery] = useState('')
@@ -97,9 +129,9 @@ const ListsPage = forwardRef((_, ref) => {
   const [listStatsVersion, setListStatsVersion] = useState(0) // used to trigger re-sorts when stats change
   const refreshRelaySubscriptionsRef = useRef(refreshRelaySubscriptions)
   const resolveRelayUrlRef = useRef(resolveRelayUrl)
-  const groupRelayReadyCacheRef = useRef<Map<string, { checkedAt: number; relayUrl: string | null }>>(
-    new Map()
-  )
+  const groupRelayReadyCacheRef = useRef<
+    Map<string, { checkedAt: number; relayUrl: string | null }>
+  >(new Map())
   const groupRelayReadyInFlightRef = useRef<Map<string, Promise<string | null>>>(new Map())
   const publicListsFetchInFlightRef = useRef<Promise<void> | null>(null)
 
@@ -160,10 +192,7 @@ const ListsPage = forwardRef((_, ref) => {
         .join('|'),
     [groupRelayTargets]
   )
-  const stableGroupRelayTargets = useMemo(
-    () => groupRelayTargets,
-    [groupRelayTargetsSignature]
-  )
+  const stableGroupRelayTargets = useMemo(() => groupRelayTargets, [groupRelayTargetsSignature])
 
   const groupRelayDisplayMeta = useMemo<Record<string, RelayDisplayMeta>>(
     () => buildGroupRelayDisplayMetaMap(stableGroupRelayTargets),
@@ -203,12 +232,10 @@ const ListsPage = forwardRef((_, ref) => {
       return
     }
 
-    setSelectedDiscoverRelayIdentities((previous) =>
-      {
-        const filtered = previous.filter((relayIdentity) => availableSet.has(relayIdentity))
-        return areStringArraysEqual(previous, filtered) ? previous : filtered
-      }
-    )
+    setSelectedDiscoverRelayIdentities((previous) => {
+      const filtered = previous.filter((relayIdentity) => availableSet.has(relayIdentity))
+      return areStringArraysEqual(previous, filtered) ? previous : filtered
+    })
   }, [discoverRelayOptions, relayFilterEdited])
 
   useEffect(() => {
@@ -604,7 +631,11 @@ const ListsPage = forwardRef((_, ref) => {
                       <span className="text-muted-foreground">•</span>
                       <div className="inline-flex items-center gap-1 min-w-0 whitespace-nowrap">
                         <span>{t('By')}</span>
-                        <UserAvatar userId={list.event.pubkey} size="xSmall" className="inline-block" />
+                        <UserAvatar
+                          userId={list.event.pubkey}
+                          size="xSmall"
+                          className="inline-block"
+                        />
                         <Username
                           userId={list.event.pubkey}
                           className="font-medium inline truncate max-w-[120px] min-w-0"
@@ -623,9 +654,7 @@ const ListsPage = forwardRef((_, ref) => {
                       e.stopPropagation()
                       handleFollowAllMembers(list.pubkeys || [], listKey)
                     }}
-                    title={
-                      alreadyFollowedAll ? t('Unfollow all members') : t('Follow all members')
-                    }
+                    title={alreadyFollowedAll ? t('Unfollow all members') : t('Follow all members')}
                     className="text-xs px-2 h-8 whitespace-nowrap"
                   >
                     {alreadyFollowedAll ? (
@@ -647,7 +676,9 @@ const ListsPage = forwardRef((_, ref) => {
                   }}
                   title={isFavorite ? t('Remove from favorites') : t('Add to favorites')}
                 >
-                  <Star className={`w-4 h-4 ${isFavorite ? 'fill-current text-yellow-500' : 'text-muted-foreground'}`} />
+                  <Star
+                    className={`w-4 h-4 ${isFavorite ? 'fill-current text-yellow-500' : 'text-muted-foreground'}`}
+                  />
                 </Button>
                 {isOwnList && (
                   <>
@@ -725,11 +756,7 @@ const ListsPage = forwardRef((_, ref) => {
       <div className="flex flex-col h-full">
         <div className="border-b px-4 py-3">
           <div className="flex items-center justify-between mb-3">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setSelectedList(null)}
-            >
+            <Button variant="ghost" size="sm" onClick={() => setSelectedList(null)}>
               <ArrowLeft className="w-4 h-4 mr-2" />
               {t('Back to Lists')}
             </Button>
@@ -742,16 +769,16 @@ const ListsPage = forwardRef((_, ref) => {
                   onClick={() => handleToggleFavorite(listKey)}
                   title={isFavorite ? t('Remove from favorites') : t('Add to favorites')}
                 >
-                  <Star className={`w-4 h-4 ${isFavorite ? 'fill-current text-yellow-500' : 'text-muted-foreground'}`} />
+                  <Star
+                    className={`w-4 h-4 ${isFavorite ? 'fill-current text-yellow-500' : 'text-muted-foreground'}`}
+                  />
                 </Button>
                 <Button
                   variant={followedLists.has(listKey) ? 'default' : 'outline'}
                   size="sm"
                   onClick={() => handleFollowAllMembers(pubkeys, listKey)}
                   title={
-                    followedLists.has(listKey)
-                      ? t('Unfollow all members')
-                      : t('Follow all members')
+                    followedLists.has(listKey) ? t('Unfollow all members') : t('Follow all members')
                   }
                 >
                   <UserPlus className="w-4 h-4 mr-2" />
@@ -830,7 +857,11 @@ const ListsPage = forwardRef((_, ref) => {
               )}
             </div>
           ) : (
-            <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as 'notes' | 'members')} className="w-full">
+            <Tabs
+              value={activeTab}
+              onValueChange={(value) => setActiveTab(value as 'notes' | 'members')}
+              className="w-full"
+            >
               <div className="border-b">
                 <TabsList className="w-full justify-start h-auto p-0 bg-transparent px-4">
                   <TabsTrigger
@@ -849,17 +880,8 @@ const ListsPage = forwardRef((_, ref) => {
               </div>
               <TabsContent value="notes" className="mt-0">
                 <NoteList
-                  subRequests={[
-                    {
-                      source: 'relays',
-                      urls: BIG_RELAY_URLS,
-                      filter: {
-                        authors: pubkeys,
-                        kinds: [1, 6]
-                      }
-                    }
-                  ]}
-                  showKinds={[1, 6]}
+                  subRequests={selectedListNoteSubRequests}
+                  showKinds={LIST_NOTE_FEED_KINDS}
                 />
               </TabsContent>
               <TabsContent value="members" className="mt-0">
@@ -949,6 +971,28 @@ const ListsPage = forwardRef((_, ref) => {
     searchResults
   ])
 
+  const selectedListNoteAuthors = selectedList?.pubkeys ?? []
+  const selectedListNoteAuthorsKey = useMemo(
+    () => selectedListNoteAuthors.join(','),
+    [selectedListNoteAuthors]
+  )
+  const selectedListNoteSubRequests = useMemo(
+    () =>
+      selectedListNoteAuthors.length
+        ? [
+            {
+              source: 'relays' as const,
+              urls: BIG_RELAY_URLS,
+              filter: {
+                authors: selectedListNoteAuthors,
+                kinds: LIST_NOTE_FEED_KINDS
+              }
+            }
+          ]
+        : [],
+    [selectedListNoteAuthorsKey]
+  )
+
   useEffect(() => {
     if (sortBy !== 'zaps' || visibleListObjectsForSort.length === 0) return
     let cancelled = false
@@ -973,9 +1017,7 @@ const ListsPage = forwardRef((_, ref) => {
     }
     return (
       <div className={isSmallScreen ? 'divide-y border-y' : 'grid gap-3'}>
-        {sortLists(items).map((list) =>
-          renderListCard(list, list?.event?.pubkey === pubkey)
-        )}
+        {sortLists(items).map((list) => renderListCard(list, list?.event?.pubkey === pubkey))}
       </div>
     )
   }
@@ -1042,7 +1084,10 @@ const ListsPage = forwardRef((_, ref) => {
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-72">
         <DropdownMenuLabel>{t('Sort')}</DropdownMenuLabel>
-        <DropdownMenuRadioGroup value={sortBy} onValueChange={(value) => setSortBy(value as TSortBy)}>
+        <DropdownMenuRadioGroup
+          value={sortBy}
+          onValueChange={(value) => setSortBy(value as TSortBy)}
+        >
           <DropdownMenuRadioItem value="recent">{t('Most recent')}</DropdownMenuRadioItem>
           <DropdownMenuRadioItem value="zaps">{t('Most zapped')}</DropdownMenuRadioItem>
         </DropdownMenuRadioGroup>
@@ -1055,7 +1100,9 @@ const ListsPage = forwardRef((_, ref) => {
                 key={option.relayIdentity}
                 checked={selectedDiscoverRelaySet.has(option.relayIdentity)}
                 onSelect={(e) => e.preventDefault()}
-                onCheckedChange={(checked) => toggleDiscoverRelay(option.relayIdentity, checked === true)}
+                onCheckedChange={(checked) =>
+                  toggleDiscoverRelay(option.relayIdentity, checked === true)
+                }
               >
                 <RelayFilterOption option={option} />
               </DropdownMenuCheckboxItem>
@@ -1169,7 +1216,9 @@ const ListsPage = forwardRef((_, ref) => {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t('Delete')}</AlertDialogTitle>
-            <AlertDialogDescription>{t('Are you sure you want to delete this list?')}</AlertDialogDescription>
+            <AlertDialogDescription>
+              {t('Are you sure you want to delete this list?')}
+            </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel onClick={() => setDeleteDialogOpen(false)}>
@@ -1222,9 +1271,7 @@ function ListsPageTitlebar({
 
   return (
     <div className="flex gap-1 items-center h-full justify-between px-3">
-      <div className="font-semibold text-lg flex-1 truncate">
-        {selectedListTitle || t('Lists')}
-      </div>
+      <div className="font-semibold text-lg flex-1 truncate">{selectedListTitle || t('Lists')}</div>
       {isSmallScreen ? (
         <div className="shrink-0 flex gap-1 items-center">
           <Button variant="ghost" size="titlebar-icon" onClick={onToggleSearch}>

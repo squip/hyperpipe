@@ -23,6 +23,8 @@ type ListPageProps = {
   listId: string
 }
 
+const LIST_NOTE_FEED_KINDS = [1, 6]
+
 const ListPage = forwardRef<HTMLDivElement, ListPageProps>(({ index, listId }, ref) => {
   const { t } = useTranslation()
   const { pop, push } = useSecondaryPage()
@@ -92,6 +94,24 @@ const ListPage = forwardRef<HTMLDivElement, ListPageProps>(({ index, listId }, r
 
   const displayList = list || externalList
   const isLoading = isLoadingMyLists || isLoadingExternal
+  const noteFeedAuthors = displayList?.pubkeys ?? []
+  const noteFeedAuthorsKey = useMemo(() => noteFeedAuthors.join(','), [noteFeedAuthors])
+  const noteFeedSubRequests = useMemo(
+    () =>
+      noteFeedAuthors.length
+        ? [
+            {
+              source: 'relays' as const,
+              urls: BIG_RELAY_URLS,
+              filter: {
+                authors: noteFeedAuthors,
+                kinds: LIST_NOTE_FEED_KINDS
+              }
+            }
+          ]
+        : [],
+    [noteFeedAuthorsKey]
+  )
 
   const unfollowedUsers = useMemo(() => {
     if (!displayList || !myPubkey) return []
@@ -220,19 +240,7 @@ const ListPage = forwardRef<HTMLDivElement, ListPageProps>(({ index, listId }, r
           </TabsList>
 
           <TabsContent value="notes" className="mt-0">
-            <NoteList
-              subRequests={[
-                {
-                  source: 'relays',
-                  urls: BIG_RELAY_URLS,
-                  filter: {
-                    authors: displayList.pubkeys,
-                    kinds: [1, 6]
-                  }
-                }
-              ]}
-              showKinds={[1, 6]}
-            />
+            <NoteList subRequests={noteFeedSubRequests} showKinds={LIST_NOTE_FEED_KINDS} />
           </TabsContent>
 
           <TabsContent value="people" className="mt-0">

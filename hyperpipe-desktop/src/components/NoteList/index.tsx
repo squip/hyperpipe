@@ -30,6 +30,26 @@ import PinnedNoteCard from '../PinnedNoteCard'
 const LIMIT = 200
 const SHOW_COUNT = 10
 
+function normalizeFeedRequestValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeFeedRequestValue(item))
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entryValue]) => [key, normalizeFeedRequestValue(entryValue)])
+    )
+  }
+
+  return value
+}
+
+function getFeedSubRequestsSignature(subRequests: TFeedSubRequest[]) {
+  return JSON.stringify(subRequests.map((request) => normalizeFeedRequestValue(request)))
+}
+
 const NoteList = forwardRef(
   (
     {
@@ -87,6 +107,13 @@ const NoteList = forwardRef(
     const resubscribeTimerRef = useRef<number | null>(null)
     const resubscribeAttemptRef = useRef(0)
     const softResubscribeRef = useRef(false)
+    // Callers often inline `subRequests`; keep the subscription stable
+    // unless the request payload actually changes.
+    const subRequestsSignature = useMemo(
+      () => getFeedSubRequestsSignature(subRequests),
+      [subRequests]
+    )
+    const stableSubRequests = useMemo(() => subRequests, [subRequestsSignature])
     const showKindsKey = useMemo(() => showKinds.join(','), [showKinds])
 
     const shouldHideEvent = useCallback(
@@ -195,7 +222,7 @@ const NoteList = forwardRef(
         console.info('[NoteList] mount', {
           label: debugLabel ?? null,
           activeTab,
-          subRequests: subRequests.length
+          subRequests: stableSubRequests.length
         })
         hasLoggedMount.current = true
       }
@@ -205,31 +232,16 @@ const NoteList = forwardRef(
           activeTab
         })
       }
-    }, [debugActiveTab, debugLabel, subRequests.length])
+    }, [debugActiveTab, debugLabel, stableSubRequests.length])
 
     useEffect(() => {
       const effectId = ++effectIdRef.current
       const activeTab = debugActiveTab ?? 'unknown'
-      const subRequestsSignature = JSON.stringify(
-        subRequests.map((req) => {
-          if (req.source === 'local') {
-            return { source: 'local', filterKeys: Object.keys(req.filter ?? {}) }
-          }
-          const hTag = Array.isArray(req.filter?.['#h']) ? req.filter['#h'][0] : undefined
-          return {
-            source: 'relays',
-            urls: req.urls,
-            filterKeys: Object.keys(req.filter ?? {}),
-            kindsCount: Array.isArray(req.filter?.kinds) ? req.filter.kinds.length : 0,
-            hTag: hTag ? String(hTag).slice(0, 32) : null
-          }
-        })
-      )
       const snapshot = {
         effectId,
         label: debugLabel ?? null,
         activeTab,
-        subRequestsCount: subRequests.length,
+        subRequestsCount: stableSubRequests.length,
         subRequestsSignature,
         showKindsKey,
         timelineLabel: timelineLabel ?? null,
@@ -256,7 +268,7 @@ const NoteList = forwardRef(
         resubscribeAttemptRef.current = 0
       }
       softResubscribeRef.current = false
-      if (!subRequests.length) return
+      if (!stableSubRequests.length) return
 
       if (!softResubscribe) {
         setLoading(true)
@@ -274,16 +286,12 @@ const NoteList = forwardRef(
       }
 
       const groupRelayUrls = new Set(
-        subRequests
-          .filter(
-            (
-              req
-            ): req is Extract<TFeedSubRequest, { source: 'relays' }> => {
-              if (req.source !== 'relays') return false
-              const hTags = (req.filter as { ['#h']?: string[] })?.['#h']
-              return Array.isArray(hTags) && hTags.length > 0
-            }
-          )
+        stableSubRequests
+          .filter((req): req is Extract<TFeedSubRequest, { source: 'relays' }> => {
+            if (req.source !== 'relays') return false
+            const hTags = (req.filter as { ['#h']?: string[] })?.['#h']
+            return Array.isArray(hTags) && hTags.length > 0
+          })
           .flatMap((req) => req.urls)
       )
       const canResubscribe = groupRelayUrls.size > 0
@@ -309,7 +317,7 @@ const NoteList = forwardRef(
       }
 
       const subc = client.subscribeTimeline(
-        subRequests,
+        stableSubRequests,
         {
           kinds: showKinds,
           limit: LIMIT,
@@ -415,11 +423,11 @@ const NoteList = forwardRef(
           effectId,
           label: debugLabel ?? null,
           activeTab,
-          subRequestsCount: subRequests.length
+          subRequestsCount: stableSubRequests.length
         })
         subc.close(`NoteList cleanup effectId=${effectId}`)
       }
-    }, [subRequests, refreshCount, showKindsKey, timelineLabel])
+    }, [stableSubRequests, subRequestsSignature, refreshCount, showKindsKey, timelineLabel])
 
     const loadMore = useCallback(async () => {
       setEvents((events) => {
@@ -438,7 +446,7 @@ const NoteList = forwardRef(
         setLoading(true)
 
         client
-          .loadMoreTimeline(subRequests, {
+          .loadMoreTimeline(stableSubRequests, {
             until: events.length ? events[events.length - 1].created_at - 1 : dayjs().unix(),
             limit: LIMIT,
             ...(sinceTimestamp && isFilteredView ? { since: sinceTimestamp } : {})
@@ -457,7 +465,7 @@ const NoteList = forwardRef(
 
         return events // bogus, just return the same thing
       })
-    }, [showCount, subRequests, sinceTimestamp, isFilteredView])
+    }, [showCount, stableSubRequests, sinceTimestamp, isFilteredView])
 
     useEffect(() => {
       if (!hasMore || loading || isFilteredView) return
