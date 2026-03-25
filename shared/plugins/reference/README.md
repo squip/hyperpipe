@@ -13,7 +13,7 @@ Included plugins:
 From repository root:
 
 ```bash
-node /Users/essorensen/hypertuna-electron/shared/plugins/reference/build-reference-plugins.mjs
+node /Users/essorensen/hyperpipe-electron/shared/plugins/reference/build-reference-plugins.mjs
 ```
 
 Archives will be written under:

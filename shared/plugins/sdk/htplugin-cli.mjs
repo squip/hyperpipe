@@ -561,7 +561,7 @@ async function handleInit({ pluginDir, options }) {
     name: pluginName,
     version: pluginVersion,
     engines: {
-      hypertuna: '^1.0.0',
+      hyperpipe: '^1.0.0',
       worker: '^1.0.0',
       renderer: '^1.0.0',
       mediaApi: '^1.0.0'

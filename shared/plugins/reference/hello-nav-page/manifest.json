@@ -1,9 +1,9 @@
 {
-  "id": "com.hypertuna.reference.hello-nav-page",
+  "id": "com.hyperpipe.reference.hello-nav-page",
   "name": "Hello Nav Page",
   "version": "1.0.0",
   "engines": {
-    "hypertuna": "^1.0.0",
+    "hyperpipe": "^1.0.0",
     "worker": "^1.0.0",
     "renderer": "^1.0.0",
     "mediaApi": "^1.0.0"
@@ -22,7 +22,7 @@
         "title": "Hello Plugin",
         "description": "First-party hello plugin page",
         "icon": "puzzle",
-        "routePath": "/plugins/com.hypertuna.reference.hello-nav-page/home",
+        "routePath": "/plugins/com.hyperpipe.reference.hello-nav-page/home",
         "order": 20
       }
     ],
@@ -31,7 +31,7 @@
         "id": "home",
         "title": "Hello Plugin Home",
         "description": "Basic route/nav contribution demo",
-        "path": "/plugins/com.hypertuna.reference.hello-nav-page/home",
+        "path": "/plugins/com.hyperpipe.reference.hello-nav-page/home",
         "timeoutMs": 12000
       }
     ],

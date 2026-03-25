@@ -26,6 +26,10 @@ export const ENV_SECTIONS = [
     keys: ['DEPLOY_PROFILE', 'DEPLOY_EXPOSURE_MODE', 'GATEWAY_HOST', 'LETSENCRYPT_EMAIL']
   },
   {
+    comment: 'Public website (optional)',
+    keys: ['SITE_ENABLED', 'SITE_HOST', 'SITE_WWW_HOST', 'HYPERPIPE_SITE_ROOT']
+  },
+  {
     comment: 'Gateway base configuration',
     keys: [
       'GATEWAY_PUBLIC_URL',
@@ -149,6 +153,10 @@ const PROFILE_PRESETS = Object.fromEntries(
 
 const BASE_DEFAULTS = {
   DEPLOY_EXPOSURE_MODE: 'https-acme',
+  SITE_ENABLED: 'false',
+  SITE_HOST: 'hyperpipe.io',
+  SITE_WWW_HOST: 'www.hyperpipe.io',
+  HYPERPIPE_SITE_ROOT: '/srv/hyperpipe-site/current',
   GATEWAY_DISCOVERY_ENABLED: 'true',
   GATEWAY_DISCOVERY_DISPLAY_NAME: '',
   GATEWAY_DISCOVERY_REGION: '',
@@ -512,6 +520,7 @@ export function validateConfig(config = {}) {
   if (normalizeString(normalized.DEPLOY_EXPOSURE_MODE) && !normalizeExposureMode(normalized.DEPLOY_EXPOSURE_MODE)) {
     errors.push('DEPLOY_EXPOSURE_MODE must be one of: https-acme, http');
   }
+  const siteEnabled = normalizeString(normalized.SITE_ENABLED).toLowerCase() === 'true';
 
   const exposureMode = deriveExposureMode(normalized);
 
@@ -528,6 +537,21 @@ export function validateConfig(config = {}) {
     }
   } else {
     errors.push('DEPLOY_EXPOSURE_MODE must be one of: https-acme, http');
+  }
+
+  if (siteEnabled) {
+    if (exposureMode !== 'https-acme') {
+      errors.push('SITE_ENABLED requires DEPLOY_EXPOSURE_MODE=https-acme');
+    }
+    if (!isAcmeHostname(normalized.SITE_HOST)) {
+      errors.push('SITE_ENABLED requires SITE_HOST to be a real hostname');
+    }
+    if (!isAcmeHostname(normalized.SITE_WWW_HOST)) {
+      errors.push('SITE_ENABLED requires SITE_WWW_HOST to be a real hostname');
+    }
+    if (!normalizeString(normalized.HYPERPIPE_SITE_ROOT).startsWith('/')) {
+      errors.push('SITE_ENABLED requires HYPERPIPE_SITE_ROOT to be an absolute path');
+    }
   }
 
   if (!isValidPublicUrl(normalized.GATEWAY_PUBLIC_URL)) {

@@ -8,11 +8,11 @@
 - Ensure workers continuously monitor the blind peer for updated relay/hyperdrive cores that matter to them and pull the latest state when required.
 
 ## 2. Current State Summary
-- **Public gateway (`public-gateway/src/PublicGatewayService.mjs`)**
+- **Public gateway (`hyperpipe-gateway/src/PublicGatewayService.mjs`)**
   - Manages Express/WS endpoints, Hyperswarm pool, registration tracking, relay dispatch & metrics.
   - Persists relay metadata via registration stores (memory/redis).
   - Hosts Hyperbee relay dataset through `HyperbeeRelayHost`.
-- **Worker (`hypertuna-worker`)**
+- **Worker (`hyperpipe-worker`)**
   - Initializes local Hyperdrive (`hyperdrive-manager.mjs`) and Nostr relays via `RelayManager`.
   - Registers with gateway through `GatewayService` (Hyperswarm & HTTP) and mirrors remote drives via `mirror-sync-manager.mjs`.
   - Stores settings in `shared/config/PublicGatewaySettings.mjs`.
@@ -21,12 +21,12 @@
 ## 3. Public Gateway Integration Tasks
 
 ### 3.1 Dependencies & Configuration
-1. **[Completed]** Added `blind-peer`, `blind-peer-encodings`, and `hypercore-id-encoding` to `public-gateway/package.json`, bringing the daemon and encoders into the runtime dependency graph.
-2. **[Completed]** Extended `public-gateway/src/config.mjs` with a fully-normalised `blindPeer` block (default 25 GB quota, GC cadence, dedupe batch size, trusted-peer path) plus matching environment overrides (`GATEWAY_BLINDPEER_*`). The loader now sanitises paths/numbers and exposes defaults to the service.
+1. **[Completed]** Added `blind-peer`, `blind-peer-encodings`, and `hypercore-id-encoding` to `hyperpipe-gateway/package.json`, bringing the daemon and encoders into the runtime dependency graph.
+2. **[Completed]** Extended `hyperpipe-gateway/src/config.mjs` with a fully-normalised `blindPeer` block (default 25 GB quota, GC cadence, dedupe batch size, trusted-peer path) plus matching environment overrides (`GATEWAY_BLINDPEER_*`). The loader now sanitises paths/numbers and exposes defaults to the service.
 3. **[Open]** Update the public gateway README / sample env files with the new configuration knobs. *Guideline:* document the new env vars alongside existing relay settings and note that `trustedPeersPersistPath` will soon store the gateway-maintained allow list.
 
 ### 3.2 Blind Peer Service Wrapper
-1. **[Completed]** Implemented `public-gateway/src/blind-peer/BlindPeerService.mjs` which spins up the real `blind-peer` daemon, tracks trusted keys, mirrors cores/autobases, and surfaces status/metrics (see integration with Prometheus gauges in `metrics.mjs`).
+1. **[Completed]** Implemented `hyperpipe-gateway/src/blind-peer/BlindPeerService.mjs` which spins up the real `blind-peer` daemon, tracks trusted keys, mirrors cores/autobases, and surfaces status/metrics (see integration with Prometheus gauges in `metrics.mjs`).
 2. **[Completed]** Service initialisation respects the configured storage directory (auto-creates `blind-peer-data/` if unset), so data persists across restarts; file-system permission hardening documented in §7.1.
 3. **[Open]** Session bridging with the gateway’s `EnhancedHyperswarmPool` is deferred. *Guideline:* once worker mirroring is stable, provide a stream adapter so the service can reuse gateway connections instead of its own embedded Hyperswarm instance.
 
@@ -53,7 +53,7 @@
 > **Status:** *In Progress.* Automated dedupe, stale-core eviction, metrics, hygiene summaries, and ownership reporting are live. Persisted metadata beyond in-memory/registration snapshots and additional admin automation remain in follow-up tasks.
 
 ### 3.5 API & Discovery Updates
-1. **[Completed]** Gateway websocket status events now include blind-peer metadata and the new `/api/blind-peer` endpoint exposes `getAnnouncementInfo()` plus metrics/trust state for inspection (`public-gateway/src/PublicGatewayService.mjs`).
+1. **[Completed]** Gateway websocket status events now include blind-peer metadata and the new `/api/blind-peer` endpoint exposes `getAnnouncementInfo()` plus metrics/trust state for inspection (`hyperpipe-gateway/src/PublicGatewayService.mjs`).
 2. **[Open]** Update CLI/docs to surface blind-peer config. *Guideline:* include sample output showing `blindPeerEnabled`, keys, and quota so operators can validate configuration after deployment.
 
 ## 4. Worker Integration Tasks
@@ -64,7 +64,7 @@
 3. **[Open]** Surface the new fields in the desktop UI/log feeds. *Guideline:* when rendering public-gateway settings, include blind-peer status and mirror keys so operators can confirm discovery data matches runtime.
 
 ### 4.2 Blind Peering Manager
-1. **[Completed]** Implemented `hypertuna-worker/blind-peering-manager.mjs`, instantiating `BlindPeering` (with Hyperswarm fallback) and exposing `start/stop`, mirror helpers, and trusted-peer tracking.
+1. **[Completed]** Implemented `hyperpipe-worker/blind-peering-manager.mjs`, instantiating `BlindPeering` (with Hyperswarm fallback) and exposing `start/stop`, mirror helpers, and trusted-peer tracking.
 2. **[Completed]** Worker bootstrap now starts the manager after Hyperdrive initialisation and reconfigures it whenever gateway status updates arrive.
 3. **[Completed]** Logging and status events show mirror scheduling (`[BlindPeering] ...`); metrics integration can follow once GC stats land.
 4. **[In Progress]** Multi-peer readiness: the manager accepts multiple keys but we still default to the gateway-hosted instance. Future work includes allowing manual additional mirrors and persisting local blind-peer credentials.
@@ -77,7 +77,7 @@
 ### 4.4 Mirroring Relay & Autobase Cores
 1. For each active `RelayManager` instance:
    - Gather core references: Autobase base core, writer cores (`base.local`, writers from `base.activeWriters`), views (`relay.view.core`, `relay.view.heads`, etc.).
-  - On relay initialization (inside `hypertuna-relay-manager-adapter.mjs` or after `RelayManager.initialize()`), call `BlindPeeringManager.ensureRelayMirror({ relayKey, publicIdentifier, coreRefs, wakeupKey })`.
+  - On relay initialization (inside `hyperpipe-relay-manager-adapter.mjs` or after `RelayManager.initialize()`), call `BlindPeeringManager.ensureRelayMirror({ relayKey, publicIdentifier, coreRefs, wakeupKey })`.
   - When the relay Autobase emits `update` events or rotates writers, reschedule mirrors immediately so the blind peer tracks new cores.
   - Use `announce: true` for high-availability datasets so blind peer advertises on DHT.
 2. Store mapping between relay identifier → mirrored core keys so returning workers can request replication without scanning.
@@ -111,7 +111,7 @@
 
 > **Status:** *Completed.* Worker shutdown and relay teardown now clear mirror metadata, unsubscribe Autobase hooks, and invoke `deleteCore` against blind peers for mirrors that are no longer needed.
 
-- **[Open]** Extend registration store records (`public-gateway/src/stores/*`) to persist full blind-peer associations (e.g., mirrored cores, storage usage). Current implementation stores trust metadata per peer, but richer GC/accounting fields still need to be added for admin inspection.
+- **[Open]** Extend registration store records (`hyperpipe-gateway/src/stores/*`) to persist full blind-peer associations (e.g., mirrored cores, storage usage). Current implementation stores trust metadata per peer, but richer GC/accounting fields still need to be added for admin inspection.
 - **[Completed]** Worker now persists `blind-peering-metadata.json` alongside mirror targets, keeping per-relay/per-drive summaries for offline recovery.
 - **[Future]** Consider migrating to a shared metadata hyperbee (mirrored via blind peer) for multi-gateway setups once phase 1 stabilises.
 
@@ -167,7 +167,7 @@
 
 ## 9. Testing Strategy
 - **Unit tests — Completed:** Added coverage for the worker blind-peering manager and config normalisation; additional GC-specific mocks still required.
-- **Integration tests — Completed:** Added dispatcher + blind-peer harness tests (`public-gateway/test/relay-dispatcher-events.test.mjs`) and worker-side mirror validation (`hypertuna-worker/test/blind-peering-manager.test.js`).
+- **Integration tests — Completed:** Added dispatcher + blind-peer harness tests (`hyperpipe-gateway/test/relay-dispatcher-events.test.mjs`) and worker-side mirror validation (`hyperpipe-worker/test/blind-peering-manager.test.js`).
 - **Regression suites — Completed:** CI now executes the new dispatcher event coverage alongside existing suites via `npm test` / `npm run test`.
 - **Manual testing — Completed:** See `docs/blind-peer-manual-qa.md` for the expanded manual checklist (dispatcher assignment, CLI GC/delete, fallback recovery).
 
@@ -182,8 +182,8 @@
 ## 12. Phase 1 Progress & Next Steps
 
 ### 12.1 Completed Deliverables
-- Gateway configuration layer, daemon wrapper, and handshake payloads now fully advertise blind-peer availability (`public-gateway/src/config.mjs`, `src/blind-peer/BlindPeerService.mjs`, `src/PublicGatewayService.mjs`).
-- Worker runtime consumes blind-peer metadata, spins up the `BlindPeering` client, and mirrors local Hyperdrive + relay autobases (`hypertuna-worker/index.js`, `blind-peering-manager.mjs`).
+- Gateway configuration layer, daemon wrapper, and handshake payloads now fully advertise blind-peer availability (`hyperpipe-gateway/src/config.mjs`, `src/blind-peer/BlindPeerService.mjs`, `src/PublicGatewayService.mjs`).
+- Worker runtime consumes blind-peer metadata, spins up the `BlindPeering` client, and mirrors local Hyperdrive + relay autobases (`hyperpipe-worker/index.js`, `blind-peering-manager.mjs`).
 - Gateway persists trusted peer state to disk, surfaces `/api/blind-peer` inspection data, and propagates trust metadata to registration stores; workers mirror the summary in their status snapshots.
 - Metrics scaffolding and unit tests validate core lifecycle wiring (Prometheus gauges, Brittle suites for manager behaviour).
 - Blind-peer hygiene loop now dedupes duplicate entries, prunes stale cores, enforces `maxBytes`, and reports Prometheus counters (`gateway_blind_peer_gc_runs_total`, `gateway_blind_peer_evictions_total{reason}`) with status surfaced via `/api/blind-peer`.
@@ -192,7 +192,7 @@
 - Relay mirror lifecycle now tracks writer/view core keys, detaches Autobase listeners on disconnect, deletes blind-peer mirrors as relays are removed, and rehydrates local cores before serving traffic on startup or reconnect.
 - Manual blind-peering overrides persist via `blindPeerManualKeys`, handshake fallbacks pull `/api/blind-peer`, and the CLI supports `--gc` / `--delete-core` admin actions.
 - Gateway persists blind-peer ownership metadata to disk for auditability, and the worker exposes a `get-blind-peering-status` debug command with mirror health details.
-- Dispatcher-driven assignments now update blind-peer metadata, emit automation events, and trigger worker-side rehydration when schedules change. Integration/regression harness coverage lives in `public-gateway/test/relay-dispatcher-events.test.mjs` and `hypertuna-worker/test/blind-peering-manager.test.js`.
+- Dispatcher-driven assignments now update blind-peer metadata, emit automation events, and trigger worker-side rehydration when schedules change. Integration/regression harness coverage lives in `hyperpipe-gateway/test/relay-dispatcher-events.test.mjs` and `hyperpipe-worker/test/blind-peering-manager.test.js`.
 
 ### 12.2 Remaining Scope
 - **Dispatcher telemetry & automated mirror tuning:** feed dispatcher health metrics back into blind-peer prioritisation and dispatcher policy adjustments.

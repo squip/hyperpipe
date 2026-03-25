@@ -44,7 +44,7 @@ test('htplugin CLI init/pack outputs installable .htplugin.tgz archive', async (
   const pluginDir = path.join(tmpRoot, 'sample-plugin')
   const storagePath = path.join(tmpRoot, 'desktop-storage')
   const artifactsDir = path.join(tmpRoot, 'artifacts')
-  const pluginId = 'com.hypertuna.cli-sample'
+  const pluginId = 'com.hyperpipe.cli-sample'
   const pluginVersion = '1.0.0'
   const archivePath = path.join(artifactsDir, `${pluginId}-${pluginVersion}.htplugin.tgz`)
 

@@ -7,7 +7,7 @@ import { MockController } from './support/mockController.js'
 
 const BASE_OPTIONS: RuntimeOptions = {
   cwd: process.cwd(),
-  storageDir: '/tmp/hypertuna-tui-e2e-dashboard-actions',
+  storageDir: '/tmp/hyperpipe-tui-e2e-dashboard-actions',
   noAnimations: true,
   logLevel: 'info'
 }

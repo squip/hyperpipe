@@ -14,9 +14,9 @@ This design splits trust into two layers:
 This document is designed as a delta from the current implementation:
 
 - gateway discovery kind `30078` in [shared/public-gateway/GatewayDiscoveryNostr.mjs](/Users/essorensen/hypertuna-electron/shared/public-gateway/GatewayDiscoveryNostr.mjs)
-- group metadata kind `39000` and gateway tags in [hypertuna-desktop/src/lib/hypertuna-group-events.ts](/Users/essorensen/hypertuna-electron/hypertuna-desktop/src/lib/hypertuna-group-events.ts)
-- closed invite payloads in [hypertuna-desktop/src/providers/GroupsProvider.tsx](/Users/essorensen/hypertuna-electron/hypertuna-desktop/src/providers/GroupsProvider.tsx)
-- open-join auth event kind `22242` in [hypertuna-worker/index.js](/Users/essorensen/hypertuna-electron/hypertuna-worker/index.js) and [public-gateway/src/PublicGatewayService.mjs](/Users/essorensen/hypertuna-electron/public-gateway/src/PublicGatewayService.mjs)
+- group metadata kind `39000` and gateway tags in [hyperpipe-desktop/src/lib/hyperpipe-group-events.ts](/Users/essorensen/hypertuna-electron/hyperpipe-desktop/src/lib/hyperpipe-group-events.ts)
+- closed invite payloads in [hyperpipe-desktop/src/providers/GroupsProvider.tsx](/Users/essorensen/hypertuna-electron/hyperpipe-desktop/src/providers/GroupsProvider.tsx)
+- open-join auth event kind `22242` in [hyperpipe-worker/index.js](/Users/essorensen/hypertuna-electron/hyperpipe-worker/index.js) and [hyperpipe-gateway/src/PublicGatewayService.mjs](/Users/essorensen/hypertuna-electron/hyperpipe-gateway/src/PublicGatewayService.mjs)
 
 ## Core Concepts
 
@@ -64,7 +64,7 @@ Keep gateway discovery on kind `30078`, but extend the event with policy metadat
   - `30078`
 - required tags
   - `["d", "<gatewayId>"]`
-  - `["t", "hypertuna-public-gateway"]`
+  - `["t", "hyperpipe-public-gateway"]`
   - `["gateway-id", "<gatewayId>"]`
   - `["http", "<httpsOrigin>"]`
 - existing optional tags
@@ -97,21 +97,21 @@ Keep gateway discovery on kind `30078`, but extend the event with policy metadat
 
 Continue using group metadata kind `39000` with the existing gateway tags:
 
-- `["hypertuna-gateway-id", "<gatewayId>"]`
-- `["hypertuna-gateway-origin", "<httpsOrigin>"]`
-- `["hypertuna-direct-join-only", "1"]` when applicable
+- `["hyperpipe-gateway-id", "<gatewayId>"]`
+- `["hyperpipe-gateway-origin", "<httpsOrigin>"]`
+- `["hyperpipe-direct-join-only", "1"]` when applicable
 
 Optional new tags:
 
-- `["hypertuna-gateway-auth-method", "relay-scoped-bearer-v1"]`
-- `["hypertuna-gateway-delegation", "none|closed-members|all-members"]`
-- `["hypertuna-gateway-sponsor", "<hexPubkey>"]`
+- `["hyperpipe-gateway-auth-method", "relay-scoped-bearer-v1"]`
+- `["hyperpipe-gateway-delegation", "none|closed-members|all-members"]`
+- `["hyperpipe-gateway-sponsor", "<hexPubkey>"]`
 
 These tags are advisory for UX. The gateway remains source of truth.
 
 ## Invite Payload Shape
 
-The current encrypted `9009` invite payload already carries relay and mirror metadata in [GroupsProvider.tsx](/Users/essorensen/hypertuna-electron/hypertuna-desktop/src/providers/GroupsProvider.tsx#L487).
+The current encrypted `9009` invite payload already carries relay and mirror metadata in [GroupsProvider.tsx](/Users/essorensen/hypertuna-electron/hyperpipe-desktop/src/providers/GroupsProvider.tsx#L487).
 
 Extend it with a `gatewayAccess` object for restricted gateways:
 
@@ -207,7 +207,7 @@ Continue using kind `22242` for signed auth proofs, but make the purpose explici
 
 ### Sponsor/admin control auth
 
-The sponsor/admin bearer flow can use the existing challenge-and-bearer model already sketched in [hypertuna-worker/gateway/PublicGatewayAuthClient.mjs](/Users/essorensen/hypertuna-electron/hypertuna-worker/gateway/PublicGatewayAuthClient.mjs).
+The sponsor/admin bearer flow can use the existing challenge-and-bearer model already sketched in [hyperpipe-worker/gateway/PublicGatewayAuthClient.mjs](/Users/essorensen/hypertuna-electron/hyperpipe-worker/gateway/PublicGatewayAuthClient.mjs).
 
 ## HTTP API Shape
 
@@ -593,7 +593,7 @@ Rules:
 
 ### Current implementation mismatches
 
-- current relay registration is authenticated by a gateway-wide shared secret in [PublicGatewayRegistrar.mjs](/Users/essorensen/hypertuna-electron/hypertuna-worker/gateway/PublicGatewayRegistrar.mjs)
+- current relay registration is authenticated by a gateway-wide shared secret in [PublicGatewayRegistrar.mjs](/Users/essorensen/hypertuna-electron/hyperpipe-worker/gateway/PublicGatewayRegistrar.mjs)
 - current gateway token state is per relay, not per subject
 - current discovery flow assumes open gateways are the only discoverable gateways
 - current blind-peer trust is gateway-global on successful registration

@@ -39,7 +39,7 @@ test('PluginMarketplaceService downloads local listing archive into cache', asyn
   try {
     const listing = {
       manifest: {
-        id: 'com.hypertuna.marketplace-download',
+        id: 'com.hyperpipe.marketplace-download',
         version: '1.2.3'
       },
       metadata: {

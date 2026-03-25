@@ -7,7 +7,7 @@ describe('local storage feed selection persistence', () => {
     storage.init()
   })
 
-  it('uses the hypertuna appearance defaults when no overrides are stored', () => {
+  it('uses the hyperpipe appearance defaults when no overrides are stored', () => {
     expect(storage.getThemeSetting()).toBe('pure-black')
     expect(storage.getPrimaryColor()).toBe('EMERALD')
     expect(storage.getEnableSingleColumnLayout()).toBe(false)

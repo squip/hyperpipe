@@ -115,7 +115,7 @@ const storageDir = parsed.values['storage-dir']
   : resolveDesktopParityStorageDir(cwd)
 const inviteePubkey = String(
   parsed.values['invitee-pubkey']
-  || process.env.HYPERTUNA_TUI_INVITEE_PUBKEY
+  || process.env.HYPERPIPE_TUI_INVITEE_PUBKEY
   || 'b'.repeat(64)
 ).trim().toLowerCase()
 

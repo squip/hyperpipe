@@ -476,6 +476,37 @@ test('runCheckCommand selects the http compose override for http exposure mode',
   );
 });
 
+test('runCheckCommand adds the site overlay when SITE_ENABLED is true', async (t) => {
+  const dir = await createTempDir(t);
+  const envFile = join(dir, 'gateway.env');
+  const io = createIo();
+
+  await runInitCommand({
+    deployEnv: envFile,
+    nonInteractive: true,
+    profile: 'open',
+    host: 'example.com',
+    email: 'admin@example.com',
+    displayName: 'Example Public Gateway',
+    discoveryRelays: 'wss://relay.damus.io/,wss://relay.primal.net/'
+  }, io);
+
+  await writeFile(envFile, `${(await readFile(envFile, 'utf8')).trim()}\nSITE_ENABLED=true\nSITE_HOST=hyperpipe.io\nSITE_WWW_HOST=www.hyperpipe.io\nHYPERPIPE_SITE_ROOT=/srv/hyperpipe-site/current\n`, 'utf8');
+
+  const execStub = createExecStub();
+  const result = await runCheckCommand({
+    deployEnv: envFile,
+    skipPortChecks: true
+  }, io, execStub);
+
+  assert.equal(result.ok, true);
+  assert.ok(
+    execStub.calls.some(
+      ({ command, args }) => command === 'docker' && args[0] === 'compose' && args.some((arg) => String(arg).endsWith('/deploy/docker-compose.site.yml'))
+    )
+  );
+});
+
 test('runSmokeCommand checks container health and the open-profile secret endpoint', async (t) => {
   const dir = await createTempDir(t);
   const envFile = join(dir, 'gateway.env');
@@ -549,6 +580,44 @@ test('runSmokeCommand uses http origin for http exposure mode', async (t) => {
 
   assert.equal(result.gatewayOrigin, 'http://203.0.113.10');
   assert.deepEqual(fetchCalls, ['http://203.0.113.10/health']);
+});
+
+test('runSmokeCommand checks the static site health endpoint when SITE_ENABLED is true', async (t) => {
+  const dir = await createTempDir(t);
+  const envFile = join(dir, 'gateway.env');
+  const io = createIo();
+
+  await runInitCommand({
+    deployEnv: envFile,
+    nonInteractive: true,
+    profile: 'open',
+    host: 'example.com',
+    email: 'admin@example.com',
+    displayName: 'Example Public Gateway',
+    discoveryRelays: 'wss://relay.damus.io/,wss://relay.primal.net/'
+  }, io);
+
+  await writeFile(envFile, `${(await readFile(envFile, 'utf8')).trim()}\nSITE_ENABLED=true\nSITE_HOST=hyperpipe.io\nSITE_WWW_HOST=www.hyperpipe.io\nHYPERPIPE_SITE_ROOT=/srv/hyperpipe-site/current\n`, 'utf8');
+
+  const execStub = createExecStub({ containerStates: { 'public-gateway': 'running', 'public-site': 'running' } });
+  const fetchCalls = [];
+  const fetchStub = async (url) => {
+    const text = String(url);
+    fetchCalls.push(text);
+    if (text === 'https://example.com/health') return jsonResponse({ status: 'ok' });
+    if (text === 'https://hyperpipe.io/healthz') return jsonResponse({ status: 'ok' });
+    if (text.includes('/.well-known/hyperpipe-gateway-secret')) return jsonResponse({ secret: 'ok' });
+    throw new Error(`Unexpected fetch URL: ${text}`);
+  };
+
+  const result = await runSmokeCommand({
+    deployEnv: envFile,
+    skipPortChecks: true,
+    timeoutMs: '2000'
+  }, io, execStub, fetchStub);
+
+  assert.equal(result.health.body.status, 'ok');
+  assert.ok(fetchCalls.includes('https://hyperpipe.io/healthz'));
 });
 
 test('runSmokeCommand can run deep auth validation from a local manifest', async (t) => {

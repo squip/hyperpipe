@@ -94,7 +94,7 @@ Expected host-approval results:
 Use the deterministic fixture generator:
 
 ```bash
-cd /Users/essorensen/hypertuna-electron/hypertuna-worker
+cd /Users/essorensen/hypertuna-electron/hyperpipe-worker
 npm run gateway:auth-fixture -- \
   --seed your-stable-seed \
   --relays wss://relay.damus.io/,wss://relay.primal.net/,wss://nos.lol/ \
@@ -117,7 +117,7 @@ The script will:
 After the fixture accounts have been published, validate a deployed gateway directly against the manifest:
 
 ```bash
-cd /Users/essorensen/hypertuna-electron/hypertuna-worker
+cd /Users/essorensen/hypertuna-electron/hyperpipe-worker
 npm run gateway:auth-validate -- \
   --manifest ../test-logs/gateway-auth-fixture/manifest.json \
   --gateway-origin https://hypertuna.com \

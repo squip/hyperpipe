@@ -215,7 +215,7 @@ async function main(): Promise<void> {
     ? path.resolve(cwd, parsed.values['base-dir'])
     : path.join(
       os.tmpdir(),
-      'hypertuna-direct-join-host-online-debug',
+      'hyperpipe-direct-join-host-online-debug',
       `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     )
 

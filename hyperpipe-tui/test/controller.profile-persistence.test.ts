@@ -53,7 +53,7 @@ function createProfileRelayStub(store: ProfileRelayStore): NostrStub {
 
 describe('TuiController profile persistence', () => {
   it('reloads dashboard profile metadata after restart + unlock', async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hypertuna-tui-profile-persist-'))
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hyperpipe-tui-profile-persist-'))
     const options: RuntimeOptions = {
       cwd: root,
       storageDir: root,
@@ -89,7 +89,7 @@ describe('TuiController profile persistence', () => {
   })
 
   it('hydrates profile name cache from account-scoped UI state when relays return no metadata', async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hypertuna-tui-profile-cache-hydrate-'))
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hyperpipe-tui-profile-cache-hydrate-'))
     const options: RuntimeOptions = {
       cwd: root,
       storageDir: root,
@@ -132,7 +132,7 @@ describe('TuiController profile persistence', () => {
   })
 
   it('publishGroupNote publishes kind 1 with h tag to exactly the selected relay', async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hypertuna-tui-publish-group-note-'))
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hyperpipe-tui-publish-group-note-'))
     const options: RuntimeOptions = {
       cwd: root,
       storageDir: root,

@@ -22,7 +22,7 @@ export const DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT =
 export const HOSTED_TRANSLATION_SERVICE_ID = 'fevela' as const
 export const HOSTED_TRANSLATION_SERVICE_LABEL = 'Hyperpipe Hosted'
 export const HOSTED_TRANSLATION_API_BASE_URL = 'https://api.fevela.social'
-export const APP_INDEXED_DB_NAME = 'hypertuna-desktop'
+export const APP_INDEXED_DB_NAME = 'hyperpipe-desktop'
 export const SUPPORT_PUBKEY = '8adab951da7d88367ed86731eeb7b4e2f8582efaac81a6459a5d580213b89a6e'
 
 export const DEFAULT_FAVORITE_RELAYS = [

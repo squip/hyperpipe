@@ -23,7 +23,7 @@ test('plugin manager installs first-party reference plugins from catalog', async
   await page.addInitScript(() => {
     const referenceCatalog: ReferencePluginDescriptor[] = [
       {
-        id: 'com.hypertuna.reference.hello-nav-page',
+        id: 'com.hyperpipe.reference.hello-nav-page',
         slug: 'hello-nav-page',
         name: 'Hello Nav Page',
         version: '1.0.0',
@@ -35,7 +35,7 @@ test('plugin manager installs first-party reference plugins from catalog', async
         mediaFeatureCount: 0
       },
       {
-        id: 'com.hypertuna.reference.p2p-audio-room',
+        id: 'com.hyperpipe.reference.p2p-audio-room',
         slug: 'p2p-audio-room',
         name: 'P2P Audio Room',
         version: '1.0.0',
@@ -47,7 +47,7 @@ test('plugin manager installs first-party reference plugins from catalog', async
         mediaFeatureCount: 1
       },
       {
-        id: 'com.hypertuna.reference.threejs-multiplayer-demo',
+        id: 'com.hyperpipe.reference.threejs-multiplayer-demo',
         slug: 'threejs-multiplayer-demo',
         name: 'Three.js Multiplayer Demo',
         version: '1.0.0',
@@ -184,8 +184,8 @@ test('plugin manager installs first-party reference plugins from catalog', async
           if (method === 'readConfig') return async () => ({ success: true, data: {} })
           if (method === 'readGatewaySettings') return async () => ({ success: true, data: {} })
           if (method === 'readPublicGatewaySettings') return async () => ({ success: true, data: {} })
-          if (method === 'getStoragePath') return async () => '/tmp/hypertuna-e2e'
-          if (method === 'getLogFilePath') return async () => '/tmp/hypertuna-e2e/desktop-console.log'
+          if (method === 'getStoragePath') return async () => '/tmp/hyperpipe-e2e'
+          if (method === 'getLogFilePath') return async () => '/tmp/hyperpipe-e2e/desktop-console.log'
           if (method === 'readFileBuffer') {
             return async () => ({ success: false, error: 'Not available in e2e mock', data: new ArrayBuffer(0) })
           }
@@ -197,7 +197,7 @@ test('plugin manager installs first-party reference plugins from catalog', async
     )
 
     ;(window as Window & { electronAPI?: unknown }).electronAPI = electronApi
-    window.localStorage.setItem('hypertuna_worker_autostart_enabled', 'false')
+    window.localStorage.setItem('hyperpipe_worker_autostart_enabled', 'false')
   })
 
   await page.goto('/settings/plugins')
@@ -221,8 +221,8 @@ test('plugin manager installs first-party reference plugins from catalog', async
   const installCalls = await page.evaluate(() => window.__referenceInstallCalls || [])
   expect(installCalls).toHaveLength(3)
   expect(installCalls.map((entry) => entry.pluginId)).toEqual([
-    'com.hypertuna.reference.hello-nav-page',
-    'com.hypertuna.reference.p2p-audio-room',
-    'com.hypertuna.reference.threejs-multiplayer-demo'
+    'com.hyperpipe.reference.hello-nav-page',
+    'com.hyperpipe.reference.p2p-audio-room',
+    'com.hyperpipe.reference.threejs-multiplayer-demo'
   ])
 })

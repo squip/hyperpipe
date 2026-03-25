@@ -72,7 +72,7 @@ export type InstalledPluginDescriptor = {
     mediaFeatures?: PluginMediaFeatureContribution[]
   }
   engines?: {
-    hypertuna?: string
+    hyperpipe?: string
     worker?: string
     renderer?: string
     mediaApi?: string
@@ -162,7 +162,7 @@ export type PluginArchivePreviewResponse = {
       mediaFeatures?: PluginMediaFeatureContribution[]
     }
     engines?: {
-      hypertuna?: string
+      hyperpipe?: string
       worker?: string
       renderer?: string
       mediaApi?: string

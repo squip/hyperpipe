@@ -42,10 +42,10 @@
 
 ### Phase 1 – Metadata & Mirror Enhancements ✅
 1. **Worker Mirror Metadata** – *Completed*
-   - `hypertuna-worker/blind-peering-manager.mjs` now attaches owner peer keys, identifiers, announce flags, and priority hints to every relay/hyperdrive mirror target.
+   - `hyperpipe-worker/blind-peering-manager.mjs` now attaches owner peer keys, identifiers, announce flags, and priority hints to every relay/hyperdrive mirror target.
    - Mirror metadata is persisted (and returned via the `blind-peering-status` IPC request) with the new fields so operators can audit pending mirrors even when workers are offline.
 2. **Gateway Core Metadata** – *Completed*
-   - `public-gateway/src/blind-peer/BlindPeerService.mjs` persists mirror metadata (including core types) and exposes readiness snapshots plus Prometheus metrics.
+   - `hyperpipe-gateway/src/blind-peer/BlindPeerService.mjs` persists mirror metadata (including core types) and exposes readiness snapshots plus Prometheus metrics.
    - `/api/blind-peer` and the new `/api/blind-peer/replicas` endpoint surface per-identifier readiness, last-active timestamps, and lag windows.
 
 #### Phase 1 Execution Tickets
@@ -59,7 +59,7 @@
 
 ### Phase 2 – BlindPeerReplicaManager ✅
 1. **Replica Manager Module** – *Completed*
-   - Added `public-gateway/src/blind-peer/BlindPeerReplicaManager.mjs`, which hooks into the blind-peer Corestore, tracks relay/hyperdrive replicas, keeps an LRU cache of open cores, and exposes snapshots for downstream consumers.
+   - Added `hyperpipe-gateway/src/blind-peer/BlindPeerReplicaManager.mjs`, which hooks into the blind-peer Corestore, tracks relay/hyperdrive replicas, keeps an LRU cache of open cores, and exposes snapshots for downstream consumers.
 2. **Lifecycle Integration** – *Completed*
    - `BlindPeerService` now emits `mirror-added`/`mirror-removed` events and exposes its underlying Corestore. The replica manager subscribes to these events, automatically seeds from existing metadata, and cleans up listeners on shutdown.
 3. **Metrics & Health** – *Completed*

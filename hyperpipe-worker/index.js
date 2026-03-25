@@ -7351,7 +7351,7 @@ async function recoverRelayDriveFile({
 
 async function writeFileToDownloads({ fileName, data }) {
   const home = os.homedir()
-  const downloadsDir = process.env.HYPERTUNA_DOWNLOADS_DIR || join(home, 'Downloads')
+  const downloadsDir = process.env.HYPERPIPE_DOWNLOADS_DIR || join(home, 'Downloads')
   await fs.mkdir(downloadsDir, { recursive: true })
   const normalizedName = normalizeDownloadFileName({ fileName, fileHash: '' })
   const savePath = await ensureUniqueDownloadPath(downloadsDir, normalizedName, {

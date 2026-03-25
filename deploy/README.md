@@ -59,6 +59,15 @@ npm run deploy:init -- --deploy-env production
 npm run deploy:apply -- --deploy-env production
 ```
 
+To serve the separate `hyperpipe.io` website from the same VPS, set these env values before `deploy:apply`:
+
+- `SITE_ENABLED=true`
+- `SITE_HOST=hyperpipe.io`
+- `SITE_WWW_HOST=www.hyperpipe.io`
+- `HYPERPIPE_SITE_ROOT=/srv/hyperpipe-site/current`
+
+The website source stays outside this repository. The deploy bundle only mounts a prebuilt static directory from `HYPERPIPE_SITE_ROOT`.
+
 ## Commands
 
 ### `init`
@@ -102,6 +111,12 @@ docker compose --env-file <selected-env> \
   up -d --build
 ```
 
+When `SITE_ENABLED=true`, the deploy CLI also adds:
+
+```bash
+-f deploy/docker-compose.site.yml
+```
+
 ### `smoke`
 
 Runs post-deploy health checks:
@@ -109,6 +124,7 @@ Runs post-deploy health checks:
 - `docker compose ps`
 - container runtime inspection
 - `GET /health` against the configured public URL
+- `GET /healthz` against `https://<SITE_HOST>` when `SITE_ENABLED=true`
 - secret endpoint validation when the selected profile advertises open access
 
 Optional deep auth validation is available if you provide an auth manifest:
@@ -197,3 +213,13 @@ Override these manually only if you already have stable values you need to prese
 ## Advanced Manual Editing
 
 `deploy/.env.example` is a full reference template for advanced users, but the preferred workflow is still `init -> check -> apply -> smoke`.
+
+## Static Website Overlay
+
+The optional static-site overlay is intended for a separate `hyperpipe.io` deployment project, not website source checked into this repository.
+
+- Build the website in its own repo or deployment project.
+- Sync the compiled output to `HYPERPIPE_SITE_ROOT` on the VPS.
+- Point DNS for `hyperpipe.io` and `www.hyperpipe.io` at the VPS.
+- Keep `hypertuna.com` mapped to the gateway service.
+- Let Traefik issue certificates for both domains from the same ACME storage.

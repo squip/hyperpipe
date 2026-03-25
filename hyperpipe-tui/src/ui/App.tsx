@@ -3368,7 +3368,7 @@ export function App({
         await controllerRef.current?.setLastCopied(text, result.method)
         return result
       },
-      unsafeCopySecrets: process.env.HYPERTUNA_TUI_ALLOW_UNSAFE_COPY === '1'
+      unsafeCopySecrets: process.env.HYPERPIPE_TUI_ALLOW_UNSAFE_COPY === '1'
     }
   }
 

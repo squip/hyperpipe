@@ -7,7 +7,7 @@ import { MockController } from './support/mockController.js'
 
 const BASE_OPTIONS: RuntimeOptions = {
   cwd: process.cwd(),
-  storageDir: '/tmp/hypertuna-tui-e2e-copy-shortcuts',
+  storageDir: '/tmp/hyperpipe-tui-e2e-copy-shortcuts',
   noAnimations: true,
   logLevel: 'info'
 }

@@ -12,7 +12,7 @@ const RelaySettingsPage = forwardRef(({ index }: { index?: number }, ref) => {
   const { t } = useTranslation()
   const [tabValue, setTabValue] = useState('favorite-relays')
   const hasDesktop = isElectron()
-  const isLegacyLocalPeerNodeRoute = hasDesktop && window.location.hash === '#hypertuna-desktop'
+  const isLegacyLocalPeerNodeRoute = hasDesktop && window.location.hash === '#hyperpipe-desktop'
 
   useEffect(() => {
     switch (window.location.hash) {

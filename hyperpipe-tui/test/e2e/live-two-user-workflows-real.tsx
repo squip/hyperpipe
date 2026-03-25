@@ -142,7 +142,7 @@ async function typeText(stdin: { write: (chunk: string) => void }, value: string
 async function runPaneStabilityCheck(runtime: RuntimeOptions): Promise<Check> {
   const paneStorageDir = path.join(
     os.tmpdir(),
-    'hypertuna-tui-pane-check',
+    'hyperpipe-tui-pane-check',
     `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
   )
   await fs.mkdir(paneStorageDir, { recursive: true })
@@ -234,7 +234,7 @@ const globalWatchdog = setTimeout(() => {
 }, 45 * 60 * 1000)
 
 async function ensureTwoUsers(): Promise<{ user1: string; user2: string }> {
-  const allowReuse = process.env.HYPERTUNA_LIVE_MATRIX_REUSE_USERS === '1'
+  const allowReuse = process.env.HYPERPIPE_LIVE_MATRIX_REUSE_USERS === '1'
   const existing = await controller.listAccountProfiles()
   const nsecProfiles = existing.filter((entry) => entry.signerType === 'nsec')
   if (allowReuse && nsecProfiles.length >= 2) {

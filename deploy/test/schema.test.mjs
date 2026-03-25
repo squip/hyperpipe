@@ -92,6 +92,27 @@ test('https-acme exposure rejects raw IP hosts', () => {
   );
 });
 
+test('site overlay requires https-acme and valid site hostnames', () => {
+  const config = buildRuntimeConfig({
+    profile: 'open',
+    answers: {
+      ...baseAnswers({
+        DEPLOY_EXPOSURE_MODE: 'http',
+        GATEWAY_HOST: '203.0.113.10'
+      })
+    },
+    existing: {}
+  });
+
+  config.SITE_ENABLED = 'true';
+  config.SITE_HOST = 'hyperpipe.io';
+  config.SITE_WWW_HOST = 'www.hyperpipe.io';
+  config.HYPERPIPE_SITE_ROOT = '/srv/hyperpipe-site/current';
+
+  const validation = validateConfig(config);
+  assert.match(validation.errors.join('\n'), /SITE_ENABLED requires DEPLOY_EXPOSURE_MODE=https-acme/);
+});
+
 test('allowlist profile requires allowlist pubkeys and validates when present', () => {
   const invalidConfig = buildRuntimeConfig({
     profile: 'allowlist',

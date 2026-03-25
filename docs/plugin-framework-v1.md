@@ -1,12 +1,12 @@
-# Hypertuna Plugin Framework v1
+# Hyperpipe Plugin Framework v1
 
 ## Status
 Implemented foundation:
-- Plugin supervisor in Electron main process (`hypertuna-desktop/electron/plugin-supervisor.cjs`)
-- Out-of-process plugin runner (`hypertuna-desktop/electron/plugin-runner.cjs`)
-- Renderer plugin route/nav registry (`hypertuna-desktop/src/providers/PluginRegistryProvider.tsx`)
-- Dynamic plugin route support (`hypertuna-desktop/src/routes.tsx`)
-- Worker media capability layer (`hypertuna-worker/media/*.mjs`)
+- Plugin supervisor in Electron main process (`hyperpipe-desktop/electron/plugin-supervisor.cjs`)
+- Out-of-process plugin runner (`hyperpipe-desktop/electron/plugin-runner.cjs`)
+- Renderer plugin route/nav registry (`hyperpipe-desktop/src/providers/PluginRegistryProvider.tsx`)
+- Dynamic plugin route support (`hyperpipe-desktop/src/routes.tsx`)
+- Worker media capability layer (`hyperpipe-worker/media/*.mjs`)
 - `.htplugin.tgz` archive installation/extraction path (`plugin-install-archive`)
 - Marketplace discovery ingestion path (`plugin-marketplace-discover`)
 
@@ -18,7 +18,7 @@ Required fields:
 - `id` (reverse DNS style, used for namespace)
 - `name`
 - `version`
-- `engines.hypertuna`, `engines.worker`, `engines.renderer`, `engines.mediaApi`
+- `engines.hyperpipe`, `engines.worker`, `engines.renderer`, `engines.mediaApi`
 - `permissions[]`
 - `contributions.navItems[]`
 - `contributions.routes[]`
@@ -62,7 +62,7 @@ Current installer status:
   - Verifies integrity SHA-256:
     - `integrity.bundleSha256` must match packaged runtime bundle artifact
     - `integrity.sourceSha256` must match `src/` hash (when present)
-  - Installs package content into `hypertuna-data/plugins/<id>/<version>/`
+  - Installs package content into `hyperpipe-data/plugins/<id>/<version>/`
   - Records archive provenance hash (`archiveSha256`) in plugin source metadata
  - Archive preview via IPC (`plugin-preview-archive`)
    - Returns manifest + contributions + permissions + integrity summary before install
@@ -135,7 +135,7 @@ Worker command:
 - `plugin-marketplace-download`
 
 Worker module:
-- `hypertuna-worker/plugins/PluginMarketplaceService.mjs`
+- `hyperpipe-worker/plugins/PluginMarketplaceService.mjs`
 
 Pipeline behavior:
 - Queries Nostr relays for plugin announcement events (default kind `37130`)

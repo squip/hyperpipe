@@ -29,7 +29,7 @@ node dist/cli.js
 Set `TUI_LOG_FILE` to an absolute path to enable structured JSONL logging without shell redirection.
 
 ```bash
-TUI_LOG_FILE=/var/log/hypertuna/tui.log npm run start
+TUI_LOG_FILE=/var/log/hyperpipe/tui.log npm run start
 ```
 
 Each line is a JSON object with fields like `ts`, `level`, `source`, `message`, and `pid`, including mirrored `worker.stdout` / `worker.stderr` entries.
@@ -37,7 +37,7 @@ Each line is a JSON object with fields like `ts`, `level`, `source`, `message`, 
 Set `TUI_STDIO_LOG_FILE` to an absolute path to capture raw terminal stdout/stderr output (the same stream you normally see on screen).
 
 ```bash
-TUI_STDIO_LOG_FILE=/var/log/hypertuna/tui-stdio.log npm run dev
+TUI_STDIO_LOG_FILE=/var/log/hyperpipe/tui-stdio.log npm run dev
 ```
 
 ## Navigation
@@ -108,7 +108,7 @@ Normal interactive startup now runs through an authentication/setup gate immedia
 - `copy <field>` copies explicit fields like `relay-id` (`group-id` is still accepted), `invite-id`, `relay`, `conversation-id`, `url`, `sha256`.
 - `copy command [workflow]` copies a workflow command template for the current selection.
 - Secret material (`nsec`, tokens, writer secrets) is blocked by default.
-- Set `HYPERTUNA_TUI_ALLOW_UNSAFE_COPY=1` only for explicit debug use.
+- Set `HYPERPIPE_TUI_ALLOW_UNSAFE_COPY=1` only for explicit debug use.
 
 ## Dashboard Actions
 
@@ -234,11 +234,11 @@ npm run demo:e2e:real -- --storage-dir <path> --profile <pubkey>
 
 Environment variable fallbacks:
 
-- `HYPERTUNA_TUI_NSEC`
-- `HYPERTUNA_TUI_NCRYPTSEC`
-- `HYPERTUNA_TUI_PASSWORD`
-- `HYPERTUNA_TUI_INVITEE_PUBKEY`
-- `HYPERTUNA_TUI_JOIN_ID`
+- `HYPERPIPE_TUI_NSEC`
+- `HYPERPIPE_TUI_NCRYPTSEC`
+- `HYPERPIPE_TUI_PASSWORD`
+- `HYPERPIPE_TUI_INVITEE_PUBKEY`
+- `HYPERPIPE_TUI_JOIN_ID`
 
 Matrix runner output options:
 

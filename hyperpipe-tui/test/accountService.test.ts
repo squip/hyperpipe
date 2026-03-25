@@ -8,7 +8,7 @@ import { AccountService } from '../src/domain/accountService.js'
 
 describe('AccountService', () => {
   it('supports nsec and ncryptsec flows', async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hypertuna-tui-accounts-'))
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hyperpipe-tui-accounts-'))
     const filePath = path.join(root, 'accounts.json')
 
     const service = new AccountService(filePath)

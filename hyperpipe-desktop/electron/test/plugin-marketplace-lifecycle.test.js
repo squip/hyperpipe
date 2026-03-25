@@ -49,7 +49,7 @@ async function createPluginArchiveFixture({
     name: 'Lifecycle Test Plugin',
     version,
     engines: {
-      hypertuna: '^1.0.0',
+      hyperpipe: '^1.0.0',
       worker: '^1.0.0',
       renderer: '^1.0.0',
       mediaApi: '^1.0.0'
@@ -106,7 +106,7 @@ async function createPluginArchiveFixture({
 test('marketplace lifecycle enforces approval, enablement, and permissions before worker commands', async (t) => {
   const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'plugin-marketplace-lifecycle-'))
   const storagePath = path.join(tmpRoot, 'desktop-storage')
-  const pluginId = 'com.hypertuna.lifecycle'
+  const pluginId = 'com.hyperpipe.lifecycle'
   const fixture = await createPluginArchiveFixture({
     rootDir: tmpRoot,
     pluginId,

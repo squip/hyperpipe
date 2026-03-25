@@ -36,7 +36,7 @@ export async function start(account: string, followings: string[], signal: Abort
 
   outbox = new OutboxManager([{ kinds: SUPPORTED_KINDS }], {
     pool,
-    label: 'hypertuna',
+    label: 'hyperpipe',
     store,
     onsyncupdate(pubkey) {
       if (!current.pubkey || current?.pubkey === pubkey) {

@@ -464,7 +464,7 @@ const isSuspiciousAdminOnlySelfDetailDowngrade = (args: {
   return isCreatorOrAdmin
 }
 
-const CLOSED_GROUP_JOIN_PENDING_STORAGE_PREFIX = 'hypertuna_group_closed_join_pending_v1'
+const CLOSED_GROUP_JOIN_PENDING_STORAGE_PREFIX = 'hyperpipe_group_closed_join_pending_v1'
 
 const normalizePubkeyList = (values: Array<string | null | undefined>) => {
   const seen = new Set<string>()

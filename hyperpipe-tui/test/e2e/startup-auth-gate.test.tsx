@@ -46,7 +46,7 @@ function isAppReady(controller: MockController): boolean {
 async function createRuntimeOptions(): Promise<RuntimeOptions> {
   return {
     ...BASE_OPTIONS,
-    storageDir: await fs.mkdtemp(path.join(os.tmpdir(), 'hypertuna-tui-e2e-startup-gate-'))
+    storageDir: await fs.mkdtemp(path.join(os.tmpdir(), 'hyperpipe-tui-e2e-startup-gate-'))
   }
 }
 

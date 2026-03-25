@@ -194,7 +194,7 @@ function createManifestFromHints(hints = {}) {
     name,
     version,
     engines: {
-      hypertuna: asString(hints?.engines?.hypertuna || '^1.0.0'),
+      hyperpipe: asString(hints?.engines?.hyperpipe || '^1.0.0'),
       worker: asString(hints?.engines?.worker || '^1.0.0'),
       renderer: asString(hints?.engines?.renderer || '^1.0.0'),
       mediaApi: asString(hints?.engines?.mediaApi || '^1.0.0')

@@ -642,10 +642,7 @@ export function findDefaultWorkerRoot(cwd: string): string {
   const candidates = [
     path.resolve(cwd, 'hyperpipe-worker'),
     path.resolve(cwd, '../hyperpipe-worker'),
-    path.resolve(cwd, '../../hyperpipe-worker'),
-    path.resolve(cwd, 'hypertuna-worker'),
-    path.resolve(cwd, '../hypertuna-worker'),
-    path.resolve(cwd, '../../hypertuna-worker')
+    path.resolve(cwd, '../../hyperpipe-worker')
   ]
 
   for (const candidate of candidates) {

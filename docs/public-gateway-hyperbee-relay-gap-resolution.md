@@ -1,9 +1,9 @@
 # Public Gateway Hyperbee Relay Gap Resolution Requirements
 
 ## 1. Context & Gap Summary
-- Gateway dispatcher assigns subscription work to workers, but `RelayWebsocketController` still forwards REQ frames over Hyperswarm, so the replicated Hyperbee in each worker is never queried locally (`public-gateway/src/relay/RelayWebsocketController.mjs`).
-- Worker relay stack (`hypertuna-worker/hypertuna-relay-manager-bare.mjs`, `hypertuna-worker/hypertuna-relay-event-processor.mjs`) is Autobase-dependent. Pulling the gateway Hyperbee replica through those classes would disable sparse downloads and reintroduce multiwriter semantics the gateway must avoid.
-- `PublicGatewayRelayClient` already mirrors the gateway Hyperbee (sparse replication, telemetry), but only exposes lifecycle hooks. There is no read API to satisfy Nostr filters from the replica (`hypertuna-worker/gateway/PublicGatewayRelayClient.mjs`).
+- Gateway dispatcher assigns subscription work to workers, but `RelayWebsocketController` still forwards REQ frames over Hyperswarm, so the replicated Hyperbee in each worker is never queried locally (`hyperpipe-gateway/src/relay/RelayWebsocketController.mjs`).
+- Worker relay stack (`hyperpipe-worker/hyperpipe-relay-manager.mjs`, `hyperpipe-worker/hyperpipe-relay-event-processor.mjs`) is Autobase-dependent. Pulling the gateway Hyperbee replica through those classes would disable sparse downloads and reintroduce multiwriter semantics the gateway must avoid.
+- `PublicGatewayRelayClient` already mirrors the gateway Hyperbee (sparse replication, telemetry), but only exposes lifecycle hooks. There is no read API to satisfy Nostr filters from the replica (`hyperpipe-worker/gateway/PublicGatewayRelayClient.mjs`).
 - Dispatcher telemetry and assignment metadata do not currently surface Hyperbee freshness, so fallback decisions cannot distinguish between stale replica data and healthy availability.
 
 ## 2. Design Outcomes
@@ -23,18 +23,18 @@
 ## 4. Detailed Requirement Tasks
 
 ### 4.1 Gateway Hyperbee Reader Layer
-1. **Module creation** – Add `hypertuna-worker/gateway/PublicGatewayHyperbeeReader.mjs` (name TBD) that:
+1. **Module creation** – Add `hyperpipe-worker/gateway/PublicGatewayHyperbeeReader.mjs` (name TBD) that:
    - Accepts a `Hyperbee` instance and optional index helpers.
    - Implements `query(filters, context)` returning `{ events, metrics, stale }`.
    - Supports filter features already handled in `NostrRelay.queryEvents` (kinds, ids, authors, time bounds, `#tag` selectors, limit/order options).
-2. **Index compatibility** – Reuse existing key derivation helpers or factor common logic out of `hypertuna-worker/hypertuna-relay-event-processor.mjs` so both Autobase and Hyperbee-only readers produce identical index paths.
+2. **Index compatibility** – Reuse existing key derivation helpers or factor common logic out of `hyperpipe-worker/hyperpipe-relay-event-processor.mjs` so both Autobase and Hyperbee-only readers produce identical index paths.
 3. **Sparse safety** – Ensure queries rely on range scans and point lookups compatible with sparse replication (avoid `.download({ start: 0 })` patterns). Document any differences in behaviour vs Autobase reads.
 4. **Error handling** – Distinguish between replica-not-ready, decode errors, and empty results to guide fallback decisions.
-5. **Unit tests** – Create targeted tests (e.g. `hypertuna-worker/test/public-gateway-hyperbee-reader.test.mjs`) using temporary Hypercores to validate filter coverage and sparse semantics.
+5. **Unit tests** – Create targeted tests (e.g. `hyperpipe-worker/test/public-gateway-hyperbee-reader.test.mjs`) using temporary Hypercores to validate filter coverage and sparse semantics.
 
 ### 4.2 Worker Integration & Dispatch Flow
 1. **Expose reader via client** – Extend `PublicGatewayRelayClient` with `getDb()`, `getVersion()`, and `createReader()` helpers. Maintain encapsulation of replication state and telemetry.
-2. **GatewayService shortcut** – In `hypertuna-worker/gateway/GatewayService.mjs:214-360`, introduce a local execution path that:
+2. **GatewayService shortcut** – In `hyperpipe-worker/gateway/GatewayService.mjs:214-360`, introduce a local execution path that:
    - Detects dispatcher assignments targeting the current worker by exposing the worker’s Hyperswarm public key (`config.swarmPublicKey`) to the service and comparing it with `decision.assignedPeer`.
    - Invokes the reader with REQ filters before invoking `forwardMessageToPeerHyperswarm`.
    - Streams results back through the websocket session using existing serialization helpers.
@@ -43,11 +43,11 @@
 5. **Telemetry updates** – Augment `GatewayService.#collectTelemetrySnapshot` (current location near usage of `publicGatewayRelayClient.getTelemetry()`) with replica freshness metrics and last local query success/failure.
 
 ### 4.3 Dispatcher & Controller Enhancements
-1. **Decision metadata** – Modify dispatcher job objects (`public-gateway/src/relay/RelayWebsocketController.mjs:62-119`) to include replica state (version, lag) so policy modules can prioritise ready replicas.
+1. **Decision metadata** – Modify dispatcher job objects (`hyperpipe-gateway/src/relay/RelayWebsocketController.mjs:62-119`) to include replica state (version, lag) so policy modules can prioritise ready replicas.
 2. **Local execution hook** – Update `RelayWebsocketController.#handleReqFrame` to call a new `handleAssignedLocally` hook on the worker session when `assignedPeer` matches the local identity, instead of blindly calling `legacyForward`.
 3. **Result acknowledgement** – Extend dispatcher acknowledgement payloads so local execution can mark jobs as `servedLocally`, including the event count and optional stale flag for adaptive routing.
 4. **Feature flags** – Introduce configurable toggles (e.g. `publicGatewaySettings.gatewayReplica.enabled`, `forceLegacyForward`) to gate the new path, defaulting to off until validated.
-5. **Test coverage** – Expand `public-gateway/test/relay-websocket-controller.test.mjs` to exercise local assignment handling, fallback scenarios, and dispatcher failure propagation.
+5. **Test coverage** – Expand `hyperpipe-gateway/test/relay-websocket-controller.test.mjs` to exercise local assignment handling, fallback scenarios, and dispatcher failure propagation.
 
 ### 4.4 Public Gateway Relay Host Alignment
 1. **Schema audit** – Validate that Hyperbee event storage schema in the gateway host matches expectations of the new reader. Update `docs/public-gateway-relay-interface-contracts.md` with any additional fields required for sparse reads (e.g. index manifests).

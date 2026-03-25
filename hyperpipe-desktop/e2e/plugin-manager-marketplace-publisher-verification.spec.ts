@@ -115,15 +115,15 @@ test('marketplace install requires explicit override for publisher mismatch', as
           if (method === 'readConfig') return async () => ({ success: true, data: {} })
           if (method === 'readGatewaySettings') return async () => ({ success: true, data: {} })
           if (method === 'readPublicGatewaySettings') return async () => ({ success: true, data: {} })
-          if (method === 'getStoragePath') return async () => '/tmp/hypertuna-e2e'
-          if (method === 'getLogFilePath') return async () => '/tmp/hypertuna-e2e/desktop-console.log'
+          if (method === 'getStoragePath') return async () => '/tmp/hyperpipe-e2e'
+          if (method === 'getLogFilePath') return async () => '/tmp/hyperpipe-e2e/desktop-console.log'
           return noopSuccess
         }
       }
     )
 
     ;(window as Window & { electronAPI?: unknown }).electronAPI = electronApi
-    window.localStorage.setItem('hypertuna_worker_autostart_enabled', 'false')
+    window.localStorage.setItem('hyperpipe_worker_autostart_enabled', 'false')
   })
 
   await page.goto('/settings/plugins')

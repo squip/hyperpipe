@@ -3,12 +3,18 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "homepage": "https://hyperpipe.io",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/squip/hypertuna-electron-dev.git"
+  },
   "bin": {
     "hyperpipe-tui": "dist/cli.js"
   },
   "scripts": {
     "dev": "tsx src/cli.tsx",
     "build": "tsup src/cli.tsx --format esm --out-dir dist --clean && node scripts/add-shebang.cjs dist/cli.js",
+    "bundle:release": "node ./scripts/bundle-release.mjs",
     "start": "node dist/cli.js",
     "test": "vitest run",
     "test:e2e": "vitest run test/e2e",

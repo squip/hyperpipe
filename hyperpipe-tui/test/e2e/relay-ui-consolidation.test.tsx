@@ -7,7 +7,7 @@ import { MockController } from './support/mockController.js'
 
 const BASE_OPTIONS: RuntimeOptions = {
   cwd: process.cwd(),
-  storageDir: '/tmp/hypertuna-tui-e2e-relay-ui',
+  storageDir: '/tmp/hyperpipe-tui-e2e-relay-ui',
   noAnimations: true,
   logLevel: 'info'
 }

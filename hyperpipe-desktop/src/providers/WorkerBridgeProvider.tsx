@@ -273,7 +273,7 @@ const WorkerBridgeContext = createContext<WorkerBridgeContextValue | undefined>(
 
 const MAX_LOGS = 500
 const MAX_OUTPUT_LINES = 250
-const AUTOSTART_KEY = 'hypertuna_worker_autostart_enabled'
+const AUTOSTART_KEY = 'hyperpipe_worker_autostart_enabled'
 const RESTART_DELAYS_MS = [1000, 3000, 10000, 30000]
 const EMPTY_RELAY_UPDATE_GRACE_MS = 2500
 

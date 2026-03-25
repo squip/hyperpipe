@@ -4,8 +4,8 @@ const DEFAULT_SETTINGS = Object.freeze({
   proxyWebsocketProtocol: 'ws'
 });
 
-const LOCAL_STORAGE_KEY = 'hypertuna_gateway_settings';
-const SETTINGS_FILENAME = 'gateway-settings.json';
+const LOCAL_STORAGE_KEY = 'hyperpipe_gateway_settings';
+const SETTINGS_FILENAME = 'hyperpipe-hyperpipe-gateway-settings.json';
 
 let cachedSettings = null;
 let nodeFsModule = null;

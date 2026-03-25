@@ -7,7 +7,7 @@ Plugin SDK/CLI for creating and packaging Hyperpipe plugins.
 Run from this repository:
 
 ```bash
-node /Users/essorensen/hypertuna-electron/shared/plugins/sdk/htplugin-cli.mjs <command>
+node /Users/essorensen/hyperpipe-electron/shared/plugins/sdk/htplugin-cli.mjs <command>
 ```
 
 Or from `shared/`:
@@ -21,7 +21,7 @@ npm run htplugin -- <command>
 Create a starter plugin project.
 
 ```bash
-node /Users/essorensen/hypertuna-electron/shared/plugins/sdk/htplugin-cli.mjs init ./my-plugin --id com.example.myplugin --name "My Plugin"
+node /Users/essorensen/hyperpipe-electron/shared/plugins/sdk/htplugin-cli.mjs init ./my-plugin --id com.example.myplugin --name "My Plugin"
 ```
 
 ### `build`
@@ -29,13 +29,13 @@ node /Users/essorensen/hypertuna-electron/shared/plugins/sdk/htplugin-cli.mjs in
 Build plugin runtime artifacts (`dist/runner.mjs`).
 
 ```bash
-node /Users/essorensen/hypertuna-electron/shared/plugins/sdk/htplugin-cli.mjs build ./my-plugin
+node /Users/essorensen/hyperpipe-electron/shared/plugins/sdk/htplugin-cli.mjs build ./my-plugin
 ```
 
 Optional custom build command:
 
 ```bash
-node /Users/essorensen/hypertuna-electron/shared/plugins/sdk/htplugin-cli.mjs build ./my-plugin --command "npm run build:plugin"
+node /Users/essorensen/hyperpipe-electron/shared/plugins/sdk/htplugin-cli.mjs build ./my-plugin --command "npm run build:plugin"
 ```
 
 ### `validate`
@@ -43,13 +43,13 @@ node /Users/essorensen/hypertuna-electron/shared/plugins/sdk/htplugin-cli.mjs bu
 Validate manifest contract + integrity hashes against local project files.
 
 ```bash
-node /Users/essorensen/hypertuna-electron/shared/plugins/sdk/htplugin-cli.mjs validate ./my-plugin
+node /Users/essorensen/hyperpipe-electron/shared/plugins/sdk/htplugin-cli.mjs validate ./my-plugin
 ```
 
 Auto-fix integrity hashes:
 
 ```bash
-node /Users/essorensen/hypertuna-electron/shared/plugins/sdk/htplugin-cli.mjs validate ./my-plugin --fix-integrity
+node /Users/essorensen/hyperpipe-electron/shared/plugins/sdk/htplugin-cli.mjs validate ./my-plugin --fix-integrity
 ```
 
 ### `pack`
@@ -57,13 +57,13 @@ node /Users/essorensen/hypertuna-electron/shared/plugins/sdk/htplugin-cli.mjs va
 Build, validate, and produce deterministic `.htplugin.tgz`.
 
 ```bash
-node /Users/essorensen/hypertuna-electron/shared/plugins/sdk/htplugin-cli.mjs pack ./my-plugin
+node /Users/essorensen/hyperpipe-electron/shared/plugins/sdk/htplugin-cli.mjs pack ./my-plugin
 ```
 
 Set explicit output archive path:
 
 ```bash
-node /Users/essorensen/hypertuna-electron/shared/plugins/sdk/htplugin-cli.mjs pack ./my-plugin --output ./artifacts/my-plugin.htplugin.tgz
+node /Users/essorensen/hyperpipe-electron/shared/plugins/sdk/htplugin-cli.mjs pack ./my-plugin --output ./artifacts/my-plugin.htplugin.tgz
 ```
 
 ## Notes

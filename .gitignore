@@ -38,19 +38,20 @@ bower_components
 build/Release
 
 # Dependency directories
-hypertuna-worker/node_modules/
-hypertuna-worker/test/*
-!hypertuna-worker/test/blind-peering-manager.test.js
-!hypertuna-worker/test/group-file-ipc.test.js
-!hypertuna-worker/test/plugin-marketplace-download.test.js
-!hypertuna-worker/test/public-gateway-hyperbee-adapter.test.js
-hypertuna-worker/package-lock.json
-hypertuna-desktop/node_modules/
-public-gateway/node_modules/
-public-gateway/package-lock.json
+hyperpipe-worker/node_modules/
+hyperpipe-worker/test/*
+!hyperpipe-worker/test/blind-peering-manager.test.js
+!hyperpipe-worker/test/group-file-ipc.test.js
+!hyperpipe-worker/test/plugin-marketplace-download.test.js
+!hyperpipe-worker/test/public-gateway-hyperbee-adapter.test.js
+hyperpipe-worker/package-lock.json
+hyperpipe-desktop/node_modules/
+hyperpipe-gateway/node_modules/
+hyperpipe-gateway/package-lock.json
 shared/package-lock.json
 shared/node_modules/
-hypertuna-desktop/package-lock.json
+hyperpipe-desktop/package-lock.json
+hyperpipe-tui/release/
 legacy-pear-codebase/
 hyperswarm-documentation/
 holepunchto-documentation/

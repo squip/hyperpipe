@@ -2,7 +2,7 @@
 
 ## R1. Parallelized Auto-Auth & Worker Startup
 1. The onboarding flow must trigger the returning-user auto-authentication workflow immediately after state detection without an arbitrary minimum splash delay.
-2. Auto-authentication must request Hypertuna worker startup concurrently with Nostr client initialization and profile hydration to avoid serialized waits.
+2. Auto-authentication must request Hyperpipe worker startup concurrently with Nostr client initialization and profile hydration to avoid serialized waits.
 3. `NostrIntegration.init` invoked during auto-authentication must accept a configuration that allows deferred discovery so that UI readiness is not blocked on relay discovery subscriptions.
 4. The onboarding overlay must be dismissible as soon as authentication, config hydration, and worker readiness prerequisites succeed, with remaining discovery tasks continuing asynchronously in the background.
 5. Auto-authentication must emit progress updates that can be surfaced by the renderer status component (e.g., stages for auth, worker boot, discovery resume).

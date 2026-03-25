@@ -95,7 +95,7 @@ function parsePositiveInteger(value, fallback) {
 
 function deriveSecretHex(masterSeed, role) {
   return createHash('sha256')
-    .update(`hypertuna-gateway-auth-fixture:v1:${masterSeed}:${role}`)
+    .update(`hyperpipe-gateway-auth-fixture:v1:${masterSeed}:${role}`)
     .digest('hex');
 }
 

@@ -161,7 +161,7 @@ async function main() {
     writeFile(path.join(SRC_ASSETS_ROOT, 'favicon.svg'), monochromeSvg)
   ])
 
-  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'hypertuna-iconset-'))
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'hyperpipe-iconset-'))
   const tmpIconset = path.join(tmpRoot, 'icon.iconset')
   await fs.mkdir(tmpIconset, { recursive: true })
 

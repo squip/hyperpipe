@@ -14,10 +14,10 @@ function platformUserDataRoot(): string {
 }
 
 export function resolveDesktopParityStorageDir(cwd: string): string {
-  const explicit = String(process.env.HYPERTUNA_STORAGE_DIR || process.env.HYPERTUNA_DATA_DIR || '').trim()
+  const explicit = String(process.env.HYPERPIPE_STORAGE_DIR || process.env.HYPERPIPE_DATA_DIR || '').trim()
   if (explicit) {
     return path.isAbsolute(explicit) ? explicit : path.resolve(cwd, explicit)
   }
   const userDataRoot = platformUserDataRoot()
-  return path.join(userDataRoot, 'hypertuna-desktop', 'hypertuna-data')
+  return path.join(userDataRoot, 'hyperpipe-desktop', 'hyperpipe-data')
 }

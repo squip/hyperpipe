@@ -96,7 +96,7 @@ export function normalizePluginManifest(input = {}) {
     name: asString(input.name),
     version: asString(input.version),
     engines: {
-      hypertuna: asString(input?.engines?.hypertuna),
+      hyperpipe: asString(input?.engines?.hyperpipe),
       worker: asString(input?.engines?.worker),
       renderer: asString(input?.engines?.renderer),
       mediaApi: asString(input?.engines?.mediaApi)
@@ -132,7 +132,7 @@ export function validatePluginManifest(input = {}, { strict = true } = {}) {
   if (!manifest.id) errors.push('Manifest id must be reverse-dns style (for example: com.example.plugin)')
   if (!manifest.name) errors.push('Manifest name is required')
   if (!manifest.version) errors.push('Manifest version is required')
-  if (!manifest.engines.hypertuna) errors.push('Manifest engines.hypertuna is required')
+  if (!manifest.engines.hyperpipe) errors.push('Manifest engines.hyperpipe is required')
   if (!manifest.engines.worker) errors.push('Manifest engines.worker is required')
   if (!manifest.engines.renderer) errors.push('Manifest engines.renderer is required')
   if (!manifest.engines.mediaApi) errors.push('Manifest engines.mediaApi is required')

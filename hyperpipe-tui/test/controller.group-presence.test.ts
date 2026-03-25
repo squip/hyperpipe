@@ -33,7 +33,7 @@ function makeGroup(overrides: Partial<GroupSummary> = {}): GroupSummary {
 
 describe('TuiController group presence', () => {
   it('hydrates visible group presence from the worker probe command', async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hypertuna-tui-group-presence-'))
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hyperpipe-tui-group-presence-'))
     const controller = new TuiController(baseOptions(root))
     await controller.initialize()
 
@@ -85,7 +85,7 @@ describe('TuiController group presence', () => {
   })
 
   it('preserves a previous gateway-backed count over a reduced fallback probe result', async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hypertuna-tui-group-presence-preserve-'))
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hyperpipe-tui-group-presence-preserve-'))
     const controller = new TuiController(baseOptions(root))
     await controller.initialize()
 

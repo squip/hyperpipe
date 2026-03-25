@@ -22,7 +22,7 @@ This document captures the implementation requirements to address both problems.
    - Expose async functions on the worker (likely within `challenge-manager.mjs` or a new helper module) that accept payloads for encrypt/decrypt using shared-secret semantics consistent with existing `NostrUtils.encrypt/decrypt` behaviour.
    - Ensure the service works for both user relay list payloads and invite payloads (same AES-256-CBC scheme).
 2. **IPC request handlers**
-   - Extend worker message handling (`hypertuna-worker/index.js`) to support commands such as `encrypt-relay-payload` / `decrypt-relay-payload`.
+   - Extend worker message handling (`hyperpipe-worker/index.js`) to support commands such as `encrypt-relay-payload` / `decrypt-relay-payload`.
    - Responses must include success flag and data/error for renderer consumption.
 3. **Renderer integration**
    - Replace `NostrUtils.encrypt/decrypt` usage paths in the renderer with wrappers that forward to the worker. These functions should remain promise-based for compatibility.
@@ -32,7 +32,7 @@ This document captures the implementation requirements to address both problems.
 
 ### Acceptance Criteria
 - Private relay creation and invite flows complete without `cipherObj.update` errors.
-- No direct references to `browserify-cipher` remain in renderer bundles (`hypertuna-desktop` sources).
+- No direct references to `browserify-cipher` remain in renderer bundles (`hyperpipe-desktop` sources).
 - Unit/integration paths relying on `NostrUtils.encrypt/decrypt` continue to receive encrypted payloads identical to the previous implementation (validated via decrypt round-trip during development).
 
 ---
@@ -45,7 +45,7 @@ This document captures the implementation requirements to address both problems.
 
 ### Functional Requirements
 1. **Worker-side registration state**
-   - Update `pear-relay-server.mjs` to retain registration result (success/failure/queued) and return it to the renderer.
+   - Update `relay-server.mjs` to retain registration result (success/failure/queued) and return it to the renderer.
    - Emit a dedicated error message when registration fails after retries, so the renderer can update UI state.
 2. **Renderer readiness gating**
    - Modify `AppIntegration.js` / `NostrGroupClient` logic to wait for `relay-registration-complete` or an error before attempting to connect to the gateway URL.

@@ -60,16 +60,16 @@ async function packReferencePlugin({
 }
 
 function assertCapabilityMarkers(t, pluginId, html) {
-  if (pluginId === 'com.hypertuna.reference.hello-nav-page') {
+  if (pluginId === 'com.hyperpipe.reference.hello-nav-page') {
     t.ok(html.includes('Hello from First-Party Plugin'))
     return
   }
-  if (pluginId === 'com.hypertuna.reference.p2p-audio-room') {
+  if (pluginId === 'com.hyperpipe.reference.p2p-audio-room') {
     t.ok(html.includes('P2P Audio/Video Room'))
     t.ok(html.includes('media-create-session'))
     return
   }
-  if (pluginId === 'com.hypertuna.reference.threejs-multiplayer-demo') {
+  if (pluginId === 'com.hyperpipe.reference.threejs-multiplayer-demo') {
     t.ok(html.includes('Three.js Multiplayer Demo'))
     t.ok(html.includes('__HT_THREE_RUNTIME_STATE'))
   }

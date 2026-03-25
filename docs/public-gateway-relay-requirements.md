@@ -7,29 +7,29 @@
 
 **Constraints**
 
-- Gateway relay must drop Autobase integration so peers never gain direct multiwriter rights (hypertuna-worker/hypertuna-relay-helper.mjs:1 shows current Autobase inheritance pattern).
+- Gateway relay must drop Autobase integration so peers never gain direct multiwriter rights (hyperpipe-worker/hyperpipe-relay-helper.mjs:1 shows current Autobase inheritance pattern).
 - Hyperbee sparse downloading should remain intact; replication logic must avoid forcing full state syncs (see docs in holepunchto-documentation/hyperbee-API-docs.md:1).
-- Existing worker relays still require Autobase; changes must not regress them (hypertuna-worker/hypertuna-relay-manager-bare.mjs:101).
+- Existing worker relays still require Autobase; changes must not regress them (hyperpipe-worker/hyperpipe-relay-manager.mjs:101).
 - Solution must operate within current discovery, registration, and token flows without breaking deployed peers.
 
 **Architecture**
 
-- Introduce a HyperbeeRelayHost service inside the public gateway to manage the writable Hyperbee core and provide websocket-backed Nostr semantics (public-gateway/src/PublicGatewayService.mjs:25 is the hosting surface).
+- Introduce a HyperbeeRelayHost service inside the public gateway to manage the writable Hyperbee core and provide websocket-backed Nostr semantics (hyperpipe-gateway/src/PublicGatewayService.mjs:25 is the hosting surface).
 - Expose replication endpoints over Hyperswarm so peers sync the Hyperbee via sparse reads while maintaining live websocket feeds.
 - Delegate REQ filtering to whichever peer (including the gateway) is best positioned to serve data, with routing metadata stored alongside subscription state.
 - Extend registration payloads and discovery broadcasts to distribute the relay Hyperbee public key plus relay URL so peers can bootstrap replication.
-- Layer a load-aware subscription dispatcher that favours healthy, low-latency peers while capping concurrent jobs per peer (reuse PeerHealthManager metrics in hypertuna-worker/gateway/GatewayService.mjs:198 and extend with rolling in-flight counts).
-- Maintain clear separation between the new gateway-only relay host and the existing Autobase-enabled worker relays. The gateway implementation must live under public-gateway/src, with shared utilities promoted into shared/ only when they are truly common.
+- Layer a load-aware subscription dispatcher that favours healthy, low-latency peers while capping concurrent jobs per peer (reuse PeerHealthManager metrics in hyperpipe-worker/gateway/GatewayService.mjs:198 and extend with rolling in-flight counts).
+- Maintain clear separation between the new gateway-only relay host and the existing Autobase-enabled worker relays. The gateway implementation must live under hyperpipe-gateway/src, with shared utilities promoted into shared/ only when they are truly common.
 - Define explicit interfaces for: (1) Hyperbee storage driver (open/close/replicate), (2) websocket relay server (ingest/publish/ack), (3) dispatcher coordination (assign/reassign/failover), and (4) telemetry bus. Each interface should hide implementation details from dependents and enable future unit testing with mocks.
 - Persist gateway relay configuration (keys, discovery key, scheduler parameters, token policy) through typed config objects so changes can be rolled out gradually and validated at startup.
 
 **Gateway Work**
 
-- Implement gateway-side Hyperbee lifecycle (corestore setup, Hyperbee instance, replication wiring) and embed it into the startup path of PublicGatewayService (public-gateway/src/PublicGatewayService.mjs:25).
+- Implement gateway-side Hyperbee lifecycle (corestore setup, Hyperbee instance, replication wiring) and embed it into the startup path of PublicGatewayService (hyperpipe-gateway/src/PublicGatewayService.mjs:25).
 - Replace Autobase-dependent event ingestion with direct Hyperbee writes, ensuring EVENT JSON and index structures mirror worker expectations for compatibility.
-- Extend websocket handling to accept Nostr EVENT and REQ frames, apply admin-only writes, and enqueue subscription workloads across connected peers (hypertuna-worker/gateway/GatewayService.mjs:304 already maintains peer health metadata that can be reused).
-- Add replication endpoints or protocol handlers so connected peers can stream the Hyperbee (reuse Hyperswarm plumbing that currently powers forwardMessageToPeerHyperswarm in shared/public-gateway/HyperswarmClient.mjs:563).
-- Persist gateway relay metadata (keys, discovery key, indexes) and expose it via health and admin APIs; ensure clean shutdown flushes caches and closes Hyperbee (public-gateway/src/config.mjs:4 governs persistence paths).
+- Extend websocket handling to accept Nostr EVENT and REQ frames, apply admin-only writes, and enqueue subscription workloads across connected peers (hyperpipe-worker/gateway/GatewayService.mjs:304 already maintains peer health metadata that can be reused).
+- Add replication endpoints or protocol handlers so connected peers can stream the Hyperbee (reuse Hyperswarm plumbing that currently powers forwardMessageToPeerHyperswarm in shared/hyperpipe-gateway/HyperswarmClient.mjs:563).
+- Persist gateway relay metadata (keys, discovery key, indexes) and expose it via health and admin APIs; ensure clean shutdown flushes caches and closes Hyperbee (hyperpipe-gateway/src/config.mjs:4 governs persistence paths).
 - Introduce metrics and logging for Hyperbee ops (append latency, replication stats) alongside the existing metrics.mjs pipeline.
 - Maintain per-peer workload telemetry (in-flight subscription handlers, rolling latency, failure rate) and feed it into the dispatcher; expose a control frame so peers can be reassigned mid-stream if they breach thresholds.
 - Emit gateway-signed token revocation frames over the websocket when per-peer tokens are invalidated and ensure the dispatcher drops revoked peers immediately.
@@ -42,7 +42,7 @@
 - Introduce a dedicated Hyperbee reader that reuses the existing peer relay index scheme (no migrations), exposes read-only query helpers for Nostr filters, and reports query diagnostics.
 - Update relay coordination to treat the gateway relay as read-only: disable Autobase writer paths when relayKey === gatewayRelayKey, route publish attempts over the websocket, and guard the reader from issuing mutating operations.
 - Build subscription distribution logic so workers receiving REQs from the gateway can query their local Hyperbee snapshot and stream results back over Hyperswarm, preferring local execution when the dispatcher assigns the worker’s Hyperswarm public key.
-- Enhance peer startup to fetch the Hyperbee key from registration payloads (public-gateway/src/stores/MemoryRegistrationStore.mjs:1 stores relay metadata) and initialise replication before declaring the relay usable.
+- Enhance peer startup to fetch the Hyperbee key from registration payloads (hyperpipe-gateway/src/stores/MemoryRegistrationStore.mjs:1 stores relay metadata) and initialise replication before declaring the relay usable.
 - Provide recovery paths for peers to resync the Hyperbee when out of date, including version detection and resubscription.
 - Report load metrics (recent REQ count, active query streams, median response latency, replica lag) back to the gateway via heartbeat or dispatcher acknowledgements so the scheduler can make informed assignments.
 - Enforce per-peer token TTLs locally; treat gateway revocation frames or failed refresh responses as hard disconnect signals and tear down replication/websocket sessions accordingly.
@@ -51,10 +51,10 @@
 
 **Shared Modules**
 
-- Extend registration DTOs and token metadata to include the gateway relay key, websocket URL, and Hyperbee discovery info (shared/auth/PublicGatewayTokens.mjs:1 and public-gateway/src/stores/MemoryRegistrationStore.mjs:1).
+- Extend registration DTOs and token metadata to include the gateway relay key, websocket URL, and Hyperbee discovery info (shared/auth/PublicGatewayTokens.mjs:1 and hyperpipe-gateway/src/stores/MemoryRegistrationStore.mjs:1).
 - Update shared/config/PublicGatewaySettings.mjs:1 and shared/config/GatewaySettings.mjs:1 to persist gateway relay flags (enable/disable auto token issuing, preferred relay key).
-- Enhance shared/public-gateway/GatewayDiscovery.mjs:13 to broadcast the new relay descriptors so auto-discovery peers can bootstrap without manual config.
-- Adjust shared/public-gateway/HyperswarmClient.mjs:563 to add message types for relay subscription delegation results and Hyperbee sync control.
+- Enhance shared/hyperpipe-gateway/GatewayDiscovery.mjs:13 to broadcast the new relay descriptors so auto-discovery peers can bootstrap without manual config.
+- Adjust shared/hyperpipe-gateway/HyperswarmClient.mjs:563 to add message types for relay subscription delegation results and Hyperbee sync control.
 - Add shared payload definitions for dispatcher telemetry (peer load reports, assignment tokens) and websocket control frames that communicate token revocations and reassignment directives.
 - Expose dispatcher policy and token refresh configuration via shared PublicGatewaySettings defaults so desktop/worker UIs surface the new tuning knobs.
 - Include Hyperbee relay metadata (public key, discovery key, replication topic) in discovery announcements and registration responses for worker bootstrap.
@@ -75,7 +75,7 @@
 **Operations**
 
 - Provide migration tooling to seed the new Hyperbee from any existing gateway data before cutover.
-- Document required environment variables and config entries for enabling the gateway relay host, including storage paths and token settings (public-gateway/src/config.mjs:4).
+- Document required environment variables and config entries for enabling the gateway relay host, including storage paths and token settings (hyperpipe-gateway/src/config.mjs:4).
 - Update deployment scripts/docker image to include Hyperbee dependencies and any new ports or topics.
 - Add health endpoints or status events exposing Hyperbee sync state so operators can monitor replication.
 - Expand operational dashboards (metrics.mjs exporters, Grafana panels) to cover dispatcher queue depth, token issuance rate, Hyperbee replication lag, and websocket error counts.
@@ -109,7 +109,7 @@
   - Outputs: `docs/public-gateway-relay-interface-contracts.md`, `shared/types/public-gateway-relay.d.ts`, and an announced rollout/knowledge share plan circulated to gateway + worker owners.
 
 - **Phase 1 – Hyperbee Host Foundations (Gateway)**
-  - Create `public-gateway/src/relay/HyperbeeRelayHost.mjs` responsible for corestore initialisation, Hyperbee lifecycle, replication hooks, and admin inspection APIs.
+  - Create `hyperpipe-gateway/src/relay/HyperbeeRelayHost.mjs` responsible for corestore initialisation, Hyperbee lifecycle, replication hooks, and admin inspection APIs.
   - Wire host startup/shutdown into `PublicGatewayService.init/start/stop`, guarded by a feature flag.
   - Implement persistence of relay keys/config in the gateway settings loader and ensure secure storage of private material.
   - Add unit tests mocking Hyperbee to validate lifecycle, metrics emission, and error handling.

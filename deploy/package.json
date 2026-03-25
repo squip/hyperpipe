@@ -1,5 +1,5 @@
 {
-  "name": "public-gateway-deploy",
+  "name": "hyperpipe-gateway-deploy",
   "private": true,
   "type": "module",
   "bin": {

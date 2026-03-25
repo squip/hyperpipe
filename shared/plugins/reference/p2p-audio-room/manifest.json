@@ -1,9 +1,9 @@
 {
-  "id": "com.hypertuna.reference.p2p-audio-room",
+  "id": "com.hyperpipe.reference.p2p-audio-room",
   "name": "P2P Audio Room",
   "version": "1.0.0",
   "engines": {
-    "hypertuna": "^1.0.0",
+    "hyperpipe": "^1.0.0",
     "worker": "^1.0.0",
     "renderer": "^1.0.0",
     "mediaApi": "^1.0.0"
@@ -25,7 +25,7 @@
         "title": "P2P Audio Room",
         "description": "Reference plugin for media session APIs",
         "icon": "mic",
-        "routePath": "/plugins/com.hypertuna.reference.p2p-audio-room/room",
+        "routePath": "/plugins/com.hyperpipe.reference.p2p-audio-room/room",
         "order": 30
       }
     ],
@@ -34,7 +34,7 @@
         "id": "audio-room",
         "title": "P2P Audio Room",
         "description": "Cross-instance WebRTC audio/video room via host signaling",
-        "path": "/plugins/com.hypertuna.reference.p2p-audio-room/room",
+        "path": "/plugins/com.hyperpipe.reference.p2p-audio-room/room",
         "timeoutMs": 15000
       }
     ],

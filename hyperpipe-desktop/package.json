@@ -11,7 +11,7 @@
     "type": "git",
     "url": "git+https://github.com/squip/hypertuna-electron-dev.git"
   },
-  "homepage": "https://github.com/squip/hypertuna-electron-dev",
+  "homepage": "https://hyperpipe.io",
   "scripts": {
     "dev": "vite --host",
     "dev:web": "vite --host",

@@ -113,13 +113,13 @@ function emitRendererEvent(channel, payload) {
 
 const APP_ROOT = path.join(__dirname, '..');
 const REPO_ROOT = path.join(APP_ROOT, '..');
-const DESKTOP_USER_DATA_DIR = 'hypertuna-desktop';
+const DESKTOP_USER_DATA_DIR = 'hyperpipe-desktop';
 const userDataPath = path.join(app.getPath('appData'), DESKTOP_USER_DATA_DIR);
 app.setPath('userData', userDataPath);
-const storagePath = path.join(userDataPath, 'hypertuna-data');
+const storagePath = path.join(userDataPath, 'hyperpipe-data');
 const logFilePath = path.join(storagePath, 'desktop-console.log');
-const gatewaySettingsPath = path.join(storagePath, 'gateway-settings.json');
-const publicGatewaySettingsPath = path.join(storagePath, 'public-gateway-settings.json');
+const gatewaySettingsPath = path.join(storagePath, 'hyperpipe-hyperpipe-gateway-settings.json');
+const publicGatewaySettingsPath = path.join(storagePath, 'hyperpipe-public-hyperpipe-gateway-settings.json');
 const LOG_APPEND_EMFILE_RETRIES = 4;
 const LOG_APPEND_EMFILE_BASE_DELAY_MS = 25;
 let logAppendChain = Promise.resolve();
@@ -149,13 +149,11 @@ function resolveExistingRoot(candidates) {
 function getWorkerRoot() {
   if (app.isPackaged) {
     return resolveExistingRoot([
-      path.join(process.resourcesPath, 'hyperpipe-worker'),
-      path.join(process.resourcesPath, 'hypertuna-worker')
+      path.join(process.resourcesPath, 'hyperpipe-worker')
     ]);
   }
   return resolveExistingRoot([
-    path.join(REPO_ROOT, 'hyperpipe-worker'),
-    path.join(REPO_ROOT, 'hypertuna-worker')
+    path.join(REPO_ROOT, 'hyperpipe-worker')
   ]);
 }
 

@@ -16,9 +16,9 @@ const FEATURE_ENV_KEYS: Record<RendererFeature, string> = {
 }
 
 const FEATURE_STORAGE_KEYS: Record<RendererFeature, string> = {
-  explore: 'hypertuna_feature_explore_enabled',
-  lists: 'hypertuna_feature_lists_enabled',
-  bookmarks: 'hypertuna_feature_bookmarks_enabled',
+  explore: 'hyperpipe_feature_explore_enabled',
+  lists: 'hyperpipe_feature_lists_enabled',
+  bookmarks: 'hyperpipe_feature_bookmarks_enabled',
   plugins: 'hyperpipe_feature_plugins_enabled'
 }
 
@@ -74,7 +74,7 @@ export function useHyperdriveUploads(): boolean {
   const envFlag = parseBooleanFlag(readEnvValue('VITE_USE_HYPERDRIVE_UPLOADS'))
   if (envFlag !== undefined) return envFlag
 
-  const stored = parseBooleanFlag(readLocalStorageValue('hypertuna_use_hyperdrive_uploads'))
+  const stored = parseBooleanFlag(readLocalStorageValue('hyperpipe_use_hyperdrive_uploads'))
   if (stored !== undefined) return stored
 
   return false

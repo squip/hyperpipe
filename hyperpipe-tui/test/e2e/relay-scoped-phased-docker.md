@@ -4,7 +4,7 @@ This runner replaces the previous timeout-only phased Docker script with a check
 
 ## Command
 
-From `/Users/essorensen/hypertuna-electron/hypertuna-tui`:
+From `/Users/essorensen/hypertuna-electron/hyperpipe-tui`:
 
 ```bash
 npm run demo:e2e:real:relay-scoped-phased-docker

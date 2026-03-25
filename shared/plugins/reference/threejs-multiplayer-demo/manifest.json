@@ -1,9 +1,9 @@
 {
-  "id": "com.hypertuna.reference.threejs-multiplayer-demo",
+  "id": "com.hyperpipe.reference.threejs-multiplayer-demo",
   "name": "Three.js Multiplayer Demo",
   "version": "1.0.1",
   "engines": {
-    "hypertuna": "^1.0.0",
+    "hyperpipe": "^1.0.0",
     "worker": "^1.0.0",
     "renderer": "^1.0.0",
     "mediaApi": "^1.0.0"
@@ -24,7 +24,7 @@
         "title": "Three.js Demo",
         "description": "First-party Three.js multiplayer demo plugin",
         "icon": "gamepad-2",
-        "routePath": "/plugins/com.hypertuna.reference.threejs-multiplayer-demo/game",
+        "routePath": "/plugins/com.hyperpipe.reference.threejs-multiplayer-demo/game",
         "order": 40
       }
     ],
@@ -33,7 +33,7 @@
         "id": "threejs-demo",
         "title": "Three.js Multiplayer Demo",
         "description": "Interactive 3D scene + WebRTC datachannel multiplayer",
-        "path": "/plugins/com.hypertuna.reference.threejs-multiplayer-demo/game",
+        "path": "/plugins/com.hyperpipe.reference.threejs-multiplayer-demo/game",
         "timeoutMs": 15000
       }
     ],

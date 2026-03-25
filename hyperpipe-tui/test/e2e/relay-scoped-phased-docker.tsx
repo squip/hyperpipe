@@ -810,7 +810,7 @@ function createGatewayComposeFile(repoRoot: string): string {
       GATEWAY_OPEN_JOIN_POOL_TTL: "0"
       GATEWAY_OPEN_JOIN_POOL_TTL_MS: "0"
       GATEWAY_BLINDPEER_ENABLED: "true"
-      GATEWAY_BLINDPEER_STORAGE: /var/lib/hypertuna/blind-peer
+      GATEWAY_BLINDPEER_STORAGE: /var/lib/hyperpipe/blind-peer
       GATEWAY_BLINDPEER_PORT: \${E2E_GATEWAY_BLINDPEER_PORT}
       GATEWAY_SCOPED_CREDENTIALS_V1: "true"
       GATEWAY_CREATOR_POLICY_V1: "true"
@@ -972,7 +972,7 @@ async function writeWorkerGatewaySettings(
   await fs.mkdir(storageDir, { recursive: true })
 
   await fs.writeFile(
-    path.join(storageDir, 'gateway-settings.json'),
+    path.join(storageDir, 'hyperpipe-gateway-settings.json'),
     JSON.stringify({
       gatewayUrl: origin,
       proxyHost: parsed.host,
@@ -982,7 +982,7 @@ async function writeWorkerGatewaySettings(
   )
 
   await fs.writeFile(
-    path.join(storageDir, 'public-gateway-settings.json'),
+    path.join(storageDir, 'public-hyperpipe-gateway-settings.json'),
     JSON.stringify({
       enabled: true,
       selectionMode: 'manual',

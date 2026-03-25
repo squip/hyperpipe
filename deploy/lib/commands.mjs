@@ -39,6 +39,7 @@ const DEFAULT_OPERATOR_ATTESTATION_FILE = join(ARTIFACTS_DIR, 'operator-attestat
 const BASE_COMPOSE_FILE = join(DEPLOY_DIR, 'docker-compose.yml');
 const HTTPS_ACME_COMPOSE_FILE = join(DEPLOY_DIR, 'docker-compose.https-acme.yml');
 const HTTP_COMPOSE_FILE = join(DEPLOY_DIR, 'docker-compose.http.yml');
+const SITE_COMPOSE_FILE = join(DEPLOY_DIR, 'docker-compose.site.yml');
 const DEFAULT_SECRET_PATH = '/.well-known/hyperpipe-gateway-secret';
 
 function log(io, message) {
@@ -667,11 +668,17 @@ async function collectPortWarnings(config) {
 }
 
 function composeFilesForConfig(config = {}) {
+  const files = [];
   const exposureMode = deriveExposureMode(config);
   if (exposureMode === 'http') {
-    return [BASE_COMPOSE_FILE, HTTP_COMPOSE_FILE];
+    files.push(BASE_COMPOSE_FILE, HTTP_COMPOSE_FILE);
+  } else {
+    files.push(BASE_COMPOSE_FILE, HTTPS_ACME_COMPOSE_FILE);
   }
-  return [BASE_COMPOSE_FILE, HTTPS_ACME_COMPOSE_FILE];
+  if (normalizeBooleanOption(config.SITE_ENABLED, false)) {
+    files.push(SITE_COMPOSE_FILE);
+  }
+  return files;
 }
 
 function composeArgs(envFile, config, extraArgs) {
@@ -924,6 +931,15 @@ export async function runSmokeCommand(options = {}, io = process, execImpl = run
   }
   log(io, `Health check passed: ${gatewayOrigin}/health`);
 
+  if (normalizeBooleanOption(checkResult.config.SITE_ENABLED, false)) {
+    const siteOrigin = siteOriginForConfig(checkResult.config);
+    const siteHealth = await fetchJson(`${siteOrigin}/healthz`, Number(options.timeoutMs || DEFAULT_TIMEOUT_MS), fetchImpl);
+    if (!siteHealth.ok) {
+      throw new Error(`Site health check failed for ${siteOrigin}/healthz`);
+    }
+    log(io, `Site health check passed: ${siteOrigin}/healthz`);
+  }
+
   const profile = deriveProfile(checkResult.config);
   const shouldCheckSecret = profile === 'open';
   if (shouldCheckSecret) {
@@ -970,6 +986,13 @@ function normalizePublicOrigin(value) {
   parsed.search = '';
   parsed.hash = '';
   return parsed.origin;
+}
+
+function siteOriginForConfig(config = {}) {
+  const host = String(config.SITE_HOST || '').trim();
+  if (!host) return '';
+  const exposureMode = deriveExposureMode(config);
+  return `${exposureMode === 'http' ? 'http' : 'https'}://${host}`;
 }
 
 export function usage() {

@@ -49,7 +49,7 @@ async function createPluginArchiveFixture({
     name: 'Archive Safety Test Plugin',
     version,
     engines: {
-      hypertuna: '^1.0.0',
+      hyperpipe: '^1.0.0',
       worker: '^1.0.0',
       renderer: '^1.0.0',
       mediaApi: '^1.0.0'
@@ -208,7 +208,7 @@ test('rejects oversized plugin archive payloads before extraction', async (t) =>
 test('rejects install when manifest integrity hash does not match bundle content', async (t) => {
   const context = await createSupervisorContext('plugin-archive-hash-mismatch')
   try {
-    const pluginId = 'com.hypertuna.archive-hash-mismatch'
+    const pluginId = 'com.hyperpipe.archive-hash-mismatch'
     const fixture = await createPluginArchiveFixture({
       rootDir: context.tmpRoot,
       pluginId,
@@ -236,7 +236,7 @@ test('rejects install when manifest integrity hash does not match bundle content
 test('upgrading plugin version requires re-approval and blocks plugin-origin worker commands until re-approved', async (t) => {
   const context = await createSupervisorContext('plugin-upgrade-reapproval')
   try {
-    const pluginId = 'com.hypertuna.upgrade-reapproval'
+    const pluginId = 'com.hyperpipe.upgrade-reapproval'
     const v1 = await createPluginArchiveFixture({
       rootDir: context.tmpRoot,
       pluginId,

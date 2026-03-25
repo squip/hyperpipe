@@ -10,7 +10,7 @@ describe('WorkerHost', () => {
   it('starts, sends requests, and stops', async () => {
     const host = new WorkerHost()
     const fixtureRoot = path.resolve(process.cwd(), 'test/fixtures')
-    const storageDir = path.join(os.tmpdir(), 'hypertuna-tui-test-storage')
+    const storageDir = path.join(os.tmpdir(), 'hyperpipe-tui-test-storage')
 
     const started = await host.start({
       workerRoot: fixtureRoot,
@@ -42,7 +42,7 @@ describe('WorkerHost', () => {
   it('throws for worker failures and timeouts', async () => {
     const host = new WorkerHost()
     const fixtureRoot = path.resolve(process.cwd(), 'test/fixtures')
-    const storageDir = path.join(os.tmpdir(), 'hypertuna-tui-test-storage-timeout')
+    const storageDir = path.join(os.tmpdir(), 'hyperpipe-tui-test-storage-timeout')
 
     const started = await host.start({
       workerRoot: fixtureRoot,

@@ -110,8 +110,8 @@ test('plugin manager shows denied-action card after permission-denied event', as
           if (method === 'readConfig') return async () => ({ success: true, data: {} })
           if (method === 'readGatewaySettings') return async () => ({ success: true, data: {} })
           if (method === 'readPublicGatewaySettings') return async () => ({ success: true, data: {} })
-          if (method === 'getStoragePath') return async () => '/tmp/hypertuna-e2e'
-          if (method === 'getLogFilePath') return async () => '/tmp/hypertuna-e2e/desktop-console.log'
+          if (method === 'getStoragePath') return async () => '/tmp/hyperpipe-e2e'
+          if (method === 'getLogFilePath') return async () => '/tmp/hyperpipe-e2e/desktop-console.log'
           if (method === 'readFileBuffer') {
             return async () => ({ success: false, error: 'Not available in e2e mock', data: new ArrayBuffer(0) })
           }
@@ -124,7 +124,7 @@ test('plugin manager shows denied-action card after permission-denied event', as
     )
 
     ;(window as Window & { electronAPI?: unknown }).electronAPI = electronApi
-    window.localStorage.setItem('hypertuna_worker_autostart_enabled', 'false')
+    window.localStorage.setItem('hyperpipe_worker_autostart_enabled', 'false')
     window.__emitPluginPermissionDenied = () => {
       includeDeniedAudit = true
       emitListener('workerMessage', {

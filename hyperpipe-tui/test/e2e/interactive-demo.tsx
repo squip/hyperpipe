@@ -9,7 +9,7 @@ const noAnimations = process.argv.includes('--no-animations')
 
 const options: RuntimeOptions = {
   cwd: process.cwd(),
-  storageDir: '/tmp/hypertuna-tui-e2e-demo',
+  storageDir: '/tmp/hyperpipe-tui-e2e-demo',
   noAnimations,
   logLevel: 'info'
 }

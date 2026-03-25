@@ -1,0 +1,144 @@
+name: Release Desktop
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install desktop dependencies
+        run: |
+          cd hyperpipe-desktop
+          npm ci
+
+      - name: Install worker dependencies
+        run: |
+          cd hyperpipe-worker
+          npm ci
+
+      - name: Install gateway deploy dependencies
+        run: |
+          cd deploy
+          npm ci
+
+      - name: Install gateway dependencies
+        run: |
+          cd hyperpipe-gateway
+          npm ci
+
+      - name: Verify worker
+        run: |
+          cd hyperpipe-worker
+          npm test
+
+      - name: Verify gateway
+        run: |
+          cd hyperpipe-gateway
+          npm test
+
+      - name: Verify deploy tooling
+        run: |
+          cd deploy
+          npm test
+
+      - name: Verify desktop renderer
+        run: |
+          cd hyperpipe-desktop
+          npm run test:unit
+          npm run build:web
+
+  package:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            builder_args: --mac dmg zip --x64
+          - os: macos-14
+            builder_args: --mac dmg zip --arm64
+          - os: windows-latest
+            builder_args: --win nsis --x64
+          - os: ubuntu-latest
+            builder_args: --linux AppImage --x64
+    runs-on: ${{ matrix.os }}
+    env:
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install desktop dependencies
+        run: |
+          cd hyperpipe-desktop
+          npm ci
+
+      - name: Install worker dependencies
+        run: |
+          cd hyperpipe-worker
+          npm ci
+
+      - name: Install xvfb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      - name: Run desktop verification
+        run: |
+          cd hyperpipe-desktop
+          npm run test:unit
+          npm run build:web
+
+      - name: Run desktop electron tests
+        if: runner.os == 'Linux'
+        run: |
+          cd hyperpipe-desktop
+          xvfb-run -a npm run test:electron
+
+      - name: Run desktop electron tests
+        if: runner.os != 'Linux'
+        run: |
+          cd hyperpipe-desktop
+          npm run test:electron
+
+      - name: Build desktop release artifacts
+        run: |
+          cd hyperpipe-desktop
+          npm run dist:desktop -- ${{ matrix.builder_args }}
+
+      - name: Write checksums
+        run: node ./scripts/write-sha256sums.mjs --dir ./hyperpipe-desktop/release --out ./hyperpipe-desktop/release/SHA256SUMS.txt
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}
+          path: hyperpipe-desktop/release/*
+
+      - name: Publish release assets
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: hyperpipe-desktop/release/*
+

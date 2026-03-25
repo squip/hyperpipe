@@ -77,8 +77,8 @@ import type { TPublishOptions } from '@/types'
 import * as nip19 from '@nostr/tools/nip19'
 import { normalizeUrl } from '@/lib/url'
 
-const INVITE_DISMISSED_STORAGE_PREFIX = 'hypertuna_group_invites_dismissed_v1'
-const INVITE_ACCEPTED_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_v1'
+const INVITE_DISMISSED_STORAGE_PREFIX = 'hyperpipe_group_invites_dismissed_v1'
+const INVITE_ACCEPTED_STORAGE_PREFIX = 'hyperpipe_group_invites_accepted_v1'
 
 const getSnapshotEventTaggedPubkeys = (event: Pick<TDraftEvent, 'tags'>) =>
   normalizeMembershipPubkeys(
@@ -114,8 +114,8 @@ const logGroupSnapshotPublishAttempt = (args: {
     relayTargets: args.relayUrls.length
   })
 }
-const INVITE_ACCEPTED_GROUPS_STORAGE_PREFIX = 'hypertuna_group_invites_accepted_groups_v1'
-const JOIN_REQUESTS_HANDLED_STORAGE_KEY = 'hypertuna_join_requests_handled_v1'
+const INVITE_ACCEPTED_GROUPS_STORAGE_PREFIX = 'hyperpipe_group_invites_accepted_groups_v1'
+const JOIN_REQUESTS_HANDLED_STORAGE_KEY = 'hyperpipe_join_requests_handled_v1'
 const GROUP_MEMBER_PREVIEW_TTL_MS = 2 * 60 * 1000
 const GROUP_MEMBER_PREVIEW_INCOMPLETE_TTL_MS = 15 * 1000
 const TOKENIZED_RELAY_REFRESH_MIN_INTERVAL_MS = 5000
@@ -1795,18 +1795,18 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         })
       ])
 
-      const hypertunaRelayUrlById = new Map<string, string>()
+      const hyperpipeRelayUrlById = new Map<string, string>()
       relayEvents.forEach((evt) => {
         const parsed = parseHyperpipeRelayEvent30166(evt)
         if (!parsed) return
-        hypertunaRelayUrlById.set(parsed.publicIdentifier, getBaseRelayUrl(parsed.wsUrl))
+        hyperpipeRelayUrlById.set(parsed.publicIdentifier, getBaseRelayUrl(parsed.wsUrl))
       })
 
       const parsed = metadataEvents.map((evt) => {
         const parsedId = parseGroupIdentifier(evt.tags.find((t) => t[0] === 'd')?.[1] ?? '')
         const meta = parseGroupMetadataEvent(evt, parsedId.relay)
         if (isHyperpipeTaggedEvent(evt)) {
-          const relayUrl = hypertunaRelayUrlById.get(meta.id)
+          const relayUrl = hyperpipeRelayUrlById.get(meta.id)
           if (relayUrl) {
             return { ...meta, relay: relayUrl }
           }
@@ -3988,7 +3988,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         membersFound: false,
         adminsFound: false,
         groupCreateFound: false,
-        hypertunaFound: false,
+        hyperpipeFound: false,
         error: null as string | null
       }
 
@@ -4002,7 +4002,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             membersByD,
             membersByH,
             groupCreateByH,
-            hypertunaByH
+            hyperpipeByH
           ] = await Promise.all([
             client.fetchEvents([targetRelayUrl], { kinds: [39000], '#d': [groupId], limit: 1 }),
             client.fetchEvents([targetRelayUrl], { kinds: [39000], '#h': [groupId], limit: 1 }),
@@ -4018,7 +4018,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           state.adminsFound = adminsByD.length > 0 || adminsByH.length > 0
           state.membersFound = membersByD.length > 0 || membersByH.length > 0
           state.groupCreateFound = groupCreateByH.length > 0
-          state.hypertunaFound = hypertunaByH.length > 0
+          state.hyperpipeFound = hyperpipeByH.length > 0
           state.error = null
 
           if (state.metadataFound && state.membersFound) {
@@ -4320,13 +4320,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         ? Array.from(new Set([bootstrapRelayUrl, ...BIG_RELAY_URLS]))
         : [bootstrapRelayUrl]
       logGroupSnapshotPublishAttempt({
-        reason: 'create-hypertuna-group:bootstrap-admins',
+        reason: 'create-hyperpipe-group:bootstrap-admins',
         groupId: publicIdentifier,
         event: adminListEvent,
         relayUrls: membershipSnapshotTargets
       })
       logGroupSnapshotPublishAttempt({
-        reason: 'create-hypertuna-group:bootstrap-members',
+        reason: 'create-hyperpipe-group:bootstrap-members',
         groupId: publicIdentifier,
         event: memberListEvent,
         relayUrls: membershipSnapshotTargets

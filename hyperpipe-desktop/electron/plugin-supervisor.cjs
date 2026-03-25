@@ -228,7 +228,7 @@ function fallbackNormalizeManifest(raw = {}) {
     name: asString(raw.name),
     version: asString(raw.version),
     engines: {
-      hypertuna: asString(raw?.engines?.hypertuna),
+      hyperpipe: asString(raw?.engines?.hyperpipe),
       worker: asString(raw?.engines?.worker),
       renderer: asString(raw?.engines?.renderer),
       mediaApi: asString(raw?.engines?.mediaApi)
@@ -263,7 +263,7 @@ function fallbackValidateManifest(raw = {}) {
   if (!manifest.id) errors.push('Manifest id is required');
   if (!manifest.name) errors.push('Manifest name is required');
   if (!manifest.version) errors.push('Manifest version is required');
-  if (!manifest.engines.hypertuna) errors.push('Manifest engines.hypertuna is required');
+  if (!manifest.engines.hyperpipe) errors.push('Manifest engines.hyperpipe is required');
   if (!manifest.engines.worker) errors.push('Manifest engines.worker is required');
   if (!manifest.engines.renderer) errors.push('Manifest engines.renderer is required');
   if (!manifest.engines.mediaApi) errors.push('Manifest engines.mediaApi is required');

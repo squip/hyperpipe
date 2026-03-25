@@ -36,8 +36,8 @@ const DEFAULT_SETTINGS = Object.freeze({
   resolvedDispatcher: null
 });
 
-const LOCAL_STORAGE_KEY = 'hypertuna_public_gateway_settings';
-const SETTINGS_FILENAME = 'public-gateway-settings.json';
+const LOCAL_STORAGE_KEY = 'hyperpipe_public_gateway_settings';
+const SETTINGS_FILENAME = 'hyperpipe-public-hyperpipe-gateway-settings.json';
 
 let cachedSettings = null;
 let nodeFsModule = null;

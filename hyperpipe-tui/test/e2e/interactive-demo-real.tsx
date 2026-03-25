@@ -85,14 +85,14 @@ const parsed = parseArgs({
 
 const env = process.env
 
-const nsec = parsed.values.nsec || env.HYPERTUNA_TUI_NSEC
-const ncryptsec = parsed.values.ncryptsec || env.HYPERTUNA_TUI_NCRYPTSEC
-const password = parsed.values.password || env.HYPERTUNA_TUI_PASSWORD
-const joinId = parsed.values['join-id'] || env.HYPERTUNA_TUI_JOIN_ID
+const nsec = parsed.values.nsec || env.HYPERPIPE_TUI_NSEC
+const ncryptsec = parsed.values.ncryptsec || env.HYPERPIPE_TUI_NCRYPTSEC
+const password = parsed.values.password || env.HYPERPIPE_TUI_PASSWORD
+const joinId = parsed.values['join-id'] || env.HYPERPIPE_TUI_JOIN_ID
 
 const rawInviteePubkey =
   parsed.values['invitee-pubkey']
-  || env.HYPERTUNA_TUI_INVITEE_PUBKEY
+  || env.HYPERPIPE_TUI_INVITEE_PUBKEY
   || 'b'.repeat(64)
 
 const inviteePubkey = isHex64(rawInviteePubkey)
@@ -101,7 +101,7 @@ const inviteePubkey = isHex64(rawInviteePubkey)
 
 if (parsed.values.help) {
   const lines = [
-    'hypertuna real-backend walkthrough',
+    'hyperpipe real-backend walkthrough',
     '',
     'Usage:',
     '  npm run demo:e2e:real',
@@ -123,8 +123,8 @@ if (parsed.values.help) {
     '  --join-id <groupPublicIdentifier>',
     '',
     'Environment fallbacks:',
-    '  HYPERTUNA_TUI_NSEC, HYPERTUNA_TUI_NCRYPTSEC, HYPERTUNA_TUI_PASSWORD,',
-    '  HYPERTUNA_TUI_INVITEE_PUBKEY, HYPERTUNA_TUI_JOIN_ID'
+    '  HYPERPIPE_TUI_NSEC, HYPERPIPE_TUI_NCRYPTSEC, HYPERPIPE_TUI_PASSWORD,',
+    '  HYPERPIPE_TUI_INVITEE_PUBKEY, HYPERPIPE_TUI_JOIN_ID'
   ]
 
   process.stdout.write(`${lines.join('\n')}\n`)
