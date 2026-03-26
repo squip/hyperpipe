@@ -142,6 +142,28 @@ vi.mock('sonner', () => ({
 }))
 
 describe('ChatListPage chat UX', () => {
+  const openCreateWizard = () => {
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+  }
+
+  const moveToMembersStep = () => {
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
+  }
+
+  const addFriendInvitee = async () => {
+    fireEvent.change(screen.getByPlaceholderText('Search users...'), {
+      target: { value: 'friend' }
+    })
+    fireEvent.click(await screen.findByRole('button', { name: 'Add' }))
+    await screen.findByText('Selected members (1)')
+  }
+
+  const moveToRelaysStep = async () => {
+    moveToMembersStep()
+    await addFriendInvitee()
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
+  }
+
   beforeEach(() => {
     messengerState.invites = []
     messengerState.conversations = []
@@ -170,17 +192,13 @@ describe('ChatListPage chat UX', () => {
 
     render(<ChatListPage />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
-    fireEvent.change(screen.getByPlaceholderText('Search users...'), {
-      target: { value: 'friend' }
-    })
-    fireEvent.click(await screen.findByRole('button', { name: 'Add' }))
-    await screen.findByText('Selected members (1)')
+    openCreateWizard()
+    await moveToRelaysStep()
     fireEvent.click(screen.getByRole('button', { name: 'Create chat' }))
 
     expect(screen.queryByRole('status')).not.toBeInTheDocument()
     expect(screen.queryByText('Creating chat…')).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Back' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Creating...' })).toBeDisabled()
     expect(screen.queryByRole('button', { name: 'Close' })).not.toBeInTheDocument()
 
@@ -208,17 +226,14 @@ describe('ChatListPage chat UX', () => {
 
     render(<ChatListPage />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
-    fireEvent.change(screen.getByPlaceholderText('Search users...'), {
-      target: { value: 'friend' }
-    })
-    fireEvent.click(await screen.findByRole('button', { name: 'Add' }))
+    openCreateWizard()
     const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement
     fireEvent.change(fileInput, {
       target: {
         files: [new File(['thumb'], 'thumb.png', { type: 'image/png' })]
       }
     })
+    await moveToRelaysStep()
     fireEvent.click(screen.getByRole('button', { name: 'Create chat' }))
 
     await waitFor(() => {
@@ -231,17 +246,28 @@ describe('ChatListPage chat UX', () => {
     expect(screen.queryByText('Upload a chat thumbnail')).not.toBeInTheDocument()
   })
 
-  it('renders the create-chat dialog with sectioned layout, conditional member results, and no fallback toggle', async () => {
+  it('renders the create-chat dialog as a three-step wizard with step state persistence and no fallback toggle', async () => {
     render(<ChatListPage />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    openCreateWizard()
 
     expect(document.querySelector('[role=\"dialog\"].flex.flex-col.overflow-hidden')).toBeTruthy()
     expect(document.querySelector('[role=\"dialog\"] .min-h-0.flex-1.overflow-y-auto.px-6.py-5')).toBeTruthy()
     expect(document.querySelector('[role=\"dialog\"] .shrink-0.border-t.bg-background.px-6.py-4')).toBeTruthy()
+    expect(screen.getByText('Details')).toBeInTheDocument()
+    expect(screen.getByText('Members')).toBeInTheDocument()
+    expect(screen.getByText('Relays')).toBeInTheDocument()
+    expect(screen.getByText('Step 1 of 3')).toBeInTheDocument()
     expect(screen.getByText('Upload a chat thumbnail')).toBeInTheDocument()
     expect(screen.queryByText('Discovery relay fallback')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Add' })).not.toBeInTheDocument()
+    expect(screen.queryByText('relay-selector')).not.toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('Chat title'), {
+      target: { value: 'Launch Room' }
+    })
+    moveToMembersStep()
+    expect(screen.getByText('Step 2 of 3')).toBeInTheDocument()
 
     fireEvent.change(screen.getByPlaceholderText('Search users...'), {
       target: { value: 'friend' }
@@ -250,6 +276,17 @@ describe('ChatListPage chat UX', () => {
     expect(await screen.findByText('Search results')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Add' }))
     expect(screen.getByText('Selected members (1)')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    expect(screen.getByDisplayValue('Launch Room')).toBeInTheDocument()
+
+    moveToMembersStep()
+    expect(screen.getByText('Selected members (1)')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
+
+    expect(screen.getByText('Step 3 of 3')).toBeInTheDocument()
+    expect(screen.getByText('relay-selector')).toBeInTheDocument()
+    expect(screen.getByText('Launch Room')).toBeInTheDocument()
   })
 
   it('shows button-level join busy state in the active invite row and avoids extra page refreshes', async () => {
