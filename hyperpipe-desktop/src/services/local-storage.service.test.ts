@@ -82,7 +82,10 @@ describe('local storage feed selection persistence', () => {
       maxItemsPerAuthor: 3,
       mutedWords: 'spam, ads',
       selectedRelayIdentities: ['relay-a', 'relay-b'],
-      selectedListKeys: ['user-3:trusted-authors']
+      selectedListKeys: ['user-3:trusted-authors'],
+      selectedLanguageCodes: ['en'],
+      selectedFileExtensions: ['pdf'],
+      customFileExtensions: ['heic']
     })
 
     expect(storage.getSharedFeedFilterSettings('user-3', 'reads')).toEqual({
@@ -91,7 +94,10 @@ describe('local storage feed selection persistence', () => {
       maxItemsPerAuthor: 3,
       mutedWords: 'spam, ads',
       selectedRelayIdentities: ['relay-a', 'relay-b'],
-      selectedListKeys: ['user-3:trusted-authors']
+      selectedListKeys: ['user-3:trusted-authors'],
+      selectedLanguageCodes: ['en'],
+      selectedFileExtensions: ['pdf'],
+      customFileExtensions: ['heic']
     })
 
     storage.init()
@@ -102,8 +108,30 @@ describe('local storage feed selection persistence', () => {
       maxItemsPerAuthor: 3,
       mutedWords: 'spam, ads',
       selectedRelayIdentities: ['relay-a', 'relay-b'],
-      selectedListKeys: ['user-3:trusted-authors']
+      selectedListKeys: ['user-3:trusted-authors'],
+      selectedLanguageCodes: ['en'],
+      selectedFileExtensions: ['pdf'],
+      customFileExtensions: ['heic']
     })
+  })
+
+  it('persists shared custom relay urls per account', () => {
+    storage.setSharedFeedFilterCustomRelayUrls('user-5', [
+      'wss://custom-one.example',
+      'wss://custom-two.example'
+    ])
+
+    expect(storage.getSharedFeedFilterCustomRelayUrls('user-5')).toEqual([
+      'wss://custom-one.example',
+      'wss://custom-two.example'
+    ])
+
+    storage.init()
+
+    expect(storage.getSharedFeedFilterCustomRelayUrls('user-5')).toEqual([
+      'wss://custom-one.example',
+      'wss://custom-two.example'
+    ])
   })
 
   it('persists and de-duplicates the per-account mute list cache', () => {

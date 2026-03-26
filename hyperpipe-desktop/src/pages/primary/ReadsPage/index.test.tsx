@@ -25,7 +25,10 @@ let sharedFilterSettingsMock = {
   maxItemsPerAuthor: 0,
   mutedWords: '',
   selectedRelayIdentities: [] as string[],
-  selectedListKeys: [] as string[]
+  selectedListKeys: [] as string[],
+  selectedLanguageCodes: [] as string[],
+  selectedFileExtensions: [] as string[],
+  customFileExtensions: [] as string[]
 }
 let hasSavedSettingsMock = false
 
@@ -147,10 +150,28 @@ vi.mock('@/providers/ListsProvider', () => ({
   })
 }))
 
+vi.mock('@/providers/GroupsProvider', () => ({
+  useGroups: () => ({
+    discoveryRelays: BIG_RELAY_URLS,
+    myGroupList: [],
+    discoveryGroups: [],
+    getProvisionalGroupMetadata: vi.fn(() => null),
+    resolveRelayUrl: vi.fn((relayUrl: string) => relayUrl)
+  })
+}))
+
 vi.mock('@/hooks', () => ({
   useFetchFollowings: () => ({
     followings: followingsMock,
     isFetching: false
+  })
+}))
+
+vi.mock('@/hooks/useSharedFeedCustomRelayUrls', () => ({
+  default: () => ({
+    relayUrls: [],
+    addRelayUrl: vi.fn(),
+    removeRelayIdentity: vi.fn()
   })
 }))
 
@@ -205,7 +226,10 @@ describe('ReadsPage shared feed filters', () => {
       maxItemsPerAuthor: 0,
       mutedWords: '',
       selectedRelayIdentities: [],
-      selectedListKeys: []
+      selectedListKeys: [],
+      selectedLanguageCodes: [],
+      selectedFileExtensions: [],
+      customFileExtensions: []
     }
     fetchRelayListMock.mockClear()
     articleListMock.mockClear()
@@ -253,7 +277,7 @@ describe('ReadsPage shared feed filters', () => {
       expect(getRenderedArticleListProps()?.subRequests).toEqual([
         {
           source: 'relays',
-          urls: ['wss://reader-relay.example/', ...BIG_RELAY_URLS].slice(0, 8),
+          urls: [...BIG_RELAY_URLS, 'wss://reader-relay.example/'],
           filter: {
             authors: ['followed-pubkey']
           }
@@ -279,7 +303,10 @@ describe('ReadsPage shared feed filters', () => {
       maxItemsPerAuthor: 0,
       mutedWords: '',
       selectedRelayIdentities: [],
-      selectedListKeys: ['reader-pubkey:trusted-authors']
+      selectedListKeys: ['reader-pubkey:trusted-authors'],
+      selectedLanguageCodes: [],
+      selectedFileExtensions: [],
+      customFileExtensions: []
     }
 
     render(<ReadsPage />)
@@ -290,7 +317,7 @@ describe('ReadsPage shared feed filters', () => {
       expect(getRenderedArticleListProps()?.subRequests).toEqual([
         {
           source: 'relays',
-          urls: ['wss://reader-relay.example/', ...BIG_RELAY_URLS].slice(0, 8),
+          urls: [...BIG_RELAY_URLS, 'wss://reader-relay.example/'],
           filter: {
             authors: ['followed-pubkey']
           }

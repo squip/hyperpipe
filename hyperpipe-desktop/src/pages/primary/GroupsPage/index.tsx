@@ -9,22 +9,26 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
+import { FILTER_LANGUAGE_CODES, getFilterLanguageLabel, matchesSelectedLanguageCodes, UNKNOWN_LANGUAGE_CODE } from '@/lib/language'
 import { toGroup } from '@/lib/link'
 import {
   areStringArraysEqual,
+  buildSharedFeedRelayOptions,
   createDefaultSharedFeedFilterSettings,
   getSelectedAuthorPubkeys,
   getSharedFeedFilterSinceTimestamp,
   isRelaySelectionActive,
   isSharedFeedFilterActive,
   matchesMutedWordList,
+  prependFollowingListOption,
+  type TFeedFilterLanguageOption,
   type TFeedFilterListOption,
   type TFeedFilterRelayOption
 } from '@/lib/shared-feed-filters'
-import { dedupeRelayTargetsByIdentity, getRelayIdentity } from '@/lib/relay-targets'
-import { simplifyUrl } from '@/lib/url'
+import { buildGroupRelayTargets, getRelayIdentity } from '@/lib/relay-targets'
 import { usePrimaryPage, useSecondaryPage } from '@/PageManager'
 import { useFetchProfile } from '@/hooks'
+import useSharedFeedCustomRelayUrls from '@/hooks/useSharedFeedCustomRelayUrls'
 import useSharedFeedFilterSettings from '@/hooks/useSharedFeedFilterSettings'
 import {
   DISCOVER_GROUPS_PRESENCE_TTL_MS,
@@ -32,6 +36,7 @@ import {
   useGroupPresenceMap
 } from '@/hooks/useGroupPresence'
 import { compareGroupPresenceStates, createGroupPresenceState } from '@/lib/group-presence'
+import { useFollowList } from '@/providers/FollowListProvider'
 import { useGroups } from '@/providers/GroupsProvider'
 import { useLists } from '@/providers/ListsProvider'
 import { useMuteList } from '@/providers/MuteListProvider'
@@ -298,8 +303,14 @@ const GroupsPage = forwardRef<
   } = useGroups()
   const { startJoinFlow, sendToWorker } = useWorkerBridge()
   const { pubkey } = useNostr()
+  const { followings = [] } = useFollowList()
   const { lists } = useLists()
   const { mutePubkeySet } = useMuteList()
+  const {
+    relayUrls: customRelayUrls,
+    addRelayUrl: addCustomRelayUrl,
+    removeRelayIdentity: removeCustomRelayIdentity
+  } = useSharedFeedCustomRelayUrls()
   const {
     settings: sharedFilterSettings,
     setSettings: setSharedFilterSettings,
@@ -323,24 +334,55 @@ const GroupsPage = forwardRef<
   const { push } = useSecondaryPage()
 
   const inviteGroupIds = useMemo(() => new Set(invites.map((inv) => inv.groupId)), [invites])
+  const groupRelayTargets = useMemo(
+    () =>
+      buildGroupRelayTargets({
+        myGroupList,
+        resolveRelayUrl,
+        getProvisionalGroupMetadata,
+        discoveryGroups
+      }),
+    [discoveryGroups, getProvisionalGroupMetadata, myGroupList, resolveRelayUrl]
+  )
   const discoveryRelayOptions = useMemo<TFeedFilterRelayOption[]>(
     () =>
-      dedupeRelayTargetsByIdentity(discoveryRelays).map((target) => ({
-        relayIdentity: target.relayIdentity,
-        relayUrl: target.relayUrl,
-        label: simplifyUrl(target.relayUrl)
-      })),
-    [discoveryRelays]
+      buildSharedFeedRelayOptions({
+        discoveryRelayUrls: discoveryRelays,
+        groupRelayTargets,
+        customRelayUrls
+      }),
+    [customRelayUrls, discoveryRelays, groupRelayTargets]
   )
   const sharedListOptions = useMemo<TFeedFilterListOption[]>(
     () =>
-      lists.map((list) => ({
-        key: `${list.event.pubkey}:${list.id}`,
-        label: list.title,
-        authorPubkeys: list.pubkeys || [],
-        description: list.description || null
+      prependFollowingListOption(
+        lists.map((list) => ({
+          key: `${list.event.pubkey}:${list.id}`,
+          label: list.title,
+          authorPubkeys: list.pubkeys || [],
+          description: list.description || null
+        })),
+        {
+          followings,
+          includeFollowing: Boolean(pubkey),
+          label: t('Following'),
+          description: t('From people you follow')
+        }
+      ),
+    [followings, lists, pubkey, t]
+  )
+  const languageOptions = useMemo<TFeedFilterLanguageOption[]>(
+    () => [
+      ...FILTER_LANGUAGE_CODES.map((code) => ({
+        code,
+        label: getFilterLanguageLabel(code)
       })),
-    [lists]
+      {
+        code: UNKNOWN_LANGUAGE_CODE,
+        label: t('Unknown')
+      }
+    ],
+    [t]
   )
   const defaultSharedFilterSettings = useMemo(
     () =>
@@ -353,10 +395,10 @@ const GroupsPage = forwardRef<
   )
   const effectiveSelectedRelayIdentities = useMemo(
     () =>
-      sharedFilterSettings.selectedRelayIdentities.length === 0 && !hasSavedSettings
+      sharedFilterSettings.selectedRelayIdentities.length === 0
         ? discoveryRelayOptions.map((option) => option.relayIdentity)
         : sharedFilterSettings.selectedRelayIdentities,
-    [discoveryRelayOptions, hasSavedSettings, sharedFilterSettings.selectedRelayIdentities]
+    [discoveryRelayOptions, sharedFilterSettings.selectedRelayIdentities]
   )
   const selectedAuthorPubkeySet = useMemo(
     () => getSelectedAuthorPubkeys(sharedListOptions, sharedFilterSettings.selectedListKeys),
@@ -910,6 +952,16 @@ const GroupsPage = forwardRef<
         return false
       }
 
+      if (
+        sharedFilterSettings.selectedLanguageCodes.length > 0
+        && !matchesSelectedLanguageCodes(
+          [row.name, row.about],
+          sharedFilterSettings.selectedLanguageCodes
+        )
+      ) {
+        return false
+      }
+
       if (!query) return true
 
       const values = [row.name, row.about, row.groupId, admin]
@@ -951,6 +1003,7 @@ const GroupsPage = forwardRef<
     search,
     selectedAuthorPubkeySet,
     sharedFilterSettings.maxItemsPerAuthor,
+    sharedFilterSettings.selectedLanguageCodes,
     sharedFilterSettings.mutedWords,
     sharedFilterSettings.recencyEnabled,
     sharedFilterSettings.selectedListKeys.length,
@@ -1694,9 +1747,12 @@ const GroupsPage = forwardRef<
               timeFrameOptions={timeFrameOptions}
               relayOptions={discoveryRelayOptions}
               listOptions={sharedListOptions}
+              languageOptions={languageOptions}
               isActive={isSharedFilterMenuActive}
               onApply={handleApplySharedFilters}
               onReset={handleResetSharedFilters}
+              onCreateRelayOption={addCustomRelayUrl}
+              onRemoveRelayOption={removeCustomRelayIdentity}
             />
           ) : null}
           <Button

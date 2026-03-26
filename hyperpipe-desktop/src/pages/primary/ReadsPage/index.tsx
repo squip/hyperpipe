@@ -1,23 +1,31 @@
 import ArticleList, { TArticleListRef, TArticleSubRequest } from '@/components/ArticleList'
 import SharedFeedFilterMenu from '@/components/SharedFeedFilterMenu'
-import TabsBar, { TTabDefinition } from '@/components/Tabs'
 import { RefreshButton } from '@/components/RefreshButton'
-import { BIG_RELAY_URLS } from '@/constants'
+import TabsBar, { TTabDefinition } from '@/components/Tabs'
 import { useFetchFollowings } from '@/hooks'
+import useSharedFeedCustomRelayUrls from '@/hooks/useSharedFeedCustomRelayUrls'
 import useSharedFeedFilterSettings from '@/hooks/useSharedFeedFilterSettings'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
 import {
+  FILTER_LANGUAGE_CODES,
+  getFilterLanguageLabel,
+  UNKNOWN_LANGUAGE_CODE
+} from '@/lib/language'
+import {
   areStringArraysEqual,
+  buildSharedFeedRelayOptions,
   createDefaultSharedFeedFilterSettings,
   getSelectedAuthorPubkeys,
   getSharedFeedFilterSinceTimestamp,
   isSharedFeedFilterActive,
+  prependFollowingListOption,
+  type TFeedFilterLanguageOption,
   type TFeedFilterListOption,
   type TFeedFilterRelayOption
 } from '@/lib/shared-feed-filters'
-import { dedupeRelayTargetsByIdentity } from '@/lib/relay-targets'
-import { simplifyUrl } from '@/lib/url'
+import { buildGroupRelayTargets } from '@/lib/relay-targets'
 import { isTouchDevice } from '@/lib/utils'
+import { useGroups } from '@/providers/GroupsProvider'
 import { useLists } from '@/providers/ListsProvider'
 import { useNostr } from '@/providers/NostrProvider'
 import client from '@/services/client.service'
@@ -40,6 +48,18 @@ const ReadsPage = forwardRef((_, ref) => {
   const { lists } = useLists()
   const { followings } = useFetchFollowings(pubkey)
   const {
+    discoveryRelays,
+    myGroupList,
+    discoveryGroups,
+    getProvisionalGroupMetadata,
+    resolveRelayUrl
+  } = useGroups()
+  const {
+    relayUrls: customRelayUrls,
+    addRelayUrl: addCustomRelayUrl,
+    removeRelayIdentity: removeCustomRelayIdentity
+  } = useSharedFeedCustomRelayUrls()
+  const {
     settings,
     setSettings,
     resetSettings,
@@ -47,7 +67,7 @@ const ReadsPage = forwardRef((_, ref) => {
     hasSavedSettings
   } = useSharedFeedFilterSettings('reads')
   const [feedMode, setFeedMode] = useState<ReadsFeedMode>('discover')
-  const [baseRelayUrls, setBaseRelayUrls] = useState<string[]>(BIG_RELAY_URLS)
+  const [followingReadRelayUrls, setFollowingReadRelayUrls] = useState<string[]>([])
   const [isResolvingRelayUrls, setIsResolvingRelayUrls] = useState(false)
   const supportTouch = useMemo(() => isTouchDevice(), [])
   const hasFollowings = followings.length > 0
@@ -55,25 +75,59 @@ const ReadsPage = forwardRef((_, ref) => {
 
   useImperativeHandle(ref, () => layoutRef.current)
 
+  const groupRelayTargets = useMemo(
+    () =>
+      buildGroupRelayTargets({
+        myGroupList,
+        resolveRelayUrl,
+        getProvisionalGroupMetadata,
+        discoveryGroups
+      }),
+    [discoveryGroups, getProvisionalGroupMetadata, myGroupList, resolveRelayUrl]
+  )
+
   const listOptions = useMemo<TFeedFilterListOption[]>(
     () =>
-      lists.map((list) => ({
-        key: `${list.event.pubkey}:${list.id}`,
-        label: list.title,
-        authorPubkeys: list.pubkeys || [],
-        description: list.description || null
-      })),
-    [lists]
+      prependFollowingListOption(
+        lists.map((list) => ({
+          key: `${list.event.pubkey}:${list.id}`,
+          label: list.title,
+          authorPubkeys: list.pubkeys || [],
+          description: list.description || null
+        })),
+        {
+          followings,
+          includeFollowing: Boolean(pubkey),
+          label: t('Following'),
+          description: t('From people you follow')
+        }
+      ),
+    [followings, lists, pubkey, t]
   )
 
   const relayOptions = useMemo<TFeedFilterRelayOption[]>(
     () =>
-      dedupeRelayTargetsByIdentity(baseRelayUrls).map((target) => ({
-        relayIdentity: target.relayIdentity,
-        relayUrl: target.relayUrl,
-        label: simplifyUrl(target.relayUrl)
+      buildSharedFeedRelayOptions({
+        discoveryRelayUrls: discoveryRelays,
+        groupRelayTargets,
+        customRelayUrls,
+        extraRelayUrls: feedMode === 'following' ? followingReadRelayUrls : []
+      }),
+    [customRelayUrls, discoveryRelays, feedMode, followingReadRelayUrls, groupRelayTargets]
+  )
+
+  const languageOptions = useMemo<TFeedFilterLanguageOption[]>(
+    () => [
+      ...FILTER_LANGUAGE_CODES.map((code) => ({
+        code,
+        label: getFilterLanguageLabel(code)
       })),
-    [baseRelayUrls]
+      {
+        code: UNKNOWN_LANGUAGE_CODE,
+        label: t('Unknown')
+      }
+    ],
+    [t]
   )
 
   const defaultFilterSettings = useMemo(
@@ -88,10 +142,10 @@ const ReadsPage = forwardRef((_, ref) => {
 
   const effectiveSelectedRelayIdentities = useMemo(
     () =>
-      settings.selectedRelayIdentities.length === 0 && !hasSavedSettings
+      settings.selectedRelayIdentities.length === 0
         ? relayOptions.map((option) => option.relayIdentity)
         : settings.selectedRelayIdentities,
-    [hasSavedSettings, relayOptions, settings.selectedRelayIdentities]
+    [relayOptions, settings.selectedRelayIdentities]
   )
 
   useEffect(() => {
@@ -105,7 +159,7 @@ const ReadsPage = forwardRef((_, ref) => {
 
     const resolveRelayUrls = async () => {
       if (feedMode !== 'following' || !pubkey || !canUseFollowing) {
-        setBaseRelayUrls(BIG_RELAY_URLS)
+        setFollowingReadRelayUrls([])
         setIsResolvingRelayUrls(false)
         return
       }
@@ -115,12 +169,12 @@ const ReadsPage = forwardRef((_, ref) => {
       try {
         const relayList = await client.fetchRelayList(pubkey)
         if (cancelled) return
-        setBaseRelayUrls(Array.from(new Set(relayList.read.concat(BIG_RELAY_URLS))).slice(0, 8))
+        setFollowingReadRelayUrls(Array.from(new Set(relayList.read.filter(Boolean))).slice(0, 8))
       } catch (error) {
         console.error('Failed to initialize following Reads feed', error)
         if (!cancelled) {
           setFeedMode('discover')
-          setBaseRelayUrls(BIG_RELAY_URLS)
+          setFollowingReadRelayUrls([])
         }
       } finally {
         if (!cancelled) {
@@ -182,7 +236,7 @@ const ReadsPage = forwardRef((_, ref) => {
         return followings
       }
 
-      return followings.filter((pubkey) => selectedAuthorPubkeySet.has(pubkey))
+      return followings.filter((accountPubkey) => selectedAuthorPubkeySet.has(accountPubkey))
     }
 
     return Array.from(selectedAuthorPubkeySet)
@@ -243,9 +297,12 @@ const ReadsPage = forwardRef((_, ref) => {
             timeFrameOptions={timeFrameOptions}
             relayOptions={relayOptions}
             listOptions={listOptions}
+            languageOptions={languageOptions}
             isActive={isFilterActive}
             onApply={setSettings}
             onReset={(nextSettings) => resetSettings(nextSettings)}
+            onCreateRelayOption={addCustomRelayUrl}
+            onRemoveRelayOption={removeCustomRelayIdentity}
           />
         </div>
       )}
@@ -276,6 +333,7 @@ const ReadsPage = forwardRef((_, ref) => {
         sinceTimestamp={sinceTimestamp}
         mutedWords={settings.mutedWords}
         maxItemsPerAuthor={settings.maxItemsPerAuthor}
+        selectedLanguageCodes={settings.selectedLanguageCodes}
       />
     )
   }

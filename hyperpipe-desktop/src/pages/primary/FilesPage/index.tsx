@@ -12,9 +12,16 @@ import {
   isRelaySelectionActive,
   isSharedFeedFilterActive,
   matchesMutedWordList,
+  prependFollowingListOption,
+  type TFeedFilterExtensionOption,
   type TFeedFilterListOption,
   type TFeedFilterRelayOption
 } from '@/lib/shared-feed-filters'
+import {
+  getGroupFileExtensionLabel,
+  normalizeGroupFileExtension,
+  resolveGroupFileExtension
+} from '@/lib/group-files'
 import {
   buildGroupRelayDisplayMetaMap,
   buildGroupRelayTargets,
@@ -24,6 +31,7 @@ import {
 import { simplifyUrl } from '@/lib/url'
 import { useGroupFiles } from '@/providers/GroupFilesProvider'
 import { useGroups } from '@/providers/GroupsProvider'
+import { useFollowList } from '@/providers/FollowListProvider'
 import { useLists } from '@/providers/ListsProvider'
 import { useMuteList } from '@/providers/MuteListProvider'
 import { TPageRef } from '@/types'
@@ -37,6 +45,7 @@ const FilesPage = forwardRef<TPageRef>((_, ref) => {
   const { t } = useTranslation()
   const { records, isLoading, refresh, lastUpdated } = useGroupFiles()
   const { lists } = useLists()
+  const { followings } = useFollowList()
   const { mutePubkeySet } = useMuteList()
   const { myGroupList, discoveryGroups, getProvisionalGroupMetadata, resolveRelayUrl } = useGroups()
   const {
@@ -85,14 +94,48 @@ const FilesPage = forwardRef<TPageRef>((_, ref) => {
 
   const listOptions = useMemo<TFeedFilterListOption[]>(
     () =>
-      lists.map((list) => ({
-        key: `${list.event.pubkey}:${list.id}`,
-        label: list.title,
-        authorPubkeys: list.pubkeys || [],
-        description: list.description || null
-      })),
-    [lists]
+      prependFollowingListOption(
+        lists.map((list) => ({
+          key: `${list.event.pubkey}:${list.id}`,
+          label: list.title,
+          authorPubkeys: list.pubkeys || [],
+          description: list.description || null
+        })),
+        {
+          followings,
+          includeFollowing: true,
+          label: t('Following'),
+          description: t('From people you follow')
+        }
+      ),
+    [followings, lists, t]
   )
+
+  const fileExtensionOptions = useMemo<TFeedFilterExtensionOption[]>(() => {
+    const optionByExtension = new Map<string, TFeedFilterExtensionOption>()
+    const order: string[] = []
+
+    records.forEach((record) => {
+      const extension = resolveGroupFileExtension(record)
+      if (!optionByExtension.has(extension)) {
+        order.push(extension)
+      }
+      optionByExtension.set(extension, {
+        extension,
+        label: getGroupFileExtensionLabel(extension),
+        description: record.mime || null
+      })
+    })
+
+    return order
+      .sort((left, right) => {
+        if (left === 'unknown') return 1
+        if (right === 'unknown') return -1
+        return left.localeCompare(right)
+      })
+      .map((extension) => optionByExtension.get(extension))
+      .filter((option): option is TFeedFilterExtensionOption => !!option)
+  }, [records])
 
   const defaultFilterSettings = useMemo(
     () =>
@@ -106,10 +149,10 @@ const FilesPage = forwardRef<TPageRef>((_, ref) => {
 
   const effectiveSelectedRelayIdentities = useMemo(
     () =>
-      settings.selectedRelayIdentities.length === 0 && !hasSavedSettings
+      settings.selectedRelayIdentities.length === 0
         ? relayOptions.map((option) => option.relayIdentity)
         : settings.selectedRelayIdentities,
-    [hasSavedSettings, relayOptions, settings.selectedRelayIdentities]
+    [relayOptions, settings.selectedRelayIdentities]
   )
 
   useEffect(() => {
@@ -143,6 +186,11 @@ const FilesPage = forwardRef<TPageRef>((_, ref) => {
   const selectedAuthorPubkeySet = useMemo(
     () => getSelectedAuthorPubkeys(listOptions, settings.selectedListKeys),
     [listOptions, settings.selectedListKeys]
+  )
+
+  const selectedFileExtensionSet = useMemo(
+    () => new Set(settings.selectedFileExtensions),
+    [settings.selectedFileExtensions]
   )
 
   const sinceTimestamp = useMemo(
@@ -182,6 +230,13 @@ const FilesPage = forwardRef<TPageRef>((_, ref) => {
       }
 
       if (
+        settings.selectedFileExtensions.length > 0
+        && !selectedFileExtensionSet.has(resolveGroupFileExtension(record))
+      ) {
+        return false
+      }
+
+      if (
         matchesMutedWordList(
           [record.fileName, record.alt, record.summary, record.groupName, record.groupId],
           settings.mutedWords
@@ -210,9 +265,11 @@ const FilesPage = forwardRef<TPageRef>((_, ref) => {
     records,
     relayFilterActive,
     selectedAuthorPubkeySet,
+    selectedFileExtensionSet,
     settings.maxItemsPerAuthor,
     settings.mutedWords,
     settings.recencyEnabled,
+    settings.selectedFileExtensions.length,
     settings.selectedListKeys.length,
     sinceTimestamp
   ])
@@ -266,9 +323,11 @@ const FilesPage = forwardRef<TPageRef>((_, ref) => {
             timeFrameOptions={timeFrameOptions}
             relayOptions={relayOptions}
             listOptions={listOptions}
+            fileExtensionOptions={fileExtensionOptions}
             isActive={isFilterActive}
             onApply={setSettings}
             onReset={(nextSettings) => resetSettings(nextSettings)}
+            createFileExtensionValue={normalizeGroupFileExtension}
           />
           <Button
             variant="ghost"

@@ -28,7 +28,14 @@ import {
   AlertDialogTitle
 } from '@/components/ui/alert-dialog'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
+import useSharedFeedCustomRelayUrls from '@/hooks/useSharedFeedCustomRelayUrls'
 import { toCreateList, toEditList } from '@/lib/link'
+import {
+  FILTER_LANGUAGE_CODES,
+  getFilterLanguageLabel,
+  matchesSelectedLanguageCodes,
+  UNKNOWN_LANGUAGE_CODE
+} from '@/lib/language'
 import localStorageService from '@/services/local-storage.service'
 import listStatsService from '@/services/list-stats.service'
 import { useFollowList } from '@/providers/FollowListProvider'
@@ -44,25 +51,24 @@ import client from '@/services/client.service'
 import { ExtendedKind, BIG_RELAY_URLS } from '@/constants'
 import {
   areStringArraysEqual,
+  buildSharedFeedRelayOptions,
   createDefaultSharedFeedFilterSettings,
   getSelectedAuthorPubkeys,
   getSharedFeedFilterSinceTimestamp,
   isRelaySelectionActive,
   isSharedFeedFilterActive,
   matchesMutedWordList,
+  prependFollowingListOption,
+  type TFeedFilterLanguageOption,
   type TFeedFilterListOption,
   type TFeedFilterRelayOption
 } from '@/lib/shared-feed-filters'
 import {
-  buildGroupRelayDisplayMetaMap,
   buildGroupRelayTargets,
-  dedupeRelayTargetsByIdentity,
   dedupeRelayUrlsByIdentity,
   getRelayIdentity,
-  type GroupRelayTarget,
-  type RelayDisplayMeta
+  type GroupRelayTarget
 } from '@/lib/relay-targets'
-import { simplifyUrl } from '@/lib/url'
 import {
   forwardRef,
   useCallback,
@@ -94,11 +100,6 @@ import { Event } from '@nostr/tools/wasm'
 import PullToRefresh from 'react-simple-pull-to-refresh'
 
 type TSortBy = 'recent' | 'zaps'
-type TDiscoverRelayOption = {
-  relayUrl: string
-  relayIdentity: string
-  meta?: RelayDisplayMeta
-}
 const GROUP_RELAY_READY_TTL_MS = 30_000
 const LIST_NOTE_FEED_KINDS = [1, 6]
 
@@ -108,12 +109,23 @@ const ListsPage = forwardRef((_, ref) => {
   useImperativeHandle(ref, () => layoutRef.current)
 
   const { pubkey, checkLogin } = useNostr()
-  const { myGroupList, discoveryGroups, getProvisionalGroupMetadata, resolveRelayUrl } = useGroups()
+  const {
+    myGroupList,
+    discoveryGroups,
+    discoveryRelays,
+    getProvisionalGroupMetadata,
+    resolveRelayUrl
+  } = useGroups()
   const { refreshRelaySubscriptions } = useWorkerBridge()
   const { push } = useSecondaryPage()
   const { lists, isLoading: isLoadingMyLists, deleteList, fetchLists } = useLists()
   const { followings = [], followMultiple, unfollowMultiple } = useFollowList()
   const { mutePubkeySet } = useMuteList()
+  const {
+    relayUrls: customRelayUrls,
+    addRelayUrl: addCustomRelayUrl,
+    removeRelayIdentity: removeCustomRelayIdentity
+  } = useSharedFeedCustomRelayUrls()
   const { isSmallScreen } = useScreenSize()
   const {
     settings: sharedFilterSettings,
@@ -208,51 +220,50 @@ const ListsPage = forwardRef((_, ref) => {
   )
   const stableGroupRelayTargets = useMemo(() => groupRelayTargets, [groupRelayTargetsSignature])
 
-  const groupRelayDisplayMeta = useMemo<Record<string, RelayDisplayMeta>>(
-    () => buildGroupRelayDisplayMetaMap(stableGroupRelayTargets),
-    [stableGroupRelayTargets]
-  )
-
-  const discoverFetchRelayUrls = useMemo(
-    () =>
-      dedupeRelayUrlsByIdentity([
-        ...BIG_RELAY_URLS.slice(0, 5),
-        ...stableGroupRelayTargets.map((target) => target.relayUrl)
-      ]),
-    [stableGroupRelayTargets]
-  )
-
-  const discoverRelayOptions = useMemo<TDiscoverRelayOption[]>(
-    () =>
-      dedupeRelayTargetsByIdentity(discoverFetchRelayUrls).map((target) => ({
-        ...target,
-        meta: groupRelayDisplayMeta[target.relayIdentity] || groupRelayDisplayMeta[target.relayUrl]
-      })),
-    [discoverFetchRelayUrls, groupRelayDisplayMeta]
-  )
-
   const sharedRelayOptions = useMemo<TFeedFilterRelayOption[]>(
     () =>
-      discoverRelayOptions.map((option) => ({
-        relayIdentity: option.relayIdentity,
-        relayUrl: option.relayUrl,
-        label: option.meta?.label?.trim() || simplifyUrl(option.relayUrl),
-        subtitle: option.meta?.hideUrl ? null : simplifyUrl(option.relayUrl),
-        imageUrl: option.meta?.imageUrl || null,
-        hideUrl: option.meta?.hideUrl
-      })),
-    [discoverRelayOptions]
+      buildSharedFeedRelayOptions({
+        discoveryRelayUrls: discoveryRelays,
+        groupRelayTargets: stableGroupRelayTargets,
+        customRelayUrls
+      }),
+    [customRelayUrls, discoveryRelays, stableGroupRelayTargets]
   )
 
   const sharedListOptions = useMemo<TFeedFilterListOption[]>(
     () =>
-      lists.map((list) => ({
-        key: `${list.event.pubkey}:${list.id}`,
-        label: list.title,
-        authorPubkeys: list.pubkeys || [],
-        description: list.description || null
+      prependFollowingListOption(
+        lists.map((list) => ({
+          key: `${list.event.pubkey}:${list.id}`,
+          label: list.title,
+          authorPubkeys: list.pubkeys || [],
+          description: list.description || null
+        })),
+        {
+          followings,
+          includeFollowing: Boolean(pubkey),
+          label: t('Following'),
+          description: t('From people you follow')
+        }
+      ),
+    [followings, lists, pubkey, t]
+  )
+  const languageOptions = useMemo<TFeedFilterLanguageOption[]>(
+    () => [
+      ...FILTER_LANGUAGE_CODES.map((code) => ({
+        code,
+        label: getFilterLanguageLabel(code)
       })),
-    [lists]
+      {
+        code: UNKNOWN_LANGUAGE_CODE,
+        label: t('Unknown')
+      }
+    ],
+    [t]
+  )
+  const baseDiscoverFetchRelayUrls = useMemo(
+    () => dedupeRelayUrlsByIdentity([...discoveryRelays, ...customRelayUrls]),
+    [customRelayUrls, discoveryRelays]
   )
 
   const defaultSharedFilterSettings = useMemo(
@@ -267,10 +278,10 @@ const ListsPage = forwardRef((_, ref) => {
 
   const effectiveSelectedRelayIdentities = useMemo(
     () =>
-      sharedFilterSettings.selectedRelayIdentities.length === 0 && !hasSavedSettings
+      sharedFilterSettings.selectedRelayIdentities.length === 0
         ? sharedRelayOptions.map((option) => option.relayIdentity)
         : sharedFilterSettings.selectedRelayIdentities,
-    [hasSavedSettings, sharedFilterSettings.selectedRelayIdentities, sharedRelayOptions]
+    [sharedFilterSettings.selectedRelayIdentities, sharedRelayOptions]
   )
 
   useEffect(() => {
@@ -278,9 +289,9 @@ const ListsPage = forwardRef((_, ref) => {
   }, [isSmallScreen])
 
   useEffect(() => {
-    if (!discoverRelayOptions.length) return
+    if (!sharedRelayOptions.length) return
 
-    const availableIdentities = discoverRelayOptions.map((option) => option.relayIdentity)
+    const availableIdentities = sharedRelayOptions.map((option) => option.relayIdentity)
     const availableSet = new Set(availableIdentities)
 
     if (!hasSavedSettings && sharedFilterSettings.selectedRelayIdentities.length === 0) {
@@ -301,7 +312,7 @@ const ListsPage = forwardRef((_, ref) => {
       })
     }
   }, [
-    discoverRelayOptions,
+    sharedRelayOptions,
     hasSavedSettings,
     setSharedFilterSettings,
     sharedFilterSettings,
@@ -417,13 +428,14 @@ const ListsPage = forwardRef((_, ref) => {
     const run = (async () => {
       setIsLoadingPublicLists(true)
       try {
-        const baseRelayUrls = dedupeRelayUrlsByIdentity(BIG_RELAY_URLS.slice(0, 5))
         const readyGroupRelayUrlsPromise = resolveReadyGroupRelayUrls()
 
-        const baseEvents = await client.fetchEvents(baseRelayUrls, {
-          kinds: [ExtendedKind.STARTER_PACK],
-          limit: 50
-        })
+        const baseEvents = baseDiscoverFetchRelayUrls.length
+          ? await client.fetchEvents(baseDiscoverFetchRelayUrls, {
+              kinds: [ExtendedKind.STARTER_PACK],
+              limit: 50
+            })
+          : []
         const baseLists = dedupeLatestLists(baseEvents.map((event) => parseStarterPackEvent(event)))
         setAllPublicLists(baseLists)
         setIsLoadingPublicLists(false)
@@ -456,7 +468,7 @@ const ListsPage = forwardRef((_, ref) => {
         publicListsFetchInFlightRef.current = null
       }
     }
-  }, [dedupeLatestLists, resolveReadyGroupRelayUrls])
+  }, [baseDiscoverFetchRelayUrls, dedupeLatestLists, resolveReadyGroupRelayUrls])
 
   useEffect(() => {
     fetchPublicLists()
@@ -539,13 +551,14 @@ const ListsPage = forwardRef((_, ref) => {
 
     setIsLoadingSelectedList(true)
     try {
-      const baseRelayUrls = dedupeRelayUrlsByIdentity(BIG_RELAY_URLS.slice(0, 5))
-      let events = await client.fetchEvents(baseRelayUrls, {
-        kinds: [ExtendedKind.STARTER_PACK],
-        authors: [ownerPubkey],
-        '#d': [dTag],
-        limit: 1
-      })
+      let events = baseDiscoverFetchRelayUrls.length
+        ? await client.fetchEvents(baseDiscoverFetchRelayUrls, {
+            kinds: [ExtendedKind.STARTER_PACK],
+            authors: [ownerPubkey],
+            '#d': [dTag],
+            limit: 1
+          })
+        : []
       if (!events.length) {
         const readyGroupRelayUrls = await resolveReadyGroupRelayUrls()
         if (readyGroupRelayUrls.length > 0) {
@@ -1074,6 +1087,16 @@ const ListsPage = forwardRef((_, ref) => {
           return false
         }
 
+        if (
+          sharedFilterSettings.selectedLanguageCodes.length > 0
+          && !matchesSelectedLanguageCodes(
+            [list.title, list.description, list.event.content],
+            sharedFilterSettings.selectedLanguageCodes
+          )
+        ) {
+          return false
+        }
+
         return true
       })
 
@@ -1096,6 +1119,7 @@ const ListsPage = forwardRef((_, ref) => {
       relayFilterActive,
       selectedAuthorPubkeySet,
       sharedFilterSettings.maxItemsPerAuthor,
+      sharedFilterSettings.selectedLanguageCodes,
       sharedFilterSettings.mutedWords,
       sharedFilterSettings.recencyEnabled,
       sharedFilterSettings.selectedListKeys.length,
@@ -1266,9 +1290,12 @@ const ListsPage = forwardRef((_, ref) => {
       timeFrameOptions={timeFrameOptions}
       relayOptions={sharedRelayOptions}
       listOptions={sharedListOptions}
+      languageOptions={languageOptions}
       isActive={isSharedFilterMenuActive}
       onApply={setSharedFilterSettings}
       onReset={(nextSettings) => resetSharedFilterSettings(nextSettings)}
+      onCreateRelayOption={addCustomRelayUrl}
+      onRemoveRelayOption={removeCustomRelayIdentity}
     />
   )
 

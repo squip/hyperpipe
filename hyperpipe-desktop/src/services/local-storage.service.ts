@@ -171,6 +171,7 @@ class LocalStorageService {
     string,
     Partial<Record<TSharedFeedFilterPage, TStoredSharedFeedFilterSettings>>
   > = {}
+  private sharedFeedFilterCustomRelayUrlsMap: Record<string, string[]> = {}
   private muteListCacheMap: Record<string, TMutedList> = {}
   private shownCreateWalletGuideToastPubkeys: Set<string> = new Set()
   private sidebarCollapse: boolean = false
@@ -403,6 +404,16 @@ class LocalStorageService {
         this.sharedFeedFilterSettingsMap = JSON.parse(sharedFeedFilterSettingsStr)
       } catch {
         this.sharedFeedFilterSettingsMap = {}
+      }
+    }
+    const sharedFeedFilterCustomRelaysStr = window.localStorage.getItem(
+      StorageKey.SHARED_FEED_FILTER_CUSTOM_RELAYS
+    )
+    if (sharedFeedFilterCustomRelaysStr) {
+      try {
+        this.sharedFeedFilterCustomRelayUrlsMap = JSON.parse(sharedFeedFilterCustomRelaysStr)
+      } catch {
+        this.sharedFeedFilterCustomRelayUrlsMap = {}
       }
     }
     const muteListCacheStr = window.localStorage.getItem(StorageKey.MUTE_LIST_CACHE)
@@ -776,6 +787,21 @@ class LocalStorageService {
     window.localStorage.setItem(
       StorageKey.SHARED_FEED_FILTER_SETTINGS,
       JSON.stringify(this.sharedFeedFilterSettingsMap)
+    )
+  }
+
+  getSharedFeedFilterCustomRelayUrls(pubkey: string | null | undefined) {
+    const key = pubkey || '_global'
+    const relayUrls = this.sharedFeedFilterCustomRelayUrlsMap[key]
+    return Array.isArray(relayUrls) ? relayUrls.filter(Boolean) : []
+  }
+
+  setSharedFeedFilterCustomRelayUrls(pubkey: string | null | undefined, relayUrls: string[]) {
+    const key = pubkey || '_global'
+    this.sharedFeedFilterCustomRelayUrlsMap[key] = Array.from(new Set(relayUrls.filter(Boolean)))
+    window.localStorage.setItem(
+      StorageKey.SHARED_FEED_FILTER_CUSTOM_RELAYS,
+      JSON.stringify(this.sharedFeedFilterCustomRelayUrlsMap)
     )
   }
 

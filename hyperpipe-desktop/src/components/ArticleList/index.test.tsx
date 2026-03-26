@@ -201,4 +201,34 @@ describe('ArticleList shared feed filtering', () => {
     expect(screen.queryByText('Busy article one|busy-author')).not.toBeInTheDocument()
     expect(screen.queryByText('Busy article two|busy-author')).not.toBeInTheDocument()
   })
+
+  it('filters articles by detected language when language codes are selected', async () => {
+    subscribedEventsMock = [
+      createArticleEvent({
+        id: 'article-1',
+        pubkey: 'author-en',
+        title: 'English article',
+        content: 'This article is written in English and should be filtered out.'
+      }),
+      createArticleEvent({
+        id: 'article-2',
+        pubkey: 'author-ja',
+        title: 'Japanese article',
+        content: 'これは日本語で書かれた記事です。'
+      })
+    ]
+
+    render(
+      <ArticleList
+        subRequests={[{ source: 'relays', urls: ['wss://relay.test'], filter: {} }]}
+        selectedLanguageCodes={['ja']}
+      />
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Japanese article|author-ja')).toBeInTheDocument()
+    })
+
+    expect(screen.queryByText('English article|author-en')).not.toBeInTheDocument()
+  })
 })

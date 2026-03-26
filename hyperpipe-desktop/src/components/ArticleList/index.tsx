@@ -1,5 +1,6 @@
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { matchesSelectedLanguageCodes } from '@/lib/language'
 import { matchesMutedWordList } from '@/lib/shared-feed-filters'
 import { isTouchDevice } from '@/lib/utils'
 import { useMuteList } from '@/providers/MuteListProvider'
@@ -34,12 +35,14 @@ const ArticleList = forwardRef(
       subRequests,
       mutedWords = '',
       maxItemsPerAuthor = 0,
-      sinceTimestamp
+      sinceTimestamp,
+      selectedLanguageCodes = []
     }: {
       subRequests: TArticleSubRequest[]
       mutedWords?: string
       maxItemsPerAuthor?: number
       sinceTimestamp?: number
+      selectedLanguageCodes?: string[]
     },
     ref
   ) => {
@@ -215,6 +218,17 @@ const ArticleList = forwardRef(
 
           return !matchesMutedWordList([title, summary, event.content, ...hashtags], mutedWords)
         })
+        .filter((event) => {
+          if (!selectedLanguageCodes.length) return true
+
+          const title = event.tags.find((tag) => tag[0] === 'title')?.[1] || ''
+          const summary = event.tags.find((tag) => tag[0] === 'summary')?.[1] || ''
+
+          return matchesSelectedLanguageCodes(
+            [title, summary, event.content],
+            selectedLanguageCodes
+          )
+        })
         .sort((a, b) => {
           const aPublishedAt =
             parseInt(a.tags.find((tag) => tag[0] === 'published_at')?.[1] || '0') ||
@@ -230,7 +244,7 @@ const ArticleList = forwardRef(
           return count <= maxItemsPerAuthor
         })
         .slice(0, showCount)
-    }, [articles, maxItemsPerAuthor, mutedWords, mutePubkeySet, showCount])
+    }, [articles, maxItemsPerAuthor, mutedWords, mutePubkeySet, selectedLanguageCodes, showCount])
 
     const handleRefresh = async () => {
       refresh()

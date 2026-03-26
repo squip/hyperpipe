@@ -23,6 +23,30 @@ export type GroupFileRecord = {
   summary: string | null
 }
 
+const MIME_EXTENSION_FALLBACKS: Record<string, string> = {
+  'application/gzip': 'gz',
+  'application/json': 'json',
+  'application/msword': 'doc',
+  'application/pdf': 'pdf',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.ms-powerpoint': 'ppt',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/xml': 'xml',
+  'application/zip': 'zip',
+  'audio/flac': 'flac',
+  'audio/mpeg': 'mp3',
+  'audio/wav': 'wav',
+  'image/jpeg': 'jpg',
+  'image/svg+xml': 'svg',
+  'text/csv': 'csv',
+  'text/html': 'html',
+  'text/markdown': 'md',
+  'text/plain': 'txt',
+  'video/quicktime': 'mov'
+}
+
 function readTag(tags: string[][], name: string) {
   return tags.find((tag) => tag[0] === name)?.[1]
 }
@@ -47,6 +71,54 @@ function getUrlFileName(url: string) {
     const name = url.split('?')[0].split('#')[0].split('/').filter(Boolean).pop()?.trim()
     return name || null
   }
+}
+
+function extractFileExtension(value?: string | null) {
+  const normalized = String(value || '').trim()
+  if (!normalized) return null
+
+  const fileName = normalized.split(/[?#]/)[0].split('/').filter(Boolean).pop() || normalized
+  const lastDotIndex = fileName.lastIndexOf('.')
+  if (lastDotIndex <= 0 || lastDotIndex === fileName.length - 1) return null
+
+  const candidate = fileName.slice(lastDotIndex + 1).toLowerCase()
+  return /^[a-z0-9]{1,16}$/i.test(candidate) ? candidate : null
+}
+
+export function normalizeGroupFileExtension(value?: string | null) {
+  const normalized = String(value || '')
+    .trim()
+    .replace(/^\./, '')
+    .toLowerCase()
+  if (!normalized) return null
+  if (normalized === 'unknown') return 'unknown'
+  return /^[a-z0-9]{1,16}$/i.test(normalized) ? normalized : null
+}
+
+export function resolveGroupFileExtension(record: Pick<GroupFileRecord, 'fileName' | 'url' | 'mime'>) {
+  const fromFileName = extractFileExtension(record.fileName)
+  if (fromFileName) return fromFileName
+
+  const fromUrl = extractFileExtension(record.url)
+  if (fromUrl) return fromUrl
+
+  const normalizedMime = toOptionalString(record.mime)?.toLowerCase() || null
+  if (normalizedMime) {
+    const mappedExtension = MIME_EXTENSION_FALLBACKS[normalizedMime]
+    if (mappedExtension) return mappedExtension
+
+    const mimeSubtype = normalizedMime.split('/')[1] || ''
+    const normalizedSubtype = normalizeGroupFileExtension(
+      mimeSubtype.replace(/^x-/, '').replace(/\+xml$/, 'xml')
+    )
+    if (normalizedSubtype) return normalizedSubtype
+  }
+
+  return 'unknown'
+}
+
+export function getGroupFileExtensionLabel(extension: string) {
+  return extension === 'unknown' ? 'Unknown' : `.${extension}`
 }
 
 function buildFallbackFileName(sha256: string | null) {
