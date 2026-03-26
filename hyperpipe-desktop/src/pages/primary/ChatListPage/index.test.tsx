@@ -15,11 +15,8 @@ const {
   acceptInviteMock,
   refreshConversationsMock,
   refreshInvitesMock,
-  updateConversationMetadataMock,
   dismissInviteMock,
   toastErrorMock,
-  toastWarningMock,
-  mediaUploadMock,
   messengerState
 } = vi.hoisted(() => ({
   pushMock: vi.fn(),
@@ -27,15 +24,15 @@ const {
   acceptInviteMock: vi.fn(),
   refreshConversationsMock: vi.fn(async () => []),
   refreshInvitesMock: vi.fn(async () => []),
-  updateConversationMetadataMock: vi.fn(async () => {}),
   dismissInviteMock: vi.fn(),
   toastErrorMock: vi.fn(),
-  toastWarningMock: vi.fn(),
-  mediaUploadMock: vi.fn(),
   messengerState: {
     invites: [] as Array<Record<string, unknown>>,
     conversations: [] as Array<Record<string, unknown>>,
-    inviteProfiles: [] as Array<Record<string, string>>
+    inviteProfiles: [] as Array<Record<string, string>>,
+    ready: true,
+    initialSyncPending: false,
+    unsupportedReason: undefined as string | undefined
   }
 }))
 
@@ -127,27 +124,20 @@ vi.mock('@/providers/MessengerProvider', () => ({
     conversations: messengerState.conversations,
     invites: messengerState.invites,
     pendingInviteCount: messengerState.invites.length,
-    ready: true,
-    unsupportedReason: undefined,
+    ready: messengerState.ready,
+    initialSyncPending: messengerState.initialSyncPending,
+    unsupportedReason: messengerState.unsupportedReason,
     createConversation: createConversationMock,
     acceptInvite: acceptInviteMock,
     refreshConversations: refreshConversationsMock,
     refreshInvites: refreshInvitesMock,
-    updateConversationMetadata: updateConversationMetadataMock,
     dismissInvite: dismissInviteMock
   })
 }))
 
-vi.mock('@/services/media-upload.service', () => ({
-  default: {
-    upload: mediaUploadMock
-  }
-}))
-
 vi.mock('sonner', () => ({
   toast: {
-    error: toastErrorMock,
-    warning: toastWarningMock
+    error: toastErrorMock
   }
 }))
 
@@ -156,16 +146,16 @@ describe('ChatListPage progress UX', () => {
     messengerState.invites = []
     messengerState.conversations = []
     messengerState.inviteProfiles = [{ pubkey: FRIEND_PUBKEY }]
+    messengerState.ready = true
+    messengerState.initialSyncPending = false
+    messengerState.unsupportedReason = undefined
     pushMock.mockReset()
     createConversationMock.mockReset()
     acceptInviteMock.mockReset()
     refreshConversationsMock.mockReset()
     refreshInvitesMock.mockReset()
-    updateConversationMetadataMock.mockReset()
     dismissInviteMock.mockReset()
     toastErrorMock.mockReset()
-    toastWarningMock.mockReset()
-    mediaUploadMock.mockReset()
     globalThis.URL.createObjectURL = vi.fn(() => 'blob:preview')
     globalThis.URL.revokeObjectURL = vi.fn()
   })
@@ -181,7 +171,6 @@ describe('ChatListPage progress UX', () => {
         await new Promise<void>((resolve) => {
           resolveCreate = resolve
         })
-        options?.onProgress?.({ phase: 'syncingConversation' })
         return {
           conversation: {
             id: 'conv-1',
@@ -196,8 +185,7 @@ describe('ChatListPage progress UX', () => {
             lastMessageAt: 0,
             lastReadAt: 0
           },
-          invited: [FRIEND_PUBKEY],
-          failed: [{ pubkey: FRIEND_PUBKEY, error: 'invite failed' }]
+          operationId: 'op-1'
         }
       }
     )
@@ -220,11 +208,9 @@ describe('ChatListPage progress UX', () => {
     })
     expect(refreshConversationsMock).not.toHaveBeenCalled()
     expect(refreshInvitesMock).not.toHaveBeenCalled()
-    expect(toastWarningMock).toHaveBeenCalled()
   })
 
-  it('renders thumbnail upload progress and publishes metadata when an image is selected', async () => {
-    let resolveUpload: ((value: unknown) => void) | null = null
+  it('passes the selected thumbnail file to the provider and navigates immediately on ack', async () => {
     createConversationMock.mockResolvedValue({
       conversation: {
         id: 'conv-2',
@@ -239,17 +225,8 @@ describe('ChatListPage progress UX', () => {
         lastMessageAt: 0,
         lastReadAt: 0
       },
-      invited: [FRIEND_PUBKEY],
-      failed: []
+      operationId: 'op-2'
     })
-    mediaUploadMock.mockImplementation(
-      async (_file: File, options?: { onProgress?: (progress: number) => void }) => {
-        options?.onProgress?.(25)
-        return await new Promise((resolve) => {
-          resolveUpload = resolve
-        })
-      }
-    )
 
     render(<ChatListPage />)
 
@@ -263,62 +240,24 @@ describe('ChatListPage progress UX', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Create chat' }))
 
-    expect(await screen.findByText('Uploading thumbnail… 25%')).toBeInTheDocument()
-
-    resolveUpload?.({
-      url: 'https://cdn.example/thumb.png',
-      metadata: {
-        mimeType: 'image/png',
-        size: 128
-      }
-    })
-
     await waitFor(() => {
-      expect(updateConversationMetadataMock).toHaveBeenCalled()
       expect(pushMock).toHaveBeenCalledWith('/conversations/conv-2')
     })
+    const payload = createConversationMock.mock.calls[0]?.[0] as {
+      thumbnailFile?: File | null
+    }
+    expect(payload.thumbnailFile).toBeInstanceOf(File)
+    expect(screen.queryByText('Uploading thumbnail… 25%')).not.toBeInTheDocument()
   })
 
-  it('still opens the chat when thumbnail upload fails', async () => {
-    createConversationMock.mockResolvedValue({
-      conversation: {
-        id: 'conv-3',
-        protocol: 'marmot',
-        participants: [ME_PUBKEY, FRIEND_PUBKEY],
-        adminPubkeys: [],
-        canInviteMembers: true,
-        title: 'Chat',
-        description: null,
-        imageUrl: null,
-        unreadCount: 0,
-        lastMessageAt: 0,
-        lastReadAt: 0
-      },
-      invited: [FRIEND_PUBKEY],
-      failed: []
-    })
-    mediaUploadMock.mockRejectedValue(new Error('upload failed'))
-
+  it('renders the create-chat dialog with a scrollable body and fixed bottom stack', async () => {
     render(<ChatListPage />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Create' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Add' }))
-    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement
-    fireEvent.change(fileInput, {
-      target: {
-        files: [new File(['thumb'], 'thumb.png', { type: 'image/png' })]
-      }
-    })
-    fireEvent.click(screen.getByRole('button', { name: 'Create chat' }))
 
-    await waitFor(() => {
-      expect(pushMock).toHaveBeenCalledWith('/conversations/conv-3')
-    })
-    expect(
-      toastErrorMock.mock.calls.some(
-        ([message]) => message === 'Chat created, but thumbnail upload failed'
-      )
-    ).toBe(true)
+    expect(document.querySelector('[role=\"dialog\"].overflow-hidden')).toBeTruthy()
+    expect(document.querySelector('[role=\"dialog\"] .min-h-0.flex-1.overflow-y-auto')).toBeTruthy()
+    expect(document.querySelector('[role=\"dialog\"] .shrink-0.space-y-3.border-t.pt-3')).toBeTruthy()
   })
 
   it('shows inline join progress in the active invite row and avoids extra page refreshes', async () => {
@@ -355,7 +294,6 @@ describe('ChatListPage progress UX', () => {
         await new Promise<void>((resolve) => {
           resolveJoin = resolve
         })
-        options?.onProgress?.({ phase: 'syncingConversation' })
         return { conversationId: 'conv-join-1' }
       }
     )
@@ -376,6 +314,18 @@ describe('ChatListPage progress UX', () => {
     })
     expect(refreshConversationsMock).not.toHaveBeenCalled()
     expect(refreshInvitesMock).not.toHaveBeenCalled()
+  })
+
+  it('keeps the invites tab loading while initial sync is pending and no invites are cached', async () => {
+    messengerState.initialSyncPending = true
+    messengerState.ready = true
+    messengerState.unsupportedReason = 'Worker reply timeout after 60000ms'
+
+    render(<ChatListPage initialTab="invites" />)
+
+    expect(screen.getByText('Loading invites...')).toBeInTheDocument()
+    expect(screen.queryByText('Worker reply timeout after 60000ms')).not.toBeInTheDocument()
+    expect(screen.queryByText('No invites')).not.toBeInTheDocument()
   })
 
   it('restores row actions and shows an inline error when join invite fails', async () => {

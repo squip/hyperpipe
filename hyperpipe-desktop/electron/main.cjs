@@ -1015,7 +1015,13 @@ function resolveWorkerRequest(message) {
   const requestId = typeof message.requestId === 'string' ? message.requestId : null;
   if (!requestId) return false;
   const pending = pendingWorkerRequests.get(requestId);
-  if (!pending) return false;
+  if (!pending) {
+    console.debug('[Main] Late worker response with no pending request', {
+      requestId,
+      success: message.success !== false
+    });
+    return false;
+  }
   pendingWorkerRequests.delete(requestId);
   clearTimeout(pending.timeoutId);
   pending.resolve({

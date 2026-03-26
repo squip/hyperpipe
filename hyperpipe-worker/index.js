@@ -8436,13 +8436,10 @@ async function handleMessageObject(message) {
       break
     }
 
-    case 'marmot-init':
     case 'marmot-list-conversations':
     case 'marmot-list-invites':
-    case 'marmot-create-conversation':
     case 'marmot-invite-members':
     case 'marmot-grant-admin':
-    case 'marmot-accept-invite':
     case 'marmot-load-thread':
     case 'marmot-send-message':
     case 'marmot-send-media-message':
@@ -8476,6 +8473,203 @@ async function handleMessageObject(message) {
           ...summarizeMarmotCommandResult(commandType, data)
         })
         sendWorkerResponse(requestId, { success: true, data })
+      } catch (err) {
+        const errorMessage = err?.message || String(err)
+        const elapsedMs = Date.now() - commandStartedAt
+        console.error('[Worker][MarmotCommand] failed', {
+          type: commandType,
+          requestId: requestId || null,
+          elapsedMs,
+          ...commandSummary,
+          error: errorMessage
+        }, err)
+        sendWorkerResponse(requestId, {
+          success: false,
+          error: errorMessage
+        })
+        sendMessage({ type: 'error', message: `${commandType} failed: ${errorMessage}` })
+      }
+      break
+    }
+
+    case 'marmot-init': {
+      const requestId =
+        (typeof message?.requestId === 'string' && message.requestId)
+        || (typeof message?.data?.requestId === 'string' && message.data.requestId)
+        || null
+      const commandType = message.type
+      const payload = message?.data || {}
+      const commandSummary = summarizeMarmotCommandPayload(commandType, payload)
+      const commandStartedAt = Date.now()
+
+      console.info('[Worker][MarmotCommand] start', {
+        type: commandType,
+        requestId: requestId || null,
+        ...commandSummary
+      })
+
+      try {
+        const service = getMarmotService()
+        await service.initialize({ relays: payload.relays })
+        const ackData = service.buildInitSnapshot({
+          operationId: requestId,
+          search: payload.search || ''
+        })
+        const elapsedMs = Date.now() - commandStartedAt
+
+        console.info('[Worker][MarmotCommand] success', {
+          type: commandType,
+          requestId: requestId || null,
+          elapsedMs,
+          ...summarizeMarmotCommandResult(commandType, ackData),
+          acknowledged: true
+        })
+        sendWorkerResponse(requestId, { success: true, data: ackData })
+
+        void service.runInitialSyncOperation(requestId).catch((err) => {
+          const errorMessage = err?.message || String(err)
+          console.error('[Worker][MarmotInit] background sync failed', {
+            requestId: requestId || null,
+            error: errorMessage
+          }, err)
+        })
+      } catch (err) {
+        const errorMessage = err?.message || String(err)
+        const elapsedMs = Date.now() - commandStartedAt
+        console.error('[Worker][MarmotCommand] failed', {
+          type: commandType,
+          requestId: requestId || null,
+          elapsedMs,
+          ...commandSummary,
+          error: errorMessage
+        }, err)
+        sendWorkerResponse(requestId, {
+          success: false,
+          error: errorMessage
+        })
+        sendMessage({ type: 'error', message: `${commandType} failed: ${errorMessage}` })
+      }
+      break
+    }
+
+    case 'marmot-create-conversation': {
+      const requestId =
+        (typeof message?.requestId === 'string' && message.requestId)
+        || (typeof message?.data?.requestId === 'string' && message.data.requestId)
+        || null
+      const commandType = message.type
+      const payload = message?.data || {}
+      const commandSummary = summarizeMarmotCommandPayload(commandType, payload)
+      const commandStartedAt = Date.now()
+
+      console.info('[Worker][MarmotCommand] start', {
+        type: commandType,
+        requestId: requestId || null,
+        ...commandSummary
+      })
+
+      try {
+        const service = getMarmotService()
+        const shell = await service.createConversationShell({
+          title: payload.title,
+          description: payload.description,
+          members: payload.members || payload.memberPubkeys || [],
+          imageUrl: payload.imageUrl || null,
+          relayUrls: payload.relayUrls || payload.relays || [],
+          relayMode: payload.relayMode
+        })
+        const ackData = {
+          operationId: requestId,
+          conversation: shell.conversation
+        }
+        const elapsedMs = Date.now() - commandStartedAt
+
+        console.info('[Worker][MarmotCommand] success', {
+          type: commandType,
+          requestId: requestId || null,
+          elapsedMs,
+          ...summarizeMarmotCommandResult(commandType, ackData),
+          acknowledged: true
+        })
+        sendWorkerResponse(requestId, { success: true, data: ackData })
+
+        void service
+          .finalizeCreatedConversation({
+            operationId: requestId,
+            conversationId: shell.conversation.id,
+            members: shell.members
+          })
+          .catch((err) => {
+            const errorMessage = err?.message || String(err)
+            console.error('[Worker][MarmotCreateConversation] finalize failed', {
+              requestId: requestId || null,
+              conversationId: shell?.conversation?.id || null,
+              error: errorMessage
+            }, err)
+          })
+      } catch (err) {
+        const errorMessage = err?.message || String(err)
+        const elapsedMs = Date.now() - commandStartedAt
+        console.error('[Worker][MarmotCommand] failed', {
+          type: commandType,
+          requestId: requestId || null,
+          elapsedMs,
+          ...commandSummary,
+          error: errorMessage
+        }, err)
+        sendWorkerResponse(requestId, {
+          success: false,
+          error: errorMessage
+        })
+        sendMessage({ type: 'error', message: `${commandType} failed: ${errorMessage}` })
+      }
+      break
+    }
+
+    case 'marmot-accept-invite': {
+      const requestId =
+        (typeof message?.requestId === 'string' && message.requestId)
+        || (typeof message?.data?.requestId === 'string' && message.data.requestId)
+        || null
+      const commandType = message.type
+      const payload = message?.data || {}
+      const commandSummary = summarizeMarmotCommandPayload(commandType, payload)
+      const commandStartedAt = Date.now()
+
+      console.info('[Worker][MarmotCommand] start', {
+        type: commandType,
+        requestId: requestId || null,
+        ...commandSummary
+      })
+
+      try {
+        const service = getMarmotService()
+        await service.initialize({ relays: payload.relays })
+        const ackData = {
+          operationId: requestId,
+          inviteId: payload.inviteId || payload.id || null
+        }
+        const elapsedMs = Date.now() - commandStartedAt
+
+        console.info('[Worker][MarmotCommand] success', {
+          type: commandType,
+          requestId: requestId || null,
+          elapsedMs,
+          ...summarizeMarmotCommandResult(commandType, ackData),
+          acknowledged: true
+        })
+        sendWorkerResponse(requestId, { success: true, data: ackData })
+
+        void service
+          .runAcceptInviteOperation(requestId, payload.inviteId || payload.id)
+          .catch((err) => {
+            const errorMessage = err?.message || String(err)
+            console.error('[Worker][MarmotAcceptInvite] background join failed', {
+              requestId: requestId || null,
+              inviteId: payload.inviteId || payload.id || null,
+              error: errorMessage
+            }, err)
+          })
       } catch (err) {
         const errorMessage = err?.message || String(err)
         const elapsedMs = Date.now() - commandStartedAt

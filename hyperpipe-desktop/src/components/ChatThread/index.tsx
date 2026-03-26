@@ -92,7 +92,14 @@ export function ChatThread({
   myPubkey: string | null
   useDocumentScroll?: boolean
 }) {
-  const { messenger, conversations, ready, unsupportedReason, drainBufferedMessages } = useMessenger()
+  const {
+    messenger,
+    conversations,
+    ready,
+    initialSyncPending,
+    unsupportedReason,
+    drainBufferedMessages
+  } = useMessenger()
   const { isSmallScreen } = useScreenSize()
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
@@ -564,11 +571,11 @@ export function ChatThread({
     }
   }
 
-  if (unsupportedReason) {
+  if (unsupportedReason && !conversation) {
     return <div className="p-4 text-sm text-muted-foreground">{unsupportedReason}</div>
   }
 
-  if (!ready || !messenger) {
+  if (!ready || !messenger || (!conversation && initialSyncPending)) {
     return <div className="p-4 text-sm text-muted-foreground">Loading chat…</div>
   }
 

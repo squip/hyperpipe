@@ -15,24 +15,27 @@ describe('workflow-progress-ui', () => {
     expect(getCreateGroupProgressValue('publishingDiscovery')).toBeGreaterThan(0)
   })
 
-  it('shows thumbnail upload progress with the current percent', () => {
+  it('limits create-chat modal progress to the pre-ack phases', () => {
     expect(
       getCreateConversationProgressLabel({
-        phase: 'uploadingThumbnail',
-        uploadProgress: 25
+        phase: 'creatingConversation'
       })
-    ).toBe('Uploading thumbnail… 25%')
+    ).toBe('Creating chat…')
     expect(
       getCreateConversationProgressValue({
-        phase: 'uploadingThumbnail',
-        uploadProgress: 25
+        phase: 'openingConversation'
       })
-    ).toBeGreaterThan(getCreateConversationProgressValue({ phase: 'syncingConversation' }))
+    ).toBeGreaterThan(
+      getCreateConversationProgressValue({
+        phase: 'creatingConversation'
+      })
+    )
   })
 
-  it('maps join-chat sync to a distinct progress step', () => {
-    expect(getJoinConversationProgressLabel('syncingConversation')).toBe('Syncing chat…')
-    expect(getJoinConversationProgressValue('syncingConversation')).toBeGreaterThan(
+  it('limits join-chat inline progress to the pre-open phases', () => {
+    expect(getJoinConversationProgressLabel('joiningConversation')).toBe('Accepting invite…')
+    expect(getJoinConversationProgressLabel('openingConversation')).toBe('Opening chat…')
+    expect(getJoinConversationProgressValue('openingConversation')).toBeGreaterThan(
       getJoinConversationProgressValue('joiningConversation')
     )
   })

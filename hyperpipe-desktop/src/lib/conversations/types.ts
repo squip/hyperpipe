@@ -81,10 +81,75 @@ export type ConversationQuery = {
   tab?: ConversationTab
 }
 
+export type InviteFailure = {
+  pubkey: string
+  error: string
+}
+
+export type CreateConversationAckResult = {
+  conversation: ConversationSummary
+  operationId: string
+}
+
+export type ConversationInitPhase =
+  | 'publishingIdentity'
+  | 'syncingConversations'
+  | 'syncingInvites'
+  | 'completed'
+  | 'failed'
+
+export type ConversationInitOperationState = {
+  operationId: string
+  phase: ConversationInitPhase
+  error?: string | null
+}
+
+export type ConversationCreateWorkerPhase =
+  | 'invitingMembers'
+  | 'syncingConversation'
+  | 'completed'
+  | 'failed'
+
+export type ConversationCreateThumbnailPhase =
+  | 'idle'
+  | 'uploadingThumbnail'
+  | 'publishingThumbnailMetadata'
+  | 'completed'
+  | 'failed'
+
+export type ConversationCreateOperationState = {
+  operationId: string
+  conversationId: string
+  workerPhase: ConversationCreateWorkerPhase
+  thumbnailPhase: ConversationCreateThumbnailPhase
+  uploadProgress?: number | null
+  invited?: string[]
+  failed?: InviteFailure[]
+  error?: string | null
+}
+
+export type ConversationJoinPhase =
+  | 'joiningConversation'
+  | 'joinedConversation'
+  | 'syncingConversation'
+  | 'completed'
+  | 'failed'
+
+export type ConversationJoinOperationState = {
+  operationId: string
+  inviteId: string
+  phase: ConversationJoinPhase
+  conversationId?: string | null
+  error?: string | null
+}
+
 export type MessengerEvent =
   | { type: 'message'; message: ThreadMessage }
   | { type: 'conversation-updated'; conversation: ConversationSummary }
   | { type: 'conversation-created'; conversation: ConversationSummary }
+  | { type: 'conversation-init-operation'; operation: ConversationInitOperationState }
+  | { type: 'conversation-create-operation'; operation: ConversationCreateOperationState }
+  | { type: 'conversation-join-operation'; operation: ConversationJoinOperationState }
   | { type: 'invite-updated'; invite: ConversationInvite }
   | { type: 'readstate-updated'; conversationId: string; readState: ReadState; unreadCount: number }
   | {
@@ -109,6 +174,7 @@ export type CreateConversationInput = {
   description?: string
   members: string[]
   imageUrl?: string | null
+  thumbnailFile?: File | null
   relayUrls?: string[]
   relayMode?: 'withFallback' | 'strict'
 }

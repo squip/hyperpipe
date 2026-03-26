@@ -29,7 +29,7 @@ export function ChatListPanel({
   onOpenConversation: (id: string) => void
   conversations?: ConversationSummary[]
 }) {
-  const { conversations, ready, unsupportedReason } = useMessenger()
+  const { conversations, ready, initialSyncPending, unsupportedReason } = useMessenger()
 
   const rows = providedConversations || conversations
 
@@ -38,11 +38,11 @@ export function ChatListPanel({
     [rows]
   )
 
-  if (unsupportedReason) {
+  if (unsupportedReason && !sorted.length) {
     return <div className="p-4 text-sm text-muted-foreground">{unsupportedReason}</div>
   }
 
-  if (!ready) {
+  if (!ready || (initialSyncPending && !sorted.length)) {
     return <div className="p-4 text-sm text-muted-foreground">Loading chats…</div>
   }
 

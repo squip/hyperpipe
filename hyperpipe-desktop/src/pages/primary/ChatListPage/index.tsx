@@ -53,7 +53,6 @@ import {
   type CreateConversationProgressState,
   type JoinConversationProgressState
 } from '@/lib/workflow-progress-ui'
-import mediaUploadService from '@/services/media-upload.service'
 import { toast } from 'sonner'
 import type { TPageRef } from '@/types'
 import WorkflowProgress from '@/components/WorkflowProgress'
@@ -72,8 +71,6 @@ type CreateChatModalPayload = {
 type ActiveJoinInviteProgressState = JoinConversationProgressState & {
   inviteId: string
 }
-
-const HYPERDRIVE_UPLOAD_RELAY_URL = 'http://127.0.0.1:8443'
 
 function normalizeRelayListForChat(
   relayList: { read: string[]; write: string[] } | null,
@@ -164,12 +161,12 @@ const ChatListPage = forwardRef<
     invites,
     pendingInviteCount,
     ready,
+    initialSyncPending,
     unsupportedReason,
     createConversation,
     acceptInvite,
     refreshConversations,
     refreshInvites,
-    updateConversationMetadata,
     dismissInvite
   } = useMessenger()
   const [tab, setTab] = useState<ConversationTab>(initialTab || 'my')
@@ -329,6 +326,7 @@ const ChatListPage = forwardRef<
           title: title.trim() || t('Chat'),
           description: description.trim() || undefined,
           members: uniqueMembers,
+          thumbnailFile: imageFile,
           relayUrls: publishRelayUrls,
           relayMode
         },
@@ -344,74 +342,6 @@ const ChatListPage = forwardRef<
         }
       )
       const conversation = createResult.conversation
-
-      if (createResult.failed.length > 0) {
-        const failedLabel = createResult.failed[0]?.pubkey || t('one or more members')
-        console.warn('[Chat] invite failures during create', {
-          conversationId: conversation.id,
-          failed: createResult.failed
-        })
-        toast.warning(
-          t('Chat created, but invite failed for {{member}}', {
-            member: failedLabel
-          })
-        )
-      }
-
-      if (imageFile) {
-        try {
-          setCreateConversationProgress({
-            phase: 'uploadingThumbnail',
-            uploadProgress: 0
-          })
-          const upload = await mediaUploadService.upload(
-            imageFile,
-            {
-              onProgress: (progress) => {
-                setCreateConversationProgress({
-                  phase: 'uploadingThumbnail',
-                  uploadProgress: progress
-                })
-              }
-            },
-            {
-              target: 'group-hyperdrive',
-              groupId: conversation.id,
-              relayUrl: HYPERDRIVE_UPLOAD_RELAY_URL,
-              resourceScope: 'conversation',
-              parentKind: 39000
-            }
-          )
-          const imageUrl = upload.url
-          if (imageUrl) {
-            setCreateConversationProgress({ phase: 'publishingThumbnailMetadata' })
-            await updateConversationMetadata({
-              conversationId: conversation.id,
-              imageUrl,
-              imageAttachment: {
-                url: upload.url,
-                gatewayUrl: null,
-                mime: upload.metadata?.mimeType || null,
-                size: Number.isFinite(upload.metadata?.size) ? Number(upload.metadata?.size) : null,
-                width: Number.isFinite(upload.metadata?.dim?.width)
-                  ? Number(upload.metadata?.dim?.width)
-                  : null,
-                height: Number.isFinite(upload.metadata?.dim?.height)
-                  ? Number(upload.metadata?.dim?.height)
-                  : null,
-                fileName: upload.metadata?.fileName || null,
-                sha256: upload.metadata?.sha256 || null,
-                driveKey: upload.metadata?.driveKey || null,
-                ownerPubkey: normalizePubkey(pubkey || '') || null,
-                fileId: upload.metadata?.fileId || null
-              }
-            })
-          }
-        } catch (error) {
-          console.error('Chat created but thumbnail upload failed', error)
-          toast.error(t('Chat created, but thumbnail upload failed'))
-        }
-      }
 
       setCreateConversationProgress({ phase: 'openingConversation' })
       setOpenNew(false)
@@ -531,23 +461,21 @@ const ChatListPage = forwardRef<
           </TabsList>
 
           <TabsContent value="my" className="mt-4">
-            {unsupportedReason ? (
-              <div className="rounded-lg border p-4 text-sm text-muted-foreground">
-                {unsupportedReason}
-              </div>
-            ) : (
-              <ChatListPanel
-                myPubkey={pubkey}
-                conversations={filteredConversations}
-                onOpenConversation={(id) => push(`/conversations/${id}`)}
-              />
-            )}
+            <ChatListPanel
+              myPubkey={pubkey}
+              conversations={filteredConversations}
+              onOpenConversation={(id) => push(`/conversations/${id}`)}
+            />
           </TabsContent>
 
           <TabsContent value="invites" className="mt-4">
-            {!ready ? (
+            {!ready || (initialSyncPending && !inviteRows.length) ? (
               <div className="rounded-lg border p-4 text-sm text-muted-foreground">
                 {t('Loading invites...')}
+              </div>
+            ) : unsupportedReason && !inviteRows.length ? (
+              <div className="rounded-lg border p-4 text-sm text-muted-foreground">
+                {unsupportedReason}
               </div>
             ) : !inviteRows.length ? (
               <div className="rounded-lg border p-4 text-sm text-muted-foreground">
@@ -835,180 +763,188 @@ export function NewChatDialog({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
-        className="sm:max-w-xl max-h-[90vh] flex flex-col"
+        className="sm:max-w-xl max-h-[90vh] overflow-hidden flex flex-col"
         withoutClose={busy}
         onEscapeKeyDown={busy ? (event) => event.preventDefault() : undefined}
         onInteractOutside={busy ? (event) => event.preventDefault() : undefined}
       >
-        <DialogHeader>
+        <DialogHeader className="shrink-0">
           <DialogTitle>{t('Create chat')}</DialogTitle>
           <DialogDescription>
             {t('Choose members, relays, and an optional thumbnail for the new chat.')}
           </DialogDescription>
         </DialogHeader>
 
-        <div
-          className={cn(
-            'flex min-h-0 flex-1 flex-col gap-3 px-1',
-            busy && 'pointer-events-none opacity-60'
-          )}
-        >
-          <Input
-            value={title}
-            onChange={(event) => setTitle(event.target.value)}
-            placeholder={t('Title') as string}
-            className="focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-            disabled={busy}
-          />
-          <Textarea
-            value={description}
-            onChange={(event) => setDescription(event.target.value)}
-            placeholder={t('Description (optional)') as string}
-            className="min-h-[72px] focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-            disabled={busy}
-          />
+        <div className="min-h-0 flex-1 overflow-y-auto px-1 pr-2">
+          <div
+            className={cn(
+              'flex flex-col gap-3 pb-1',
+              busy && 'pointer-events-none opacity-60'
+            )}
+          >
+            <Input
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+              placeholder={t('Title') as string}
+              className="focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              disabled={busy}
+            />
+            <Textarea
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              placeholder={t('Description (optional)') as string}
+              className="min-h-[72px] focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              disabled={busy}
+            />
 
-          <div className="space-y-2">
-            <div className="text-sm font-medium">{t('Invite members')}</div>
-            <div className="relative px-0.5">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-              <Input
-                value={inviteSearch}
-                onChange={(event) => setInviteSearch(event.target.value)}
-                placeholder={t('Search users...') as string}
-                className="pl-9"
-                disabled={busy}
-              />
-            </div>
-            <div
-              className={`${hasThumbnailPreview ? 'h-44' : 'h-56'} overflow-y-auto overflow-x-hidden space-y-2 pr-1 rounded border py-2`}
-            >
-              <div className="min-h-5 px-2 text-sm text-muted-foreground">
-                {inviteSearch && isSearchingInvites ? t('Searching...') : null}
-                {inviteSearch && !isSearchingInvites && inviteCandidateProfiles.length === 0
-                  ? t('No users found')
-                  : null}
+            <div className="space-y-2">
+              <div className="text-sm font-medium">{t('Invite members')}</div>
+              <div className="relative px-0.5">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                <Input
+                  value={inviteSearch}
+                  onChange={(event) => setInviteSearch(event.target.value)}
+                  placeholder={t('Search users...') as string}
+                  className="pl-9"
+                  disabled={busy}
+                />
               </div>
-              {inviteCandidateProfiles.map((profile) => {
-                const isSelected = selectedInvitees.includes(profile.pubkey)
-                return (
-                  <div
-                    key={profile.pubkey}
-                    className="flex w-full min-w-0 items-center gap-2 rounded px-2 py-1 transition-colors hover:bg-accent"
-                  >
-                    <UserAvatar userId={profile.pubkey} className="shrink-0" />
-                    <div className="min-w-0 flex-1 overflow-hidden">
-                      <Username
-                        userId={profile.pubkey}
-                        className="block w-full min-w-0 truncate font-semibold"
-                      />
-                      <Nip05 pubkey={profile.pubkey} className="w-full min-w-0" />
+              <div
+                className={`${hasThumbnailPreview ? 'h-44' : 'h-56'} overflow-y-auto overflow-x-hidden space-y-2 pr-1 rounded border py-2`}
+              >
+                <div className="min-h-5 px-2 text-sm text-muted-foreground">
+                  {inviteSearch && isSearchingInvites ? t('Searching...') : null}
+                  {inviteSearch && !isSearchingInvites && inviteCandidateProfiles.length === 0
+                    ? t('No users found')
+                    : null}
+                </div>
+                {inviteCandidateProfiles.map((profile) => {
+                  const isSelected = selectedInvitees.includes(profile.pubkey)
+                  return (
+                    <div
+                      key={profile.pubkey}
+                      className="flex w-full min-w-0 items-center gap-2 rounded px-2 py-1 transition-colors hover:bg-accent"
+                    >
+                      <UserAvatar userId={profile.pubkey} className="shrink-0" />
+                      <div className="min-w-0 flex-1 overflow-hidden">
+                        <Username
+                          userId={profile.pubkey}
+                          className="block w-full min-w-0 truncate font-semibold"
+                        />
+                        <Nip05 pubkey={profile.pubkey} className="w-full min-w-0" />
+                      </div>
+                      <Button
+                        variant={isSelected ? 'secondary' : 'outline'}
+                        size="sm"
+                        onClick={() => handleInviteToggle(profile.pubkey)}
+                        className="h-8 w-20 shrink-0 px-2"
+                        disabled={busy}
+                      >
+                        {isSelected ? (
+                          <>
+                            <Check className="w-3 h-3 mr-1" />
+                            {t('Added')}
+                          </>
+                        ) : (
+                          <>
+                            <UserPlus className="w-3 h-3 mr-1" />
+                            {t('Add')}
+                          </>
+                        )}
+                      </Button>
                     </div>
+                  )
+                })}
+              </div>
+              {selectedInvitees.length > 0 ? (
+                <div className="flex max-h-24 flex-wrap gap-2 overflow-y-auto pr-1">
+                  {selectedInvitees.map((pubkey) => (
                     <Button
-                      variant={isSelected ? 'secondary' : 'outline'}
+                      key={pubkey}
+                      variant="secondary"
                       size="sm"
-                      onClick={() => handleInviteToggle(profile.pubkey)}
-                      className="h-8 w-20 shrink-0 px-2"
+                      className="flex max-w-full items-center gap-2"
+                      onClick={() => handleInviteToggle(pubkey)}
                       disabled={busy}
                     >
-                      {isSelected ? (
-                        <>
-                          <Check className="w-3 h-3 mr-1" />
-                          {t('Added')}
-                        </>
-                      ) : (
-                        <>
-                          <UserPlus className="w-3 h-3 mr-1" />
-                          {t('Add')}
-                        </>
-                      )}
+                      <UserAvatar userId={pubkey} size="xSmall" />
+                      <Username userId={pubkey} className="truncate max-w-[8rem] min-w-0" />
+                      <span className="text-xs text-muted-foreground">{t('Remove')}</span>
                     </Button>
-                  </div>
-                )
-              })}
+                  ))}
+                </div>
+              ) : null}
             </div>
-            {selectedInvitees.length > 0 ? (
-              <div className="flex max-h-24 flex-wrap gap-2 overflow-y-auto pr-1">
-                {selectedInvitees.map((pubkey) => (
-                  <Button
-                    key={pubkey}
-                    variant="secondary"
-                    size="sm"
-                    className="flex max-w-full items-center gap-2"
-                    onClick={() => handleInviteToggle(pubkey)}
-                    disabled={busy}
-                  >
-                    <UserAvatar userId={pubkey} size="xSmall" />
-                    <Username userId={pubkey} className="truncate max-w-[8rem] min-w-0" />
-                    <span className="text-xs text-muted-foreground">{t('Remove')}</span>
-                  </Button>
-                ))}
-              </div>
-            ) : null}
-          </div>
 
-          <div className="space-y-1">
-            <div className="text-sm font-medium">{t('Chat thumbnail (optional)')}</div>
-            <Input type="file" accept="image/*" onChange={handleFileChange} disabled={busy} />
-            {imagePreviewUrl ? (
-              <div className="flex items-center gap-2 rounded-md border p-2">
-                <img
-                  src={imagePreviewUrl}
-                  alt={imageFile?.name || 'Chat thumbnail'}
-                  className="h-10 w-10 rounded object-cover"
-                />
-                <div className="text-xs text-muted-foreground truncate">
-                  {t('Selected image')}: {imageFile?.name}
+            <div className="space-y-1">
+              <div className="text-sm font-medium">{t('Chat thumbnail (optional)')}</div>
+              <Input type="file" accept="image/*" onChange={handleFileChange} disabled={busy} />
+              {imagePreviewUrl ? (
+                <div className="flex items-center gap-2 rounded-md border p-2">
+                  <img
+                    src={imagePreviewUrl}
+                    alt={imageFile?.name || 'Chat thumbnail'}
+                    className="h-10 w-10 rounded object-cover"
+                  />
+                  <div className="text-xs text-muted-foreground truncate">
+                    {t('Selected image')}: {imageFile?.name}
+                  </div>
                 </div>
-              </div>
-            ) : null}
-          </div>
+              ) : null}
+            </div>
 
-          <div className="space-y-2 rounded-md border p-3">
-            <PostRelaySelector
-              allowWriteRelays={false}
-              extraRelayUrls={[
-                ...defaultRelayUrls,
-                ...groupRelayTargets.map((target) => target.relayUrl)
-              ]}
-              relayDisplayMeta={localGroupRelayDisplay}
-              valueRelayUrls={selectedRelayUrls}
-              onValueRelayUrlsChange={setSelectedRelayUrls}
-            />
-            <div className="flex items-center justify-between rounded-md border px-3 py-2">
-              <div>
-                <div className="text-sm font-medium">{t('Discovery relay fallback')}</div>
-                <div className="text-xs text-muted-foreground">
-                  {t('Also publish chat events to discovery relays')}
-                </div>
-              </div>
-              <Switch
-                checked={relayMode === 'withFallback'}
-                onCheckedChange={(checked) => setRelayMode(checked ? 'withFallback' : 'strict')}
-                disabled={busy}
+            <div className="space-y-2 rounded-md border p-3">
+              <PostRelaySelector
+                allowWriteRelays={false}
+                extraRelayUrls={[
+                  ...defaultRelayUrls,
+                  ...groupRelayTargets.map((target) => target.relayUrl)
+                ]}
+                relayDisplayMeta={localGroupRelayDisplay}
+                valueRelayUrls={selectedRelayUrls}
+                onValueRelayUrlsChange={setSelectedRelayUrls}
               />
+              <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                <div>
+                  <div className="text-sm font-medium">{t('Discovery relay fallback')}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {t('Also publish chat events to discovery relays')}
+                  </div>
+                </div>
+                <Switch
+                  checked={relayMode === 'withFallback'}
+                  onCheckedChange={(checked) => setRelayMode(checked ? 'withFallback' : 'strict')}
+                  disabled={busy}
+                />
+              </div>
             </div>
           </div>
         </div>
 
-        {showProgressSection ? (
-          <div className="mt-3 space-y-2 rounded-md border border-border/60 bg-muted/30 p-3">
-            <WorkflowProgress title={progressTitle} detail={progressDetail} value={progressValue} />
-            {error ? <div className="text-sm text-red-500">{error}</div> : null}
-          </div>
-        ) : null}
+        <div className="shrink-0 space-y-3 border-t pt-3">
+          {showProgressSection ? (
+            <div className="space-y-2 rounded-md border border-border/60 bg-muted/30 p-3">
+              <WorkflowProgress
+                title={progressTitle}
+                detail={progressDetail}
+                value={progressValue}
+              />
+              {error ? <div className="text-sm text-red-500">{error}</div> : null}
+            </div>
+          ) : null}
 
-        <DialogFooter className="flex shrink-0 justify-end gap-2 border-t pt-3">
-          <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
-            {t('Cancel')}
-          </Button>
-          <Button
-            onClick={handleCreate}
-            disabled={busy || selectedInvitees.length === 0 || selectedRelayUrls.length === 0}
-          >
-            {busy ? t('Creating...') : t('Create chat')}
-          </Button>
-        </DialogFooter>
+          <DialogFooter className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
+              {t('Cancel')}
+            </Button>
+            <Button
+              onClick={handleCreate}
+              disabled={busy || selectedInvitees.length === 0 || selectedRelayUrls.length === 0}
+            >
+              {busy ? t('Creating...') : t('Create chat')}
+            </Button>
+          </DialogFooter>
+        </div>
       </DialogContent>
     </Dialog>
   )

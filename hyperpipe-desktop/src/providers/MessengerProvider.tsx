@@ -2,10 +2,19 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { useNostr } from './NostrProvider'
 import { electronIpc } from '@/services/electron-ipc.service'
 import type {
+  ConversationInitOperationState,
+  ConversationInitPhase,
+  ConversationCreateOperationState,
+  ConversationCreateThumbnailPhase,
+  ConversationCreateWorkerPhase,
   ConversationInvite,
+  ConversationJoinOperationState,
+  ConversationJoinPhase,
   ConversationQuery,
   ConversationSummary,
+  CreateConversationAckResult,
   CreateConversationInput,
+  InviteFailure,
   MessageAttachment,
   MessengerEvent,
   ReadState,
@@ -17,6 +26,8 @@ import type {
   CreateConversationProgressState,
   JoinConversationProgressState
 } from '@/lib/workflow-progress-ui'
+import mediaUploadService, { type MediaUploadResult } from '@/services/media-upload.service'
+import { toast } from 'sonner'
 
 type MarmotSendStatus = {
   conversationId: string
@@ -33,15 +44,11 @@ type LoadThreadResult = {
   unreadCount: number
 }
 
-type InviteFailure = {
-  pubkey: string
-  error: string
-}
+type ToastId = string | number
 
-type CreateConversationResult = {
-  conversation: ConversationSummary
-  invited: string[]
-  failed: InviteFailure[]
+type PendingJoinInviteWaiter = {
+  resolve: (value: { conversationId: string | null }) => void
+  reject: (error: Error) => void
 }
 
 type MarmotMessenger = {
@@ -82,13 +89,14 @@ type MessengerContextType = {
   invites: ConversationInvite[]
   pendingInviteCount: number
   ready: boolean
+  initialSyncPending: boolean
   unsupportedReason?: string
   createConversation: (
     input: CreateConversationInput,
     options?: {
       onProgress?: (state: CreateConversationProgressState) => void
     }
-  ) => Promise<CreateConversationResult>
+  ) => Promise<CreateConversationAckResult>
   inviteMembers: (conversationId: string, members: string[]) => Promise<void>
   grantConversationAdmin: (conversationId: string, targetPubkey: string) => Promise<void>
   acceptInvite: (
@@ -109,6 +117,7 @@ type MessengerContextType = {
 const MessengerContext = createContext<MessengerContextType | undefined>(undefined)
 
 const debug = (...args: any[]) => console.debug('[MarmotProvider]', ...args)
+const HYPERDRIVE_UPLOAD_RELAY_URL = 'http://127.0.0.1:8443'
 
 const readStateStorageKey = (pubkey: string | null | undefined) =>
   `marmotReadState:${pubkey || 'anon'}`
@@ -186,6 +195,153 @@ function sameStringSet(left: string[], right: string[]) {
   if (left.length !== right.length) return false
   const rightSet = new Set(right)
   return left.every((value) => rightSet.has(value))
+}
+
+function parseInvitedMembers(payload: unknown): string[] {
+  if (!Array.isArray(payload)) return []
+  return payload
+    .map((member: unknown) => (typeof member === 'string' ? member.trim().toLowerCase() : ''))
+    .filter((member: string): member is string => Boolean(member))
+}
+
+function parseInviteFailures(payload: unknown): InviteFailure[] {
+  if (!Array.isArray(payload)) return []
+  return payload
+    .filter((row: unknown): row is Record<string, unknown> => !!row && typeof row === 'object')
+    .map((row: Record<string, unknown>) => ({
+      pubkey: typeof row.pubkey === 'string' ? row.pubkey : '',
+      error: typeof row.error === 'string' ? row.error : 'Unknown invite failure'
+    }))
+    .filter((row: InviteFailure) => Boolean(row.pubkey))
+}
+
+function normalizeConversationCreateWorkerPhase(
+  value: unknown
+): ConversationCreateWorkerPhase | null {
+  if (
+    value === 'invitingMembers' ||
+    value === 'syncingConversation' ||
+    value === 'completed' ||
+    value === 'failed'
+  ) {
+    return value
+  }
+  return null
+}
+
+function normalizeConversationInitPhase(value: unknown): ConversationInitPhase | null {
+  if (
+    value === 'publishingIdentity' ||
+    value === 'syncingConversations' ||
+    value === 'syncingInvites' ||
+    value === 'completed' ||
+    value === 'failed'
+  ) {
+    return value
+  }
+  return null
+}
+
+function normalizeConversationJoinPhase(value: unknown): ConversationJoinPhase | null {
+  if (
+    value === 'joiningConversation' ||
+    value === 'joinedConversation' ||
+    value === 'syncingConversation' ||
+    value === 'completed' ||
+    value === 'failed'
+  ) {
+    return value
+  }
+  return null
+}
+
+function isTerminalInitPhase(phase: ConversationInitPhase) {
+  return phase === 'completed' || phase === 'failed'
+}
+
+function isTerminalWorkerPhase(phase: ConversationCreateWorkerPhase) {
+  return phase === 'completed' || phase === 'failed'
+}
+
+function isTerminalThumbnailPhase(phase: ConversationCreateThumbnailPhase) {
+  return phase === 'completed' || phase === 'failed'
+}
+
+function isConversationCreateOperationTerminal(operation: ConversationCreateOperationState) {
+  return (
+    isTerminalWorkerPhase(operation.workerPhase) &&
+    isTerminalThumbnailPhase(operation.thumbnailPhase)
+  )
+}
+
+function hasJoinConversationShell(operation: ConversationJoinOperationState) {
+  return (
+    operation.phase === 'joinedConversation' ||
+    operation.phase === 'syncingConversation' ||
+    operation.phase === 'completed' ||
+    (operation.phase === 'failed' && Boolean(operation.conversationId))
+  )
+}
+
+function formatConversationCreateLoadingDescription(
+  operation: ConversationCreateOperationState
+): string {
+  if (operation.thumbnailPhase === 'publishingThumbnailMetadata') {
+    return 'Publishing chat thumbnail.'
+  }
+  if (operation.thumbnailPhase === 'uploadingThumbnail') {
+    const progress = Number.isFinite(operation.uploadProgress)
+      ? Math.max(0, Math.min(100, Math.round(Number(operation.uploadProgress))))
+      : 0
+    return progress > 0
+      ? `Uploading chat thumbnail (${progress}%).`
+      : 'Uploading chat thumbnail.'
+  }
+  if (operation.workerPhase === 'syncingConversation') {
+    return 'Syncing your new chat.'
+  }
+  return 'Inviting members and preparing your new chat.'
+}
+
+function buildConversationCreateWarningDescription(failed: InviteFailure[]): string {
+  if (!failed.length) return 'One or more chat invites could not be delivered.'
+  const firstFailure = failed[0]
+  const memberLabel = firstFailure?.pubkey || 'one or more members'
+  return `Chat created, but invite failed for ${memberLabel}.`
+}
+
+function formatConversationJoinLoadingDescription(operation: ConversationJoinOperationState): string {
+  if (operation.phase === 'syncingConversation') {
+    return 'Syncing your joined chat.'
+  }
+  return 'Opening your joined chat.'
+}
+
+function generateWorkerRequestId(prefix: string) {
+  return `${prefix}-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`
+}
+
+function buildThumbnailAttachment(
+  upload: MediaUploadResult,
+  ownerPubkey: string | null
+): MessageAttachment {
+  return {
+    url: upload.url,
+    gatewayUrl: null,
+    mime: upload.metadata?.mimeType || null,
+    size: Number.isFinite(upload.metadata?.size) ? Number(upload.metadata?.size) : null,
+    width: Number.isFinite(upload.metadata?.dim?.width)
+      ? Number(upload.metadata?.dim?.width)
+      : null,
+    height: Number.isFinite(upload.metadata?.dim?.height)
+      ? Number(upload.metadata?.dim?.height)
+      : null,
+    fileName: upload.metadata?.fileName || null,
+    sha256: upload.metadata?.sha256 || null,
+    driveKey: upload.metadata?.driveKey || null,
+    ownerPubkey,
+    fileId: upload.metadata?.fileId || null
+  }
 }
 
 function parseConversations(payload: any): ConversationSummary[] {
@@ -335,16 +491,31 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
   )
   const [unsupportedReason, setUnsupportedReason] = useState<string | undefined>(undefined)
   const [ready, setReady] = useState(false)
+  const [initialSyncPending, setInitialSyncPending] = useState(false)
 
   const listenersRef = useRef<Set<(event: MessengerEvent) => void>>(new Set())
   const bufferedMessagesRef = useRef<Map<string, ThreadMessage[]>>(new Map())
   const messageCacheRef = useRef<Map<string, ThreadMessage[]>>(new Map())
   const readStateRef = useRef<Map<string, ReadState>>(new Map())
+  const conversationsRef = useRef<ConversationSummary[]>([])
+  const invitesRef = useRef<ConversationInvite[]>([])
   const recentInitRef = useRef<{ signature: string; at: number } | null>(null)
   const initInFlightSignatureRef = useRef<string | null>(null)
+  const currentInitOperationIdRef = useRef<string | null>(null)
   const dismissedInviteIdsRef = useRef<Set<string>>(new Set())
   const acceptedInviteIdsRef = useRef<Set<string>>(new Set())
   const acceptedInviteConversationIdsRef = useRef<Set<string>>(new Set())
+  const initOperationRef = useRef<ConversationInitOperationState | null>(null)
+  const createConversationOperationsRef = useRef<Map<string, ConversationCreateOperationState>>(
+    new Map()
+  )
+  const createConversationToastIdsRef = useRef<Map<string, ToastId>>(new Map())
+  const createConversationToastStatusRef = useRef<Map<string, 'error' | 'warning' | 'success'>>(
+    new Map()
+  )
+  const joinConversationOperationsRef = useRef<Map<string, ConversationJoinOperationState>>(new Map())
+  const joinConversationWaitersRef = useRef<Map<string, PendingJoinInviteWaiter>>(new Map())
+  const joinConversationToastIdsRef = useRef<Map<string, ToastId>>(new Map())
 
   const discoveryRelay = import.meta.env.VITE_DISCOVERY_RELAY as string | undefined
   const relayUrls = useMemo(
@@ -369,6 +540,152 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       }
     }
   }
+
+  useEffect(() => {
+    conversationsRef.current = conversations
+  }, [conversations])
+
+  useEffect(() => {
+    invitesRef.current = invites
+  }, [invites])
+
+  const syncConversationCreateToast = useCallback((operation: ConversationCreateOperationState) => {
+    const existingToastId = createConversationToastIdsRef.current.get(operation.operationId)
+    const finalizedStatus = createConversationToastStatusRef.current.get(operation.operationId)
+    const toastId =
+      existingToastId
+      || toast.loading('Finishing chat setup…', {
+        description: formatConversationCreateLoadingDescription(operation)
+      })
+
+    createConversationToastIdsRef.current.set(operation.operationId, toastId)
+
+    if (operation.workerPhase === 'failed' || operation.thumbnailPhase === 'failed') {
+      toast.error('Chat setup incomplete', {
+        id: toastId,
+        description:
+          operation.error || 'The chat was created, but setup did not finish cleanly.'
+      })
+      createConversationToastStatusRef.current.set(operation.operationId, 'error')
+      if (isConversationCreateOperationTerminal(operation)) {
+        createConversationOperationsRef.current.delete(operation.operationId)
+        createConversationToastIdsRef.current.delete(operation.operationId)
+        createConversationToastStatusRef.current.delete(operation.operationId)
+      }
+      return
+    }
+
+    if (isConversationCreateOperationTerminal(operation)) {
+      if ((operation.failed || []).length > 0) {
+        toast.warning('Chat created with invite warnings', {
+          id: toastId,
+          description: buildConversationCreateWarningDescription(operation.failed || [])
+        })
+        createConversationToastStatusRef.current.set(operation.operationId, 'warning')
+      } else {
+        toast.dismiss(toastId)
+      }
+      createConversationOperationsRef.current.delete(operation.operationId)
+      createConversationToastIdsRef.current.delete(operation.operationId)
+      createConversationToastStatusRef.current.delete(operation.operationId)
+      return
+    }
+
+    if (!finalizedStatus) {
+      toast.loading('Finishing chat setup…', {
+        id: toastId,
+        description: formatConversationCreateLoadingDescription(operation)
+      })
+    }
+  }, [])
+
+  const syncConversationJoinToast = useCallback((operation: ConversationJoinOperationState) => {
+    if (!hasJoinConversationShell(operation)) return
+
+    const existingToastId = joinConversationToastIdsRef.current.get(operation.operationId)
+    const toastId =
+      existingToastId
+      || toast.loading('Finishing chat join…', {
+        description: formatConversationJoinLoadingDescription(operation)
+      })
+
+    joinConversationToastIdsRef.current.set(operation.operationId, toastId)
+
+    if (operation.phase === 'failed') {
+      toast.error('Chat join incomplete', {
+        id: toastId,
+        description: operation.error || 'The chat joined, but sync did not finish cleanly.'
+      })
+      joinConversationOperationsRef.current.delete(operation.operationId)
+      joinConversationToastIdsRef.current.delete(operation.operationId)
+      return
+    }
+
+    if (operation.phase === 'completed') {
+      toast.dismiss(toastId)
+      joinConversationOperationsRef.current.delete(operation.operationId)
+      joinConversationToastIdsRef.current.delete(operation.operationId)
+      return
+    }
+
+    toast.loading('Finishing chat join…', {
+      id: toastId,
+      description: formatConversationJoinLoadingDescription(operation)
+    })
+  }, [])
+
+  const mergeConversationCreateOperation = useCallback(
+    (
+      operationId: string,
+      patch: Partial<ConversationCreateOperationState> &
+        Pick<ConversationCreateOperationState, 'conversationId'>
+    ) => {
+      const previous = createConversationOperationsRef.current.get(operationId)
+      const next: ConversationCreateOperationState = {
+        operationId,
+        conversationId: patch.conversationId || previous?.conversationId || '',
+        workerPhase: patch.workerPhase || previous?.workerPhase || 'invitingMembers',
+        thumbnailPhase: patch.thumbnailPhase || previous?.thumbnailPhase || 'idle',
+        uploadProgress:
+          'uploadProgress' in patch ? patch.uploadProgress ?? null : previous?.uploadProgress ?? null,
+        invited: patch.invited || previous?.invited || [],
+        failed: patch.failed || previous?.failed || [],
+        error: 'error' in patch ? patch.error ?? null : previous?.error ?? null
+      }
+
+      createConversationOperationsRef.current.set(operationId, next)
+      emitEvent({ type: 'conversation-create-operation', operation: next })
+      syncConversationCreateToast(next)
+      return { previous, next }
+    },
+    [syncConversationCreateToast]
+  )
+
+  const mergeConversationJoinOperation = useCallback(
+    (
+      operationId: string,
+      patch: Partial<ConversationJoinOperationState> &
+        Pick<ConversationJoinOperationState, 'inviteId'>
+    ) => {
+      const previous = joinConversationOperationsRef.current.get(operationId)
+      const next: ConversationJoinOperationState = {
+        operationId,
+        inviteId: patch.inviteId || previous?.inviteId || '',
+        phase: patch.phase || previous?.phase || 'joiningConversation',
+        conversationId:
+          'conversationId' in patch
+            ? patch.conversationId ?? null
+            : previous?.conversationId ?? null,
+        error: 'error' in patch ? patch.error ?? null : previous?.error ?? null
+      }
+
+      joinConversationOperationsRef.current.set(operationId, next)
+      emitEvent({ type: 'conversation-join-operation', operation: next })
+      syncConversationJoinToast(next)
+      return { previous, next }
+    },
+    [syncConversationJoinToast]
+  )
 
   const saveReadStateToStorage = (stateMap: Map<string, ReadState>) => {
     if (typeof window === 'undefined') return
@@ -470,6 +787,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
   }
 
   const applyConversationUpdate = (conversation: ConversationSummary) => {
+    setUnsupportedReason((current) => (current ? undefined : current))
     setConversations((previous) => {
       const existing = previous.find((item) => item.id === conversation.id)
       if (
@@ -498,6 +816,100 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       return next
     })
   }
+
+  const updateConversationFromPayload = useCallback(
+    (payload: unknown, eventType: 'created' | 'updated') => {
+      const conversation = parseConversations(payload ? [payload] : [])[0]
+      if (!conversation) return null
+      applyConversationUpdate(conversation)
+      emitEvent({
+        type: eventType === 'created' ? 'conversation-created' : 'conversation-updated',
+        conversation
+      })
+      return conversation
+    },
+    []
+  )
+
+  const publishConversationMetadata = useCallback(
+    async (input: UpdateConversationMetadataInput) => {
+      const data = await sendToWorkerAwait({
+        type: 'marmot-update-conversation-metadata',
+        data: {
+          conversationId: input.conversationId,
+          title: input.title,
+          description: input.description,
+          imageUrl: input.imageUrl,
+          imageAttachment: input.imageAttachment || null,
+          publish: true
+        }
+      })
+
+      updateConversationFromPayload(data?.conversation, 'updated')
+    },
+    [updateConversationFromPayload]
+  )
+
+  const runConversationThumbnailUpload = useCallback(
+    async (operationId: string, conversation: ConversationSummary, file: File) => {
+      const ownerPubkey = normalizePubkeyList([pubkey])[0] || null
+
+      try {
+        mergeConversationCreateOperation(operationId, {
+          conversationId: conversation.id,
+          thumbnailPhase: 'uploadingThumbnail',
+          uploadProgress: 0,
+          error: null
+        })
+
+        const upload = await mediaUploadService.upload(
+          file,
+          {
+            onProgress: (progress) => {
+              mergeConversationCreateOperation(operationId, {
+                conversationId: conversation.id,
+                thumbnailPhase: 'uploadingThumbnail',
+                uploadProgress: progress
+              })
+            }
+          },
+          {
+            target: 'group-hyperdrive',
+            groupId: conversation.id,
+            relayUrl: HYPERDRIVE_UPLOAD_RELAY_URL,
+            resourceScope: 'conversation',
+            parentKind: 39000
+          }
+        )
+
+        mergeConversationCreateOperation(operationId, {
+          conversationId: conversation.id,
+          thumbnailPhase: 'publishingThumbnailMetadata',
+          uploadProgress: 100
+        })
+
+        await publishConversationMetadata({
+          conversationId: conversation.id,
+          imageUrl: upload.url,
+          imageAttachment: buildThumbnailAttachment(upload, ownerPubkey)
+        })
+
+        mergeConversationCreateOperation(operationId, {
+          conversationId: conversation.id,
+          thumbnailPhase: 'completed',
+          uploadProgress: 100
+        })
+      } catch (error) {
+        console.error('Chat created but thumbnail upload failed', error)
+        mergeConversationCreateOperation(operationId, {
+          conversationId: conversation.id,
+          thumbnailPhase: 'failed',
+          error: error instanceof Error ? error.message : String(error)
+        })
+      }
+    },
+    [mergeConversationCreateOperation, publishConversationMetadata, pubkey]
+  )
 
   const isInviteActionable = useCallback((invite: ConversationInvite | null | undefined) => {
     if (!invite || !invite.id) return false
@@ -601,6 +1013,9 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       }
     })
     const parsed = parseConversations(data?.conversations || [])
+    if (parsed.length > 0) {
+      setUnsupportedReason(undefined)
+    }
     setConversations(parsed)
     return parsed
   }
@@ -615,6 +1030,9 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     })
     const parsed = parseInvites(data?.invites || [])
     const actionable = filterActionableInvites(parsed)
+    if (actionable.length > 0) {
+      setUnsupportedReason(undefined)
+    }
     setInvites(actionable)
     return actionable
   }
@@ -686,44 +1104,32 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
         }
       })
 
-      const conversation = parseConversations(data?.conversation ? [data.conversation] : [])[0]
-      if (conversation) {
-        applyConversationUpdate(conversation)
-        emitEvent({ type: 'conversation-created', conversation })
-      }
-
-      reportProgress({ phase: 'syncingConversation' })
-      await refreshConversations()
-      await refreshInvites()
-
+      const operationId = typeof data?.operationId === 'string' ? data.operationId : ''
+      const conversation = updateConversationFromPayload(data?.conversation, 'created')
       if (!conversation) {
         throw new Error('Worker did not return created conversation')
       }
+      if (!operationId) {
+        throw new Error('Worker did not return create operation id')
+      }
 
-      const invited = Array.isArray(data?.invited)
-        ? data.invited
-            .map((member: unknown) =>
-              typeof member === 'string' ? member.trim().toLowerCase() : ''
-            )
-            .filter((member: string) => Boolean(member))
-        : []
+      mergeConversationCreateOperation(operationId, {
+        conversationId: conversation.id,
+        workerPhase: 'invitingMembers',
+        thumbnailPhase: input.thumbnailFile ? 'idle' : 'completed',
+        uploadProgress: input.thumbnailFile ? 0 : null,
+        invited: [],
+        failed: [],
+        error: null
+      })
 
-      const failed = Array.isArray(data?.failed)
-        ? data.failed
-            .filter(
-              (row: unknown): row is Record<string, unknown> => !!row && typeof row === 'object'
-            )
-            .map((row: Record<string, unknown>) => ({
-              pubkey: typeof row.pubkey === 'string' ? row.pubkey : '',
-              error: typeof row.error === 'string' ? row.error : 'Unknown invite failure'
-            }))
-            .filter((row: InviteFailure) => Boolean(row.pubkey))
-        : []
+      if (input.thumbnailFile) {
+        void runConversationThumbnailUpload(operationId, conversation, input.thumbnailFile)
+      }
 
       return {
         conversation,
-        invited,
-        failed
+        operationId
       }
     } catch (error) {
       reportProgress({
@@ -733,6 +1139,24 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       throw error
     }
   }
+
+  const settleJoinInviteWaiter = useCallback(
+    (
+      operationId: string,
+      action: 'resolve' | 'reject',
+      payload: { conversationId: string | null } | Error
+    ) => {
+      const waiter = joinConversationWaitersRef.current.get(operationId)
+      if (!waiter) return
+      joinConversationWaitersRef.current.delete(operationId)
+      if (action === 'resolve') {
+        waiter.resolve(payload as { conversationId: string | null })
+        return
+      }
+      waiter.reject(payload as Error)
+    },
+    []
+  )
 
   const inviteMembers = async (conversationId: string, members: string[]) => {
     await sendToWorkerAwait({
@@ -773,27 +1197,34 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       options?.onProgress?.(state)
     }
 
+    const operationId = generateWorkerRequestId('marmot-accept-invite')
+    const joinPromise = new Promise<{ conversationId: string | null }>((resolve, reject) => {
+      joinConversationWaitersRef.current.set(operationId, { resolve, reject })
+    })
+
     try {
       reportProgress({ phase: 'joiningConversation' })
       const data = await sendToWorkerAwait({
         type: 'marmot-accept-invite',
+        requestId: operationId,
         data: {
           inviteId
         }
       })
-      const conversationId =
-        typeof data?.conversation?.id === 'string'
-          ? data.conversation.id
-          : typeof data?.conversationId === 'string'
-            ? data.conversationId
-            : null
 
-      markInviteAccepted(inviteId, conversationId)
-      reportProgress({ phase: 'syncingConversation' })
-      await refreshConversations()
-      await refreshInvites()
-      return { conversationId }
+      const acknowledgedOperationId =
+        typeof data?.operationId === 'string' && data.operationId ? data.operationId : operationId
+      if (acknowledgedOperationId !== operationId) {
+        const waiter = joinConversationWaitersRef.current.get(operationId)
+        if (waiter) {
+          joinConversationWaitersRef.current.delete(operationId)
+          joinConversationWaitersRef.current.set(acknowledgedOperationId, waiter)
+        }
+      }
+
+      return await joinPromise
     } catch (error) {
+      joinConversationWaitersRef.current.delete(operationId)
       reportProgress({
         phase: 'error',
         error: error instanceof Error ? error.message : String(error)
@@ -803,18 +1234,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
   }
 
   const updateConversationMetadata = async (input: UpdateConversationMetadataInput) => {
-    await sendToWorkerAwait({
-      type: 'marmot-update-conversation-metadata',
-      data: {
-        conversationId: input.conversationId,
-        title: input.title,
-        description: input.description,
-        imageUrl: input.imageUrl,
-        imageAttachment: input.imageAttachment || null,
-        publish: true
-      }
-    })
-    await refreshConversations()
+    await publishConversationMetadata(input)
   }
 
   const messenger = useMemo<MarmotMessenger | null>(() => {
@@ -1024,6 +1444,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!isReady || !pubkey) return
     if (!relayUrls.length) {
+      setInitialSyncPending(false)
       setReady(true)
       return
     }
@@ -1041,12 +1462,14 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
 
     if (!electronIpc.isElectron()) {
       setUnsupportedReason('Conversations require Electron runtime.')
+      setInitialSyncPending(false)
       setReady(true)
       return
     }
 
     let cancelled = false
     setReady(false)
+    setInitialSyncPending(false)
     setUnsupportedReason(undefined)
 
     readStateRef.current = loadReadStateFromStorage()
@@ -1054,10 +1477,13 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     const init = async () => {
       initInFlightSignatureRef.current = initSignature
       recentInitRef.current = { signature: initSignature, at: Date.now() }
+      const operationId = generateWorkerRequestId('marmot-init')
+      currentInitOperationIdRef.current = operationId
       try {
         const initData = await sendToWorkerAwait(
           {
             type: 'marmot-init',
+            requestId: operationId,
             data: {
               relays: relayUrls
             }
@@ -1069,19 +1495,28 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
 
         const nextConversations = parseConversations(initData?.conversations || [])
         const nextInvites = filterActionableInvites(parseInvites(initData?.invites || []))
+        const acknowledgedOperationId =
+          typeof initData?.operationId === 'string' && initData.operationId
+            ? initData.operationId
+            : operationId
+        currentInitOperationIdRef.current = acknowledgedOperationId
 
         setConversations(nextConversations)
         setInvites(nextInvites)
         setReady(true)
+        setInitialSyncPending(true)
 
-        debug('marmot init complete', {
+        debug('marmot init acknowledged', {
           conversations: nextConversations.length,
           invites: nextInvites.length,
+          operationId: acknowledgedOperationId,
           relayCount: relayUrls.length
         })
       } catch (error) {
         console.error('Failed to initialize marmot conversations', error)
         if (!cancelled) {
+          currentInitOperationIdRef.current = null
+          setInitialSyncPending(false)
           setUnsupportedReason(
             error instanceof Error ? error.message : 'Failed to initialize conversations'
           )
@@ -1097,11 +1532,143 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     const offWorkerMessage = electronIpc.onWorkerMessage((msg) => {
       if (!msg || typeof msg !== 'object') return
 
+      if (msg.type === 'marmot-init-operation' && msg.data) {
+        const operationId =
+          typeof msg.data.operationId === 'string' ? String(msg.data.operationId) : null
+        const phase = normalizeConversationInitPhase(msg.data.phase)
+        if (!operationId || !phase) return
+
+        const operation: ConversationInitOperationState = {
+          operationId,
+          phase,
+          error:
+            typeof msg.data.error === 'string' && msg.data.error ? String(msg.data.error) : null
+        }
+
+        initOperationRef.current = operation
+        emitEvent({ type: 'conversation-init-operation', operation })
+
+        if (operationId !== currentInitOperationIdRef.current) {
+          return
+        }
+
+        if (isTerminalInitPhase(phase)) {
+          currentInitOperationIdRef.current = null
+          setInitialSyncPending(false)
+          if (phase === 'failed') {
+            const hasVisibleData =
+              conversationsRef.current.length > 0 || invitesRef.current.length > 0
+            if (!hasVisibleData) {
+              setUnsupportedReason(operation.error || 'Failed to initialize conversations')
+            } else {
+              console.warn('[MarmotProvider] background init failed after local bootstrap', {
+                error: operation.error
+              })
+            }
+          } else {
+            setUnsupportedReason(undefined)
+          }
+          return
+        }
+
+        setInitialSyncPending(true)
+        return
+      }
+
       if (msg.type === 'marmot-conversation-updated' && msg.data?.conversation) {
         const conversation = parseConversations([msg.data.conversation])[0]
         if (!conversation) return
         applyConversationUpdate(conversation)
         emitEvent({ type: 'conversation-updated', conversation })
+        return
+      }
+
+      if (msg.type === 'marmot-create-conversation-operation' && msg.data) {
+        const operationId =
+          typeof msg.data.operationId === 'string' ? String(msg.data.operationId) : null
+        const conversationId =
+          typeof msg.data.conversationId === 'string' ? String(msg.data.conversationId) : null
+        const workerPhase = normalizeConversationCreateWorkerPhase(msg.data.phase)
+        if (!operationId || !conversationId || !workerPhase) return
+
+        updateConversationFromPayload(msg.data.conversation, 'updated')
+
+        const patch: Partial<ConversationCreateOperationState> &
+          Pick<ConversationCreateOperationState, 'conversationId'> = {
+          conversationId,
+          workerPhase
+        }
+
+        if (workerPhase === 'completed') {
+          patch.invited = parseInvitedMembers(msg.data.invited)
+          patch.failed = parseInviteFailures(msg.data.failed)
+          patch.error = null
+        } else if (workerPhase === 'failed') {
+          patch.invited = parseInvitedMembers(msg.data.invited)
+          patch.failed = parseInviteFailures(msg.data.failed)
+          patch.error =
+            typeof msg.data.error === 'string' && msg.data.error
+              ? msg.data.error
+              : 'Chat setup failed'
+        }
+
+        const { previous, next } = mergeConversationCreateOperation(operationId, patch)
+        if (!isTerminalWorkerPhase(previous?.workerPhase || 'invitingMembers') && isTerminalWorkerPhase(next.workerPhase)) {
+          void refreshConversations().catch((error) => {
+            console.warn('[MarmotProvider] failed refreshing conversations after create op', error)
+          })
+          void refreshInvites().catch((error) => {
+            console.warn('[MarmotProvider] failed refreshing invites after create op', error)
+          })
+        }
+        return
+      }
+
+      if (msg.type === 'marmot-accept-invite-operation' && msg.data) {
+        const operationId =
+          typeof msg.data.operationId === 'string' ? String(msg.data.operationId) : null
+        const inviteId = typeof msg.data.inviteId === 'string' ? String(msg.data.inviteId) : null
+        const phase = normalizeConversationJoinPhase(msg.data.phase)
+        const conversationId =
+          typeof msg.data.conversationId === 'string' ? String(msg.data.conversationId) : null
+        if (!operationId || !inviteId || !phase) return
+
+        updateConversationFromPayload(msg.data.conversation, 'updated')
+
+        const patch: Partial<ConversationJoinOperationState> &
+          Pick<ConversationJoinOperationState, 'inviteId'> = {
+          inviteId,
+          phase,
+          conversationId,
+          error:
+            phase === 'failed'
+              ? typeof msg.data.error === 'string' && msg.data.error
+                ? String(msg.data.error)
+                : 'Chat join failed'
+              : null
+        }
+
+        const { next } = mergeConversationJoinOperation(operationId, patch)
+
+        if (phase === 'joinedConversation') {
+          markInviteAccepted(inviteId, conversationId)
+          settleJoinInviteWaiter(operationId, 'resolve', {
+            conversationId
+          })
+          return
+        }
+
+        if (phase === 'failed' && !hasJoinConversationShell(next)) {
+          settleJoinInviteWaiter(
+            operationId,
+            'reject',
+            new Error(next.error || 'Chat join failed')
+          )
+          joinConversationOperationsRef.current.delete(operationId)
+          joinConversationToastIdsRef.current.delete(operationId)
+          return
+        }
+
         return
       }
 
@@ -1133,6 +1700,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
           const next = [...previous.filter((item) => item.id !== invite.id), invite]
           return sortInvites(next)
         })
+        setUnsupportedReason((current) => (current ? undefined : current))
         emitEvent({ type: 'invite-updated', invite })
         return
       }
@@ -1196,6 +1764,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       invites,
       pendingInviteCount,
       ready,
+      initialSyncPending,
       unsupportedReason,
       createConversation,
       inviteMembers,
@@ -1219,6 +1788,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       invites,
       pendingInviteCount,
       ready,
+      initialSyncPending,
       unsupportedReason,
       createConversation,
       inviteMembers,

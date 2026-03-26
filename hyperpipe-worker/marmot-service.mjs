@@ -922,6 +922,43 @@ export class MarmotService {
     }
   }
 
+  emitInitOperation(operationId, phase, { error = null } = {}) {
+    if (!operationId || !phase) return
+    this.emit('marmot-init-operation', {
+      operationId,
+      phase,
+      error
+    })
+  }
+
+  emitAcceptInviteOperation(
+    operationId,
+    inviteId,
+    phase,
+    { conversationId = null, conversation = null, error = null } = {}
+  ) {
+    if (!operationId || !inviteId || !phase) return
+    this.emit('marmot-accept-invite-operation', {
+      operationId,
+      inviteId,
+      phase,
+      conversationId,
+      conversation,
+      error
+    })
+  }
+
+  buildInitSnapshot({ operationId = null, search = '' } = {}) {
+    return {
+      operationId,
+      initialized: true,
+      pubkey: this.pubkey,
+      relays: this.relays,
+      conversations: this.listConversationSummaries({ search }),
+      invites: this.listInvites({ search })
+    }
+  }
+
   async initialize({ relays } = {}) {
     ensureWebCryptoAvailable(this.logger)
 
@@ -933,7 +970,6 @@ export class MarmotService {
           next: nextRelays
         })
         this.relays = nextRelays
-        await this.publishKeyPackageRelayList()
       }
       return
     }
@@ -979,11 +1015,9 @@ export class MarmotService {
         network: this.network
       })
 
-      await this.ensureLocalKeyPackagePublished()
       await this.refreshGroupsMap()
-      await this.syncAll({ emit: false, force: true })
-      this.startPolling()
       this.initialized = true
+      this.startPolling()
     })()
 
     try {
@@ -993,10 +1027,39 @@ export class MarmotService {
     }
   }
 
+  async runInitialSyncOperation(operationId) {
+    if (!operationId) return
+
+    try {
+      this.emitInitOperation(operationId, 'publishingIdentity')
+      try {
+        await this.ensureLocalKeyPackagePublished()
+      } catch (error) {
+        this.logger.warn?.('[MarmotService] Initial identity publish failed', {
+          operationId,
+          error: error?.message || error
+        })
+      }
+
+      this.emitInitOperation(operationId, 'syncingConversations')
+      await this.syncConversations({ emit: true, reason: 'init' })
+
+      this.emitInitOperation(operationId, 'syncingInvites')
+      await this.syncInvites({ emit: true })
+
+      this.emitInitOperation(operationId, 'completed')
+    } catch (error) {
+      this.emitInitOperation(operationId, 'failed', {
+        error: error?.message || String(error)
+      })
+      throw error
+    }
+  }
+
   startPolling() {
     if (this.pollTimer) return
     this.pollTimer = setInterval(() => {
-      this.syncAll({ emit: true, force: false }).catch((error) => {
+      this.syncAll({ emit: true, reason: 'poll' }).catch((error) => {
         this.logger.warn('[MarmotService] background sync failed', {
           error: error?.message || error
         })
@@ -1732,28 +1795,33 @@ export class MarmotService {
     return { changed, newMessages }
   }
 
-  async syncAll({ emit = false, force = false } = {}) {
+  async syncConversations({ emit = false, reason = 'sync' } = {}) {
     if (!this.client || !this.network) return
 
-    if (this.syncInFlight && !force) {
+    await this.refreshGroupsMap()
+
+    for (const groupId of this.groupsById.keys()) {
+      try {
+        await this.syncConversation(groupId, { emit, reason })
+      } catch (error) {
+        this.logger.warn('[MarmotService] Failed syncing conversation', {
+          groupId,
+          error: error?.message || error
+        })
+      }
+    }
+  }
+
+  async syncAll({ emit = false, reason = 'sync' } = {}) {
+    if (!this.client || !this.network) return
+
+    if (this.syncInFlight) {
       await this.syncInFlight
       return
     }
 
     this.syncInFlight = (async () => {
-      await this.refreshGroupsMap()
-
-      for (const groupId of this.groupsById.keys()) {
-        try {
-          await this.syncConversation(groupId, { emit, reason: 'poll' })
-        } catch (error) {
-          this.logger.warn('[MarmotService] Failed syncing conversation', {
-            groupId,
-            error: error?.message || error
-          })
-        }
-      }
-
+      await this.syncConversations({ emit, reason })
       await this.syncInvites({ emit })
     })()
 
@@ -2057,7 +2125,7 @@ export class MarmotService {
     }
   }
 
-  async createConversation({
+  resolveConversationCreateRequest({
     title,
     description,
     members,
@@ -2067,6 +2135,7 @@ export class MarmotService {
   } = {}) {
     const normalizedTitle = sanitizeString(title || 'Chat', 256) || 'Chat'
     const normalizedDescription = sanitizeString(description, 1024) || ''
+    const normalizedImageUrl = sanitizeString(imageUrl, 2048) || null
     const normalizedRelayMode = relayMode === 'strict' ? 'strict' : 'withFallback'
     const selectedRelays = uniqueRelays(relayUrls || [], { includeDefaults: false })
     const defaultRelays = uniqueRelays(this.relays || [], { includeDefaults: true })
@@ -2075,11 +2144,67 @@ export class MarmotService {
     if (normalizedRelayMode === 'strict') {
       effectiveRelays = selectedRelays.length ? selectedRelays : defaultRelays
     } else if (selectedRelays.length) {
-      effectiveRelays = uniqueRelays([...selectedRelays, ...defaultRelays], { includeDefaults: false })
+      effectiveRelays = uniqueRelays([...selectedRelays, ...defaultRelays], {
+        includeDefaults: false
+      })
       if (!effectiveRelays.length) {
         effectiveRelays = defaultRelays
       }
     }
+
+    return {
+      normalizedTitle,
+      normalizedDescription,
+      normalizedImageUrl,
+      normalizedRelayMode,
+      selectedRelays,
+      defaultRelays,
+      effectiveRelays,
+      members: ensureArray(members)
+    }
+  }
+
+  emitCreateConversationOperation(
+    operationId,
+    conversationId,
+    phase,
+    { conversation = null, invited = undefined, failed = undefined, error = null } = {}
+  ) {
+    if (!operationId || !conversationId || !phase) return
+    this.emit('marmot-create-conversation-operation', {
+      operationId,
+      conversationId,
+      phase,
+      conversation,
+      invited,
+      failed,
+      error
+    })
+  }
+
+  async createConversationShell({
+    title,
+    description,
+    members,
+    imageUrl,
+    relayUrls,
+    relayMode
+  } = {}) {
+    const {
+      normalizedTitle,
+      normalizedDescription,
+      normalizedImageUrl,
+      normalizedRelayMode,
+      selectedRelays,
+      effectiveRelays
+    } = this.resolveConversationCreateRequest({
+      title,
+      description,
+      members,
+      imageUrl,
+      relayUrls,
+      relayMode
+    })
 
     this.logger.info?.('[MarmotService] createConversation start', {
       titleLength: normalizedTitle.length,
@@ -2100,20 +2225,13 @@ export class MarmotService {
     })
 
     this.groupsById.set(group.idStr, group)
+    this.schedulePersist()
 
-    if (imageUrl) {
-      this.setMetadata(group.idStr, { imageUrl })
+    if (normalizedImageUrl) {
+      this.setMetadata(group.idStr, { imageUrl: normalizedImageUrl })
     }
 
-    const inviteResult = await this.inviteMembers(group.idStr, ensureArray(members))
-    await this.syncConversation(group.idStr, { emit: false, reason: 'create' })
-
     const conversation = this.buildConversationSummary(group)
-    this.logger.info?.('[MarmotService] createConversation complete', {
-      conversationId: group.idStr,
-      invitedCount: inviteResult.invited.length,
-      failedInviteCount: inviteResult.failed.length
-    })
     this.emit('marmot-conversation-updated', {
       conversation,
       reason: 'created'
@@ -2121,28 +2239,131 @@ export class MarmotService {
 
     return {
       conversation,
-      invited: inviteResult.invited,
-      failed: inviteResult.failed
+      members: ensureArray(members)
     }
   }
 
-  async acceptInvite(inviteId) {
+  async finalizeCreatedConversation({
+    operationId = null,
+    conversationId,
+    members = []
+  } = {}) {
+    const normalizedConversationId = sanitizeString(conversationId, 256)
+    if (!normalizedConversationId) {
+      throw new Error('Conversation id is required')
+    }
+
+    let inviteResult = {
+      invited: [],
+      failed: []
+    }
+
+    try {
+      this.emitCreateConversationOperation(
+        operationId,
+        normalizedConversationId,
+        'invitingMembers'
+      )
+      inviteResult = await this.inviteMembers(normalizedConversationId, ensureArray(members))
+      this.emitCreateConversationOperation(
+        operationId,
+        normalizedConversationId,
+        'syncingConversation'
+      )
+      await this.syncConversation(normalizedConversationId, { emit: false, reason: 'create' })
+
+      const group =
+        this.groupsById.get(normalizedConversationId)
+        || (await this.client.getGroup(normalizedConversationId))
+      if (!group) {
+        throw new Error(`Conversation ${normalizedConversationId} not found after create`)
+      }
+
+      this.groupsById.set(group.idStr, group)
+      this.schedulePersist()
+
+      const conversation = this.buildConversationSummary(group)
+      this.logger.info?.('[MarmotService] createConversation complete', {
+        conversationId: group.idStr,
+        invitedCount: inviteResult.invited.length,
+        failedInviteCount: inviteResult.failed.length
+      })
+      this.emit('marmot-conversation-updated', {
+        conversation,
+        reason: 'created'
+      })
+      this.emitCreateConversationOperation(operationId, normalizedConversationId, 'completed', {
+        conversation,
+        invited: inviteResult.invited,
+        failed: inviteResult.failed
+      })
+
+      return {
+        conversation,
+        invited: inviteResult.invited,
+        failed: inviteResult.failed
+      }
+    } catch (error) {
+      this.emitCreateConversationOperation(operationId, normalizedConversationId, 'failed', {
+        invited: inviteResult.invited,
+        failed: inviteResult.failed,
+        error: error?.message || String(error)
+      })
+      throw error
+    }
+  }
+
+  async createConversation({
+    title,
+    description,
+    members,
+    imageUrl,
+    relayUrls,
+    relayMode
+  } = {}) {
+    const shell = await this.createConversationShell({
+      title,
+      description,
+      members,
+      imageUrl,
+      relayUrls,
+      relayMode
+    })
+
+    return await this.finalizeCreatedConversation({
+      conversationId: shell.conversation.id,
+      members: shell.members
+    })
+  }
+
+  async runAcceptInviteOperation(operationId, inviteId) {
     const invite = this.invitesById.get(inviteId)
     if (!invite) {
-      throw new Error(`Invite ${inviteId} not found`)
+      const error = new Error(`Invite ${inviteId} not found`)
+      this.emitAcceptInviteOperation(operationId, inviteId, 'failed', {
+        error: error.message
+      })
+      throw error
     }
 
     if (!invite.welcomeRumor) {
-      throw new Error(`Invite ${inviteId} does not contain a welcome payload`)
+      const error = new Error(`Invite ${inviteId} does not contain a welcome payload`)
+      this.emitAcceptInviteOperation(operationId, inviteId, 'failed', {
+        error: error.message
+      })
+      throw error
     }
 
     invite.status = 'joining'
     invite.error = null
     this.invitesById.set(inviteId, invite)
+    this.emitAcceptInviteOperation(operationId, inviteId, 'joiningConversation')
     this.emit('marmot-invite-updated', {
       invite: this.toPublicInvite(invite),
       reason: 'joining'
     })
+
+    let conversationId = null
 
     try {
       const group = await this.client.joinGroupFromWelcome({
@@ -2152,34 +2373,72 @@ export class MarmotService {
 
       invite.status = 'joined'
       invite.conversationId = group.idStr
+      invite.error = null
       this.invitesById.set(inviteId, invite)
 
       this.groupsById.set(group.idStr, group)
-      await this.syncConversation(group.idStr, { emit: false, reason: 'accept-invite' })
-
+      conversationId = group.idStr
       this.schedulePersist()
 
+      const shellConversation = this.buildConversationSummary(group)
       this.emit('marmot-invite-updated', {
         invite: this.toPublicInvite(invite),
         reason: 'joined'
       })
       await this.emitConversationUpdated(group.idStr, 'joined')
+      this.emitAcceptInviteOperation(operationId, inviteId, 'joinedConversation', {
+        conversationId,
+        conversation: shellConversation
+      })
+      this.emitAcceptInviteOperation(operationId, inviteId, 'syncingConversation', {
+        conversationId,
+        conversation: shellConversation
+      })
+
+      await this.syncConversation(group.idStr, { emit: true, reason: 'accept-invite' })
+
+      const nextGroup =
+        this.groupsById.get(group.idStr) || (await this.client.getGroup(group.idStr)) || group
+      this.groupsById.set(nextGroup.idStr, nextGroup)
+      this.schedulePersist()
+
+      const finalConversation = this.buildConversationSummary(nextGroup)
+      this.emitAcceptInviteOperation(operationId, inviteId, 'completed', {
+        conversationId,
+        conversation: finalConversation
+      })
 
       return {
         invite: this.toPublicInvite(invite),
-        conversation: this.buildConversationSummary(group)
+        conversation: finalConversation
       }
     } catch (error) {
-      invite.status = 'failed'
-      invite.error = error?.message || String(error)
+      const errorMessage = error?.message || String(error)
+      if (!conversationId) {
+        invite.status = 'failed'
+        invite.error = errorMessage
+      } else {
+        invite.status = 'joined'
+        invite.error = null
+      }
       this.invitesById.set(inviteId, invite)
       this.schedulePersist()
-      this.emit('marmot-invite-updated', {
-        invite: this.toPublicInvite(invite),
-        reason: 'failed'
+      if (!conversationId) {
+        this.emit('marmot-invite-updated', {
+          invite: this.toPublicInvite(invite),
+          reason: 'failed'
+        })
+      }
+      this.emitAcceptInviteOperation(operationId, inviteId, 'failed', {
+        conversationId,
+        error: errorMessage
       })
       throw error
     }
+  }
+
+  async acceptInvite(inviteId) {
+    return await this.runAcceptInviteOperation(null, inviteId)
   }
 
   async sendMessage({
@@ -2459,18 +2718,11 @@ export class MarmotService {
 
     switch (type) {
       case 'marmot-init': {
-        await this.syncAll({ emit: false, force: true })
-        return {
-          initialized: true,
-          pubkey: this.pubkey,
-          relays: this.relays,
-          conversations: this.listConversationSummaries({ search: payload.search || '' }),
-          invites: this.listInvites({ search: payload.search || '' })
-        }
+        return this.buildInitSnapshot({ search: payload.search || '' })
       }
 
       case 'marmot-list-conversations': {
-        await this.syncAll({ emit: false, force: false })
+        await this.syncAll({ emit: false, reason: 'list-conversations' })
         return {
           conversations: this.listConversationSummaries({ search: payload.search || '' })
         }

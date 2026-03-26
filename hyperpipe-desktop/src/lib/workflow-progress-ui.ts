@@ -1,9 +1,3 @@
-const clampPercent = (value?: number | null) => {
-  const numeric = Number(value)
-  if (!Number.isFinite(numeric)) return 0
-  return Math.max(0, Math.min(100, Math.round(numeric)))
-}
-
 export type CreateGroupProgressPhase =
   | 'idle'
   | 'creatingRelay'
@@ -22,23 +16,18 @@ export type CreateGroupProgressState = {
 export type CreateConversationProgressPhase =
   | 'idle'
   | 'creatingConversation'
-  | 'syncingConversation'
-  | 'uploadingThumbnail'
-  | 'publishingThumbnailMetadata'
   | 'openingConversation'
   | 'success'
   | 'error'
 
 export type CreateConversationProgressState = {
   phase: CreateConversationProgressPhase
-  uploadProgress?: number | null
   error?: string | null
 }
 
 export type JoinConversationProgressPhase =
   | 'idle'
   | 'joiningConversation'
-  | 'syncingConversation'
   | 'openingConversation'
   | 'success'
   | 'error'
@@ -97,12 +86,6 @@ export function getCreateConversationProgressValue(
   switch (state?.phase) {
     case 'creatingConversation':
       return 18
-    case 'syncingConversation':
-      return 52
-    case 'uploadingThumbnail':
-      return 60 + Math.round(clampPercent(state.uploadProgress) * 0.24)
-    case 'publishingThumbnailMetadata':
-      return 88
     case 'openingConversation':
       return 96
     case 'success':
@@ -118,14 +101,6 @@ export function getCreateConversationProgressLabel(
   switch (state?.phase) {
     case 'creatingConversation':
       return 'Creating chat…'
-    case 'syncingConversation':
-      return 'Syncing members…'
-    case 'uploadingThumbnail': {
-      const percent = clampPercent(state.uploadProgress)
-      return percent > 0 ? `Uploading thumbnail… ${percent}%` : 'Uploading thumbnail…'
-    }
-    case 'publishingThumbnailMetadata':
-      return 'Publishing thumbnail…'
     case 'openingConversation':
       return 'Opening chat…'
     default:
@@ -145,9 +120,7 @@ export function getJoinConversationProgressValue(
 ): number {
   switch (phase) {
     case 'joiningConversation':
-      return 28
-    case 'syncingConversation':
-      return 72
+      return 34
     case 'openingConversation':
       return 92
     case 'success':
@@ -163,8 +136,6 @@ export function getJoinConversationProgressLabel(
   switch (phase) {
     case 'joiningConversation':
       return 'Accepting invite…'
-    case 'syncingConversation':
-      return 'Syncing chat…'
     case 'openingConversation':
       return 'Opening chat…'
     default:
