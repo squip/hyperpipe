@@ -30,6 +30,34 @@ let publicGatewayStatusCache = null;
 let currentWorkerUserKey = null;
 let pluginSupervisor = null;
 
+function getHeaderValue(headers, name) {
+  if (!headers || typeof headers !== 'object') return null;
+  const target = String(name || '').toLowerCase();
+  const entry = Object.entries(headers).find(([key]) => String(key).toLowerCase() === target);
+  if (!entry) return null;
+
+  const value = entry[1];
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item)).join(', ');
+  }
+
+  if (typeof value === 'number') {
+    return String(value);
+  }
+
+  return typeof value === 'string' ? value : null;
+}
+
+function summarizeResponseHeaders(headers) {
+  return {
+    contentType: getHeaderValue(headers, 'content-type'),
+    contentSecurityPolicy: getHeaderValue(headers, 'content-security-policy'),
+    crossOriginResourcePolicy: getHeaderValue(headers, 'cross-origin-resource-policy'),
+    cacheControl: getHeaderValue(headers, 'cache-control'),
+    server: getHeaderValue(headers, 'server')
+  };
+}
+
 function parseBooleanEnvFlag(value) {
   if (typeof value === 'boolean') return value;
   if (typeof value !== 'string') return null;
@@ -634,12 +662,61 @@ async function openHtmlViewerWindow({ url, title, parentWindow } = {}) {
     return { success: false, error: 'Blocked unsupported HTML viewer URL' };
   }
 
+  console.info('[Main] Opening HTML viewer URL', {
+    url,
+    title: title || null,
+    parentWindow: Boolean(parentWindow && !parentWindow.isDestroyed?.())
+  });
+
   const partition = createHtmlViewerPartition();
   const viewerSession = session.fromPartition(partition);
   viewerSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
   if (typeof viewerSession.setPermissionCheckHandler === 'function') {
     viewerSession.setPermissionCheckHandler(() => false);
   }
+  const requestFilter = { urls: ['http://*/*', 'https://*/*'] };
+  viewerSession.webRequest.onBeforeRequest(requestFilter, (details, callback) => {
+    if (details.resourceType === 'mainFrame') {
+      console.info('[Main] HTML viewer main-frame request', {
+        url: details.url,
+        method: details.method,
+        resourceType: details.resourceType,
+        webContentsId: details.webContentsId
+      });
+    }
+    callback({ cancel: false });
+  });
+  viewerSession.webRequest.onHeadersReceived(requestFilter, (details, callback) => {
+    if (details.resourceType === 'mainFrame') {
+      console.info('[Main] HTML viewer main-frame response', {
+        url: details.url,
+        statusCode: details.statusCode,
+        resourceType: details.resourceType,
+        ...summarizeResponseHeaders(details.responseHeaders)
+      });
+    }
+    callback({
+      cancel: false,
+      responseHeaders: details.responseHeaders
+    });
+  });
+  viewerSession.webRequest.onCompleted(requestFilter, (details) => {
+    if (details.resourceType === 'mainFrame') {
+      console.info('[Main] HTML viewer main-frame completed', {
+        url: details.url,
+        statusCode: details.statusCode,
+        fromCache: details.fromCache
+      });
+    }
+  });
+  viewerSession.webRequest.onErrorOccurred(requestFilter, (details) => {
+    if (details.resourceType === 'mainFrame') {
+      console.warn('[Main] HTML viewer main-frame failed', {
+        url: details.url,
+        error: details.error
+      });
+    }
+  });
 
   const viewerWindow = new BrowserWindow({
     ...buildHtmlViewerWindowOptions(partition),
@@ -654,6 +731,15 @@ async function openHtmlViewerWindow({ url, title, parentWindow } = {}) {
     if (!viewerWindow.isDestroyed()) {
       viewerWindow.show();
     }
+  });
+  viewerWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    if (level < 2) return;
+    console.info('[Main] HTML viewer console', {
+      level,
+      message,
+      line,
+      sourceId
+    });
   });
 
   configureHtmlViewerNavigation(viewerWindow, url);
@@ -685,6 +771,17 @@ async function openHtmlSourceViewer({ title, source, url } = {}) {
       if (!isAllowedHtmlViewerUrl(finalUrl)) {
         return { success: false, error: 'Blocked unsupported redirected HTML source URL' };
       }
+      console.info('[Main] HTML source fetch response', {
+        url: finalUrl,
+        status: response.status,
+        ...summarizeResponseHeaders({
+          'content-type': response.headers.get('content-type'),
+          'content-security-policy': response.headers.get('content-security-policy'),
+          'cross-origin-resource-policy': response.headers.get('cross-origin-resource-policy'),
+          'cache-control': response.headers.get('cache-control'),
+          server: response.headers.get('server')
+        })
+      });
       if (!response.ok) {
         return {
           success: false,

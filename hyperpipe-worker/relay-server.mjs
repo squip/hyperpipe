@@ -3920,6 +3920,27 @@ function setupProtocolHandlers(protocol) {
       'cache-control': 'no-store'
     })
 
+  const isHtmlDriveRequest = (fileName = '') =>
+    typeof fileName === 'string' && /\.html?$/i.test(fileName)
+
+  const readDriveHeaderValue = (headers, name) => {
+    if (!headers || typeof headers !== 'object') return null
+    const target = String(name || '').toLowerCase()
+    const entry = Object.entries(headers).find(([key]) => String(key).toLowerCase() === target)
+    if (!entry) return null
+    const value = entry[1]
+    if (Array.isArray(value)) return value.map((item) => String(item)).join(', ')
+    if (typeof value === 'number') return String(value)
+    return typeof value === 'string' ? value : null
+  }
+
+  const summarizeDriveHeaders = (headers) => ({
+    contentType: readDriveHeaderValue(headers, 'content-type'),
+    contentSecurityPolicy: readDriveHeaderValue(headers, 'content-security-policy'),
+    crossOriginResourcePolicy: readDriveHeaderValue(headers, 'cross-origin-resource-policy'),
+    cacheControl: readDriveHeaderValue(headers, 'cache-control')
+  })
+
   const etagMatches = (ifNoneMatchHeader, etag) => {
     if (!ifNoneMatchHeader || !etag) return false
     const normalized = String(ifNoneMatchHeader).trim()
@@ -4032,6 +4053,14 @@ function setupProtocolHandlers(protocol) {
         contentLength: fileBuffer.length,
         fileHash: hash
       })
+      if (isHtmlDriveRequest(fileId)) {
+        console.log('[RelayServer] Drive HTML response headers', {
+          identifier,
+          fileId,
+          statusCode: 200,
+          headers: summarizeDriveHeaders(successHeaders)
+        })
+      }
       const ifNoneMatch = request?.headers?.['if-none-match'] || request?.headers?.['If-None-Match']
       if (etagMatches(ifNoneMatch, successHeaders.etag)) {
         updateMetrics(true);

@@ -342,22 +342,21 @@ class MediaUploadService {
 
 	    const responseData = (response?.data || {}) as Record<string, unknown>
 	    const isConversationScope = context.resourceScope === 'conversation'
-	    const localUrl =
+	    const url =
 	      (typeof responseData.url === 'string' && responseData.url) ||
 	      this.buildLocalDriveUrl(localBaseUrl, context.groupId, fileId)
 	    const gatewayUrl =
 	      isConversationScope
-	        ? localUrl
-	        : ((typeof responseData.gatewayUrl === 'string' && responseData.gatewayUrl) || localUrl)
+	        ? url
+	        : ((typeof responseData.gatewayUrl === 'string' && responseData.gatewayUrl) || url)
 	    const gatewayUrls =
 	      isConversationScope
-	        ? [localUrl]
+	        ? [url]
 	        : (Array.isArray(responseData.gatewayUrls)
 	          ? responseData.gatewayUrls.filter((value): value is string => typeof value === 'string' && Boolean(value))
 	          : [])
 	          .concat(gatewayUrl ? [gatewayUrl] : [])
 	          .filter((value, index, list) => list.indexOf(value) === index)
-	    const url = isConversationScope ? localUrl : gatewayUrl || localUrl
 
     const mimeType =
       (typeof responseData.mime === 'string' && responseData.mime) ||

@@ -80,6 +80,35 @@ function applyDriveCorsHeaders(res, extraHeaders = {}) {
   });
 }
 
+function isHtmlDriveRequest(fileName = '') {
+  return typeof fileName === 'string' && /\.html?$/i.test(fileName);
+}
+
+function readHeaderValue(headers, name) {
+  if (!headers || typeof headers !== 'object') return null;
+  const target = String(name || '').toLowerCase();
+  const entry = Object.entries(headers).find(([key]) => String(key).toLowerCase() === target);
+  if (!entry) return null;
+  const value = entry[1];
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item)).join(', ');
+  }
+  if (typeof value === 'number') {
+    return String(value);
+  }
+  return typeof value === 'string' ? value : null;
+}
+
+function summarizeDriveHeaders(headers) {
+  return {
+    contentType: readHeaderValue(headers, 'content-type'),
+    contentSecurityPolicy: readHeaderValue(headers, 'content-security-policy'),
+    crossOriginResourcePolicy: readHeaderValue(headers, 'cross-origin-resource-policy'),
+    cacheControl: readHeaderValue(headers, 'cache-control'),
+    server: readHeaderValue(headers, 'server')
+  };
+}
+
 function cloneJson(value) {
   return value && typeof value === 'object'
     ? JSON.parse(JSON.stringify(value))
@@ -3380,7 +3409,19 @@ export class GatewayService extends EventEmitter {
 
     this.app.get('/drive/:identifier/:file', async (req, res) => {
       const { identifier, file } = req.params;
+      const shouldLogHtml = isHtmlDriveRequest(file);
       try {
+        if (shouldLogHtml) {
+          this.log('info', `[DriveHTML][Gateway] request ${JSON.stringify({
+            identifier,
+            file,
+            host: req.get('host') || null,
+            origin: req.get('origin') || null,
+            referer: req.get('referer') || null,
+            userAgent: req.get('user-agent') || null
+          })}`);
+        }
+
         const fileHash = typeof file === 'string' ? file.split('.')[0] : null;
         const validHash = typeof fileHash === 'string' && /^[a-f0-9]{64}$/i.test(fileHash);
         if (validHash) {
@@ -3408,6 +3449,14 @@ export class GatewayService extends EventEmitter {
               'content-type': guessContentType(file),
               'cache-control': 'public, max-age=31536000, immutable'
             });
+            if (shouldLogHtml) {
+              this.log('info', `[DriveHTML][Gateway] local-response ${JSON.stringify({
+                identifier,
+                file,
+                statusCode: 200,
+                ...summarizeDriveHeaders(res.getHeaders())
+              })}`);
+            }
             res.status(200).send(Buffer.isBuffer(localBuffer) ? localBuffer : Buffer.from(localBuffer));
             return;
           }
@@ -3421,10 +3470,26 @@ export class GatewayService extends EventEmitter {
         const stream = await requestFileFromPeer(peer, identifier, file, this.connectionPool);
         applyDriveCorsHeaders(res);
         Object.entries(stream.headers).forEach(([key, value]) => res.setHeader(key, value));
+        if (shouldLogHtml) {
+          this.log('info', `[DriveHTML][Gateway] peer-response ${JSON.stringify({
+            identifier,
+            file,
+            statusCode: stream.statusCode,
+            upstream: summarizeDriveHeaders(stream.headers || {}),
+            response: summarizeDriveHeaders(res.getHeaders())
+          })}`);
+        }
         res.status(stream.statusCode);
         stream.pipe(res);
         peer.lastSeen = Date.now();
       } catch (error) {
+        if (shouldLogHtml) {
+          this.log('error', `[DriveHTML][Gateway] error ${JSON.stringify({
+            identifier,
+            file,
+            message: error?.message || String(error)
+          })}`);
+        }
         this.log('error', `Drive file error: ${error.message}`);
         res.status(500).json({ error: 'Internal Server Error', message: error.message });
       }
