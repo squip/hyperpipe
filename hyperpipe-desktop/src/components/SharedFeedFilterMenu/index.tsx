@@ -549,7 +549,11 @@ function MultiSelectField({
             </button>
           ) : null}
         </div>
-        <ScrollArea className="max-h-[min(65vh,22rem)]">
+        <ScrollArea
+          className={cn(
+            options.length > 5 ? 'h-[min(65vh,22rem)]' : 'max-h-[min(65vh,22rem)]'
+          )}
+        >
           <div className="space-y-1 p-2 pb-3">
             {filteredOptions.length > 0 ? (
               filteredOptions.map((option) => {

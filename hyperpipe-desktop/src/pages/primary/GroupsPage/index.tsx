@@ -42,6 +42,7 @@ import { useLists } from '@/providers/ListsProvider'
 import { useMuteList } from '@/providers/MuteListProvider'
 import { useNostr } from '@/providers/NostrProvider'
 import { useWorkerBridge } from '@/providers/WorkerBridgeProvider'
+import client from '@/services/client.service'
 import type { TGroupInvite, TGroupMembershipState, TGroupPresenceState } from '@/types/groups'
 import { TPageRef } from '@/types'
 import dayjs from 'dayjs'
@@ -936,9 +937,28 @@ const GroupsPage = forwardRef<
       }
 
       if (relayFilterActive) {
+        const relayIdentities = new Set<string>()
         const relayUrl = row.relay ? resolveRelayUrl(row.relay) || row.relay : undefined
         const relayIdentity = relayUrl ? getRelayIdentity(relayUrl) : null
-        if (!relayIdentity || !selectedRelaySet.has(relayIdentity)) {
+        if (relayIdentity) {
+          relayIdentities.add(relayIdentity)
+        }
+
+        const metadataEvent = resolveGroupMeta(row.groupId, row.relay)?.event
+        if (metadataEvent) {
+          client.getSeenEventRelayUrls(metadataEvent.id, metadataEvent).forEach((seenRelayUrl) => {
+            const seenRelayIdentity = getRelayIdentity(seenRelayUrl)
+            if (seenRelayIdentity) {
+              relayIdentities.add(seenRelayIdentity)
+            }
+          })
+        }
+
+        const hasMatchingRelay = Array.from(relayIdentities).some((identity) =>
+          selectedRelaySet.has(identity)
+        )
+
+        if (!hasMatchingRelay) {
           return false
         }
       }
@@ -997,6 +1017,7 @@ const GroupsPage = forwardRef<
     effectiveSelectedRelayIdentities,
     mutePubkeySet,
     relayFilterActive,
+    resolveGroupMeta,
     resolveRelayUrl,
     resolveRowAdmin,
     resolveRowCreatedAt,
