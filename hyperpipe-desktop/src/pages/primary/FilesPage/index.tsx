@@ -1,5 +1,6 @@
 import GroupFilesTable from '@/components/GroupFilesTable'
 import SharedFeedFilterMenu from '@/components/SharedFeedFilterMenu'
+import TitlebarInfoButton from '@/components/TitlebarInfoButton'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import useSharedFeedFilterSettings from '@/hooks/useSharedFeedFilterSettings'
@@ -343,6 +344,7 @@ const FilesPage = forwardRef<TPageRef>((_, ref) => {
           records={filteredRecords}
           loading={isLoading}
           showGroupColumn
+          showDownloadAction
           searchQuery={search}
           emptyLabel={t('No files uploaded yet')}
           defaultSortKey="uploadedAt"
@@ -366,11 +368,17 @@ function FilesPageTitlebar() {
   const { t } = useTranslation()
 
   return (
-    <div className="flex gap-2 items-center h-full pl-3 [&_svg]:text-muted-foreground">
-      <Files />
-      <div className="text-lg font-semibold" style={{ fontSize: 'var(--title-font-size, 18px)' }}>
-        {t('Files')}
+    <div className="flex items-center justify-between h-full pl-3 pr-2">
+      <div className="flex gap-2 items-center [&_svg]:text-muted-foreground">
+        <Files />
+        <div className="text-lg font-semibold" style={{ fontSize: 'var(--title-font-size, 18px)' }}>
+          {t('Files')}
+        </div>
       </div>
+      <TitlebarInfoButton
+        label="Files info"
+        content="Search, sort, and manage your p2p file system across all your Hyperpipe group relays."
+      />
     </div>
   )
 }

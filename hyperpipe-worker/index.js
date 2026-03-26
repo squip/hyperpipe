@@ -5,7 +5,7 @@
 /** @typedef {import('pear-interface')} */ 
 import process from 'node:process'
 import { promises as fs } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import os from 'node:os'
 import nodeCrypto from 'node:crypto'
 import swarmCrypto from 'hypercore-crypto'
@@ -7349,12 +7349,19 @@ async function recoverRelayDriveFile({
   }
 }
 
-async function writeFileToDownloads({ fileName, data }) {
+async function writeFileToDownloads({ fileName, data, savePath }) {
+  if (typeof savePath === 'string' && savePath.trim()) {
+    const explicitPath = savePath.trim()
+    await fs.mkdir(dirname(explicitPath), { recursive: true })
+    await fs.writeFile(explicitPath, data)
+    return explicitPath
+  }
+
   const home = os.homedir()
   const downloadsDir = process.env.HYPERPIPE_DOWNLOADS_DIR || join(home, 'Downloads')
   await fs.mkdir(downloadsDir, { recursive: true })
   const normalizedName = normalizeDownloadFileName({ fileName, fileHash: '' })
-  const savePath = await ensureUniqueDownloadPath(downloadsDir, normalizedName, {
+  const resolvedSavePath = await ensureUniqueDownloadPath(downloadsDir, normalizedName, {
     fileAccess: async (candidate) => {
       try {
         await fs.access(candidate)
@@ -7364,8 +7371,8 @@ async function writeFileToDownloads({ fileName, data }) {
       }
     }
   })
-  await fs.writeFile(savePath, data)
-  return savePath
+  await fs.writeFile(resolvedSavePath, data)
+  return resolvedSavePath
 }
 
 async function syncRemotePfpMirrors() {

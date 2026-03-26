@@ -13,6 +13,10 @@ import type {
 
 export type WorkerCommandResult = { success: boolean; error?: string }
 export type WorkerStartResult = WorkerCommandResult & { alreadyRunning?: boolean; configSent?: boolean }
+export type SaveDialogResult = {
+  canceled: boolean
+  filePath?: string
+}
 
 export type RelayEntry = {
   relayKey: string
@@ -281,6 +285,13 @@ type ElectronAPI = {
   getLogFilePath: () => Promise<string>
   appendLogLine: (line: string) => Promise<WorkerCommandResult>
   readFileBuffer: (filePath: string) => Promise<{ success: boolean; data: ArrayBuffer }>
+  showSaveDialog: (payload: { defaultFileName?: string }) => Promise<SaveDialogResult>
+  openHtmlViewerWindow: (url: string, title?: string) => Promise<WorkerCommandResult>
+  openHtmlSourceViewer: (payload: {
+    title?: string
+    source: string
+    url?: string
+  }) => Promise<WorkerCommandResult>
 
   listPlugins?: () => Promise<{ success: boolean; plugins: unknown[] }>
   discoverPlugin?: (payload: unknown) => Promise<PluginLifecycleResponse>
@@ -409,6 +420,15 @@ export const electronIpc = {
   },
   readFileBuffer(filePath: string) {
     return api()?.readFileBuffer(filePath) ?? unavailable()
+  },
+  showSaveDialog(payload: { defaultFileName?: string }) {
+    return api()?.showSaveDialog(payload) ?? unavailable()
+  },
+  openHtmlViewerWindow(url: string, title?: string) {
+    return api()?.openHtmlViewerWindow(url, title) ?? unavailable()
+  },
+  openHtmlSourceViewer(payload: { title?: string; source: string; url?: string }) {
+    return api()?.openHtmlSourceViewer(payload) ?? unavailable()
   },
   listPlugins() {
     return api()?.listPlugins?.() ?? unavailable()

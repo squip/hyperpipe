@@ -87,6 +87,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getLogFilePath: () => ipcRenderer.invoke('get-log-file-path'),
   appendLogLine: (line) => ipcRenderer.invoke('append-log-line', line),
   readFileBuffer: (filePath) => ipcRenderer.invoke('read-file-buffer', filePath),
+  showSaveDialog: (payload) => ipcRenderer.invoke('show-save-dialog', payload),
+  openHtmlViewerWindow: (url, title) => ipcRenderer.invoke('open-html-viewer-window', { url, title }),
+  openHtmlSourceViewer: (payload) => ipcRenderer.invoke('open-html-source-viewer', payload),
   importModule,
   requireModule
 });

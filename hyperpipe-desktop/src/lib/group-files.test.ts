@@ -1,5 +1,6 @@
 import {
   getGroupFileExtensionLabel,
+  isGroupFileHtml,
   normalizeGroupFileExtension,
   resolveGroupFileExtension
 } from '@/lib/group-files'
@@ -48,5 +49,31 @@ describe('group file extension helpers', () => {
   it('formats extension labels for display', () => {
     expect(getGroupFileExtensionLabel('pdf')).toBe('.pdf')
     expect(getGroupFileExtensionLabel('unknown')).toBe('Unknown')
+  })
+
+  it('detects HTML files from mime type or extension', () => {
+    expect(
+      isGroupFileHtml({
+        fileName: 'landing-page',
+        url: 'https://example.com/page',
+        mime: 'text/html'
+      })
+    ).toBe(true)
+
+    expect(
+      isGroupFileHtml({
+        fileName: 'landing-page.html',
+        url: 'https://example.com/page',
+        mime: null
+      })
+    ).toBe(true)
+
+    expect(
+      isGroupFileHtml({
+        fileName: 'image.png',
+        url: 'https://example.com/image.png',
+        mime: 'image/png'
+      })
+    ).toBe(false)
   })
 })

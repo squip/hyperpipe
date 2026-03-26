@@ -445,6 +445,7 @@ class MediaUploadService {
       'audio/mpeg': '.mp3',
       'audio/mp4': '.m4a',
       'application/pdf': '.pdf',
+      'text/html': '.html',
       'text/plain': '.txt'
     }
     return mimeMap[file.type] || ''

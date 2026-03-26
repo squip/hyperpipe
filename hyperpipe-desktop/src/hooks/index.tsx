@@ -1,4 +1,5 @@
 export * from './useFetchEvent'
+export * from './useFetchHtmlAnalysis'
 export * from './useFetchFollowings'
 export * from './useFetchNip05'
 export * from './useFetchProfile'

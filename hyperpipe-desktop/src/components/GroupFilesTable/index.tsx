@@ -7,9 +7,22 @@ import {
   formatGroupFileSize,
   GroupFileRecord,
   GroupFileSortKey,
+  isGroupFileHtml,
   matchesGroupFileSearch
 } from '@/lib/group-files'
-import { ArrowDown, ArrowUp, ArrowUpDown, AudioLines, Copy, File, Film, Link2 } from 'lucide-react'
+import { electronIpc } from '@/services/electron-ipc.service'
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
+  AudioLines,
+  Copy,
+  Download,
+  File,
+  Film,
+  Link2,
+  Loader2
+} from 'lucide-react'
 import dayjs from 'dayjs'
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
@@ -25,6 +38,7 @@ type GroupFilesTableProps = {
   onCountChange?: (count: number) => void
   defaultSortKey?: GroupFileSortKey
   defaultSortDirection?: SortDirection
+  showDownloadAction?: boolean
 }
 
 function getSortValue(record: GroupFileRecord, key: GroupFileSortKey) {
@@ -129,11 +143,13 @@ export default function GroupFilesTable({
   emptyLabel = 'No files uploaded yet',
   onCountChange,
   defaultSortKey = 'uploadedAt',
-  defaultSortDirection = 'desc'
+  defaultSortDirection = 'desc',
+  showDownloadAction = false
 }: GroupFilesTableProps) {
   const [sortKey, setSortKey] = useState<GroupFileSortKey>(defaultSortKey)
   const [sortDirection, setSortDirection] = useState<SortDirection>(defaultSortDirection)
   const [expandedEventId, setExpandedEventId] = useState<string | null>(null)
+  const [downloadingEventId, setDownloadingEventId] = useState<string | null>(null)
 
   useEffect(() => {
     onCountChange?.(records.length)
@@ -178,6 +194,50 @@ export default function GroupFilesTable({
     } catch (error) {
       toast.error('Failed to copy file URL')
       console.warn('[GroupFilesTable] copy URL failed', error)
+    }
+  }
+
+  const downloadFile = async (record: GroupFileRecord) => {
+    if (!electronIpc.isElectron()) {
+      toast.error('File downloads require the Electron desktop app')
+      return
+    }
+    if (!record.sha256) {
+      toast.error('This file is missing a download hash')
+      return
+    }
+
+    try {
+      setDownloadingEventId(record.eventId)
+      const saveDialog = await electronIpc.showSaveDialog({ defaultFileName: record.fileName })
+      if (saveDialog?.canceled || !saveDialog?.filePath) {
+        return
+      }
+
+      const response = await electronIpc.sendToWorkerAwait({
+        message: {
+          type: 'download-group-file',
+          data: {
+            groupId: record.groupId,
+            identifier: record.groupId,
+            fileHash: record.sha256,
+            fileName: record.fileName,
+            savePath: saveDialog.filePath
+          }
+        },
+        timeoutMs: 120_000
+      })
+
+      if (!response?.success) {
+        throw new Error(response?.error || 'Worker download failed')
+      }
+
+      toast.success(`Saved file to ${response?.data?.savedPath || saveDialog.filePath}`)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Failed to download file')
+      console.warn('[GroupFilesTable] download failed', error)
+    } finally {
+      setDownloadingEventId((current) => (current === record.eventId ? null : current))
     }
   }
 
@@ -238,6 +298,8 @@ export default function GroupFilesTable({
       <div className="divide-y">
         {sortedRecords.map((record) => {
           const isExpanded = expandedEventId === record.eventId
+          const isDownloading = downloadingEventId === record.eventId
+          const isHtmlRecord = isGroupFileHtml(record)
           const uploadedDate = formatUploadedDate(record.uploadedAt)
           const sizeLabel = formatGroupFileSize(record.size)
           const mimeLabel = formatGroupFileMime(record.mime)
@@ -288,14 +350,32 @@ export default function GroupFilesTable({
               {isExpanded && (
                 <div className="border-t bg-muted/10 px-3 py-3">
                   <div className="mb-2 flex flex-wrap items-center gap-2">
-                    <Button type="button" size="sm" variant="outline" onClick={() => openExternalUrl(record.url)}>
-                      <Link2 className="mr-1.5 h-3.5 w-3.5" />
-                      Open
-                    </Button>
+                    {!isHtmlRecord && (
+                      <Button type="button" size="sm" variant="outline" onClick={() => openExternalUrl(record.url)}>
+                        <Link2 className="mr-1.5 h-3.5 w-3.5" />
+                        Open
+                      </Button>
+                    )}
                     <Button type="button" size="sm" variant="outline" onClick={() => copyUrl(record.url)}>
                       <Copy className="mr-1.5 h-3.5 w-3.5" />
                       Copy URL
                     </Button>
+                    {showDownloadAction && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void downloadFile(record)}
+                        disabled={isDownloading || !record.sha256}
+                      >
+                        {isDownloading ? (
+                          <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Download className="mr-1.5 h-3.5 w-3.5" />
+                        )}
+                        Download
+                      </Button>
+                    )}
                   </div>
                   <FileMetadataNote event={record.event} className="mt-0 border-0 bg-transparent p-0" />
                 </div>

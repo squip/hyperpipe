@@ -121,6 +121,14 @@ export function getGroupFileExtensionLabel(extension: string) {
   return extension === 'unknown' ? 'Unknown' : `.${extension}`
 }
 
+export function isGroupFileHtml(
+  record: Pick<GroupFileRecord, 'fileName' | 'url' | 'mime'>
+) {
+  const mime = toOptionalString(record.mime)?.toLowerCase() || null
+  if (mime === 'text/html') return true
+  return resolveGroupFileExtension(record) === 'html'
+}
+
 function buildFallbackFileName(sha256: string | null) {
   return sha256 ? `file-${sha256.slice(0, 12)}` : 'file'
 }

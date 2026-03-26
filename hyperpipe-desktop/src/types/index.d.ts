@@ -62,6 +62,12 @@ export type TWebMetadata = {
   image?: string | null
 }
 
+export type THtmlDocumentAnalysis = TWebMetadata & {
+  htmlSource?: string | null
+  declaredExternalOrigins?: string[]
+  hasMetaPreview?: boolean
+}
+
 export type TRelaySet = {
   id: string
   pubkey: string

@@ -12,6 +12,19 @@ const DRAGOVER_CLASS_LIST = [
   'rounded-md'
 ]
 
+function isHtmlFile(file: File) {
+  const name = String(file.name || '').toLowerCase()
+  return file.type === 'text/html' || name.endsWith('.html') || name.endsWith('.htm')
+}
+
+function isUploadableFile(file: File, uploadContext?: MediaUploadContext) {
+  const type = String(file.type || '').toLowerCase()
+  if (type.includes('image') || type.includes('video') || type.includes('audio')) {
+    return true
+  }
+  return uploadContext?.target === 'group-hyperdrive' && isHtmlFile(file)
+}
+
 export interface ClipboardAndDropHandlerOptions {
   onUploadStart?: (file: File, cancel: () => void) => void
   onUploadEnd?: (file: File) => void
@@ -63,9 +76,7 @@ export const ClipboardAndDropHandler = Extension.create<ClipboardAndDropHandlerO
             view.dom.classList.remove(...DRAGOVER_CLASS_LIST)
 
             const items = Array.from(event.dataTransfer?.files ?? [])
-            const mediaFiles = items.filter(
-              (item) => item.type.includes('image') || item.type.includes('video')
-            )
+            const mediaFiles = items.filter((item) => isUploadableFile(item, options.uploadContext))
             if (!mediaFiles.length) return false
 
             uploadFiles(view, mediaFiles, options)
@@ -76,15 +87,14 @@ export const ClipboardAndDropHandler = Extension.create<ClipboardAndDropHandlerO
             let handled = false
 
             for (const item of items) {
+              const file = item.kind === 'file' ? item.getAsFile() : null
               if (
                 item.kind === 'file' &&
-                (item.type.includes('image') || item.type.includes('video'))
+                file &&
+                isUploadableFile(file, options.uploadContext)
               ) {
-                const file = item.getAsFile()
-                if (file) {
-                  uploadFiles(view, [file], options)
-                  handled = true
-                }
+                uploadFiles(view, [file], options)
+                handled = true
               } else if (item.kind === 'string' && item.type === 'text/plain') {
                 item.getAsString((text) => {
                   const { schema } = view.state

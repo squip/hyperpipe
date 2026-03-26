@@ -4008,8 +4008,21 @@ function setupProtocolHandlers(protocol) {
           'jpeg': 'image/jpeg',
           'png': 'image/png',
           'gif': 'image/gif',
+          'webp': 'image/webp',
+          'svg': 'image/svg+xml',
+          'html': 'text/html; charset=utf-8',
+          'htm': 'text/html; charset=utf-8',
+          'css': 'text/css; charset=utf-8',
+          'js': 'text/javascript; charset=utf-8',
+          'mjs': 'text/javascript; charset=utf-8',
+          'json': 'application/json; charset=utf-8',
+          'csv': 'text/csv; charset=utf-8',
+          'md': 'text/markdown; charset=utf-8',
           'pdf': 'application/pdf',
-          'txt': 'text/plain'
+          'txt': 'text/plain; charset=utf-8',
+          'wav': 'audio/wav',
+          'ogg': 'audio/ogg',
+          'flac': 'audio/flac'
         };
         contentType = mimeTypes[ext] || contentType;
       }

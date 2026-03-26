@@ -1,9 +1,16 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, session } = require('electron');
 const path = require('path');
 const { promises: fs, existsSync } = require('fs');
 const { spawn, execFile } = require('child_process');
 const { promisify } = require('util');
 const { PluginSupervisor } = require('./plugin-supervisor.cjs');
+const {
+  buildHtmlSourceViewerDocument,
+  buildHtmlSourceViewerWindowOptions,
+  buildHtmlViewerWindowOptions,
+  createHtmlViewerPartition,
+  isAllowedHtmlViewerUrl
+} = require('./html-viewer.cjs');
 
 const execFileAsync = promisify(execFile);
 const APP_DISPLAY_NAME = 'Hyperpipe';
@@ -589,6 +596,114 @@ function createWindow() {
   } else {
     const rendererPath = getRendererIndexPath();
     mainWindow.loadFile(rendererPath);
+  }
+}
+
+function configureHtmlViewerNavigation(viewerWindow, initialUrl) {
+  if (!viewerWindow || viewerWindow.isDestroyed()) return;
+  let initialLoadComplete = false;
+
+  viewerWindow.webContents.setWindowOpenHandler(({ url }) => {
+    openHtmlViewerWindow({
+      url,
+      parentWindow: viewerWindow
+    }).catch((error) => {
+      console.warn('[Main] Failed to open HTML popup window', error);
+    });
+    return { action: 'deny' };
+  });
+
+  viewerWindow.webContents.once('did-finish-load', () => {
+    initialLoadComplete = true;
+  });
+
+  viewerWindow.webContents.on('will-navigate', (event, nextUrl) => {
+    if (!initialLoadComplete || !nextUrl || nextUrl === initialUrl) return;
+    event.preventDefault();
+    openHtmlViewerWindow({
+      url: nextUrl,
+      parentWindow: viewerWindow
+    }).catch((error) => {
+      console.warn('[Main] Failed to open navigated HTML window', error);
+    });
+  });
+}
+
+async function openHtmlViewerWindow({ url, title, parentWindow } = {}) {
+  if (!isAllowedHtmlViewerUrl(url)) {
+    return { success: false, error: 'Blocked unsupported HTML viewer URL' };
+  }
+
+  const partition = createHtmlViewerPartition();
+  const viewerSession = session.fromPartition(partition);
+  viewerSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+  if (typeof viewerSession.setPermissionCheckHandler === 'function') {
+    viewerSession.setPermissionCheckHandler(() => false);
+  }
+
+  const viewerWindow = new BrowserWindow({
+    ...buildHtmlViewerWindowOptions(partition),
+    ...(parentWindow && !parentWindow.isDestroyed() ? { parent: parentWindow } : {})
+  });
+
+  viewerWindow.removeMenu?.();
+  if (title) {
+    viewerWindow.setTitle(String(title));
+  }
+  viewerWindow.once('ready-to-show', () => {
+    if (!viewerWindow.isDestroyed()) {
+      viewerWindow.show();
+    }
+  });
+
+  configureHtmlViewerNavigation(viewerWindow, url);
+
+  try {
+    await viewerWindow.loadURL(url);
+    return { success: true };
+  } catch (error) {
+    console.error('[Main] Failed to load HTML viewer URL', error);
+    if (!viewerWindow.isDestroyed()) {
+      viewerWindow.close();
+    }
+    return { success: false, error: error?.message || String(error) };
+  }
+}
+
+async function openHtmlSourceViewer({ title, source, url } = {}) {
+  if (typeof source !== 'string') {
+    return { success: false, error: 'HTML source is required' };
+  }
+
+  const viewerWindow = new BrowserWindow(buildHtmlSourceViewerWindowOptions());
+  viewerWindow.removeMenu?.();
+  if (title) {
+    viewerWindow.setTitle(String(title));
+  }
+  viewerWindow.once('ready-to-show', () => {
+    if (!viewerWindow.isDestroyed()) {
+      viewerWindow.show();
+    }
+  });
+  viewerWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  viewerWindow.webContents.on('will-navigate', (event) => event.preventDefault());
+
+  const html = buildHtmlSourceViewerDocument({
+    title: title || 'HTML Source',
+    url: typeof url === 'string' ? url : '',
+    source
+  });
+  const dataUrl = `data:text/html;base64,${Buffer.from(html, 'utf8').toString('base64')}`;
+
+  try {
+    await viewerWindow.loadURL(dataUrl);
+    return { success: true };
+  } catch (error) {
+    console.error('[Main] Failed to load HTML source viewer', error);
+    if (!viewerWindow.isDestroyed()) {
+      viewerWindow.close();
+    }
+    return { success: false, error: error?.message || String(error) };
   }
 }
 
@@ -1499,6 +1614,47 @@ ipcMain.handle('read-file-buffer', async (_event, filePath) => {
     console.error('[Main] Failed to read file buffer', error);
     return { success: false, error: error.message };
   }
+});
+
+ipcMain.handle('show-save-dialog', async (_event, payload) => {
+  try {
+    const defaultFileName =
+      payload && typeof payload === 'object' && typeof payload.defaultFileName === 'string'
+        ? payload.defaultFileName.trim()
+        : '';
+    const result = await dialog.showSaveDialog(mainWindow || undefined, {
+      defaultPath: defaultFileName
+        ? path.join(app.getPath('downloads'), defaultFileName)
+        : undefined
+    });
+    return {
+      canceled: !!result.canceled,
+      filePath: result.filePath || undefined
+    };
+  } catch (error) {
+    console.error('[Main] Failed to show save dialog', error);
+    return {
+      canceled: true
+    };
+  }
+});
+
+ipcMain.handle('open-html-viewer-window', async (_event, payload) => {
+  const request = payload && typeof payload === 'object' ? payload : {};
+  return openHtmlViewerWindow({
+    url: typeof request.url === 'string' ? request.url : '',
+    title: typeof request.title === 'string' ? request.title : '',
+    parentWindow: BrowserWindow.fromWebContents(_event.sender) || mainWindow
+  });
+});
+
+ipcMain.handle('open-html-source-viewer', async (_event, payload) => {
+  const request = payload && typeof payload === 'object' ? payload : {};
+  return openHtmlSourceViewer({
+    title: typeof request.title === 'string' ? request.title : '',
+    url: typeof request.url === 'string' ? request.url : '',
+    source: typeof request.source === 'string' ? request.source : ''
+  });
 });
 
 app.whenReady().then(async () => {

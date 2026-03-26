@@ -1,3 +1,8 @@
+import HtmlFilePreviewCard from '@/components/HtmlFilePreviewCard'
+import {
+  isGroupFileHtml,
+  parseGroupFileRecordFromEvent
+} from '@/lib/group-files'
 import { cn } from '@/lib/utils'
 import { Event } from '@nostr/tools/wasm'
 
@@ -21,6 +26,13 @@ export default function FileMetadataNote({ event, className }: { event: Event; c
   const dim = readTag(event, 'dim')
   const alt = readTag(event, 'alt')
   const summary = readTag(event, 'summary')
+  const record = parseGroupFileRecordFromEvent(event)
+  const fileName = record?.fileName || alt || event.content || 'Shared file'
+  const isHtml = !!url && isGroupFileHtml({
+    fileName,
+    url,
+    mime: mimeType || null
+  })
   const isImage = mimeType.startsWith('image/')
   const isVideo = mimeType.startsWith('video/')
   const isAudio = mimeType.startsWith('audio/')
@@ -32,6 +44,13 @@ export default function FileMetadataNote({ event, className }: { event: Event; c
         {size ? <span>{size}</span> : null}
         {dim ? <span>{dim}</span> : null}
       </div>
+      {isHtml && url ? (
+        <HtmlFilePreviewCard
+          url={url}
+          fileName={fileName}
+          summary={summary || alt || event.content || null}
+        />
+      ) : null}
       {isImage && url ? (
         <img src={url} alt={alt || event.content || 'Shared file'} className="max-h-80 w-full rounded-md object-contain bg-black/5" />
       ) : null}
@@ -41,9 +60,9 @@ export default function FileMetadataNote({ event, className }: { event: Event; c
       {isAudio && url ? (
         <audio controls src={url} className="w-full" />
       ) : null}
-      {summary ? <div className="text-sm text-muted-foreground">{summary}</div> : null}
-      {event.content ? <div className="text-sm break-words">{event.content}</div> : null}
-      {url ? (
+      {!isHtml && summary ? <div className="text-sm text-muted-foreground">{summary}</div> : null}
+      {!isHtml && event.content ? <div className="text-sm break-words">{event.content}</div> : null}
+      {!isHtml && url ? (
         <a
           href={url}
           target="_blank"
@@ -52,9 +71,10 @@ export default function FileMetadataNote({ event, className }: { event: Event; c
         >
           {url}
         </a>
-      ) : (
+      ) : null}
+      {!url ? (
         <div className="text-sm text-muted-foreground">Missing file URL</div>
-      )}
+      ) : null}
     </div>
   )
 }

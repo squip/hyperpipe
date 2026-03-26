@@ -82,6 +82,7 @@ export async function downloadGroupFileOperation (
 ) {
   const requestedFileHash = typeof payload.fileHash === 'string' ? payload.fileHash.trim().toLowerCase() : ''
   const requestedFileName = typeof payload.fileName === 'string' ? payload.fileName.trim() : ''
+  const requestedSavePath = typeof payload.savePath === 'string' ? payload.savePath.trim() : ''
   if (!requestedFileHash) throw new Error('download-group-file requires fileHash')
 
   const { relayKey, identifier } = await resolveGroupFileTarget(payload, {
@@ -118,7 +119,8 @@ export async function downloadGroupFileOperation (
   })
   const savePath = await writeFileToDownloads({
     fileName: normalizedFileName,
-    data: buffer
+    data: buffer,
+    savePath: requestedSavePath || undefined
   })
 
   return {

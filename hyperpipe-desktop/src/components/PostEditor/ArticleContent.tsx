@@ -131,6 +131,9 @@ export default function ArticleContent({
       parentKind: 30023
     }
   }, [groupContext?.groupId, groupContext?.relay])
+  const uploadAccept = groupContext?.groupId
+    ? 'image/*,video/*,audio/*,.html,text/html'
+    : 'image/*,video/*,audio/*'
   const groupDisplayName = groupContext?.name || groupContext?.groupId
   const groupInitials = (groupDisplayName || 'GR').slice(0, 2).toUpperCase()
   const hasBlockingUploadFailures = !!groupContext?.groupId && failedUploads.length > 0
@@ -622,6 +625,7 @@ export default function ArticleContent({
           onUploadProgress={handleUploadProgress}
           onUploadError={handleUploadError}
           uploadContext={groupUploadContext}
+          uploadAccept={uploadAccept}
           onClearEditor={handleClearEditor}
           onUploadSuccess={(result, file) => {
             setContent((prev) => `${prev}${prev ? '\n' : ''}${result.url}`)

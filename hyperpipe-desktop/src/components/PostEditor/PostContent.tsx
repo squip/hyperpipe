@@ -143,6 +143,9 @@ export default function PostContent({
           : kinds.ShortTextNote
     }
   }, [groupContext?.groupId, groupContext?.relay, parentEvent])
+  const uploadAccept = groupContext?.groupId
+    ? 'image/*,video/*,audio/*,.html,text/html'
+    : 'image/*,video/*,audio/*'
   const isFirstRender = useRef(true)
   const hasBlockingUploadFailures = !!groupContext?.groupId && failedUploads.length > 0
   const canPost = useMemo(() => {
@@ -579,7 +582,7 @@ export default function PostContent({
             onUploadStart={handleUploadStart}
             onUploadEnd={handleUploadEnd}
             onProgress={handleUploadProgress}
-            accept="image/*,video/*,audio/*"
+            accept={uploadAccept}
             uploadContext={groupUploadContext}
           >
             <Button variant="ghost" size="icon">

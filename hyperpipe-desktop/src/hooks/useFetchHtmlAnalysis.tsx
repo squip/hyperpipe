@@ -1,24 +1,24 @@
-import { TWebMetadata } from '@/types'
+import { THtmlDocumentAnalysis } from '@/types'
 import { useEffect, useState } from 'react'
 import webService from '@/services/web.service'
 
-export function useFetchWebMetadata(url: string) {
-  const [metadata, setMetadata] = useState<TWebMetadata>({})
+export function useFetchHtmlAnalysis(url: string) {
+  const [analysis, setAnalysis] = useState<THtmlDocumentAnalysis>({})
   const [isLoading, setIsLoading] = useState(true)
 
   useEffect(() => {
     setIsLoading(true)
     let cancelled = false
     webService
-      .fetchWebMetadata(url)
-      .then((metadata) => {
+      .fetchHtmlAnalysis(url)
+      .then((nextAnalysis) => {
         if (cancelled) return
-        setMetadata(metadata)
+        setAnalysis(nextAnalysis)
       })
       .catch((error) => {
         if (cancelled) return
-        console.warn('Failed to fetch web metadata', error)
-        setMetadata({})
+        console.warn('Failed to fetch HTML analysis', error)
+        setAnalysis({})
       })
       .finally(() => {
         if (cancelled) return
@@ -29,5 +29,5 @@ export function useFetchWebMetadata(url: string) {
     }
   }, [url])
 
-  return { ...metadata, isLoading }
+  return { ...analysis, isLoading }
 }

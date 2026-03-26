@@ -147,6 +147,40 @@ test('downloadGroupFileOperation retries local read via relay key fallback', asy
   t.is(result.source, 'local')
 })
 
+test('downloadGroupFileOperation forwards an explicit save path to the writer', async (t) => {
+  const relayKey = hex64('d')
+  const fileHash = hex64('7')
+  let writePayload = null
+
+  const result = await downloadGroupFileOperation(
+    {
+      groupId: 'npubdemo:group-explicit',
+      fileHash,
+      fileName: 'index.html',
+      savePath: '/tmp/custom/index.html'
+    },
+    {
+      getRelayKeyFromPublicIdentifier: async () => relayKey,
+      getRelayProfileByKey: async () => ({ public_identifier: 'npubdemo:group-explicit' }),
+      recoverRelayDriveFile: async () => ({
+        status: 'ok',
+        reason: 'already-local',
+        identifier: 'npubdemo:group-explicit',
+        relayKey
+      }),
+      getFile: async () => Buffer.from('<html></html>'),
+      writeFileToDownloads: async (payload) => {
+        writePayload = payload
+        return payload.savePath
+      }
+    }
+  )
+
+  t.is(writePayload.fileName, 'index.html')
+  t.is(writePayload.savePath, '/tmp/custom/index.html')
+  t.is(result.savedPath, '/tmp/custom/index.html')
+})
+
 test('downloadGroupFileOperation validates file hash and recovery errors', async (t) => {
   await t.exception(async () => {
     await downloadGroupFileOperation({}, {

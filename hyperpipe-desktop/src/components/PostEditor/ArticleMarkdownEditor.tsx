@@ -102,6 +102,7 @@ type ArticleMarkdownEditorProps = {
   onUploadSuccess?: (result: MediaUploadResult, file?: File) => void
   onUploadError?: (file: File, error: Error) => void
   uploadContext?: MediaUploadContext
+  uploadAccept?: string
   onSaveDraft?: () => void
   shouldInsertTemplate?: boolean
   renderToolbar?: (toolbar: React.ReactNode) => void
@@ -150,6 +151,7 @@ export default function ArticleMarkdownEditor({
   onUploadSuccess,
   onUploadError,
   uploadContext,
+  uploadAccept = 'image/*,video/*,audio/*',
   onSaveDraft,
   shouldInsertTemplate,
   renderToolbar,
@@ -1414,7 +1416,7 @@ export default function ArticleMarkdownEditor({
             }
             debugLog('toolbar:upload-insert', { url: result.url, type })
           }}
-          accept="image/*,video/*,audio/*"
+          accept={uploadAccept}
           onPickerOpen={() => {
             debugLog('toolbar:upload-picker-open', { source: 'article-toolbar' })
             setIsFabOpen(false)
