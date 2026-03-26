@@ -13,6 +13,10 @@ import type {
   ThreadMessage,
   UpdateConversationMetadataInput
 } from '@/lib/conversations/types'
+import type {
+  CreateConversationProgressState,
+  JoinConversationProgressState
+} from '@/lib/workflow-progress-ui'
 
 type MarmotSendStatus = {
   conversationId: string
@@ -79,10 +83,20 @@ type MessengerContextType = {
   pendingInviteCount: number
   ready: boolean
   unsupportedReason?: string
-  createConversation: (input: CreateConversationInput) => Promise<CreateConversationResult>
+  createConversation: (
+    input: CreateConversationInput,
+    options?: {
+      onProgress?: (state: CreateConversationProgressState) => void
+    }
+  ) => Promise<CreateConversationResult>
   inviteMembers: (conversationId: string, members: string[]) => Promise<void>
   grantConversationAdmin: (conversationId: string, targetPubkey: string) => Promise<void>
-  acceptInvite: (inviteId: string) => Promise<{ conversationId: string | null }>
+  acceptInvite: (
+    inviteId: string,
+    options?: {
+      onProgress?: (state: JoinConversationProgressState) => void
+    }
+  ) => Promise<{ conversationId: string | null }>
   refreshConversations: (query?: ConversationQuery) => Promise<ConversationSummary[]>
   refreshInvites: (query?: ConversationQuery) => Promise<ConversationInvite[]>
   updateConversationMetadata: (input: UpdateConversationMetadataInput) => Promise<void>
@@ -96,10 +110,14 @@ const MessengerContext = createContext<MessengerContextType | undefined>(undefin
 
 const debug = (...args: any[]) => console.debug('[MarmotProvider]', ...args)
 
-const readStateStorageKey = (pubkey: string | null | undefined) => `marmotReadState:${pubkey || 'anon'}`
-const inviteDismissedStorageKey = (pubkey: string | null | undefined) => `marmotInviteDismissed:${pubkey || 'anon'}`
-const inviteAcceptedStorageKey = (pubkey: string | null | undefined) => `marmotInviteAccepted:${pubkey || 'anon'}`
-const inviteAcceptedConversationStorageKey = (pubkey: string | null | undefined) => `marmotInviteAcceptedConversation:${pubkey || 'anon'}`
+const readStateStorageKey = (pubkey: string | null | undefined) =>
+  `marmotReadState:${pubkey || 'anon'}`
+const inviteDismissedStorageKey = (pubkey: string | null | undefined) =>
+  `marmotInviteDismissed:${pubkey || 'anon'}`
+const inviteAcceptedStorageKey = (pubkey: string | null | undefined) =>
+  `marmotInviteAccepted:${pubkey || 'anon'}`
+const inviteAcceptedConversationStorageKey = (pubkey: string | null | undefined) =>
+  `marmotInviteAcceptedConversation:${pubkey || 'anon'}`
 
 function normalizeRelayUrl(relay: string): string | null {
   if (typeof relay !== 'string') return null
@@ -112,7 +130,10 @@ function normalizeRelayUrl(relay: string): string | null {
 
     const pathname = parsed.pathname.replace(/\/+/g, '/')
     parsed.pathname = pathname.endsWith('/') && pathname !== '/' ? pathname.slice(0, -1) : pathname
-    if ((parsed.protocol === 'ws:' && parsed.port === '80') || (parsed.protocol === 'wss:' && parsed.port === '443')) {
+    if (
+      (parsed.protocol === 'ws:' && parsed.port === '80') ||
+      (parsed.protocol === 'wss:' && parsed.port === '443')
+    ) {
       parsed.port = ''
     }
     parsed.searchParams.sort()
@@ -123,12 +144,11 @@ function normalizeRelayUrl(relay: string): string | null {
   }
 }
 
-function normalizeRelayUrls(relayList: { read: string[]; write: string[] } | null, discoveryRelay?: string) {
-  const relays = [
-    ...(relayList?.read || []),
-    ...(relayList?.write || []),
-    discoveryRelay || ''
-  ]
+function normalizeRelayUrls(
+  relayList: { read: string[]; write: string[] } | null,
+  discoveryRelay?: string
+) {
+  const relays = [...(relayList?.read || []), ...(relayList?.write || []), discoveryRelay || '']
   const seen = new Set<string>()
   const normalized: string[] = []
   for (const relay of relays) {
@@ -189,8 +209,7 @@ function parseConversations(payload: any): ConversationSummary[] {
       lastMessagePreview:
         typeof row.lastMessagePreview === 'string' ? row.lastMessagePreview : null,
       lastReadAt: Number.isFinite(row.lastReadAt) ? Number(row.lastReadAt) : 0,
-      lastReadMessageId:
-        typeof row.lastReadMessageId === 'string' ? row.lastReadMessageId : null,
+      lastReadMessageId: typeof row.lastReadMessageId === 'string' ? row.lastReadMessageId : null,
       relayCount: Number.isFinite(row.relayCount) ? Number(row.relayCount) : 0,
       updatedAt: Number.isFinite(row.updatedAt) ? Number(row.updatedAt) : undefined
     }))
@@ -236,32 +255,35 @@ function parseMessages(payload: any): ThreadMessage[] {
       timestamp: Number.isFinite(row.timestamp) ? Number(row.timestamp) : 0,
       type: ['text', 'media', 'reaction', 'system'].includes(row.type) ? row.type : 'text',
       replyTo: typeof row.replyTo === 'string' ? row.replyTo : null,
-	      attachments: Array.isArray(row.attachments)
-	        ? row.attachments
-	            .filter((attachment: unknown): attachment is Record<string, unknown> => (
-	              !!attachment && typeof attachment === 'object'
-	            ))
-	            .map((attachment: Record<string, unknown>) => {
-	              const rawUrl = typeof attachment.url === 'string' ? attachment.url : ''
-	              const rawGatewayUrl = typeof attachment.gatewayUrl === 'string' ? attachment.gatewayUrl : ''
-	              return {
-	                url: rawUrl || rawGatewayUrl,
-	                gatewayUrl: rawGatewayUrl || null,
-	              mime: typeof attachment.mime === 'string' ? attachment.mime : null,
-	              size: Number.isFinite(attachment.size) ? Number(attachment.size) : null,
-	              width: Number.isFinite(attachment.width) ? Number(attachment.width) : null,
-	              height: Number.isFinite(attachment.height) ? Number(attachment.height) : null,
-	              blurhash: typeof attachment.blurhash === 'string' ? attachment.blurhash : null,
-	              fileName: typeof attachment.fileName === 'string' ? attachment.fileName : null,
-	              sha256: typeof attachment.sha256 === 'string' ? attachment.sha256 : null,
-	              driveKey: typeof attachment.driveKey === 'string' ? attachment.driveKey : null,
-	              ownerPubkey: typeof attachment.ownerPubkey === 'string' ? attachment.ownerPubkey : null,
-	              fileId: typeof attachment.fileId === 'string' ? attachment.fileId : null
-	              }
-	            })
-	            .filter((attachment: { url: string; gatewayUrl: string | null }) => (
+      attachments: Array.isArray(row.attachments)
+        ? row.attachments
+            .filter(
+              (attachment: unknown): attachment is Record<string, unknown> =>
+                !!attachment && typeof attachment === 'object'
+            )
+            .map((attachment: Record<string, unknown>) => {
+              const rawUrl = typeof attachment.url === 'string' ? attachment.url : ''
+              const rawGatewayUrl =
+                typeof attachment.gatewayUrl === 'string' ? attachment.gatewayUrl : ''
+              return {
+                url: rawUrl || rawGatewayUrl,
+                gatewayUrl: rawGatewayUrl || null,
+                mime: typeof attachment.mime === 'string' ? attachment.mime : null,
+                size: Number.isFinite(attachment.size) ? Number(attachment.size) : null,
+                width: Number.isFinite(attachment.width) ? Number(attachment.width) : null,
+                height: Number.isFinite(attachment.height) ? Number(attachment.height) : null,
+                blurhash: typeof attachment.blurhash === 'string' ? attachment.blurhash : null,
+                fileName: typeof attachment.fileName === 'string' ? attachment.fileName : null,
+                sha256: typeof attachment.sha256 === 'string' ? attachment.sha256 : null,
+                driveKey: typeof attachment.driveKey === 'string' ? attachment.driveKey : null,
+                ownerPubkey:
+                  typeof attachment.ownerPubkey === 'string' ? attachment.ownerPubkey : null,
+                fileId: typeof attachment.fileId === 'string' ? attachment.fileId : null
+              }
+            })
+            .filter((attachment: { url: string; gatewayUrl: string | null }) =>
               Boolean(attachment.url || attachment.gatewayUrl)
-            ))
+            )
         : [],
       tags: Array.isArray(row.tags)
         ? row.tags
@@ -308,7 +330,9 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
   const [invites, setInvites] = useState<ConversationInvite[]>([])
   const [dismissedInviteIds, setDismissedInviteIds] = useState<Set<string>>(new Set())
   const [acceptedInviteIds, setAcceptedInviteIds] = useState<Set<string>>(new Set())
-  const [acceptedInviteConversationIds, setAcceptedInviteConversationIds] = useState<Set<string>>(new Set())
+  const [acceptedInviteConversationIds, setAcceptedInviteConversationIds] = useState<Set<string>>(
+    new Set()
+  )
   const [unsupportedReason, setUnsupportedReason] = useState<string | undefined>(undefined)
   const [ready, setReady] = useState(false)
 
@@ -449,17 +473,17 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     setConversations((previous) => {
       const existing = previous.find((item) => item.id === conversation.id)
       if (
-        existing
-        && existing.lastMessageAt === conversation.lastMessageAt
-        && existing.lastMessageSenderPubkey === conversation.lastMessageSenderPubkey
-        && existing.unreadCount === conversation.unreadCount
-        && existing.lastReadAt === conversation.lastReadAt
-        && existing.lastReadMessageId === conversation.lastReadMessageId
-        && existing.canInviteMembers === conversation.canInviteMembers
-        && sameStringSet(existing.adminPubkeys || [], conversation.adminPubkeys || [])
-        && existing.title === conversation.title
-        && existing.description === conversation.description
-        && existing.imageUrl === conversation.imageUrl
+        existing &&
+        existing.lastMessageAt === conversation.lastMessageAt &&
+        existing.lastMessageSenderPubkey === conversation.lastMessageSenderPubkey &&
+        existing.unreadCount === conversation.unreadCount &&
+        existing.lastReadAt === conversation.lastReadAt &&
+        existing.lastReadMessageId === conversation.lastReadMessageId &&
+        existing.canInviteMembers === conversation.canInviteMembers &&
+        sameStringSet(existing.adminPubkeys || [], conversation.adminPubkeys || []) &&
+        existing.title === conversation.title &&
+        existing.description === conversation.description &&
+        existing.imageUrl === conversation.imageUrl
       ) {
         return previous
       }
@@ -480,8 +504,8 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     if (dismissedInviteIdsRef.current.has(invite.id)) return false
     if (acceptedInviteIdsRef.current.has(invite.id)) return false
     if (
-      invite.conversationId
-      && acceptedInviteConversationIdsRef.current.has(invite.conversationId)
+      invite.conversationId &&
+      acceptedInviteConversationIdsRef.current.has(invite.conversationId)
     ) {
       return false
     }
@@ -496,9 +520,12 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     })
   }, [])
 
-  const filterActionableInvites = useCallback((rows: ConversationInvite[]) => {
-    return sortInvites(rows.filter((invite) => isInviteActionable(invite)))
-  }, [isInviteActionable, sortInvites])
+  const filterActionableInvites = useCallback(
+    (rows: ConversationInvite[]) => {
+      return sortInvites(rows.filter((invite) => isInviteActionable(invite)))
+    },
+    [isInviteActionable, sortInvites]
+  )
 
   const dismissInvite = useCallback((inviteId: string) => {
     const normalizedInviteId = String(inviteId || '').trim()
@@ -537,24 +564,33 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     setInvites((previous) =>
       previous.filter((invite) => {
         if (normalizedInviteId && invite.id === normalizedInviteId) return false
-        if (normalizedConversationId && invite.conversationId === normalizedConversationId) return false
+        if (normalizedConversationId && invite.conversationId === normalizedConversationId)
+          return false
         if (invite.status === 'joined') return false
         return true
       })
     )
   }, [])
 
-  const getInviteById = useCallback((inviteId: string) => {
-    const normalizedInviteId = String(inviteId || '').trim()
-    if (!normalizedInviteId) return null
-    return invites.find((invite) => invite.id === normalizedInviteId) || null
-  }, [invites])
+  const getInviteById = useCallback(
+    (inviteId: string) => {
+      const normalizedInviteId = String(inviteId || '').trim()
+      if (!normalizedInviteId) return null
+      return invites.find((invite) => invite.id === normalizedInviteId) || null
+    },
+    [invites]
+  )
 
   const pendingInviteCount = invites.length
 
   useEffect(() => {
     setInvites((previous) => filterActionableInvites(previous))
-  }, [dismissedInviteIds, acceptedInviteIds, acceptedInviteConversationIds, filterActionableInvites])
+  }, [
+    dismissedInviteIds,
+    acceptedInviteIds,
+    acceptedInviteConversationIds,
+    filterActionableInvites
+  ])
 
   const refreshConversations = async (query: ConversationQuery = {}) => {
     if (!electronIpc.isElectron()) return []
@@ -622,56 +658,79 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
-  const createConversation = async (input: CreateConversationInput) => {
-    const data = await sendToWorkerAwait({
-      type: 'marmot-create-conversation',
-      data: {
-        title: input.title,
-        description: input.description,
-        members: input.members,
-        imageUrl: input.imageUrl || null,
-        relayUrls: Array.isArray(input.relayUrls)
-          ? input.relayUrls
-              .map((relay) => normalizeRelayUrl(relay))
-              .filter((relay): relay is string => Boolean(relay))
-          : undefined,
-        relayMode: input.relayMode === 'strict' ? 'strict' : 'withFallback'
+  const createConversation = async (
+    input: CreateConversationInput,
+    options?: {
+      onProgress?: (state: CreateConversationProgressState) => void
+    }
+  ) => {
+    const reportProgress = (state: CreateConversationProgressState) => {
+      options?.onProgress?.(state)
+    }
+
+    try {
+      reportProgress({ phase: 'creatingConversation' })
+      const data = await sendToWorkerAwait({
+        type: 'marmot-create-conversation',
+        data: {
+          title: input.title,
+          description: input.description,
+          members: input.members,
+          imageUrl: input.imageUrl || null,
+          relayUrls: Array.isArray(input.relayUrls)
+            ? input.relayUrls
+                .map((relay) => normalizeRelayUrl(relay))
+                .filter((relay): relay is string => Boolean(relay))
+            : undefined,
+          relayMode: input.relayMode === 'strict' ? 'strict' : 'withFallback'
+        }
+      })
+
+      const conversation = parseConversations(data?.conversation ? [data.conversation] : [])[0]
+      if (conversation) {
+        applyConversationUpdate(conversation)
+        emitEvent({ type: 'conversation-created', conversation })
       }
-    })
 
-    const conversation = parseConversations(data?.conversation ? [data.conversation] : [])[0]
-    if (conversation) {
-      applyConversationUpdate(conversation)
-      emitEvent({ type: 'conversation-created', conversation })
-    }
+      reportProgress({ phase: 'syncingConversation' })
+      await refreshConversations()
+      await refreshInvites()
 
-    await refreshConversations()
-    await refreshInvites()
+      if (!conversation) {
+        throw new Error('Worker did not return created conversation')
+      }
 
-    if (!conversation) {
-      throw new Error('Worker did not return created conversation')
-    }
+      const invited = Array.isArray(data?.invited)
+        ? data.invited
+            .map((member: unknown) =>
+              typeof member === 'string' ? member.trim().toLowerCase() : ''
+            )
+            .filter((member: string) => Boolean(member))
+        : []
 
-    const invited = Array.isArray(data?.invited)
-      ? data.invited
-          .map((member: unknown) => (typeof member === 'string' ? member.trim().toLowerCase() : ''))
-          .filter((member: string) => Boolean(member))
-      : []
+      const failed = Array.isArray(data?.failed)
+        ? data.failed
+            .filter(
+              (row: unknown): row is Record<string, unknown> => !!row && typeof row === 'object'
+            )
+            .map((row: Record<string, unknown>) => ({
+              pubkey: typeof row.pubkey === 'string' ? row.pubkey : '',
+              error: typeof row.error === 'string' ? row.error : 'Unknown invite failure'
+            }))
+            .filter((row: InviteFailure) => Boolean(row.pubkey))
+        : []
 
-    const failed = Array.isArray(data?.failed)
-      ? data.failed
-          .filter((row: unknown): row is Record<string, unknown> => !!row && typeof row === 'object')
-          .map((row: Record<string, unknown>) => ({
-            pubkey: typeof row.pubkey === 'string' ? row.pubkey : '',
-            error: typeof row.error === 'string' ? row.error : 'Unknown invite failure'
-          }))
-          .filter((row: InviteFailure) => Boolean(row.pubkey))
-      : []
-
-    return {
-      conversation,
-      invited,
-      failed
+      return {
+        conversation,
+        invited,
+        failed
+      }
+    } catch (error) {
+      reportProgress({
+        phase: 'error',
+        error: error instanceof Error ? error.message : String(error)
+      })
+      throw error
     }
   }
 
@@ -704,24 +763,43 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     await refreshConversations()
   }
 
-  const acceptInvite = async (inviteId: string) => {
-    const data = await sendToWorkerAwait({
-      type: 'marmot-accept-invite',
-      data: {
-        inviteId
-      }
-    })
-    const conversationId =
-      typeof data?.conversation?.id === 'string'
-        ? data.conversation.id
-        : typeof data?.conversationId === 'string'
-          ? data.conversationId
-          : null
+  const acceptInvite = async (
+    inviteId: string,
+    options?: {
+      onProgress?: (state: JoinConversationProgressState) => void
+    }
+  ) => {
+    const reportProgress = (state: JoinConversationProgressState) => {
+      options?.onProgress?.(state)
+    }
 
-    markInviteAccepted(inviteId, conversationId)
-    await refreshConversations()
-    await refreshInvites()
-    return { conversationId }
+    try {
+      reportProgress({ phase: 'joiningConversation' })
+      const data = await sendToWorkerAwait({
+        type: 'marmot-accept-invite',
+        data: {
+          inviteId
+        }
+      })
+      const conversationId =
+        typeof data?.conversation?.id === 'string'
+          ? data.conversation.id
+          : typeof data?.conversationId === 'string'
+            ? data.conversationId
+            : null
+
+      markInviteAccepted(inviteId, conversationId)
+      reportProgress({ phase: 'syncingConversation' })
+      await refreshConversations()
+      await refreshInvites()
+      return { conversationId }
+    } catch (error) {
+      reportProgress({
+        phase: 'error',
+        error: error instanceof Error ? error.message : String(error)
+      })
+      throw error
+    }
   }
 
   const updateConversationMetadata = async (input: UpdateConversationMetadataInput) => {
@@ -768,9 +846,14 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
         return limit ? thread.messages.slice(-limit) : thread.messages
       },
       loadThread,
-      sendMessage: async (conversationId: string, content: string, opts: SendMessageOptions = {}) => {
+      sendMessage: async (
+        conversationId: string,
+        content: string,
+        opts: SendMessageOptions = {}
+      ) => {
         const clientMessageId =
-          opts.clientMessageId || `client-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`
+          opts.clientMessageId ||
+          `client-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`
 
         emitEvent({
           type: 'message-send-status',
@@ -840,7 +923,8 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
         opts: SendMessageOptions = {}
       ) => {
         const clientMessageId =
-          opts.clientMessageId || `client-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`
+          opts.clientMessageId ||
+          `client-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`
 
         emitEvent({
           type: 'message-send-status',
@@ -945,7 +1029,10 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     }
     const initSignature = `${pubkey}:${relaySignature}`
     const now = Date.now()
-    if (recentInitRef.current?.signature === initSignature && now - recentInitRef.current.at < 10_000) {
+    if (
+      recentInitRef.current?.signature === initSignature &&
+      now - recentInitRef.current.at < 10_000
+    ) {
       return
     }
     if (initInFlightSignatureRef.current === initSignature) {
@@ -968,12 +1055,15 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       initInFlightSignatureRef.current = initSignature
       recentInitRef.current = { signature: initSignature, at: Date.now() }
       try {
-        const initData = await sendToWorkerAwait({
-          type: 'marmot-init',
-          data: {
-            relays: relayUrls
-          }
-        }, 60_000)
+        const initData = await sendToWorkerAwait(
+          {
+            type: 'marmot-init',
+            data: {
+              relays: relayUrls
+            }
+          },
+          60_000
+        )
 
         if (cancelled) return
 
@@ -992,7 +1082,9 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       } catch (error) {
         console.error('Failed to initialize marmot conversations', error)
         if (!cancelled) {
-          setUnsupportedReason(error instanceof Error ? error.message : 'Failed to initialize conversations')
+          setUnsupportedReason(
+            error instanceof Error ? error.message : 'Failed to initialize conversations'
+          )
           setReady(true)
         }
       } finally {

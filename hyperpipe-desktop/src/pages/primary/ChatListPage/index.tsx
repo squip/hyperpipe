@@ -16,6 +16,7 @@ import { useSecondaryPage } from '@/PageManager'
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle
@@ -28,7 +29,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useSearchProfiles } from '@/hooks/useSearchProfiles'
 import Username from '@/components/Username'
 import Nip05 from '@/components/Nip05'
-import type { ConversationInvite, ConversationSummary, ConversationTab } from '@/lib/conversations/types'
+import type {
+  ConversationInvite,
+  ConversationSummary,
+  ConversationTab
+} from '@/lib/conversations/types'
 import {
   buildGroupRelayDisplayMetaMap,
   buildGroupRelayTargets,
@@ -37,9 +42,21 @@ import {
   type GroupRelayTarget,
   type RelayDisplayMeta
 } from '@/lib/relay-targets'
+import { cn } from '@/lib/utils'
+import {
+  getCreateConversationProgressLabel,
+  getCreateConversationProgressTitle,
+  getCreateConversationProgressValue,
+  getJoinConversationProgressLabel,
+  getJoinConversationProgressTitle,
+  getJoinConversationProgressValue,
+  type CreateConversationProgressState,
+  type JoinConversationProgressState
+} from '@/lib/workflow-progress-ui'
 import mediaUploadService from '@/services/media-upload.service'
 import { toast } from 'sonner'
 import type { TPageRef } from '@/types'
+import WorkflowProgress from '@/components/WorkflowProgress'
 
 type RelayPublishMode = 'withFallback' | 'strict'
 
@@ -50,6 +67,10 @@ type CreateChatModalPayload = {
   imageFile: File | null
   relayUrls: string[]
   relayMode: RelayPublishMode
+}
+
+type ActiveJoinInviteProgressState = JoinConversationProgressState & {
+  inviteId: string
 }
 
 const HYPERDRIVE_UPLOAD_RELAY_URL = 'http://127.0.0.1:8443'
@@ -66,10 +87,7 @@ function normalizeRelayListForChat(
 }
 
 function MembersCell({ members }: { members: string[] }) {
-  const compact = useMemo(
-    () => new Intl.NumberFormat(undefined, { notation: 'compact' }),
-    []
-  )
+  const compact = useMemo(() => new Intl.NumberFormat(undefined, { notation: 'compact' }), [])
 
   if (!members.length) {
     return <span className="text-xs text-muted-foreground">0</span>
@@ -80,7 +98,10 @@ function MembersCell({ members }: { members: string[] }) {
     <div className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-1">
       <div className="flex -space-x-2">
         {preview.map((pubkey) => (
-          <div key={pubkey} className="h-5 w-5 overflow-hidden rounded-full bg-muted ring-2 ring-background">
+          <div
+            key={pubkey}
+            className="h-5 w-5 overflow-hidden rounded-full bg-muted ring-2 ring-background"
+          >
             <SimpleUserAvatar userId={pubkey} size="small" className="h-full w-full rounded-full" />
           </div>
         ))}
@@ -155,7 +176,12 @@ const ChatListPage = forwardRef<
   const [search, setSearch] = useState('')
   const [openNew, setOpenNew] = useState(false)
   const [creatingConversation, setCreatingConversation] = useState(false)
+  const [createConversationProgress, setCreateConversationProgress] =
+    useState<CreateConversationProgressState | null>(null)
+  const [createConversationError, setCreateConversationError] = useState<string | null>(null)
   const [joiningInviteId, setJoiningInviteId] = useState<string | null>(null)
+  const [joinInviteProgress, setJoinInviteProgress] =
+    useState<ActiveJoinInviteProgressState | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const discoveryRelay = import.meta.env.VITE_DISCOVERY_RELAY as string | undefined
 
@@ -197,6 +223,12 @@ const ChatListPage = forwardRef<
     setTab(initialTab)
   }, [initialTab, tabRequestId])
 
+  useEffect(() => {
+    if (openNew) return
+    setCreateConversationProgress(null)
+    setCreateConversationError(null)
+  }, [openNew])
+
   const conversationParticipantsById = useMemo(() => {
     const next = new Map<string, string[]>()
     for (const conversation of conversations) {
@@ -217,14 +249,12 @@ const ChatListPage = forwardRef<
         return left.id.localeCompare(right.id)
       })
       .map((invite) => {
-        const conversationMembers =
-          invite.conversationId
-            ? conversationParticipantsById.get(invite.conversationId) || []
-            : []
-        const explicitMembers =
-          Array.isArray(invite.memberPubkeys)
-            ? invite.memberPubkeys.filter((member) => Boolean(member))
-            : []
+        const conversationMembers = invite.conversationId
+          ? conversationParticipantsById.get(invite.conversationId) || []
+          : []
+        const explicitMembers = Array.isArray(invite.memberPubkeys)
+          ? invite.memberPubkeys.filter((member) => Boolean(member))
+          : []
         const members = Array.from(
           new Set(
             explicitMembers.length
@@ -262,7 +292,11 @@ const ChatListPage = forwardRef<
     relayMode
   }: CreateChatModalPayload) => {
     const uniqueMembers = Array.from(
-      new Set(members.map((member) => normalizePubkey(member)).filter((member): member is string => !!member))
+      new Set(
+        members
+          .map((member) => normalizePubkey(member))
+          .filter((member): member is string => !!member)
+      )
     ).filter((member) => member !== pubkey)
 
     if (!uniqueMembers.length) {
@@ -271,6 +305,8 @@ const ChatListPage = forwardRef<
     }
 
     setCreatingConversation(true)
+    setCreateConversationError(null)
+    setCreateConversationProgress({ phase: 'creatingConversation' })
     try {
       const publishRelayUrls = await resolvePublishRelayUrls({
         relayUrls: dedupeRelayUrlsByIdentity(relayUrls),
@@ -288,13 +324,25 @@ const ChatListPage = forwardRef<
         throw new Error(t('Select at least one relay'))
       }
 
-      const createResult = await createConversation({
-        title: title.trim() || t('Chat'),
-        description: description.trim() || undefined,
-        members: uniqueMembers,
-        relayUrls: publishRelayUrls,
-        relayMode
-      })
+      const createResult = await createConversation(
+        {
+          title: title.trim() || t('Chat'),
+          description: description.trim() || undefined,
+          members: uniqueMembers,
+          relayUrls: publishRelayUrls,
+          relayMode
+        },
+        {
+          onProgress: (state) => {
+            if (state.phase === 'error') {
+              setCreateConversationError(state.error || t('Failed to create chat'))
+              return
+            }
+            setCreateConversationError(null)
+            setCreateConversationProgress(state)
+          }
+        }
+      )
       const conversation = createResult.conversation
 
       if (createResult.failed.length > 0) {
@@ -312,48 +360,66 @@ const ChatListPage = forwardRef<
 
       if (imageFile) {
         try {
-	          const upload = await mediaUploadService.upload(
-	            imageFile,
-	            undefined,
-	            {
-	              target: 'group-hyperdrive',
-	              groupId: conversation.id,
-	              relayUrl: HYPERDRIVE_UPLOAD_RELAY_URL,
-	              resourceScope: 'conversation',
-	              parentKind: 39000
-	            }
-	          )
-	          const imageUrl = upload.url
-	          if (imageUrl) {
-	            await updateConversationMetadata({
-	              conversationId: conversation.id,
-	              imageUrl,
-	              imageAttachment: {
-	                url: upload.url,
-	                gatewayUrl: null,
-	                mime: upload.metadata?.mimeType || null,
-	                size: Number.isFinite(upload.metadata?.size) ? Number(upload.metadata?.size) : null,
-	                width: Number.isFinite(upload.metadata?.dim?.width) ? Number(upload.metadata?.dim?.width) : null,
-	                height: Number.isFinite(upload.metadata?.dim?.height) ? Number(upload.metadata?.dim?.height) : null,
-	                fileName: upload.metadata?.fileName || null,
-	                sha256: upload.metadata?.sha256 || null,
-	                driveKey: upload.metadata?.driveKey || null,
-	                ownerPubkey: normalizePubkey(pubkey || '') || null,
-	                fileId: upload.metadata?.fileId || null
-	              }
-	            })
-	          }
+          setCreateConversationProgress({
+            phase: 'uploadingThumbnail',
+            uploadProgress: 0
+          })
+          const upload = await mediaUploadService.upload(
+            imageFile,
+            {
+              onProgress: (progress) => {
+                setCreateConversationProgress({
+                  phase: 'uploadingThumbnail',
+                  uploadProgress: progress
+                })
+              }
+            },
+            {
+              target: 'group-hyperdrive',
+              groupId: conversation.id,
+              relayUrl: HYPERDRIVE_UPLOAD_RELAY_URL,
+              resourceScope: 'conversation',
+              parentKind: 39000
+            }
+          )
+          const imageUrl = upload.url
+          if (imageUrl) {
+            setCreateConversationProgress({ phase: 'publishingThumbnailMetadata' })
+            await updateConversationMetadata({
+              conversationId: conversation.id,
+              imageUrl,
+              imageAttachment: {
+                url: upload.url,
+                gatewayUrl: null,
+                mime: upload.metadata?.mimeType || null,
+                size: Number.isFinite(upload.metadata?.size) ? Number(upload.metadata?.size) : null,
+                width: Number.isFinite(upload.metadata?.dim?.width)
+                  ? Number(upload.metadata?.dim?.width)
+                  : null,
+                height: Number.isFinite(upload.metadata?.dim?.height)
+                  ? Number(upload.metadata?.dim?.height)
+                  : null,
+                fileName: upload.metadata?.fileName || null,
+                sha256: upload.metadata?.sha256 || null,
+                driveKey: upload.metadata?.driveKey || null,
+                ownerPubkey: normalizePubkey(pubkey || '') || null,
+                fileId: upload.metadata?.fileId || null
+              }
+            })
+          }
         } catch (error) {
           console.error('Chat created but thumbnail upload failed', error)
           toast.error(t('Chat created, but thumbnail upload failed'))
         }
       }
 
-      await Promise.all([refreshConversations(), refreshInvites()])
+      setCreateConversationProgress({ phase: 'openingConversation' })
       setOpenNew(false)
       push(`/conversations/${conversation.id}`)
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
       console.error('Failed creating chat', error)
+      setCreateConversationError(message)
       toast.error(t('Failed to create chat'))
     } finally {
       setCreatingConversation(false)
@@ -362,7 +428,7 @@ const ChatListPage = forwardRef<
 
   const handleJoinInvite = async (invite: ConversationInvite) => {
     if (!invite?.id) return
-    if (joiningInviteId === invite.id) return
+    if (joiningInviteId) return
 
     if (invite.status === 'joined' && invite.conversationId) {
       push(`/conversations/${invite.conversationId}`)
@@ -370,15 +436,57 @@ const ChatListPage = forwardRef<
     }
 
     setJoiningInviteId(invite.id)
+    setJoinInviteProgress({
+      inviteId: invite.id,
+      phase: 'joiningConversation',
+      error: null
+    })
     try {
-      const result = await acceptInvite(invite.id)
-      await Promise.all([refreshConversations(), refreshInvites()])
+      const result = await acceptInvite(invite.id, {
+        onProgress: (state) => {
+          if (state.phase === 'error') {
+            setJoinInviteProgress((previous) =>
+              previous?.inviteId === invite.id
+                ? {
+                    ...previous,
+                    error: state.error || t('Failed to join invite')
+                  }
+                : previous
+            )
+            return
+          }
+          setJoinInviteProgress({
+            inviteId: invite.id,
+            ...state
+          })
+        }
+      })
+      setJoinInviteProgress({
+        inviteId: invite.id,
+        phase: 'openingConversation',
+        error: null
+      })
       const conversationId = result.conversationId || invite.conversationId
       if (conversationId) {
         push(`/conversations/${conversationId}`)
+      } else {
+        setJoinInviteProgress(null)
       }
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
       console.error('Failed joining chat invite', error)
+      setJoinInviteProgress((previous) =>
+        previous?.inviteId === invite.id
+          ? {
+              ...previous,
+              error: message
+            }
+          : {
+              inviteId: invite.id,
+              phase: 'joiningConversation',
+              error: message
+            }
+      )
       toast.error(t('Failed to join invite'))
     } finally {
       setJoiningInviteId(null)
@@ -404,7 +512,9 @@ const ChatListPage = forwardRef<
             <Input
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder={tab === 'my' ? t('Search chats...') as string : t('Search invites...') as string}
+              placeholder={
+                tab === 'my' ? (t('Search chats...') as string) : (t('Search invites...') as string)
+              }
               className="pl-8"
             />
           </div>
@@ -422,7 +532,9 @@ const ChatListPage = forwardRef<
 
           <TabsContent value="my" className="mt-4">
             {unsupportedReason ? (
-              <div className="rounded-lg border p-4 text-sm text-muted-foreground">{unsupportedReason}</div>
+              <div className="rounded-lg border p-4 text-sm text-muted-foreground">
+                {unsupportedReason}
+              </div>
             ) : (
               <ChatListPanel
                 myPubkey={pubkey}
@@ -434,9 +546,13 @@ const ChatListPage = forwardRef<
 
           <TabsContent value="invites" className="mt-4">
             {!ready ? (
-              <div className="rounded-lg border p-4 text-sm text-muted-foreground">{t('Loading invites...')}</div>
+              <div className="rounded-lg border p-4 text-sm text-muted-foreground">
+                {t('Loading invites...')}
+              </div>
             ) : !inviteRows.length ? (
-              <div className="rounded-lg border p-4 text-sm text-muted-foreground">{t('No invites')}</div>
+              <div className="rounded-lg border p-4 text-sm text-muted-foreground">
+                {t('No invites')}
+              </div>
             ) : (
               <div className="overflow-x-auto scrollbar-hide rounded-lg border">
                 <table className="w-full min-w-[1060px] table-fixed">
@@ -455,30 +571,74 @@ const ChatListPage = forwardRef<
                   </thead>
                   <tbody className="text-sm">
                     {inviteRows.map(({ invite, members }) => {
+                      const activeJoinProgress =
+                        joinInviteProgress?.inviteId === invite.id ? joinInviteProgress : null
                       const isJoining = joiningInviteId === invite.id || invite.status === 'joining'
+                      const joinDisabled = Boolean(joiningInviteId) || invite.status === 'joining'
+                      const dismissDisabled = joiningInviteId === invite.id
+                      const joinProgressTitle = getJoinConversationProgressTitle(
+                        activeJoinProgress?.phase
+                      )
+                      const joinProgressDetail = getJoinConversationProgressLabel(
+                        activeJoinProgress?.phase
+                      )
+                      const joinProgressValue = getJoinConversationProgressValue(
+                        activeJoinProgress?.phase
+                      )
+                      const rowError = activeJoinProgress?.error || invite.error
                       const initials = (invite.title || t('Chat')).slice(0, 2).toUpperCase()
 
                       return (
-                        <tr key={invite.id} className="border-t transition-colors hover:bg-accent/30">
+                        <tr
+                          key={invite.id}
+                          className="border-t transition-colors hover:bg-accent/30"
+                        >
                           <td className="px-3 py-3 align-top">
                             <div className="flex items-center gap-2">
-                              <Button variant="outline" size="sm" onClick={() => handleDismissInvite(invite)}>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => handleDismissInvite(invite)}
+                                disabled={dismissDisabled}
+                              >
                                 <X className="mr-1 h-4 w-4" />
                                 {t('Dismiss')}
                               </Button>
-                              <Button size="sm" disabled={isJoining} onClick={() => handleJoinInvite(invite)}>
+                              <Button
+                                size="sm"
+                                disabled={joinDisabled}
+                                onClick={() => handleJoinInvite(invite)}
+                              >
                                 {isJoining ? t('Joining...') : t('Join')}
                               </Button>
                             </div>
-                            {invite.error ? (
-                              <div className="mt-2 text-xs text-red-500">{invite.error}</div>
+                            {activeJoinProgress ? (
+                              <div className="mt-2 rounded-md border border-border/60 bg-muted/30 p-2">
+                                <WorkflowProgress
+                                  title={joinProgressTitle}
+                                  detail={joinProgressDetail}
+                                  value={joinProgressValue}
+                                />
+                              </div>
+                            ) : null}
+                            {rowError ? (
+                              <div className="mt-2 text-xs text-red-500">{rowError}</div>
                             ) : null}
                           </td>
                           <td className="px-3 py-3 align-top">
                             <Avatar className="h-10 w-10 shrink-0">
-                              {invite.imageUrl ? <AvatarImage src={invite.imageUrl} alt={invite.title || t('Chat invite')} /> : null}
+                              {invite.imageUrl ? (
+                                <AvatarImage
+                                  src={invite.imageUrl}
+                                  alt={invite.title || t('Chat invite')}
+                                />
+                              ) : null}
                               <AvatarFallback className="text-xs font-semibold">
-                                {invite.imageUrl ? initials : <Users className="h-4 w-4 text-muted-foreground" />}
+                                {invite.imageUrl ? (
+                                  initials
+                                ) : (
+                                  <Users className="h-4 w-4 text-muted-foreground" />
+                                )}
                               </AvatarFallback>
                             </Avatar>
                           </td>
@@ -497,12 +657,20 @@ const ChatListPage = forwardRef<
                           </td>
                           <td className="px-3 py-3 align-top">
                             <div className="flex min-w-0 items-center gap-2">
-                              <SimpleUserAvatar userId={invite.senderPubkey} size="small" className="h-6 w-6 rounded-full" />
+                              <SimpleUserAvatar
+                                userId={invite.senderPubkey}
+                                size="small"
+                                className="h-6 w-6 rounded-full"
+                              />
                               <Username userId={invite.senderPubkey} className="truncate text-sm" />
                             </div>
                           </td>
                           <td className="px-3 py-3 align-top text-xs text-muted-foreground">
-                            {invite.createdAt > 0 ? <FormattedTimestamp timestamp={invite.createdAt} /> : '-'}
+                            {invite.createdAt > 0 ? (
+                              <FormattedTimestamp timestamp={invite.createdAt} />
+                            ) : (
+                              '-'
+                            )}
                           </td>
                         </tr>
                       )
@@ -518,11 +686,13 @@ const ChatListPage = forwardRef<
       <NewChatDialog
         open={openNew}
         onOpenChange={setOpenNew}
-        creating={creatingConversation}
+        busy={creatingConversation}
         myPubkey={pubkey}
         defaultRelayUrls={defaultCreateRelayUrls}
         groupRelayTargets={groupRelayTargets}
         localGroupRelayDisplay={localGroupRelayDisplay}
+        progress={createConversationProgress}
+        error={createConversationError}
         onCreate={handleCreateConversation}
       />
     </PrimaryPageLayout>
@@ -548,23 +718,27 @@ function ChatListPageTitlebar() {
   )
 }
 
-function NewChatDialog({
+export function NewChatDialog({
   open,
   onOpenChange,
-  creating,
+  busy,
   myPubkey,
   defaultRelayUrls,
   groupRelayTargets,
   localGroupRelayDisplay,
+  progress,
+  error,
   onCreate
 }: {
   open: boolean
   onOpenChange: (v: boolean) => void
-  creating: boolean
+  busy: boolean
   myPubkey: string | null
   defaultRelayUrls: string[]
   groupRelayTargets: GroupRelayTarget[]
   localGroupRelayDisplay: Record<string, RelayDisplayMeta>
+  progress: CreateConversationProgressState | null
+  error: string | null
   onCreate: (payload: CreateChatModalPayload) => Promise<void>
 }) {
   const { t } = useTranslation()
@@ -577,7 +751,10 @@ function NewChatDialog({
   const [selectedRelayUrls, setSelectedRelayUrls] = useState<string[]>(defaultRelayUrls)
   const [relayMode, setRelayMode] = useState<RelayPublishMode>('withFallback')
   const wasOpenRef = useRef(false)
-  const { profiles: inviteProfiles, isFetching: isSearchingInvites } = useSearchProfiles(inviteSearch, 8)
+  const { profiles: inviteProfiles, isFetching: isSearchingInvites } = useSearchProfiles(
+    inviteSearch,
+    8
+  )
   const inviteCandidateProfiles = useMemo(
     () => inviteProfiles.filter((profile) => profile.pubkey && profile.pubkey !== myPubkey),
     [inviteProfiles, myPubkey]
@@ -609,9 +786,14 @@ function NewChatDialog({
     setRelayMode('withFallback')
   }
 
+  useEffect(() => {
+    if (open) return
+    resetState()
+  }, [defaultRelayUrls, open])
+
   const handleOpenChange = (nextOpen: boolean) => {
-    if (!nextOpen) {
-      resetState()
+    if (!nextOpen && busy) {
+      return
     }
     onOpenChange(nextOpen)
   }
@@ -645,26 +827,45 @@ function NewChatDialog({
   }
 
   const hasThumbnailPreview = Boolean(imagePreviewUrl)
+  const progressTitle = getCreateConversationProgressTitle(progress?.phase)
+  const progressDetail = getCreateConversationProgressLabel(progress)
+  const progressValue = getCreateConversationProgressValue(progress)
+  const showProgressSection = Boolean(progress || error)
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="sm:max-w-xl max-h-[90vh] flex flex-col">
+      <DialogContent
+        className="sm:max-w-xl max-h-[90vh] flex flex-col"
+        withoutClose={busy}
+        onEscapeKeyDown={busy ? (event) => event.preventDefault() : undefined}
+        onInteractOutside={busy ? (event) => event.preventDefault() : undefined}
+      >
         <DialogHeader>
           <DialogTitle>{t('Create chat')}</DialogTitle>
+          <DialogDescription>
+            {t('Choose members, relays, and an optional thumbnail for the new chat.')}
+          </DialogDescription>
         </DialogHeader>
 
-        <div className="flex min-h-0 flex-1 flex-col gap-3 px-1">
+        <div
+          className={cn(
+            'flex min-h-0 flex-1 flex-col gap-3 px-1',
+            busy && 'pointer-events-none opacity-60'
+          )}
+        >
           <Input
             value={title}
             onChange={(event) => setTitle(event.target.value)}
             placeholder={t('Title') as string}
             className="focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            disabled={busy}
           />
           <Textarea
             value={description}
             onChange={(event) => setDescription(event.target.value)}
             placeholder={t('Description (optional)') as string}
             className="min-h-[72px] focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            disabled={busy}
           />
 
           <div className="space-y-2">
@@ -676,6 +877,7 @@ function NewChatDialog({
                 onChange={(event) => setInviteSearch(event.target.value)}
                 placeholder={t('Search users...') as string}
                 className="pl-9"
+                disabled={busy}
               />
             </div>
             <div
@@ -707,6 +909,7 @@ function NewChatDialog({
                       size="sm"
                       onClick={() => handleInviteToggle(profile.pubkey)}
                       className="h-8 w-20 shrink-0 px-2"
+                      disabled={busy}
                     >
                       {isSelected ? (
                         <>
@@ -733,6 +936,7 @@ function NewChatDialog({
                     size="sm"
                     className="flex max-w-full items-center gap-2"
                     onClick={() => handleInviteToggle(pubkey)}
+                    disabled={busy}
                   >
                     <UserAvatar userId={pubkey} size="xSmall" />
                     <Username userId={pubkey} className="truncate max-w-[8rem] min-w-0" />
@@ -745,10 +949,14 @@ function NewChatDialog({
 
           <div className="space-y-1">
             <div className="text-sm font-medium">{t('Chat thumbnail (optional)')}</div>
-            <Input type="file" accept="image/*" onChange={handleFileChange} />
+            <Input type="file" accept="image/*" onChange={handleFileChange} disabled={busy} />
             {imagePreviewUrl ? (
               <div className="flex items-center gap-2 rounded-md border p-2">
-                <img src={imagePreviewUrl} alt={imageFile?.name || 'Chat thumbnail'} className="h-10 w-10 rounded object-cover" />
+                <img
+                  src={imagePreviewUrl}
+                  alt={imageFile?.name || 'Chat thumbnail'}
+                  className="h-10 w-10 rounded object-cover"
+                />
                 <div className="text-xs text-muted-foreground truncate">
                   {t('Selected image')}: {imageFile?.name}
                 </div>
@@ -759,7 +967,10 @@ function NewChatDialog({
           <div className="space-y-2 rounded-md border p-3">
             <PostRelaySelector
               allowWriteRelays={false}
-              extraRelayUrls={[...defaultRelayUrls, ...groupRelayTargets.map((target) => target.relayUrl)]}
+              extraRelayUrls={[
+                ...defaultRelayUrls,
+                ...groupRelayTargets.map((target) => target.relayUrl)
+              ]}
               relayDisplayMeta={localGroupRelayDisplay}
               valueRelayUrls={selectedRelayUrls}
               onValueRelayUrlsChange={setSelectedRelayUrls}
@@ -774,20 +985,28 @@ function NewChatDialog({
               <Switch
                 checked={relayMode === 'withFallback'}
                 onCheckedChange={(checked) => setRelayMode(checked ? 'withFallback' : 'strict')}
+                disabled={busy}
               />
             </div>
           </div>
         </div>
 
+        {showProgressSection ? (
+          <div className="mt-3 space-y-2 rounded-md border border-border/60 bg-muted/30 p-3">
+            <WorkflowProgress title={progressTitle} detail={progressDetail} value={progressValue} />
+            {error ? <div className="text-sm text-red-500">{error}</div> : null}
+          </div>
+        ) : null}
+
         <DialogFooter className="flex shrink-0 justify-end gap-2 border-t pt-3">
-          <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={creating}>
+          <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
             {t('Cancel')}
           </Button>
           <Button
             onClick={handleCreate}
-            disabled={creating || selectedInvitees.length === 0 || selectedRelayUrls.length === 0}
+            disabled={busy || selectedInvitees.length === 0 || selectedRelayUrls.length === 0}
           >
-            {creating ? t('Creating...') : t('Create chat')}
+            {busy ? t('Creating...') : t('Create chat')}
           </Button>
         </DialogFooter>
       </DialogContent>

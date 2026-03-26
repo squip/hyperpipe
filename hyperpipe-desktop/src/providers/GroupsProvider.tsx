@@ -76,6 +76,7 @@ import { useWorkerBridge } from './WorkerBridgeProvider'
 import type { TPublishOptions } from '@/types'
 import * as nip19 from '@nostr/tools/nip19'
 import { normalizeUrl } from '@/lib/url'
+import type { CreateGroupProgressState } from '@/lib/workflow-progress-ui'
 
 const INVITE_DISMISSED_STORAGE_PREFIX = 'hyperpipe_group_invites_dismissed_v1'
 const INVITE_ACCEPTED_STORAGE_PREFIX = 'hyperpipe_group_invites_accepted_v1'
@@ -90,7 +91,10 @@ const getSnapshotEventTaggedPubkeys = (event: Pick<TDraftEvent, 'tags'>) =>
 const getSnapshotEventAdminTaggedPubkeys = (event: Pick<TDraftEvent, 'tags'>) =>
   normalizeMembershipPubkeys(
     (Array.isArray(event.tags) ? event.tags : [])
-      .filter((tag) => tag[0] === 'p' && tag.slice(2).some((value) => String(value || '').trim() === 'admin'))
+      .filter(
+        (tag) =>
+          tag[0] === 'p' && tag.slice(2).some((value) => String(value || '').trim() === 'admin')
+      )
       .map((tag) => tag[1])
   )
 
@@ -122,7 +126,12 @@ const TOKENIZED_RELAY_REFRESH_MIN_INTERVAL_MS = 5000
 const LEAVE_PUBLISH_RETRY_BASE_DELAY_MS = 5000
 const LEAVE_PUBLISH_RETRY_MAX_DELAY_MS = 60 * 60 * 1000
 const JOIN_FLOW_SUCCESS_FRESH_MS = 15 * 60 * 1000
-const DEFAULT_GATEWAY_MEMBER_SCOPES = ['relay:bootstrap', 'relay:mirror-read', 'relay:mirror-sync', 'relay:ws-connect']
+const DEFAULT_GATEWAY_MEMBER_SCOPES = [
+  'relay:bootstrap',
+  'relay:mirror-read',
+  'relay:mirror-sync',
+  'relay:ws-connect'
+]
 
 type GroupMemberPreviewEntry = TGroupMembershipState
 
@@ -237,10 +246,7 @@ type TGroupsContext = {
     membershipFetchSource: TGroupMembershipState['membershipFetchSource']
   }>
   getProvisionalGroupMetadata: (groupId: string, relay?: string) => TGroupMetadata | null
-  getGroupMemberPreview: (
-    groupId: string,
-    relay?: string
-  ) => TGroupMembershipState | null
+  getGroupMemberPreview: (groupId: string, relay?: string) => TGroupMembershipState | null
   hydrateGroupMemberPreview: (groupId: string, relay?: string) => Promise<void>
   groupMemberPreviewVersion: number
   refreshGroupMemberPreview: (
@@ -295,20 +301,25 @@ type TGroupsContext = {
     isOpen: boolean
     relays?: string[]
   }) => Promise<{ groupId: string; relay: string }>
-  createHyperpipeRelayGroup: (data: {
-    name: string
-    about?: string
-    isPublic: boolean
-    isOpen: boolean
-    picture?: string
-    fileSharing?: boolean
-    gatewayOrigin?: string | null
-    gatewayId?: string | null
-    gatewayAuthMethod?: string | null
-    gatewayDelegation?: string | null
-    gatewaySponsorPubkey?: string | null
-    directJoinOnly?: boolean
-  }) => Promise<{ groupId: string; relay: string }>
+  createHyperpipeRelayGroup: (
+    data: {
+      name: string
+      about?: string
+      isPublic: boolean
+      isOpen: boolean
+      picture?: string
+      fileSharing?: boolean
+      gatewayOrigin?: string | null
+      gatewayId?: string | null
+      gatewayAuthMethod?: string | null
+      gatewayDelegation?: string | null
+      gatewaySponsorPubkey?: string | null
+      directJoinOnly?: boolean
+    },
+    options?: {
+      onProgress?: (state: CreateGroupProgressState) => void
+    }
+  ) => Promise<{ groupId: string; relay: string }>
 }
 
 const GroupsContext = createContext<TGroupsContext | undefined>(undefined)
@@ -689,8 +700,12 @@ const parseGatewayAccessPayload = (value: unknown): TGroupGatewayAccess | null =
   if (!value || typeof value !== 'object') return null
   const candidate = value as Record<string, unknown>
   const gatewayOrigin =
-    normalizeHttpOrigin(typeof candidate.gatewayOrigin === 'string' ? candidate.gatewayOrigin : null)
-    || normalizeHttpOrigin(typeof candidate.gateway_origin === 'string' ? candidate.gateway_origin : null)
+    normalizeHttpOrigin(
+      typeof candidate.gatewayOrigin === 'string' ? candidate.gatewayOrigin : null
+    ) ||
+    normalizeHttpOrigin(
+      typeof candidate.gateway_origin === 'string' ? candidate.gateway_origin : null
+    )
   const gatewayId =
     typeof candidate.gatewayId === 'string'
       ? candidate.gatewayId.trim().toLowerCase() || null
@@ -709,17 +724,10 @@ const parseGatewayAccessPayload = (value: unknown): TGroupGatewayAccess | null =
       : typeof candidate.auth_method === 'string'
         ? candidate.auth_method.trim() || null
         : null
-  const version =
-    typeof candidate.version === 'string'
-      ? candidate.version.trim() || null
-      : null
+  const version = typeof candidate.version === 'string' ? candidate.version.trim() || null : null
   const scopes = Array.isArray(candidate.scopes)
     ? Array.from(
-        new Set(
-          candidate.scopes
-            .map((entry) => String(entry || '').trim())
-            .filter(Boolean)
-        )
+        new Set(candidate.scopes.map((entry) => String(entry || '').trim()).filter(Boolean))
       )
     : []
   if (!grantId && !gatewayOrigin && !gatewayId) return null
@@ -801,7 +809,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const [discoveryRelays, setDiscoveryRelaysState] = useState<string[]>(() => {
     const stored = localStorageService.getGroupDiscoveryRelays()
     const base = stored.length ? stored : defaultDiscoveryRelays
-    return Array.from(new Set(base.map((url) => normalizeUrl(String(url || '').trim())).filter(Boolean)))
+    return Array.from(
+      new Set(base.map((url) => normalizeUrl(String(url || '').trim())).filter(Boolean))
+    )
   })
   const [handledJoinRequests, setHandledJoinRequests] = useState<Record<string, Set<string>>>(
     () => {
@@ -850,9 +860,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   const acceptedInviteGroupIdsRef = useRef<Set<string>>(new Set())
   const groupMemberPreviewByKeyRef = useRef<Record<string, GroupMemberPreviewEntry>>({})
   const groupMemberPreviewInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map())
-  const groupMembershipPersistedRecordsRef = useRef<Record<string, TPersistedGroupMembershipRecord>>(
-    {}
-  )
+  const groupMembershipPersistedRecordsRef = useRef<
+    Record<string, TPersistedGroupMembershipRecord>
+  >({})
   const groupMetadataPersistedRecordsRef = useRef<Record<string, TPersistedGroupMetadataRecord>>({})
   const groupMembershipLazyHydrateInFlightRef = useRef<Set<string>>(new Set())
   const groupMetadataLazyHydrateInFlightRef = useRef<Set<string>>(new Set())
@@ -1162,9 +1172,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const normalizedGroupId = String(groupId || '').trim()
       if (!normalizedGroupId) return null
       const cacheKeys = getGroupMembershipCacheKeys(normalizedGroupId, relay)
-      return selectPreferredMembershipState(
-        cacheKeys.map((cacheKey) => source[cacheKey] || null)
-      )
+      return selectPreferredMembershipState(cacheKeys.map((cacheKey) => source[cacheKey] || null))
     },
     [getGroupMembershipCacheKeys]
   )
@@ -1204,7 +1212,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       const candidates = Array.from(relayBases)
         .map((relayBase) => {
-          const recordKey = toPersistedGroupMembershipRecordKey(pubkey, normalizedGroupId, relayBase)
+          const recordKey = toPersistedGroupMembershipRecordKey(
+            pubkey,
+            normalizedGroupId,
+            relayBase
+          )
           const record = groupMembershipPersistedRecordsRef.current[recordKey] || null
           if (!record) return null
           return (
@@ -1258,9 +1270,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     ) => {
       if (!pubkey || !visibleState) return
       const shouldPersist =
-        opts?.isJoinedGroup === true || opts?.isActiveGroup === true || opts?.persistDiscover === true
+        opts?.isJoinedGroup === true ||
+        opts?.isActiveGroup === true ||
+        opts?.persistDiscover === true
       if (!shouldPersist) return
-      if (opts?.persistDiscover && visibleState.memberCount === 0 && visibleState.quality === 'partial') {
+      if (
+        opts?.persistDiscover &&
+        visibleState.memberCount === 0 &&
+        visibleState.quality === 'partial'
+      ) {
         return
       }
       const relayBase = getGroupMembershipRelayBase(groupId, relay, {
@@ -1366,9 +1384,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       const joined = myGroupList.some((entry) => entry.groupId === normalizedGroupId)
       const relayBasesToTry = joined
         ? [relayBase]
-        : Array.from(
-            new Set([relayBase, DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE].filter(Boolean))
-          )
+        : Array.from(new Set([relayBase, DISCOVERY_GROUP_MEMBERSHIP_RELAY_BASE].filter(Boolean)))
       const recordKeysToTry = relayBasesToTry.map((candidateRelayBase) =>
         toPersistedGroupMembershipRecordKey(pubkey, normalizedGroupId, candidateRelayBase)
       )
@@ -1403,7 +1419,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           {
             persist: false,
             isJoinedGroup: joined,
-            persistDiscover: !joined && isDiscoveryPersistedGroupMembershipRelayBase(record.relayBase),
+            persistDiscover:
+              !joined && isDiscoveryPersistedGroupMembershipRelayBase(record.relayBase),
             discoveryOnly: isDiscoveryPersistedGroupMembershipRelayBase(record.relayBase)
           }
         )
@@ -1658,8 +1675,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               hydratePersistedGroupMembershipState(
                 record.lastComplete,
                 'persisted-last-complete'
-              ) ||
-              hydratePersistedGroupMembershipState(record.lastKnown, 'persisted-last-known')
+              ) || hydratePersistedGroupMembershipState(record.lastKnown, 'persisted-last-known')
             if (!state) return null
             return {
               key: isDiscoveryPersistedGroupMembershipRelayBase(record.relayBase)
@@ -1777,67 +1793,68 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     }
   }, [handledJoinRequests])
 
-  const refreshDiscovery = useCallback(async (relayUrls?: string[]) => {
-    setIsLoadingDiscovery(true)
-    setDiscoveryError(null)
-    try {
-      if (Array.isArray(relayUrls) && relayUrls.length === 0) {
-        setDiscoveryGroups([])
-        return
-      }
-
-      const fetchRelayUrls = Array.isArray(relayUrls)
-        ? relayUrls
-        : discoveryRelays
-
-      const [metadataEvents, relayEvents] = await Promise.all([
-        client.fetchEvents(fetchRelayUrls, {
-          kinds: [ExtendedKind.GROUP_METADATA],
-          '#i': [HYPERPIPE_IDENTIFIER_TAG],
-          since: 1764892800, // 2025-12-05T00:00:00Z - temporary cutoff to filter legacy noise
-          limit: 200
-        }),
-        client.fetchEvents(fetchRelayUrls, {
-          kinds: [KIND_HYPERPIPE_RELAY],
-          '#i': [HYPERPIPE_IDENTIFIER_TAG],
-          limit: 300
-        })
-      ])
-
-      const hyperpipeRelayUrlById = new Map<string, string>()
-      relayEvents.forEach((evt) => {
-        const parsed = parseHyperpipeRelayEvent30166(evt)
-        if (!parsed) return
-        hyperpipeRelayUrlById.set(parsed.publicIdentifier, getBaseRelayUrl(parsed.wsUrl))
-      })
-
-      const parsed = metadataEvents.map((evt) => {
-        const parsedId = parseGroupIdentifier(evt.tags.find((t) => t[0] === 'd')?.[1] ?? '')
-        const meta = parseGroupMetadataEvent(evt, parsedId.relay)
-        if (isHyperpipeTaggedEvent(evt)) {
-          const relayUrl = hyperpipeRelayUrlById.get(meta.id)
-          if (relayUrl) {
-            return { ...meta, relay: relayUrl }
-          }
+  const refreshDiscovery = useCallback(
+    async (relayUrls?: string[]) => {
+      setIsLoadingDiscovery(true)
+      setDiscoveryError(null)
+      try {
+        if (Array.isArray(relayUrls) && relayUrls.length === 0) {
+          setDiscoveryGroups([])
+          return
         }
-        return meta
-      })
 
-      const seen = new Set<string>()
-      const deduped = parsed.filter((g) => {
-        const key = toGroupKey(g.id, g.relay)
-        if (seen.has(key)) return false
-        seen.add(key)
-        return true
-      })
-      setDiscoveryGroups(deduped)
-    } catch (error) {
-      console.warn('Failed to refresh discovery groups', error)
-      setDiscoveryError((error as Error).message)
-    } finally {
-      setIsLoadingDiscovery(false)
-    }
-  }, [discoveryRelays])
+        const fetchRelayUrls = Array.isArray(relayUrls) ? relayUrls : discoveryRelays
+
+        const [metadataEvents, relayEvents] = await Promise.all([
+          client.fetchEvents(fetchRelayUrls, {
+            kinds: [ExtendedKind.GROUP_METADATA],
+            '#i': [HYPERPIPE_IDENTIFIER_TAG],
+            since: 1764892800, // 2025-12-05T00:00:00Z - temporary cutoff to filter legacy noise
+            limit: 200
+          }),
+          client.fetchEvents(fetchRelayUrls, {
+            kinds: [KIND_HYPERPIPE_RELAY],
+            '#i': [HYPERPIPE_IDENTIFIER_TAG],
+            limit: 300
+          })
+        ])
+
+        const hyperpipeRelayUrlById = new Map<string, string>()
+        relayEvents.forEach((evt) => {
+          const parsed = parseHyperpipeRelayEvent30166(evt)
+          if (!parsed) return
+          hyperpipeRelayUrlById.set(parsed.publicIdentifier, getBaseRelayUrl(parsed.wsUrl))
+        })
+
+        const parsed = metadataEvents.map((evt) => {
+          const parsedId = parseGroupIdentifier(evt.tags.find((t) => t[0] === 'd')?.[1] ?? '')
+          const meta = parseGroupMetadataEvent(evt, parsedId.relay)
+          if (isHyperpipeTaggedEvent(evt)) {
+            const relayUrl = hyperpipeRelayUrlById.get(meta.id)
+            if (relayUrl) {
+              return { ...meta, relay: relayUrl }
+            }
+          }
+          return meta
+        })
+
+        const seen = new Set<string>()
+        const deduped = parsed.filter((g) => {
+          const key = toGroupKey(g.id, g.relay)
+          if (seen.has(key)) return false
+          seen.add(key)
+          return true
+        })
+        setDiscoveryGroups(deduped)
+      } catch (error) {
+        console.warn('Failed to refresh discovery groups', error)
+        setDiscoveryError((error as Error).message)
+      } finally {
+        setIsLoadingDiscovery(false)
+      }
+    },
+    [discoveryRelays]
+  )
 
   const dismissInvite = useCallback((inviteId: string) => {
     const normalizedInviteId = String(inviteId || '').trim()
@@ -1975,8 +1992,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                   gatewayId = payload.gateway_id.trim().toLowerCase() || null
                 }
                 const payloadGatewayOrigin =
-                  normalizeHttpOrigin(typeof payload.gatewayOrigin === 'string' ? payload.gatewayOrigin : null)
-                  || normalizeHttpOrigin(typeof payload.gateway_origin === 'string' ? payload.gateway_origin : null)
+                  normalizeHttpOrigin(
+                    typeof payload.gatewayOrigin === 'string' ? payload.gatewayOrigin : null
+                  ) ||
+                  normalizeHttpOrigin(
+                    typeof payload.gateway_origin === 'string' ? payload.gateway_origin : null
+                  )
                 if (payloadGatewayOrigin) {
                   gatewayOrigin = payloadGatewayOrigin
                 }
@@ -2021,10 +2042,15 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 if (typeof payload.writerIssuerPubkey === 'string') {
                   writerIssuerPubkey = payload.writerIssuerPubkey
                 }
-                if (payload.writerLeaseEnvelope && typeof payload.writerLeaseEnvelope === 'object') {
+                if (
+                  payload.writerLeaseEnvelope &&
+                  typeof payload.writerLeaseEnvelope === 'object'
+                ) {
                   writerLeaseEnvelope = payload.writerLeaseEnvelope as Record<string, unknown>
                 }
-                gatewayAccess = parseGatewayAccessPayload(payload.gatewayAccess ?? payload.gateway_access)
+                gatewayAccess = parseGatewayAccessPayload(
+                  payload.gatewayAccess ?? payload.gateway_access
+                )
                 if (typeof payload.writerCore === 'string') {
                   writerCore = payload.writerCore
                 }
@@ -2405,9 +2431,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         : []
 
       const joinRequestRelayUrls =
-        canUseResolvedRelay && resolvedRelay
-          ? [resolvedRelay]
-          : availableDiscoveryRelays
+        canUseResolvedRelay && resolvedRelay ? [resolvedRelay] : availableDiscoveryRelays
 
       const { state, selectionDebug } = await resolveCanonicalGroupMembershipState({
         groupId: normalizedGroupId,
@@ -2432,7 +2456,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         extraMembershipEventsSource: shadowLeaveEvents.length ? 'discovery' : undefined
       })
 
-      if (selectionDebug.usedProtectedState || selectionDebug.skippedSuspiciousCandidateIds.length) {
+      if (
+        selectionDebug.usedProtectedState ||
+        selectionDebug.skippedSuspiciousCandidateIds.length
+      ) {
         console.warn('[GroupsProvider] Quarantined suspicious relay membership snapshot', {
           groupId: normalizedGroupId,
           relay: resolvedRelay || relay || null,
@@ -2497,7 +2524,10 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           discoveryOnly: opts?.discoveryOnly
         }
       )
-      const protectionBaseline = selectPreferredMembershipState([cachedMembership, persistedMembership])
+      const protectionBaseline = selectPreferredMembershipState([
+        cachedMembership,
+        persistedMembership
+      ])
       const nextVisibleState = isSuspiciousCreatorSelfMembershipDowngrade({
         currentState: protectionBaseline,
         incomingState: resolved.state,
@@ -2507,13 +2537,16 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         ? protectionBaseline
         : resolved.state
       if (nextVisibleState !== resolved.state) {
-        console.warn('[GroupsProvider] Preserving cached membership over suspicious creator self-only relay state', {
-          groupId: normalizedGroupId,
-          relay: resolved.resolvedRelay || relay || null,
-          cachedMemberCount: protectionBaseline?.memberCount || 0,
-          incomingMemberCount: resolved.state.memberCount,
-          incomingSource: resolved.state.hydrationSource
-        })
+        console.warn(
+          '[GroupsProvider] Preserving cached membership over suspicious creator self-only relay state',
+          {
+            groupId: normalizedGroupId,
+            relay: resolved.resolvedRelay || relay || null,
+            cachedMemberCount: protectionBaseline?.memberCount || 0,
+            incomingMemberCount: resolved.state.memberCount,
+            incomingSource: resolved.state.hydrationSource
+          }
+        )
       }
       const visibleState = applyGroupMembershipState(
         normalizedGroupId,
@@ -2550,8 +2583,12 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
     ) => {
       const relayFromList = myGroupList.find((entry) => entry.groupId === groupId)?.relay
       const targetRelay = relay || relayFromList || undefined
-      const { resolvedRelay: resolved, relayHasAuthToken, hasActiveRelayConnection, relayLooksLoopback } =
-        getRelayRuntimeState(groupId, targetRelay)
+      const {
+        resolvedRelay: resolved,
+        relayHasAuthToken,
+        hasActiveRelayConnection,
+        relayLooksLoopback
+      } = getRelayRuntimeState(groupId, targetRelay)
       const isInMyGroups = myGroupList.some((entry) => entry.groupId === groupId)
       const preferRelay =
         !opts?.discoveryOnly &&
@@ -2712,7 +2749,11 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         ((!!creatorPubkey && creatorPubkey === pubkey) ||
           (!!groupIdPubkey && groupIdPubkey === pubkey))
       const creatorProtectionBaseline = selectPreferredMembershipState([
-        getCachedGroupMemberPreview(groupId, resolved || targetRelay || undefined, groupMemberPreviewByKeyRef.current),
+        getCachedGroupMemberPreview(
+          groupId,
+          resolved || targetRelay || undefined,
+          groupMemberPreviewByKeyRef.current
+        ),
         getPersistedGroupMembershipBaseline(groupId, resolved || targetRelay || undefined)
       ])
       if (
@@ -2724,14 +2765,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         }) &&
         creatorProtectionBaseline
       ) {
-        console.warn('[GroupsProvider] Corrected creator self-only membership detail with protected baseline', {
-          groupId,
-          relay: resolved || targetRelay || null,
-          incomingSnapshotId: membershipState.selectedSnapshotId,
-          incomingMemberCount: membershipState.memberCount,
-          baselineSnapshotId: creatorProtectionBaseline.selectedSnapshotId,
-          baselineMemberCount: creatorProtectionBaseline.memberCount
-        })
+        console.warn(
+          '[GroupsProvider] Corrected creator self-only membership detail with protected baseline',
+          {
+            groupId,
+            relay: resolved || targetRelay || null,
+            incomingSnapshotId: membershipState.selectedSnapshotId,
+            incomingMemberCount: membershipState.memberCount,
+            baselineSnapshotId: creatorProtectionBaseline.selectedSnapshotId,
+            baselineMemberCount: creatorProtectionBaseline.memberCount
+          }
+        )
         membershipState = creatorProtectionBaseline
       }
       let coercedMembershipStatus =
@@ -3065,13 +3109,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       }
     })
     tokenizedPreviewLastRefreshByGroupRef.current = nextRefreshAt
-  }, [
-    myGroupList,
-    pubkey,
-    refreshGroupMemberPreview,
-    resolveRelayUrl,
-    workerRelays
-  ])
+  }, [myGroupList, pubkey, refreshGroupMemberPreview, resolveRelayUrl, workerRelays])
 
   const republishMemberSnapshot39002 = useCallback(
     async (params: {
@@ -4124,109 +4162,82 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   )
 
   const createHyperpipeRelayGroup = useCallback(
-    async ({
-      name,
-      about,
-      isPublic,
-      isOpen,
-      picture,
-      fileSharing,
-      gatewayOrigin,
-      gatewayId,
-      gatewayAuthMethod,
-      gatewayDelegation,
-      gatewaySponsorPubkey,
-      directJoinOnly
-    }: {
-      name: string
-      about?: string
-      isPublic: boolean
-      isOpen: boolean
-      picture?: string
-      fileSharing?: boolean
-      gatewayOrigin?: string | null
-      gatewayId?: string | null
-      gatewayAuthMethod?: string | null
-      gatewayDelegation?: string | null
-      gatewaySponsorPubkey?: string | null
-      directJoinOnly?: boolean
-    }) => {
-      if (!pubkey) throw new Error('Not logged in')
-      const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin || null)
-      const normalizedGatewayId =
-        typeof gatewayId === 'string' && gatewayId.trim()
-          ? gatewayId.trim().toLowerCase()
-          : null
-      const normalizedDirectJoinOnly = directJoinOnly === true
-      const result = await createRelay({
-        name,
-        description: about || undefined,
-        isPublic,
-        isOpen,
-        fileSharing,
-        picture,
-        gatewayOrigin: normalizedGatewayOrigin,
-        gatewayId: normalizedGatewayId,
-        directJoinOnly: normalizedDirectJoinOnly
-      })
-      if (!result?.success) throw new Error(result?.error || 'Failed to create relay')
-
-      const publicIdentifier = result.publicIdentifier
-      const authenticatedRelayUrl = result.relayUrl
-      const relayKey = result.relayKey || null
-      if (!publicIdentifier || !authenticatedRelayUrl) {
-        throw new Error('Worker did not return a publicIdentifier/relayUrl')
-      }
-
-      const relayWsUrl = getBaseRelayUrl(authenticatedRelayUrl)
-      const discoveryTopic =
-        typeof result.discoveryTopic === 'string' && result.discoveryTopic.trim()
-          ? result.discoveryTopic.trim()
-          : null
-      const hostPeerKeys = normalizePubkeyList(result.hostPeerKeys || [])
-      const leaseReplicaPeerKeys = normalizePubkeyList(result.leaseReplicaPeerKeys || [])
-      const writerIssuerPubkey =
-        typeof result.writerIssuerPubkey === 'string' && result.writerIssuerPubkey.trim()
-          ? result.writerIssuerPubkey.trim()
-          : null
-      upsertProvisionalGroupMetadata({
-        groupId: publicIdentifier,
-        relay: relayWsUrl,
+    async (
+      {
         name,
         about,
-        picture,
         isPublic,
         isOpen,
-        gatewayId: normalizedGatewayId,
-        gatewayOrigin: normalizedGatewayOrigin,
-        directJoinOnly: normalizedDirectJoinOnly,
-        creatorPubkey: pubkey,
-        source: 'create'
-      })
+        picture,
+        fileSharing,
+        gatewayOrigin,
+        gatewayId,
+        gatewayAuthMethod,
+        gatewayDelegation,
+        gatewaySponsorPubkey,
+        directJoinOnly
+      }: {
+        name: string
+        about?: string
+        isPublic: boolean
+        isOpen: boolean
+        picture?: string
+        fileSharing?: boolean
+        gatewayOrigin?: string | null
+        gatewayId?: string | null
+        gatewayAuthMethod?: string | null
+        gatewayDelegation?: string | null
+        gatewaySponsorPubkey?: string | null
+        directJoinOnly?: boolean
+      },
+      options?: {
+        onProgress?: (state: CreateGroupProgressState) => void
+      }
+    ) => {
+      const reportProgress = (state: CreateGroupProgressState) => {
+        options?.onProgress?.(state)
+      }
 
-      const { groupCreateEvent, metadataEvent, hyperpipeEvent } =
-        buildHyperpipeDiscoveryDraftEvents({
-          publicIdentifier,
+      try {
+        if (!pubkey) throw new Error('Not logged in')
+        const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin || null)
+        const normalizedGatewayId =
+          typeof gatewayId === 'string' && gatewayId.trim() ? gatewayId.trim().toLowerCase() : null
+        const normalizedDirectJoinOnly = directJoinOnly === true
+
+        reportProgress({ phase: 'creatingRelay' })
+        const result = await createRelay({
           name,
-          about,
+          description: about || undefined,
           isPublic,
           isOpen,
           fileSharing,
-          relayWsUrl,
-          pictureTagUrl: picture,
+          picture,
           gatewayOrigin: normalizedGatewayOrigin,
           gatewayId: normalizedGatewayId,
-          gatewayAuthMethod,
-          gatewayDelegation,
-          gatewaySponsorPubkey,
-          directJoinOnly: normalizedDirectJoinOnly,
-          discoveryTopic,
-          hostPeerKeys,
-          leaseReplicaPeerKeys,
-          writerIssuerPubkey
+          directJoinOnly: normalizedDirectJoinOnly
         })
-      persistGroupMetadata(
-        createProvisionalGroupMetadata({
+        if (!result?.success) throw new Error(result?.error || 'Failed to create relay')
+
+        const publicIdentifier = result.publicIdentifier
+        const authenticatedRelayUrl = result.relayUrl
+        const relayKey = result.relayKey || null
+        if (!publicIdentifier || !authenticatedRelayUrl) {
+          throw new Error('Worker did not return a publicIdentifier/relayUrl')
+        }
+
+        const relayWsUrl = getBaseRelayUrl(authenticatedRelayUrl)
+        const discoveryTopic =
+          typeof result.discoveryTopic === 'string' && result.discoveryTopic.trim()
+            ? result.discoveryTopic.trim()
+            : null
+        const hostPeerKeys = normalizePubkeyList(result.hostPeerKeys || [])
+        const leaseReplicaPeerKeys = normalizePubkeyList(result.leaseReplicaPeerKeys || [])
+        const writerIssuerPubkey =
+          typeof result.writerIssuerPubkey === 'string' && result.writerIssuerPubkey.trim()
+            ? result.writerIssuerPubkey.trim()
+            : null
+        upsertProvisionalGroupMetadata({
           groupId: publicIdentifier,
           relay: relayWsUrl,
           name,
@@ -4237,115 +4248,170 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           gatewayId: normalizedGatewayId,
           gatewayOrigin: normalizedGatewayOrigin,
           directJoinOnly: normalizedDirectJoinOnly,
-          createdAt: metadataEvent.created_at,
-          creatorPubkey: pubkey
-        }),
-        relayWsUrl
-      ).catch(() => {})
-      const { adminListEvent, memberListEvent } = buildHyperpipeAdminBootstrapDraftEvents({
-        publicIdentifier,
-        adminPubkeyHex: pubkey,
-        name
-      })
+          creatorPubkey: pubkey,
+          source: 'create'
+        })
 
-      if (isPublic) {
-        await Promise.all([
-          publish(groupCreateEvent, { specifiedRelayUrls: BIG_RELAY_URLS }),
-          publish(metadataEvent, { specifiedRelayUrls: BIG_RELAY_URLS }),
-          publish(hyperpipeEvent, { specifiedRelayUrls: BIG_RELAY_URLS })
-        ])
-      }
-
-      const updatedList = [
-        ...myGroupList.filter((entry) => entry.groupId !== publicIdentifier),
-        { groupId: publicIdentifier, relay: relayWsUrl }
-      ]
-      await saveMyGroupList(
-        updatedList,
-        isPublic ? { specifiedRelayUrls: BIG_RELAY_URLS } : undefined
-      )
-
-      const workerBootstrap = result?.bootstrapPublish
-      const workerBootstrapRelayUrl =
-        resolveRelayUrl(workerBootstrap?.relayWsUrl || authenticatedRelayUrl) ||
-        authenticatedRelayUrl
-      console.info('[GroupsProvider] create bootstrap worker status', {
-        groupId: publicIdentifier,
-        relayKey,
-        status: workerBootstrap?.status || 'unknown',
-        attempt: workerBootstrap?.attempt ?? null,
-        publishedKinds: workerBootstrap?.publishedKinds || [],
-        error: workerBootstrap?.error || null
-      })
-
-      console.info('[GroupsProvider] create bootstrap verify start', {
-        groupId: publicIdentifier,
-        relayKey,
-        relayUrl: workerBootstrapRelayUrl
-      })
-
-      let bootstrapRelayUrl = workerBootstrapRelayUrl
-      const workerVerification = await verifyGroupRelayBootstrapState({
-        groupId: publicIdentifier,
-        relayUrl: workerBootstrapRelayUrl,
-        maxAttempts: workerBootstrap?.status === 'success' ? 8 : 4,
-        delayMs: 450
-      })
-
-      if (!workerVerification.ok) {
-        console.warn(
-          '[GroupsProvider] create bootstrap worker verification failed, using renderer fallback',
-          {
+        const { groupCreateEvent, metadataEvent, hyperpipeEvent } =
+          buildHyperpipeDiscoveryDraftEvents({
+            publicIdentifier,
+            name,
+            about,
+            isPublic,
+            isOpen,
+            fileSharing,
+            relayWsUrl,
+            pictureTagUrl: picture,
+            gatewayOrigin: normalizedGatewayOrigin,
+            gatewayId: normalizedGatewayId,
+            gatewayAuthMethod,
+            gatewayDelegation,
+            gatewaySponsorPubkey,
+            directJoinOnly: normalizedDirectJoinOnly,
+            discoveryTopic,
+            hostPeerKeys,
+            leaseReplicaPeerKeys,
+            writerIssuerPubkey
+          })
+        persistGroupMetadata(
+          createProvisionalGroupMetadata({
             groupId: publicIdentifier,
-            relayKey,
-            status: workerBootstrap?.status || 'unknown',
-            workerError: workerBootstrap?.error || null,
-            verifyAttempt: workerVerification.attempt,
-            metadataFound: workerVerification.metadataFound,
-            membersFound: workerVerification.membersFound,
-            verifyError: workerVerification.error
-          }
+            relay: relayWsUrl,
+            name,
+            about,
+            picture,
+            isPublic,
+            isOpen,
+            gatewayId: normalizedGatewayId,
+            gatewayOrigin: normalizedGatewayOrigin,
+            directJoinOnly: normalizedDirectJoinOnly,
+            createdAt: metadataEvent.created_at,
+            creatorPubkey: pubkey
+          }),
+          relayWsUrl
+        ).catch(() => {})
+        const { adminListEvent, memberListEvent } = buildHyperpipeAdminBootstrapDraftEvents({
+          publicIdentifier,
+          adminPubkeyHex: pubkey,
+          name
+        })
+
+        if (isPublic) {
+          reportProgress({ phase: 'publishingDiscovery' })
+          await Promise.all([
+            publish(groupCreateEvent, { specifiedRelayUrls: BIG_RELAY_URLS }),
+            publish(metadataEvent, { specifiedRelayUrls: BIG_RELAY_URLS }),
+            publish(hyperpipeEvent, { specifiedRelayUrls: BIG_RELAY_URLS })
+          ])
+        }
+
+        reportProgress({ phase: 'savingGroupList' })
+        const updatedList = [
+          ...myGroupList.filter((entry) => entry.groupId !== publicIdentifier),
+          { groupId: publicIdentifier, relay: relayWsUrl }
+        ]
+        await saveMyGroupList(
+          updatedList,
+          isPublic ? { specifiedRelayUrls: BIG_RELAY_URLS } : undefined
         )
-        bootstrapRelayUrl = await publishBootstrapEventsToGroupRelay({
+
+        const workerBootstrap = result?.bootstrapPublish
+        const workerBootstrapRelayUrl =
+          resolveRelayUrl(workerBootstrap?.relayWsUrl || authenticatedRelayUrl) ||
+          authenticatedRelayUrl
+        console.info('[GroupsProvider] create bootstrap worker status', {
           groupId: publicIdentifier,
           relayKey,
-          fallbackRelayUrl: workerBootstrapRelayUrl,
-          events: [groupCreateEvent, metadataEvent, hyperpipeEvent, adminListEvent, memberListEvent]
+          status: workerBootstrap?.status || 'unknown',
+          attempt: workerBootstrap?.attempt ?? null,
+          publishedKinds: workerBootstrap?.publishedKinds || [],
+          error: workerBootstrap?.error || null
         })
+
+        console.info('[GroupsProvider] create bootstrap verify start', {
+          groupId: publicIdentifier,
+          relayKey,
+          relayUrl: workerBootstrapRelayUrl
+        })
+
+        reportProgress({ phase: 'verifyingBootstrap' })
+        let bootstrapRelayUrl = workerBootstrapRelayUrl
+        const workerVerification = await verifyGroupRelayBootstrapState({
+          groupId: publicIdentifier,
+          relayUrl: workerBootstrapRelayUrl,
+          maxAttempts: workerBootstrap?.status === 'success' ? 8 : 4,
+          delayMs: 450
+        })
+
+        if (!workerVerification.ok) {
+          console.warn(
+            '[GroupsProvider] create bootstrap worker verification failed, using renderer fallback',
+            {
+              groupId: publicIdentifier,
+              relayKey,
+              status: workerBootstrap?.status || 'unknown',
+              workerError: workerBootstrap?.error || null,
+              verifyAttempt: workerVerification.attempt,
+              metadataFound: workerVerification.metadataFound,
+              membersFound: workerVerification.membersFound,
+              verifyError: workerVerification.error
+            }
+          )
+          bootstrapRelayUrl = await publishBootstrapEventsToGroupRelay({
+            groupId: publicIdentifier,
+            relayKey,
+            fallbackRelayUrl: workerBootstrapRelayUrl,
+            events: [
+              groupCreateEvent,
+              metadataEvent,
+              hyperpipeEvent,
+              adminListEvent,
+              memberListEvent
+            ]
+          })
+        }
+
+        console.info('[GroupsProvider] create bootstrap verify complete', {
+          groupId: publicIdentifier,
+          relayKey,
+          relayUrl: bootstrapRelayUrl,
+          source: workerVerification.ok ? 'worker' : 'renderer-fallback',
+          metadataFound: workerVerification.metadataFound,
+          membersFound: workerVerification.membersFound,
+          adminsFound: workerVerification.adminsFound
+        })
+
+        reportProgress({ phase: 'publishingMembershipSnapshots' })
+        // Bootstrap admin/member snapshots on the group relay.
+        const membershipSnapshotTargets = isPublic
+          ? Array.from(new Set([bootstrapRelayUrl, ...BIG_RELAY_URLS]))
+          : [bootstrapRelayUrl]
+        logGroupSnapshotPublishAttempt({
+          reason: 'create-hyperpipe-group:bootstrap-admins',
+          groupId: publicIdentifier,
+          event: adminListEvent,
+          relayUrls: membershipSnapshotTargets
+        })
+        logGroupSnapshotPublishAttempt({
+          reason: 'create-hyperpipe-group:bootstrap-members',
+          groupId: publicIdentifier,
+          event: memberListEvent,
+          relayUrls: membershipSnapshotTargets
+        })
+        await Promise.all([
+          publish(adminListEvent, { specifiedRelayUrls: membershipSnapshotTargets }),
+          publish(memberListEvent, { specifiedRelayUrls: membershipSnapshotTargets })
+        ])
+
+        reportProgress({ phase: 'success' })
+        return { groupId: publicIdentifier, relay: relayWsUrl }
+      } catch (error) {
+        reportProgress({
+          phase: 'error',
+          error: error instanceof Error ? error.message : String(error)
+        })
+        throw error
       }
-
-      console.info('[GroupsProvider] create bootstrap verify complete', {
-        groupId: publicIdentifier,
-        relayKey,
-        relayUrl: bootstrapRelayUrl,
-        source: workerVerification.ok ? 'worker' : 'renderer-fallback',
-        metadataFound: workerVerification.metadataFound,
-        membersFound: workerVerification.membersFound,
-        adminsFound: workerVerification.adminsFound
-      })
-
-      // Bootstrap admin/member snapshots on the group relay.
-      const membershipSnapshotTargets = isPublic
-        ? Array.from(new Set([bootstrapRelayUrl, ...BIG_RELAY_URLS]))
-        : [bootstrapRelayUrl]
-      logGroupSnapshotPublishAttempt({
-        reason: 'create-hyperpipe-group:bootstrap-admins',
-        groupId: publicIdentifier,
-        event: adminListEvent,
-        relayUrls: membershipSnapshotTargets
-      })
-      logGroupSnapshotPublishAttempt({
-        reason: 'create-hyperpipe-group:bootstrap-members',
-        groupId: publicIdentifier,
-        event: memberListEvent,
-        relayUrls: membershipSnapshotTargets
-      })
-      await Promise.all([
-        publish(adminListEvent, { specifiedRelayUrls: membershipSnapshotTargets }),
-        publish(memberListEvent, { specifiedRelayUrls: membershipSnapshotTargets })
-      ])
-
-      return { groupId: publicIdentifier, relay: relayWsUrl }
     },
     [
       createRelay,
@@ -4433,7 +4499,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           : null
       const gatewayOrigin = normalizeHttpOrigin(metadataHints?.gatewayOrigin || null)
       const gatewayAuthMethod =
-        typeof metadataHints?.gatewayAuthMethod === 'string' && metadataHints.gatewayAuthMethod.trim()
+        typeof metadataHints?.gatewayAuthMethod === 'string' &&
+        metadataHints.gatewayAuthMethod.trim()
           ? metadataHints.gatewayAuthMethod.trim()
           : null
       const directJoinOnly = metadataHints?.directJoinOnly === true
@@ -4443,16 +4510,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           : null
       const hostPeerKeys = Array.isArray(metadataHints?.hostPeerKeys)
         ? metadataHints.hostPeerKeys
-          .map((entry: string) => String(entry || '').trim())
-          .filter(Boolean)
+            .map((entry: string) => String(entry || '').trim())
+            .filter(Boolean)
         : []
       const metadataLeaseReplicaPeerKeys = Array.isArray(metadataHints?.leaseReplicaPeerKeys)
         ? metadataHints.leaseReplicaPeerKeys
-          .map((entry: string) => String(entry || '').trim())
-          .filter(Boolean)
+            .map((entry: string) => String(entry || '').trim())
+            .filter(Boolean)
         : []
       const metadataWriterIssuerPubkey =
-        typeof metadataHints?.writerIssuerPubkey === 'string' && metadataHints.writerIssuerPubkey.trim()
+        typeof metadataHints?.writerIssuerPubkey === 'string' &&
+        metadataHints.writerIssuerPubkey.trim()
           ? metadataHints.writerIssuerPubkey.trim()
           : null
       if (!isOpenGroup && !inviteRelayKey) {
@@ -4488,15 +4556,17 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 : undefined,
               fastForward: (res as any).fastForward || null,
               writerLeaseEnvelope:
-                (res as any).writerLeaseEnvelope && typeof (res as any).writerLeaseEnvelope === 'object'
+                (res as any).writerLeaseEnvelope &&
+                typeof (res as any).writerLeaseEnvelope === 'object'
                   ? (res as any).writerLeaseEnvelope
                   : null,
               leaseReplicaPeerKeys: Array.isArray((res as any).leaseReplicaPeerKeys)
                 ? (res as any).leaseReplicaPeerKeys
                 : [],
-              writerIssuerPubkey: typeof (res as any).writerIssuerPubkey === 'string'
-                ? (res as any).writerIssuerPubkey
-                : null
+              writerIssuerPubkey:
+                typeof (res as any).writerIssuerPubkey === 'string'
+                  ? (res as any).writerIssuerPubkey
+                  : null
             }
             console.info('[GroupsProvider] Writer provisioning result (invite)', {
               groupId,
@@ -4564,13 +4634,13 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           const token = isOpenGroup ? null : randomString(24)
           const writerInfo = await provisionWriterInfo(invitee, token)
           const gatewayAccess =
-            !isOpenGroup
-            && gatewayAuthMethod === 'relay-scoped-bearer-v1'
-            && !directJoinOnly
-            && !!gatewayOrigin
-            && !!inviteRelayKey
-            && !!sendToWorker
-              ? await sendToWorker({
+            !isOpenGroup &&
+            gatewayAuthMethod === 'relay-scoped-bearer-v1' &&
+            !directJoinOnly &&
+            !!gatewayOrigin &&
+            !!inviteRelayKey &&
+            !!sendToWorker
+              ? ((await sendToWorker({
                   type: 'authorize-relay-member-access',
                   data: {
                     relayKey: inviteRelayKey,
@@ -4580,7 +4650,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                     gatewayId,
                     scopes: DEFAULT_GATEWAY_MEMBER_SCOPES
                   }
-                }) as TGroupGatewayAccess
+                })) as TGroupGatewayAccess)
               : null
           const inviteMirrorMetadata = buildInviteMirrorMetadata(writerInfo)
           const payload = isOpenGroup
