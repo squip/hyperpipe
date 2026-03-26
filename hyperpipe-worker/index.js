@@ -6526,7 +6526,6 @@ function summarizeMarmotCommandPayload(type, payload = {}) {
 
   if (Array.isArray(data.relays)) summary.relayCount = data.relays.length
   if (Array.isArray(data.relayUrls)) summary.relayUrlCount = data.relayUrls.length
-  if (typeof data.relayMode === 'string') summary.relayMode = data.relayMode
   if (typeof data.search === 'string') summary.searchLength = data.search.length
   if (typeof data.conversationId === 'string') summary.conversationId = previewValue(data.conversationId, 20)
   if (typeof data.targetPubkey === 'string' || typeof data.pubkey === 'string') {
@@ -8575,8 +8574,7 @@ async function handleMessageObject(message) {
           description: payload.description,
           members: payload.members || payload.memberPubkeys || [],
           imageUrl: payload.imageUrl || null,
-          relayUrls: payload.relayUrls || payload.relays || [],
-          relayMode: payload.relayMode
+          relayUrls: payload.relayUrls || payload.relays || []
         })
         const ackData = {
           operationId: requestId,

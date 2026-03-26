@@ -106,8 +106,7 @@ function Harness({ thumbnailFile = null }: { thumbnailFile?: File | null }) {
             title: 'Chat',
             members: [FRIEND_PUBKEY],
             thumbnailFile,
-            relayUrls: ['wss://relay.test'],
-            relayMode: 'withFallback'
+            relayUrls: ['wss://relay.test']
           })
           setResult(`${created.conversation.id}:${created.operationId}`)
         }}
@@ -145,9 +144,7 @@ function JoinHarness() {
         disabled={!ready}
         onClick={async () => {
           try {
-            const joined = await acceptInvite('invite-1', {
-              onProgress: () => {}
-            })
+            const joined = await acceptInvite('invite-1')
             setResult(joined.conversationId || '')
           } catch (joinError) {
             setError(joinError instanceof Error ? joinError.message : String(joinError))
@@ -255,6 +252,14 @@ describe('MessengerProvider create conversation contract', () => {
     })
 
     fireEvent.click(screen.getByRole('button', { name: 'create' }))
+
+    await waitFor(() => {
+      const createCall = sendToWorkerAwaitMock.mock.calls.find(
+        ([payload]) => payload?.message?.type === 'marmot-create-conversation'
+      )
+      expect(createCall?.[0]?.message?.data?.relayMode).toBeUndefined()
+      expect(createCall?.[0]?.message?.data?.relayUrls).toEqual(['wss://relay.test/'])
+    })
 
     await waitFor(() => {
       expect(screen.getByTestId('result')).toHaveTextContent('conv-1:op-1')

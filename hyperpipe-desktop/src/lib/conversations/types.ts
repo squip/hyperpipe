@@ -176,7 +176,6 @@ export type CreateConversationInput = {
   imageUrl?: string | null
   thumbnailFile?: File | null
   relayUrls?: string[]
-  relayMode?: 'withFallback' | 'strict'
 }
 
 export type UpdateConversationMetadataInput = {

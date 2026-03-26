@@ -4,7 +4,8 @@ import TitlebarInfoButton from '@/components/TitlebarInfoButton'
 import PrimaryPageLayout from '@/layouts/PrimaryPageLayout'
 import PostRelaySelector from '@/components/PostEditor/PostRelaySelector'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
-import { Check, Loader2, MessageSquare, Search, UserPlus, Users, X } from 'lucide-react'
+import { Card, CardContent } from '@/components/ui/card'
+import { Check, Loader2, MessageSquare, Search, Upload, UserPlus, Users, X } from 'lucide-react'
 import { forwardRef, type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useMessenger } from '@/providers/MessengerProvider'
@@ -23,8 +24,9 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
+import { Label } from '@/components/ui/label'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import { Textarea } from '@/components/ui/textarea'
-import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useSearchProfiles } from '@/hooks/useSearchProfiles'
 import Username from '@/components/Username'
@@ -43,21 +45,8 @@ import {
   type RelayDisplayMeta
 } from '@/lib/relay-targets'
 import { cn } from '@/lib/utils'
-import {
-  getCreateConversationProgressLabel,
-  getCreateConversationProgressTitle,
-  getCreateConversationProgressValue,
-  getJoinConversationProgressLabel,
-  getJoinConversationProgressTitle,
-  getJoinConversationProgressValue,
-  type CreateConversationProgressState,
-  type JoinConversationProgressState
-} from '@/lib/workflow-progress-ui'
 import { toast } from 'sonner'
 import type { TPageRef } from '@/types'
-import WorkflowProgress from '@/components/WorkflowProgress'
-
-type RelayPublishMode = 'withFallback' | 'strict'
 
 type CreateChatModalPayload = {
   title: string
@@ -65,11 +54,11 @@ type CreateChatModalPayload = {
   members: string[]
   imageFile: File | null
   relayUrls: string[]
-  relayMode: RelayPublishMode
 }
 
-type ActiveJoinInviteProgressState = JoinConversationProgressState & {
+type ActiveJoinInviteErrorState = {
   inviteId: string
+  message: string
 }
 
 function normalizeRelayListForChat(
@@ -173,12 +162,9 @@ const ChatListPage = forwardRef<
   const [search, setSearch] = useState('')
   const [openNew, setOpenNew] = useState(false)
   const [creatingConversation, setCreatingConversation] = useState(false)
-  const [createConversationProgress, setCreateConversationProgress] =
-    useState<CreateConversationProgressState | null>(null)
   const [createConversationError, setCreateConversationError] = useState<string | null>(null)
   const [joiningInviteId, setJoiningInviteId] = useState<string | null>(null)
-  const [joinInviteProgress, setJoinInviteProgress] =
-    useState<ActiveJoinInviteProgressState | null>(null)
+  const [joinInviteError, setJoinInviteError] = useState<ActiveJoinInviteErrorState | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const discoveryRelay = import.meta.env.VITE_DISCOVERY_RELAY as string | undefined
 
@@ -222,7 +208,6 @@ const ChatListPage = forwardRef<
 
   useEffect(() => {
     if (openNew) return
-    setCreateConversationProgress(null)
     setCreateConversationError(null)
   }, [openNew])
 
@@ -285,8 +270,7 @@ const ChatListPage = forwardRef<
     description,
     members,
     imageFile,
-    relayUrls,
-    relayMode
+    relayUrls
   }: CreateChatModalPayload) => {
     const uniqueMembers = Array.from(
       new Set(
@@ -303,7 +287,6 @@ const ChatListPage = forwardRef<
 
     setCreatingConversation(true)
     setCreateConversationError(null)
-    setCreateConversationProgress({ phase: 'creatingConversation' })
     try {
       const publishRelayUrls = await resolvePublishRelayUrls({
         relayUrls: dedupeRelayUrlsByIdentity(relayUrls),
@@ -327,23 +310,11 @@ const ChatListPage = forwardRef<
           description: description.trim() || undefined,
           members: uniqueMembers,
           thumbnailFile: imageFile,
-          relayUrls: publishRelayUrls,
-          relayMode
-        },
-        {
-          onProgress: (state) => {
-            if (state.phase === 'error') {
-              setCreateConversationError(state.error || t('Failed to create chat'))
-              return
-            }
-            setCreateConversationError(null)
-            setCreateConversationProgress(state)
-          }
+          relayUrls: publishRelayUrls
         }
       )
       const conversation = createResult.conversation
 
-      setCreateConversationProgress({ phase: 'openingConversation' })
       setOpenNew(false)
       push(`/conversations/${conversation.id}`)
     } catch (error) {
@@ -366,57 +337,22 @@ const ChatListPage = forwardRef<
     }
 
     setJoiningInviteId(invite.id)
-    setJoinInviteProgress({
-      inviteId: invite.id,
-      phase: 'joiningConversation',
-      error: null
-    })
+    setJoinInviteError((previous) =>
+      previous?.inviteId === invite.id ? null : previous
+    )
     try {
-      const result = await acceptInvite(invite.id, {
-        onProgress: (state) => {
-          if (state.phase === 'error') {
-            setJoinInviteProgress((previous) =>
-              previous?.inviteId === invite.id
-                ? {
-                    ...previous,
-                    error: state.error || t('Failed to join invite')
-                  }
-                : previous
-            )
-            return
-          }
-          setJoinInviteProgress({
-            inviteId: invite.id,
-            ...state
-          })
-        }
-      })
-      setJoinInviteProgress({
-        inviteId: invite.id,
-        phase: 'openingConversation',
-        error: null
-      })
+      const result = await acceptInvite(invite.id)
       const conversationId = result.conversationId || invite.conversationId
       if (conversationId) {
         push(`/conversations/${conversationId}`)
-      } else {
-        setJoinInviteProgress(null)
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       console.error('Failed joining chat invite', error)
-      setJoinInviteProgress((previous) =>
-        previous?.inviteId === invite.id
-          ? {
-              ...previous,
-              error: message
-            }
-          : {
-              inviteId: invite.id,
-              phase: 'joiningConversation',
-              error: message
-            }
-      )
+      setJoinInviteError({
+        inviteId: invite.id,
+        message
+      })
       toast.error(t('Failed to join invite'))
     } finally {
       setJoiningInviteId(null)
@@ -499,21 +435,13 @@ const ChatListPage = forwardRef<
                   </thead>
                   <tbody className="text-sm">
                     {inviteRows.map(({ invite, members }) => {
-                      const activeJoinProgress =
-                        joinInviteProgress?.inviteId === invite.id ? joinInviteProgress : null
                       const isJoining = joiningInviteId === invite.id || invite.status === 'joining'
                       const joinDisabled = Boolean(joiningInviteId) || invite.status === 'joining'
                       const dismissDisabled = joiningInviteId === invite.id
-                      const joinProgressTitle = getJoinConversationProgressTitle(
-                        activeJoinProgress?.phase
-                      )
-                      const joinProgressDetail = getJoinConversationProgressLabel(
-                        activeJoinProgress?.phase
-                      )
-                      const joinProgressValue = getJoinConversationProgressValue(
-                        activeJoinProgress?.phase
-                      )
-                      const rowError = activeJoinProgress?.error || invite.error
+                      const rowError =
+                        joinInviteError?.inviteId === invite.id
+                          ? joinInviteError.message
+                          : invite.error
                       const initials = (invite.title || t('Chat')).slice(0, 2).toUpperCase()
 
                       return (
@@ -540,15 +468,6 @@ const ChatListPage = forwardRef<
                                 {isJoining ? t('Joining...') : t('Join')}
                               </Button>
                             </div>
-                            {activeJoinProgress ? (
-                              <div className="mt-2 rounded-md border border-border/60 bg-muted/30 p-2">
-                                <WorkflowProgress
-                                  title={joinProgressTitle}
-                                  detail={joinProgressDetail}
-                                  value={joinProgressValue}
-                                />
-                              </div>
-                            ) : null}
                             {rowError ? (
                               <div className="mt-2 text-xs text-red-500">{rowError}</div>
                             ) : null}
@@ -619,7 +538,6 @@ const ChatListPage = forwardRef<
         defaultRelayUrls={defaultCreateRelayUrls}
         groupRelayTargets={groupRelayTargets}
         localGroupRelayDisplay={localGroupRelayDisplay}
-        progress={createConversationProgress}
         error={createConversationError}
         onCreate={handleCreateConversation}
       />
@@ -654,7 +572,6 @@ export function NewChatDialog({
   defaultRelayUrls,
   groupRelayTargets,
   localGroupRelayDisplay,
-  progress,
   error,
   onCreate
 }: {
@@ -665,7 +582,6 @@ export function NewChatDialog({
   defaultRelayUrls: string[]
   groupRelayTargets: GroupRelayTarget[]
   localGroupRelayDisplay: Record<string, RelayDisplayMeta>
-  progress: CreateConversationProgressState | null
   error: string | null
   onCreate: (payload: CreateChatModalPayload) => Promise<void>
 }) {
@@ -677,16 +593,21 @@ export function NewChatDialog({
   const [imageFile, setImageFile] = useState<File | null>(null)
   const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null)
   const [selectedRelayUrls, setSelectedRelayUrls] = useState<string[]>(defaultRelayUrls)
-  const [relayMode, setRelayMode] = useState<RelayPublishMode>('withFallback')
   const wasOpenRef = useRef(false)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const { profiles: inviteProfiles, isFetching: isSearchingInvites } = useSearchProfiles(
     inviteSearch,
     8
   )
   const inviteCandidateProfiles = useMemo(
-    () => inviteProfiles.filter((profile) => profile.pubkey && profile.pubkey !== myPubkey),
+    () =>
+      inviteProfiles.filter(
+        (profile) => profile.pubkey && normalizePubkey(profile.pubkey) !== normalizePubkey(myPubkey || '')
+      ),
     [inviteProfiles, myPubkey]
   )
+  const normalizedInviteSearch = inviteSearch.trim()
+  const showInviteResults = Boolean(normalizedInviteSearch)
 
   useEffect(() => {
     if (open && !wasOpenRef.current) {
@@ -709,9 +630,16 @@ export function NewChatDialog({
     setInviteSearch('')
     setSelectedInvitees([])
     setImageFile(null)
-    setImagePreviewUrl(null)
+    setImagePreviewUrl((previous) => {
+      if (previous) {
+        URL.revokeObjectURL(previous)
+      }
+      return null
+    })
     setSelectedRelayUrls(defaultRelayUrls)
-    setRelayMode('withFallback')
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
   }
 
   useEffect(() => {
@@ -729,13 +657,43 @@ export function NewChatDialog({
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0] || null
     setImageFile(file)
-    setImagePreviewUrl(file ? URL.createObjectURL(file) : null)
+    setImagePreviewUrl((previous) => {
+      if (previous) {
+        URL.revokeObjectURL(previous)
+      }
+      return file ? URL.createObjectURL(file) : null
+    })
   }
 
-  const handleInviteToggle = (pubkey: string) => {
-    setSelectedInvitees((prev) =>
-      prev.includes(pubkey) ? prev.filter((existing) => existing !== pubkey) : [...prev, pubkey]
+  const handleInviteAdd = (pubkey: string) => {
+    setSelectedInvitees((previous) =>
+      previous.includes(pubkey) ? previous : [...previous, pubkey]
     )
+  }
+
+  const handleInviteRemove = (pubkey: string) => {
+    setSelectedInvitees((previous) => previous.filter((existing) => existing !== pubkey))
+  }
+
+  const openFilePicker = () => {
+    if (busy) return
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+      fileInputRef.current.click()
+    }
+  }
+
+  const clearSelectedImage = () => {
+    setImageFile(null)
+    setImagePreviewUrl((previous) => {
+      if (previous) {
+        URL.revokeObjectURL(previous)
+      }
+      return null
+    })
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
   }
 
   const handleCreate = async () => {
@@ -749,151 +707,263 @@ export function NewChatDialog({
       description,
       members: selectedInvitees,
       imageFile,
-      relayUrls: selectedRelayUrls,
-      relayMode
+      relayUrls: selectedRelayUrls
     })
   }
 
   const hasThumbnailPreview = Boolean(imagePreviewUrl)
-  const progressTitle = getCreateConversationProgressTitle(progress?.phase)
-  const progressDetail = getCreateConversationProgressLabel(progress)
-  const progressValue = getCreateConversationProgressValue(progress)
-  const showProgressSection = Boolean(progress || error)
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
-        className="sm:max-w-xl max-h-[90vh] overflow-hidden flex flex-col"
+        className="flex max-h-[90vh] w-[min(96vw,46rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl"
         withoutClose={busy}
         onEscapeKeyDown={busy ? (event) => event.preventDefault() : undefined}
         onInteractOutside={busy ? (event) => event.preventDefault() : undefined}
       >
-        <DialogHeader className="shrink-0">
+        <DialogHeader className="shrink-0 border-b px-6 py-5">
           <DialogTitle>{t('Create chat')}</DialogTitle>
           <DialogDescription>
             {t('Choose members, relays, and an optional thumbnail for the new chat.')}
           </DialogDescription>
         </DialogHeader>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-1 pr-2">
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
           <div
             className={cn(
-              'flex flex-col gap-3 pb-1',
+              'flex flex-col gap-5',
               busy && 'pointer-events-none opacity-60'
             )}
           >
-            <Input
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              placeholder={t('Title') as string}
-              className="focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-              disabled={busy}
-            />
-            <Textarea
-              value={description}
-              onChange={(event) => setDescription(event.target.value)}
-              placeholder={t('Description (optional)') as string}
-              className="min-h-[72px] focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-              disabled={busy}
-            />
-
-            <div className="space-y-2">
-              <div className="text-sm font-medium">{t('Invite members')}</div>
-              <div className="relative px-0.5">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                <Input
-                  value={inviteSearch}
-                  onChange={(event) => setInviteSearch(event.target.value)}
-                  placeholder={t('Search users...') as string}
-                  className="pl-9"
-                  disabled={busy}
-                />
+            <section className="space-y-4 rounded-2xl border border-border/70 bg-card/60 p-4">
+              <div className="space-y-1">
+                <div className="text-sm font-semibold">{t('Basics')}</div>
+                <p className="text-sm text-muted-foreground">
+                  {t('Add a name, optional description, and optional thumbnail.')}
+                </p>
               </div>
-              <div
-                className={`${hasThumbnailPreview ? 'h-44' : 'h-56'} overflow-y-auto overflow-x-hidden space-y-2 pr-1 rounded border py-2`}
-              >
-                <div className="min-h-5 px-2 text-sm text-muted-foreground">
-                  {inviteSearch && isSearchingInvites ? t('Searching...') : null}
-                  {inviteSearch && !isSearchingInvites && inviteCandidateProfiles.length === 0
-                    ? t('No users found')
-                    : null}
-                </div>
-                {inviteCandidateProfiles.map((profile) => {
-                  const isSelected = selectedInvitees.includes(profile.pubkey)
-                  return (
-                    <div
-                      key={profile.pubkey}
-                      className="flex w-full min-w-0 items-center gap-2 rounded px-2 py-1 transition-colors hover:bg-accent"
-                    >
-                      <UserAvatar userId={profile.pubkey} className="shrink-0" />
-                      <div className="min-w-0 flex-1 overflow-hidden">
-                        <Username
-                          userId={profile.pubkey}
-                          className="block w-full min-w-0 truncate font-semibold"
-                        />
-                        <Nip05 pubkey={profile.pubkey} className="w-full min-w-0" />
-                      </div>
-                      <Button
-                        variant={isSelected ? 'secondary' : 'outline'}
-                        size="sm"
-                        onClick={() => handleInviteToggle(profile.pubkey)}
-                        className="h-8 w-20 shrink-0 px-2"
-                        disabled={busy}
-                      >
-                        {isSelected ? (
-                          <>
-                            <Check className="w-3 h-3 mr-1" />
-                            {t('Added')}
-                          </>
-                        ) : (
-                          <>
-                            <UserPlus className="w-3 h-3 mr-1" />
-                            {t('Add')}
-                          </>
-                        )}
-                      </Button>
-                    </div>
-                  )
-                })}
-              </div>
-              {selectedInvitees.length > 0 ? (
-                <div className="flex max-h-24 flex-wrap gap-2 overflow-y-auto pr-1">
-                  {selectedInvitees.map((pubkey) => (
-                    <Button
-                      key={pubkey}
-                      variant="secondary"
-                      size="sm"
-                      className="flex max-w-full items-center gap-2"
-                      onClick={() => handleInviteToggle(pubkey)}
-                      disabled={busy}
-                    >
-                      <UserAvatar userId={pubkey} size="xSmall" />
-                      <Username userId={pubkey} className="truncate max-w-[8rem] min-w-0" />
-                      <span className="text-xs text-muted-foreground">{t('Remove')}</span>
-                    </Button>
-                  ))}
-                </div>
-              ) : null}
-            </div>
 
-            <div className="space-y-1">
-              <div className="text-sm font-medium">{t('Chat thumbnail (optional)')}</div>
-              <Input type="file" accept="image/*" onChange={handleFileChange} disabled={busy} />
-              {imagePreviewUrl ? (
-                <div className="flex items-center gap-2 rounded-md border p-2">
-                  <img
-                    src={imagePreviewUrl}
-                    alt={imageFile?.name || 'Chat thumbnail'}
-                    className="h-10 w-10 rounded object-cover"
+              <div className="space-y-2">
+                <Label htmlFor="create-chat-title">{t('Chat title')}</Label>
+                <div className="relative z-0 rounded-xl border border-input bg-background shadow-sm transition-[border-color,box-shadow] focus-within:z-10 focus-within:border-ring/70 focus-within:ring-4 focus-within:ring-ring/10">
+                  <Input
+                    id="create-chat-title"
+                    value={title}
+                    onChange={(event) => setTitle(event.target.value)}
+                    placeholder={t('Give this chat a name') as string}
+                    className="h-11 rounded-xl border-0 bg-transparent px-4 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
+                    disabled={busy}
                   />
-                  <div className="text-xs text-muted-foreground truncate">
-                    {t('Selected image')}: {imageFile?.name}
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="create-chat-description">{t('Description')}</Label>
+                <div className="relative z-0 rounded-xl border border-input bg-background shadow-sm transition-[border-color,box-shadow] focus-within:z-10 focus-within:border-ring/70 focus-within:ring-4 focus-within:ring-ring/10">
+                  <Textarea
+                    id="create-chat-description"
+                    value={description}
+                    onChange={(event) => setDescription(event.target.value)}
+                    placeholder={t('Add context for members joining this chat (optional)') as string}
+                    className="min-h-[96px] resize-y rounded-xl border-0 bg-transparent px-4 py-3 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
+                    disabled={busy}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                <div className="space-y-1">
+                  <Label>{t('Chat thumbnail (optional)')}</Label>
+                  <p className="text-sm text-muted-foreground">
+                    {t('Choose an image to help people recognize this chat.')}
+                  </p>
+                </div>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={handleFileChange}
+                  disabled={busy}
+                  className="sr-only"
+                />
+                {!hasThumbnailPreview ? (
+                  <button
+                    type="button"
+                    onClick={openFilePicker}
+                    disabled={busy}
+                    className="flex w-full items-center gap-4 rounded-xl border border-dashed border-border/80 bg-muted/10 px-4 py-4 text-left transition-colors hover:border-ring/40 hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground">
+                      <Upload className="h-5 w-5" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-medium">{t('Upload a chat thumbnail')}</div>
+                      <div className="text-sm text-muted-foreground">
+                        {t('PNG, JPG, or GIF')}
+                      </div>
+                    </div>
+                  </button>
+                ) : (
+                  <div className="rounded-xl border border-border/70 bg-background p-3">
+                    <div className="flex min-w-0 items-center gap-3">
+                      <img
+                        src={imagePreviewUrl || undefined}
+                        alt={imageFile?.name || 'Chat thumbnail'}
+                        className="h-14 w-14 shrink-0 rounded-lg object-cover"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-medium">{imageFile?.name}</div>
+                        <div className="text-xs text-muted-foreground">
+                          {t('Selected image')}
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <Button variant="outline" size="sm" onClick={openFilePicker} disabled={busy}>
+                          {t('Replace')}
+                        </Button>
+                        <Button variant="ghost" size="sm" onClick={clearSelectedImage} disabled={busy}>
+                          {t('Remove')}
+                        </Button>
+                      </div>
+                    </div>
                   </div>
+                )}
+              </div>
+            </section>
+
+            <section className="space-y-4 rounded-2xl border border-border/70 bg-card/60 p-4">
+              <div className="space-y-1">
+                <div className="text-sm font-semibold">{t('Members')}</div>
+                <p className="text-sm text-muted-foreground">
+                  {t('Search for people to invite, then review the final member list below.')}
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="create-chat-invite-search">{t('Invite members')}</Label>
+                <div className="relative z-0 rounded-xl border border-input bg-background shadow-sm transition-[border-color,box-shadow] focus-within:z-10 focus-within:border-ring/70 focus-within:ring-4 focus-within:ring-ring/10">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    id="create-chat-invite-search"
+                    value={inviteSearch}
+                    onChange={(event) => setInviteSearch(event.target.value)}
+                    placeholder={t('Search users...') as string}
+                    className="h-11 rounded-xl border-0 bg-transparent pl-10 pr-4 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
+                    disabled={busy}
+                  />
+                </div>
+              </div>
+
+              {showInviteResults ? (
+                <div className="space-y-2">
+                  <div className="text-sm font-medium">{t('Search results')}</div>
+                  <Card className="overflow-hidden">
+                    <ScrollArea className="max-h-60">
+                      <CardContent className="space-y-2 p-3">
+                        {isSearchingInvites ? (
+                          <div className="py-3 text-sm text-muted-foreground">
+                            {t('Searching...')}
+                          </div>
+                        ) : null}
+                        {!isSearchingInvites && inviteCandidateProfiles.length === 0 ? (
+                          <div className="py-3 text-sm text-muted-foreground">
+                            {t('No users found')}
+                          </div>
+                        ) : null}
+                        {!isSearchingInvites &&
+                          inviteCandidateProfiles.map((profile) => {
+                            const normalizedPubkey = normalizePubkey(profile.pubkey || '')
+                            if (!normalizedPubkey) return null
+                            const isSelected = selectedInvitees.includes(normalizedPubkey)
+                            return (
+                              <div
+                                key={normalizedPubkey}
+                                className="flex min-w-0 items-center gap-3 rounded-lg px-2 py-2 transition-colors hover:bg-accent/40"
+                              >
+                                <UserAvatar userId={normalizedPubkey} className="shrink-0" />
+                                <div className="min-w-0 flex-1">
+                                  <Username
+                                    userId={normalizedPubkey}
+                                    className="block truncate font-semibold"
+                                  />
+                                  <Nip05 pubkey={normalizedPubkey} className="w-full min-w-0" />
+                                </div>
+                                <Button
+                                  variant={isSelected ? 'secondary' : 'outline'}
+                                  size="sm"
+                                  onClick={() => handleInviteAdd(normalizedPubkey)}
+                                  className="h-8 w-20 shrink-0 px-2"
+                                  disabled={busy || isSelected}
+                                >
+                                  {isSelected ? (
+                                    <>
+                                      <Check className="mr-1 h-3 w-3" />
+                                      {t('Added')}
+                                    </>
+                                  ) : (
+                                    <>
+                                      <UserPlus className="mr-1 h-3 w-3" />
+                                      {t('Add')}
+                                    </>
+                                  )}
+                                </Button>
+                              </div>
+                            )
+                          })}
+                      </CardContent>
+                    </ScrollArea>
+                  </Card>
+                </div>
+              ) : (
+                <div className="rounded-xl border border-dashed border-border/70 bg-muted/10 px-3 py-2 text-sm text-muted-foreground">
+                  {t('Search for users to invite')}
+                </div>
+              )}
+
+              {selectedInvitees.length > 0 ? (
+                <div className="space-y-2">
+                  <div className="text-sm font-medium">
+                    {t('Selected members')} ({selectedInvitees.length})
+                  </div>
+                  <Card className="overflow-hidden">
+                    <ScrollArea className="max-h-56">
+                      <CardContent className="space-y-2 p-3">
+                        {selectedInvitees.map((pubkey) => (
+                          <div
+                            key={pubkey}
+                            className="flex min-w-0 items-center gap-3 rounded-lg px-2 py-2 transition-colors hover:bg-accent/30"
+                          >
+                            <UserAvatar userId={pubkey} className="shrink-0" />
+                            <div className="min-w-0 flex-1">
+                              <Username userId={pubkey} className="block truncate font-semibold" />
+                              <Nip05 pubkey={pubkey} className="w-full min-w-0" />
+                            </div>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="shrink-0"
+                              onClick={() => handleInviteRemove(pubkey)}
+                              disabled={busy}
+                            >
+                              {t('Remove')}
+                            </Button>
+                          </div>
+                        ))}
+                      </CardContent>
+                    </ScrollArea>
+                  </Card>
                 </div>
               ) : null}
-            </div>
+            </section>
 
-            <div className="space-y-2 rounded-md border p-3">
+            <section className="space-y-4 rounded-2xl border border-border/70 bg-card/60 p-4">
+              <div className="space-y-1">
+                <div className="text-sm font-semibold">{t('Relays')}</div>
+                <p className="text-sm text-muted-foreground">
+                  {t('Choose the relays this chat should publish to.')}
+                </p>
+              </div>
+
               <PostRelaySelector
                 allowWriteRelays={false}
                 extraRelayUrls={[
@@ -904,35 +974,12 @@ export function NewChatDialog({
                 valueRelayUrls={selectedRelayUrls}
                 onValueRelayUrlsChange={setSelectedRelayUrls}
               />
-              <div className="flex items-center justify-between rounded-md border px-3 py-2">
-                <div>
-                  <div className="text-sm font-medium">{t('Discovery relay fallback')}</div>
-                  <div className="text-xs text-muted-foreground">
-                    {t('Also publish chat events to discovery relays')}
-                  </div>
-                </div>
-                <Switch
-                  checked={relayMode === 'withFallback'}
-                  onCheckedChange={(checked) => setRelayMode(checked ? 'withFallback' : 'strict')}
-                  disabled={busy}
-                />
-              </div>
-            </div>
+            </section>
           </div>
         </div>
 
-        <div className="shrink-0 space-y-3 border-t pt-3">
-          {showProgressSection ? (
-            <div className="space-y-2 rounded-md border border-border/60 bg-muted/30 p-3">
-              <WorkflowProgress
-                title={progressTitle}
-                detail={progressDetail}
-                value={progressValue}
-              />
-              {error ? <div className="text-sm text-red-500">{error}</div> : null}
-            </div>
-          ) : null}
-
+        <div className="shrink-0 border-t bg-background px-6 py-4">
+          {error ? <div className="mb-3 text-sm text-red-500">{error}</div> : null}
           <DialogFooter className="flex justify-end gap-2">
             <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
               {t('Cancel')}

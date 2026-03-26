@@ -141,7 +141,7 @@ vi.mock('sonner', () => ({
   }
 }))
 
-describe('ChatListPage progress UX', () => {
+describe('ChatListPage chat UX', () => {
   beforeEach(() => {
     messengerState.invites = []
     messengerState.conversations = []
@@ -160,52 +160,30 @@ describe('ChatListPage progress UX', () => {
     globalThis.URL.revokeObjectURL = vi.fn()
   })
 
-  it('locks the create-chat modal during the provider create phase and avoids extra page refreshes', async () => {
-    let resolveCreate: (() => void) | null = null
+  it('locks the create-chat modal during the provider create phase without rendering a progress bar', async () => {
     createConversationMock.mockImplementation(
-      async (
-        _payload: unknown,
-        options?: { onProgress?: (state: { phase: string; error?: string }) => void }
-      ) => {
-        options?.onProgress?.({ phase: 'creatingConversation' })
-        await new Promise<void>((resolve) => {
-          resolveCreate = resolve
+      async (_payload: unknown) =>
+        await new Promise(() => {
+          // keep the create request pending so the modal remains in its busy state
         })
-        return {
-          conversation: {
-            id: 'conv-1',
-            protocol: 'marmot',
-            participants: [ME_PUBKEY, FRIEND_PUBKEY],
-            adminPubkeys: [],
-            canInviteMembers: true,
-            title: 'Chat',
-            description: null,
-            imageUrl: null,
-            unreadCount: 0,
-            lastMessageAt: 0,
-            lastReadAt: 0
-          },
-          operationId: 'op-1'
-        }
-      }
     )
 
     render(<ChatListPage />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    fireEvent.change(screen.getByPlaceholderText('Search users...'), {
+      target: { value: 'friend' }
+    })
     fireEvent.click(await screen.findByRole('button', { name: 'Add' }))
+    await screen.findByText('Selected members (1)')
     fireEvent.click(screen.getByRole('button', { name: 'Create chat' }))
 
-    expect(await screen.findByRole('status')).toBeInTheDocument()
-    expect(screen.getAllByText('Creating chat…')).toHaveLength(2)
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    expect(screen.queryByText('Creating chat…')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Creating...' })).toBeDisabled()
     expect(screen.queryByRole('button', { name: 'Close' })).not.toBeInTheDocument()
 
-    resolveCreate?.()
-
-    await waitFor(() => {
-      expect(pushMock).toHaveBeenCalledWith('/conversations/conv-1')
-    })
     expect(refreshConversationsMock).not.toHaveBeenCalled()
     expect(refreshInvitesMock).not.toHaveBeenCalled()
   })
@@ -231,6 +209,9 @@ describe('ChatListPage progress UX', () => {
     render(<ChatListPage />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    fireEvent.change(screen.getByPlaceholderText('Search users...'), {
+      target: { value: 'friend' }
+    })
     fireEvent.click(await screen.findByRole('button', { name: 'Add' }))
     const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement
     fireEvent.change(fileInput, {
@@ -247,20 +228,31 @@ describe('ChatListPage progress UX', () => {
       thumbnailFile?: File | null
     }
     expect(payload.thumbnailFile).toBeInstanceOf(File)
-    expect(screen.queryByText('Uploading thumbnail… 25%')).not.toBeInTheDocument()
+    expect(screen.queryByText('Upload a chat thumbnail')).not.toBeInTheDocument()
   })
 
-  it('renders the create-chat dialog with a scrollable body and fixed bottom stack', async () => {
+  it('renders the create-chat dialog with sectioned layout, conditional member results, and no fallback toggle', async () => {
     render(<ChatListPage />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Create' }))
 
-    expect(document.querySelector('[role=\"dialog\"].overflow-hidden')).toBeTruthy()
-    expect(document.querySelector('[role=\"dialog\"] .min-h-0.flex-1.overflow-y-auto')).toBeTruthy()
-    expect(document.querySelector('[role=\"dialog\"] .shrink-0.space-y-3.border-t.pt-3')).toBeTruthy()
+    expect(document.querySelector('[role=\"dialog\"].flex.flex-col.overflow-hidden')).toBeTruthy()
+    expect(document.querySelector('[role=\"dialog\"] .min-h-0.flex-1.overflow-y-auto.px-6.py-5')).toBeTruthy()
+    expect(document.querySelector('[role=\"dialog\"] .shrink-0.border-t.bg-background.px-6.py-4')).toBeTruthy()
+    expect(screen.getByText('Upload a chat thumbnail')).toBeInTheDocument()
+    expect(screen.queryByText('Discovery relay fallback')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Add' })).not.toBeInTheDocument()
+
+    fireEvent.change(screen.getByPlaceholderText('Search users...'), {
+      target: { value: 'friend' }
+    })
+
+    expect(await screen.findByText('Search results')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+    expect(screen.getByText('Selected members (1)')).toBeInTheDocument()
   })
 
-  it('shows inline join progress in the active invite row and avoids extra page refreshes', async () => {
+  it('shows button-level join busy state in the active invite row and avoids extra page refreshes', async () => {
     messengerState.invites = [
       {
         id: 'invite-1',
@@ -285,24 +277,19 @@ describe('ChatListPage progress UX', () => {
     ]
 
     let resolveJoin: (() => void) | null = null
-    acceptInviteMock.mockImplementation(
-      async (
-        _inviteId: string,
-        options?: { onProgress?: (state: { phase: string; error?: string }) => void }
-      ) => {
-        options?.onProgress?.({ phase: 'joiningConversation' })
+    acceptInviteMock.mockImplementation(async (_inviteId: string) => {
         await new Promise<void>((resolve) => {
           resolveJoin = resolve
         })
         return { conversationId: 'conv-join-1' }
-      }
-    )
+      })
 
     render(<ChatListPage initialTab="invites" />)
 
     fireEvent.click(screen.getAllByRole('button', { name: 'Join' })[0])
 
-    expect(await screen.findByText('Accepting invite…')).toBeInTheDocument()
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    expect(screen.queryByText('Accepting invite…')).not.toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: 'Dismiss' })[0]).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Joining...' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Join' })).toBeDisabled()
@@ -342,15 +329,9 @@ describe('ChatListPage progress UX', () => {
       }
     ]
 
-    acceptInviteMock.mockImplementation(
-      async (
-        _inviteId: string,
-        options?: { onProgress?: (state: { phase: string; error?: string }) => void }
-      ) => {
-        options?.onProgress?.({ phase: 'joiningConversation' })
-        throw new Error('join failed')
-      }
-    )
+    acceptInviteMock.mockImplementation(async (_inviteId: string) => {
+      throw new Error('join failed')
+    })
 
     render(<ChatListPage initialTab="invites" />)
 

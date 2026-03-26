@@ -2130,33 +2130,19 @@ export class MarmotService {
     description,
     members,
     imageUrl,
-    relayUrls,
-    relayMode
+    relayUrls
   } = {}) {
     const normalizedTitle = sanitizeString(title || 'Chat', 256) || 'Chat'
     const normalizedDescription = sanitizeString(description, 1024) || ''
     const normalizedImageUrl = sanitizeString(imageUrl, 2048) || null
-    const normalizedRelayMode = relayMode === 'strict' ? 'strict' : 'withFallback'
     const selectedRelays = uniqueRelays(relayUrls || [], { includeDefaults: false })
     const defaultRelays = uniqueRelays(this.relays || [], { includeDefaults: true })
-    let effectiveRelays = defaultRelays
-
-    if (normalizedRelayMode === 'strict') {
-      effectiveRelays = selectedRelays.length ? selectedRelays : defaultRelays
-    } else if (selectedRelays.length) {
-      effectiveRelays = uniqueRelays([...selectedRelays, ...defaultRelays], {
-        includeDefaults: false
-      })
-      if (!effectiveRelays.length) {
-        effectiveRelays = defaultRelays
-      }
-    }
+    const effectiveRelays = selectedRelays.length ? selectedRelays : defaultRelays
 
     return {
       normalizedTitle,
       normalizedDescription,
       normalizedImageUrl,
-      normalizedRelayMode,
       selectedRelays,
       defaultRelays,
       effectiveRelays,
@@ -2187,14 +2173,12 @@ export class MarmotService {
     description,
     members,
     imageUrl,
-    relayUrls,
-    relayMode
+    relayUrls
   } = {}) {
     const {
       normalizedTitle,
       normalizedDescription,
       normalizedImageUrl,
-      normalizedRelayMode,
       selectedRelays,
       effectiveRelays
     } = this.resolveConversationCreateRequest({
@@ -2202,15 +2186,13 @@ export class MarmotService {
       description,
       members,
       imageUrl,
-      relayUrls,
-      relayMode
+      relayUrls
     })
 
     this.logger.info?.('[MarmotService] createConversation start', {
       titleLength: normalizedTitle.length,
       descriptionLength: normalizedDescription.length,
       requestedMembers: ensureArray(members).length,
-      relayMode: normalizedRelayMode,
       requestedRelayCount: selectedRelays.length,
       effectiveRelayCount: effectiveRelays.length,
       relayCount: this.relays.length,
@@ -2318,16 +2300,14 @@ export class MarmotService {
     description,
     members,
     imageUrl,
-    relayUrls,
-    relayMode
+    relayUrls
   } = {}) {
     const shell = await this.createConversationShell({
       title,
       description,
       members,
       imageUrl,
-      relayUrls,
-      relayMode
+      relayUrls
     })
 
     return await this.finalizeCreatedConversation({
@@ -2741,8 +2721,7 @@ export class MarmotService {
           description: payload.description,
           members: payload.members || payload.memberPubkeys || [],
           imageUrl: payload.imageUrl || null,
-          relayUrls: payload.relayUrls || payload.relays || [],
-          relayMode: payload.relayMode
+          relayUrls: payload.relayUrls || payload.relays || []
         })
         return result
       }

@@ -22,10 +22,6 @@ import type {
   ThreadMessage,
   UpdateConversationMetadataInput
 } from '@/lib/conversations/types'
-import type {
-  CreateConversationProgressState,
-  JoinConversationProgressState
-} from '@/lib/workflow-progress-ui'
 import mediaUploadService, { type MediaUploadResult } from '@/services/media-upload.service'
 import { toast } from 'sonner'
 
@@ -92,19 +88,11 @@ type MessengerContextType = {
   initialSyncPending: boolean
   unsupportedReason?: string
   createConversation: (
-    input: CreateConversationInput,
-    options?: {
-      onProgress?: (state: CreateConversationProgressState) => void
-    }
+    input: CreateConversationInput
   ) => Promise<CreateConversationAckResult>
   inviteMembers: (conversationId: string, members: string[]) => Promise<void>
   grantConversationAdmin: (conversationId: string, targetPubkey: string) => Promise<void>
-  acceptInvite: (
-    inviteId: string,
-    options?: {
-      onProgress?: (state: JoinConversationProgressState) => void
-    }
-  ) => Promise<{ conversationId: string | null }>
+  acceptInvite: (inviteId: string) => Promise<{ conversationId: string | null }>
   refreshConversations: (query?: ConversationQuery) => Promise<ConversationSummary[]>
   refreshInvites: (query?: ConversationQuery) => Promise<ConversationInvite[]>
   updateConversationMetadata: (input: UpdateConversationMetadataInput) => Promise<void>
@@ -1076,18 +1064,8 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     }
   }
 
-  const createConversation = async (
-    input: CreateConversationInput,
-    options?: {
-      onProgress?: (state: CreateConversationProgressState) => void
-    }
-  ) => {
-    const reportProgress = (state: CreateConversationProgressState) => {
-      options?.onProgress?.(state)
-    }
-
+  const createConversation = async (input: CreateConversationInput) => {
     try {
-      reportProgress({ phase: 'creatingConversation' })
       const data = await sendToWorkerAwait({
         type: 'marmot-create-conversation',
         data: {
@@ -1099,8 +1077,7 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
             ? input.relayUrls
                 .map((relay) => normalizeRelayUrl(relay))
                 .filter((relay): relay is string => Boolean(relay))
-            : undefined,
-          relayMode: input.relayMode === 'strict' ? 'strict' : 'withFallback'
+            : undefined
         }
       })
 
@@ -1132,10 +1109,6 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
         operationId
       }
     } catch (error) {
-      reportProgress({
-        phase: 'error',
-        error: error instanceof Error ? error.message : String(error)
-      })
       throw error
     }
   }
@@ -1187,23 +1160,13 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
     await refreshConversations()
   }
 
-  const acceptInvite = async (
-    inviteId: string,
-    options?: {
-      onProgress?: (state: JoinConversationProgressState) => void
-    }
-  ) => {
-    const reportProgress = (state: JoinConversationProgressState) => {
-      options?.onProgress?.(state)
-    }
-
+  const acceptInvite = async (inviteId: string) => {
     const operationId = generateWorkerRequestId('marmot-accept-invite')
     const joinPromise = new Promise<{ conversationId: string | null }>((resolve, reject) => {
       joinConversationWaitersRef.current.set(operationId, { resolve, reject })
     })
 
     try {
-      reportProgress({ phase: 'joiningConversation' })
       const data = await sendToWorkerAwait({
         type: 'marmot-accept-invite',
         requestId: operationId,
@@ -1225,10 +1188,6 @@ export function MessengerProvider({ children }: { children: React.ReactNode }) {
       return await joinPromise
     } catch (error) {
       joinConversationWaitersRef.current.delete(operationId)
-      reportProgress({
-        phase: 'error',
-        error: error instanceof Error ? error.message : String(error)
-      })
       throw error
     }
   }
