@@ -10,7 +10,7 @@ export function useFetchHtmlAnalysis(url: string) {
     setIsLoading(true)
     let cancelled = false
     webService
-      .fetchHtmlAnalysis(url)
+      .fetchHtmlAnalysis(url, { suppressErrors: true })
       .then((nextAnalysis) => {
         if (cancelled) return
         setAnalysis(nextAnalysis)

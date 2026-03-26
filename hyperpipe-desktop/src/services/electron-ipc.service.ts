@@ -289,7 +289,7 @@ type ElectronAPI = {
   openHtmlViewerWindow: (url: string, title?: string) => Promise<WorkerCommandResult>
   openHtmlSourceViewer: (payload: {
     title?: string
-    source: string
+    source?: string
     url?: string
   }) => Promise<WorkerCommandResult>
 
@@ -427,7 +427,7 @@ export const electronIpc = {
   openHtmlViewerWindow(url: string, title?: string) {
     return api()?.openHtmlViewerWindow(url, title) ?? unavailable()
   },
-  openHtmlSourceViewer(payload: { title?: string; source: string; url?: string }) {
+  openHtmlSourceViewer(payload: { title?: string; source?: string; url?: string }) {
     return api()?.openHtmlSourceViewer(payload) ?? unavailable()
   },
   listPlugins() {

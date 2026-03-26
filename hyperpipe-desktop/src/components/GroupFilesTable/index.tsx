@@ -3,6 +3,7 @@ import Username from '@/components/Username'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
+  resolveGroupFileAccessUrl,
   formatGroupFileMime,
   formatGroupFileSize,
   GroupFileRecord,
@@ -299,6 +300,12 @@ export default function GroupFilesTable({
         {sortedRecords.map((record) => {
           const isExpanded = expandedEventId === record.eventId
           const isDownloading = downloadingEventId === record.eventId
+          const resolvedUrl =
+            resolveGroupFileAccessUrl({
+              url: record.url,
+              groupId: record.groupId,
+              relayUrl: record.groupRelay
+            }) || record.url
           const isHtmlRecord = isGroupFileHtml(record)
           const uploadedDate = formatUploadedDate(record.uploadedAt)
           const sizeLabel = formatGroupFileSize(record.size)
@@ -351,12 +358,12 @@ export default function GroupFilesTable({
                 <div className="border-t bg-muted/10 px-3 py-3">
                   <div className="mb-2 flex flex-wrap items-center gap-2">
                     {!isHtmlRecord && (
-                      <Button type="button" size="sm" variant="outline" onClick={() => openExternalUrl(record.url)}>
+                      <Button type="button" size="sm" variant="outline" onClick={() => openExternalUrl(resolvedUrl)}>
                         <Link2 className="mr-1.5 h-3.5 w-3.5" />
                         Open
                       </Button>
                     )}
-                    <Button type="button" size="sm" variant="outline" onClick={() => copyUrl(record.url)}>
+                    <Button type="button" size="sm" variant="outline" onClick={() => copyUrl(resolvedUrl)}>
                       <Copy className="mr-1.5 h-3.5 w-3.5" />
                       Copy URL
                     </Button>
@@ -377,7 +384,11 @@ export default function GroupFilesTable({
                       </Button>
                     )}
                   </div>
-                  <FileMetadataNote event={record.event} className="mt-0 border-0 bg-transparent p-0" />
+                  <FileMetadataNote
+                    event={record.event}
+                    resolvedUrl={resolvedUrl}
+                    className="mt-0 border-0 bg-transparent p-0"
+                  />
                 </div>
               )}
             </div>

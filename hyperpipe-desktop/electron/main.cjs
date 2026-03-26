@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, session } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, net, session } = require('electron');
 const path = require('path');
 const { promises: fs, existsSync } = require('fs');
 const { spawn, execFile } = require('child_process');
@@ -671,8 +671,31 @@ async function openHtmlViewerWindow({ url, title, parentWindow } = {}) {
 }
 
 async function openHtmlSourceViewer({ title, source, url } = {}) {
-  if (typeof source !== 'string') {
-    return { success: false, error: 'HTML source is required' };
+  let resolvedSource = typeof source === 'string' ? source : '';
+  const sourceUrl = typeof url === 'string' ? url : '';
+
+  if (!resolvedSource) {
+    if (!isAllowedHtmlViewerUrl(sourceUrl)) {
+      return { success: false, error: 'Blocked unsupported HTML source URL' };
+    }
+
+    try {
+      const response = await net.fetch(sourceUrl);
+      const finalUrl = typeof response.url === 'string' ? response.url : sourceUrl;
+      if (!isAllowedHtmlViewerUrl(finalUrl)) {
+        return { success: false, error: 'Blocked unsupported redirected HTML source URL' };
+      }
+      if (!response.ok) {
+        return {
+          success: false,
+          error: `Failed to fetch HTML source (${response.status})`
+        };
+      }
+      resolvedSource = await response.text();
+    } catch (error) {
+      console.error('[Main] Failed to fetch HTML source', error);
+      return { success: false, error: error?.message || String(error) };
+    }
   }
 
   const viewerWindow = new BrowserWindow(buildHtmlSourceViewerWindowOptions());
@@ -690,8 +713,8 @@ async function openHtmlSourceViewer({ title, source, url } = {}) {
 
   const html = buildHtmlSourceViewerDocument({
     title: title || 'HTML Source',
-    url: typeof url === 'string' ? url : '',
-    source
+    url: sourceUrl,
+    source: resolvedSource
   });
   const dataUrl = `data:text/html;base64,${Buffer.from(html, 'utf8').toString('base64')}`;
 

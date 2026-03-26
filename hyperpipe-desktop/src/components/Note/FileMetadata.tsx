@@ -1,9 +1,11 @@
 import HtmlFilePreviewCard from '@/components/HtmlFilePreviewCard'
 import {
   isGroupFileHtml,
-  parseGroupFileRecordFromEvent
+  parseGroupFileRecordFromEvent,
+  resolveGroupFileAccessUrl
 } from '@/lib/group-files'
 import { cn } from '@/lib/utils'
+import { useGroups } from '@/providers/GroupsProvider'
 import { Event } from '@nostr/tools/wasm'
 
 function readTag(event: Event, name: string) {
@@ -19,14 +21,31 @@ function formatSize(size: string | undefined) {
   return `${(num / (1024 * 1024)).toFixed(2)} MB`
 }
 
-export default function FileMetadataNote({ event, className }: { event: Event; className?: string }) {
-  const url = readTag(event, 'url')
+export default function FileMetadataNote({
+  event,
+  className,
+  resolvedUrl
+}: {
+  event: Event
+  className?: string
+  resolvedUrl?: string
+}) {
+  const { resolveRelayUrl } = useGroups()
+  const rawUrl = readTag(event, 'url')
   const mimeType = (readTag(event, 'm') || '').toLowerCase()
   const size = formatSize(readTag(event, 'size'))
   const dim = readTag(event, 'dim')
   const alt = readTag(event, 'alt')
   const summary = readTag(event, 'summary')
   const record = parseGroupFileRecordFromEvent(event)
+  const url =
+    resolvedUrl ||
+    resolveGroupFileAccessUrl({
+      url: rawUrl,
+      groupId: record?.groupId || null,
+      relayUrl: record?.groupRelay || resolveRelayUrl(record?.groupId || undefined) || null
+    }) ||
+    rawUrl
   const fileName = record?.fileName || alt || event.content || 'Shared file'
   const isHtml = !!url && isGroupFileHtml({
     fileName,
@@ -72,7 +91,7 @@ export default function FileMetadataNote({ event, className }: { event: Event; c
           {url}
         </a>
       ) : null}
-      {!url ? (
+      {!rawUrl ? (
         <div className="text-sm text-muted-foreground">Missing file URL</div>
       ) : null}
     </div>

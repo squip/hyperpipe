@@ -1,7 +1,9 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { vi } from 'vitest'
 
 const useFetchHtmlAnalysisMock = vi.fn()
+const openHtmlSourceViewerMock = vi.fn(async () => ({ success: true }))
+let isElectronMock = false
 
 vi.mock('@/hooks/useFetchHtmlAnalysis', () => ({
   useFetchHtmlAnalysis: (...args: unknown[]) => useFetchHtmlAnalysisMock(...args)
@@ -9,8 +11,15 @@ vi.mock('@/hooks/useFetchHtmlAnalysis', () => ({
 
 vi.mock('@/services/electron-ipc.service', () => ({
   electronIpc: {
-    isElectron: () => false
+    isElectron: () => isElectronMock,
+    openHtmlSourceViewer: (...args: unknown[]) => openHtmlSourceViewerMock(...args)
   }
+}))
+
+vi.mock('@/providers/GroupsProvider', () => ({
+  useGroups: () => ({
+    resolveRelayUrl: (value?: string) => value
+  })
 }))
 
 import FileMetadataNote from '@/components/Note/FileMetadata'
@@ -25,6 +34,8 @@ function createFileEvent(tags: string[][]) {
 
 describe('FileMetadataNote HTML preview', () => {
   beforeEach(() => {
+    isElectronMock = false
+    openHtmlSourceViewerMock.mockClear()
     useFetchHtmlAnalysisMock.mockReset()
     useFetchHtmlAnalysisMock.mockReturnValue({
       title: null,
@@ -93,5 +104,38 @@ describe('FileMetadataNote HTML preview', () => {
 
     expect(screen.queryByRole('button', { name: /view code/i })).not.toBeInTheDocument()
     expect(screen.getByRole('img', { name: /photo\.png/i })).toBeInTheDocument()
+  })
+
+  it('delegates source loading to Electron when renderer analysis has no source body', async () => {
+    isElectronMock = true
+    useFetchHtmlAnalysisMock.mockReturnValue({
+      title: 'Demo page',
+      description: 'An HTML preview description',
+      image: null,
+      htmlSource: undefined,
+      declaredExternalOrigins: [],
+      hasMetaPreview: true,
+      isLoading: false
+    })
+
+    render(
+      <FileMetadataNote
+        event={createFileEvent([
+          ['url', 'https://gateway.hyperpipe.example/drive/group/index.html'],
+          ['m', 'text/html'],
+          ['alt', 'index.html']
+        ])}
+      />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /view code/i }))
+
+    await waitFor(() => {
+      expect(openHtmlSourceViewerMock).toHaveBeenCalledWith({
+        title: 'Demo page',
+        source: undefined,
+        url: 'https://gateway.hyperpipe.example/drive/group/index.html'
+      })
+    })
   })
 })

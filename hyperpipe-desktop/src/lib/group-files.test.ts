@@ -1,7 +1,10 @@
 import {
+  buildGroupFileDriveUrl,
   getGroupFileExtensionLabel,
   isGroupFileHtml,
+  isLoopbackGroupFileUrl,
   normalizeGroupFileExtension,
+  resolveGroupFileAccessUrl,
   resolveGroupFileExtension
 } from '@/lib/group-files'
 
@@ -75,5 +78,33 @@ describe('group file extension helpers', () => {
         mime: 'image/png'
       })
     ).toBe(false)
+  })
+
+  it('rewrites loopback drive URLs to the current relay origin when available', () => {
+    expect(isLoopbackGroupFileUrl('http://127.0.0.1:61142/drive/group/file.html')).toBe(true)
+
+    expect(
+      resolveGroupFileAccessUrl({
+        url: 'http://127.0.0.1:61142/drive/npubdemo:group-a/file.html',
+        groupId: 'npubdemo:group-a',
+        relayUrl: 'wss://gateway.hyperpipe.example/npubdemo/group-a?token=abc'
+      })
+    ).toBe('https://gateway.hyperpipe.example/drive/npubdemo:group-a/file.html')
+
+    expect(
+      resolveGroupFileAccessUrl({
+        url: 'https://gateway.hyperpipe.example/drive/npubdemo:group-a/file.html',
+        groupId: 'npubdemo:group-a',
+        relayUrl: 'ws://127.0.0.1:1945/npubdemo/group-a?token=abc'
+      })
+    ).toBe('https://gateway.hyperpipe.example/drive/npubdemo:group-a/file.html')
+
+    expect(
+      buildGroupFileDriveUrl(
+        'ws://127.0.0.1:1945/npubdemo/group-a?token=abc',
+        'npubdemo:group-a',
+        'file.html'
+      )
+    ).toBe('http://127.0.0.1:1945/drive/npubdemo:group-a/file.html')
   })
 })

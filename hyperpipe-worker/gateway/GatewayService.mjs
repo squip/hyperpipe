@@ -64,6 +64,22 @@ function guessContentType(fileName = '') {
   return 'application/octet-stream';
 }
 
+function applyDriveCorsHeaders(res, extraHeaders = {}) {
+  const headers = {
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET,HEAD,OPTIONS',
+    'access-control-allow-headers': 'Content-Type, Range',
+    'access-control-expose-headers': 'Content-Length, Content-Range, Accept-Ranges',
+    'cross-origin-resource-policy': 'cross-origin',
+    ...extraHeaders
+  };
+
+  Object.entries(headers).forEach(([key, value]) => {
+    if (value === undefined || value === null) return;
+    res.setHeader(key, value);
+  });
+}
+
 function cloneJson(value) {
   return value && typeof value === 'object'
     ? JSON.parse(JSON.stringify(value))
@@ -3388,8 +3404,10 @@ export class GatewayService extends EventEmitter {
           }
 
           if (localBuffer) {
-            res.setHeader('content-type', guessContentType(file));
-            res.setHeader('cache-control', 'public, max-age=31536000, immutable');
+            applyDriveCorsHeaders(res, {
+              'content-type': guessContentType(file),
+              'cache-control': 'public, max-age=31536000, immutable'
+            });
             res.status(200).send(Buffer.isBuffer(localBuffer) ? localBuffer : Buffer.from(localBuffer));
             return;
           }
@@ -3401,6 +3419,7 @@ export class GatewayService extends EventEmitter {
         }
 
         const stream = await requestFileFromPeer(peer, identifier, file, this.connectionPool);
+        applyDriveCorsHeaders(res);
         Object.entries(stream.headers).forEach(([key, value]) => res.setHeader(key, value));
         res.status(stream.statusCode);
         stream.pipe(res);

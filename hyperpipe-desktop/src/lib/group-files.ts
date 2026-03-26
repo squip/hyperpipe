@@ -85,6 +85,80 @@ function extractFileExtension(value?: string | null) {
   return /^[a-z0-9]{1,16}$/i.test(candidate) ? candidate : null
 }
 
+function isLoopbackHostname(hostname: string) {
+  const normalized = hostname.toLowerCase()
+  return normalized === '127.0.0.1' || normalized === 'localhost' || normalized === '::1'
+}
+
+export function isLoopbackGroupFileUrl(value?: string | null) {
+  const normalized = toOptionalString(value)
+  if (!normalized) return false
+
+  try {
+    return isLoopbackHostname(new URL(normalized).hostname)
+  } catch {
+    return /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(normalized)
+  }
+}
+
+export function toGroupFileHttpOrigin(value?: string | null): string | null {
+  const normalized = toOptionalString(value)
+  if (!normalized) return null
+
+  try {
+    const parsed = new URL(normalized)
+    if (parsed.protocol === 'ws:') parsed.protocol = 'http:'
+    if (parsed.protocol === 'wss:') parsed.protocol = 'https:'
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    return parsed.origin
+  } catch {
+    return null
+  }
+}
+
+export function extractGroupFileIdFromUrl(value?: string | null) {
+  const normalized = toOptionalString(value)
+  if (!normalized) return null
+
+  try {
+    const parsed = new URL(normalized)
+    const parts = parsed.pathname.split('/').filter(Boolean)
+    return parts.length > 0 ? decodeURIComponent(parts[parts.length - 1]) : null
+  } catch {
+    const parts = normalized.split('?')[0].split('#')[0].split('/').filter(Boolean)
+    return parts.length > 0 ? parts[parts.length - 1] : null
+  }
+}
+
+export function buildGroupFileDriveUrl(baseUrl: string, groupId: string, fileId: string) {
+  const origin = toGroupFileHttpOrigin(baseUrl)
+  const normalizedGroupId = toOptionalString(groupId)
+  const normalizedFileId = toOptionalString(fileId)
+  if (!origin || !normalizedGroupId || !normalizedFileId) return null
+  return `${origin}/drive/${normalizedGroupId}/${normalizedFileId.replace(/^\/+/, '')}`
+}
+
+export function resolveGroupFileAccessUrl(args: {
+  url?: string | null
+  groupId?: string | null
+  relayUrl?: string | null
+}) {
+  const url = toOptionalString(args.url)
+  if (!url) return null
+
+  if (!isLoopbackGroupFileUrl(url)) {
+    return url
+  }
+
+  const fileId = extractGroupFileIdFromUrl(url)
+  const nextUrl =
+    fileId && args.groupId && args.relayUrl
+      ? buildGroupFileDriveUrl(args.relayUrl, args.groupId, fileId)
+      : null
+
+  return nextUrl || url
+}
+
 export function normalizeGroupFileExtension(value?: string | null) {
   const normalized = String(value || '')
     .trim()

@@ -118,22 +118,25 @@ export default function HtmlFilePreviewCard({
   const handleViewCode = async () => {
     try {
       setViewingCode(true)
-      const analysis = htmlSource ? { htmlSource } : await webService.fetchHtmlAnalysis(url)
-      const source = analysis.htmlSource
-      if (!source) {
-        throw new Error('Unable to load HTML source for this file')
-      }
-
       if (electronIpc.isElectron()) {
         const response = await electronIpc.openHtmlSourceViewer({
           title: resolvedTitle,
-          source,
+          source: typeof htmlSource === 'string' ? htmlSource : undefined,
           url
         })
         if (!response?.success) {
           throw new Error(response?.error || 'Failed to open source viewer')
         }
         return
+      }
+
+      const analysis =
+        typeof htmlSource === 'string'
+          ? { htmlSource }
+          : await webService.fetchHtmlAnalysis(url, { force: true })
+      const source = analysis.htmlSource
+      if (typeof source !== 'string') {
+        throw new Error('Unable to load HTML source for this file')
       }
 
       if (!openHtmlSourceFallback(source, resolvedTitle)) {
