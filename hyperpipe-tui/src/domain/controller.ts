@@ -1824,7 +1824,7 @@ export class TuiController {
     const normalized = String(message || '').toLowerCase()
     if (!normalized) return false
     return (
-      normalized.includes('incompatible hyperpipe-worker dependency graph detected')
+      normalized.includes('incompatible hyperpipe-core dependency graph detected')
       || normalized.includes('worker dependency check failed')
       || normalized.includes('setinflightrange')
     )

@@ -50,7 +50,7 @@ test('htplugin CLI init/pack outputs installable .htplugin.tgz archive', async (
 
   const currentFile = fileURLToPath(import.meta.url)
   const repoRoot = path.resolve(path.dirname(currentFile), '..', '..', '..')
-  const cliPath = path.join(repoRoot, 'shared', 'plugins', 'sdk', 'htplugin-cli.mjs')
+  const cliPath = path.join(repoRoot, 'hyperpipe-bridge', 'plugins', 'sdk', 'htplugin-cli.mjs')
 
   const supervisor = new PluginSupervisor({
     storagePath,

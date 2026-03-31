@@ -26,7 +26,7 @@ import {
   validateConfig
 } from './schema.mjs';
 import { buildAuthMarkdownReport, runDeepAuthValidation } from './deep-auth.mjs';
-import { signOperatorAttestationRequest } from '../../shared/public-gateway/OperatorAttestation.mjs';
+import { signOperatorAttestationRequest } from '@hyperpipe/bridge/public-gateway/OperatorAttestation';
 
 const DEFAULT_SCOPE = 'gateway:relay-register';
 const DEFAULT_TIMEOUT_MS = 10_000;

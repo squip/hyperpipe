@@ -3,7 +3,7 @@ import * as kinds from '@nostr/tools/kinds'
 export const APP_DISPLAY_NAME = 'Hyperpipe'
 export const APP_DESCRIPTION = 'Desktop client for Hyperpipe peer-to-peer Nostr relays and file sharing'
 export const APP_PUBLIC_URL = 'https://hyperpipe.io'
-export const APP_REPOSITORY_URL = 'https://github.com/squip/hypertuna-electron-dev'
+export const APP_REPOSITORY_URL = 'https://github.com/squip/hyperpipe'
 export const APP_ISSUES_URL = `${APP_REPOSITORY_URL}/issues/new`
 export const APP_SHARE_BASE_URL =
   (import.meta.env.VITE_PUBLIC_SHARE_BASE_URL as string | undefined) || APP_PUBLIC_URL

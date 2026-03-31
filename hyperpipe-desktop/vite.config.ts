@@ -38,7 +38,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
-      '@shared': path.resolve(__dirname, '../shared')
+      '@hyperpipe/bridge': path.resolve(__dirname, '../hyperpipe-bridge')
     }
   },
   server: {

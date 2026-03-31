@@ -2,7 +2,7 @@
 
 ![Hyperpipe icon](./public/pwa-512x512.png)
 
-Hyperpipe Desktop is the Electron renderer and shell for the Hyperpipe peer-to-peer relay client. It runs alongside the shared worker in [`../hyperpipe-worker`](../hyperpipe-worker) and consumes shared protocol/UI code from [`../shared`](../shared).
+Hyperpipe Desktop is the Electron renderer and shell for the Hyperpipe peer-to-peer relay client. It runs alongside [`../hyperpipe-core`](../hyperpipe-core) and consumes first-party integration/runtime helpers from [`../hyperpipe-bridge`](../hyperpipe-bridge) and [`../hyperpipe-core-host`](../hyperpipe-core-host).
 
 ## What lives here
 

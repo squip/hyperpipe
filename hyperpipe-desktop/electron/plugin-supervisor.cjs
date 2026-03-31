@@ -315,7 +315,7 @@ class PluginSupervisor {
     this.storagePath = storagePath;
     this.sharedRoot = typeof sharedRoot === 'string' && sharedRoot
       ? sharedRoot
-      : path.join(__dirname, '..', '..', 'shared');
+      : path.join(__dirname, '..', '..', 'hyperpipe-bridge');
     this.pluginsRoot = path.join(storagePath, 'plugins');
     this.registryPath = path.join(this.pluginsRoot, 'registry.json');
     this.runnerPath = path.join(__dirname, 'plugin-runner.cjs');

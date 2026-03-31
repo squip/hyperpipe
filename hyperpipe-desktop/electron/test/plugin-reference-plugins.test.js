@@ -104,8 +104,8 @@ test('first-party reference plugins package, install, and render route payloads'
 
   const currentFile = fileURLToPath(import.meta.url)
   const repoRoot = path.resolve(path.dirname(currentFile), '..', '..', '..')
-  const referenceRoot = path.join(repoRoot, 'shared', 'plugins', 'reference')
-  const cliPath = path.join(repoRoot, 'shared', 'plugins', 'sdk', 'htplugin-cli.mjs')
+  const referenceRoot = path.join(repoRoot, 'hyperpipe-bridge', 'plugins', 'reference')
+  const cliPath = path.join(repoRoot, 'hyperpipe-bridge', 'plugins', 'sdk', 'htplugin-cli.mjs')
   const catalogPath = path.join(referenceRoot, 'catalog.json')
 
   const catalog = await readJson(catalogPath)

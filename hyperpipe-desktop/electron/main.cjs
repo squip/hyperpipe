@@ -167,11 +167,11 @@ for (const host of envAllowlist) {
   DEFAULT_CERT_ALLOWLIST.add(host);
 }
 
-function getSharedRoot() {
+function getBridgeRoot() {
   if (app.isPackaged) {
-    return path.join(process.resourcesPath, 'shared');
+    return path.join(process.resourcesPath, 'app', 'node_modules', '@hyperpipe', 'bridge');
   }
-  return path.join(REPO_ROOT, 'shared');
+  return path.join(REPO_ROOT, 'hyperpipe-bridge');
 }
 
 function resolveExistingRoot(candidates) {
@@ -181,14 +181,14 @@ function resolveExistingRoot(candidates) {
   return candidates[0];
 }
 
-function getWorkerRoot() {
+function getCoreRoot() {
   if (app.isPackaged) {
     return resolveExistingRoot([
-      path.join(process.resourcesPath, 'hyperpipe-worker')
+      path.join(process.resourcesPath, 'app', 'node_modules', '@hyperpipe', 'core')
     ]);
   }
   return resolveExistingRoot([
-    path.join(REPO_ROOT, 'hyperpipe-worker')
+    path.join(REPO_ROOT, 'hyperpipe-core')
   ]);
 }
 
@@ -233,7 +233,7 @@ async function ensurePluginSupervisor() {
   pluginSupervisor = new PluginSupervisor({
     storagePath,
     logger: console,
-    sharedRoot: getSharedRoot()
+    sharedRoot: getBridgeRoot()
   });
   pluginSupervisor.setRendererEmitter((channel, payload) => {
     emitRendererEvent(channel, payload);
@@ -256,11 +256,11 @@ function toArray(value) {
 }
 
 function getReferencePluginPaths() {
-  const referenceRoot = path.join(getSharedRoot(), 'plugins', 'reference');
+  const referenceRoot = path.join(getBridgeRoot(), 'plugins', 'reference');
   return {
     referenceRoot,
     catalogPath: path.join(referenceRoot, 'catalog.json'),
-    cliPath: path.join(getSharedRoot(), 'plugins', 'sdk', 'htplugin-cli.mjs')
+    cliPath: path.join(getBridgeRoot(), 'plugins', 'sdk', 'htplugin-cli.mjs')
   };
 }
 
@@ -852,11 +852,11 @@ async function startWorkerProcess(workerConfig = null) {
     }
   }
 
-  const workerRoot = getWorkerRoot();
-  const workerEntry = path.join(workerRoot, 'index.js');
+  const workerRoot = getCoreRoot();
+  const workerEntry = path.join(workerRoot, 'bin', 'hyperpipe-core.mjs');
 
   if (!existsSync(workerEntry)) {
-    const error = 'Relay worker entry not found in the worker package';
+    const error = 'Hyperpipe Core entry not found in the core package';
     console.error('[Main] ' + error);
     return { success: false, error };
   }

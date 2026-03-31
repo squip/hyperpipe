@@ -1,6 +1,6 @@
 import { usePrimaryPage } from '@/PageManager'
 import { cn } from '@/lib/utils'
-import { getHyperpipeWordmarkLayout } from '@shared/ui/hyperpipeSplash'
+import { getHyperpipeWordmarkLayout } from '@hyperpipe/bridge/ui/hyperpipeSplash'
 import { useId } from 'react'
 
 const CELL_HEIGHT = 18

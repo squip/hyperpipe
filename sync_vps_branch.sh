@@ -9,7 +9,7 @@ Usage:
 Sync the current local branch (or --branch) to a remote VPS checkout by:
 1) verifying local HEAD is pushed to origin
 2) resetting remote checkout to origin/<branch>
-3) optionally reinstalling hyperpipe-worker + hyperpipe-tui dependencies
+3) optionally reinstalling hyperpipe-core + hyperpipe-tui dependencies
 4) printing final branch/head/status verification
 
 Options:
@@ -200,8 +200,8 @@ if [[ "${SKIP_INSTALL}" != "1" ]]; then
     echo "Warning: nvm not found at ${HOME}/.nvm/nvm.sh; using system node." >&2
   fi
 
-  if [[ -d hyperpipe-worker ]]; then
-    cd hyperpipe-worker
+  if [[ -d hyperpipe-core ]]; then
+    cd hyperpipe-core
     if [[ -f package-lock.json ]]; then
       npm ci --no-audit --no-fund
     else

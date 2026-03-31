@@ -16,8 +16,9 @@ function usage() {
     '',
     'The script assembles a portable bundle directory containing:',
     '  - the built hyperpipe-tui dist output',
-    '  - the hyperpipe-worker runtime',
-    '  - the shared workspace',
+    '  - the @hyperpipe/core runtime package',
+    '  - the @hyperpipe/core-host launcher package',
+    '  - the @hyperpipe/bridge integration package',
     '  - a bundled Node.js runtime',
     '  - launcher scripts for the target platform'
   ].join('\n')
@@ -127,23 +128,41 @@ async function extractArchive({ archivePath, extractDir, platform }) {
   await execFileAsync('tar', ['-xf', archivePath, '-C', extractDir])
 }
 
-function shouldCopyWorker(relativePath) {
+function shouldCopyCore(relativePath) {
   if (!relativePath) return true
   const normalized = relativePath.replace(/\\/g, '/')
   return !(
+    normalized === 'node_modules'
+    || normalized.startsWith('node_modules/')
     normalized === 'data'
     || normalized.startsWith('data/')
     || normalized === 'test'
     || normalized.startsWith('test/')
     || normalized === 'release'
     || normalized.startsWith('release/')
+    || normalized === 'package-lock.json'
   )
 }
 
-function shouldCopyShared(relativePath) {
+function shouldCopyCoreHost(relativePath) {
   if (!relativePath) return true
   const normalized = relativePath.replace(/\\/g, '/')
-  return !(normalized === 'package-lock.json')
+  return !(
+    normalized === 'node_modules'
+    || normalized.startsWith('node_modules/')
+  )
+}
+
+function shouldCopyBridge(relativePath) {
+  if (!relativePath) return true
+  const normalized = relativePath.replace(/\\/g, '/')
+  return !(
+    normalized === 'node_modules'
+    || normalized.startsWith('node_modules/')
+    || normalized === 'package-lock.json'
+    || normalized === 'plugins/reference'
+    || normalized.startsWith('plugins/reference/')
+  )
 }
 
 async function copyDirectory(fromPath, toPath, filter) {
@@ -189,15 +208,17 @@ async function main() {
   const scriptsDir = path.dirname(scriptPath)
   const tuiRoot = path.resolve(scriptsDir, '..')
   const repoRoot = path.resolve(tuiRoot, '..')
-  const workerRoot = path.join(repoRoot, 'hyperpipe-worker')
-  const sharedRoot = path.join(repoRoot, 'shared')
+  const coreRoot = path.join(repoRoot, 'hyperpipe-core')
+  const coreHostRoot = path.join(repoRoot, 'hyperpipe-core-host')
+  const bridgeRoot = path.join(repoRoot, 'hyperpipe-bridge')
   const distRoot = path.join(tuiRoot, 'dist')
   const distEntry = path.join(distRoot, 'cli.js')
   const outputDir = path.resolve(options.outputDir || path.join(tuiRoot, 'release'))
 
   await ensureExists(distEntry, 'Built TUI entry')
-  await ensureExists(workerRoot, 'Worker workspace')
-  await ensureExists(sharedRoot, 'Shared workspace')
+  await ensureExists(coreRoot, 'Core workspace')
+  await ensureExists(coreHostRoot, 'Core Host workspace')
+  await ensureExists(bridgeRoot, 'Bridge workspace')
 
   const nodeDist = getNodeDistributionInfo(options.platform, options.arch, options.nodeVersion)
   const bundleName = `hyperpipe-tui-${options.platform}-${options.arch}`
@@ -220,8 +241,9 @@ async function main() {
   await copyDirectory(distRoot, path.join(bundleRoot, 'app', 'dist'), () => true)
   await fs.copyFile(path.join(tuiRoot, 'package.json'), path.join(bundleRoot, 'app', 'package.json'))
   await fs.copyFile(path.join(tuiRoot, 'README.md'), path.join(bundleRoot, 'README.md'))
-  await copyDirectory(workerRoot, path.join(bundleRoot, 'hyperpipe-worker'), shouldCopyWorker)
-  await copyDirectory(sharedRoot, path.join(bundleRoot, 'shared'), shouldCopyShared)
+  await copyDirectory(coreRoot, path.join(bundleRoot, 'app', 'node_modules', '@hyperpipe', 'core'), shouldCopyCore)
+  await copyDirectory(coreHostRoot, path.join(bundleRoot, 'app', 'node_modules', '@hyperpipe', 'core-host'), shouldCopyCoreHost)
+  await copyDirectory(bridgeRoot, path.join(bundleRoot, 'app', 'node_modules', '@hyperpipe', 'bridge'), shouldCopyBridge)
   await writeLauncherScripts(bundleRoot, options.platform)
 
   const nodeExecutable = path.join(bundleRoot, 'runtime', 'node', nodeDist.nodeExecutableRelativePath)

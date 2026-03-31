@@ -9,7 +9,8 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/squip/hypertuna-electron-dev.git"
+    "url": "git+https://github.com/squip/hyperpipe.git",
+    "directory": "hyperpipe-desktop"
   },
   "homepage": "https://hyperpipe.io",
   "scripts": {
@@ -32,6 +33,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@hyperpipe/bridge": "file:../hyperpipe-bridge",
+    "@hyperpipe/core": "file:../hyperpipe-core",
+    "@hyperpipe/core-host": "file:../hyperpipe-core-host",
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/modifiers": "^9.0.0",
     "@dnd-kit/sortable": "^10.0.0",
@@ -160,10 +164,12 @@
     ],
     "extraResources": [
       {
-        "from": "../hyperpipe-worker",
-        "to": "hyperpipe-worker",
+        "from": "../hyperpipe-core",
+        "to": "app/node_modules/@hyperpipe/core",
         "filter": [
           "**/*",
+          "!node_modules",
+          "!node_modules/**/*",
           "!data",
           "!data/**/*",
           "!test",
@@ -172,11 +178,25 @@
         ]
       },
       {
-        "from": "../shared",
-        "to": "shared",
+        "from": "../hyperpipe-core-host",
+        "to": "app/node_modules/@hyperpipe/core-host",
         "filter": [
           "**/*",
+          "!node_modules",
+          "!node_modules/**/*",
           "!package-lock.json"
+        ]
+      },
+      {
+        "from": "../hyperpipe-bridge",
+        "to": "app/node_modules/@hyperpipe/bridge",
+        "filter": [
+          "**/*",
+          "!node_modules",
+          "!node_modules/**/*",
+          "!package-lock.json",
+          "!plugins/reference",
+          "!plugins/reference/**/*"
         ]
       }
     ],

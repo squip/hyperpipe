@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - 'v*'
+      - 'desktop-v*'
 
 permissions:
   contents: write
@@ -19,46 +19,22 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install desktop dependencies
-        run: |
-          cd hyperpipe-desktop
-          npm ci
+      - name: Install workspace dependencies
+        run: npm ci
 
-      - name: Install worker dependencies
-        run: |
-          cd hyperpipe-worker
-          npm ci
-
-      - name: Install gateway deploy dependencies
-        run: |
-          cd deploy
-          npm ci
-
-      - name: Install gateway dependencies
-        run: |
-          cd hyperpipe-gateway
-          npm ci
-
-      - name: Verify worker
-        run: |
-          cd hyperpipe-worker
-          npm test
+      - name: Verify core
+        run: npm --workspace ./hyperpipe-core test
 
       - name: Verify gateway
-        run: |
-          cd hyperpipe-gateway
-          npm test
+        run: npm --workspace ./hyperpipe-gateway test
 
       - name: Verify deploy tooling
-        run: |
-          cd deploy
-          npm test
+        run: npm --workspace ./deploy test
 
       - name: Verify desktop renderer
         run: |
-          cd hyperpipe-desktop
-          npm run test:unit
-          npm run build:web
+          npm --workspace ./hyperpipe-desktop run test:unit
+          npm --workspace ./hyperpipe-desktop run build:web
 
   package:
     needs: verify
@@ -88,15 +64,8 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install desktop dependencies
-        run: |
-          cd hyperpipe-desktop
-          npm ci
-
-      - name: Install worker dependencies
-        run: |
-          cd hyperpipe-worker
-          npm ci
+      - name: Install workspace dependencies
+        run: npm ci
 
       - name: Install xvfb (Linux)
         if: runner.os == 'Linux'
@@ -106,26 +75,19 @@ jobs:
 
       - name: Run desktop verification
         run: |
-          cd hyperpipe-desktop
-          npm run test:unit
-          npm run build:web
+          npm --workspace ./hyperpipe-desktop run test:unit
+          npm --workspace ./hyperpipe-desktop run build:web
 
       - name: Run desktop electron tests
         if: runner.os == 'Linux'
-        run: |
-          cd hyperpipe-desktop
-          xvfb-run -a npm run test:electron
+        run: xvfb-run -a npm --workspace ./hyperpipe-desktop run test:electron
 
       - name: Run desktop electron tests
         if: runner.os != 'Linux'
-        run: |
-          cd hyperpipe-desktop
-          npm run test:electron
+        run: npm --workspace ./hyperpipe-desktop run test:electron
 
       - name: Build desktop release artifacts
-        run: |
-          cd hyperpipe-desktop
-          npm run dist:desktop -- ${{ matrix.builder_args }}
+        run: npm --workspace ./hyperpipe-desktop run dist:desktop -- ${{ matrix.builder_args }}
 
       - name: Write checksums
         run: node ./scripts/write-sha256sums.mjs --dir ./hyperpipe-desktop/release --out ./hyperpipe-desktop/release/SHA256SUMS.txt
@@ -141,4 +103,3 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: hyperpipe-desktop/release/*
-

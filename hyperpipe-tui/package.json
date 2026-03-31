@@ -6,7 +6,8 @@
   "homepage": "https://hyperpipe.io",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/squip/hypertuna-electron-dev.git"
+    "url": "git+https://github.com/squip/hyperpipe.git",
+    "directory": "hyperpipe-tui"
   },
   "bin": {
     "hyperpipe-tui": "dist/cli.js"
@@ -26,9 +27,18 @@
     "demo:e2e:real:two-user": "tsx test/e2e/live-two-user-workflows-real.tsx",
     "demo:e2e:real:direct-join-host-online": "tsx test/e2e/direct-join-host-online-debug-real.tsx",
     "demo:e2e:real:closed-gateway-inheritance-docker": "tsx test/e2e/closed-gateway-inheritance-docker-real.tsx",
-    "demo:e2e:real:relay-scoped-phased-docker": "tsx test/e2e/relay-scoped-phased-docker.tsx"
+    "demo:e2e:real:relay-scoped-phased-docker": "tsx test/e2e/relay-scoped-phased-docker.tsx",
+    "pack:check": "npm pack --dry-run"
   },
+  "files": [
+    "dist/**",
+    "README.md",
+    "package.json"
+  ],
   "dependencies": {
+    "@hyperpipe/bridge": "file:../hyperpipe-bridge",
+    "@hyperpipe/core": "file:../hyperpipe-core",
+    "@hyperpipe/core-host": "file:../hyperpipe-core-host",
     "chalk": "^5.6.2",
     "ink": "^5.0.1",
     "ink-spinner": "^5.0.0",

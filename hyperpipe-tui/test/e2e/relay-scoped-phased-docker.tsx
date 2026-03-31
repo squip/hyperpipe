@@ -3645,10 +3645,10 @@ async function runPhase6AuthLifecycle(options: {
   const summaryFile = path.join(phaseDir, 'phase-summary.json')
   const lifecycleSummaryFile = path.join(phaseDir, 'relay-member-lifecycle.json')
   const workerAuthClientPath = pathToFileURL(
-    path.join(options.repoRoot, 'hyperpipe-worker/gateway/PublicGatewayAuthClient.mjs')
+    path.join(options.repoRoot, 'hyperpipe-core/gateway/PublicGatewayAuthClient.mjs')
   ).href
   const workerControlClientPath = pathToFileURL(
-    path.join(options.repoRoot, 'hyperpipe-worker/gateway/PublicGatewayControlClient.mjs')
+    path.join(options.repoRoot, 'hyperpipe-core/gateway/PublicGatewayControlClient.mjs')
   ).href
   const authClientModule = await import(workerAuthClientPath) as {
     default: new (args: {
