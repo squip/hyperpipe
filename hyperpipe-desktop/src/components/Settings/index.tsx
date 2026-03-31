@@ -1,5 +1,4 @@
 import AboutInfoDialog from '@/components/AboutInfoDialog'
-import Donation from '@/components/Donation'
 import {
   toAppearanceSettings,
   toGeneralSettings,
@@ -144,9 +143,6 @@ export default function Settings() {
           </div>
         </SettingItem>
       </AboutInfoDialog>
-      <div className="px-4 mt-4">
-        <Donation />
-      </div>
     </div>
   )
 }

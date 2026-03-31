@@ -3,7 +3,7 @@ import * as kinds from '@jsr/nostr__tools/kinds'
 export const APP_DISPLAY_NAME = 'Hyperpipe'
 export const APP_DESCRIPTION = 'Desktop client for Hyperpipe peer-to-peer Nostr relays and file sharing'
 export const APP_PUBLIC_URL = 'https://hyperpipe.io'
-export const APP_REPOSITORY_URL = 'https://github.com/squip/hyperpipe'
+export const APP_REPOSITORY_URL = 'https://github.com/squip/hyperpipe-desktop'
 export const APP_ISSUES_URL = `${APP_REPOSITORY_URL}/issues/new`
 export const APP_SHARE_BASE_URL =
   (import.meta.env.VITE_PUBLIC_SHARE_BASE_URL as string | undefined) || APP_PUBLIC_URL
@@ -23,8 +23,6 @@ export const HOSTED_TRANSLATION_SERVICE_ID = 'fevela' as const
 export const HOSTED_TRANSLATION_SERVICE_LABEL = 'Hyperpipe Hosted'
 export const HOSTED_TRANSLATION_API_BASE_URL = 'https://api.fevela.social'
 export const APP_INDEXED_DB_NAME = 'hyperpipe-desktop'
-export const SUPPORT_PUBKEY = '8adab951da7d88367ed86731eeb7b4e2f8582efaac81a6459a5d580213b89a6e'
-
 export const DEFAULT_FAVORITE_RELAYS = [
   'wss://nostr.wine/',
   'wss://pyramid.fiatjaf.com/',

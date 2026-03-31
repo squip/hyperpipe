@@ -1,4 +1,4 @@
-import { APP_DISPLAY_NAME, BIG_RELAY_URLS, DEV_PUBKEY, SUPPORT_PUBKEY } from '@/constants'
+import { APP_DISPLAY_NAME, BIG_RELAY_URLS } from '@/constants'
 import { getZapInfoFromEvent } from '@/lib/event-metadata'
 import { init, launchPaymentModal } from '@getalby/bitcoin-connect-react'
 import { bech32 } from '@scure/base'
@@ -15,14 +15,9 @@ import { NostrUser } from '@nostr/gadgets/metadata'
 import { getLightningAddressFromProfile } from '@/lib/lightning'
 import { pool } from '@nostr/gadgets/global'
 
-export type TRecentSupporter = { pubkey: string; amount: number; comment?: string }
-
-const OFFICIAL_PUBKEYS = [SUPPORT_PUBKEY, DEV_PUBKEY]
-
 class LightningService {
   static instance: LightningService
   provider: WebLNProvider | null = null
-  private recentSupportersCache: TRecentSupporter[] | null = null
 
   constructor() {
     if (!LightningService.instance) {
@@ -157,38 +152,6 @@ class LightningService {
         }
       })
     })
-  }
-
-  async fetchRecentSupporters() {
-    if (this.recentSupportersCache) {
-      return this.recentSupportersCache
-    }
-    const relayList = await client.fetchRelayList(DEV_PUBKEY)
-    const events = await client.fetchEvents(relayList.read.slice(0, 4), {
-      authors: ['beeb48407a6f087ea8f76dc384a5d88c67ced9bd9fb0cdba90930210df3d92e7'], // minibits
-      kinds: [kinds.Zap],
-      '#p': OFFICIAL_PUBKEYS,
-      since: dayjs().subtract(1, 'month').unix()
-    })
-    events.sort((a, b) => b.created_at - a.created_at)
-    const map = new Map<string, { pubkey: string; amount: number; comment?: string }>()
-    events.forEach((event) => {
-      const info = getZapInfoFromEvent(event)
-      if (!info || !info.senderPubkey || OFFICIAL_PUBKEYS.includes(info.senderPubkey)) return
-
-      const { amount, comment, senderPubkey } = info
-      const item = map.get(senderPubkey)
-      if (!item) {
-        map.set(senderPubkey, { pubkey: senderPubkey, amount, comment })
-      } else {
-        item.amount += amount
-        if (!item.comment && comment) item.comment = comment
-      }
-    })
-    this.recentSupportersCache = Array.from(map.values())
-      .filter((item) => item.amount >= 1000)
-      .sort((a, b) => b.amount - a.amount)
-    return this.recentSupportersCache
   }
 
   private async getZapEndpoint(profile: NostrUser): Promise<null | {
