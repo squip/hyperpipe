@@ -78,7 +78,7 @@ jobs:
             prefix: hyperpipe-gateway
             target_repo: squip/hyperpipe-gateway
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: github.event_name == 'push' || inputs.mirror == 'all' || inputs.mirror == matrix.mirror
         with:
           fetch-depth: 0
