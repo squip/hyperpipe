@@ -35,3 +35,20 @@ Install policy:
 - the root `package-lock.json` is the only tracked lockfile in this monorepo
 - run `npm install` or `npm ci` from the monorepo root
 - nested workspace `package-lock.json` files should not be committed
+
+Pull request expectations:
+
+- keep changes scoped to one package, application, or release concern when practical
+- include tests or a clear explanation when tests are not practical
+- update README/docs when changing public behavior, package names, or release flow
+- do not commit secrets, local runtime `.env` files, or generated `node_modules`
+- prefer changesets or namespaced release-tag updates when a publishable package changes
+
+Issue routing:
+
+- use the bug report or feature request templates when filing issues
+- do not use public issues for vulnerability reports; follow [SECURITY.md](./SECURITY.md)
+
+Behavior expectations:
+
+- this project follows the rules in [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)

@@ -2,10 +2,9 @@
 
 Terminal UI implementation of the Hyperpipe client, backed by `@squip/hyperpipe-core` through the shared `@squip/hyperpipe-core-host` launcher contract.
 
-## Run
+## Development
 
 ```bash
-cd /Users/essorensen/hypertuna-electron/hyperpipe-tui
 npm install
 npm run dev
 ```
@@ -16,6 +15,23 @@ Build + run binary entry:
 npm run build
 node dist/cli.js
 ```
+
+## Release Model
+
+- portable bundles are the primary end-user distribution path
+- npm publication is a secondary install path for terminal users and automation
+
+## Join Behavior Defaults
+
+The default production behavior now ships in `@squip/hyperpipe-core`, so users do
+not need to pass manual join-tuning env vars just to start the app.
+
+These env vars remain available only as explicit runtime overrides:
+
+- `JOIN_DIRECT_DISCOVERY_V2`
+- `JOIN_TOTAL_DEADLINE_MS`
+- `RELAY_PROTOCOL_REQUEST_TIMEOUT_MS`
+- `DIRECT_JOIN_VERIFY_TIMEOUT_MS`
 
 ## CLI flags
 

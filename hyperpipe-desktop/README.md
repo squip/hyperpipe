@@ -38,6 +38,20 @@ Build a local desktop package:
 npm run dist:desktop -- --dir
 ```
 
+## Join Behavior Defaults
+
+Desktop builds now inherit the production join behavior defaults from
+`@squip/hyperpipe-core`. Users do not need to launch the app with extra join-tuning
+env vars for normal operation.
+
+The old env vars still work as runtime overrides when you intentionally launch the
+desktop shell from a terminal:
+
+- `JOIN_DIRECT_DISCOVERY_V2`
+- `JOIN_TOTAL_DEADLINE_MS`
+- `RELAY_PROTOCOL_REQUEST_TIMEOUT_MS`
+- `DIRECT_JOIN_VERIFY_TIMEOUT_MS`
+
 ## Feature Flags
 
 Renderer feature visibility can be toggled with Vite env flags (values: `true/false`, `1/0`, `enabled/disabled`):
