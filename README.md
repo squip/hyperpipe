@@ -49,3 +49,4 @@ Lockfile policy:
 - `hyperpipe-gateway` is distributed as a public repo plus container image, not as
   an npm package.
 - public mirror automation is documented in [docs/public-mirror-sync.md](./docs/public-mirror-sync.md)
+- release credentials and required secrets are documented in [docs/release-secrets.md](./docs/release-secrets.md)
