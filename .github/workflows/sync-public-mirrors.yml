@@ -82,6 +82,7 @@ jobs:
         if: github.event_name == 'push' || inputs.mirror == 'all' || inputs.mirror == matrix.mirror
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Verify mirror token presence
         if: (github.event_name == 'push' || inputs.mirror == 'all' || inputs.mirror == matrix.mirror) && (github.event_name != 'workflow_dispatch' || inputs.dry_run != true)

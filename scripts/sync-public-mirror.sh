@@ -155,5 +155,10 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
+# actions/checkout configures a GitHub auth extraheader for the workflow token.
+# Clear it so the explicit mirror push token in the remote URL is the credential
+# used for cross-repo pushes.
+git -C "$WORKTREE_DIR" config --local --unset-all http.https://github.com/.extraheader >/dev/null 2>&1 || true
+
 git -C "$WORKTREE_DIR" push --force "$REMOTE_URL" "HEAD:refs/heads/$BRANCH"
 printf '[mirror] pushed %s to %s@%s\n' "$PREFIX" "$TARGET" "$BRANCH"
