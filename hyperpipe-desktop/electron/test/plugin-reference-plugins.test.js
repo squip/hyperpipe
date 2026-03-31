@@ -3,12 +3,14 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { execFile } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 
 import { PluginSupervisor } from '../plugin-supervisor.cjs'
 
 const execFileAsync = promisify(execFile)
+const require = createRequire(import.meta.url)
 
 const QUIET_LOGGER = {
   info() {},
@@ -79,6 +81,20 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+function resolveBridgeRoot() {
+  const currentFile = fileURLToPath(import.meta.url)
+  const fallbackRepoRoot = path.resolve(path.dirname(currentFile), '..', '..', '..')
+
+  try {
+    const packageJsonPath = require.resolve('@squip/hyperpipe-bridge/package.json', {
+      paths: [path.dirname(currentFile), process.cwd()]
+    })
+    return path.dirname(packageJsonPath)
+  } catch (_) {
+    return path.join(fallbackRepoRoot, 'hyperpipe-bridge')
+  }
+}
+
 async function invokeRouteWithRetry(supervisor, { pluginId, routeId, routePath, timeoutMs = 20_000 }) {
   let lastResult = null
   for (let attempt = 0; attempt < 12; attempt += 1) {
@@ -102,11 +118,18 @@ test('first-party reference plugins package, install, and render route payloads'
   const storagePath = path.join(tmpRoot, 'desktop-storage')
   const archivesDir = path.join(tmpRoot, 'archives')
 
-  const currentFile = fileURLToPath(import.meta.url)
-  const repoRoot = path.resolve(path.dirname(currentFile), '..', '..', '..')
-  const referenceRoot = path.join(repoRoot, 'hyperpipe-bridge', 'plugins', 'reference')
-  const cliPath = path.join(repoRoot, 'hyperpipe-bridge', 'plugins', 'sdk', 'htplugin-cli.mjs')
+  const bridgeRoot = resolveBridgeRoot()
+  const referenceRoot = path.join(bridgeRoot, 'plugins', 'reference')
+  const cliPath = path.join(bridgeRoot, 'plugins', 'sdk', 'htplugin-cli.mjs')
   const catalogPath = path.join(referenceRoot, 'catalog.json')
+
+  try {
+    await fs.access(catalogPath)
+    await fs.access(cliPath)
+  } catch (_) {
+    t.comment('reference plugin fixtures are not included in the installed bridge package')
+    return
+  }
 
   const catalog = await readJson(catalogPath)
   t.ok(Array.isArray(catalog))

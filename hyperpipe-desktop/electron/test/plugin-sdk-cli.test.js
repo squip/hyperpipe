@@ -4,12 +4,14 @@ import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import { execFile } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 
 import { PluginSupervisor } from '../plugin-supervisor.cjs'
 
 const execFileAsync = promisify(execFile)
+const require = createRequire(import.meta.url)
 
 const QUIET_LOGGER = {
   info() {},
@@ -39,6 +41,20 @@ async function sha256ForFile(filePath) {
   return crypto.createHash('sha256').update(bytes).digest('hex')
 }
 
+function resolveBridgeRoot() {
+  const currentFile = fileURLToPath(import.meta.url)
+  const fallbackRepoRoot = path.resolve(path.dirname(currentFile), '..', '..', '..')
+
+  try {
+    const packageJsonPath = require.resolve('@squip/hyperpipe-bridge/package.json', {
+      paths: [path.dirname(currentFile), process.cwd()]
+    })
+    return path.dirname(packageJsonPath)
+  } catch (_) {
+    return path.join(fallbackRepoRoot, 'hyperpipe-bridge')
+  }
+}
+
 test('htplugin CLI init/pack outputs installable .htplugin.tgz archive', async (t) => {
   const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'htplugin-cli-e2e-'))
   const pluginDir = path.join(tmpRoot, 'sample-plugin')
@@ -48,9 +64,16 @@ test('htplugin CLI init/pack outputs installable .htplugin.tgz archive', async (
   const pluginVersion = '1.0.0'
   const archivePath = path.join(artifactsDir, `${pluginId}-${pluginVersion}.htplugin.tgz`)
 
-  const currentFile = fileURLToPath(import.meta.url)
-  const repoRoot = path.resolve(path.dirname(currentFile), '..', '..', '..')
-  const cliPath = path.join(repoRoot, 'hyperpipe-bridge', 'plugins', 'sdk', 'htplugin-cli.mjs')
+  const bridgeRoot = resolveBridgeRoot()
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
+  const cliPath = path.join(bridgeRoot, 'plugins', 'sdk', 'htplugin-cli.mjs')
+
+  try {
+    await fs.access(cliPath)
+  } catch (_) {
+    t.comment('plugin SDK CLI is not included in the installed bridge package')
+    return
+  }
 
   const supervisor = new PluginSupervisor({
     storagePath,

@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
+import zlib from 'node:zlib'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
@@ -20,6 +21,49 @@ const QUIET_LOGGER = {
 
 function sha256Hex(buffer) {
   return crypto.createHash('sha256').update(buffer).digest('hex')
+}
+
+function writeTarString(buffer, offset, length, value) {
+  const encoded = Buffer.from(String(value), 'utf8')
+  encoded.copy(buffer, offset, 0, Math.min(length, encoded.length))
+}
+
+function writeTarOctal(buffer, offset, length, value) {
+  const encoded = Math.max(0, value).toString(8).padStart(length - 1, '0')
+  writeTarString(buffer, offset, length - 1, encoded)
+  buffer[offset + length - 1] = 0
+}
+
+function createTarRecord({ name, body, mode = 0o644, type = '0', linkName = '' }) {
+  const data = Buffer.isBuffer(body) ? body : Buffer.from(body)
+  const header = Buffer.alloc(512, 0)
+
+  writeTarString(header, 0, 100, name)
+  writeTarOctal(header, 100, 8, mode)
+  writeTarOctal(header, 108, 8, 0)
+  writeTarOctal(header, 116, 8, 0)
+  writeTarOctal(header, 124, 12, data.length)
+  writeTarOctal(header, 136, 12, Math.floor(Date.now() / 1000))
+  header.fill(0x20, 148, 156)
+  header[156] = type.charCodeAt(0)
+  writeTarString(header, 157, 100, linkName)
+  writeTarString(header, 257, 6, 'ustar')
+  writeTarString(header, 263, 2, '00')
+
+  const checksum = [...header].reduce((sum, value) => sum + value, 0)
+  writeTarOctal(header, 148, 8, checksum)
+
+  const padding = Buffer.alloc((512 - (data.length % 512)) % 512, 0)
+  return Buffer.concat([header, data, padding])
+}
+
+async function writeTarGzArchive(archivePath, entries) {
+  const trailer = Buffer.alloc(1024, 0)
+  const payload = Buffer.concat([
+    ...entries.map((entry) => createTarRecord(entry)),
+    trailer
+  ])
+  await fs.writeFile(archivePath, zlib.gzipSync(payload))
 }
 
 async function createPluginArchiveFixture({
@@ -130,14 +174,11 @@ test('rejects plugin archives with path traversal entries', async (t) => {
     await fs.writeFile(path.join(packageRoot, 'file.txt'), 'payload', 'utf8')
 
     const archivePath = path.join(context.tmpRoot, 'path-traversal.htplugin.tgz')
-    await execFileAsync('tar', [
-      '-czf',
-      archivePath,
-      '-C',
-      packageRoot,
-      '-s',
-      ',^file\\.txt$,../outside.txt,',
-      'file.txt'
+    await writeTarGzArchive(archivePath, [
+      {
+        name: '../outside.txt',
+        body: Buffer.from('payload', 'utf8')
+      }
     ])
 
     const result = await context.supervisor.previewPluginArchive({ archivePath })

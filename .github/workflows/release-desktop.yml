@@ -22,11 +22,8 @@ jobs:
       - name: Install workspace dependencies
         run: npm ci
 
-      - name: Install Rollup Linux native binary
-        if: runner.os == 'Linux'
-        run: |
-          ROLLUP_VERSION=$(node -p "require('./hyperpipe-desktop/node_modules/rollup/package.json').version")
-          npm install --no-save @rollup/rollup-linux-x64-gnu@${ROLLUP_VERSION}
+      - name: Install Rollup native binary
+        run: node ./hyperpipe-desktop/scripts/install-rollup-native.cjs
 
       - name: Verify core
         run: npm --workspace ./hyperpipe-core test
@@ -48,7 +45,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-13
+          - os: macos-15-intel
             builder_args: --mac dmg zip --x64
             csc_link_secret: MACOS_CSC_LINK
             csc_key_password_secret: MACOS_CSC_KEY_PASSWORD
@@ -69,6 +66,8 @@ jobs:
             csc_key_password_secret: ''
             notarize: false
     runs-on: ${{ matrix.os }}
+    env:
+      DESKTOP_STANDALONE_DIR: ${{ runner.temp }}/hyperpipe-desktop-standalone
     steps:
       - uses: actions/checkout@v5
 
@@ -76,14 +75,16 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install workspace dependencies
-        run: npm ci
+      - name: Prepare standalone desktop workspace
+        run: node ./scripts/stage-standalone-workspace.cjs ./hyperpipe-desktop "${{ env.DESKTOP_STANDALONE_DIR }}"
 
-      - name: Install Rollup Linux native binary
-        if: runner.os == 'Linux'
-        run: |
-          ROLLUP_VERSION=$(node -p "require('./hyperpipe-desktop/node_modules/rollup/package.json').version")
-          npm install --no-save @rollup/rollup-linux-x64-gnu@${ROLLUP_VERSION}
+      - name: Install standalone desktop dependencies
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        run: npm install --no-audit --no-fund
+
+      - name: Install Rollup native binary
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        run: node ./scripts/install-rollup-native.cjs
 
       - name: Install xvfb (Linux)
         if: runner.os == 'Linux'
@@ -92,38 +93,42 @@ jobs:
           sudo apt-get install -y xvfb
 
       - name: Run desktop verification
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
         run: |
-          npm --workspace ./hyperpipe-desktop run test:unit
-          npm --workspace ./hyperpipe-desktop run build:web
+          npm run test:unit
+          npm run build:web
 
       - name: Run desktop electron tests
         if: runner.os == 'Linux'
-        run: xvfb-run -a npm --workspace ./hyperpipe-desktop run test:electron
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        run: xvfb-run -a npm run test:electron
 
       - name: Run desktop electron tests
         if: runner.os != 'Linux'
-        run: npm --workspace ./hyperpipe-desktop run test:electron
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        run: npm run test:electron
 
       - name: Build desktop release artifacts
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
         env:
           CSC_LINK: ${{ matrix.csc_link_secret != '' && secrets[matrix.csc_link_secret] || '' }}
           CSC_KEY_PASSWORD: ${{ matrix.csc_key_password_secret != '' && secrets[matrix.csc_key_password_secret] || '' }}
           APPLE_ID: ${{ matrix.notarize && secrets.APPLE_ID || '' }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ matrix.notarize && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
           APPLE_TEAM_ID: ${{ matrix.notarize && secrets.APPLE_TEAM_ID || '' }}
-        run: npm --workspace ./hyperpipe-desktop run dist:desktop -- ${{ matrix.builder_args }}
+        run: npm run dist:desktop -- ${{ matrix.builder_args }}
 
       - name: Write checksums
-        run: node ./scripts/write-sha256sums.mjs --dir ./hyperpipe-desktop/release --out ./hyperpipe-desktop/release/SHA256SUMS.txt
+        run: node ./scripts/write-sha256sums.mjs --dir "${{ env.DESKTOP_STANDALONE_DIR }}/release" --out "${{ env.DESKTOP_STANDALONE_DIR }}/release/SHA256SUMS.txt"
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.os }}
-          path: hyperpipe-desktop/release/*
+          path: ${{ env.DESKTOP_STANDALONE_DIR }}/release/*
 
       - name: Publish release assets
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: hyperpipe-desktop/release/*
+          files: ${{ env.DESKTOP_STANDALONE_DIR }}/release/*
