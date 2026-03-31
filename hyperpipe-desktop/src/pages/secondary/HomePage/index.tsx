@@ -1,15 +1,10 @@
 import Logo from '@/assets/Logo'
-import { Button } from '@/components/ui/button'
 import SecondaryPageLayout from '@/layouts/SecondaryPageLayout'
 import { APP_DISPLAY_NAME } from '@/constants'
 import { Sparkles } from 'lucide-react'
 import { forwardRef } from 'react'
 
 const HomePage = forwardRef(({ index }: { index?: number }, ref) => {
-  const handleLearnMore = () => {
-    window.open('https://njump.me', '_blank', 'noopener,noreferrer')
-  }
-
   return (
     <SecondaryPageLayout
       ref={ref}
@@ -33,47 +28,57 @@ const HomePage = forwardRef(({ index }: { index?: number }, ref) => {
         <div className="space-y-4 text-base">
           <h2 className="text-2xl font-bold">About {APP_DISPLAY_NAME}</h2>
           <p>
-            {APP_DISPLAY_NAME} is a desktop client for creating, joining, and managing
-            peer-to-peer multiwriter <strong>Nostr</strong> relays backed by Hypercore and Autobase.
-            It pairs the renderer with a local worker node so each desktop client can act as a
-            fully capable peer in the relay network.
+            {APP_DISPLAY_NAME} lets you create <strong>Nostr</strong> relays powered by{' '}
+            <strong>peer-to-peer</strong> technology instead of traditional hosted servers. It
+            integrates relay creation into the client experience, so running your own relay feels
+            closer to creating or joining a moderated group than provisioning infrastructure.
           </p>
 
           <p>
-            Desktop peers in this network are intentionally ephemeral. {APP_DISPLAY_NAME}'s public
-            gateway bridge preserves relay state, mirrored cores, and file metadata so members can
-            reconnect, sync, merge, and keep collaborating even when no other desktop peer is
-            currently online.
+            Nostr made online identity portable and censorship resistant. {APP_DISPLAY_NAME} pushes
+            that idea deeper into the stack by making relay ownership permissionless and practical
+            too. Create a relay from your own device, keep data local by default, and use
+            Nostr&apos;s identity layer to share it with trusted peers in your network.
+          </p>
+
+          <p>
+            The result is a simpler, more adaptable and personalized relay model: one that works
+            for smaller, intentional networks where a relay can be leveraged as a user-owned
+            building block for permissionless speech, coordination, and custom apps.
           </p>
         </div>
 
         <div className="space-y-4 text-base">
-          <h2 className="text-2xl font-bold">Why Nostr still matters here</h2>
+          <h2 className="text-2xl font-bold">What You Can Build</h2>
           <p>
-            <span className="font-semibold text-foreground">Nostr</span> is a simple, open protocol
-            for portable identity, relay-based discovery, and interoperable event flows. Hyperpipe
-            uses that openness as the control plane for private group relays, relay membership, and
-            peer-to-peer coordination.
+            {APP_DISPLAY_NAME} relays come out-of-the-box with p2p database replication, state
+            synchronization, and file-sharing capabilities.
           </p>
 
           <p>
-            The result is a workflow that combines direct peer replication with a persistent
-            availability layer. You keep local ownership of your account and data while still being
-            able to rejoin a relay, browse the latest state, and publish new updates without
-            waiting for another operator to come online.
+            This native p2p-first model makes it trivial for users to run feature-rich Nostr relays
+            at the edge of the network without servers or middlemen, providing a practical solution
+            for use cases where we seek more direct control, moderation, and privacy around who we
+            talk to, and what we share:
           </p>
+
+          <ul className="list-disc pl-6 space-y-2">
+            <li>Personal and family relays</li>
+            <li>Private group chat relays</li>
+            <li>Community and interest-based relays</li>
+            <li>Secure file-sharing spaces</li>
+            <li>Ephemeral relays for events, campaigns, trips, and working-groups</li>
+            <li>Coordination relays for autonomous agents and mixed human-agent systems</li>
+            <li>Purpose-built apps and custom client surfaces wrapped around a relay</li>
+          </ul>
 
           <p>
-            If you are new to Nostr, the protocol basics are still worth learning. They explain the
-            identity model, event format, and relay architecture that Hyperpipe extends for
-            multiwriter relays and file distribution.
+            Hosting private online spaces should not require permissioned platforms, including the
+            infrastructure layer. While most relays still depend on someone else&apos;s server,
+            someone else&apos;s rules, and someone else&apos;s uptime, {APP_DISPLAY_NAME} aims to
+            offer a new alternative that makes relay ownership as practical and self-sovereign as
+            owning your Nostr identity.
           </p>
-        </div>
-
-        <div className="flex justify-center pt-2">
-          <Button size="lg" onClick={handleLearnMore} className="px-8">
-            Learn more about Nostr
-          </Button>
         </div>
       </div>
     </SecondaryPageLayout>
