@@ -16,9 +16,9 @@ function usage() {
     '',
     'The script assembles a portable bundle directory containing:',
     '  - the built hyperpipe-tui dist output',
-    '  - the @hyperpipe/core runtime package',
-    '  - the @hyperpipe/core-host launcher package',
-    '  - the @hyperpipe/bridge integration package',
+    '  - the @squip/hyperpipe-core runtime package',
+    '  - the @squip/hyperpipe-core-host launcher package',
+    '  - the @squip/hyperpipe-bridge integration package',
     '  - a bundled Node.js runtime',
     '  - launcher scripts for the target platform'
   ].join('\n')

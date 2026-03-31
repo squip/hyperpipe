@@ -15,7 +15,7 @@ import {
   runInitCommand,
   runSmokeCommand
 } from '../lib/commands.mjs';
-import { verifyOperatorAttestation } from '@hyperpipe/bridge/public-gateway/OperatorAttestation';
+import { verifyOperatorAttestation } from '@squip/hyperpipe-bridge/public-gateway/OperatorAttestation';
 
 const OPERATOR_SECRET_HEX = '7'.repeat(64);
 const OPERATOR_PUBKEY = Buffer.from(

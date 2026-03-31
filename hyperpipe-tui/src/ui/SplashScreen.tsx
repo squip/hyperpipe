@@ -8,7 +8,7 @@ import {
   HYPERPIPE_SPLASH_DESKTOP_DURATION_MS,
   HYPERPIPE_SPLASH_TOTAL_FRAMES,
   renderHyperpipeSplashGrid
-} from '@hyperpipe/bridge/ui/hyperpipeSplash'
+} from '@squip/hyperpipe-bridge/ui/hyperpipeSplash'
 
 type SplashScreenProps = {
   onComplete: () => void

@@ -1,5 +1,5 @@
 {
-  "name": "@hyperpipe/bridge",
+  "name": "@squip/hyperpipe-bridge",
   "version": "0.1.0",
   "description": "First-party integration layer for Hyperpipe core, gateway, and client packages",
   "type": "module",

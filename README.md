@@ -5,9 +5,9 @@ Canonical Hyperpipe monorepo.
 This repository contains the first-party packages and applications that make up the
 Hyperpipe stack:
 
-- `hyperpipe-bridge` -> `@hyperpipe/bridge`
-- `hyperpipe-core` -> `@hyperpipe/core`
-- `hyperpipe-core-host` -> `@hyperpipe/core-host`
+- `hyperpipe-bridge` -> `@squip/hyperpipe-bridge`
+- `hyperpipe-core` -> `@squip/hyperpipe-core`
+- `hyperpipe-core-host` -> `@squip/hyperpipe-core-host`
 - `hyperpipe-desktop`
 - `hyperpipe-tui`
 - `hyperpipe-gateway`

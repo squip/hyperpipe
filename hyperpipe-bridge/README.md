@@ -1,6 +1,6 @@
-# @hyperpipe/bridge
+# @squip/hyperpipe-bridge
 
-`@hyperpipe/bridge` is the first-party integration package shared by Hyperpipe Core,
+`@squip/hyperpipe-bridge` is the first-party integration package shared by Hyperpipe Core,
 Gateway, and client applications.
 
 It contains the currently shared runtime surfaces for:

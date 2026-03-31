@@ -1,4 +1,4 @@
 export {
   WorkerHost,
   findDefaultWorkerRoot
-} from '@hyperpipe/core-host'
+} from '@squip/hyperpipe-core-host'

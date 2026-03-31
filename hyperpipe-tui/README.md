@@ -1,6 +1,6 @@
 # Hyperpipe TUI (Ink)
 
-Terminal UI implementation of the Hyperpipe client, backed by `@hyperpipe/core` through the shared `@hyperpipe/core-host` launcher contract.
+Terminal UI implementation of the Hyperpipe client, backed by `@squip/hyperpipe-core` through the shared `@squip/hyperpipe-core-host` launcher contract.
 
 ## Run
 

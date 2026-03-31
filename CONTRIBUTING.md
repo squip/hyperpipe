@@ -11,9 +11,9 @@ Repository policy:
 
 Current first-party packages:
 
-- `@hyperpipe/bridge`
-- `@hyperpipe/core`
-- `@hyperpipe/core-host`
+- `@squip/hyperpipe-bridge`
+- `@squip/hyperpipe-core`
+- `@squip/hyperpipe-core-host`
 
 Current first-party applications:
 

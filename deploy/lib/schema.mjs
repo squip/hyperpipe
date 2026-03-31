@@ -8,7 +8,7 @@ import {
   OPERATOR_ATTESTATION_PURPOSE,
   createOperatorAttestationRequest,
   verifyOperatorAttestation
-} from '@hyperpipe/bridge/public-gateway/OperatorAttestation';
+} from '@squip/hyperpipe-bridge/public-gateway/OperatorAttestation';
 import { parseEnvText } from './env-file.mjs';
 
 export const PROFILE_NAMES = ['open', 'allowlist', 'wot', 'allowlist+wot'];

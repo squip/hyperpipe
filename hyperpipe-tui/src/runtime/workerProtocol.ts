@@ -6,4 +6,4 @@ export type {
   WorkerConfig,
   WorkerEvent,
   WorkerRequestResult
-} from '@hyperpipe/core-host'
+} from '@squip/hyperpipe-core-host'
