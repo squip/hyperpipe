@@ -1,6 +1,6 @@
 // Type definitions supporting the public gateway relay integration (Phase 0)
-// These interfaces formalise the contracts referenced in docs/public-gateway-relay-interface-contracts.md
-// and should be kept in sync with runtime implementations as phases progress.
+// These interfaces formalise the gateway relay contracts and should be kept in
+// sync with the runtime implementations as phases progress.
 
 export interface NostrTag extends Array<string> {}
 

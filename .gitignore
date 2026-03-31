@@ -55,6 +55,7 @@ deploy/node_modules/
 deploy/environments/*.env
 !deploy/environments/.gitkeep
 hyperpipe-gateway/deploy/runtime/.env
+/docs/
 
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/
