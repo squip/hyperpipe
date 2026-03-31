@@ -67,7 +67,7 @@ jobs:
             notarize: false
     runs-on: ${{ matrix.os }}
     env:
-      DESKTOP_STANDALONE_DIR: ${{ runner.temp }}/hyperpipe-desktop-standalone
+      DESKTOP_STANDALONE_DIR: .desktop-release-workdir
     steps:
       - uses: actions/checkout@v5
 
