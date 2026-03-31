@@ -1,0 +1,111 @@
+name: Sync Public Mirrors
+
+on:
+  workflow_dispatch:
+    inputs:
+      mirror:
+        description: Mirror repo to sync
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - hyperpipe-bridge
+          - hyperpipe-core
+          - hyperpipe-core-host
+          - hyperpipe-desktop
+          - hyperpipe-tui
+          - hyperpipe-gateway
+      ref:
+        description: Monorepo ref to mirror
+        required: false
+        default: main
+        type: string
+      dry_run:
+        description: Prepare the mirror tree without pushing
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/sync-public-mirrors.yml'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+      - 'README.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'CODE_OF_CONDUCT.md'
+      - 'scripts/sync-public-mirror.sh'
+      - 'hyperpipe-bridge/**'
+      - 'hyperpipe-core/**'
+      - 'hyperpipe-core-host/**'
+      - 'hyperpipe-desktop/**'
+      - 'hyperpipe-tui/**'
+      - 'hyperpipe-gateway/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-public-mirrors-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mirror: hyperpipe-bridge
+            prefix: hyperpipe-bridge
+            target_repo: squip/hyperpipe-bridge
+          - mirror: hyperpipe-core
+            prefix: hyperpipe-core
+            target_repo: squip/hyperpipe-core
+          - mirror: hyperpipe-core-host
+            prefix: hyperpipe-core-host
+            target_repo: squip/hyperpipe-core-host
+          - mirror: hyperpipe-desktop
+            prefix: hyperpipe-desktop
+            target_repo: squip/hyperpipe-desktop
+          - mirror: hyperpipe-tui
+            prefix: hyperpipe-tui
+            target_repo: squip/hyperpipe-tui
+          - mirror: hyperpipe-gateway
+            prefix: hyperpipe-gateway
+            target_repo: squip/hyperpipe-gateway
+    if: github.event_name == 'push' || inputs.mirror == 'all' || inputs.mirror == matrix.mirror
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify mirror token presence
+        if: github.event_name != 'workflow_dispatch' || inputs.dry_run != true
+        env:
+          MIRROR_PUSH_TOKEN: ${{ secrets.PUBLIC_MIRROR_PUSH_TOKEN }}
+        run: |
+          if [ -z "${MIRROR_PUSH_TOKEN:-}" ]; then
+            echo "Missing required secret: PUBLIC_MIRROR_PUSH_TOKEN" >&2
+            exit 1
+          fi
+
+      - name: Sync mirror
+        env:
+          MIRROR_PUSH_TOKEN: ${{ secrets.PUBLIC_MIRROR_PUSH_TOKEN }}
+        run: |
+          REF="${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}"
+          DRY_RUN_FLAG=""
+          if [ "${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+
+          ./scripts/sync-public-mirror.sh \
+            --prefix "${{ matrix.prefix }}" \
+            --target "${{ matrix.target_repo }}" \
+            --branch main \
+            --ref "$REF" \
+            $DRY_RUN_FLAG
