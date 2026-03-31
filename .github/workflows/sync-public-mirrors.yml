@@ -77,14 +77,14 @@ jobs:
           - mirror: hyperpipe-gateway
             prefix: hyperpipe-gateway
             target_repo: squip/hyperpipe-gateway
-    if: github.event_name == 'push' || inputs.mirror == 'all' || inputs.mirror == matrix.mirror
     steps:
       - uses: actions/checkout@v4
+        if: github.event_name == 'push' || inputs.mirror == 'all' || inputs.mirror == matrix.mirror
         with:
           fetch-depth: 0
 
       - name: Verify mirror token presence
-        if: github.event_name != 'workflow_dispatch' || inputs.dry_run != true
+        if: (github.event_name == 'push' || inputs.mirror == 'all' || inputs.mirror == matrix.mirror) && (github.event_name != 'workflow_dispatch' || inputs.dry_run != true)
         env:
           MIRROR_PUSH_TOKEN: ${{ secrets.PUBLIC_MIRROR_PUSH_TOKEN }}
         run: |
@@ -94,6 +94,7 @@ jobs:
           fi
 
       - name: Sync mirror
+        if: github.event_name == 'push' || inputs.mirror == 'all' || inputs.mirror == matrix.mirror
         env:
           MIRROR_PUSH_TOKEN: ${{ secrets.PUBLIC_MIRROR_PUSH_TOKEN }}
         run: |
