@@ -1,6 +1,6 @@
 import { formatNpub } from '@/lib/pubkey'
 import { Check, Copy } from 'lucide-react'
-import * as nip19 from '@nostr/tools/nip19'
+import * as nip19 from '@jsr/nostr__tools/nip19'
 import { useMemo, useState } from 'react'
 
 export default function PubkeyCopy({ pubkey }: { pubkey: string }) {

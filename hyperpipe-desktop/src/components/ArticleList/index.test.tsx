@@ -1,5 +1,5 @@
 import { render, screen, waitFor } from '@testing-library/react'
-import type { Event } from '@nostr/tools/wasm'
+import type { Event } from '@jsr/nostr__tools/wasm'
 import { vi } from 'vitest'
 
 let subscribedEventsMock: Event[] = []

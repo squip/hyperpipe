@@ -3,9 +3,9 @@ import UserAvatar from '@/components/UserAvatar'
 import { FormattedTimestamp } from '@/components/FormattedTimestamp'
 import { SecondaryPageLink } from '@/PageManager'
 import { toArticle } from '@/lib/link'
-import { Event } from '@nostr/tools/wasm'
+import { Event } from '@jsr/nostr__tools/wasm'
 import { useEffect, useMemo, useState } from 'react'
-import * as nip19 from '@nostr/tools/nip19'
+import * as nip19 from '@jsr/nostr__tools/nip19'
 
 export default function ArticleCard({ event }: { event: Event }) {
   const [shouldShowImage, setShouldShowImage] = useState(true)

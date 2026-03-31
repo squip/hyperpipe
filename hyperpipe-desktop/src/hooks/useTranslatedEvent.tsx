@@ -1,5 +1,5 @@
 import { useTranslationService } from '@/providers/TranslationServiceProvider'
-import { Event } from '@nostr/tools/wasm'
+import { Event } from '@jsr/nostr__tools/wasm'
 import { useEffect, useMemo, useState } from 'react'
 
 export function useTranslatedEvent(eventId?: string) {

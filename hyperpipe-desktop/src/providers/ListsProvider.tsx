@@ -2,10 +2,10 @@ import { BIG_RELAY_URLS, ExtendedKind } from '@/constants'
 import { dedupeRelayUrlsByIdentity } from '@/lib/relay-targets'
 import client from '@/services/client.service'
 import { TDraftEvent } from '@/types'
-import { Event } from '@nostr/tools/wasm'
+import { Event } from '@jsr/nostr__tools/wasm'
 import { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef, ReactNode } from 'react'
 import { useNostr } from './NostrProvider'
-import * as kinds from '@nostr/tools/kinds'
+import * as kinds from '@jsr/nostr__tools/kinds'
 
 export type TStarterPack = {
   id: string // d tag value

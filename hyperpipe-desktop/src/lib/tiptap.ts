@@ -1,7 +1,7 @@
 import customEmojiService from '@/services/custom-emoji.service'
 import { emojis, shortcodeToEmoji } from '@tiptap/extension-emoji'
 import { JSONContent } from '@tiptap/react'
-import * as nip19 from '@nostr/tools/nip19'
+import * as nip19 from '@jsr/nostr__tools/nip19'
 
 export function parseEditorJsonToText(node?: JSONContent) {
   const text = _parseEditorJsonToText(node).trim()

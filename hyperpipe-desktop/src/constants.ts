@@ -1,4 +1,4 @@
-import * as kinds from '@nostr/tools/kinds'
+import * as kinds from '@jsr/nostr__tools/kinds'
 
 export const APP_DISPLAY_NAME = 'Hyperpipe'
 export const APP_DESCRIPTION = 'Desktop client for Hyperpipe peer-to-peer Nostr relays and file sharing'

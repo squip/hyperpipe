@@ -10,8 +10,8 @@ import { useUserTrust } from '@/providers/UserTrustProvider'
 import client from '@/services/client.service'
 import { TFeedSubRequest } from '@/types'
 import dayjs from 'dayjs'
-import { Event, NostrEvent, verifyEvent } from '@nostr/tools/wasm'
-import * as kinds from '@nostr/tools/kinds'
+import { Event, NostrEvent, verifyEvent } from '@jsr/nostr__tools/wasm'
+import * as kinds from '@jsr/nostr__tools/kinds'
 import {
   forwardRef,
   useCallback,
@@ -392,7 +392,7 @@ const NoteList = forwardRef(
               scheduleResubscribe(url, reason)
             }
             if (!showRelayCloseReason) return
-            // ignore reasons from @nostr/tools
+            // ignore reasons from @jsr/nostr__tools
             if (
               [
                 'closed by caller',

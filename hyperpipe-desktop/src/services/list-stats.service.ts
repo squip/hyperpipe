@@ -3,9 +3,9 @@ import { getZapInfoFromEvent } from '@/lib/event-metadata'
 import { dedupeRelayUrlsByIdentity } from '@/lib/relay-targets'
 import client from '@/services/client.service'
 import dayjs from 'dayjs'
-import { Event } from '@nostr/tools/wasm'
-import { Filter } from '@nostr/tools/filter'
-import * as kinds from '@nostr/tools/kinds'
+import { Event } from '@jsr/nostr__tools/wasm'
+import { Filter } from '@jsr/nostr__tools/filter'
+import * as kinds from '@jsr/nostr__tools/kinds'
 
 export type TListStats = {
   zapPrSet: Set<string>

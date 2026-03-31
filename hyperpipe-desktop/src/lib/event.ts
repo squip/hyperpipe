@@ -2,10 +2,10 @@ import { EMBEDDED_MENTION_REGEX, ExtendedKind } from '@/constants'
 import client from '@/services/client.service'
 import { TImetaInfo } from '@/types'
 import { LRUCache } from 'lru-cache'
-import { Event, UnsignedEvent } from '@nostr/tools/wasm'
-import * as kinds from '@nostr/tools/kinds'
-import * as nip19 from '@nostr/tools/nip19'
-import { fastEventHash, getPow } from '@nostr/tools/nip13'
+import { Event, UnsignedEvent } from '@jsr/nostr__tools/wasm'
+import * as kinds from '@jsr/nostr__tools/kinds'
+import * as nip19 from '@jsr/nostr__tools/nip19'
+import { fastEventHash, getPow } from '@jsr/nostr__tools/nip13'
 import {
   generateBech32IdFromATag,
   generateBech32IdFromETag,

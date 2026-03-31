@@ -9,7 +9,7 @@ import { useScreenSize } from '@/providers/ScreenSizeProvider'
 import modalManager from '@/services/modal-manager.service'
 import { TSearchParams } from '@/types'
 import { Hash, Notebook, Search, Server } from 'lucide-react'
-import * as nip19 from '@nostr/tools/nip19'
+import * as nip19 from '@jsr/nostr__tools/nip19'
 import {
   forwardRef,
   HTMLAttributes,

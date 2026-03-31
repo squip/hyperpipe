@@ -1,5 +1,5 @@
 import { visit } from 'unist-util-visit'
-import * as nip19 from '@nostr/tools/nip19'
+import * as nip19 from '@jsr/nostr__tools/nip19'
 import type { Root, Text, Link } from 'mdast'
 
 export function remarkNostrLinks() {

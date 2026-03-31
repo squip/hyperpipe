@@ -1,7 +1,7 @@
 import { Button } from '@/components/ui/button'
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
-import { Event } from '@nostr/tools/wasm'
+import { Event } from '@jsr/nostr__tools/wasm'
 import { List } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'

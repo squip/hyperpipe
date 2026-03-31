@@ -1,4 +1,4 @@
-import { npubEncode } from '@nostr/tools/nip19'
+import { npubEncode } from '@jsr/nostr__tools/nip19'
 import { Button } from '@/components/ui/button'
 import {
   DropdownMenu,

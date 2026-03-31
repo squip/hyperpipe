@@ -8,7 +8,7 @@ import {
   useRef,
   useState
 } from 'react'
-import * as nip19 from '@nostr/tools/nip19'
+import * as nip19 from '@jsr/nostr__tools/nip19'
 import {
   electronIpc,
   WorkerStartResult,

@@ -6,8 +6,8 @@ import {
   resolveCanonicalGroupMembershipState,
   selectPreferredMembershipState
 } from '@/lib/group-membership'
-import type { Filter } from '@nostr/tools/filter'
-import type { Event } from '@nostr/tools/wasm'
+import type { Filter } from '@jsr/nostr__tools/filter'
+import type { Event } from '@jsr/nostr__tools/wasm'
 
 const makeEvent = ({
   id,

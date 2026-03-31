@@ -6,9 +6,9 @@ import { useUserPreferences } from '@/providers/UserPreferencesProvider'
 import client from '@/services/client.service'
 import noteStatsService from '@/services/note-stats.service'
 import dayjs from 'dayjs'
-import { NostrEvent } from '@nostr/tools/wasm'
-import { matchFilter } from '@nostr/tools/filter'
-import * as kinds from '@nostr/tools/kinds'
+import { NostrEvent } from '@jsr/nostr__tools/wasm'
+import { matchFilter } from '@jsr/nostr__tools/filter'
+import * as kinds from '@jsr/nostr__tools/kinds'
 import {
   forwardRef,
   useCallback,

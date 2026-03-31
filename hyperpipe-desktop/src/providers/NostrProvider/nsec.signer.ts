@@ -1,7 +1,7 @@
 import { ISigner, TDraftEvent } from '@/types'
-import { finalizeEvent, getPublicKey as nGetPublicKey } from '@nostr/tools/wasm'
-import * as nip04 from '@nostr/tools/nip04'
-import * as nip19 from '@nostr/tools/nip19'
+import { finalizeEvent, getPublicKey as nGetPublicKey } from '@jsr/nostr__tools/wasm'
+import * as nip04 from '@jsr/nostr__tools/nip04'
+import * as nip19 from '@jsr/nostr__tools/nip19'
 
 export class NsecSigner implements ISigner {
   private privkey: Uint8Array | null = null

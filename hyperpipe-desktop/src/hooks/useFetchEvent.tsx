@@ -1,7 +1,7 @@
 import { useDeletedEvent } from '@/providers/DeletedEventProvider'
 import { useReply } from '@/providers/ReplyProvider'
 import client from '@/services/client.service'
-import { Event } from '@nostr/tools/wasm'
+import { Event } from '@jsr/nostr__tools/wasm'
 import { useEffect, useState } from 'react'
 
 export function useFetchEvent(eventId?: string) {

@@ -96,7 +96,7 @@ import {
 import { Sheet, SheetContent } from '@/components/ui/sheet'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import ListEditorForm from '@/components/ListEditorForm'
-import { Event } from '@nostr/tools/wasm'
+import { Event } from '@jsr/nostr__tools/wasm'
 import PullToRefresh from 'react-simple-pull-to-refresh'
 
 type TSortBy = 'recent' | 'zaps'

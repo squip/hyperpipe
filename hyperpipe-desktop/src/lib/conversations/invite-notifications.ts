@@ -1,5 +1,5 @@
 import type { ConversationInvite } from '@/lib/conversations/types'
-import type { NostrEvent } from '@nostr/tools/wasm'
+import type { NostrEvent } from '@jsr/nostr__tools/wasm'
 
 export const CONVERSATION_INVITE_NOTIFICATION_KIND = 99017
 const CONVERSATION_INVITE_ID_TAG = 'marmot-invite-id'

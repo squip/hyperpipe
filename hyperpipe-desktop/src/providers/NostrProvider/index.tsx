@@ -35,10 +35,10 @@ import {
 } from '@/types'
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
 import dayjs from 'dayjs'
-import { Event, VerifiedEvent } from '@nostr/tools/wasm'
-import * as kinds from '@nostr/tools/kinds'
-import * as nip19 from '@nostr/tools/nip19'
-import * as nip49 from '@nostr/tools/nip49'
+import { Event, VerifiedEvent } from '@jsr/nostr__tools/wasm'
+import * as kinds from '@jsr/nostr__tools/kinds'
+import * as nip19 from '@jsr/nostr__tools/nip19'
+import * as nip49 from '@jsr/nostr__tools/nip49'
 import { createContext, useContext, useEffect, useState, FormEvent, MouseEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -56,7 +56,7 @@ import {
   loadFollowsList,
   loadPins
 } from '@nostr/gadgets/lists'
-import { AddressPointer } from '@nostr/tools/nip19'
+import { AddressPointer } from '@jsr/nostr__tools/nip19'
 import {
   start,
   end,

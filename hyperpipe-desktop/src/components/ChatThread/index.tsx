@@ -9,7 +9,7 @@ import React, {
   type SetStateAction
 } from 'react'
 import mediaUploadService, { type MediaUploadResult } from '@/services/media-upload.service'
-import * as nip19 from '@nostr/tools/nip19'
+import * as nip19 from '@jsr/nostr__tools/nip19'
 import { Button } from '@/components/ui/button'
 import { useMessenger } from '@/providers/MessengerProvider'
 import type { MessageAttachment, ThreadMessage } from '@/lib/conversations/types'

@@ -1,15 +1,24 @@
 import react from '@vitejs/plugin-react'
 import { execSync } from 'child_process'
+import { createRequire } from 'module'
 import path from 'path'
 import { VitePWA } from 'vite-plugin-pwa'
 import { defineConfig } from 'vitest/config'
 import packageJson from './package.json'
 
+const require = createRequire(import.meta.url)
+
 const getGitHash = () => {
   try {
-    return JSON.stringify(execSync('git rev-parse --short HEAD').toString().trim())
+    return JSON.stringify(
+      execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] })
+        .toString()
+        .trim()
+    )
   } catch (error) {
-    console.warn('Failed to retrieve commit hash:', error)
+    if (!(error instanceof Error) || !`${error.message}`.includes('not a git repository')) {
+      console.warn(`Failed to retrieve commit hash: ${error instanceof Error ? error.message : String(error)}`)
+    }
     return '"unknown"'
   }
 }
@@ -20,6 +29,15 @@ const getAppVersion = () => {
   } catch (error) {
     console.warn('Failed to retrieve app version:', error)
     return '"unknown"'
+  }
+}
+
+const resolveBridgePackageRoot = () => {
+  try {
+    const packageJsonPath = require.resolve('@squip/hyperpipe-bridge/package.json')
+    return path.dirname(packageJsonPath)
+  } catch (_) {
+    return path.resolve(__dirname, '../hyperpipe-bridge')
   }
 }
 
@@ -38,7 +56,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
-      '@squip/hyperpipe-bridge': path.resolve(__dirname, '../hyperpipe-bridge')
+      '@squip/hyperpipe-bridge': resolveBridgePackageRoot()
     }
   },
   server: {

@@ -12,9 +12,9 @@ import {
 } from '@/types'
 import { sha256 } from '@noble/hashes/sha2'
 import dayjs from 'dayjs'
-import { Event } from '@nostr/tools/wasm'
-import * as kinds from '@nostr/tools/kinds'
-import * as nip19 from '@nostr/tools/nip19'
+import { Event } from '@jsr/nostr__tools/wasm'
+import * as kinds from '@jsr/nostr__tools/kinds'
+import * as nip19 from '@jsr/nostr__tools/nip19'
 import {
   getReplaceableCoordinate,
   getReplaceableCoordinateFromEvent,

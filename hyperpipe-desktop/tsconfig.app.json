@@ -8,8 +8,7 @@
     "skipLibCheck": true,
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./src/*"],
-      "@squip/hyperpipe-bridge/*": ["../hyperpipe-bridge/*"]
+      "@/*": ["./src/*"]
     },
 
     /* Bundler mode */

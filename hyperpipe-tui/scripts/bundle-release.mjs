@@ -4,10 +4,12 @@ import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
+const require = createRequire(import.meta.url)
 
 function usage() {
   return [
@@ -117,6 +119,10 @@ async function downloadFile(url, outputPath) {
 
 async function extractArchive({ archivePath, extractDir, platform }) {
   if (platform === 'win32') {
+    if (process.platform !== 'win32') {
+      await execFileAsync('unzip', ['-q', archivePath, '-d', extractDir])
+      return
+    }
     await execFileAsync('powershell', [
       '-NoProfile',
       '-Command',
@@ -134,7 +140,7 @@ function shouldCopyCore(relativePath) {
   return !(
     normalized === 'node_modules'
     || normalized.startsWith('node_modules/')
-    normalized === 'data'
+    || normalized === 'data'
     || normalized.startsWith('data/')
     || normalized === 'test'
     || normalized.startsWith('test/')
@@ -202,23 +208,37 @@ async function writeLauncherScripts(bundleRoot, platform) {
   }
 }
 
+function resolvePackageRoot(packageName, searchPaths) {
+  for (const base of searchPaths) {
+    try {
+      const packageJsonPath = require.resolve(`${packageName}/package.json`, { paths: [base] })
+      return path.dirname(packageJsonPath)
+    } catch (_) {
+      // continue
+    }
+  }
+
+  return null
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2))
   const scriptPath = fileURLToPath(import.meta.url)
   const scriptsDir = path.dirname(scriptPath)
   const tuiRoot = path.resolve(scriptsDir, '..')
   const repoRoot = path.resolve(tuiRoot, '..')
-  const coreRoot = path.join(repoRoot, 'hyperpipe-core')
-  const coreHostRoot = path.join(repoRoot, 'hyperpipe-core-host')
-  const bridgeRoot = path.join(repoRoot, 'hyperpipe-bridge')
+  const packageSearchPaths = [tuiRoot, repoRoot, process.cwd()]
+  const coreRoot = resolvePackageRoot('@squip/hyperpipe-core', packageSearchPaths) || path.join(repoRoot, 'hyperpipe-core')
+  const coreHostRoot = resolvePackageRoot('@squip/hyperpipe-core-host', packageSearchPaths) || path.join(repoRoot, 'hyperpipe-core-host')
+  const bridgeRoot = resolvePackageRoot('@squip/hyperpipe-bridge', packageSearchPaths) || path.join(repoRoot, 'hyperpipe-bridge')
   const distRoot = path.join(tuiRoot, 'dist')
   const distEntry = path.join(distRoot, 'cli.js')
   const outputDir = path.resolve(options.outputDir || path.join(tuiRoot, 'release'))
 
   await ensureExists(distEntry, 'Built TUI entry')
-  await ensureExists(coreRoot, 'Core workspace')
-  await ensureExists(coreHostRoot, 'Core Host workspace')
-  await ensureExists(bridgeRoot, 'Bridge workspace')
+  await ensureExists(coreRoot, 'Core package')
+  await ensureExists(coreHostRoot, 'Core Host package')
+  await ensureExists(bridgeRoot, 'Bridge package')
 
   const nodeDist = getNodeDistributionInfo(options.platform, options.arch, options.nodeVersion)
   const bundleName = `hyperpipe-tui-${options.platform}-${options.arch}`
@@ -241,9 +261,9 @@ async function main() {
   await copyDirectory(distRoot, path.join(bundleRoot, 'app', 'dist'), () => true)
   await fs.copyFile(path.join(tuiRoot, 'package.json'), path.join(bundleRoot, 'app', 'package.json'))
   await fs.copyFile(path.join(tuiRoot, 'README.md'), path.join(bundleRoot, 'README.md'))
-  await copyDirectory(coreRoot, path.join(bundleRoot, 'app', 'node_modules', '@hyperpipe', 'core'), shouldCopyCore)
-  await copyDirectory(coreHostRoot, path.join(bundleRoot, 'app', 'node_modules', '@hyperpipe', 'core-host'), shouldCopyCoreHost)
-  await copyDirectory(bridgeRoot, path.join(bundleRoot, 'app', 'node_modules', '@hyperpipe', 'bridge'), shouldCopyBridge)
+  await copyDirectory(coreRoot, path.join(bundleRoot, 'app', 'node_modules', '@squip', 'hyperpipe-core'), shouldCopyCore)
+  await copyDirectory(coreHostRoot, path.join(bundleRoot, 'app', 'node_modules', '@squip', 'hyperpipe-core-host'), shouldCopyCoreHost)
+  await copyDirectory(bridgeRoot, path.join(bundleRoot, 'app', 'node_modules', '@squip', 'hyperpipe-bridge'), shouldCopyBridge)
   await writeLauncherScripts(bundleRoot, options.platform)
 
   const nodeExecutable = path.join(bundleRoot, 'runtime', 'node', nodeDist.nodeExecutableRelativePath)

@@ -1,6 +1,6 @@
 import { TPollCreateData } from '@/types'
 import { Content } from '@tiptap/react'
-import { Event } from '@nostr/tools/wasm'
+import { Event } from '@jsr/nostr__tools/wasm'
 
 type TPostSettings = {
   isNsfw?: boolean

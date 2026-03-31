@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import NoteCard, { NoteCardLoadingSkeleton } from '../NoteCard'
 import { isHex32 } from '@nostr/gadgets/utils'
-import { neventEncode, naddrEncode } from '@nostr/tools/nip19'
+import { neventEncode, naddrEncode } from '@jsr/nostr__tools/nip19'
 
 const SHOW_COUNT = 10
 

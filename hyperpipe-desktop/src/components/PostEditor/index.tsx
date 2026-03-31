@@ -4,7 +4,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sh
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useScreenSize } from '@/providers/ScreenSizeProvider'
 import postEditor from '@/services/post-editor.service'
-import { Event } from '@nostr/tools/wasm'
+import { Event } from '@jsr/nostr__tools/wasm'
 import {
   CSSProperties,
   Dispatch,

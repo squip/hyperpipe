@@ -6,7 +6,7 @@ import {
 } from '@/lib/group-files'
 import { cn } from '@/lib/utils'
 import { useGroups } from '@/providers/GroupsProvider'
-import { Event } from '@nostr/tools/wasm'
+import { Event } from '@jsr/nostr__tools/wasm'
 
 function readTag(event: Event, name: string) {
   return event.tags.find((tag) => tag[0] === name)?.[1]

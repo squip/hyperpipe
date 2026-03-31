@@ -29,8 +29,8 @@ import {
   type GroupRelayTarget
 } from '@/lib/relay-targets'
 import { ImageUp, ListTodo, LoaderCircle, Settings, Smile, X } from 'lucide-react'
-import { Event } from '@nostr/tools/wasm'
-import * as kinds from '@nostr/tools/kinds'
+import { Event } from '@jsr/nostr__tools/wasm'
+import * as kinds from '@jsr/nostr__tools/kinds'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'

@@ -15,8 +15,8 @@ import rehypeRaw from 'rehype-raw'
 import rehypeSanitize from 'rehype-sanitize'
 import { remarkNostrLinks, nostrSanitizeSchema } from '@/lib/markdown'
 import { EmbeddedNote } from '@/components/Embedded/EmbeddedNote'
-import * as nip19 from '@nostr/tools/nip19'
-import { Event } from '@nostr/tools/wasm'
+import * as nip19 from '@jsr/nostr__tools/nip19'
+import { Event } from '@jsr/nostr__tools/wasm'
 
 const ArticlePage = forwardRef(({ id, index }: { id?: string; index?: number }, ref) => {
   const { t } = useTranslation()

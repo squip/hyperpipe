@@ -12,8 +12,8 @@ import { useGroupedNotesReadStatus } from '@/hooks/useGroupedNotesReadStatus'
 import { getTimeFrameInMs } from '@/lib/time-frame'
 import client from '@/services/client.service'
 import { TFeedSubRequest } from '@/types'
-import { Event, NostrEvent } from '@nostr/tools/wasm'
-import * as kinds from '@nostr/tools/kinds'
+import { Event, NostrEvent } from '@jsr/nostr__tools/wasm'
+import * as kinds from '@jsr/nostr__tools/kinds'
 import { Loader2 } from 'lucide-react'
 import {
   forwardRef,
@@ -1239,7 +1239,7 @@ const GroupedNoteList = forwardRef(
               scheduleResubscribe(url, reason)
             }
             if (!showRelayCloseReason) return
-            // ignore reasons from @nostr/tools
+            // ignore reasons from @jsr/nostr__tools
             if (
               [
                 'closed by caller',

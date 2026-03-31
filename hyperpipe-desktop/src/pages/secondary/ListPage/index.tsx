@@ -15,7 +15,7 @@ import { useNostr } from '@/providers/NostrProvider'
 import Username from '@/components/Username'
 import UserAvatar from '@/components/UserAvatar'
 import client from '@/services/client.service'
-import { Event } from '@nostr/tools/wasm'
+import { Event } from '@jsr/nostr__tools/wasm'
 import { useFollowList } from '@/providers/FollowListProvider'
 
 type ListPageProps = {

@@ -1,4 +1,4 @@
-import { npubEncode } from '@nostr/tools/nip19'
+import { npubEncode } from '@jsr/nostr__tools/nip19'
 import FollowingBadge from '@/components/FollowingBadge'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { formatNpub } from '@/lib/pubkey'

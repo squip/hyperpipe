@@ -1,5 +1,5 @@
-import { Event, VerifiedEvent } from '@nostr/tools/wasm'
-import { Filter } from '@nostr/tools/filter'
+import { Event, VerifiedEvent } from '@jsr/nostr__tools/wasm'
+import { Filter } from '@jsr/nostr__tools/filter'
 import {
   HOSTED_TRANSLATION_SERVICE_ID,
   LINK_PREVIEW_MODE,

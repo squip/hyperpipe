@@ -2,7 +2,7 @@ import { BIG_RELAY_URLS, SUPPORTED_KINDS } from '@/constants'
 import { pool } from '@nostr/gadgets/global'
 import { OutboxManager } from '@nostr/gadgets/outbox'
 import { IDBEventStore } from '@nostr/gadgets/store'
-import { NostrEvent } from '@nostr/tools/core'
+import { NostrEvent } from '@jsr/nostr__tools/core'
 
 export const store = new IDBEventStore()
 export let outbox: OutboxManager

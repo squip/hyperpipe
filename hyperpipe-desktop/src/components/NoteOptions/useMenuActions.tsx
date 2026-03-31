@@ -1,4 +1,4 @@
-import { npubEncode } from '@nostr/tools/nip19'
+import { npubEncode } from '@jsr/nostr__tools/nip19'
 import { getNoteBech32Id, isProtectedEvent } from '@/lib/event'
 import { toNjump } from '@/lib/link'
 import { simplifyUrl } from '@/lib/url'
@@ -24,8 +24,8 @@ import {
   Trash2,
   TriangleAlert
 } from 'lucide-react'
-import { Event } from '@nostr/tools/wasm'
-import * as kinds from '@nostr/tools/kinds'
+import { Event } from '@jsr/nostr__tools/wasm'
+import * as kinds from '@jsr/nostr__tools/kinds'
 import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'

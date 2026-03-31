@@ -7,7 +7,7 @@ import { useGroups } from '@/providers/GroupsProvider'
 import { TFeedSubRequest, TPageRef } from '@/types'
 import { useTranslation } from 'react-i18next'
 import { forwardRef, useEffect, useMemo, useRef, useState } from 'react'
-import { Event as NostrEvent } from '@nostr/tools/wasm'
+import { Event as NostrEvent } from '@jsr/nostr__tools/wasm'
 import {
   Users,
   Loader2,
@@ -56,7 +56,7 @@ import Nip05 from '@/components/Nip05'
 import { useMuteList } from '@/providers/MuteListProvider'
 import ReportDialog from '@/components/NoteOptions/ReportDialog'
 import localStorageService from '@/services/local-storage.service'
-import * as nip19 from '@nostr/tools/nip19'
+import * as nip19 from '@jsr/nostr__tools/nip19'
 import { SimpleUserAvatar } from '@/components/UserAvatar'
 import { SimpleUsername } from '@/components/Username'
 import { generateImageByPubkey } from '@/lib/pubkey'

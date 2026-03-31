@@ -1,6 +1,6 @@
 import { TSearchParams } from '@/types'
-import { Event } from '@nostr/tools/wasm'
-import * as nip19 from '@nostr/tools/nip19'
+import { Event } from '@jsr/nostr__tools/wasm'
+import * as nip19 from '@jsr/nostr__tools/nip19'
 import { getNoteBech32Id } from './event'
 
 export const toHome = () => '/'

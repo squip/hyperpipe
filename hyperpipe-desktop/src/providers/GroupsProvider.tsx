@@ -74,7 +74,7 @@ import { useNostr } from './NostrProvider'
 import { randomString } from '@/lib/random'
 import { useWorkerBridge } from './WorkerBridgeProvider'
 import type { TPublishOptions } from '@/types'
-import * as nip19 from '@nostr/tools/nip19'
+import * as nip19 from '@jsr/nostr__tools/nip19'
 import { normalizeUrl } from '@/lib/url'
 import type { CreateGroupProgressState } from '@/lib/workflow-progress-ui'
 

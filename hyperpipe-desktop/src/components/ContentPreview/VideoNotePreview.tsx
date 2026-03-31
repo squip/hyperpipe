@@ -1,5 +1,5 @@
 import { cn } from '@/lib/utils'
-import { Event } from '@nostr/tools/wasm'
+import { Event } from '@jsr/nostr__tools/wasm'
 import { useTranslation } from 'react-i18next'
 
 export default function VideoNotePreview({

@@ -1,6 +1,6 @@
 import { TDraftEvent } from '@/types'
 import { MediaUploadResult } from '@/services/media-upload.service'
-import { Event as NostrEvent } from '@nostr/tools/wasm'
+import { Event as NostrEvent } from '@jsr/nostr__tools/wasm'
 
 export type GroupFileSortKey = 'fileName' | 'uploadedAt' | 'uploadedBy' | 'size' | 'mime'
   | 'group'

@@ -1,5 +1,5 @@
 import { getUsingClient } from '@/lib/event'
-import { NostrEvent } from '@nostr/tools/wasm'
+import { NostrEvent } from '@jsr/nostr__tools/wasm'
 import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 

@@ -8,7 +8,7 @@ import { cn } from '@/lib/utils'
 import { useKindFilter } from '@/providers/KindFilterProvider'
 import { useScreenSize } from '@/providers/ScreenSizeProvider'
 import { ListFilter } from 'lucide-react'
-import * as kinds from '@nostr/tools/kinds'
+import * as kinds from '@jsr/nostr__tools/kinds'
 import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 

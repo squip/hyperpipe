@@ -1,6 +1,6 @@
-import { npubEncode } from '@nostr/tools/nip19'
+import { npubEncode } from '@jsr/nostr__tools/nip19'
 import { LRUCache } from 'lru-cache'
-import * as nip19 from '@nostr/tools/nip19'
+import * as nip19 from '@jsr/nostr__tools/nip19'
 
 export function formatPubkey(pubkey: string) {
   const npub = npubEncode(pubkey)

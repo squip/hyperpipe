@@ -4,7 +4,7 @@ import { GroupFileRecord, parseGroupFileRecordFromEvent } from '@/lib/group-file
 import { useNostr } from '@/providers/NostrProvider'
 import client from '@/services/client.service'
 import { TFeedSubRequest } from '@/types'
-import { Event as NostrEvent } from '@nostr/tools/wasm'
+import { Event as NostrEvent } from '@jsr/nostr__tools/wasm'
 import { useEffect, useMemo, useState } from 'react'
 
 const ENABLE_GROUP_FILES_DEBUG_LOGS = false

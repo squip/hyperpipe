@@ -1,5 +1,5 @@
 import { TFeedSubRequest } from '@/types'
-import { Filter } from '@nostr/tools/filter'
+import { Filter } from '@jsr/nostr__tools/filter'
 
 export const DEFAULT_WARM_HYDRATION_OVERLAP_SECONDS = 10
 

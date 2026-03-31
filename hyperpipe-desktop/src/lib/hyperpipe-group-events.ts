@@ -1,4 +1,4 @@
-import { Event } from '@nostr/tools/wasm'
+import { Event } from '@jsr/nostr__tools/wasm'
 import { TDraftEvent } from '@/types'
 
 export const HYPERPIPE_IDENTIFIER_TAG = 'hyperpipe:relay'

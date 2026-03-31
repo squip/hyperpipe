@@ -10,8 +10,8 @@ import type {
   TPersistedGroupMembershipRecord,
   TPersistedGroupMembershipSnapshot
 } from '@/types/groups'
-import type { Filter } from '@nostr/tools/filter'
-import type { Event } from '@nostr/tools/wasm'
+import type { Filter } from '@jsr/nostr__tools/filter'
+import type { Event } from '@jsr/nostr__tools/wasm'
 
 export type GroupMembershipLiveSourceKey = 'resolved-relay' | 'discovery'
 

@@ -167,13 +167,6 @@ for (const host of envAllowlist) {
   DEFAULT_CERT_ALLOWLIST.add(host);
 }
 
-function getBridgeRoot() {
-  if (app.isPackaged) {
-    return path.join(process.resourcesPath, 'app', 'node_modules', '@hyperpipe', 'bridge');
-  }
-  return path.join(REPO_ROOT, 'hyperpipe-bridge');
-}
-
 function resolveExistingRoot(candidates) {
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;
@@ -181,15 +174,41 @@ function resolveExistingRoot(candidates) {
   return candidates[0];
 }
 
-function getCoreRoot() {
-  if (app.isPackaged) {
-    return resolveExistingRoot([
-      path.join(process.resourcesPath, 'app', 'node_modules', '@hyperpipe', 'core')
-    ]);
+function resolveInstalledPackageRoot(packageName) {
+  const searchPaths = [
+    APP_ROOT,
+    __dirname,
+    process.cwd(),
+    path.resolve(APP_ROOT, '..'),
+    path.resolve(APP_ROOT, '../..')
+  ];
+
+  for (const base of searchPaths) {
+    try {
+      const packageJsonPath = require.resolve(`${packageName}/package.json`, { paths: [base] });
+      return path.dirname(packageJsonPath);
+    } catch (_) {
+      // continue
+    }
   }
+
+  return null;
+}
+
+function getBridgeRoot() {
   return resolveExistingRoot([
+    app.isPackaged ? path.join(process.resourcesPath, 'app', 'node_modules', '@squip', 'hyperpipe-bridge') : null,
+    resolveInstalledPackageRoot('@squip/hyperpipe-bridge'),
+    path.join(REPO_ROOT, 'hyperpipe-bridge')
+  ].filter(Boolean));
+}
+
+function getCoreRoot() {
+  return resolveExistingRoot([
+    app.isPackaged ? path.join(process.resourcesPath, 'app', 'node_modules', '@squip', 'hyperpipe-core') : null,
+    resolveInstalledPackageRoot('@squip/hyperpipe-core'),
     path.join(REPO_ROOT, 'hyperpipe-core')
-  ]);
+  ].filter(Boolean));
 }
 
 function getRendererIndexPath() {

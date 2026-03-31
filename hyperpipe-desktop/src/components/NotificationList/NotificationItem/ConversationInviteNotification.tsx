@@ -2,7 +2,7 @@ import { parseConversationInviteNotification } from '@/lib/conversations/invite-
 import { usePrimaryPage } from '@/PageManager'
 import { useMessenger } from '@/providers/MessengerProvider'
 import { MessageSquare } from 'lucide-react'
-import { Event } from '@nostr/tools/wasm'
+import { Event } from '@jsr/nostr__tools/wasm'
 import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
