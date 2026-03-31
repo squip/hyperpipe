@@ -22,6 +22,12 @@ jobs:
       - name: Install workspace dependencies
         run: npm ci
 
+      - name: Install Rollup Linux native binary
+        if: runner.os == 'Linux'
+        run: |
+          ROLLUP_VERSION=$(node -p "require('./hyperpipe-desktop/node_modules/rollup/package.json').version")
+          npm install --no-save @rollup/rollup-linux-x64-gnu@${ROLLUP_VERSION}
+
       - name: Verify core
         run: npm --workspace ./hyperpipe-core test
 
@@ -72,6 +78,12 @@ jobs:
 
       - name: Install workspace dependencies
         run: npm ci
+
+      - name: Install Rollup Linux native binary
+        if: runner.os == 'Linux'
+        run: |
+          ROLLUP_VERSION=$(node -p "require('./hyperpipe-desktop/node_modules/rollup/package.json').version")
+          npm install --no-save @rollup/rollup-linux-x64-gnu@${ROLLUP_VERSION}
 
       - name: Install xvfb (Linux)
         if: runner.os == 'Linux'
