@@ -1,0 +1,21 @@
+{
+  "name": "hyperpipe",
+  "private": true,
+  "workspaces": [
+    "deploy",
+    "hyperpipe-bridge",
+    "hyperpipe-core",
+    "hyperpipe-core-host",
+    "hyperpipe-desktop",
+    "hyperpipe-gateway",
+    "hyperpipe-tui"
+  ],
+  "scripts": {
+    "release:version": "changeset version",
+    "release:publish": "changeset publish",
+    "pack:check": "npm pack --dry-run --workspace @squip/hyperpipe-bridge && npm pack --dry-run --workspace @squip/hyperpipe-core && npm pack --dry-run --workspace @squip/hyperpipe-core-host && npm pack --dry-run --workspace hyperpipe-tui"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.29.7"
+  }
+}

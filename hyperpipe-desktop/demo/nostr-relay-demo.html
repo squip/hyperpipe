@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hyperpipe HTML Nostr Relay Demo</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #09111d;
+        --panel: #101b2d;
+        --panel-2: #13233a;
+        --line: rgba(226, 232, 240, 0.14);
+        --text: #e2e8f0;
+        --muted: #93a4b8;
+        --accent: #5eead4;
+        --accent-2: #f59e0b;
+        --danger: #fb7185;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(94, 234, 212, 0.12), transparent 28%),
+          radial-gradient(circle at top right, rgba(245, 158, 11, 0.12), transparent 24%),
+          linear-gradient(180deg, #08111d 0%, #0b1525 100%);
+        color: var(--text);
+      }
+
+      main {
+        width: min(1100px, calc(100vw - 32px));
+        margin: 24px auto 48px;
+      }
+
+      .hero,
+      .panel {
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: linear-gradient(180deg, rgba(16, 27, 45, 0.96), rgba(10, 17, 29, 0.96));
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.26);
+      }
+
+      .hero {
+        padding: 24px;
+        margin-bottom: 18px;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(94, 234, 212, 0.12);
+        color: var(--accent);
+        font-size: 12px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 14px 0 8px;
+        font-size: clamp(28px, 4vw, 44px);
+        line-height: 1.04;
+      }
+
+      .hero p,
+      .muted {
+        color: var(--muted);
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
+        gap: 18px;
+      }
+
+      .panel {
+        padding: 18px;
+      }
+
+      .panel h2 {
+        margin: 0 0 14px;
+        font-size: 18px;
+      }
+
+      .stack {
+        display: grid;
+        gap: 12px;
+      }
+
+      label {
+        display: grid;
+        gap: 6px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      input,
+      textarea,
+      select,
+      button {
+        font: inherit;
+      }
+
+      input,
+      textarea,
+      select {
+        width: 100%;
+        border: 1px solid rgba(226, 232, 240, 0.12);
+        border-radius: 12px;
+        background: rgba(9, 17, 29, 0.85);
+        color: var(--text);
+        padding: 12px 13px;
+      }
+
+      textarea {
+        min-height: 120px;
+        resize: vertical;
+      }
+
+      .button-row,
+      .preset-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+
+      button {
+        border: 0;
+        border-radius: 12px;
+        padding: 11px 14px;
+        background: var(--panel-2);
+        color: var(--text);
+        cursor: pointer;
+        transition: transform 120ms ease, opacity 120ms ease, background 120ms ease;
+      }
+
+      button:hover {
+        transform: translateY(-1px);
+      }
+
+      button.primary {
+        background: linear-gradient(135deg, #14b8a6, #0f766e);
+      }
+
+      button.warn {
+        background: linear-gradient(135deg, #d97706, #92400e);
+      }
+
+      button.ghost {
+        background: rgba(255, 255, 255, 0.06);
+      }
+
+      button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+        transform: none;
+      }
+
+      .status {
+        display: grid;
+        gap: 10px;
+      }
+
+      .status-card,
+      .event,
+      .log-line {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: rgba(7, 12, 20, 0.62);
+      }
+
+      .status-card {
+        padding: 14px;
+      }
+
+      .status-card strong {
+        display: block;
+        margin-bottom: 4px;
+      }
+
+      .signal {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-weight: 600;
+      }
+
+      .signal::before {
+        content: "";
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #64748b;
+        box-shadow: 0 0 0 4px rgba(100, 116, 139, 0.16);
+      }
+
+      .signal[data-state="open"]::before {
+        background: #10b981;
+        box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.16);
+      }
+
+      .signal[data-state="connecting"]::before {
+        background: var(--accent-2);
+        box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.16);
+      }
+
+      .signal[data-state="error"]::before,
+      .signal[data-state="closed"]::before {
+        background: var(--danger);
+        box-shadow: 0 0 0 4px rgba(251, 113, 133, 0.16);
+      }
+
+      .warning {
+        padding: 12px 13px;
+        border-radius: 12px;
+        border: 1px solid rgba(245, 158, 11, 0.25);
+        background: rgba(245, 158, 11, 0.08);
+        color: #fcd34d;
+        font-size: 13px;
+      }
+
+      .events,
+      .logs {
+        display: grid;
+        gap: 10px;
+        margin-top: 12px;
+      }
+
+      .event,
+      .log-line {
+        padding: 12px 14px;
+      }
+
+      .event-meta,
+      .log-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 12px;
+        margin-bottom: 8px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .event-content,
+      pre {
+        margin: 0;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+
+      code {
+        font-family: "IBM Plex Mono", "SFMono-Regular", ui-monospace, monospace;
+      }
+
+      .mono {
+        font-family: "IBM Plex Mono", "SFMono-Regular", ui-monospace, monospace;
+      }
+
+      @media (max-width: 900px) {
+        main {
+          width: min(100vw - 20px, 1100px);
+          margin-top: 10px;
+        }
+
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <div class="eyebrow">Hyperpipe HTML Demo</div>
+        <h1>Single-file nostr relay client</h1>
+        <p>
+          This demo is intentionally read-only. It proves that an uploaded HTML client can run in the
+          Hyperpipe HTML viewer, connect to a specified relay over WebSocket, issue nostr
+          <code>REQ</code> messages, and render returned events.
+        </p>
+      </section>
+
+      <section class="grid">
+        <div class="panel">
+          <h2>Connection</h2>
+          <div class="stack">
+            <label>
+              Relay WebSocket URL
+              <input id="relay-url" placeholder="ws://127.0.0.1:1945/npub.../group?token=..." />
+            </label>
+
+            <div class="preset-row">
+              <button id="preset-notes" class="ghost" type="button">Preset: recent notes</button>
+              <button id="preset-files" class="ghost" type="button">Preset: group files</button>
+              <button id="preset-metadata" class="ghost" type="button">Preset: group metadata</button>
+            </div>
+
+            <label>
+              Nostr filter JSON
+              <textarea id="filter-json" spellcheck="false" class="mono">{ "kinds": [1], "limit": 20 }</textarea>
+            </label>
+
+            <div class="button-row">
+              <button id="connect-btn" class="primary" type="button">Connect</button>
+              <button id="subscribe-btn" type="button">Run REQ</button>
+              <button id="close-sub-btn" type="button">Close sub</button>
+              <button id="disconnect-btn" class="warn" type="button">Disconnect</button>
+              <button id="clear-btn" class="ghost" type="button">Clear results</button>
+            </div>
+
+            <div id="warning" class="warning" hidden></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Session</h2>
+          <div class="status">
+            <div class="status-card">
+              <strong>Viewer origin</strong>
+              <div id="origin" class="mono muted"></div>
+            </div>
+            <div class="status-card">
+              <strong>Connection state</strong>
+              <div id="socket-state" class="signal" data-state="closed">Closed</div>
+            </div>
+            <div class="status-card">
+              <strong>Current subscription</strong>
+              <div id="subscription-id" class="mono muted">none</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" style="margin-top: 18px;">
+        <h2>Events</h2>
+        <div id="events" class="events"></div>
+      </section>
+
+      <section class="panel" style="margin-top: 18px;">
+        <h2>Protocol log</h2>
+        <div id="logs" class="logs"></div>
+      </section>
+    </main>
+
+    <script>
+      const relayInput = document.getElementById('relay-url');
+      const filterInput = document.getElementById('filter-json');
+      const warningEl = document.getElementById('warning');
+      const originEl = document.getElementById('origin');
+      const socketStateEl = document.getElementById('socket-state');
+      const subscriptionIdEl = document.getElementById('subscription-id');
+      const eventsEl = document.getElementById('events');
+      const logsEl = document.getElementById('logs');
+
+      const presetNotesBtn = document.getElementById('preset-notes');
+      const presetFilesBtn = document.getElementById('preset-files');
+      const presetMetadataBtn = document.getElementById('preset-metadata');
+      const connectBtn = document.getElementById('connect-btn');
+      const subscribeBtn = document.getElementById('subscribe-btn');
+      const closeSubBtn = document.getElementById('close-sub-btn');
+      const disconnectBtn = document.getElementById('disconnect-btn');
+      const clearBtn = document.getElementById('clear-btn');
+
+      const params = new URLSearchParams(window.location.search);
+      const defaultRelay = params.get('relay') || '';
+      const defaultFilter = params.get('filter');
+      relayInput.value = defaultRelay;
+      if (defaultFilter) {
+        filterInput.value = defaultFilter;
+      }
+
+      originEl.textContent = window.location.origin || '(opaque origin)';
+
+      let socket = null;
+      let activeSubId = null;
+      let eventCount = 0;
+
+      function setSocketState(state, label) {
+        socketStateEl.dataset.state = state;
+        socketStateEl.textContent = label;
+      }
+
+      function updateSubId(value) {
+        activeSubId = value;
+        subscriptionIdEl.textContent = value || 'none';
+      }
+
+      function showWarning(message) {
+        if (!message) {
+          warningEl.hidden = true;
+          warningEl.textContent = '';
+          return;
+        }
+        warningEl.hidden = false;
+        warningEl.textContent = message;
+      }
+
+      function parseFilter() {
+        let filter;
+        try {
+          filter = JSON.parse(filterInput.value);
+        } catch (error) {
+          throw new Error('Filter JSON is invalid');
+        }
+        if (!filter || typeof filter !== 'object' || Array.isArray(filter)) {
+          throw new Error('Filter JSON must be an object');
+        }
+        return filter;
+      }
+
+      function nextSubId() {
+        return 'demo-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+      }
+
+      function logMessage(direction, payload) {
+        const line = document.createElement('div');
+        line.className = 'log-line';
+
+        const meta = document.createElement('div');
+        meta.className = 'log-meta';
+        meta.innerHTML = '<span>' + new Date().toLocaleTimeString() + '</span><span>' + direction + '</span>';
+
+        const pre = document.createElement('pre');
+        pre.className = 'mono';
+        pre.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+
+        line.appendChild(meta);
+        line.appendChild(pre);
+        logsEl.prepend(line);
+      }
+
+      function renderEvent(event) {
+        const wrap = document.createElement('article');
+        wrap.className = 'event';
+
+        const meta = document.createElement('div');
+        meta.className = 'event-meta';
+        meta.innerHTML =
+          '<span>kind ' + String(event.kind) + '</span>' +
+          '<span>' + new Date((event.created_at || 0) * 1000).toLocaleString() + '</span>' +
+          '<span class="mono">' + String(event.pubkey || '').slice(0, 16) + '...</span>';
+
+        const content = document.createElement('pre');
+        content.className = 'event-content mono';
+        content.textContent = event.content || '(empty content)';
+
+        wrap.appendChild(meta);
+        wrap.appendChild(content);
+        eventsEl.prepend(wrap);
+
+        eventCount += 1;
+      }
+
+      function clearOutput() {
+        eventsEl.innerHTML = '';
+        logsEl.innerHTML = '';
+        eventCount = 0;
+      }
+
+      function checkMixedContent(relayUrl) {
+        if (window.location.protocol === 'https:' && relayUrl.startsWith('ws://')) {
+          return (
+            'This page is loaded from https, so Chromium will usually block insecure ws:// relay ' +
+            'connections as mixed content. Use a wss:// relay URL or open the HTML from a local ' +
+            'http://127.0.0.1 Hyperpipe drive route.'
+          );
+        }
+        return '';
+      }
+
+      function ensureSocketOpen() {
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          throw new Error('Socket is not open');
+        }
+      }
+
+      function connect() {
+        const relayUrl = relayInput.value.trim();
+        if (!relayUrl) {
+          showWarning('Enter a relay WebSocket URL first.');
+          return;
+        }
+
+        showWarning(checkMixedContent(relayUrl));
+
+        if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+          socket.close();
+        }
+
+        setSocketState('connecting', 'Connecting');
+        updateSubId(null);
+        logMessage('connect', relayUrl);
+
+        try {
+          socket = new WebSocket(relayUrl);
+        } catch (error) {
+          setSocketState('error', 'Connect error');
+          logMessage('error', error instanceof Error ? error.message : String(error));
+          return;
+        }
+
+        socket.addEventListener('open', () => {
+          setSocketState('open', 'Open');
+          logMessage('open', relayUrl);
+        });
+
+        socket.addEventListener('close', (event) => {
+          setSocketState('closed', 'Closed');
+          logMessage('close', { code: event.code, reason: event.reason || '', wasClean: event.wasClean });
+        });
+
+        socket.addEventListener('error', () => {
+          setSocketState('error', 'Error');
+          logMessage('error', 'WebSocket error');
+        });
+
+        socket.addEventListener('message', (event) => {
+          let parsed = event.data;
+          try {
+            parsed = JSON.parse(event.data);
+          } catch (_) {}
+
+          logMessage('recv', parsed);
+
+          if (Array.isArray(parsed) && parsed[0] === 'EVENT' && parsed[2]) {
+            renderEvent(parsed[2]);
+          }
+        });
+      }
+
+      function runReq() {
+        let filter;
+        try {
+          filter = parseFilter();
+          ensureSocketOpen();
+        } catch (error) {
+          showWarning(error instanceof Error ? error.message : String(error));
+          return;
+        }
+
+        const subId = nextSubId();
+        updateSubId(subId);
+        const payload = ['REQ', subId, filter];
+        socket.send(JSON.stringify(payload));
+        logMessage('send', payload);
+      }
+
+      function closeSub() {
+        if (!activeSubId) return;
+        try {
+          ensureSocketOpen();
+        } catch (_) {
+          updateSubId(null);
+          return;
+        }
+
+        const payload = ['CLOSE', activeSubId];
+        socket.send(JSON.stringify(payload));
+        logMessage('send', payload);
+        updateSubId(null);
+      }
+
+      presetNotesBtn.addEventListener('click', () => {
+        filterInput.value = JSON.stringify({ kinds: [1], limit: 20 }, null, 2);
+      });
+
+      presetFilesBtn.addEventListener('click', () => {
+        filterInput.value = JSON.stringify({ kinds: [1063], limit: 20 }, null, 2);
+      });
+
+      presetMetadataBtn.addEventListener('click', () => {
+        filterInput.value = JSON.stringify({ kinds: [39000, 39001, 39002], limit: 20 }, null, 2);
+      });
+
+      connectBtn.addEventListener('click', connect);
+      subscribeBtn.addEventListener('click', runReq);
+      closeSubBtn.addEventListener('click', closeSub);
+      disconnectBtn.addEventListener('click', () => {
+        updateSubId(null);
+        if (socket) socket.close(1000, 'manual-disconnect');
+      });
+      clearBtn.addEventListener('click', clearOutput);
+
+      showWarning(checkMixedContent(relayInput.value.trim()));
+    </script>
+  </body>
+</html>

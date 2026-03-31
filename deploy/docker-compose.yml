@@ -1,25 +1,4 @@
-version: '3.9'
-
 services:
-  proxy:
-    image: traefik:v3.0
-    command:
-      - --providers.docker=true
-      - --providers.docker.exposedbydefault=false
-      - --entrypoints.web.address=:80
-      - --entrypoints.websecure.address=:443
-      - --certificatesresolvers.le.acme.httpchallenge=true
-      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
-      - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL}
-      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - traefik-lets:/letsencrypt
-    restart: unless-stopped
-
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "300", "1"]
@@ -30,24 +9,84 @@ services:
   public-gateway:
     build:
       context: ..
-      dockerfile: public-gateway/Dockerfile
+      dockerfile: hyperpipe-gateway/Dockerfile
     environment:
-      GATEWAY_PUBLIC_URL: https://${GATEWAY_HOST}
+      GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL}
       GATEWAY_REGISTRATION_SECRET: ${GATEWAY_REGISTRATION_SECRET}
+      GATEWAY_DISCOVERY_ENABLED: "true"
+      GATEWAY_DISCOVERY_OPEN_ACCESS: ${GATEWAY_DISCOVERY_OPEN_ACCESS:-false}
+      GATEWAY_DISCOVERY_DISPLAY_NAME: ${GATEWAY_DISCOVERY_DISPLAY_NAME:-Public Gateway}
+      GATEWAY_DISCOVERY_REGION: ${GATEWAY_DISCOVERY_REGION:-}
+      GATEWAY_DISCOVERY_KEY_SEED: ${GATEWAY_DISCOVERY_KEY_SEED}
+      GATEWAY_NOSTR_DISCOVERY_KEY_SEED: ${GATEWAY_NOSTR_DISCOVERY_KEY_SEED:-}
+      GATEWAY_NOSTR_DISCOVERY_RELAYS: ${GATEWAY_NOSTR_DISCOVERY_RELAYS}
       GATEWAY_REGISTRATION_REDIS: redis://redis:6379
       GATEWAY_REGISTRATION_REDIS_PREFIX: "public-gateway:${GATEWAY_HOST}:"
       GATEWAY_DEFAULT_TOKEN_TTL: 3600
+      STORAGE_DIR: /data
+      GATEWAY_AUTH_HOST_POLICY: ${GATEWAY_AUTH_HOST_POLICY:-open}
+      GATEWAY_AUTH_MEMBER_DELEGATION: ${GATEWAY_AUTH_MEMBER_DELEGATION:-all-members}
+      GATEWAY_AUTH_OPERATOR_PUBKEY: ${GATEWAY_AUTH_OPERATOR_PUBKEY}
+      GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE: ${GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE}
+      GATEWAY_AUTH_ALLOWLIST_PUBKEYS: ${GATEWAY_AUTH_ALLOWLIST_PUBKEYS}
+      GATEWAY_AUTH_ALLOWLIST_FILE: ${GATEWAY_AUTH_ALLOWLIST_FILE}
+      GATEWAY_AUTH_ALLOWLIST_REFRESH_MS: ${GATEWAY_AUTH_ALLOWLIST_REFRESH_MS:-5000}
+      GATEWAY_AUTH_BLOCKLIST_PUBKEYS: ${GATEWAY_AUTH_BLOCKLIST_PUBKEYS}
+      GATEWAY_AUTH_BLOCKLIST_FILE: ${GATEWAY_AUTH_BLOCKLIST_FILE}
+      GATEWAY_AUTH_BLOCKLIST_REFRESH_MS: ${GATEWAY_AUTH_BLOCKLIST_REFRESH_MS:-5000}
+      GATEWAY_AUTH_WOT_ROOT_PUBKEY: ${GATEWAY_AUTH_WOT_ROOT_PUBKEY}
+      GATEWAY_AUTH_WOT_MAX_DEPTH: ${GATEWAY_AUTH_WOT_MAX_DEPTH:-1}
+      GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2: ${GATEWAY_AUTH_WOT_MIN_FOLLOWERS_DEPTH2:-0}
+      GATEWAY_AUTH_WOT_RELAYS: ${GATEWAY_AUTH_WOT_RELAYS}
+      GATEWAY_AUTH_WOT_LOAD_TIMEOUT_MS: ${GATEWAY_AUTH_WOT_LOAD_TIMEOUT_MS:-30000}
+      GATEWAY_AUTH_WOT_REFRESH_MS: ${GATEWAY_AUTH_WOT_REFRESH_MS:-600000}
+
+      # Relay host + dispatcher
+      GATEWAY_FEATURE_HYPERBEE_RELAY: "true"
+      GATEWAY_RELAY_STORAGE: /data/gateway-relay
+      GATEWAY_RELAY_NAMESPACE: ${GATEWAY_RELAY_NAMESPACE}
+      GATEWAY_RELAY_REPLICATION_TOPIC: ${GATEWAY_RELAY_REPLICATION_TOPIC}
+      GATEWAY_RELAY_ADMIN_PUBLIC_KEY: ${GATEWAY_RELAY_ADMIN_PUBLIC_KEY}
+      GATEWAY_RELAY_ADMIN_SECRET_KEY: ${GATEWAY_RELAY_ADMIN_SECRET_KEY}
+      GATEWAY_FEATURE_RELAY_DISPATCHER: ${GATEWAY_FEATURE_RELAY_DISPATCHER:-false}
+      GATEWAY_FEATURE_RELAY_TOKEN_ENFORCEMENT: ${GATEWAY_FEATURE_RELAY_TOKEN_ENFORCEMENT:-true}
+      GATEWAY_DISPATCHER_MAX_CONCURRENT: ${GATEWAY_DISPATCHER_MAX_CONCURRENT:-3}
+      GATEWAY_DISPATCHER_INFLIGHT_WEIGHT: ${GATEWAY_DISPATCHER_INFLIGHT_WEIGHT:-25}
+      GATEWAY_DISPATCHER_LATENCY_WEIGHT: ${GATEWAY_DISPATCHER_LATENCY_WEIGHT:-1}
+      GATEWAY_DISPATCHER_FAILURE_WEIGHT: ${GATEWAY_DISPATCHER_FAILURE_WEIGHT:-500}
+      GATEWAY_DISPATCHER_REASSIGN_LAG: ${GATEWAY_DISPATCHER_REASSIGN_LAG:-500}
+      GATEWAY_DISPATCHER_CIRCUIT_BREAKER_THRESHOLD: ${GATEWAY_DISPATCHER_CIRCUIT_BREAKER_THRESHOLD:-5}
+      GATEWAY_DISPATCHER_CIRCUIT_BREAKER_TIMEOUT_MS: ${GATEWAY_DISPATCHER_CIRCUIT_BREAKER_TIMEOUT_MS:-60000}
+
+      # Blind peer
+      GATEWAY_BLINDPEER_ENABLED: ${GATEWAY_BLINDPEER_ENABLED:-true}
+      GATEWAY_BLINDPEER_STORAGE: ${GATEWAY_BLINDPEER_STORAGE:-/data/blind-peer}
+      GATEWAY_BLINDPEER_PORT: ${GATEWAY_BLINDPEER_PORT}
+      GATEWAY_BLINDPEER_MAX_BYTES: ${GATEWAY_BLINDPEER_MAX_BYTES:-26843545600}
+      GATEWAY_BLINDPEER_GC_INTERVAL_MS: ${GATEWAY_BLINDPEER_GC_INTERVAL_MS:-300000}
+      GATEWAY_BLINDPEER_TRUSTED_PATH: ${GATEWAY_BLINDPEER_TRUSTED_PATH:-/data/blind-peer/trusted-peers.json}
+
+      # Open join
+      GATEWAY_OPEN_JOIN_POOL_TTL: ${GATEWAY_OPEN_JOIN_POOL_TTL:-0}
+
+      # Metrics
+      GATEWAY_METRICS_ENABLED: ${GATEWAY_METRICS_ENABLED:-true}
+      # Stdout/stderr file rotation
+      GATEWAY_LOG_DIR: ${GATEWAY_LOG_DIR:-/app/public-gateway/logs}
+      GATEWAY_LOG_PREFIX: ${GATEWAY_LOG_PREFIX:-public-gateway}
+      GATEWAY_LOG_ROTATE_MS: ${GATEWAY_LOG_ROTATE_MS:-1200000}
+      GATEWAY_LOG_RETENTION_MS: ${GATEWAY_LOG_RETENTION_MS:-10800000}
+    ports:
+      - "${GATEWAY_BLINDPEER_PORT}:${GATEWAY_BLINDPEER_PORT}/udp"
     depends_on:
       - redis
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.gateway.rule=Host(`${GATEWAY_HOST}`)
-      - traefik.http.routers.gateway.entrypoints=websecure
-      - traefik.http.routers.gateway.tls=true
-      - traefik.http.routers.gateway.tls.certresolver=le
-      - traefik.http.services.gateway.loadbalancer.server.port=4430
+    volumes:
+      - public-gateway-data:/data
+      - ${GATEWAY_LOG_MOUNT_SOURCE:-public-gateway-logs}:${GATEWAY_LOG_DIR:-/app/public-gateway/logs}
+      - ./artifacts:/app/public-gateway/artifacts:ro
     restart: unless-stopped
 
 volumes:
-  traefik-lets:
   redis-data:
+  public-gateway-data:
+  public-gateway-logs:

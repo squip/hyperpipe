@@ -1,0 +1,23 @@
+[
+  {
+    "id": "com.hyperpipe.reference.hello-nav-page",
+    "slug": "hello-nav-page",
+    "name": "Hello Nav Page",
+    "summary": "Minimal additive sidebar + page plugin.",
+    "majorCapability": "Renderer nav + route contribution"
+  },
+  {
+    "id": "com.hyperpipe.reference.p2p-audio-room",
+    "slug": "p2p-audio-room",
+    "name": "P2P Audio Room",
+    "summary": "WebRTC audio/video room using host-managed cross-instance signaling.",
+    "majorCapability": "Real-time AV tracks + host media signaling APIs"
+  },
+  {
+    "id": "com.hyperpipe.reference.threejs-multiplayer-demo",
+    "slug": "threejs-multiplayer-demo",
+    "name": "Three.js Multiplayer Demo",
+    "summary": "Three.js route with real multiplayer sync over WebRTC data channels.",
+    "majorCapability": "Interactive 3D route + WebRTC multiplayer"
+  }
+]

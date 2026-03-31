@@ -1,0 +1,61 @@
+{
+  "name": "@squip/hyperpipe-bridge",
+  "version": "0.1.0",
+  "description": "First-party integration layer for Hyperpipe core, gateway, and client packages",
+  "type": "module",
+  "license": "Apache-2.0",
+  "homepage": "https://hyperpipe.io",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/squip/hyperpipe.git",
+    "directory": "hyperpipe-bridge"
+  },
+  "bugs": {
+    "url": "https://github.com/squip/hyperpipe/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "htplugin": "./plugins/sdk/htplugin-cli.mjs"
+  },
+  "scripts": {
+    "htplugin": "node ./plugins/sdk/htplugin-cli.mjs",
+    "pack:check": "npm pack --dry-run"
+  },
+  "files": [
+    "auth/**",
+    "config/**",
+    "plugins/PluginManifest.mjs",
+    "plugins/index.mjs",
+    "plugins/sdk/htplugin-cli.mjs",
+    "public-gateway/**",
+    "types/**",
+    "ui/hyperpipeSplash.ts",
+    "index.mjs",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json",
+    "./auth/*": "./auth/*.mjs",
+    "./config/*": "./config/*.mjs",
+    "./plugins": "./plugins/index.mjs",
+    "./plugins/*": "./plugins/*.mjs",
+    "./plugins/sdk/htplugin-cli": "./plugins/sdk/htplugin-cli.mjs",
+    "./public-gateway/*": "./public-gateway/*.mjs",
+    "./types/*": "./types/*",
+    "./ui/*": "./ui/*.ts"
+  },
+  "dependencies": {
+    "compact-encoding": "^2.16.1",
+    "hypercore-crypto": "^3.6.1",
+    "hyperswarm": "^4.14.0",
+    "protomux": "^3.10.1"
+  }
+}

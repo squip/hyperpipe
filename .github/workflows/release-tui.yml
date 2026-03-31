@@ -1,0 +1,103 @@
+name: Release TUI
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'tui-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Verify core
+        run: npm --workspace ./hyperpipe-core test
+
+      - name: Verify TUI
+        run: |
+          npm --workspace ./hyperpipe-tui run build
+          npm --workspace ./hyperpipe-tui test
+
+  package:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            platform: darwin
+            arch: x64
+            archive_name: hyperpipe-tui-macos-x64.tar.gz
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+            archive_name: hyperpipe-tui-macos-arm64.tar.gz
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+            archive_name: hyperpipe-tui-linux-x64.tar.gz
+          - os: windows-latest
+            platform: win32
+            arch: x64
+            archive_name: hyperpipe-tui-windows-x64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Build and test TUI
+        run: |
+          npm --workspace ./hyperpipe-tui run build
+          npm --workspace ./hyperpipe-tui test
+
+      - name: Build portable bundle directory
+        run: npm --workspace ./hyperpipe-tui run bundle:release -- --platform ${{ matrix.platform }} --arch ${{ matrix.arch }} --output-dir ./release
+
+      - name: Archive portable bundle (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd hyperpipe-tui/release
+          tar -czf ${{ matrix.archive_name }} hyperpipe-tui-${{ matrix.platform }}-${{ matrix.arch }}
+
+      - name: Archive portable bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Compress-Archive -Path hyperpipe-tui/release/hyperpipe-tui-${{ matrix.platform }}-${{ matrix.arch }}\* -DestinationPath hyperpipe-tui/release/${{ matrix.archive_name }} -Force
+
+      - name: Write checksums
+        run: node ./scripts/write-sha256sums.mjs ./hyperpipe-tui/release/${{ matrix.archive_name }} --out ./hyperpipe-tui/release/SHA256SUMS.txt
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-${{ matrix.os }}
+          path: |
+            hyperpipe-tui/release/${{ matrix.archive_name }}
+            hyperpipe-tui/release/SHA256SUMS.txt
+
+      - name: Publish release assets
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            hyperpipe-tui/release/${{ matrix.archive_name }}
+            hyperpipe-tui/release/SHA256SUMS.txt

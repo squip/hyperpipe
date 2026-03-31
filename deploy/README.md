@@ -1,53 +1,235 @@
-# Public Gateway Docker Bundle
+# Public Gateway Deploy Bundle
 
-This directory contains a turnkey docker-compose setup that launches the public gateway, a Redis cache, and a Traefik reverse proxy with automatic Let's Encrypt certificates.
+This directory contains a standalone Docker Compose bundle and deploy CLI for self-hosting the public gateway on a machine or VPS.
 
-## Quick Start
+## Recommended Flow
 
-1. **Install prerequisites**
-   - Docker and Docker Compose Plugin (or docker-compose v2)
-   - DNS A record pointing `your.domain` at the VPS
+1. Install prerequisites:
+   - Docker
+   - Docker Compose plugin or `docker-compose`
+   - Node.js 20+ for the deploy CLI
+   - either:
+     - a DNS A record pointing your chosen hostname at the target machine for `https-acme`, or
+     - a public IP for `http`
 
-2. **Configure secrets**
+2. Install the deploy CLI dependencies:
    ```bash
    cd deploy
-   cp .env.example .env
-   # edit .env and set:
-   # GATEWAY_HOST=your.domain
-   # LETSENCRYPT_EMAIL=admin@domain
-   # GATEWAY_REGISTRATION_SECRET=openssl rand -hex 32
+   npm install
    ```
 
-3. **Start the stack**
+3. Generate a runtime env file:
    ```bash
-   docker compose up -d --build
+   npm run deploy:init
    ```
 
-Traefik listens on ports 80/443, requests certificates from Let's Encrypt, and proxies HTTPS traffic to the public gateway container. Redis stores registration state so the gateway can scale horizontally or survive restarts.
+4. If `deploy:init` enabled verified operator identity, sign the generated request on a trusted machine:
+   ```bash
+   npm run deploy:attest-operator -- \
+     --request ./artifacts/operator-attestation-request.json \
+     --out ./artifacts/operator-attestation.json
+   ```
 
-## Services
+5. Validate the deploy bundle:
+   ```bash
+   npm run deploy:check
+   ```
 
-| Service        | Description                                           |
-| -------------- | ----------------------------------------------------- |
-| `proxy`        | Traefik reverse proxy + automatic TLS certificates    |
-| `redis`        | Redis cache for relay registrations                   |
-| `public-gateway` | Hypertuna public gateway (builds from repo source)  |
+6. Start the stack:
+   ```bash
+   npm run deploy:apply
+   ```
 
-Volumes `traefik-lets` and `redis-data` persist ACME certificates and Redis data respectively.
+7. Run smoke checks:
+   ```bash
+   npm run deploy:smoke
+   ```
 
-## Updating
+The package also exposes the standalone CLI directly if you prefer:
 
-Pull repository updates and rebuild:
 ```bash
-docker compose pull
-docker compose up -d --build
+./bin/gateway-deploy.mjs init
+./bin/gateway-deploy.mjs check
 ```
 
-## Stopping / Removing
-```bash
-docker compose down
-```
-Add `-v` to remove persisted volumes.
+By default the generated runtime config is written to `deploy/.env`. You can also target a named env file under `deploy/environments/`:
 
-## Desktop Configuration
-In the desktop app, enable the Public Gateway bridge and set the base URL to `https://your.domain` with the same registration secret used above.
+```bash
+npm run deploy:init -- --deploy-env production
+npm run deploy:apply -- --deploy-env production
+```
+
+To serve the separate `hyperpipe.io` website from the same VPS, set these env values before `deploy:apply`:
+
+- `SITE_ENABLED=true`
+- `SITE_HOST=hyperpipe.io`
+- `SITE_WWW_HOST=www.hyperpipe.io`
+- `HYPERPIPE_SITE_ROOT=/srv/hyperpipe-site/current`
+
+The website source stays outside this repository. The deploy bundle only mounts a prebuilt static directory from `HYPERPIPE_SITE_ROOT`.
+
+Gateway log rotation is controlled with:
+
+- `GATEWAY_LOG_MOUNT_SOURCE`
+- `GATEWAY_LOG_DIR`
+- `GATEWAY_LOG_PREFIX`
+- `GATEWAY_LOG_ROTATE_MS`
+- `GATEWAY_LOG_RETENTION_MS`
+
+If you want gateway logs to appear in a host folder instead of a Docker named volume, set `GATEWAY_LOG_MOUNT_SOURCE` to an absolute path such as `/home/squip/public-gateway-logs`.
+
+## Commands
+
+### `init`
+
+Interactive setup wizard that:
+
+- prompts for foundational values such as auth profile, exposure mode, host, display name, region, and relay lists
+- applies one of the built-in auth profiles:
+  - `open`
+  - `allowlist`
+  - `wot`
+  - `allowlist+wot`
+- supports two deploy exposure modes:
+  - `https-acme` for domain + Let’s Encrypt
+  - `http` for public IP / plain HTTP
+- generates stable secrets and relay admin keys when missing
+- generates a stable discovery key seed so the gateway identity remains stable across restarts
+- can optionally generate an offline operator attestation request when an operator pubkey is configured
+- preserves existing values when re-run against the same env file
+
+### `check`
+
+Runs deploy validation before you start containers:
+
+- schema validation for the selected profile
+- schema validation for the selected exposure mode
+- optional operator attestation artifact validation when `GATEWAY_AUTH_OPERATOR_ATTESTATION_FILE` is enabled
+- Docker / Compose availability checks
+- Docker daemon reachability
+- best-effort port-availability warnings for the selected exposure mode
+- `docker compose config` validation against the base compose file plus the selected exposure-mode override
+
+### `apply`
+
+Runs `check` first, then executes:
+
+```bash
+docker compose --env-file <selected-env> \
+  -f deploy/docker-compose.yml \
+  -f deploy/docker-compose.<exposure-mode>.yml \
+  up -d --build
+```
+
+When `SITE_ENABLED=true`, the deploy CLI also adds:
+
+```bash
+-f deploy/docker-compose.site.yml
+```
+
+### `smoke`
+
+Runs post-deploy health checks:
+
+- `docker compose ps`
+- container runtime inspection
+- `GET /health` against the configured public URL
+- `GET /healthz` against `https://<SITE_HOST>` when `SITE_ENABLED=true`
+- secret endpoint validation when the selected profile advertises open access
+
+Optional deep auth validation is available if you provide an auth manifest:
+
+```bash
+npm run deploy:smoke -- \
+  --auth-manifest ./path/to/manifest.json \
+  --policy-column wotDepth2Threshold
+```
+
+The manifest should follow the same shape used by the gateway auth fixture tooling: an `accounts` array with credential material and a `policyMatrix` describing expected `ALLOW` / `DENY` outcomes.
+
+### `attest-operator`
+
+Signs the operator attestation request on a trusted machine without storing the operator `nsec` on the gateway host.
+
+```bash
+npm run deploy:attest-operator -- \
+  --request ./artifacts/operator-attestation-request.json \
+  --out ./artifacts/operator-attestation.json
+```
+
+The command securely prompts for the operator `nsec` or 32-byte hex secret, verifies that it matches the requested `GATEWAY_AUTH_OPERATOR_PUBKEY`, and writes a signed JSON artifact that `deploy:check` validates before deployment.
+
+## Profiles
+
+Profile defaults are stored in:
+
+- `deploy/profiles/open.env`
+- `deploy/profiles/allowlist.env`
+- `deploy/profiles/wot.env`
+- `deploy/profiles/allowlist+wot.env`
+
+The CLI writes explicit env values for discovery relays, auth relays, public URL, and auth policy so deployments do not inherit project-specific defaults accidentally.
+The checked-in profile files are also the source of truth for the profile presets loaded by the schema.
+
+## Exposure Modes
+
+The deploy bundle supports two exposure modes:
+
+- `https-acme`
+  - default mode
+  - expects `GATEWAY_HOST` to be a real domain hostname
+  - requires `LETSENCRYPT_EMAIL`
+  - derives `GATEWAY_PUBLIC_URL=https://<host>`
+  - uses Traefik + Let’s Encrypt and exposes ports `80` and `443`
+- `http`
+  - intended for public-IP or non-TLS setups
+  - allows `GATEWAY_HOST` to be a hostname or IPv4 address
+  - ignores `LETSENCRYPT_EMAIL`
+  - derives `GATEWAY_PUBLIC_URL=http://<host>`
+  - maps host port `80` directly to the gateway container
+
+`http` mode is convenient for VPS setups without a registered domain, but it leaves registration, admin auth, and access-manager traffic unencrypted.
+
+The deploy bundle now enables the live Block List store by default for every profile, and enables the live Allow List store by default for `allowlist` and `allowlist+wot`, with:
+
+- `GATEWAY_AUTH_ALLOWLIST_FILE=/data/config/allowlist.json`
+- `GATEWAY_AUTH_ALLOWLIST_REFRESH_MS=5000`
+- `GATEWAY_AUTH_BLOCKLIST_FILE=/data/config/blocklist.json`
+- `GATEWAY_AUTH_BLOCKLIST_REFRESH_MS=5000`
+
+If `GATEWAY_AUTH_OPERATOR_PUBKEY` is set, the gateway exposes the operator access manager at `/admin/allowlist`, including user-friendly **Allow List**, **Web of Trust**, and **Block List** tabs when those features are enabled by the active profile and env file.
+
+If you also enable verified operator identity during `init`, the CLI generates:
+
+- `deploy/artifacts/operator-attestation-request.json`
+- expected signed output at `deploy/artifacts/operator-attestation.json`
+
+That signed artifact is mounted read-only into the gateway container and is only returned to already-approved clients through `/api/auth/verify`.
+
+## Portable Defaults
+
+The deploy CLI generates and persists the following values automatically when missing:
+
+- `GATEWAY_REGISTRATION_SECRET`
+- `GATEWAY_DISCOVERY_KEY_SEED`
+- `GATEWAY_RELAY_NAMESPACE`
+- `GATEWAY_RELAY_REPLICATION_TOPIC`
+- `GATEWAY_RELAY_ADMIN_PUBLIC_KEY`
+- `GATEWAY_RELAY_ADMIN_SECRET_KEY`
+- `GATEWAY_BLINDPEER_PORT`
+
+Override these manually only if you already have stable values you need to preserve.
+
+## Advanced Manual Editing
+
+`deploy/.env.example` is a full reference template for advanced users, but the preferred workflow is still `init -> check -> apply -> smoke`.
+
+## Static Website Overlay
+
+The optional static-site overlay is intended for a separate `hyperpipe.io` deployment project, not website source checked into this repository.
+
+- Build the website in its own repo or deployment project.
+- Sync the compiled output to `HYPERPIPE_SITE_ROOT` on the VPS.
+- Point DNS for `hyperpipe.io` and `www.hyperpipe.io` at the VPS.
+- Keep `hypertuna.com` mapped to the gateway service.
+- Let Traefik issue certificates for both domains from the same ACME storage.

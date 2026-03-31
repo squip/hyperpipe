@@ -1,0 +1,22 @@
+services:
+  public-site:
+    image: nginx:1.27-alpine
+    volumes:
+      - ${HYPERPIPE_SITE_ROOT}:/usr/share/nginx/html:ro
+      - ./nginx/hyperpipe-site.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.hyperpipe-site.rule=Host(`${SITE_HOST}`)
+      - traefik.http.routers.hyperpipe-site.entrypoints=websecure
+      - traefik.http.routers.hyperpipe-site.tls=true
+      - traefik.http.routers.hyperpipe-site.tls.certresolver=le
+      - traefik.http.services.hyperpipe-site.loadbalancer.server.port=80
+      - traefik.http.routers.hyperpipe-site-www.rule=Host(`${SITE_WWW_HOST}`)
+      - traefik.http.routers.hyperpipe-site-www.entrypoints=websecure
+      - traefik.http.routers.hyperpipe-site-www.tls=true
+      - traefik.http.routers.hyperpipe-site-www.tls.certresolver=le
+      - traefik.http.routers.hyperpipe-site-www.middlewares=hyperpipe-site-redirect
+      - traefik.http.middlewares.hyperpipe-site-redirect.redirectregex.regex=^https?://${SITE_WWW_HOST}/(.*)
+      - traefik.http.middlewares.hyperpipe-site-redirect.redirectregex.replacement=https://${SITE_HOST}/$$1
+      - traefik.http.middlewares.hyperpipe-site-redirect.redirectregex.permanent=true

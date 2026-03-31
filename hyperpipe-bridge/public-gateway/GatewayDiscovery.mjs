@@ -1,0 +1,259 @@
+import { createHash, randomBytes } from 'node:crypto';
+import hyperCrypto from 'hypercore-crypto';
+import * as c from 'compact-encoding';
+
+const DISCOVERY_TOPIC_SEED = 'hyperpipe-public-gateway-discovery-v1';
+const DISCOVERY_TOPIC = hyperCrypto.hash(Buffer.from(DISCOVERY_TOPIC_SEED));
+
+const announcementEncoding = {
+  preencode(state, value) {
+    c.string.preencode(state, value.gatewayId || '');
+    c.uint.preencode(state, value.timestamp || 0);
+    c.uint.preencode(state, value.ttl || 0);
+    c.string.preencode(state, value.publicUrl || '');
+    c.string.preencode(state, value.wsUrl || '');
+    c.string.preencode(state, value.secretUrl || '');
+    c.string.preencode(state, value.secretHash || '');
+    c.bool.preencode(state, value.openAccess === true);
+    c.string.preencode(state, value.sharedSecretVersion || '');
+    c.string.preencode(state, value.displayName || '');
+    c.string.preencode(state, value.region || '');
+    c.uint.preencode(state, value.protocolVersion || 1);
+    c.string.preencode(state, value.signature || '');
+    c.string.preencode(state, value.signatureKey || '');
+    c.string.preencode(state, value.relayKey || '');
+    c.string.preencode(state, value.relayDiscoveryKey || '');
+    c.string.preencode(state, value.relayReplicationTopic || '');
+    c.uint.preencode(state, value.relayTokenTtl || 0);
+    c.uint.preencode(state, value.relayTokenRefreshWindow || 0);
+    c.uint.preencode(state, value.dispatcherMaxConcurrent || 0);
+    c.uint.preencode(state, value.dispatcherInFlightWeight || 0);
+    c.uint.preencode(state, value.dispatcherLatencyWeight || 0);
+    c.uint.preencode(state, value.dispatcherFailureWeight || 0);
+    c.uint.preencode(state, value.dispatcherReassignLagBlocks || 0);
+    c.uint.preencode(state, value.dispatcherCircuitBreakerThreshold || 0);
+    c.uint.preencode(state, value.dispatcherCircuitBreakerTimeoutMs || 0);
+    c.string.preencode(state, value.authMethod || '');
+    c.string.preencode(state, value.hostPolicy || '');
+    c.string.preencode(state, value.memberDelegationMode || '');
+    c.string.preencode(state, value.operatorPubkey || '');
+    c.string.preencode(state, value.wotRootPubkey || '');
+    c.uint.preencode(state, value.wotMaxDepth || 0);
+    c.uint.preencode(state, value.wotMinFollowersDepth2 || 0);
+    c.string.preencode(state, Array.isArray(value.capabilities) ? value.capabilities.join(',') : '');
+  },
+  encode(state, value) {
+    c.string.encode(state, value.gatewayId || '');
+    c.uint.encode(state, value.timestamp || 0);
+    c.uint.encode(state, value.ttl || 0);
+    c.string.encode(state, value.publicUrl || '');
+    c.string.encode(state, value.wsUrl || '');
+    c.string.encode(state, value.secretUrl || '');
+    c.string.encode(state, value.secretHash || '');
+    c.bool.encode(state, value.openAccess === true);
+    c.string.encode(state, value.sharedSecretVersion || '');
+    c.string.encode(state, value.displayName || '');
+    c.string.encode(state, value.region || '');
+    c.uint.encode(state, value.protocolVersion || 1);
+    c.string.encode(state, value.signature || '');
+    c.string.encode(state, value.signatureKey || '');
+    c.string.encode(state, value.relayKey || '');
+    c.string.encode(state, value.relayDiscoveryKey || '');
+    c.string.encode(state, value.relayReplicationTopic || '');
+    c.uint.encode(state, value.relayTokenTtl || 0);
+    c.uint.encode(state, value.relayTokenRefreshWindow || 0);
+    c.uint.encode(state, value.dispatcherMaxConcurrent || 0);
+    c.uint.encode(state, value.dispatcherInFlightWeight || 0);
+    c.uint.encode(state, value.dispatcherLatencyWeight || 0);
+    c.uint.encode(state, value.dispatcherFailureWeight || 0);
+    c.uint.encode(state, value.dispatcherReassignLagBlocks || 0);
+    c.uint.encode(state, value.dispatcherCircuitBreakerThreshold || 0);
+    c.uint.encode(state, value.dispatcherCircuitBreakerTimeoutMs || 0);
+    c.string.encode(state, value.authMethod || '');
+    c.string.encode(state, value.hostPolicy || '');
+    c.string.encode(state, value.memberDelegationMode || '');
+    c.string.encode(state, value.operatorPubkey || '');
+    c.string.encode(state, value.wotRootPubkey || '');
+    c.uint.encode(state, value.wotMaxDepth || 0);
+    c.uint.encode(state, value.wotMinFollowersDepth2 || 0);
+    c.string.encode(state, Array.isArray(value.capabilities) ? value.capabilities.join(',') : '');
+  },
+  decode(state) {
+    const announcement = {
+      gatewayId: c.string.decode(state),
+      timestamp: c.uint.decode(state),
+      ttl: c.uint.decode(state),
+      publicUrl: c.string.decode(state),
+      wsUrl: c.string.decode(state),
+      secretUrl: c.string.decode(state),
+      secretHash: c.string.decode(state),
+      openAccess: c.bool.decode(state),
+      sharedSecretVersion: c.string.decode(state),
+      displayName: c.string.decode(state),
+      region: c.string.decode(state),
+      protocolVersion: c.uint.decode(state),
+      signature: c.string.decode(state),
+      signatureKey: c.string.decode(state)
+    };
+
+    announcement.relayKey = state.start < state.end ? c.string.decode(state) : '';
+    announcement.relayDiscoveryKey = state.start < state.end ? c.string.decode(state) : '';
+    announcement.relayReplicationTopic = state.start < state.end ? c.string.decode(state) : '';
+
+    const maybeDecodeUint = () => (state.start < state.end ? c.uint.decode(state) : 0);
+
+    announcement.relayTokenTtl = maybeDecodeUint();
+    announcement.relayTokenRefreshWindow = maybeDecodeUint();
+    announcement.dispatcherMaxConcurrent = maybeDecodeUint();
+    announcement.dispatcherInFlightWeight = maybeDecodeUint();
+    announcement.dispatcherLatencyWeight = maybeDecodeUint();
+    announcement.dispatcherFailureWeight = maybeDecodeUint();
+    announcement.dispatcherReassignLagBlocks = maybeDecodeUint();
+    announcement.dispatcherCircuitBreakerThreshold = maybeDecodeUint();
+    announcement.dispatcherCircuitBreakerTimeoutMs = maybeDecodeUint();
+    announcement.authMethod = state.start < state.end ? c.string.decode(state) : '';
+    announcement.hostPolicy = state.start < state.end ? c.string.decode(state) : '';
+    announcement.memberDelegationMode = state.start < state.end ? c.string.decode(state) : '';
+    announcement.operatorPubkey = state.start < state.end ? c.string.decode(state) : '';
+    announcement.wotRootPubkey = state.start < state.end ? c.string.decode(state) : '';
+    announcement.wotMaxDepth = maybeDecodeUint();
+    announcement.wotMinFollowersDepth2 = maybeDecodeUint();
+    announcement.capabilities = state.start < state.end
+      ? String(c.string.decode(state) || '')
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean)
+      : [];
+
+    return announcement;
+  }
+};
+
+function deriveKeyPair(seed) {
+  if (seed && typeof seed === 'string') {
+    const digest = createHash('sha256').update(seed).digest();
+    return hyperCrypto.keyPair(digest);
+  }
+  if (seed instanceof Uint8Array) {
+    const buf = seed.length === 32 ? seed : createHash('sha256').update(seed).digest();
+    return hyperCrypto.keyPair(buf);
+  }
+  return hyperCrypto.keyPair(randomBytes(32));
+}
+
+function canonicalizeAnnouncement(announcement) {
+  const payload = {
+    gatewayId: announcement.gatewayId || '',
+    timestamp: announcement.timestamp || 0,
+    ttl: announcement.ttl || 0,
+    publicUrl: announcement.publicUrl || '',
+    wsUrl: announcement.wsUrl || '',
+    secretUrl: announcement.secretUrl || '',
+    secretHash: announcement.secretHash || '',
+    openAccess: announcement.openAccess === true,
+    sharedSecretVersion: announcement.sharedSecretVersion || '',
+    displayName: announcement.displayName || '',
+    region: announcement.region || '',
+    protocolVersion: announcement.protocolVersion || 1
+  };
+  if (announcement.relayKey) payload.relayKey = announcement.relayKey;
+  if (announcement.relayDiscoveryKey) payload.relayDiscoveryKey = announcement.relayDiscoveryKey;
+  if (announcement.relayReplicationTopic) payload.relayReplicationTopic = announcement.relayReplicationTopic;
+  if (announcement.relayTokenTtl) payload.relayTokenTtl = announcement.relayTokenTtl;
+  if (announcement.relayTokenRefreshWindow) payload.relayTokenRefreshWindow = announcement.relayTokenRefreshWindow;
+  if (announcement.dispatcherMaxConcurrent) payload.dispatcherMaxConcurrent = announcement.dispatcherMaxConcurrent;
+  if (announcement.dispatcherInFlightWeight) payload.dispatcherInFlightWeight = announcement.dispatcherInFlightWeight;
+  if (announcement.dispatcherLatencyWeight) payload.dispatcherLatencyWeight = announcement.dispatcherLatencyWeight;
+  if (announcement.dispatcherFailureWeight) payload.dispatcherFailureWeight = announcement.dispatcherFailureWeight;
+  if (announcement.dispatcherReassignLagBlocks) payload.dispatcherReassignLagBlocks = announcement.dispatcherReassignLagBlocks;
+  if (announcement.dispatcherCircuitBreakerThreshold) payload.dispatcherCircuitBreakerThreshold = announcement.dispatcherCircuitBreakerThreshold;
+  if (announcement.dispatcherCircuitBreakerTimeoutMs) payload.dispatcherCircuitBreakerTimeoutMs = announcement.dispatcherCircuitBreakerTimeoutMs;
+  if (announcement.authMethod) payload.authMethod = announcement.authMethod;
+  if (announcement.hostPolicy) payload.hostPolicy = announcement.hostPolicy;
+  if (announcement.memberDelegationMode) payload.memberDelegationMode = announcement.memberDelegationMode;
+  if (announcement.operatorPubkey) payload.operatorPubkey = announcement.operatorPubkey;
+  if (announcement.wotRootPubkey) payload.wotRootPubkey = announcement.wotRootPubkey;
+  if (announcement.wotMaxDepth) payload.wotMaxDepth = announcement.wotMaxDepth;
+  if (announcement.wotMinFollowersDepth2) payload.wotMinFollowersDepth2 = announcement.wotMinFollowersDepth2;
+  if (Array.isArray(announcement.capabilities) && announcement.capabilities.length) {
+    payload.capabilities = announcement.capabilities;
+  }
+  const json = JSON.stringify(payload);
+  return Buffer.from(json, 'utf8');
+}
+
+function ensureSecretKeyBuffer(secretKey) {
+  if (!secretKey) {
+    throw new Error('Gateway discovery secret key not provided');
+  }
+
+  if (Buffer.isBuffer(secretKey)) {
+    return secretKey;
+  }
+
+  if (secretKey instanceof Uint8Array) {
+    return Buffer.from(secretKey);
+  }
+
+  throw new Error('Gateway discovery secret key must be a Buffer or Uint8Array');
+}
+
+function signAnnouncement(announcement, secretKey) {
+  const payload = canonicalizeAnnouncement(announcement);
+  const skBuffer = ensureSecretKeyBuffer(secretKey);
+  if (skBuffer.length !== 64) {
+    throw new Error(`Gateway discovery secret key must be 64 bytes, received ${skBuffer.length}`);
+  }
+  const signature = hyperCrypto.sign(payload, skBuffer);
+  return Buffer.from(signature).toString('hex');
+}
+
+function verifyAnnouncementSignature(announcement) {
+  if (!announcement?.signature || !announcement?.signatureKey) {
+    return false;
+  }
+  try {
+    const payload = canonicalizeAnnouncement(announcement);
+    const signature = Buffer.from(announcement.signature, 'hex');
+    const publicKey = Buffer.from(announcement.signatureKey, 'hex');
+    return hyperCrypto.verify(payload, signature, publicKey);
+  } catch (_) {
+    return false;
+  }
+}
+
+function computeSecretHash(secret) {
+  if (secret == null) return '';
+  return createHash('sha256').update(String(secret)).digest('hex');
+}
+
+function encodeAnnouncement(announcement) {
+  const state = { start: 0, end: 0, buffer: null };
+  announcementEncoding.preencode(state, announcement);
+  state.buffer = Buffer.allocUnsafe(state.end);
+  state.start = 0;
+  announcementEncoding.encode(state, announcement);
+  return state.buffer;
+}
+
+function decodeAnnouncement(buffer) {
+  const state = { start: 0, end: buffer.length, buffer };
+  return announcementEncoding.decode(state);
+}
+
+function isAnnouncementExpired(announcement, now = Date.now()) {
+  if (!announcement?.ttl || !announcement?.timestamp) return true;
+  return announcement.timestamp + announcement.ttl * 1000 < now;
+}
+
+export {
+  DISCOVERY_TOPIC,
+  DISCOVERY_TOPIC_SEED,
+  computeSecretHash,
+  decodeAnnouncement,
+  deriveKeyPair,
+  encodeAnnouncement,
+  isAnnouncementExpired,
+  signAnnouncement,
+  verifyAnnouncementSignature
+};
