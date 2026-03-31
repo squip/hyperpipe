@@ -44,19 +44,25 @@ jobs:
         include:
           - os: macos-13
             builder_args: --mac dmg zip --x64
+            csc_link_secret: MACOS_CSC_LINK
+            csc_key_password_secret: MACOS_CSC_KEY_PASSWORD
+            notarize: true
           - os: macos-14
             builder_args: --mac dmg zip --arm64
+            csc_link_secret: MACOS_CSC_LINK
+            csc_key_password_secret: MACOS_CSC_KEY_PASSWORD
+            notarize: true
           - os: windows-latest
             builder_args: --win nsis --x64
+            csc_link_secret: WIN_CSC_LINK
+            csc_key_password_secret: WIN_CSC_KEY_PASSWORD
+            notarize: false
           - os: ubuntu-latest
             builder_args: --linux AppImage --x64
+            csc_link_secret: ''
+            csc_key_password_secret: ''
+            notarize: false
     runs-on: ${{ matrix.os }}
-    env:
-      CSC_LINK: ${{ secrets.CSC_LINK }}
-      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
       - uses: actions/checkout@v5
 
@@ -87,6 +93,12 @@ jobs:
         run: npm --workspace ./hyperpipe-desktop run test:electron
 
       - name: Build desktop release artifacts
+        env:
+          CSC_LINK: ${{ matrix.csc_link_secret != '' && secrets[matrix.csc_link_secret] || '' }}
+          CSC_KEY_PASSWORD: ${{ matrix.csc_key_password_secret != '' && secrets[matrix.csc_key_password_secret] || '' }}
+          APPLE_ID: ${{ matrix.notarize && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ matrix.notarize && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ matrix.notarize && secrets.APPLE_TEAM_ID || '' }}
         run: npm --workspace ./hyperpipe-desktop run dist:desktop -- ${{ matrix.builder_args }}
 
       - name: Write checksums
