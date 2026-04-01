@@ -263,21 +263,7 @@ async function runBuildStep(pluginDir, command = '') {
     const packageJson = await readJsonFile(packageJsonPath)
     const scripts = asObject(packageJson.scripts)
     if (scripts && isNonEmptyString(scripts.build)) {
-      const npmBinary = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-      await new Promise((resolve, reject) => {
-        const child = spawn(npmBinary, ['run', 'build'], {
-          cwd: pluginDir,
-          stdio: 'inherit'
-        })
-        child.once('error', (error) => reject(error))
-        child.once('exit', (code) => {
-          if (code === 0) {
-            resolve()
-            return
-          }
-          reject(new Error(`npm run build failed with exit code ${code}`))
-        })
-      })
+      await runShellCommand('npm run build', { cwd: pluginDir })
       return { mode: 'npm-build-script', command: 'npm run build' }
     }
   }

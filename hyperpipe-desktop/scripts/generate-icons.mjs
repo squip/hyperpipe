@@ -141,11 +141,38 @@ async function ensureDir(dirPath) {
   await fs.mkdir(dirPath, { recursive: true })
 }
 
+async function hasExistingReleaseIcons() {
+  const requiredPaths = [
+    path.join(BUILD_ROOT, 'icon.icns'),
+    path.join(BUILD_ROOT, 'icon.ico'),
+    path.join(BUILD_ROOT, 'icon.png'),
+    path.join(PUBLIC_ROOT, 'favicon.ico'),
+    path.join(PUBLIC_ROOT, 'pwa-192x192.png'),
+    path.join(PUBLIC_ROOT, 'pwa-512x512.png'),
+    path.join(PUBLIC_ROOT, 'apple-touch-icon.png')
+  ]
+
+  for (const targetPath of requiredPaths) {
+    try {
+      await fs.access(targetPath)
+    } catch (_) {
+      return false
+    }
+  }
+
+  return true
+}
+
 async function main() {
   await ensureDir(BUILD_ROOT)
   await ensureDir(PUBLIC_ROOT)
   await ensureDir(SRC_ASSETS_ROOT)
   await ensureDir(BUILD_ICONS_ROOT)
+
+  if (process.platform !== 'darwin' && await hasExistingReleaseIcons()) {
+    console.log(`[generate-icons] Reusing checked-in icon assets on ${process.platform}`)
+    return
+  }
 
   const fullColorSvg = renderPipeSvg({ background: true })
   const monochromeSvg = renderPipeSvg({ monochrome: true, background: false })
