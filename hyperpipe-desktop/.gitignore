@@ -9,7 +9,20 @@ lerna-debug.log*
 
 node_modules
 package-lock.json
-build
+build/*
+!build/icon.icns
+!build/icon.ico
+!build/icon.png
+!build/icons/
+build/icons/*
+!build/icons/16x16.png
+!build/icons/32x32.png
+!build/icons/48x48.png
+!build/icons/64x64.png
+!build/icons/128x128.png
+!build/icons/256x256.png
+!build/icons/512x512.png
+!build/icons/1024x1024.png
 dist
 dist-ssr
 dev-dist
