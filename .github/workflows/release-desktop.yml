@@ -119,16 +119,29 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npm run dist:desktop -- ${{ matrix.builder_args }}
 
-      - name: Build desktop release artifacts (signed + notarized)
+      - name: Build signed macOS app bundle
         if: runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
         env:
           CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
+        run: node ./scripts/build-notarized-mac-release.cjs build-app --arch ${{ matrix.arch }}
+
+      - name: Notarize and staple macOS app
+        if: runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: node ./scripts/build-notarized-mac-release.cjs --arch ${{ matrix.arch }} --timeout-minutes 60
+        run: node ./scripts/build-notarized-mac-release.cjs notarize --arch ${{ matrix.arch }} --timeout-minutes 60
+
+      - name: Package notarized macOS release artifacts
+        if: runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: node ./scripts/build-notarized-mac-release.cjs package --arch ${{ matrix.arch }}
 
       - name: Build desktop release artifacts
         if: runner.os != 'macOS'

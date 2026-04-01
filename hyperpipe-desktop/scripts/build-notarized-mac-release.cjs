@@ -14,7 +14,13 @@ const DEFAULT_TIMEOUT_MS = 45 * 60 * 1000
 function usage() {
   return [
     'Usage:',
-    '  node ./scripts/build-notarized-mac-release.cjs --arch <x64|arm64> [--timeout-minutes <minutes>]',
+    '  node ./scripts/build-notarized-mac-release.cjs <command> --arch <x64|arm64> [--timeout-minutes <minutes>]',
+    '',
+    'Commands:',
+    '  build-app    Build a signed macOS .app bundle only',
+    '  notarize     Zip, notarize, and staple the existing .app bundle',
+    '  package      Build DMG and ZIP from the existing notarized .app bundle',
+    '  all          Run build-app, notarize, and package in sequence',
     '',
     'Required env:',
     '  CSC_LINK',
@@ -26,6 +32,7 @@ function usage() {
 }
 
 function parseArgs(argv) {
+  let command = ''
   let arch = ''
   let timeoutMinutes = 45
 
@@ -34,6 +41,10 @@ function parseArgs(argv) {
     if (token === '--help' || token === '-h') {
       process.stdout.write(`${usage()}\n`)
       process.exit(0)
+    }
+    if (!token.startsWith('--') && !command) {
+      command = token
+      continue
     }
     if (token === '--arch') {
       arch = String(argv[index + 1] || '').trim()
@@ -48,6 +59,9 @@ function parseArgs(argv) {
     throw new Error(`Unknown argument: ${token}`)
   }
 
+  if (!command || !['build-app', 'notarize', 'package', 'all'].includes(command)) {
+    throw new Error('Missing or invalid command. Expected build-app, notarize, package, or all.')
+  }
   if (!arch || !['x64', 'arm64'].includes(arch)) {
     throw new Error('Missing or invalid --arch value. Expected x64 or arm64.')
   }
@@ -55,7 +69,7 @@ function parseArgs(argv) {
     throw new Error('Missing or invalid --timeout-minutes value.')
   }
 
-  return { arch, timeoutMs: timeoutMinutes * 60 * 1000 }
+  return { command, arch, timeoutMs: timeoutMinutes * 60 * 1000 }
 }
 
 function assertEnv(name) {
@@ -398,18 +412,49 @@ async function buildReleaseContainers(appPath, arch) {
 }
 
 async function main() {
-  const { arch, timeoutMs } = parseArgs(process.argv.slice(2))
+  const { command, arch, timeoutMs } = parseArgs(process.argv.slice(2))
+  const appPath = appBundlePathForArch(arch)
 
-  assertEnv('CSC_LINK')
-  assertEnv('CSC_KEY_PASSWORD')
-  assertEnv('APPLE_ID')
-  assertEnv('APPLE_APP_SPECIFIC_PASSWORD')
-  assertEnv('APPLE_TEAM_ID')
+  if (command === 'build-app' || command === 'all') {
+    assertEnv('CSC_LINK')
+    assertEnv('CSC_KEY_PASSWORD')
+  }
+
+  if (command === 'notarize' || command === 'all') {
+    assertEnv('APPLE_ID')
+    assertEnv('APPLE_APP_SPECIFIC_PASSWORD')
+    assertEnv('APPLE_TEAM_ID')
+  }
+
+  if (command === 'build-app') {
+    await buildSignedAppBundle(arch)
+    log(`Signed macOS app build completed for ${arch}`)
+    return
+  }
+
+  if (command === 'notarize') {
+    await fsp.rm(notaryLogsDir(), { recursive: true, force: true })
+    if (!fs.existsSync(appPath)) {
+      throw new Error(`Signed app bundle not found for notarization: ${appPath}`)
+    }
+    await notarizeAndStapleApp(appPath, arch, timeoutMs || DEFAULT_TIMEOUT_MS)
+    log(`Notarization and stapling completed for ${arch}`)
+    return
+  }
+
+  if (command === 'package') {
+    if (!fs.existsSync(appPath)) {
+      throw new Error(`Signed app bundle not found for packaging: ${appPath}`)
+    }
+    await buildReleaseContainers(appPath, arch)
+    log(`Release container packaging completed for ${arch}`)
+    return
+  }
 
   await fsp.rm(notaryLogsDir(), { recursive: true, force: true })
-  const appPath = await buildSignedAppBundle(arch)
-  await notarizeAndStapleApp(appPath, arch, timeoutMs || DEFAULT_TIMEOUT_MS)
-  await buildReleaseContainers(appPath, arch)
+  const builtAppPath = await buildSignedAppBundle(arch)
+  await notarizeAndStapleApp(builtAppPath, arch, timeoutMs || DEFAULT_TIMEOUT_MS)
+  await buildReleaseContainers(builtAppPath, arch)
   log(`Notarized macOS release packaging completed for ${arch}`)
 }
 
