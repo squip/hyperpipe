@@ -101,16 +101,21 @@ jobs:
         run: npm run test:electron
 
       - name: Build desktop release artifacts
+        if: runner.os == 'macOS'
         working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
         env:
-          CSC_LINK: ${{ runner.os == 'macOS' && secrets.MACOS_CSC_LINK || '' }}
-          CSC_KEY_PASSWORD: ${{ runner.os == 'macOS' && secrets.MACOS_CSC_KEY_PASSWORD || '' }}
-          WIN_CSC_LINK: ${{ runner.os == 'Windows' && secrets.WIN_CSC_LINK || '' }}
-          WIN_CSC_KEY_PASSWORD: ${{ runner.os == 'Windows' && secrets.WIN_CSC_KEY_PASSWORD || '' }}
-          CSC_IDENTITY_AUTO_DISCOVERY: ${{ runner.os != 'macOS' && 'false' || '' }}
-          APPLE_ID: ${{ matrix.notarize && secrets.APPLE_ID || '' }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ matrix.notarize && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
-          APPLE_TEAM_ID: ${{ matrix.notarize && secrets.APPLE_TEAM_ID || '' }}
+          CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run dist:desktop -- ${{ matrix.builder_args }}
+
+      - name: Build desktop release artifacts
+        if: runner.os != 'macOS'
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npm run dist:desktop -- ${{ matrix.builder_args }}
 
       - name: Write checksums
