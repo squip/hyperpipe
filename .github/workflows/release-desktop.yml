@@ -41,7 +41,7 @@ jobs:
 
   package:
     needs: verify
-    timeout-minutes: 90
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -51,10 +51,12 @@ jobs:
             arch: x64
             builder_args: --mac dmg zip --x64
             notarize: true
+            notarize_timeout_minutes: 90
           - os: macos-14
             arch: arm64
             builder_args: --mac dmg zip --arm64
             notarize: true
+            notarize_timeout_minutes: 120
           - os: windows-latest
             arch: x64
             builder_args: --win nsis --x64
@@ -134,7 +136,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: node ./scripts/build-notarized-mac-release.cjs notarize --arch ${{ matrix.arch }} --timeout-minutes 60
+        run: node ./scripts/build-notarized-mac-release.cjs notarize --arch ${{ matrix.arch }} --timeout-minutes ${{ matrix.notarize_timeout_minutes }}
 
       - name: Package notarized macOS release artifacts
         if: runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
@@ -158,7 +160,7 @@ jobs:
         if: always() && runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: notarization-${{ matrix.os }}
+          name: notarization-${{ matrix.os }}-${{ matrix.arch }}
           path: ${{ env.DESKTOP_STANDALONE_DIR }}/.notarization/**/*
           if-no-files-found: ignore
 

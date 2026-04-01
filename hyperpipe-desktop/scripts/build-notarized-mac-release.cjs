@@ -101,6 +101,19 @@ function notaryLogsDir() {
   return path.join(PROJECT_DIR, '.notarization')
 }
 
+function notaryStatusPath(arch) {
+  return path.join(notaryLogsDir(), `notary-status-${arch}.json`)
+}
+
+function notarySummaryPath(arch) {
+  return path.join(notaryLogsDir(), `notary-summary-${arch}.json`)
+}
+
+async function writeJson(filePath, value) {
+  await fsp.mkdir(path.dirname(filePath), { recursive: true })
+  await fsp.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
+}
+
 async function ensureDistArtifacts() {
   const distIndex = path.join(PROJECT_DIR, 'dist', 'index.html')
   if (!fs.existsSync(distIndex)) {
@@ -251,7 +264,7 @@ async function submitForNotarization(archivePath) {
   }
 
   log(`Apple notarization submission id: ${submissionId}`)
-  return submissionId
+  return { submissionId, submission }
 }
 
 async function fetchNotaryInfo(submissionId) {
@@ -321,7 +334,20 @@ async function notarizeAndStapleApp(appPath, arch, timeoutMs) {
     }
   )
 
-  const submissionId = await submitForNotarization(archivePath)
+  const { submissionId, submission } = await submitForNotarization(archivePath)
+  const statusPath = notaryStatusPath(arch)
+  const summaryPath = notarySummaryPath(arch)
+  const pollHistory = []
+
+  await writeJson(summaryPath, {
+    arch,
+    submissionId,
+    archivePath: path.basename(archivePath),
+    timeoutMinutes: Math.round(timeoutMs / 60000),
+    submittedAt: timestamp(),
+    submission
+  })
+
   const deadline = Date.now() + timeoutMs
   let lastStatus = ''
   let attempts = 0
@@ -342,6 +368,19 @@ async function notarizeAndStapleApp(appPath, arch, timeoutMs) {
     const status = String(info.status || info.Status || '').trim() || 'Unknown'
     const normalizedStatus = status.toLowerCase()
     const message = String(info.message || info.statusSummary || '').trim()
+    pollHistory.push({
+      checkedAt: timestamp(),
+      status,
+      message,
+      info
+    })
+    await writeJson(statusPath, {
+      arch,
+      submissionId,
+      latestStatus: status,
+      attempts,
+      pollHistory
+    })
     if (status !== lastStatus || attempts === 1 || attempts % 4 === 0) {
       log(`Apple notarization status (${arch}): ${status}${message ? ` - ${message}` : ''}`)
       lastStatus = status
@@ -361,6 +400,15 @@ async function notarizeAndStapleApp(appPath, arch, timeoutMs) {
 
   if (!finalInfo || String(finalInfo.status || '').trim().toLowerCase() !== 'accepted') {
     const logPath = await writeNotaryLog(submissionId, arch).catch(() => '')
+    await writeJson(summaryPath, {
+      arch,
+      submissionId,
+      timeoutMinutes: Math.round(timeoutMs / 60000),
+      completedAt: timestamp(),
+      finalInfo,
+      timedOut: true,
+      logPath: logPath || null
+    })
     throw new Error(
       `Apple notarization timed out for ${arch} after ${Math.round(timeoutMs / 60000)} minutes` +
         (logPath ? `. Partial log: ${logPath}` : '')
@@ -369,7 +417,15 @@ async function notarizeAndStapleApp(appPath, arch, timeoutMs) {
 
   const logPath = await writeNotaryLog(submissionId, arch)
   const infoPath = path.join(logsDir, `notary-info-${arch}.json`)
-  await fsp.writeFile(infoPath, `${JSON.stringify(finalInfo, null, 2)}\n`, 'utf8')
+  await writeJson(infoPath, finalInfo)
+  await writeJson(summaryPath, {
+    arch,
+    submissionId,
+    completedAt: timestamp(),
+    finalInfo,
+    accepted: true,
+    logPath
+  })
   log(`Apple notarization accepted for ${arch}. Log saved to ${logPath}`)
 
   await run('xcrun', ['stapler', 'staple', '-v', appPath], {
