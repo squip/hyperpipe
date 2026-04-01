@@ -97,15 +97,30 @@ jobs:
           rm -rf "$artifact_dir"
           mkdir -p "$artifact_dir"
           gh run download "$SOURCE_RUN_ID" --repo "${{ github.repository }}" --name "signed-macos-${{ matrix.arch }}" --dir "$artifact_dir"
-          app_path="$(find "$artifact_dir" -type d -name 'Hyperpipe.app' -print -quit)"
+          app_path="$(find "$artifact_dir" -type d -name 'Hyperpipe.app' -print -quit || true)"
           if [ -z "$app_path" ]; then
+            info_path="$(find "$artifact_dir" -type f -path '*/Contents/Info.plist' -print -quit || true)"
+            if [ -n "$info_path" ]; then
+              app_path="$(dirname "$(dirname "$info_path")")"
+            fi
+          fi
+          if [ -z "$app_path" ]; then
+            echo "Downloaded artifact contents:" >&2
+            find "$artifact_dir" -maxdepth 4 -print >&2 || true
             echo "Signed Hyperpipe.app not found in downloaded artifact" >&2
             exit 1
           fi
           dest_dir="${DESKTOP_STANDALONE_DIR}/release/${{ matrix.release_dir }}"
           rm -rf "$dest_dir"
           mkdir -p "$dest_dir"
-          mv "$app_path" "$dest_dir/Hyperpipe.app"
+          dest_app="$dest_dir/Hyperpipe.app"
+          if [ "$app_path" = "$artifact_dir" ]; then
+            mkdir -p "$dest_app"
+            shopt -s dotglob nullglob
+            mv "$artifact_dir"/* "$dest_app"/
+          else
+            mv "$app_path" "$dest_app"
+          fi
 
       - name: Restore notarization metadata
         env:
