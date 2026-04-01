@@ -48,15 +48,19 @@ jobs:
       matrix:
         include:
           - os: macos-15-intel
+            arch: x64
             builder_args: --mac dmg zip --x64
             notarize: true
           - os: macos-14
+            arch: arm64
             builder_args: --mac dmg zip --arm64
             notarize: true
           - os: windows-latest
+            arch: x64
             builder_args: --win nsis --x64
             notarize: false
           - os: ubuntu-latest
+            arch: x64
             builder_args: --linux AppImage --x64
             notarize: false
     runs-on: ${{ matrix.os }}
@@ -124,7 +128,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: npm run dist:desktop -- ${{ matrix.builder_args }}
+        run: node ./scripts/build-notarized-mac-release.cjs --arch ${{ matrix.arch }} --timeout-minutes 60
 
       - name: Build desktop release artifacts
         if: runner.os != 'macOS'
@@ -134,16 +138,26 @@ jobs:
         run: npm run dist:desktop -- ${{ matrix.builder_args }}
 
       - name: Write checksums
+        if: success()
         run: node ./scripts/write-sha256sums.mjs --dir "${{ env.DESKTOP_STANDALONE_DIR }}/release" --out "${{ env.DESKTOP_STANDALONE_DIR }}/release/SHA256SUMS.txt"
 
+      - name: Upload notarization diagnostics
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: notarization-${{ matrix.os }}
+          path: ${{ env.DESKTOP_STANDALONE_DIR }}/.notarization/**/*
+          if-no-files-found: ignore
+
       - name: Upload workflow artifacts
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.os }}
           path: ${{ env.DESKTOP_STANDALONE_DIR }}/release/*
 
       - name: Publish release assets
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: success() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.DESKTOP_STANDALONE_DIR }}/release/*
