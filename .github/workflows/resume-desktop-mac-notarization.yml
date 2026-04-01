@@ -1,0 +1,170 @@
+name: Resume Desktop Mac Notarization
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Release Desktop run id that uploaded the signed mac app bundle
+        required: true
+        type: string
+      release_tag:
+        description: Desktop release tag to append macOS assets to
+        required: true
+        type: string
+      arch:
+        description: macOS architecture to resume
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - x64
+          - arm64
+      timeout_minutes:
+        description: Additional minutes to wait for Apple notarization processing
+        required: true
+        default: '180'
+        type: string
+      submission_id:
+        description: Optional Apple submission id override if no metadata artifact is available
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: resume-desktop-mac-notarization-${{ inputs.release_tag }}-${{ inputs.arch }}
+  cancel-in-progress: false
+
+jobs:
+  select-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          case "${{ inputs.arch }}" in
+            x64)
+              echo 'matrix={"include":[{"os":"macos-15-intel","arch":"x64","release_dir":"mac"}]}' >> "$GITHUB_OUTPUT"
+              ;;
+            arm64)
+              echo 'matrix={"include":[{"os":"macos-14","arch":"arm64","release_dir":"mac-arm64"}]}' >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo 'matrix={"include":[{"os":"macos-15-intel","arch":"x64","release_dir":"mac"},{"os":"macos-14","arch":"arm64","release_dir":"mac-arm64"}]}' >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+  resume:
+    needs: select-matrix
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.select-matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    env:
+      DESKTOP_STANDALONE_DIR: .desktop-release-workdir
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      NOTARIZE_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+      SUBMISSION_ID_OVERRIDE: ${{ inputs.submission_id }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Prepare standalone desktop workspace
+        run: node ./scripts/stage-standalone-workspace.cjs ./hyperpipe-desktop "${{ env.DESKTOP_STANDALONE_DIR }}"
+
+      - name: Install standalone desktop dependencies
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        run: npm install --no-audit --no-fund
+
+      - name: Restore signed macOS app bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          artifact_dir="${RUNNER_TEMP}/signed-${{ matrix.arch }}"
+          rm -rf "$artifact_dir"
+          mkdir -p "$artifact_dir"
+          gh run download "$SOURCE_RUN_ID" --repo "${{ github.repository }}" --name "signed-macos-${{ matrix.arch }}" --dir "$artifact_dir"
+          app_path="$(find "$artifact_dir" -type d -name 'Hyperpipe.app' -print -quit)"
+          if [ -z "$app_path" ]; then
+            echo "Signed Hyperpipe.app not found in downloaded artifact" >&2
+            exit 1
+          fi
+          dest_dir="${DESKTOP_STANDALONE_DIR}/release/${{ matrix.release_dir }}"
+          rm -rf "$dest_dir"
+          mkdir -p "$dest_dir"
+          mv "$app_path" "$dest_dir/Hyperpipe.app"
+
+      - name: Restore notarization metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          artifact_dir="${RUNNER_TEMP}/notarization-${{ matrix.arch }}"
+          rm -rf "$artifact_dir"
+          mkdir -p "$artifact_dir"
+          if gh run download "$SOURCE_RUN_ID" --repo "${{ github.repository }}" --name "notarization-${{ matrix.arch }}" --dir "$artifact_dir"; then
+            mkdir -p "${DESKTOP_STANDALONE_DIR}/.notarization"
+            cp -R "$artifact_dir"/. "${DESKTOP_STANDALONE_DIR}/.notarization/"
+          else
+            echo "No notarization metadata artifact was available for ${{ matrix.arch }}." >&2
+          fi
+
+      - name: Notarize and staple restored macOS app
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          args=(wait --arch "${{ matrix.arch }}" --timeout-minutes "$NOTARIZE_TIMEOUT_MINUTES")
+          if [ -n "$SUBMISSION_ID_OVERRIDE" ]; then
+            args+=(--submission-id "$SUBMISSION_ID_OVERRIDE")
+          fi
+          node ./scripts/build-notarized-mac-release.cjs "${args[@]}"
+
+      - name: Package notarized macOS release artifacts
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: node ./scripts/build-notarized-mac-release.cjs package --arch ${{ matrix.arch }}
+
+      - name: Write checksums
+        run: node ./scripts/write-sha256sums.mjs --dir "${{ env.DESKTOP_STANDALONE_DIR }}/release" --out "${{ env.DESKTOP_STANDALONE_DIR }}/release/SHA256SUMS.txt"
+
+      - name: Upload notarization diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resumed-notarization-${{ matrix.arch }}
+          path: ${{ env.DESKTOP_STANDALONE_DIR }}/.notarization/**/*
+          if-no-files-found: ignore
+          include-hidden-files: true
+
+      - name: Upload workflow artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resumed-desktop-macos-${{ matrix.arch }}
+          path: ${{ env.DESKTOP_STANDALONE_DIR }}/release/*
+
+      - name: Publish release assets
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: ${{ env.DESKTOP_STANDALONE_DIR }}/release/*
+          overwrite_files: true

@@ -14,10 +14,12 @@ const DEFAULT_TIMEOUT_MS = 45 * 60 * 1000
 function usage() {
   return [
     'Usage:',
-    '  node ./scripts/build-notarized-mac-release.cjs <command> --arch <x64|arm64> [--timeout-minutes <minutes>]',
+    '  node ./scripts/build-notarized-mac-release.cjs <command> --arch <x64|arm64> [--timeout-minutes <minutes>] [--submission-id <id>]',
     '',
     'Commands:',
     '  build-app    Build a signed macOS .app bundle only',
+    '  submit       Zip and submit the existing .app bundle for notarization without waiting',
+    '  wait         Poll an existing Apple notarization submission, then staple the accepted app',
     '  notarize     Zip, notarize, and staple the existing .app bundle',
     '  package      Build DMG and ZIP from the existing notarized .app bundle',
     '  all          Run build-app, notarize, and package in sequence',
@@ -35,6 +37,7 @@ function parseArgs(argv) {
   let command = ''
   let arch = ''
   let timeoutMinutes = 45
+  let submissionId = ''
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index]
@@ -56,11 +59,16 @@ function parseArgs(argv) {
       index += 1
       continue
     }
+    if (token === '--submission-id') {
+      submissionId = String(argv[index + 1] || '').trim()
+      index += 1
+      continue
+    }
     throw new Error(`Unknown argument: ${token}`)
   }
 
-  if (!command || !['build-app', 'notarize', 'package', 'all'].includes(command)) {
-    throw new Error('Missing or invalid command. Expected build-app, notarize, package, or all.')
+  if (!command || !['build-app', 'submit', 'wait', 'notarize', 'package', 'all'].includes(command)) {
+    throw new Error('Missing or invalid command. Expected build-app, submit, wait, notarize, package, or all.')
   }
   if (!arch || !['x64', 'arm64'].includes(arch)) {
     throw new Error('Missing or invalid --arch value. Expected x64 or arm64.')
@@ -69,7 +77,7 @@ function parseArgs(argv) {
     throw new Error('Missing or invalid --timeout-minutes value.')
   }
 
-  return { command, arch, timeoutMs: timeoutMinutes * 60 * 1000 }
+  return { command, arch, timeoutMs: timeoutMinutes * 60 * 1000, submissionId }
 }
 
 function assertEnv(name) {
@@ -112,6 +120,18 @@ function notarySummaryPath(arch) {
 async function writeJson(filePath, value) {
   await fsp.mkdir(path.dirname(filePath), { recursive: true })
   await fsp.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
+}
+
+async function readJson(filePath) {
+  try {
+    const raw = await fsp.readFile(filePath, 'utf8')
+    return JSON.parse(raw)
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return null
+    }
+    throw error
+  }
 }
 
 async function ensureDistArtifacts() {
@@ -267,6 +287,78 @@ async function submitForNotarization(archivePath) {
   return { submissionId, submission }
 }
 
+async function createNotarizationArchive(appPath, arch) {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), `hyperpipe-notary-${arch}-`))
+  const archivePath = path.join(tempDir, `${PRODUCT_NAME}-${arch}-notary.zip`)
+  await run(
+    'ditto',
+    ['-c', '-k', '--sequesterRsrc', '--keepParent', appPath, archivePath],
+    {
+      announce: `Creating notarization archive for ${arch}`
+    }
+  )
+  return { archivePath, tempDir }
+}
+
+async function readSubmissionId(arch, explicitSubmissionId = '') {
+  const direct = String(explicitSubmissionId || '').trim()
+  if (direct) {
+    return direct
+  }
+
+  const summary = await readJson(notarySummaryPath(arch))
+  const summaryId = String(summary?.submissionId || '').trim()
+  if (summaryId) {
+    return summaryId
+  }
+
+  const status = await readJson(notaryStatusPath(arch))
+  const statusId = String(status?.submissionId || '').trim()
+  if (statusId) {
+    return statusId
+  }
+
+  throw new Error(`No saved notarization submission id found for ${arch}. Pass --submission-id or restore .notarization metadata.`)
+}
+
+async function submitAppForNotarization(appPath, arch, timeoutMs) {
+  const logsDir = notaryLogsDir()
+  await fsp.mkdir(logsDir, { recursive: true })
+
+  const { archivePath, tempDir } = await createNotarizationArchive(appPath, arch)
+  try {
+    const { submissionId, submission } = await submitForNotarization(archivePath)
+    const submittedAt = timestamp()
+
+    await writeJson(notaryStatusPath(arch), {
+      arch,
+      submissionId,
+      latestStatus: 'Submitted',
+      attempts: 0,
+      pollHistory: [
+        {
+          checkedAt: submittedAt,
+          status: 'Submitted',
+          message: 'Submitted to Apple notarization service',
+          submission
+        }
+      ]
+    })
+    await writeJson(notarySummaryPath(arch), {
+      arch,
+      submissionId,
+      archivePath: path.basename(archivePath),
+      timeoutMinutes: Math.round(timeoutMs / 60000),
+      submittedAt,
+      submission
+    })
+
+    return { submissionId, submission }
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true })
+  }
+}
+
 async function fetchNotaryInfo(submissionId) {
   const appleId = assertEnv('APPLE_ID')
   const password = assertEnv('APPLE_APP_SPECIFIC_PASSWORD')
@@ -320,33 +412,15 @@ async function writeNotaryLog(submissionId, arch) {
   return logPath
 }
 
-async function notarizeAndStapleApp(appPath, arch, timeoutMs) {
-  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), `hyperpipe-notary-${arch}-`))
-  const archivePath = path.join(tempDir, `${PRODUCT_NAME}-${arch}-notary.zip`)
+async function waitForNotarizationAndStapleApp(appPath, arch, timeoutMs, explicitSubmissionId = '') {
   const logsDir = notaryLogsDir()
-
   await fsp.mkdir(logsDir, { recursive: true })
-  await run(
-    'ditto',
-    ['-c', '-k', '--sequesterRsrc', '--keepParent', appPath, archivePath],
-    {
-      announce: `Creating notarization archive for ${arch}`
-    }
-  )
 
-  const { submissionId, submission } = await submitForNotarization(archivePath)
+  const submissionId = await readSubmissionId(arch, explicitSubmissionId)
+  const priorSummary = (await readJson(notarySummaryPath(arch))) || {}
   const statusPath = notaryStatusPath(arch)
   const summaryPath = notarySummaryPath(arch)
   const pollHistory = []
-
-  await writeJson(summaryPath, {
-    arch,
-    submissionId,
-    archivePath: path.basename(archivePath),
-    timeoutMinutes: Math.round(timeoutMs / 60000),
-    submittedAt: timestamp(),
-    submission
-  })
 
   const deadline = Date.now() + timeoutMs
   let lastStatus = ''
@@ -401,6 +475,7 @@ async function notarizeAndStapleApp(appPath, arch, timeoutMs) {
   if (!finalInfo || String(finalInfo.status || '').trim().toLowerCase() !== 'accepted') {
     const logPath = await writeNotaryLog(submissionId, arch).catch(() => '')
     await writeJson(summaryPath, {
+      ...priorSummary,
       arch,
       submissionId,
       timeoutMinutes: Math.round(timeoutMs / 60000),
@@ -419,6 +494,7 @@ async function notarizeAndStapleApp(appPath, arch, timeoutMs) {
   const infoPath = path.join(logsDir, `notary-info-${arch}.json`)
   await writeJson(infoPath, finalInfo)
   await writeJson(summaryPath, {
+    ...priorSummary,
     arch,
     submissionId,
     completedAt: timestamp(),
@@ -434,6 +510,11 @@ async function notarizeAndStapleApp(appPath, arch, timeoutMs) {
   await run('xcrun', ['stapler', 'validate', '-v', appPath], {
     announce: `Validating stapled ticket for ${path.basename(appPath)}`
   })
+}
+
+async function notarizeAndStapleApp(appPath, arch, timeoutMs) {
+  await submitAppForNotarization(appPath, arch, timeoutMs)
+  await waitForNotarizationAndStapleApp(appPath, arch, timeoutMs)
 }
 
 async function buildReleaseContainers(appPath, arch) {
@@ -468,7 +549,7 @@ async function buildReleaseContainers(appPath, arch) {
 }
 
 async function main() {
-  const { command, arch, timeoutMs } = parseArgs(process.argv.slice(2))
+  const { command, arch, timeoutMs, submissionId } = parseArgs(process.argv.slice(2))
   const appPath = appBundlePathForArch(arch)
 
   if (command === 'build-app' || command === 'all') {
@@ -476,7 +557,7 @@ async function main() {
     assertEnv('CSC_KEY_PASSWORD')
   }
 
-  if (command === 'notarize' || command === 'all') {
+  if (command === 'submit' || command === 'wait' || command === 'notarize' || command === 'all') {
     assertEnv('APPLE_ID')
     assertEnv('APPLE_APP_SPECIFIC_PASSWORD')
     assertEnv('APPLE_TEAM_ID')
@@ -485,6 +566,25 @@ async function main() {
   if (command === 'build-app') {
     await buildSignedAppBundle(arch)
     log(`Signed macOS app build completed for ${arch}`)
+    return
+  }
+
+  if (command === 'submit') {
+    await fsp.rm(notaryLogsDir(), { recursive: true, force: true })
+    if (!fs.existsSync(appPath)) {
+      throw new Error(`Signed app bundle not found for notarization submit: ${appPath}`)
+    }
+    const { submissionId: savedSubmissionId } = await submitAppForNotarization(appPath, arch, timeoutMs || DEFAULT_TIMEOUT_MS)
+    log(`Notarization submission completed for ${arch}: ${savedSubmissionId}`)
+    return
+  }
+
+  if (command === 'wait') {
+    if (!fs.existsSync(appPath)) {
+      throw new Error(`Signed app bundle not found for notarization wait: ${appPath}`)
+    }
+    await waitForNotarizationAndStapleApp(appPath, arch, timeoutMs || DEFAULT_TIMEOUT_MS, submissionId)
+    log(`Notarization wait and stapling completed for ${arch}`)
     return
   }
 

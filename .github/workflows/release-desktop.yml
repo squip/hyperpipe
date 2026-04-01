@@ -49,20 +49,24 @@ jobs:
         include:
           - os: macos-15-intel
             arch: x64
+            release_dir: mac
             builder_args: --mac dmg zip --x64
             notarize: true
             notarize_timeout_minutes: 90
           - os: macos-14
             arch: arm64
+            release_dir: mac-arm64
             builder_args: --mac dmg zip --arm64
             notarize: true
             notarize_timeout_minutes: 120
           - os: windows-latest
             arch: x64
+            release_dir: ''
             builder_args: --win nsis --x64
             notarize: false
           - os: ubuntu-latest
             arch: x64
+            release_dir: ''
             builder_args: --linux AppImage --x64
             notarize: false
     runs-on: ${{ matrix.os }}
@@ -129,21 +133,14 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
         run: node ./scripts/build-notarized-mac-release.cjs build-app --arch ${{ matrix.arch }}
 
-      - name: Notarize and staple macOS app
+      - name: Submit macOS app for notarization
         if: runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: node ./scripts/build-notarized-mac-release.cjs notarize --arch ${{ matrix.arch }} --timeout-minutes ${{ matrix.notarize_timeout_minutes }}
-
-      - name: Package notarized macOS release artifacts
-        if: runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: node ./scripts/build-notarized-mac-release.cjs package --arch ${{ matrix.arch }}
+        run: node ./scripts/build-notarized-mac-release.cjs submit --arch ${{ matrix.arch }} --timeout-minutes ${{ matrix.notarize_timeout_minutes }}
 
       - name: Build desktop release artifacts
         if: runner.os != 'macOS'
@@ -153,27 +150,36 @@ jobs:
         run: npm run dist:desktop -- ${{ matrix.builder_args }}
 
       - name: Write checksums
-        if: success()
+        if: success() && !(runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
         run: node ./scripts/write-sha256sums.mjs --dir "${{ env.DESKTOP_STANDALONE_DIR }}/release" --out "${{ env.DESKTOP_STANDALONE_DIR }}/release/SHA256SUMS.txt"
+
+      - name: Upload signed macOS app bundle
+        if: success() && runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-macos-${{ matrix.arch }}
+          path: ${{ env.DESKTOP_STANDALONE_DIR }}/release/${{ matrix.release_dir }}/Hyperpipe.app
+          if-no-files-found: error
 
       - name: Upload notarization diagnostics
         if: always() && runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: notarization-${{ matrix.os }}-${{ matrix.arch }}
+          name: notarization-${{ matrix.arch }}
           path: ${{ env.DESKTOP_STANDALONE_DIR }}/.notarization/**/*
           if-no-files-found: ignore
           include-hidden-files: true
 
       - name: Upload workflow artifacts
-        if: success()
+        if: success() && !(runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
         uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.os }}
           path: ${{ env.DESKTOP_STANDALONE_DIR }}/release/*
 
       - name: Publish release assets
-        if: success() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: success() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && runner.os != 'macOS'
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.DESKTOP_STANDALONE_DIR }}/release/*
+          overwrite_files: true
