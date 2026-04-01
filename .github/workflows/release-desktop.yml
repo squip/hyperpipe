@@ -78,6 +78,10 @@ jobs:
         working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
         run: node ./scripts/install-rollup-native.cjs
 
+      - name: Prune native prebuilds for target platform
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        run: node ./scripts/prune-native-prebuilds.cjs
+
       - name: Install xvfb (Linux)
         if: runner.os == 'Linux'
         run: |
