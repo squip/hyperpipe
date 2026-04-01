@@ -8,12 +8,14 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { execFile } from 'node:child_process'
+import zlib from 'node:zlib'
 
 import { validatePluginManifest } from '../index.mjs'
 
 const execFileAsync = promisify(execFile)
 
 const FIXED_MTIME = new Date('2000-01-01T00:00:00.000Z')
+const FIXED_MTIME_SECONDS = Math.floor(FIXED_MTIME.getTime() / 1000)
 const BLOCKED_SEGMENTS = new Set(['.git', '.hg', '.svn', 'node_modules'])
 const DEFAULT_TEMPLATE_VERSION = '0.1.0'
 
@@ -375,28 +377,81 @@ async function createStagingDirectory(pluginDir, filesToInclude) {
   return stagingRoot
 }
 
+function writeTarString(buffer, offset, length, value) {
+  const bytes = Buffer.from(String(value || ''), 'utf8')
+  bytes.copy(buffer, offset, 0, Math.min(length, bytes.length))
+}
+
+function writeTarOctal(buffer, offset, length, value) {
+  const encoded = Math.max(0, Number(value) || 0).toString(8).padStart(length - 1, '0')
+  writeTarString(buffer, offset, length - 1, encoded)
+  buffer[offset + length - 1] = 0
+}
+
+function writeTarChecksum(buffer, checksum) {
+  const encoded = Math.max(0, Number(checksum) || 0).toString(8).padStart(6, '0')
+  writeTarString(buffer, 148, 6, encoded)
+  buffer[154] = 0
+  buffer[155] = 0x20
+}
+
+function splitTarPath(relativePath) {
+  const normalized = normalizeRelativePath(relativePath, `Path "${relativePath}"`)
+  if (Buffer.byteLength(normalized, 'utf8') <= 100) {
+    return { name: normalized, prefix: '' }
+  }
+
+  const segments = normalized.split('/')
+  for (let index = segments.length - 1; index > 0; index -= 1) {
+    const prefix = segments.slice(0, index).join('/')
+    const name = segments.slice(index).join('/')
+    if (Buffer.byteLength(prefix, 'utf8') <= 155 && Buffer.byteLength(name, 'utf8') <= 100) {
+      return { name, prefix }
+    }
+  }
+
+  throw new Error(`Path is too long for deterministic archive packaging: ${normalized}`)
+}
+
+function createTarFileRecord(relativePath, body) {
+  const data = Buffer.isBuffer(body) ? body : Buffer.from(body)
+  const header = Buffer.alloc(512, 0)
+  const { name, prefix } = splitTarPath(relativePath)
+
+  writeTarString(header, 0, 100, name)
+  writeTarOctal(header, 100, 8, 0o644)
+  writeTarOctal(header, 108, 8, 0)
+  writeTarOctal(header, 116, 8, 0)
+  writeTarOctal(header, 124, 12, data.length)
+  writeTarOctal(header, 136, 12, FIXED_MTIME_SECONDS)
+  header.fill(0x20, 148, 156)
+  header[156] = '0'.charCodeAt(0)
+  writeTarString(header, 257, 6, 'ustar')
+  writeTarString(header, 263, 2, '00')
+  writeTarString(header, 265, 32, 'root')
+  writeTarString(header, 297, 32, 'root')
+  writeTarString(header, 345, 155, prefix)
+
+  const checksum = [...header].reduce((sum, value) => sum + value, 0)
+  writeTarChecksum(header, checksum)
+
+  const padding = Buffer.alloc((512 - (data.length % 512)) % 512, 0)
+  return Buffer.concat([header, data, padding])
+}
+
 async function createDeterministicArchive(stagingRoot, filesToInclude, outputPath) {
   const outputDir = path.dirname(outputPath)
   await fs.mkdir(outputDir, { recursive: true })
-  const tarArgs = [
-    '-czf',
-    outputPath,
-    '--uid',
-    '0',
-    '--gid',
-    '0',
-    '--uname',
-    'root',
-    '--gname',
-    'root',
-    '--format',
-    'ustar',
-    '-C',
-    stagingRoot,
-    '--',
-    ...filesToInclude
-  ]
-  await execFileAsync('tar', tarArgs)
+  const archiveParts = []
+  for (const relativePath of filesToInclude) {
+    const sourcePath = path.join(stagingRoot, relativePath)
+    const data = await fs.readFile(sourcePath)
+    archiveParts.push(createTarFileRecord(relativePath, data))
+  }
+  archiveParts.push(Buffer.alloc(1024, 0))
+  const tarPayload = Buffer.concat(archiveParts)
+  const gzipped = zlib.gzipSync(tarPayload, { level: 9, mtime: 0 })
+  await fs.writeFile(outputPath, gzipped)
 }
 
 async function computeProjectIntegrity(pluginDir, manifest) {
