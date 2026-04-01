@@ -197,6 +197,7 @@ function resolveInstalledPackageRoot(packageName) {
 
 function getBridgeRoot() {
   return resolveExistingRoot([
+    app.isPackaged ? path.join(process.resourcesPath, 'app.asar', 'node_modules', '@squip', 'hyperpipe-bridge') : null,
     app.isPackaged ? path.join(process.resourcesPath, 'app', 'node_modules', '@squip', 'hyperpipe-bridge') : null,
     resolveInstalledPackageRoot('@squip/hyperpipe-bridge'),
     path.join(REPO_ROOT, 'hyperpipe-bridge')
@@ -205,6 +206,7 @@ function getBridgeRoot() {
 
 function getCoreRoot() {
   return resolveExistingRoot([
+    app.isPackaged ? path.join(process.resourcesPath, 'app.asar', 'node_modules', '@squip', 'hyperpipe-core') : null,
     app.isPackaged ? path.join(process.resourcesPath, 'app', 'node_modules', '@squip', 'hyperpipe-core') : null,
     resolveInstalledPackageRoot('@squip/hyperpipe-core'),
     path.join(REPO_ROOT, 'hyperpipe-core')

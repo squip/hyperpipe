@@ -160,7 +160,10 @@
   "build": {
     "appId": "com.hyperpipe.desktop",
     "productName": "Hyperpipe",
-    "asar": false,
+    "asar": true,
+    "asarUnpack": [
+      "electron/plugin-runner.cjs"
+    ],
     "directories": {
       "output": "release",
       "buildResources": "build"
