@@ -150,7 +150,7 @@ jobs:
         run: npm run dist:desktop -- ${{ matrix.builder_args }}
 
       - name: Write checksums
-        if: success() && !(runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+        if: success() && github.event_name == 'workflow_dispatch'
         run: node ./scripts/write-sha256sums.mjs --dir "${{ env.DESKTOP_STANDALONE_DIR }}/release" --out "${{ env.DESKTOP_STANDALONE_DIR }}/release/SHA256SUMS.txt"
 
       - name: Upload signed macOS app bundle

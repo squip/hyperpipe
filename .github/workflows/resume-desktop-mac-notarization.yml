@@ -157,8 +157,9 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: node ./scripts/build-notarized-mac-release.cjs package --arch ${{ matrix.arch }}
 
-      - name: Write checksums
-        run: node ./scripts/write-sha256sums.mjs --dir "${{ env.DESKTOP_STANDALONE_DIR }}/release" --out "${{ env.DESKTOP_STANDALONE_DIR }}/release/SHA256SUMS.txt"
+      - name: Normalize macOS updater metadata
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        run: node ./scripts/normalize-mac-release-metadata.cjs --arch ${{ matrix.arch }}
 
       - name: Upload notarization diagnostics
         if: always()
@@ -182,4 +183,64 @@ jobs:
         with:
           tag_name: ${{ inputs.release_tag }}
           files: ${{ env.DESKTOP_STANDALONE_DIR }}/release/*
+          overwrite_files: true
+
+  publish-release-metadata:
+    needs: resume
+    if: success()
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_ASSET_DIR: ${{ runner.temp }}/desktop-release-assets
+      RELEASE_METADATA_DIR: ${{ runner.temp }}/desktop-release-metadata
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf "$RELEASE_ASSET_DIR"
+          mkdir -p "$RELEASE_ASSET_DIR"
+          gh release download "$RELEASE_TAG" --repo "${{ github.repository }}" --dir "$RELEASE_ASSET_DIR"
+          rm -f "$RELEASE_ASSET_DIR/SHA256SUMS.txt"
+          if [ -f "$RELEASE_ASSET_DIR/latest-mac.yml" ] && [ ! -f "$RELEASE_ASSET_DIR/latest-mac-x64.yml" ]; then
+            cp "$RELEASE_ASSET_DIR/latest-mac.yml" "$RELEASE_ASSET_DIR/latest-mac-x64.yml"
+          fi
+          if [ ! -f "$RELEASE_ASSET_DIR/latest-mac.yml" ] && [ -f "$RELEASE_ASSET_DIR/latest-mac-x64.yml" ]; then
+            cp "$RELEASE_ASSET_DIR/latest-mac-x64.yml" "$RELEASE_ASSET_DIR/latest-mac.yml"
+          fi
+
+      - name: Regenerate combined release checksums
+        run: node ./scripts/write-sha256sums.mjs --dir "${{ env.RELEASE_ASSET_DIR }}" --out "${{ env.RELEASE_ASSET_DIR }}/SHA256SUMS.txt"
+
+      - name: Stage merged release metadata
+        run: |
+          set -euo pipefail
+          rm -rf "$RELEASE_METADATA_DIR"
+          mkdir -p "$RELEASE_METADATA_DIR"
+          cp "$RELEASE_ASSET_DIR/SHA256SUMS.txt" "$RELEASE_METADATA_DIR/"
+          for file in latest-mac.yml latest-mac-x64.yml latest-mac-arm64.yml; do
+            if [ -f "$RELEASE_ASSET_DIR/$file" ]; then
+              cp "$RELEASE_ASSET_DIR/$file" "$RELEASE_METADATA_DIR/"
+            fi
+          done
+
+      - name: Upload merged release metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-release-metadata
+          path: ${{ env.RELEASE_METADATA_DIR }}/*
+          if-no-files-found: error
+
+      - name: Publish merged release metadata
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: ${{ env.RELEASE_METADATA_DIR }}/*
           overwrite_files: true
