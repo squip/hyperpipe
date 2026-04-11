@@ -191,8 +191,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
-      RELEASE_ASSET_DIR: ${{ runner.temp }}/desktop-release-assets
-      RELEASE_METADATA_DIR: ${{ runner.temp }}/desktop-release-metadata
+      RELEASE_ASSET_DIR: ${{ github.workspace }}/.release-artifacts/desktop-release-assets
+      RELEASE_METADATA_DIR: ${{ github.workspace }}/.release-artifacts/desktop-release-metadata
     steps:
       - uses: actions/checkout@v5
 
