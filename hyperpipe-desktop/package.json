@@ -1,6 +1,6 @@
 {
   "name": "hyperpipe-desktop",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Desktop client for Hyperpipe peer-to-peer Nostr relays and file sharing",
   "private": true,
   "main": "electron/main.cjs",
@@ -20,6 +20,7 @@
     "build:icons": "node ./scripts/generate-icons.mjs",
     "prepare:release-deps": "node ./scripts/prepare-release-deps.cjs",
     "prepare:release-runtime": "node ./scripts/prepare-release-deps.cjs",
+    "smoke:worker-runtime": "node ./scripts/smoke-worker-runtime.cjs",
     "build": "tsc -b && vite build",
     "build:web": "tsc -b && vite build",
     "build:desktop": "npm run build:icons && npm run build:web && npm run prepare:release-runtime && electron-builder --config ./electron-builder.config.cjs",
@@ -35,8 +36,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@squip/hyperpipe-bridge": "^0.1.0",
-    "@squip/hyperpipe-core": "^0.1.0",
+    "@squip/hyperpipe-bridge": "^0.1.2",
+    "@squip/hyperpipe-core": "^0.1.2",
     "@squip/hyperpipe-core-host": "^0.1.0",
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/modifiers": "^9.0.0",

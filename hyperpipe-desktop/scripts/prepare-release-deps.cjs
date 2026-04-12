@@ -1,18 +1,17 @@
+const { spawnSync } = require('node:child_process')
 const { builtinModules } = require('node:module')
-const { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } = require('node:fs')
+const { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } = require('node:fs')
 const path = require('node:path')
 
 const projectRoot = path.resolve(__dirname, '..')
 const stageRoot = path.join(projectRoot, '.release-runtime')
-const stageNodeModulesRoot = path.join(stageRoot, 'node_modules')
+const packedPackagesRoot = path.join(stageRoot, '.packages')
 
 const ENTRY_PACKAGES = [
   '@squip/hyperpipe-core',
   '@squip/hyperpipe-bridge',
   '@squip/hyperpipe-core-host'
 ]
-
-const copiedPackages = new Map()
 
 function isBuiltinPackage(packageName) {
   if (!packageName) return false
@@ -44,46 +43,11 @@ function findPackageRootFromResolvedEntry(resolvedEntry, packageName) {
   return null
 }
 
-function resolvePackageRoot(packageName, fallbackRelativePath) {
-  const searchPaths = [
-    projectRoot,
-    path.resolve(projectRoot, '..'),
-    path.resolve(projectRoot, '../..'),
-    process.cwd()
-  ]
-
-  for (const base of searchPaths) {
-    try {
-      const packageJsonPath = require.resolve(`${packageName}/package.json`, { paths: [base] })
-      return path.dirname(packageJsonPath)
-    } catch (_) {
-      // Continue searching.
-    }
+function resolveInstalledPackageRoot(packageName, parentRoot = projectRoot) {
+  if (isBuiltinPackage(packageName)) {
+    return null
   }
 
-  return path.resolve(projectRoot, fallbackRelativePath)
-}
-
-function shouldCopyPath(relativePath) {
-  if (!relativePath) return true
-  const normalized = relativePath.replace(/\\/g, '/')
-  return !(
-    normalized === 'node_modules'
-    || normalized.startsWith('node_modules/')
-    || normalized === 'package-lock.json'
-  )
-}
-
-function copyPackageTree(sourceRoot, targetRoot) {
-  rmSync(targetRoot, { recursive: true, force: true })
-  mkdirSync(path.dirname(targetRoot), { recursive: true })
-  cpSync(sourceRoot, targetRoot, {
-    recursive: true,
-    filter: (source) => shouldCopyPath(path.relative(sourceRoot, source))
-  })
-}
-
-function resolveInstalledPackageRoot(packageName, parentRoot = projectRoot) {
   const searchPaths = [
     parentRoot,
     projectRoot,
@@ -109,68 +73,118 @@ function resolveInstalledPackageRoot(packageName, parentRoot = projectRoot) {
     }
   }
 
-  if (packageName === '@squip/hyperpipe-core') {
-    return resolvePackageRoot(packageName, '../hyperpipe-core')
-  }
-  if (packageName === '@squip/hyperpipe-core-host') {
-    return resolvePackageRoot(packageName, '../hyperpipe-core-host')
-  }
-  if (packageName === '@squip/hyperpipe-bridge') {
-    return resolvePackageRoot(packageName, '../hyperpipe-bridge')
-  }
-
   throw new Error(`Unable to resolve installed package root for ${packageName}`)
 }
 
-function stagePackageTree(packageName, parentRoot = projectRoot) {
-  if (isBuiltinPackage(packageName) || copiedPackages.has(packageName)) {
-    return
+function packLocalPackage(sourceRoot) {
+  const result = spawnSync(
+    'npm',
+    ['pack', '--json', '--pack-destination', packedPackagesRoot],
+    {
+      cwd: sourceRoot,
+      stdio: ['ignore', 'pipe', 'inherit'],
+      env: process.env
+    }
+  )
+
+  if (result.status !== 0) {
+    throw new Error(`npm pack failed for ${sourceRoot} (exit ${result.status ?? 'unknown'})`)
   }
 
-  const sourceRoot = resolveInstalledPackageRoot(packageName, parentRoot)
-  if (!existsSync(sourceRoot)) {
-    throw new Error(`Unable to resolve ${packageName} from ${projectRoot}`)
+  let parsed
+  try {
+    parsed = JSON.parse(String(result.stdout || '[]'))
+  } catch (error) {
+    throw new Error(`Failed to parse npm pack output for ${sourceRoot}: ${String(result.stdout || '')}`)
   }
 
-  const targetRoot = path.join(stageNodeModulesRoot, ...packageName.split('/'))
-  copyPackageTree(sourceRoot, targetRoot)
-  copiedPackages.set(packageName, targetRoot)
-
-  const packageJson = readJson(path.join(sourceRoot, 'package.json'))
-  const dependencyMap = {
-    ...(packageJson.dependencies || {}),
-    ...(packageJson.optionalDependencies || {})
+  const filename = parsed?.[0]?.filename
+  if (!filename) {
+    throw new Error(`npm pack did not produce a filename for ${sourceRoot}`)
   }
 
-  for (const dependencyName of Object.keys(dependencyMap)) {
-    stagePackageTree(dependencyName, sourceRoot)
+  return filename
+}
+
+function buildStageManifest() {
+  const packages = ENTRY_PACKAGES.map((packageName) => {
+    const sourceRoot = resolveInstalledPackageRoot(packageName)
+    const packageJson = readJson(path.join(sourceRoot, 'package.json'))
+    const tarballName = packLocalPackage(sourceRoot)
+    return {
+      name: packageName,
+      version: packageJson.version,
+      sourceRoot,
+      tarballName,
+      overrides: packageJson.overrides || {}
+    }
+  })
+
+  const dependencies = {}
+  const overrides = {}
+
+  for (const pkg of packages) {
+    dependencies[pkg.name] = `file:.packages/${pkg.tarballName}`
+    Object.assign(overrides, pkg.overrides)
+  }
+
+  return {
+    packages,
+    packageJson: {
+      name: 'hyperpipe-desktop-runtime',
+      private: true,
+      type: 'module',
+      dependencies,
+      ...(Object.keys(overrides).length ? { overrides } : {})
+    }
+  }
+}
+
+function installRuntimeTree() {
+  const result = spawnSync(
+    'npm',
+    ['install', '--omit=dev', '--no-audit', '--no-fund', '--package-lock=false'],
+    {
+      cwd: stageRoot,
+      stdio: 'inherit',
+      env: process.env
+    }
+  )
+
+  if (result.status !== 0) {
+    throw new Error(`npm install failed while preparing desktop runtime (exit ${result.status ?? 'unknown'})`)
   }
 }
 
 function main() {
   rmSync(stageRoot, { recursive: true, force: true })
-  mkdirSync(stageNodeModulesRoot, { recursive: true })
+  mkdirSync(stageRoot, { recursive: true })
+  mkdirSync(packedPackagesRoot, { recursive: true })
 
-  for (const packageName of ENTRY_PACKAGES) {
-    stagePackageTree(packageName)
-  }
-
-  const manifestPath = path.join(stageRoot, 'manifest.json')
+  const manifest = buildStageManifest()
   writeFileSync(
-    manifestPath,
-    JSON.stringify(
-      {
-        generatedAt: new Date().toISOString(),
-        packages: Array.from(copiedPackages.keys()).sort()
-      },
-      null,
-      2
-    ),
+    path.join(stageRoot, 'package.json'),
+    `${JSON.stringify(manifest.packageJson, null, 2)}\n`,
+    'utf8'
+  )
+
+  installRuntimeTree()
+
+  writeFileSync(
+    path.join(stageRoot, 'manifest.json'),
+    `${JSON.stringify({
+      generatedAt: new Date().toISOString(),
+      packages: manifest.packages.map(({ name, version, sourceRoot }) => ({ name, version, sourceRoot }))
+    }, null, 2)}\n`,
     'utf8'
   )
 
   process.stdout.write(
-    `${JSON.stringify({ success: true, stageRoot, packages: Array.from(copiedPackages.keys()).sort() }, null, 2)}\n`
+    `${JSON.stringify({
+      success: true,
+      stageRoot,
+      packages: manifest.packages.map(({ name, version }) => ({ name, version }))
+    }, null, 2)}\n`
   )
 }
 
