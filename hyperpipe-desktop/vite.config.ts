@@ -43,6 +43,7 @@ const resolveBridgePackageRoot = () => {
 
 // https://vite.dev/config/
 export default defineConfig({
+  base: './',
   define: {
     'import.meta.env.GIT_COMMIT': getGitHash(),
     'import.meta.env.APP_VERSION': getAppVersion()
@@ -82,37 +83,37 @@ export default defineConfig({
         short_name: 'Hyperpipe',
         icons: [
           {
-            src: '/pwa-512x512.png',
+            src: './pwa-512x512.png',
             sizes: '512x512',
             type: 'image/png',
             purpose: 'any'
           },
           {
-            src: '/pwa-192x192.png',
+            src: './pwa-192x192.png',
             sizes: '192x192',
             type: 'image/png',
             purpose: 'any'
           },
           {
-            src: '/pwa-512x512.png',
+            src: './pwa-512x512.png',
             sizes: '512x512',
             type: 'image/png',
             purpose: 'maskable'
           },
           {
-            src: '/pwa-192x192.png',
+            src: './pwa-192x192.png',
             sizes: '192x192',
             type: 'image/png',
             purpose: 'maskable'
           },
           {
-            src: '/pwa-monochrome.svg',
+            src: './pwa-monochrome.svg',
             sizes: '512x512',
             type: 'image/svg+xml',
             purpose: 'monochrome'
           }
         ],
-        start_url: '/',
+        start_url: './',
         display: 'standalone',
         background_color: '#050505',
         theme_color: '#050505',
