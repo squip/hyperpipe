@@ -46,6 +46,7 @@ jobs:
       should_run: ${{ steps.resolve.outputs.should_run }}
       source_run_id: ${{ steps.resolve.outputs.source_run_id }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
+      release_version: ${{ steps.resolve.outputs.release_version }}
       arch: ${{ steps.resolve.outputs.arch }}
       timeout_minutes: ${{ steps.resolve.outputs.timeout_minutes }}
       submission_id: ${{ steps.resolve.outputs.submission_id }}
@@ -71,6 +72,7 @@ jobs:
             echo "should_run=true" >> "$GITHUB_OUTPUT"
             echo "source_run_id=$INPUT_SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
             echo "release_tag=$INPUT_RELEASE_TAG" >> "$GITHUB_OUTPUT"
+            echo "release_version=${INPUT_RELEASE_TAG#desktop-v}" >> "$GITHUB_OUTPUT"
             echo "arch=${INPUT_ARCH:-all}" >> "$GITHUB_OUTPUT"
             echo "timeout_minutes=${INPUT_TIMEOUT_MINUTES:-180}" >> "$GITHUB_OUTPUT"
             echo "submission_id=${INPUT_SUBMISSION_ID:-}" >> "$GITHUB_OUTPUT"
@@ -118,6 +120,7 @@ jobs:
           echo "should_run=true" >> "$GITHUB_OUTPUT"
           echo "source_run_id=$WORKFLOW_RUN_ID" >> "$GITHUB_OUTPUT"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "release_version=${release_tag#desktop-v}" >> "$GITHUB_OUTPUT"
           echo "arch=all" >> "$GITHUB_OUTPUT"
           echo "timeout_minutes=180" >> "$GITHUB_OUTPUT"
           echo "submission_id=" >> "$GITHUB_OUTPUT"
@@ -159,6 +162,7 @@ jobs:
       DESKTOP_STANDALONE_DIR: .desktop-release-workdir
       SOURCE_RUN_ID: ${{ needs.resolve-trigger.outputs.source_run_id }}
       RELEASE_TAG: ${{ needs.resolve-trigger.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.resolve-trigger.outputs.release_version }}
       NOTARIZE_TIMEOUT_MINUTES: ${{ needs.resolve-trigger.outputs.timeout_minutes }}
       SUBMISSION_ID_OVERRIDE: ${{ needs.resolve-trigger.outputs.submission_id }}
     steps:
@@ -176,6 +180,11 @@ jobs:
       - name: Install standalone desktop dependencies
         working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
         run: npm install --no-audit --no-fund
+
+      - name: Pin staged desktop version to release tag
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        run: |
+          node -e "const fs=require('node:fs'); const path=require('node:path'); const file=path.join(process.cwd(),'package.json'); const pkg=JSON.parse(fs.readFileSync(file,'utf8')); pkg.version=process.env.RELEASE_VERSION; fs.writeFileSync(file, JSON.stringify(pkg, null, 2)+'\n', 'utf8')"
 
       - name: Restore signed macOS app bundle
         env:

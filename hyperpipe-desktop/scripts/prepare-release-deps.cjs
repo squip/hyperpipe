@@ -8,6 +8,13 @@ const stageRoot = path.join(projectRoot, '.release-runtime')
 const packedPackagesRoot = path.join(stageRoot, '.packages')
 const npmExecutable = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
+function spawnNpm(args, options = {}) {
+  return spawnSync(npmExecutable, args, {
+    ...options,
+    shell: process.platform === 'win32'
+  })
+}
+
 const ENTRY_PACKAGES = [
   '@squip/hyperpipe-core',
   '@squip/hyperpipe-bridge',
@@ -78,8 +85,7 @@ function resolveInstalledPackageRoot(packageName, parentRoot = projectRoot) {
 }
 
 function packLocalPackage(sourceRoot) {
-  const result = spawnSync(
-    npmExecutable,
+  const result = spawnNpm(
     ['pack', '--json', '--pack-destination', packedPackagesRoot],
     {
       cwd: sourceRoot,
@@ -144,8 +150,7 @@ function buildStageManifest() {
 }
 
 function installRuntimeTree() {
-  const result = spawnSync(
-    npmExecutable,
+  const result = spawnNpm(
     ['install', '--omit=dev', '--no-audit', '--no-fund', '--package-lock=false'],
     {
       cwd: stageRoot,
