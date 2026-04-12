@@ -97,37 +97,21 @@ jobs:
           rm -rf "$artifact_dir"
           mkdir -p "$artifact_dir"
           gh run download "$SOURCE_RUN_ID" --repo "${{ github.repository }}" --name "signed-macos-${{ matrix.arch }}" --dir "$artifact_dir"
-          app_path=""
-          if [ -f "$artifact_dir/Contents/Info.plist" ]; then
-            app_path="$artifact_dir"
-          else
-            app_path="$(find "$artifact_dir" -type d -name 'Hyperpipe.app' -print -quit || true)"
-          fi
-          if [ -z "$app_path" ]; then
-            while IFS= read -r info_path; do
-              bundle_dir="$(dirname "$(dirname "$info_path")")"
-              if /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_path" 2>/dev/null | grep -qx 'com.hyperpipe.desktop'; then
-                app_path="$bundle_dir"
-                break
-              fi
-            done < <(find "$artifact_dir" -type f -path '*/Contents/Info.plist' | sort)
-          fi
-          if [ -z "$app_path" ]; then
+          archive_path="$(find "$artifact_dir" -maxdepth 2 -type f -name 'Hyperpipe-*-signed-app.zip' -print -quit || true)"
+          if [ -z "$archive_path" ]; then
             echo "Downloaded artifact contents:" >&2
             find "$artifact_dir" -maxdepth 4 -print >&2 || true
-            echo "Signed Hyperpipe.app not found in downloaded artifact" >&2
+            echo "Signed macOS app archive not found in downloaded artifact" >&2
             exit 1
           fi
           dest_dir="${DESKTOP_STANDALONE_DIR}/release/${{ matrix.release_dir }}"
           rm -rf "$dest_dir"
           mkdir -p "$dest_dir"
-          dest_app="$dest_dir/Hyperpipe.app"
-          if [ "$app_path" = "$artifact_dir" ]; then
-            mkdir -p "$dest_app"
-            shopt -s dotglob nullglob
-            mv "$artifact_dir"/* "$dest_app"/
-          else
-            mv "$app_path" "$dest_app"
+          ditto -x -k "$archive_path" "$dest_dir"
+          if [ ! -d "$dest_dir/Hyperpipe.app" ]; then
+            echo "Restored archive did not produce Hyperpipe.app" >&2
+            find "$dest_dir" -maxdepth 4 -print >&2 || true
+            exit 1
           fi
 
       - name: Restore notarization metadata
