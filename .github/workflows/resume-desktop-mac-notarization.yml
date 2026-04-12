@@ -97,12 +97,20 @@ jobs:
           rm -rf "$artifact_dir"
           mkdir -p "$artifact_dir"
           gh run download "$SOURCE_RUN_ID" --repo "${{ github.repository }}" --name "signed-macos-${{ matrix.arch }}" --dir "$artifact_dir"
-          app_path="$(find "$artifact_dir" -type d -name 'Hyperpipe.app' -print -quit || true)"
+          app_path=""
+          if [ -f "$artifact_dir/Contents/Info.plist" ]; then
+            app_path="$artifact_dir"
+          else
+            app_path="$(find "$artifact_dir" -type d -name 'Hyperpipe.app' -print -quit || true)"
+          fi
           if [ -z "$app_path" ]; then
-            info_path="$(find "$artifact_dir" -type f -path '*/Contents/Info.plist' -print -quit || true)"
-            if [ -n "$info_path" ]; then
-              app_path="$(dirname "$(dirname "$info_path")")"
-            fi
+            while IFS= read -r info_path; do
+              bundle_dir="$(dirname "$(dirname "$info_path")")"
+              if /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_path" 2>/dev/null | grep -qx 'com.hyperpipe.desktop'; then
+                app_path="$bundle_dir"
+                break
+              fi
+            done < <(find "$artifact_dir" -type f -path '*/Contents/Info.plist' | sort)
           fi
           if [ -z "$app_path" ]; then
             echo "Downloaded artifact contents:" >&2
