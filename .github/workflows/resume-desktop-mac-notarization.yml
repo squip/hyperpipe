@@ -106,13 +106,11 @@ jobs:
             exit 0
           fi
 
-          artifact_names="$(
-            gh api \
-              "repos/$WORKFLOW_RUN_REPOSITORY/actions/runs/$WORKFLOW_RUN_ID/artifacts" \
-              --jq '.artifacts[].name' 2>/dev/null || true
+          release_asset_names="$(
+            gh release view "$release_tag" --repo "$WORKFLOW_RUN_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null || true
           )"
 
-          if ! printf '%s\n' "$artifact_names" | grep -q '^signed-macos-'; then
+          if ! printf '%s\n' "$release_asset_names" | grep -q 'signed-app\.zip$'; then
             echo "should_run=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -194,8 +192,8 @@ jobs:
           artifact_dir="${RUNNER_TEMP}/signed-${{ matrix.arch }}"
           rm -rf "$artifact_dir"
           mkdir -p "$artifact_dir"
-          gh run download "$SOURCE_RUN_ID" --repo "${{ github.repository }}" --name "signed-macos-${{ matrix.arch }}" --dir "$artifact_dir"
-          archive_path="$(find "$artifact_dir" -maxdepth 2 -type f -name 'Hyperpipe-*-signed-app.zip' -print -quit || true)"
+          gh release download "$RELEASE_TAG" --repo "${{ github.repository }}" --pattern "Hyperpipe-${{ matrix.arch }}-signed-app.zip" --dir "$artifact_dir"
+          archive_path="$(find "$artifact_dir" -maxdepth 2 -type f -name "Hyperpipe-${{ matrix.arch }}-signed-app.zip" -print -quit || true)"
           if [ -z "$archive_path" ]; then
             echo "Downloaded artifact contents:" >&2
             find "$artifact_dir" -maxdepth 4 -print >&2 || true
@@ -336,6 +334,13 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           files: ${{ env.RELEASE_METADATA_DIR }}/*
           overwrite_files: true
+
+      - name: Remove internal signed app archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete-asset "$RELEASE_TAG" "Hyperpipe-x64-signed-app.zip" --repo "${{ github.repository }}" --yes || true
+          gh release delete-asset "$RELEASE_TAG" "Hyperpipe-arm64-signed-app.zip" --repo "${{ github.repository }}" --yes || true
 
       - name: Publish completed release
         if: needs.resolve-trigger.outputs.base_workflow_conclusion == 'success' || needs.resolve-trigger.outputs.base_workflow_conclusion == 'manual'

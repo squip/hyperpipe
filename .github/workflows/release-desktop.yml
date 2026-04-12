@@ -184,11 +184,12 @@ jobs:
 
       - name: Upload signed macOS app bundle
         if: success() && runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@v4
+        uses: softprops/action-gh-release@v2
         with:
-          name: signed-macos-${{ matrix.arch }}
-          path: ${{ env.DESKTOP_STANDALONE_DIR }}/signed-app-artifacts/Hyperpipe-${{ matrix.arch }}-signed-app.zip
-          if-no-files-found: error
+          tag_name: ${{ github.ref_name }}
+          files: ${{ env.DESKTOP_STANDALONE_DIR }}/signed-app-artifacts/Hyperpipe-${{ matrix.arch }}-signed-app.zip
+          overwrite_files: true
+          draft: true
 
       - name: Upload notarization diagnostics
         if: always() && runner.os == 'macOS'
