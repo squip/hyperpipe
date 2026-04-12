@@ -6,6 +6,7 @@ const path = require('node:path')
 const projectRoot = path.resolve(__dirname, '..')
 const stageRoot = path.join(projectRoot, '.release-runtime')
 const packedPackagesRoot = path.join(stageRoot, '.packages')
+const npmExecutable = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
 const ENTRY_PACKAGES = [
   '@squip/hyperpipe-core',
@@ -78,7 +79,7 @@ function resolveInstalledPackageRoot(packageName, parentRoot = projectRoot) {
 
 function packLocalPackage(sourceRoot) {
   const result = spawnSync(
-    'npm',
+    npmExecutable,
     ['pack', '--json', '--pack-destination', packedPackagesRoot],
     {
       cwd: sourceRoot,
@@ -88,7 +89,9 @@ function packLocalPackage(sourceRoot) {
   )
 
   if (result.status !== 0) {
-    throw new Error(`npm pack failed for ${sourceRoot} (exit ${result.status ?? 'unknown'})`)
+    throw new Error(
+      `npm pack failed for ${sourceRoot} (exit ${result.status ?? 'unknown'}${result.error ? `: ${result.error.message}` : ''})`
+    )
   }
 
   let parsed
@@ -142,7 +145,7 @@ function buildStageManifest() {
 
 function installRuntimeTree() {
   const result = spawnSync(
-    'npm',
+    npmExecutable,
     ['install', '--omit=dev', '--no-audit', '--no-fund', '--package-lock=false'],
     {
       cwd: stageRoot,
@@ -152,7 +155,9 @@ function installRuntimeTree() {
   )
 
   if (result.status !== 0) {
-    throw new Error(`npm install failed while preparing desktop runtime (exit ${result.status ?? 'unknown'})`)
+    throw new Error(
+      `npm install failed while preparing desktop runtime (exit ${result.status ?? 'unknown'}${result.error ? `: ${result.error.message}` : ''})`
+    )
   }
 }
 

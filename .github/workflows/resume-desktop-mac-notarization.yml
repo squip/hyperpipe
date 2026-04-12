@@ -49,6 +49,7 @@ jobs:
       arch: ${{ steps.resolve.outputs.arch }}
       timeout_minutes: ${{ steps.resolve.outputs.timeout_minutes }}
       submission_id: ${{ steps.resolve.outputs.submission_id }}
+      base_workflow_conclusion: ${{ steps.resolve.outputs.base_workflow_conclusion }}
     steps:
       - id: resolve
         env:
@@ -73,10 +74,11 @@ jobs:
             echo "arch=${INPUT_ARCH:-all}" >> "$GITHUB_OUTPUT"
             echo "timeout_minutes=${INPUT_TIMEOUT_MINUTES:-180}" >> "$GITHUB_OUTPUT"
             echo "submission_id=${INPUT_SUBMISSION_ID:-}" >> "$GITHUB_OUTPUT"
+            echo "base_workflow_conclusion=manual" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if [ "$WORKFLOW_RUN_CONCLUSION" != "success" ] || [ "$WORKFLOW_RUN_EVENT" != "push" ]; then
+          if [ "$WORKFLOW_RUN_EVENT" != "push" ]; then
             echo "should_run=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -102,12 +104,24 @@ jobs:
             exit 0
           fi
 
+          artifact_names="$(
+            gh api \
+              "repos/$WORKFLOW_RUN_REPOSITORY/actions/runs/$WORKFLOW_RUN_ID/artifacts" \
+              --jq '.artifacts[].name' 2>/dev/null || true
+          )"
+
+          if ! printf '%s\n' "$artifact_names" | grep -q '^signed-macos-'; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           echo "should_run=true" >> "$GITHUB_OUTPUT"
           echo "source_run_id=$WORKFLOW_RUN_ID" >> "$GITHUB_OUTPUT"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "arch=all" >> "$GITHUB_OUTPUT"
           echo "timeout_minutes=180" >> "$GITHUB_OUTPUT"
           echo "submission_id=" >> "$GITHUB_OUTPUT"
+          echo "base_workflow_conclusion=$WORKFLOW_RUN_CONCLUSION" >> "$GITHUB_OUTPUT"
 
   select-matrix:
     needs: resolve-trigger
@@ -315,6 +329,7 @@ jobs:
           overwrite_files: true
 
       - name: Publish completed release
+        if: needs.resolve-trigger.outputs.base_workflow_conclusion == 'success' || needs.resolve-trigger.outputs.base_workflow_conclusion == 'manual'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --draft=false
