@@ -157,7 +157,8 @@ export const EMOJI_REGEX =
 export const YOUTUBE_URL_REGEX =
   /https?:\/\/(?:(?:www|m)\.)?(?:youtube\.com\/(?:watch\?[^#\s]*|embed\/[\w-]+|shorts\/[\w-]+|live\/[\w-]+)|youtu\.be\/[\w-]+)(?:\?[^#\s]*)?(?:#[^\s]*)?/gi
 
-export const DEV_PUBKEY = '7bdef7be22dd8e59f4600e044aa53a1cf975a9dc7d27df5833bc77db784a5805'
+export const DEV_PUBKEY = '5fc31523db0cb6cc86f8542b64ea788aa7bc4c3cb1787c4ef0bde76f88c61ded'
+export const DEV_DISPLAY_NAME = 'SQUIP'
 
 export const NIP_96_SERVICE = [
   'https://mockingyou.com',

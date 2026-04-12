@@ -53,6 +53,22 @@
     }
   }
 
+  .desktop-titlebar {
+    -webkit-app-region: drag;
+  }
+
+  .desktop-titlebar button,
+  .desktop-titlebar a,
+  .desktop-titlebar input,
+  .desktop-titlebar textarea,
+  .desktop-titlebar select,
+  .desktop-titlebar summary,
+  .desktop-titlebar [role='button'],
+  .desktop-titlebar [role='link'],
+  .desktop-titlebar [data-no-drag='true'] {
+    -webkit-app-region: no-drag;
+  }
+
   .tiptap p.is-editor-empty:first-child::before {
     color: hsl(var(--muted-foreground));
     content: attr(data-placeholder);

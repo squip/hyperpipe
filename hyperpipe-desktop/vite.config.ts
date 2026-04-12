@@ -52,7 +52,14 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: './src/test/setup.ts',
     globals: true,
-    exclude: ['e2e/**', 'electron/**', 'release/**', 'node_modules/**']
+    exclude: [
+      'e2e/**',
+      'electron/**',
+      'release/**',
+      'node_modules/**',
+      '.release-deps/**',
+      '.release-runtime/**'
+    ]
   },
   resolve: {
     alias: {

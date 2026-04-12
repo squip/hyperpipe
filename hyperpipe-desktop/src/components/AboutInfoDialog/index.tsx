@@ -1,9 +1,18 @@
+import { SecondaryPageLink } from '@/PageManager'
 import { Dialog, DialogContent, DialogTrigger } from '@/components/ui/dialog'
+import ProfileCard from '@/components/ProfileCard'
+import { HoverCard, HoverCardContent, HoverCardTrigger } from '@/components/ui/hover-card'
 import { Drawer, DrawerContent, DrawerTrigger } from '@/components/ui/drawer'
-import { APP_DESCRIPTION, APP_DISPLAY_NAME, APP_REPOSITORY_URL, DEV_PUBKEY } from '@/constants'
+import {
+  APP_DESCRIPTION,
+  APP_DISPLAY_NAME,
+  APP_REPOSITORY_URL,
+  DEV_DISPLAY_NAME,
+  DEV_PUBKEY
+} from '@/constants'
+import { toProfile } from '@/lib/link'
 import { useScreenSize } from '@/providers/ScreenSizeProvider'
 import { useState } from 'react'
-import Username from '../Username'
 
 export default function AboutInfoDialog({ children }: { children: React.ReactNode }) {
   const { isSmallScreen } = useScreenSize()
@@ -14,7 +23,7 @@ export default function AboutInfoDialog({ children }: { children: React.ReactNod
       <div className="text-xl font-semibold">{APP_DISPLAY_NAME}</div>
       <div className="text-muted-foreground">{APP_DESCRIPTION}</div>
       <div>
-        Made by <Username userId={DEV_PUBKEY} className="inline-block text-primary" showAt />
+        Made by <DeveloperProfileLink />
       </div>
       <div>
         Source code:{' '}
@@ -49,5 +58,26 @@ export default function AboutInfoDialog({ children }: { children: React.ReactNod
       <DialogTrigger asChild>{children}</DialogTrigger>
       <DialogContent>{content}</DialogContent>
     </Dialog>
+  )
+}
+
+function DeveloperProfileLink() {
+  return (
+    <HoverCard>
+      <HoverCardTrigger asChild>
+        <span className="inline-flex">
+          <SecondaryPageLink
+            to={toProfile(DEV_PUBKEY)}
+            className="text-primary hover:underline"
+            onClick={(event) => event.stopPropagation()}
+          >
+            @{DEV_DISPLAY_NAME}
+          </SecondaryPageLink>
+        </span>
+      </HoverCardTrigger>
+      <HoverCardContent className="w-80">
+        <ProfileCard userId={DEV_PUBKEY} />
+      </HoverCardContent>
+    </HoverCard>
   )
 }

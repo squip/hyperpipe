@@ -616,6 +616,11 @@ function createWindow() {
     height: 1022,
     show: false,
     backgroundColor: '#000000',
+    ...(process.platform === 'darwin'
+      ? {
+          titleBarStyle: 'hiddenInset'
+        }
+      : {}),
     ...(process.platform === 'linux' || process.platform === 'win32'
       ? { icon: runtimeIconPath }
       : {}),
