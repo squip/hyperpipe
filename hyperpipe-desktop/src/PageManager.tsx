@@ -2,6 +2,7 @@ import Sidebar from '@/components/Sidebar'
 import { DEFAULT_DESKTOP_COLUMN_TOTAL_WIDTH } from '@/constants'
 import { isRendererFeatureEnabled } from '@/lib/features'
 import type { RendererFeature } from '@/lib/features'
+import { isMacDesktop } from '@/lib/platform'
 import { cn } from '@/lib/utils'
 import NoteListPage from '@/pages/primary/NoteListPage'
 import HomePage from '@/pages/secondary/HomePage'
@@ -44,6 +45,8 @@ import { useUserPreferences } from './providers/UserPreferencesProvider'
 import { getRoutes } from './routes'
 import storage from './services/local-storage.service'
 import modalManager from './services/modal-manager.service'
+
+const MAC_DESKTOP_SHELL_BAR_HEIGHT_PX = 40
 
 export type TPrimaryPageName = keyof typeof PRIMARY_PAGE_MAP
 
@@ -131,6 +134,7 @@ export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
   const { isSmallScreen } = useScreenSize()
   const { themeSetting } = useTheme()
   const { enableSingleColumnLayout } = useUserPreferences()
+  const macDesktop = isMacDesktop()
   const ignorePopStateRef = useRef(false)
   const [leftColumnWidth, setLeftColumnWidth] = useState(() => storage.getDesktopPrimaryColumnWidth())
   const [isResizing, setIsResizing] = useState(false)
@@ -448,37 +452,47 @@ export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
         >
           <CurrentRelaysProvider>
             <NotificationProvider>
-              <div className="flex lg:justify-around w-full">
-                <div className="sticky top-0 lg:w-full flex justify-end self-start h-[var(--vh)]">
+              <div className="flex flex-col w-full bg-surface-background">
+                {macDesktop && <DesktopShellTitlebarInset />}
+                <div
+                  className="flex lg:justify-around w-full"
+                  style={{
+                    height: macDesktop
+                      ? `calc(var(--vh) - ${MAC_DESKTOP_SHELL_BAR_HEIGHT_PX}px)`
+                      : 'var(--vh)'
+                  }}
+                >
+                  <div className="sticky top-0 lg:w-full flex justify-end self-start h-full">
                   <Sidebar />
-                </div>
-                <div className="flex-1 w-0 bg-background border-x lg:flex-auto lg:w-[640px] lg:shrink-0">
-                  {!!secondaryStack.length &&
-                    secondaryStack.map((item, index) => (
+                  </div>
+                  <div className="flex-1 w-0 bg-background border-x lg:flex-auto lg:w-[640px] lg:shrink-0">
+                    {!!secondaryStack.length &&
+                      secondaryStack.map((item, index) => (
+                        <div
+                          key={item.index}
+                          style={{
+                            display: index === secondaryStack.length - 1 ? 'block' : 'none'
+                          }}
+                        >
+                          {item.component}
+                        </div>
+                      ))}
+                    {primaryPages.map(({ name, element, props }) => (
                       <div
-                        key={item.index}
+                        key={name}
                         style={{
-                          display: index === secondaryStack.length - 1 ? 'block' : 'none'
+                          display:
+                            secondaryStack.length === 0 && currentPrimaryPage === name
+                              ? 'block'
+                              : 'none'
                         }}
                       >
-                        {item.component}
+                        {props ? cloneElement(element as React.ReactElement, props) : element}
                       </div>
                     ))}
-                  {primaryPages.map(({ name, element, props }) => (
-                    <div
-                      key={name}
-                      style={{
-                        display:
-                          secondaryStack.length === 0 && currentPrimaryPage === name
-                            ? 'block'
-                            : 'none'
-                      }}
-                    >
-                      {props ? cloneElement(element as React.ReactElement, props) : element}
-                    </div>
-                  ))}
+                  </div>
+                  <div className="hidden lg:w-full lg:block" />
                 </div>
-                <div className="hidden lg:w-full lg:block" />
               </div>
               <TooManyRelaysAlertDialog />
               <CreateWalletGuideToast />
@@ -504,14 +518,27 @@ export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
           pop: popSecondaryPage,
           currentIndex: secondaryStack.length ? secondaryStack[secondaryStack.length - 1].index : 0
         }}
-      >
-        <CurrentRelaysProvider>
+        >
+          <CurrentRelaysProvider>
           <NotificationProvider>
             <div className="flex flex-col items-center bg-surface-background">
+              {macDesktop && (
+                <div
+                  style={{
+                    maxWidth: '1920px'
+                  }}
+                  className="w-full"
+                >
+                  <DesktopShellTitlebarInset />
+                </div>
+              )}
               <div
-                className="flex h-[var(--vh)] w-full bg-surface-background"
+                className="flex w-full bg-surface-background"
                 style={{
-                  maxWidth: '1920px'
+                  maxWidth: '1920px',
+                  height: macDesktop
+                    ? `calc(var(--vh) - ${MAC_DESKTOP_SHELL_BAR_HEIGHT_PX}px)`
+                    : 'var(--vh)'
                 }}
               >
                 <Sidebar />
@@ -592,6 +619,12 @@ export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
         </CurrentRelaysProvider>
       </SecondaryPageContext.Provider>
     </PrimaryPageContext.Provider>
+  )
+}
+
+function DesktopShellTitlebarInset() {
+  return (
+    <div className="desktop-shell-titlebar-inset h-10 w-full shrink-0 border-b bg-background" />
   )
 }
 

@@ -224,6 +224,9 @@ async function buildSignedAppBundle(arch) {
   await run('node', ['./scripts/generate-icons.mjs'], {
     announce: `Generating desktop icons for ${arch}`
   })
+  await run('npm', ['run', 'prepare:release-runtime'], {
+    announce: `Preparing packaged desktop runtime for ${arch}`
+  })
 
   const builderEnv = {
     ...process.env,
