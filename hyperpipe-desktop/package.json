@@ -5,7 +5,7 @@
   "private": true,
   "main": "electron/main.cjs",
   "type": "module",
-  "author": "codytseng",
+  "author": "squip",
   "license": "MIT",
   "repository": {
     "type": "git",

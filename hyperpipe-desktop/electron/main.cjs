@@ -14,9 +14,19 @@ const {
 
 const execFileAsync = promisify(execFile);
 const APP_DISPLAY_NAME = 'Hyperpipe';
+const APP_COPYRIGHT = `Copyright © ${new Date().getFullYear()} squip`;
 
 if (typeof app.setName === 'function') {
   app.setName(APP_DISPLAY_NAME);
+}
+
+if (typeof app.setAboutPanelOptions === 'function') {
+  app.setAboutPanelOptions({
+    applicationName: APP_DISPLAY_NAME,
+    applicationVersion: app.getVersion(),
+    version: app.getVersion(),
+    copyright: APP_COPYRIGHT
+  });
 }
 
 let mainWindow = null;
