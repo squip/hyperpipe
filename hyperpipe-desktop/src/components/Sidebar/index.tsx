@@ -47,8 +47,8 @@ export default function PrimaryPageSidebar() {
             <Icon />
           </div>
         ) : (
-          <div className="ml-3 pr-8 mt-2 mb-6 w-full">
-            <Logo />
+          <div className="ml-3 pr-4 mt-2 mb-6 w-full">
+            <Logo variant="sidebar" className="max-w-[9.75rem]" />
           </div>
         )}
         <HomeButton collapse={sidebarCollapse} />

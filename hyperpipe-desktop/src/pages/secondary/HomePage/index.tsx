@@ -21,7 +21,7 @@ const HomePage = forwardRef(({ index }: { index?: number }, ref) => {
       <div className="px-6 pt-6 pb-8 max-w-3xl mx-auto space-y-6">
         <div className="flex justify-center">
           <div className="w-full max-w-xl">
-            <Logo className="max-w-full" />
+            <Logo variant="hero" className="max-w-full" />
           </div>
         </div>
 
