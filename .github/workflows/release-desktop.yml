@@ -206,3 +206,4 @@ jobs:
         with:
           files: ${{ env.DESKTOP_STANDALONE_DIR }}/release/*
           overwrite_files: true
+          draft: true

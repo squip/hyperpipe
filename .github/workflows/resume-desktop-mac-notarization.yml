@@ -248,7 +248,7 @@ jobs:
         if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: ${{ env.DESKTOP_STANDALONE_DIR }}/release/*
           overwrite_files: true
 
@@ -310,6 +310,11 @@ jobs:
       - name: Publish merged release metadata
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: ${{ env.RELEASE_METADATA_DIR }}/*
           overwrite_files: true
+
+      - name: Publish completed release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --draft=false
