@@ -29,24 +29,96 @@ on:
         description: Optional Apple submission id override if no metadata artifact is available
         required: false
         type: string
+  workflow_run:
+    workflows:
+      - Release Desktop
+    types:
+      - completed
 
 permissions:
   contents: write
   actions: read
 
-concurrency:
-  group: resume-desktop-mac-notarization-${{ inputs.release_tag }}-${{ inputs.arch }}
-  cancel-in-progress: false
-
 jobs:
+  resolve-trigger:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.resolve.outputs.should_run }}
+      source_run_id: ${{ steps.resolve.outputs.source_run_id }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      arch: ${{ steps.resolve.outputs.arch }}
+      timeout_minutes: ${{ steps.resolve.outputs.timeout_minutes }}
+      submission_id: ${{ steps.resolve.outputs.submission_id }}
+    steps:
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_ARCH: ${{ inputs.arch }}
+          INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+          INPUT_SUBMISSION_ID: ${{ inputs.submission_id }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
+          WORKFLOW_RUN_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "source_run_id=$INPUT_SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
+            echo "release_tag=$INPUT_RELEASE_TAG" >> "$GITHUB_OUTPUT"
+            echo "arch=${INPUT_ARCH:-all}" >> "$GITHUB_OUTPUT"
+            echo "timeout_minutes=${INPUT_TIMEOUT_MINUTES:-180}" >> "$GITHUB_OUTPUT"
+            echo "submission_id=${INPUT_SUBMISSION_ID:-}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$WORKFLOW_RUN_CONCLUSION" != "success" ] || [ "$WORKFLOW_RUN_EVENT" != "push" ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          context_dir="$RUNNER_TEMP/desktop-release-context"
+          rm -rf "$context_dir"
+          mkdir -p "$context_dir"
+
+          if ! gh run download "$WORKFLOW_RUN_ID" --repo "$WORKFLOW_RUN_REPOSITORY" --name "desktop-release-context" --dir "$context_dir"; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          release_tag_file="$(find "$context_dir" -maxdepth 2 -type f -name 'release-tag.txt' -print -quit || true)"
+          if [ -z "$release_tag_file" ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          release_tag="$(tr -d '\r\n' < "$release_tag_file")"
+          if [ -z "$release_tag" ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          echo "source_run_id=$WORKFLOW_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "arch=all" >> "$GITHUB_OUTPUT"
+          echo "timeout_minutes=180" >> "$GITHUB_OUTPUT"
+          echo "submission_id=" >> "$GITHUB_OUTPUT"
+
   select-matrix:
+    needs: resolve-trigger
+    if: needs.resolve-trigger.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - id: set-matrix
         run: |
-          case "${{ inputs.arch }}" in
+          case "${{ needs.resolve-trigger.outputs.arch }}" in
             x64)
               echo 'matrix={"include":[{"os":"macos-15-intel","arch":"x64","release_dir":"mac"}]}' >> "$GITHUB_OUTPUT"
               ;;
@@ -59,7 +131,10 @@ jobs:
           esac
 
   resume:
-    needs: select-matrix
+    needs:
+      - resolve-trigger
+      - select-matrix
+    if: needs.resolve-trigger.outputs.should_run == 'true'
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -68,10 +143,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       DESKTOP_STANDALONE_DIR: .desktop-release-workdir
-      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-      RELEASE_TAG: ${{ inputs.release_tag }}
-      NOTARIZE_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
-      SUBMISSION_ID_OVERRIDE: ${{ inputs.submission_id }}
+      SOURCE_RUN_ID: ${{ needs.resolve-trigger.outputs.source_run_id }}
+      RELEASE_TAG: ${{ needs.resolve-trigger.outputs.release_tag }}
+      NOTARIZE_TIMEOUT_MINUTES: ${{ needs.resolve-trigger.outputs.timeout_minutes }}
+      SUBMISSION_ID_OVERRIDE: ${{ needs.resolve-trigger.outputs.submission_id }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -178,11 +253,13 @@ jobs:
           overwrite_files: true
 
   publish-release-metadata:
-    needs: resume
-    if: success()
+    needs:
+      - resolve-trigger
+      - resume
+    if: needs.resolve-trigger.outputs.should_run == 'true' && success()
     runs-on: ubuntu-latest
     env:
-      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_TAG: ${{ needs.resolve-trigger.outputs.release_tag }}
       RELEASE_ASSET_DIR: ${{ github.workspace }}/.release-artifacts/desktop-release-assets
       RELEASE_METADATA_DIR: ${{ github.workspace }}/.release-artifacts/desktop-release-metadata
     steps:
