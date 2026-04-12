@@ -22,6 +22,8 @@ function shouldInclude(relativePath) {
     || normalized.startsWith('release/')
     || normalized === '.release-deps'
     || normalized.startsWith('.release-deps/')
+    || normalized === '.release-runtime'
+    || normalized.startsWith('.release-runtime/')
   )
 }
 

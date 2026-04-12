@@ -19,10 +19,11 @@
     "dev:electron": "node ./scripts/dev-electron.cjs",
     "build:icons": "node ./scripts/generate-icons.mjs",
     "prepare:release-deps": "node ./scripts/prepare-release-deps.cjs",
+    "prepare:release-runtime": "node ./scripts/prepare-release-deps.cjs",
     "build": "tsc -b && vite build",
     "build:web": "tsc -b && vite build",
-    "build:desktop": "npm run build:icons && npm run build:web && electron-builder --config ./electron-builder.config.cjs",
-    "dist:desktop": "npm run build:icons && npm run build:web && electron-builder --config ./electron-builder.config.cjs --publish=never",
+    "build:desktop": "npm run build:icons && npm run build:web && npm run prepare:release-runtime && electron-builder --config ./electron-builder.config.cjs",
+    "dist:desktop": "npm run build:icons && npm run build:web && npm run prepare:release-runtime && electron-builder --config ./electron-builder.config.cjs --publish=never",
     "electron:dev-shell": "electron .",
     "closed-join-sim": "node ./electron/bin/closed-join-sim.mjs",
     "test:unit": "vitest run",
@@ -172,6 +173,15 @@
       "dist/**/*",
       "electron/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": ".release-runtime",
+        "to": "runtime",
+        "filter": [
+          "**/*"
+        ]
+      }
     ],
     "mac": {
       "category": "public.app-category.utilities",

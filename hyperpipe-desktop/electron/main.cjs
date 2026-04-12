@@ -205,8 +205,14 @@ function resolveInstalledPackageRoot(packageName) {
   return null;
 }
 
+function resolvePackagedRuntimePackageRoot(packageName) {
+  if (!app.isPackaged) return null;
+  return path.join(process.resourcesPath, 'runtime', 'node_modules', ...packageName.split('/'));
+}
+
 function getBridgeRoot() {
   return resolveExistingRoot([
+    resolvePackagedRuntimePackageRoot('@squip/hyperpipe-bridge'),
     app.isPackaged ? path.join(process.resourcesPath, 'app.asar', 'node_modules', '@squip', 'hyperpipe-bridge') : null,
     app.isPackaged ? path.join(process.resourcesPath, 'app', 'node_modules', '@squip', 'hyperpipe-bridge') : null,
     resolveInstalledPackageRoot('@squip/hyperpipe-bridge'),
@@ -216,6 +222,7 @@ function getBridgeRoot() {
 
 function getCoreRoot() {
   return resolveExistingRoot([
+    resolvePackagedRuntimePackageRoot('@squip/hyperpipe-core'),
     app.isPackaged ? path.join(process.resourcesPath, 'app.asar', 'node_modules', '@squip', 'hyperpipe-core') : null,
     app.isPackaged ? path.join(process.resourcesPath, 'app', 'node_modules', '@squip', 'hyperpipe-core') : null,
     resolveInstalledPackageRoot('@squip/hyperpipe-core'),
@@ -887,7 +894,7 @@ async function startWorkerProcess(workerConfig = null) {
   const workerEntry = path.join(workerRoot, 'bin', 'hyperpipe-core.mjs');
 
   if (!existsSync(workerEntry)) {
-    const error = 'Hyperpipe Core entry not found in the core package';
+    const error = `Hyperpipe Core entry not found at ${workerEntry}`;
     console.error('[Main] ' + error);
     return { success: false, error };
   }

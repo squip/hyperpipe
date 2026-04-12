@@ -631,6 +631,11 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         if (!res?.success) {
           throw new Error(res?.error || 'Failed to start worker')
         }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        setLifecycle('error')
+        setLastError(message)
+        throw err
       } finally {
         inFlightStartRef.current = false
       }
@@ -1421,6 +1426,7 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
 
     unsubscribers.push(
       electronIpc.onWorkerError((err) => {
+        setLifecycle('error')
         setLastError(err?.message || String(err))
       })
     )
