@@ -528,7 +528,7 @@ function ChatListPageTitlebar() {
   const { t } = useTranslation()
 
   return (
-    <div className="flex gap-2 items-center justify-between h-full pl-3 pr-2">
+    <div className="flex h-full w-full min-w-0 items-center justify-between gap-2 pl-3 pr-2">
       <div className="flex items-center gap-2">
         <MessageSquare />
         <div className="text-lg font-semibold">{t('Chat')}</div>

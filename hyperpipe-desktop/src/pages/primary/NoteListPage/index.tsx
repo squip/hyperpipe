@@ -141,8 +141,8 @@ function NoteListPageTitlebar({
   const { isSmallScreen } = useScreenSize()
 
   return (
-    <div className="flex gap-1 items-center h-full justify-between">
-      <FeedButton className="flex-1 max-w-fit w-0" />
+    <div className="flex h-full w-full min-w-0 items-center justify-between gap-1">
+      <FeedButton className="min-w-0 flex-1" />
       <div className="shrink-0 flex gap-1 items-center">
         {setShowRelayDetails && (
           <Button

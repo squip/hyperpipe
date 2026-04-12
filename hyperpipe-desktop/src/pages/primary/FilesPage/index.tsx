@@ -368,7 +368,7 @@ function FilesPageTitlebar() {
   const { t } = useTranslation()
 
   return (
-    <div className="flex items-center justify-between h-full pl-3 pr-2">
+    <div className="flex h-full w-full min-w-0 items-center justify-between pl-3 pr-2">
       <div className="flex gap-2 items-center [&_svg]:text-muted-foreground">
         <Files />
         <div className="text-lg font-semibold" style={{ fontSize: 'var(--title-font-size, 18px)' }}>

@@ -101,12 +101,15 @@ const FeedSwitcherTrigger = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivEle
 
     return (
       <div
-        className={cn('flex items-center gap-2 clickable px-3 h-full rounded-lg', className)}
+        className={cn(
+          'flex h-full min-w-0 items-center gap-2 rounded-lg px-3 clickable',
+          className
+        )}
         ref={ref}
         {...props}
       >
         {feedInfo.feedType === 'following' ? <UsersRound /> : <Server />}
-        <div className="text-lg font-semibold truncate">{title}</div>
+        <div className="min-w-0 flex-1 truncate text-lg font-semibold">{title}</div>
         <ChevronDown />
       </div>
     )
