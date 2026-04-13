@@ -521,17 +521,9 @@ export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
         >
           <CurrentRelaysProvider>
           <NotificationProvider>
-            <div className="flex flex-col items-center bg-surface-background">
-              {macDesktop && (
-                <div
-                  style={{
-                    maxWidth: '1920px'
-                  }}
-                  className="w-full"
-                >
-                  <DesktopShellTitlebarInset />
-                </div>
-              )}
+            <div className="flex w-full flex-col bg-surface-background">
+              {macDesktop && <DesktopShellTitlebarInset />}
+              <div className="flex w-full justify-center">
               <div
                 className="flex w-full bg-surface-background"
                 style={{
@@ -610,6 +602,7 @@ export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
                     </div>
                   </div>
                 </div>
+              </div>
               </div>
             </div>
             <TooManyRelaysAlertDialog />

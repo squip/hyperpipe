@@ -1,11 +1,23 @@
 import { getRelayIdentity } from '@/lib/relay-targets'
 import {
+  createDefaultSharedFeedFilterSettings,
   buildSharedFeedRelayOptions,
   FOLLOWING_FEED_FILTER_KEY,
   prependFollowingListOption
 } from '@/lib/shared-feed-filters'
 
 describe('shared feed filter helpers', () => {
+  it('defaults the Groups muted word filter to test without affecting other pages', () => {
+    const timeFrameOptions = Array.from({ length: 24 }, (_, index) => ({
+      label: `${index + 1}h`,
+      value: index + 1,
+      unit: 'hours' as const
+    }))
+
+    expect(createDefaultSharedFeedFilterSettings('groups', timeFrameOptions).mutedWords).toBe('test')
+    expect(createDefaultSharedFeedFilterSettings('reads', timeFrameOptions).mutedWords).toBe('')
+  })
+
   it('builds a unified relay option list with group metadata and custom relay markers', () => {
     const groupRelayUrl = 'ws://127.0.0.1:61120/example-group?token=abc123'
     const groupRelayIdentity = getRelayIdentity(groupRelayUrl)

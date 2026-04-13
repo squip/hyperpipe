@@ -9,7 +9,7 @@ export const APP_SHARE_BASE_URL =
   (import.meta.env.VITE_PUBLIC_SHARE_BASE_URL as string | undefined) || APP_PUBLIC_URL
 export const APP_WINDOW_GLOBAL = 'hyperpipe'
 export const DEFAULT_THEME_SETTING = 'pure-black'
-export const DEFAULT_PRIMARY_COLOR = 'EMERALD' as const
+export const DEFAULT_PRIMARY_COLOR = 'CYAN' as const
 export const DEFAULT_ENABLE_SINGLE_COLUMN_LAYOUT = false
 export const DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH = 1067
 export const DEFAULT_DESKTOP_SECONDARY_COLUMN_WIDTH = 586

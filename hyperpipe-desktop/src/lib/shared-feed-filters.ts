@@ -73,7 +73,7 @@ export function createDefaultSharedFeedFilterSettings(
     recencyEnabled: page === 'reads',
     timeFrame: timeFrameOptions[23],
     maxItemsPerAuthor: 0,
-    mutedWords: '',
+    mutedWords: page === 'groups' ? 'test' : '',
     selectedRelayIdentities,
     selectedListKeys: [],
     selectedLanguageCodes: [],

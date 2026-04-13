@@ -142,8 +142,10 @@ function NoteListPageTitlebar({
 
   return (
     <div className="flex h-full w-full min-w-0 items-center justify-between gap-1">
-      <FeedButton className="min-w-0 flex-1" />
-      <div className="shrink-0 flex gap-1 items-center">
+      <div className="min-w-0 flex-1">
+        <FeedButton className="max-w-full" />
+      </div>
+      <div className="ml-auto flex shrink-0 items-center gap-1">
         {setShowRelayDetails && (
           <Button
             variant="ghost"

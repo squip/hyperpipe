@@ -38,7 +38,7 @@ export default function PrimaryPageSidebar() {
     <div
       className={cn(
         'relative flex flex-col pb-2 pt-3 justify-between h-full shrink-0',
-        sidebarCollapse ? 'px-2 w-16' : 'px-4 w-52'
+        sidebarCollapse ? 'px-2 w-16' : 'px-3 w-60'
       )}
     >
       <div className="space-y-2">
@@ -47,8 +47,8 @@ export default function PrimaryPageSidebar() {
             <Icon />
           </div>
         ) : (
-          <div className="ml-3 pr-4 mt-2 mb-6 w-full">
-            <Logo variant="sidebar" className="max-w-[9.75rem]" />
+          <div className="mt-2 mb-6 w-full pr-0">
+            <Logo variant="sidebar" className="max-w-[13rem]" />
           </div>
         )}
         <HomeButton collapse={sidebarCollapse} />

@@ -39,9 +39,10 @@ export default function FeedButton({ className }: { className?: string }) {
         <FeedSwitcherTrigger className={className} />
       </PopoverTrigger>
       <PopoverContent
+        align="start"
         sideOffset={0}
         side="bottom"
-        className="w-96 p-4 max-h-[80vh] overflow-auto scrollbar-hide"
+        className="w-96 min-w-[var(--radix-popover-trigger-width)] max-w-[calc(100vw-1rem)] max-h-[80vh] overflow-auto scrollbar-hide p-4"
       >
         <FeedSwitcher close={() => setOpen(false)} />
       </PopoverContent>
@@ -102,14 +103,14 @@ const FeedSwitcherTrigger = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivEle
     return (
       <div
         className={cn(
-          'flex h-full min-w-0 items-center gap-2 rounded-lg px-3 clickable',
+          'inline-flex h-full max-w-full min-w-0 items-center gap-2 rounded-lg px-3 clickable',
           className
         )}
         ref={ref}
         {...props}
       >
         {feedInfo.feedType === 'following' ? <UsersRound /> : <Server />}
-        <div className="min-w-0 flex-1 truncate text-lg font-semibold">{title}</div>
+        <div className="min-w-0 shrink truncate text-lg font-semibold">{title}</div>
         <ChevronDown />
       </div>
     )

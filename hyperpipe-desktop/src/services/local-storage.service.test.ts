@@ -9,7 +9,7 @@ describe('local storage feed selection persistence', () => {
 
   it('uses the hyperpipe appearance defaults when no overrides are stored', () => {
     expect(storage.getThemeSetting()).toBe('pure-black')
-    expect(storage.getPrimaryColor()).toBe('EMERALD')
+    expect(storage.getPrimaryColor()).toBe('CYAN')
     expect(storage.getEnableSingleColumnLayout()).toBe(false)
     expect(storage.getDesktopPrimaryColumnWidth()).toBeCloseTo((1067 / (1067 + 586)) * 100, 5)
   })
