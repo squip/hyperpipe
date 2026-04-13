@@ -52,11 +52,16 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: './src/test/setup.ts',
     globals: true,
+    include: [
+      'src/**/*.test.{js,mjs,cjs,ts,mts,cts,jsx,tsx}',
+      'src/**/*.spec.{js,mjs,cjs,ts,mts,cts,jsx,tsx}'
+    ],
     exclude: [
       'e2e/**',
       'electron/**',
       'release/**',
       'node_modules/**',
+      '.local-packages/**',
       '.release-deps/**',
       '.release-runtime/**'
     ]
