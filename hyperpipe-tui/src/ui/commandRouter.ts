@@ -1319,6 +1319,7 @@ export async function executeCommand(
         payload: {
           groupName: groupId,
           isPublic: true,
+          isOpen: !token,
           fileSharing: true
         }
       })

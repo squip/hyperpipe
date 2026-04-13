@@ -645,6 +645,7 @@ const buildInvitePayload = (args: {
   gatewayOrigin: args.gatewayOrigin ?? null,
   directJoinOnly: args.directJoinOnly === true,
   isPublic: args.meta?.isPublic !== false,
+  isOpen: args.meta?.isOpen === true,
   groupName: args.groupName || args.meta?.name,
   groupPicture: args.groupPicture || args.meta?.picture || null,
   authorizedMemberPubkeys: normalizePubkeyList(args.authorizedMemberPubkeys),
@@ -686,6 +687,7 @@ const buildOpenInvitePayload = (args: {
   gatewayId: args.gatewayId ?? null,
   gatewayOrigin: args.gatewayOrigin ?? null,
   directJoinOnly: args.directJoinOnly === true,
+  isOpen: true,
   discoveryTopic: args.discoveryTopic || null,
   hostPeerKeys: normalizePubkeyList(args.hostPeerKeys || []),
   leaseReplicaPeerKeys: normalizePubkeyList(args.leaseReplicaPeerKeys || []),
@@ -695,6 +697,27 @@ const buildOpenInvitePayload = (args: {
   authorizedMemberPubkeys: normalizePubkeyList(args.authorizedMemberPubkeys),
   gatewayAccess: args.gatewayAccess || null
 })
+
+const resolveInviteIsOpen = (invite: Pick<
+  TGroupInvite,
+  'isOpen'
+  | 'token'
+  | 'gatewayAccess'
+  | 'gatewayOrigin'
+  | 'gatewayId'
+  | 'writerLeaseEnvelope'
+  | 'writerSecret'
+  | 'directJoinOnly'
+  | 'fileSharing'
+>) => {
+  if (invite.isOpen === true) return true
+  if (invite.isOpen === false) return false
+  if (invite.token) return false
+  if (invite.writerLeaseEnvelope || invite.writerSecret) return false
+  if (invite.gatewayAccess || invite.gatewayOrigin || invite.gatewayId) return false
+  if (invite.directJoinOnly === true) return true
+  return invite.fileSharing === true
+}
 
 const parseGatewayAccessPayload = (value: unknown): TGroupGatewayAccess | null => {
   if (!value || typeof value !== 'object') return null
@@ -1902,7 +1925,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             about: matchedInvite.about,
             picture: matchedInvite.groupPicture,
             isPublic: matchedInvite.isPublic,
-            isOpen: matchedInvite.fileSharing,
+            isOpen: resolveInviteIsOpen(matchedInvite),
             gatewayId: matchedInvite.gatewayId,
             gatewayOrigin: matchedInvite.gatewayOrigin,
             directJoinOnly: matchedInvite.directJoinOnly,
@@ -1957,6 +1980,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
             let groupName: string | undefined = invite.groupName || invite.name
             let groupPicture: string | undefined = invite.groupPicture
             let authorizedMemberPubkeys: string[] | undefined
+            let isOpen: boolean | undefined = invite.isOpen
             let fileSharing: boolean | undefined = invite.fileSharing
             let isPublic: boolean | undefined = invite.isPublic
             let blindPeer: TGroupInvite['blindPeer'] | null | undefined
@@ -2003,6 +2027,9 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
                 }
                 if (payload.directJoinOnly === true || payload.gatewayDirectJoinOnly === true) {
                   directJoinOnly = true
+                }
+                if (typeof payload.isOpen === 'boolean') {
+                  isOpen = payload.isOpen
                 }
                 if (typeof payload.groupName === 'string') {
                   groupName = payload.groupName
@@ -2132,6 +2159,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               gatewayId,
               gatewayOrigin,
               directJoinOnly,
+              isOpen,
               fileSharing,
               isPublic,
               blindPeer,
@@ -2175,7 +2203,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           about: invite.about,
           picture: invite.groupPicture,
           isPublic: invite.isPublic,
-          isOpen: invite.fileSharing,
+          isOpen: resolveInviteIsOpen(invite),
           gatewayId: invite.gatewayId,
           gatewayOrigin: invite.gatewayOrigin,
           directJoinOnly: invite.directJoinOnly,
@@ -4722,6 +4750,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           if (inviteName) inviteTags.push(['name', inviteName])
           if (inviteAbout) inviteTags.push(['about', inviteAbout])
           if (invitePicture) inviteTags.push(['picture', invitePicture])
+          if (isOpenGroup) inviteTags.push(['open'])
           if (gatewayId) inviteTags.push([HYPERPIPE_GATEWAY_ID_TAG, gatewayId])
           if (gatewayOrigin) inviteTags.push([HYPERPIPE_GATEWAY_ORIGIN_TAG, gatewayOrigin])
           if (directJoinOnly) inviteTags.push([HYPERPIPE_DIRECT_JOIN_ONLY_TAG, '1'])

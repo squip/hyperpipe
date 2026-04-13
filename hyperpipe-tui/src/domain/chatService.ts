@@ -5,8 +5,9 @@ import type {
   ThreadMessage
 } from './types.js'
 import type { WorkerHost } from '../runtime/workerHost.js'
+import { waitForWorkerEvent } from '../runtime/waitForWorkerEvent.js'
 
-function parseConversation(row: Record<string, unknown>): ChatConversation | null {
+export function parseConversationPayload(row: Record<string, unknown>): ChatConversation | null {
   if (typeof row.id !== 'string') return null
 
   return {
@@ -35,7 +36,7 @@ function parseConversation(row: Record<string, unknown>): ChatConversation | nul
   }
 }
 
-function parseInvite(row: Record<string, unknown>): ChatInvite | null {
+export function parseInvitePayload(row: Record<string, unknown>): ChatInvite | null {
   if (typeof row.id !== 'string') return null
 
   const rawStatus = typeof row.status === 'string' ? row.status : 'pending'
@@ -55,7 +56,7 @@ function parseInvite(row: Record<string, unknown>): ChatInvite | null {
   }
 }
 
-function parseThreadMessage(row: Record<string, unknown>): ThreadMessage | null {
+export function parseThreadMessagePayload(row: Record<string, unknown>): ThreadMessage | null {
   if (typeof row.id !== 'string') return null
   if (typeof row.conversationId !== 'string') return null
 
@@ -128,7 +129,7 @@ export class ChatService implements IChatService {
     const rows = Array.isArray(response?.conversations) ? response.conversations : []
     return rows
       .filter((row): row is Record<string, unknown> => !!row && typeof row === 'object')
-      .map((row) => parseConversation(row))
+      .map((row) => parseConversationPayload(row))
       .filter((row): row is ChatConversation => !!row)
   }
 
@@ -140,7 +141,7 @@ export class ChatService implements IChatService {
     const rows = Array.isArray(response?.invites) ? response.invites : []
     return rows
       .filter((row): row is Record<string, unknown> => !!row && typeof row === 'object')
-      .map((row) => parseInvite(row))
+      .map((row) => parseInvitePayload(row))
       .filter((row): row is ChatInvite => !!row)
   }
 
@@ -201,7 +202,7 @@ export class ChatService implements IChatService {
       }
     )
 
-    const parsed = response?.conversation ? parseConversation(response.conversation) : null
+    const parsed = response?.conversation ? parseConversationPayload(response.conversation) : null
     if (!parsed) {
       throw new Error('Worker did not return created conversation')
     }
@@ -231,7 +232,7 @@ export class ChatService implements IChatService {
       }
     )
 
-    const conversation = response?.conversation ? parseConversation(response.conversation) : null
+    const conversation = response?.conversation ? parseConversationPayload(response.conversation) : null
     const invited = Array.isArray(response?.invited)
       ? response.invited
           .map((entry) => (typeof entry === 'string' ? entry.trim().toLowerCase() : ''))
@@ -259,19 +260,71 @@ export class ChatService implements IChatService {
   }
 
   async acceptInvite(inviteId: string): Promise<{ conversationId: string | null }> {
-    const response = await this.command<{ conversation?: { id?: string }; conversationId?: string }>(
+    const response = await this.command<{
+      operationId?: string
+      inviteId?: string
+      conversation?: { id?: string }
+      conversationId?: string
+    }>(
       'marmot-accept-invite',
       {
         inviteId
       }
     )
 
+    const operationId =
+      typeof response?.operationId === 'string' && response.operationId.trim().length
+        ? response.operationId.trim()
+        : null
+
+    if (!operationId) {
+      const conversationId =
+        typeof response?.conversation?.id === 'string'
+          ? response.conversation.id
+          : typeof response?.conversationId === 'string'
+            ? response.conversationId
+            : null
+
+      return { conversationId }
+    }
+
+    const event = await waitForWorkerEvent(
+      this.workerHost,
+      (candidate) => {
+        if (candidate?.type !== 'marmot-accept-invite-operation') return false
+        const data =
+          candidate?.data && typeof candidate.data === 'object'
+            ? candidate.data as Record<string, unknown>
+            : null
+        if (!data) return false
+        if (data.operationId !== operationId) return false
+        return data.phase === 'joinedConversation' || data.phase === 'failed'
+      },
+      120_000
+    )
+
+    const eventData =
+      event?.data && typeof event.data === 'object'
+        ? event.data as Record<string, unknown>
+        : null
+    const phase = typeof eventData?.phase === 'string' ? eventData.phase : null
+
+    if (phase === 'failed') {
+      throw new Error(
+        typeof eventData?.error === 'string' && eventData.error.trim().length
+          ? eventData.error
+          : 'Chat join failed'
+      )
+    }
+
     const conversationId =
-      typeof response?.conversation?.id === 'string'
-        ? response.conversation.id
-        : typeof response?.conversationId === 'string'
-          ? response.conversationId
-          : null
+      typeof eventData?.conversationId === 'string'
+        ? eventData.conversationId
+        : typeof response?.conversation?.id === 'string'
+          ? response.conversation.id
+          : typeof response?.conversationId === 'string'
+            ? response.conversationId
+            : null
 
     return { conversationId }
   }
@@ -287,7 +340,7 @@ export class ChatService implements IChatService {
 
     return rows
       .filter((row): row is Record<string, unknown> => !!row && typeof row === 'object')
-      .map((row) => parseThreadMessage({ ...row, conversationId }))
+      .map((row) => parseThreadMessagePayload({ ...row, conversationId }))
       .filter((row): row is ThreadMessage => !!row)
       .sort((left, right) => {
         if (left.timestamp !== right.timestamp) return left.timestamp - right.timestamp
@@ -307,7 +360,7 @@ export class ChatService implements IChatService {
       throw new Error('Worker did not return sent message')
     }
 
-    const parsed = parseThreadMessage({
+    const parsed = parseThreadMessagePayload({
       ...response.message,
       conversationId
     })

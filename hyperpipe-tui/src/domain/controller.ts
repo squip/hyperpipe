@@ -58,7 +58,11 @@ import { GroupService } from './groupService.js'
 import { FileService } from './fileService.js'
 import { ListService } from './listService.js'
 import { BookmarkService } from './bookmarkService.js'
-import { ChatService } from './chatService.js'
+import {
+  ChatService,
+  parseConversationPayload,
+  parseInvitePayload
+} from './chatService.js'
 import { SearchService } from './searchService.js'
 import { NostrClient } from './nostrClient.js'
 import { WorkerHost, findDefaultWorkerRoot } from '../runtime/workerHost.js'
@@ -479,10 +483,34 @@ type LocalRelayProfileSnapshot = {
   picture?: string
   isPublic: boolean
   isOpen: boolean
+  gatewayId?: string | null
+  gatewayOrigin?: string | null
+  directJoinOnly?: boolean
   adminPubkey?: string | null
   members: string[]
   membersCount: number
   createdAt: number | null
+}
+
+function resolveGroupInviteOpenState(invite: Pick<
+  GroupInvite,
+  'isOpen'
+  | 'token'
+  | 'gatewayAccess'
+  | 'gatewayOrigin'
+  | 'gatewayId'
+  | 'writerLeaseEnvelope'
+  | 'writerSecret'
+  | 'directJoinOnly'
+  | 'fileSharing'
+>): boolean {
+  if (invite.isOpen === true) return true
+  if (invite.isOpen === false) return false
+  if (invite.token) return false
+  if (invite.writerLeaseEnvelope || invite.writerSecret) return false
+  if (invite.gatewayAccess || invite.gatewayOrigin || invite.gatewayId) return false
+  if (invite.directJoinOnly === true) return true
+  return invite.fileSharing === true
 }
 
 export class TuiController {
@@ -1315,6 +1343,68 @@ export class TuiController {
 
         if (event.type.startsWith('join-auth-')) {
           this.log('info', `${event.type}: ${JSON.stringify((event as { data?: unknown }).data || {})}`)
+          return
+        }
+
+        if (
+          event.type === 'marmot-conversation-updated'
+          && event.data?.conversation
+          && typeof event.data.conversation === 'object'
+        ) {
+          const conversation = parseConversationPayload(
+            event.data.conversation as Record<string, unknown>
+          )
+          if (!conversation) return
+          const nextConversations = [
+            ...this.state.conversations.filter((entry) => entry.id !== conversation.id),
+            conversation
+          ].sort((left, right) => {
+            if (left.lastMessageAt !== right.lastMessageAt) {
+              return right.lastMessageAt - left.lastMessageAt
+            }
+            return left.id.localeCompare(right.id)
+          })
+          this.clearChatRetryTimer()
+          this.patchState({
+            conversations: nextConversations,
+            chatRuntimeState: 'ready',
+            chatWarning: null,
+            chatRetryCount: 0,
+            chatNextRetryAt: null,
+            lastError: null
+          })
+          return
+        }
+
+        if (
+          event.type === 'marmot-invite-updated'
+          && event.data?.invite
+          && typeof event.data.invite === 'object'
+        ) {
+          const invite = parseInvitePayload(
+            event.data.invite as Record<string, unknown>
+          )
+          if (!invite) return
+          const nextInvites = this.chatService.filterActionableInvites(
+            [
+              ...this.state.chatInvites.filter((entry) => entry.id !== invite.id),
+              invite
+            ],
+            {
+              dismissedInviteIds: new Set(this.state.dismissedChatInviteIds),
+              acceptedInviteIds: new Set(this.state.acceptedChatInviteIds),
+              acceptedConversationIds: new Set(this.state.acceptedChatInviteConversationIds)
+            }
+          )
+          this.clearChatRetryTimer()
+          this.patchState({
+            chatInvites: nextInvites,
+            chatRuntimeState: 'ready',
+            chatWarning: null,
+            chatRetryCount: 0,
+            chatNextRetryAt: null,
+            lastError: null
+          })
           return
         }
 
@@ -3343,6 +3433,18 @@ export class TuiController {
         const members = Array.isArray(row.members)
           ? row.members.map((member) => String(member || '').trim()).filter(Boolean)
           : []
+        const gatewayId =
+          typeof row.gateway_id === 'string'
+            ? row.gateway_id.trim().toLowerCase()
+            : typeof row.gatewayId === 'string'
+              ? row.gatewayId.trim().toLowerCase()
+              : null
+        const gatewayOrigin =
+          typeof row.gateway_origin === 'string'
+            ? row.gateway_origin.trim()
+            : typeof row.gatewayOrigin === 'string'
+              ? row.gatewayOrigin.trim()
+              : null
         const relayUrl = `${gatewayBase}/${publicIdentifier.replace(':', '/')}`
         const next: LocalRelayProfileSnapshot = {
           relayKey,
@@ -3353,6 +3455,9 @@ export class TuiController {
           picture: typeof row.picture === 'string' ? row.picture.trim() : undefined,
           isPublic: row.isPublic === true,
           isOpen: row.isOpen === true,
+          gatewayId,
+          gatewayOrigin,
+          directJoinOnly: row.directJoinOnly === true || row.direct_join_only === true,
           adminPubkey: typeof row.admin_pubkey === 'string' ? row.admin_pubkey.trim() : null,
           members,
           membersCount: members.length,
@@ -3412,6 +3517,9 @@ export class TuiController {
         picture: profile.picture,
         isPublic: profile.isPublic,
         isOpen: profile.isOpen,
+        gatewayId: profile.gatewayId || null,
+        gatewayOrigin: profile.gatewayOrigin || null,
+        directJoinOnly: profile.directJoinOnly === true,
         adminPubkey: profile.adminPubkey || null,
         members: [...profile.members],
         membersCount: profile.membersCount,
@@ -3808,6 +3916,15 @@ export class TuiController {
           resolvedGatewayId = matchedByOrigin.gatewayId
         } else {
           throw new Error('Gateway origin is not approved for hosting on this account')
+        }
+      }
+
+      if (!directJoinOnly && !resolvedGatewayOrigin && !resolvedGatewayId) {
+        const soleAuthorizedGateway =
+          this.state.authorizedGateways.length === 1 ? this.state.authorizedGateways[0] : null
+        if (soleAuthorizedGateway) {
+          resolvedGatewayId = soleAuthorizedGateway.gatewayId
+          resolvedGatewayOrigin = soleAuthorizedGateway.publicUrl
         }
       }
 
@@ -4589,6 +4706,7 @@ export class TuiController {
       if (!target) {
         throw new Error(`Group invite not found: ${inviteId}`)
       }
+      const isOpenInvite = resolveGroupInviteOpenState(target)
 
       await this.startJoinFlow({
         publicIdentifier: target.groupId,
@@ -4605,7 +4723,8 @@ export class TuiController {
         writerLeaseEnvelope: target.writerLeaseEnvelope || undefined,
         gatewayAccess: target.gatewayAccess || undefined,
         fileSharing: target.fileSharing,
-        openJoin: !target.token && target.fileSharing !== false,
+        isOpen: target.isOpen,
+        openJoin: isOpenInvite,
         blindPeer: target.blindPeer || undefined,
         cores: target.cores || undefined,
         writerCore: target.writerCore || undefined,
@@ -4729,7 +4848,8 @@ export class TuiController {
         name: selectedGroup?.name || normalizedGroupId,
         about: selectedGroup?.about || '',
         isPublic: selectedGroup?.isPublic !== false,
-        fileSharing: isOpenGroup,
+        isOpen: isOpenGroup,
+        fileSharing: true,
         authorizedMemberPubkeys: Array.from(new Set([...groupMembers, normalizedPubkey])),
         token: token || null
       }
@@ -4894,9 +5014,17 @@ export class TuiController {
         payloadGatewayAccessAuthMethod
         || payloadGatewayAuthMethod
         || null
-      const isOpenGroup = input.token
-        ? false
-        : (typeof payloadInput.fileSharing === 'boolean' ? payloadInput.fileSharing : true)
+      const selectedGroup =
+        this.state.myGroups.find((entry) => entry.id === normalizedGroupId)
+        || this.state.groupDiscover.find((entry) => entry.id === normalizedGroupId)
+        || null
+      const explicitIsOpen =
+        typeof payloadInput.isOpen === 'boolean'
+          ? payloadInput.isOpen
+          : typeof selectedGroup?.isOpen === 'boolean'
+            ? selectedGroup.isOpen
+            : undefined
+      const isOpenGroup = input.token ? false : explicitIsOpen === true
       const inviteTokenCandidate = String(
         input.token
         || (typeof payloadInput.token === 'string' ? payloadInput.token : '')
@@ -5073,6 +5201,7 @@ export class TuiController {
         autobaseLocal: autobaseLocal || payloadInput.autobaseLocal || payloadInput.autobase_local || null,
         writerSecret: writerSecret || payloadInput.writerSecret || null,
         fastForward: fastForward || payloadInput.fastForward || payloadInput.fast_forward || null,
+        isOpen: isOpenGroup,
         authorizedMemberPubkeys: Array.from(new Set(
           [
             ...(Array.isArray(payloadInput.authorizedMemberPubkeys) ? payloadInput.authorizedMemberPubkeys : []),

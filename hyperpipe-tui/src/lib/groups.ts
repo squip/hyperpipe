@@ -99,6 +99,7 @@ export function parseGroupInviteEvent(event: Event, relay?: string) {
   const picture = event.tags.find((tag) => tag[0] === 'picture')?.[1]
   const about = event.tags.find((tag) => tag[0] === 'about')?.[1]
   const isPublic = event.tags.some((tag) => tag[0] === 'public')
+  const isOpen = event.tags.some((tag) => tag[0] === 'open')
   const fileSharing = event.tags.some((tag) => tag[0] === 'file-sharing-on')
   const gatewayId = event.tags.find((tag) => tag[0] === HYPERPIPE_GATEWAY_ID_TAG)?.[1] ?? null
   const gatewayOrigin = normalizeHttpOrigin(
@@ -124,6 +125,7 @@ export function parseGroupInviteEvent(event: Event, relay?: string) {
     groupName: name,
     groupPicture: picture,
     isPublic,
+    isOpen,
     fileSharing,
     about,
     event

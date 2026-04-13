@@ -8,6 +8,7 @@ import { App } from '../../src/ui/App.js'
 import { TuiController, type RuntimeOptions } from '../../src/domain/controller.js'
 import type { LogLevel } from '../../src/domain/types.js'
 import { resolveDesktopParityStorageDir } from '../../src/storage/defaultStorageDir.js'
+import { groupScopeKey } from '../../src/lib/groupScope.js'
 
 type CheckStatus = 'PASS' | 'FAIL' | 'SKIP'
 type RowStatus = 'PASS' | 'FAIL' | 'SKIP'
@@ -474,8 +475,9 @@ try {
         const request = await waitFor('admin sees join request', async () => {
           await controller.refreshJoinRequests(groupId!, relayUrl || undefined)
           const snapshot = controller.getState()
-          const keyPrimary = relayUrl ? `${relayUrl}|${groupId}` : groupId
-          const entries = snapshot.groupJoinRequests[keyPrimary] || snapshot.groupJoinRequests[groupId!] || []
+          const keyPrimary = groupScopeKey(groupId!, relayUrl || null)
+          const fallbackKey = groupScopeKey(groupId!, null)
+          const entries = snapshot.groupJoinRequests[keyPrimary] || snapshot.groupJoinRequests[fallbackKey] || []
           return entries.find((entry) => entry.pubkey === user2) || null
         }, { timeoutMs: 90_000, intervalMs: 1_600 })
         await withStepTimeout(

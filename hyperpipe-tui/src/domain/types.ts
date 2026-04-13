@@ -177,6 +177,7 @@ export type GroupInvite = {
   name?: string
   about?: string
   isPublic?: boolean
+  isOpen?: boolean
   fileSharing?: boolean
   authorizedMemberPubkeys?: string[]
   blindPeer?: {

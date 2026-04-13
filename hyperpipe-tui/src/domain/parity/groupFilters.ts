@@ -187,6 +187,7 @@ export function parseGroupInviteWithPayload(args: {
     || payload.gatewayDirectJoinOnly === true
     || parsed.directJoinOnly === true
   const token = typeof payload.token === 'string' ? payload.token : undefined
+  const isOpen = typeof payload.isOpen === 'boolean' ? payload.isOpen : parsed.isOpen
   const fileSharing = typeof payload.fileSharing === 'boolean' ? payload.fileSharing : parsed.fileSharing
   const isPublic = typeof payload.isPublic === 'boolean' ? payload.isPublic : parsed.isPublic
   const about =
@@ -362,6 +363,7 @@ export function parseGroupInviteWithPayload(args: {
     groupPicture,
     name: groupName,
     about,
+    isOpen,
     fileSharing,
     isPublic,
     discoveryTopic,

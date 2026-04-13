@@ -180,15 +180,34 @@ export class RelayService implements IRelayService {
       timeoutMs?: number | null
     } | null
   }): Promise<void> {
-    const sent = await this.workerHost.send({
-      type: 'start-join-flow',
-      data: {
-        ...input
-      }
-    })
+    const publicIdentifier = String(input.publicIdentifier || '').trim()
+    const event = await this.sendAndWaitForEvent<Record<string, unknown>>(
+      {
+        type: 'start-join-flow',
+        data: {
+          ...input
+        }
+      },
+      (msg) => {
+        if (msg.type !== 'join-auth-success' && msg.type !== 'join-auth-error') return false
+        const payload = (msg as { data?: Record<string, unknown> }).data || {}
+        const messageIdentifier =
+          typeof payload.publicIdentifier === 'string'
+            ? payload.publicIdentifier.trim()
+            : ''
+        return !publicIdentifier || messageIdentifier === publicIdentifier
+      },
+      180_000,
+      'Failed to start join flow'
+    )
 
-    if (!sent.success) {
-      throw new Error(sent.error || 'Failed to start join flow')
+    if (event.type === 'join-auth-error') {
+      const payload = (event as { data?: Record<string, unknown> }).data || {}
+      const message =
+        typeof payload.error === 'string' && payload.error.trim()
+          ? payload.error.trim()
+          : 'Join flow failed'
+      throw new Error(message)
     }
   }
 

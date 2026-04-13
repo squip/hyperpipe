@@ -1645,7 +1645,21 @@ const GroupPage = forwardRef<TPageRef, TGroupPageProps>(({ index, id, relay }, r
   const canRequestToJoinClosedGroup = !isMember && !isOpenGroup && !inviteToken
   const hasSubmittedClosedGroupJoinRequest =
     canRequestToJoinClosedGroup && effectiveMembershipStatus === 'pending'
-  const inviteOpenJoin = !!inviteData && !inviteToken && inviteData.fileSharing !== false
+  const inviteOpenJoin =
+    !!inviteData &&
+    (
+      inviteData.isOpen === true
+      || (
+        !inviteToken
+        && inviteData.isOpen !== false
+        && !inviteData.gatewayAccess
+        && !inviteData.gatewayOrigin
+        && !inviteData.gatewayId
+        && !inviteData.writerLeaseEnvelope
+        && !inviteData.writerSecret
+        && inviteData.directJoinOnly === true
+      )
+    )
   const openJoinAllowed = inviteOpenJoin || effectiveDetail?.metadata?.isOpen === true
   const groupPresenceInput = useMemo(() => {
     if (!groupId) return null

@@ -207,6 +207,7 @@ export type TGroupInvite = {
   name?: string
   about?: string
   authorizedMemberPubkeys?: string[]
+  isOpen?: boolean
   fileSharing?: boolean
   isPublic?: boolean
   relayUrl?: string | null

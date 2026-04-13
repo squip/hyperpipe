@@ -262,6 +262,16 @@ export class GroupService implements IGroupService {
       content: encrypted
     }
 
+    if (payload.isOpen === true) {
+      draft.tags.push(['open'])
+    }
+    if (payload.isPublic === true) {
+      draft.tags.push(['public'])
+    }
+    if (typeof payload.fileSharing === 'boolean') {
+      draft.tags.push([payload.fileSharing ? 'file-sharing-on' : 'file-sharing-off'])
+    }
+
     const event = signDraftEvent(this.getNsecHex(), draft)
     await this.client.publish(input.relayTargets, event)
     return event

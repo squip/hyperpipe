@@ -548,7 +548,10 @@ const GroupsPage = forwardRef<
         name: invite.groupName || invite.name || invite.groupId,
         about: invite.about || '',
         picture: invite.groupPicture,
-        isOpen: invite.fileSharing !== false,
+        isOpen:
+          typeof invite.isOpen === 'boolean'
+            ? invite.isOpen
+            : invite.fileSharing !== false,
         isPublic: invite.isPublic !== false,
         inviteDate: invite.event.created_at,
         invitedBy: invite.event.pubkey,
@@ -1218,7 +1221,18 @@ const GroupsPage = forwardRef<
     const inviteHints = toJoinFlowHintFields(inv)
     const relayUrl = inv.relayUrl ?? (inv.relay ? resolveRelayUrl(inv.relay) : null) ?? inv.relay ?? null
     const relayKey = inv.relayKey ?? null
-    const openJoin = !inv.token && inv.fileSharing !== false
+    const openJoin =
+      inv.isOpen === true
+      || (
+        !inv.token
+        && inv.isOpen !== false
+        && !inv.gatewayAccess
+        && !inv.gatewayOrigin
+        && !inv.gatewayId
+        && !inv.writerLeaseEnvelope
+        && !inv.writerSecret
+        && inv.directJoinOnly === true
+      )
     setJoiningInviteId(inv.event.id)
     try {
       if (sendToWorker && pubkey && inv.token) {
@@ -1235,6 +1249,7 @@ const GroupsPage = forwardRef<
 
       await startJoinFlow(inv.groupId, {
         fileSharing: inv.fileSharing !== false,
+        isOpen: inv.isOpen,
         openJoin,
         token: inv.token,
         relayKey,

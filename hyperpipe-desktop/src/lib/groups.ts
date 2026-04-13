@@ -196,6 +196,7 @@ export function parseGroupInviteEvent(event: Event, relay?: string): TGroupInvit
   const picture = event.tags.find((t) => t[0] === 'picture')?.[1]
   const about = event.tags.find((t) => t[0] === 'about')?.[1]
   const isPublic = event.tags.some((t) => t[0] === 'public')
+  const isOpen = event.tags.some((t) => t[0] === 'open')
   const fileSharingOn = event.tags.some((t) => t[0] === 'file-sharing-on')
   const gatewayId = event.tags.find((t) => t[0] === HYPERPIPE_GATEWAY_ID_TAG)?.[1] ?? null
   const gatewayOrigin = normalizeHttpOrigin(
@@ -221,6 +222,7 @@ export function parseGroupInviteEvent(event: Event, relay?: string): TGroupInvit
     name,
     about,
     isPublic,
+    isOpen,
     fileSharing: fileSharingOn,
     // Token is encrypted in content per requirements; decrypted elsewhere
     token: undefined,

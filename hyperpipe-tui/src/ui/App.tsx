@@ -2022,7 +2022,11 @@ function splitBottomRows(
         `about: -`,
         `createdAt: ${invite.event?.created_at ? new Date(invite.event.created_at * 1000).toLocaleString() : '-'}`,
         `visibility: ${invite.isPublic === false ? 'private' : 'public'}`,
-        `membership: ${invite.fileSharing === false ? 'closed' : 'open'}`,
+        `membership: ${
+          typeof invite.isOpen === 'boolean'
+            ? (invite.isOpen ? 'open' : 'closed')
+            : (invite.fileSharing === false ? 'closed' : 'open')
+        }`,
         `admin: ${formatPubkeyDisplay(state, invite.event?.pubkey || '-', 12)}`,
         `members: -`
       ]
@@ -3845,7 +3849,8 @@ export function App({
           payload: {
             groupName: group?.name || compose.target.name || compose.target.id,
             isPublic: group?.isPublic !== false,
-            fileSharing: group?.isOpen !== false
+            isOpen: group?.isOpen === true,
+            fileSharing: true
           }
         })
       } else {
