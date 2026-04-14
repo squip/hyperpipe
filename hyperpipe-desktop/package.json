@@ -1,6 +1,6 @@
 {
   "name": "hyperpipe-desktop",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "description": "Desktop client for Hyperpipe peer-to-peer Nostr relays and file sharing",
   "private": true,
   "main": "electron/main.cjs",
