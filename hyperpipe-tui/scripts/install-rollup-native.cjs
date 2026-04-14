@@ -1,4 +1,4 @@
-const { execFileSync } = require('node:child_process')
+const { spawnSync } = require('node:child_process')
 const path = require('node:path')
 
 const projectRoot = path.resolve(__dirname, '..')
@@ -38,10 +38,17 @@ function hasNativePackage(packageName) {
 
 function installNativePackage(packageName, version) {
   const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  execFileSync(npmCommand, ['install', '--no-save', `${packageName}@${version}`], {
+  const result = spawnSync(npmCommand, ['install', '--no-save', `${packageName}@${version}`], {
     cwd: projectRoot,
-    stdio: 'inherit'
+    stdio: 'inherit',
+    shell: process.platform === 'win32',
+    env: process.env
   })
+  if (result.status !== 0) {
+    throw new Error(
+      `Failed to install ${packageName}@${version} (exit ${result.status ?? 'unknown'}${result.error ? `: ${result.error.message}` : ''})`
+    )
+  }
 }
 
 function main() {
