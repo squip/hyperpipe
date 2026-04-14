@@ -41,10 +41,14 @@ afterEach(() => {
 
 describe.sequential('TUI copy shortcuts', () => {
   it('supports y/Y context-first copy shortcuts from pane selection', async () => {
+    const controller = MockController.withSeedData(BASE_OPTIONS)
+    const groupId = controller.getState().groups[0]?.id
+    expect(groupId).toBeTruthy()
+    const commandSnippet = `relay members ${groupId}`
     const instance = render(
       <App
         options={BASE_OPTIONS}
-        controllerFactory={(options) => MockController.withSeedData(options)}
+        controllerFactory={() => controller}
         scriptedCommands={[{ command: 'goto relay:my', delayMs: 50, pauseAfterMs: 50 }]}
       />
     )
@@ -52,18 +56,20 @@ describe.sequential('TUI copy shortcuts', () => {
     try {
       await waitFor(() => frame(instance).includes('Command'))
       await waitFor(() => frame(instance).includes('Keys:'))
-      await sleep(120)
+      await waitFor(() => frame(instance).includes('$ goto relay:my ->'), 6_000)
+      await sleep(250)
 
       instance.stdin.write('y')
-      await waitFor(() => /Copied|Copy unavailable/.test(frame(instance)))
+      await waitFor(() => controller.getState().lastCopiedValue === groupId, 6_000)
 
       instance.stdin.write('Y')
-      await waitFor(() => /Copied|Copy unavailable/.test(frame(instance)))
+      await waitFor(() => controller.getState().lastCopiedValue === commandSnippet, 6_000)
 
       expect(frame(instance)).toContain('Keys:')
+      expect(controller.getState().lastCopiedMethod).not.toBeNull()
       expect(instance.stderr.frames.length).toBe(0)
     } finally {
       instance.unmount()
     }
-  })
+  }, 15_000)
 })
