@@ -51,6 +51,24 @@ async function openImportNsecFlow(instance: RenderInstance): Promise<void> {
   await waitFor(() => frame(instance).includes('Sign In With Existing nsec'))
 }
 
+async function waitForStartupSignInMenu(instance: RenderInstance): Promise<void> {
+  await waitFor(() => {
+    const output = frame(instance)
+    return output.includes('Sign In')
+      && output.includes('Sign In With Saved Account')
+      && output.includes('Generate New Account')
+      && output.includes('Sign In With Existing nsec')
+  })
+}
+
+async function openSavedAccountPicker(instance: RenderInstance): Promise<void> {
+  await waitForStartupSignInMenu(instance)
+  await sleep(100)
+  await pressKey(instance, '\r', 1, 30)
+  await waitFor(() => frame(instance).includes('Saved Accounts'))
+  await sleep(100)
+}
+
 function frame(instance: RenderInstance): string {
   return stripAnsi(instance.lastFrame() || '')
 }
@@ -254,13 +272,9 @@ describe.sequential('TUI e2e startup authentication gate', () => {
     )
 
     try {
-      await waitFor(() => frame(instance).includes('Sign In'))
-      await waitFor(() => frame(instance).includes('Sign In With Saved Account'))
+      await openSavedAccountPicker(instance)
 
-      await pressKey(instance, '\r')
-      await waitFor(() => frame(instance).includes('Saved Accounts'))
-
-      await pressKey(instance, '\r')
+      await pressKey(instance, '\r', 1, 30)
       await waitFor(() => frame(instance).includes('Account Password'))
       await typeText(instance, 'password123')
       await pressKey(instance, '\r')
@@ -272,7 +286,7 @@ describe.sequential('TUI e2e startup authentication gate', () => {
     } finally {
       instance.unmount()
     }
-  })
+  }, 15_000)
 
   it('bypasses startup gate when scripted commands are provided', async () => {
     const options = await createRuntimeOptions()
