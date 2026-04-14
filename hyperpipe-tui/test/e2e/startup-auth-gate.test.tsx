@@ -34,6 +34,23 @@ async function waitFor(check: () => boolean, timeoutMs = 12_000): Promise<void> 
   throw new Error('Timed out waiting for expected frame update')
 }
 
+async function waitForStartupAccountSetup(instance: RenderInstance): Promise<void> {
+  await waitFor(() => {
+    const output = frame(instance)
+    return output.includes('Account Setup')
+      && output.includes('Generate New Account')
+      && output.includes('Sign In With Existing nsec')
+  })
+}
+
+async function openImportNsecFlow(instance: RenderInstance): Promise<void> {
+  await waitForStartupAccountSetup(instance)
+  await sleep(100)
+  await pressKey(instance, '\u001b[B', 1, 30)
+  await pressKey(instance, '\r', 1, 30)
+  await waitFor(() => frame(instance).includes('Sign In With Existing nsec'))
+}
+
 function frame(instance: RenderInstance): string {
   return stripAnsi(instance.lastFrame() || '')
 }
@@ -85,7 +102,7 @@ describe.sequential('TUI e2e startup authentication gate', () => {
     )
 
     try {
-      await waitFor(() => frame(instance).includes('Account Setup'))
+      await waitForStartupAccountSetup(instance)
       const output = frame(instance)
       expect(output).toContain('Generate New Account')
       expect(output).toContain('Sign In With Existing nsec')
@@ -107,7 +124,7 @@ describe.sequential('TUI e2e startup authentication gate', () => {
     )
 
     try {
-      await waitFor(() => frame(instance).includes('Account Setup'))
+      await waitForStartupAccountSetup(instance)
       await sleep(100)
       await pressKey(instance, '\r')
       await waitFor(() => {
@@ -155,10 +172,7 @@ describe.sequential('TUI e2e startup authentication gate', () => {
     )
 
     try {
-      await waitFor(() => frame(instance).includes('Account Setup'))
-      await pressKey(instance, '\u001b[B')
-      await pressKey(instance, '\r')
-      await waitFor(() => frame(instance).includes('Sign In With Existing nsec'))
+      await openImportNsecFlow(instance)
 
       await typeText(instance, '1'.repeat(64))
       await pressKey(instance, '\r')
@@ -188,10 +202,7 @@ describe.sequential('TUI e2e startup authentication gate', () => {
     )
 
     try {
-      await waitFor(() => frame(instance).includes('Account Setup'))
-      await pressKey(instance, '\u001b[B')
-      await pressKey(instance, '\r')
-      await waitFor(() => frame(instance).includes('Sign In With Existing nsec'))
+      await openImportNsecFlow(instance)
 
       await typeText(instance, bech32Nsec)
       await pressKey(instance, '\r')
