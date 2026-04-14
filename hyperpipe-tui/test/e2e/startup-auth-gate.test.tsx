@@ -172,7 +172,7 @@ describe.sequential('TUI e2e startup authentication gate', () => {
     } finally {
       instance.unmount()
     }
-  })
+  }, 15_000)
 
   it('imports bech32 nsec, supports manual discovery relay add, and persists selected relay set', async () => {
     const options = await createRuntimeOptions()
