@@ -223,7 +223,6 @@ class HyperswarmConnection {
   async _identifyAsGateway() {
     if (!this.protocol) return;
     try {
-      this.logger?.info?.('Sending gateway identification', { peer: this.publicKey });
       const identityPayload = this.pool._buildHandshakeData(false, {
         publicKey: this.publicKey,
         connection: this.stream,
@@ -232,6 +231,20 @@ class HyperswarmConnection {
       if (!identityPayload.role) {
         identityPayload.role = identityPayload.gatewayReplica ? 'gateway-replica' : 'gateway';
       }
+      const claimsGateway = identityPayload?.isGateway === true
+        || identityPayload?.gatewayReplica === true
+        || identityPayload?.role === 'gateway'
+        || identityPayload?.role === 'gateway-replica';
+      if (!claimsGateway) {
+        this.logger?.debug?.('Skipping gateway identification for non-gateway peer role', {
+          peer: this.publicKey,
+          role: identityPayload?.role || null,
+          isGateway: identityPayload?.isGateway === true,
+          gatewayReplica: identityPayload?.gatewayReplica === true
+        });
+        return;
+      }
+      this.logger?.info?.('Sending gateway identification', { peer: this.publicKey });
       await this.protocol.sendRequest({
         method: 'POST',
         path: '/identify-gateway',

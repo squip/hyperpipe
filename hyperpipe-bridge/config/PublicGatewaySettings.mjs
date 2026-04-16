@@ -33,16 +33,19 @@ const DEFAULT_SETTINGS = Object.freeze({
   resolvedGatewayRelay: null,
   resolvedDefaultTokenTtl: null,
   resolvedTokenRefreshWindowSeconds: null,
-  resolvedDispatcher: null
+  resolvedDispatcher: null,
+  gatewayBlindPeerCatalog: {}
 });
 
 const LOCAL_STORAGE_KEY = 'hyperpipe_public_gateway_settings';
 const SETTINGS_FILENAME = 'hyperpipe-public-hyperpipe-gateway-settings.json';
+export const PUBLIC_GATEWAY_SETTINGS_FILENAME = SETTINGS_FILENAME;
 
 let cachedSettings = null;
 let nodeFsModule = null;
 let nodePathModule = null;
 let nodeSettingsPath = null;
+let nodeLegacySettingsPath = null;
 
 function isRenderer() {
   return typeof window !== 'undefined' && typeof window.document !== 'undefined';
@@ -269,6 +272,40 @@ function normalizeSettings(raw = {}) {
     normalized.resolvedDispatcher = Object.keys(dispatcher).length ? dispatcher : null;
   }
 
+  if (raw.gatewayBlindPeerCatalog && typeof raw.gatewayBlindPeerCatalog === 'object' && !Array.isArray(raw.gatewayBlindPeerCatalog)) {
+    const catalog = {};
+    for (const [key, value] of Object.entries(raw.gatewayBlindPeerCatalog)) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const gatewayOrigin = typeof value.gatewayOrigin === 'string' ? value.gatewayOrigin.trim() || null : null;
+      const gatewayId = typeof value.gatewayId === 'string' ? value.gatewayId.trim().toLowerCase() || null : null;
+      const blindPeer = normalizeSettings({
+        blindPeerKeys: [],
+        blindPeerManualKeys: [],
+        blindPeerEnabled: value.blindPeer?.enabled,
+        blindPeerEncryptionKey: value.blindPeer?.encryptionKey,
+        blindPeerReplicationTopic: value.blindPeer?.replicationTopic,
+        blindPeerMaxBytes: value.blindPeer?.maxBytes
+      });
+      const publicKey = typeof value?.blindPeer?.publicKey === 'string' ? value.blindPeer.publicKey.trim() : '';
+      const updatedAt = Number.isFinite(Number(value.updatedAt)) ? Number(value.updatedAt) : null;
+      if (!gatewayOrigin && !gatewayId) continue;
+      if (!publicKey) continue;
+      catalog[key] = {
+        gatewayOrigin,
+        gatewayId,
+        blindPeer: {
+          enabled: blindPeer.blindPeerEnabled === true,
+          publicKey,
+          encryptionKey: blindPeer.blindPeerEncryptionKey || null,
+          replicationTopic: blindPeer.blindPeerReplicationTopic || null,
+          maxBytes: blindPeer.blindPeerMaxBytes ?? null
+        },
+        updatedAt
+      };
+    }
+    normalized.gatewayBlindPeerCatalog = catalog;
+  }
+
   if (!normalized.selectedGatewayId && typeof raw.gatewayId === 'string') {
     const value = raw.gatewayId.trim();
     normalized.selectedGatewayId = value || null;
@@ -395,6 +432,10 @@ function withDefaults(raw = {}) {
     merged.resolvedDispatcher = null;
   }
 
+  if (!merged.gatewayBlindPeerCatalog || typeof merged.gatewayBlindPeerCatalog !== 'object' || Array.isArray(merged.gatewayBlindPeerCatalog)) {
+    merged.gatewayBlindPeerCatalog = {};
+  }
+
   return merged;
 }
 
@@ -412,6 +453,23 @@ async function getNodePath() {
   return nodePathModule;
 }
 
+function extractLegacyUserScopedSettings(raw = {}) {
+  const migrated = {};
+  if (typeof raw.selectionMode === 'string') {
+    migrated.selectionMode = raw.selectionMode;
+  }
+  if (typeof raw.selectedGatewayId === 'string') {
+    migrated.selectedGatewayId = raw.selectedGatewayId;
+  }
+  if (typeof raw.preferredBaseUrl === 'string') {
+    migrated.preferredBaseUrl = raw.preferredBaseUrl;
+  }
+  if (typeof raw.baseUrl === 'string') {
+    migrated.baseUrl = raw.baseUrl;
+  }
+  return migrated;
+}
+
 async function resolveNodeSettingsPath() {
   if (nodeSettingsPath) return nodeSettingsPath;
   const pathModule = await getNodePath();
@@ -425,11 +483,20 @@ async function resolveNodeSettingsPath() {
   return nodeSettingsPath;
 }
 
-async function loadNodeSettings() {
-  if (!isNodeProcess()) return null;
+async function resolveLegacyNodeSettingsPath() {
+  if (nodeLegacySettingsPath) return nodeLegacySettingsPath;
+  const explicit = process.env.PUBLIC_GATEWAY_LEGACY_SETTINGS_PATH;
+  if (explicit) {
+    nodeLegacySettingsPath = explicit;
+    return nodeLegacySettingsPath;
+  }
+  return null;
+}
+
+async function readNodeSettingsFile(filePath) {
+  if (!filePath) return null;
+  const fs = await getNodeFs();
   try {
-    const fs = await getNodeFs();
-    const filePath = await resolveNodeSettingsPath();
     const data = await fs.readFile(filePath, 'utf8');
     return JSON.parse(data);
   } catch (error) {
@@ -438,6 +505,31 @@ async function loadNodeSettings() {
     }
     return null;
   }
+}
+
+async function loadNodeSettings() {
+  if (!isNodeProcess()) return null;
+  const filePath = await resolveNodeSettingsPath();
+  const primary = await readNodeSettingsFile(filePath);
+  if (primary) return primary;
+
+  const legacyPath = await resolveLegacyNodeSettingsPath();
+  if (!legacyPath || legacyPath === filePath) {
+    return null;
+  }
+
+  const legacy = await readNodeSettingsFile(legacyPath);
+  if (!legacy) return null;
+
+  const migrated = extractLegacyUserScopedSettings(legacy);
+  if (!Object.keys(migrated).length) return null;
+
+  try {
+    await saveNodeSettings(migrated);
+  } catch (error) {
+    console.warn('[PublicGatewaySettings] Failed to persist migrated user-scoped settings:', error);
+  }
+  return migrated;
 }
 
 async function saveNodeSettings(settings) {
@@ -508,4 +600,10 @@ export function clearCachedPublicGatewaySettings() {
 
 export function normalizePublicGatewaySettings(raw = {}) {
   return withDefaults(raw);
+}
+
+export function setPublicGatewaySettingsNodeStorage({ filePath = null, legacyFilePath = null } = {}) {
+  nodeSettingsPath = filePath || null;
+  nodeLegacySettingsPath = legacyFilePath || null;
+  clearCachedPublicGatewaySettings();
 }
