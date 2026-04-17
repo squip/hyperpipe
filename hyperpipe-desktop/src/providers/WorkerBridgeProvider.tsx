@@ -1891,11 +1891,18 @@ export function WorkerBridgeProvider({ children }: PropsWithChildren) {
         const msgType = (message as any)?.type
         const expectsReply = msgType === 'provision-writer-for-invitee'
         if (msgType === 'authorize-relay-member-access') {
+          const requestId = (message as any)?.requestId || makeRequestId('authorize-member')
+          const payload = { ...(message as any), requestId }
           const result = await electronIpc.sendToWorkerAwait({
-            message,
+            message: payload,
             timeoutMs: 30_000
           })
-          if (result && typeof result === 'object' && 'success' in result && (result as any).success === false) {
+          if (
+            result &&
+            typeof result === 'object' &&
+            'success' in result &&
+            (result as any).success === false
+          ) {
             throw new Error((result as any).error || 'Worker rejected message')
           }
           return (result as any)?.data ?? result

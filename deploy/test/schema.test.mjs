@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
 import { parseEnvText } from '../lib/env-file.mjs';
+import hyperCrypto from 'hypercore-crypto';
 import {
   PROFILE_NAMES,
   buildOperatorAttestationRequestFromConfig,
   buildRuntimeConfig,
+  createGeneratedValues,
   defaultPolicyColumnForConfig,
   deriveGatewayIdFromSeed,
   validateConfig
@@ -52,6 +54,24 @@ test('open profile config validates and clears profile-specific auth settings', 
   assert.equal(config.GATEWAY_AUTH_WOT_RELAYS, '');
   assert.equal(config.GATEWAY_PUBLIC_URL, 'https://example.com');
   assert.match(config.GATEWAY_DISCOVERY_KEY_SEED, /^[0-9a-f]{64}$/u);
+});
+
+test('relay admin keys are generated as a Hypercore keypair and preserve legacy seeds', () => {
+  const generated = createGeneratedValues({});
+  assert.match(generated.GATEWAY_RELAY_ADMIN_PUBLIC_KEY, /^[0-9a-f]{64}$/u);
+  assert.match(generated.GATEWAY_RELAY_ADMIN_SECRET_KEY, /^[0-9a-f]{128}$/u);
+  assert.equal(
+    generated.GATEWAY_RELAY_ADMIN_SECRET_KEY.slice(64),
+    generated.GATEWAY_RELAY_ADMIN_PUBLIC_KEY
+  );
+
+  const legacySeed = 'ab'.repeat(32);
+  const fromLegacySeed = createGeneratedValues({
+    GATEWAY_RELAY_ADMIN_SECRET_KEY: legacySeed
+  });
+  const derived = hyperCrypto.keyPair(Buffer.from(legacySeed, 'hex'));
+  assert.equal(fromLegacySeed.GATEWAY_RELAY_ADMIN_PUBLIC_KEY, Buffer.from(derived.publicKey).toString('hex'));
+  assert.equal(fromLegacySeed.GATEWAY_RELAY_ADMIN_SECRET_KEY, Buffer.from(derived.secretKey).toString('hex'));
 });
 
 test('http exposure mode derives an http public URL and does not require letsencrypt email', () => {

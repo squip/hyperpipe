@@ -355,10 +355,14 @@ function publicUrlForExposureMode(host, exposureMode) {
 }
 
 export function createGeneratedValues(existing = {}) {
-  const relayAdminSecretKey = isHex64(existing.GATEWAY_RELAY_ADMIN_SECRET_KEY)
+  const relayAdminSeed = isHex64(existing.GATEWAY_RELAY_ADMIN_SECRET_KEY)
     ? existing.GATEWAY_RELAY_ADMIN_SECRET_KEY
-    : generateHex(32);
-  const relayAdminPublicKey = Buffer.from(schnorr.getPublicKey(Buffer.from(relayAdminSecretKey, 'hex'))).toString('hex');
+    : /^[0-9a-f]{128}$/i.test(normalizeString(existing.GATEWAY_RELAY_ADMIN_SECRET_KEY))
+      ? normalizeString(existing.GATEWAY_RELAY_ADMIN_SECRET_KEY).slice(0, 64)
+      : generateHex(32);
+  const relayAdminKeyPair = hyperCrypto.keyPair(Buffer.from(relayAdminSeed, 'hex'));
+  const relayAdminSecretKey = Buffer.from(relayAdminKeyPair.secretKey).toString('hex');
+  const relayAdminPublicKey = Buffer.from(relayAdminKeyPair.publicKey).toString('hex');
   return {
     GATEWAY_DISCOVERY_KEY_SEED: normalizeString(existing.GATEWAY_DISCOVERY_KEY_SEED) || generateHex(32),
     GATEWAY_REGISTRATION_SECRET: isHex64(existing.GATEWAY_REGISTRATION_SECRET)
@@ -587,8 +591,8 @@ export function validateConfig(config = {}) {
   if (!isHex64(normalized.GATEWAY_RELAY_ADMIN_PUBLIC_KEY)) {
     errors.push('GATEWAY_RELAY_ADMIN_PUBLIC_KEY must be a 64-character hex string');
   }
-  if (!isHex64(normalized.GATEWAY_RELAY_ADMIN_SECRET_KEY)) {
-    errors.push('GATEWAY_RELAY_ADMIN_SECRET_KEY must be a 64-character hex string');
+  if (!isHex64(normalized.GATEWAY_RELAY_ADMIN_SECRET_KEY) && !/^[0-9a-f]{128}$/i.test(normalized.GATEWAY_RELAY_ADMIN_SECRET_KEY)) {
+    errors.push('GATEWAY_RELAY_ADMIN_SECRET_KEY must be a 64-character legacy seed or 128-character Hypercore secret key');
   }
   if (!isPositiveIntegerString(normalized.GATEWAY_BLINDPEER_PORT)) {
     errors.push('GATEWAY_BLINDPEER_PORT must be a positive integer');

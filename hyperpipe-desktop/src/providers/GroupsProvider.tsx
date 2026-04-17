@@ -126,6 +126,7 @@ const TOKENIZED_RELAY_REFRESH_MIN_INTERVAL_MS = 5000
 const LEAVE_PUBLISH_RETRY_BASE_DELAY_MS = 5000
 const LEAVE_PUBLISH_RETRY_MAX_DELAY_MS = 60 * 60 * 1000
 const JOIN_FLOW_SUCCESS_FRESH_MS = 15 * 60 * 1000
+const INVITE_MIRROR_METADATA_TIMEOUT_MS = 1500
 const DEFAULT_GATEWAY_MEMBER_SCOPES = [
   'relay:bootstrap',
   'relay:mirror-read',
@@ -562,6 +563,17 @@ const normalizeHttpOrigin = (value?: string | null): string | null => {
     return parsed.origin
   } catch (_err) {
     return null
+  }
+}
+
+const isLoopbackHttpOrigin = (origin?: string | null): boolean => {
+  if (!origin) return false
+  try {
+    const parsed = new URL(origin)
+    const host = String(parsed.hostname || '').toLowerCase()
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1'
+  } catch (_err) {
+    return /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(origin)
   }
 }
 
@@ -1533,27 +1545,52 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
   )
 
   const fetchInviteMirrorMetadata = useCallback(
-    async (relayIdentifier: string, resolved?: string | null): Promise<InviteMirrorMetadata> => {
+    async (
+      relayIdentifier: string,
+      options?: {
+        gatewayOrigin?: string | null
+        resolved?: string | null
+        timeoutMs?: number | null
+      }
+    ): Promise<InviteMirrorMetadata> => {
       const origins: string[] = []
-      if (resolved) {
+      const normalizedGatewayOrigin = normalizeHttpOrigin(options?.gatewayOrigin || null)
+      if (normalizedGatewayOrigin && !isLoopbackHttpOrigin(normalizedGatewayOrigin)) {
+        origins.push(normalizedGatewayOrigin)
+      }
+      if (options?.resolved) {
         try {
-          const baseUrl = new URL(resolved)
+          const baseUrl = new URL(options.resolved)
           baseUrl.protocol = baseUrl.protocol === 'wss:' ? 'https:' : 'http:'
-          const hostOrigin = baseUrl.origin
-          if (!origins.includes(hostOrigin)) {
+          const hostOrigin = normalizeHttpOrigin(baseUrl.origin)
+          if (
+            hostOrigin &&
+            !isLoopbackHttpOrigin(hostOrigin) &&
+            !origins.includes(hostOrigin)
+          ) {
             origins.push(hostOrigin)
           }
         } catch (_err) {
-          return null
+          // Ignore malformed relay URLs and fall back to any explicit gateway origin.
         }
       }
 
       if (!origins.length) return null
 
       for (const origin of origins) {
+        const controller =
+          typeof AbortController === 'function' ? new AbortController() : null
+        const timeoutMs =
+          Number.isFinite(Number(options?.timeoutMs))
+            ? Math.max(1, Number(options?.timeoutMs))
+            : INVITE_MIRROR_METADATA_TIMEOUT_MS
+        const timeoutId = controller
+          ? window.setTimeout(() => controller.abort(), timeoutMs)
+          : null
         try {
           const resp = await fetch(
-            `${origin}/api/relays/${encodeURIComponent(relayIdentifier)}/mirror`
+            `${origin}/api/relays/${encodeURIComponent(relayIdentifier)}/mirror`,
+            controller ? { signal: controller.signal } : undefined
           )
           if (!resp.ok) {
             console.warn('[GroupsProvider] Mirror metadata request failed', {
@@ -1584,10 +1621,21 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
               : undefined
           return { blindPeer, cores }
         } catch (err) {
+          const isAbort =
+            err instanceof DOMException
+              ? err.name === 'AbortError'
+              : typeof err === 'object' &&
+                err !== null &&
+                'name' in err &&
+                (err as { name?: string }).name === 'AbortError'
           console.warn('[GroupsProvider] Failed to fetch relay mirror metadata', {
             origin,
-            err: err instanceof Error ? err.message : err
+            err: isAbort ? 'Timed out' : err instanceof Error ? err.message : err
           })
+        } finally {
+          if (timeoutId !== null) {
+            window.clearTimeout(timeoutId)
+          }
         }
       }
 
@@ -3146,8 +3194,16 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       isPublicGroup?: boolean
       reason: string
       ensureMemberPubkey?: string
+      waitForVerification?: boolean
     }) => {
-      const { groupId, relay, isPublicGroup, reason, ensureMemberPubkey } = params
+      const {
+        groupId,
+        relay,
+        isPublicGroup,
+        reason,
+        ensureMemberPubkey,
+        waitForVerification = true
+      } = params
       const resolved = relay ? resolveRelayUrl(relay) : undefined
       let members: string[] = []
       let resolvedIsPublic = typeof isPublicGroup === 'boolean' ? isPublicGroup : true
@@ -3241,42 +3297,53 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         reason: `republish-39002:${reason}`
       }).catch(() => {})
 
-      let latestSnapshotCreatedAt: number | null = null
-      let latestSnapshotId: string | null = null
-      try {
-        const snapshots = await client.fetchEvents(relayUrls, {
-          kinds: [39002],
-          '#h': [groupId],
-          limit: 10
-        })
-        const latestSnapshot = snapshots.sort((a, b) => b.created_at - a.created_at)[0] || null
-        latestSnapshotCreatedAt = latestSnapshot?.created_at ?? null
-        latestSnapshotId = latestSnapshot?.id ?? null
-      } catch (err) {
-        console.warn('[GroupsProvider] Failed to verify latest 39002 snapshot after republish', {
+      const runVerification = async () => {
+        let latestSnapshotCreatedAt: number | null = null
+        let latestSnapshotId: string | null = null
+        try {
+          const snapshots = await client.fetchEvents(relayUrls, {
+            kinds: [39002],
+            '#h': [groupId],
+            limit: 10
+          })
+          const latestSnapshot = snapshots.sort((a, b) => b.created_at - a.created_at)[0] || null
+          latestSnapshotCreatedAt = latestSnapshot?.created_at ?? null
+          latestSnapshotId = latestSnapshot?.id ?? null
+        } catch (err) {
+          console.warn('[GroupsProvider] Failed to verify latest 39002 snapshot after republish', {
+            groupId,
+            reason,
+            err: err instanceof Error ? err.message : err
+          })
+        }
+
+        let postPublishMembersCount: number | null = null
+        try {
+          const postDetail = await fetchGroupDetail(groupId, relay, { preferRelay: true })
+          postPublishMembersCount = Array.isArray(postDetail?.members)
+            ? postDetail.members.length
+            : 0
+        } catch (_err) {
+          postPublishMembersCount = null
+        }
+
+        console.info('[GroupsProvider] 39002 republish verification', {
           groupId,
           reason,
-          err: err instanceof Error ? err.message : err
+          membersCountBeforePublish: members.length,
+          latestSnapshotCreatedAt,
+          latestSnapshotId,
+          postPublishMembersCount,
+          targets: relayUrls.length
         })
       }
 
-      let postPublishMembersCount: number | null = null
-      try {
-        const postDetail = await fetchGroupDetail(groupId, relay, { preferRelay: true })
-        postPublishMembersCount = Array.isArray(postDetail?.members) ? postDetail.members.length : 0
-      } catch (_err) {
-        postPublishMembersCount = null
+      if (!waitForVerification) {
+        void runVerification()
+        return
       }
 
-      console.info('[GroupsProvider] 39002 republish verification', {
-        groupId,
-        reason,
-        membersCountBeforePublish: members.length,
-        latestSnapshotCreatedAt,
-        latestSnapshotId,
-        postPublishMembersCount,
-        targets: relayUrls.length
-      })
+      await runVerification()
     },
     [
       fetchGroupDetail,
@@ -4508,6 +4575,26 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
       if (!meta) {
         meta = getProvisionalGroupMetadata(groupId, resolved || relay || undefined)
       }
+      const initialResolvedIsOpen =
+        typeof options?.isOpen === 'boolean' ? options.isOpen : meta?.isOpen
+      const initialGatewayOrigin = normalizeHttpOrigin(
+        ((meta as TGroupMetadata & TGroupMetadataDiscoveryHints | null)?.gatewayOrigin) || null
+      )
+      const shouldRefreshClosedInviteMetadata =
+        initialResolvedIsOpen === false &&
+        (!initialGatewayOrigin || isLoopbackHttpOrigin(initialGatewayOrigin))
+      if (shouldRefreshClosedInviteMetadata) {
+        try {
+          const detail = await fetchGroupDetail(groupId, resolved || relay || undefined, {
+            preferRelay: true
+          })
+          if (detail?.metadata) {
+            meta = detail.metadata
+          }
+        } catch (_err) {
+          // Best-effort only.
+        }
+      }
       const relayEntry = getRelayEntryForGroup(groupId)
       const resolvedIsOpen = typeof options?.isOpen === 'boolean' ? options.isOpen : meta?.isOpen
       const isOpenGroup = resolvedIsOpen === true
@@ -4617,14 +4704,14 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         return null
       }
 
-      const baseMirrorMetadata: InviteMirrorMetadata = !isOpenGroup
-        ? await fetchInviteMirrorMetadata(
-            inviteRelayKey || relayEntry?.relayKey || groupId,
+      const baseMirrorMetadataPromise: Promise<InviteMirrorMetadata> = !isOpenGroup
+        ? fetchInviteMirrorMetadata(inviteRelayKey || relayEntry?.relayKey || groupId, {
+            gatewayOrigin,
             resolved
-          )
-        : null
+          })
+        : Promise.resolve(null)
 
-      const buildInviteMirrorMetadata = (
+      const buildInviteMirrorMetadata = async (
         writerInfo: {
           writerCore?: string
           writerCoreHex?: string
@@ -4637,6 +4724,7 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
         } | null
       ) => {
         if (isOpenGroup) return null
+        const baseMirrorMetadata = await baseMirrorMetadataPromise
         const writerCoreKey =
           writerInfo?.writerCoreHex || writerInfo?.autobaseLocal || writerInfo?.writerCore
         const extraRefs = [
@@ -4659,152 +4747,162 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
 
       await Promise.all(
         invitees.map(async (invitee) => {
-          const token = isOpenGroup ? null : randomString(24)
-          const writerInfo = await provisionWriterInfo(invitee, token)
-          const gatewayAccess =
-            !isOpenGroup &&
-            gatewayAuthMethod === 'relay-scoped-bearer-v1' &&
-            !directJoinOnly &&
-            !!gatewayOrigin &&
-            !!inviteRelayKey &&
-            !!sendToWorker
-              ? ((await sendToWorker({
-                  type: 'authorize-relay-member-access',
-                  data: {
-                    relayKey: inviteRelayKey,
-                    publicIdentifier: groupId,
-                    subjectPubkey: invitee,
-                    gatewayOrigin,
-                    gatewayId,
-                    scopes: DEFAULT_GATEWAY_MEMBER_SCOPES
-                  }
-                })) as TGroupGatewayAccess)
-              : null
-          const inviteMirrorMetadata = buildInviteMirrorMetadata(writerInfo)
-          const payload = isOpenGroup
-            ? buildOpenInvitePayload({
-                relayUrl: inviteRelayUrl,
-                relayKey: inviteRelayKey,
-                gatewayId,
-                gatewayOrigin,
-                directJoinOnly,
-                discoveryTopic,
-                hostPeerKeys,
-                leaseReplicaPeerKeys: metadataLeaseReplicaPeerKeys,
-                writerIssuerPubkey: metadataWriterIssuerPubkey,
-                groupName: inviteName,
-                groupPicture: invitePicture,
-                authorizedMemberPubkeys: baseAuthorizedMemberPubkeys,
-                gatewayAccess
-              })
-            : buildInvitePayload({
-                token: token as string,
-                relayUrl: inviteRelayUrl,
-                relayKey: inviteRelayKey,
-                gatewayId,
-                gatewayOrigin,
-                directJoinOnly,
-                meta,
-                groupName: inviteName,
-                groupPicture: invitePicture,
-                authorizedMemberPubkeys: normalizePubkeyList([
-                  ...baseAuthorizedMemberPubkeys,
-                  invitee
-                ]),
-                discoveryTopic,
-                hostPeerKeys,
-                leaseReplicaPeerKeys: Array.isArray(writerInfo?.leaseReplicaPeerKeys)
-                  ? writerInfo.leaseReplicaPeerKeys
-                  : metadataLeaseReplicaPeerKeys,
-                writerIssuerPubkey: writerInfo?.writerIssuerPubkey || metadataWriterIssuerPubkey,
-                writerLeaseEnvelope: writerInfo?.writerLeaseEnvelope || null,
-                mirrorMetadata: inviteMirrorMetadata,
-                writerInfo,
-                fastForward: writerInfo?.fastForward || null,
-                gatewayAccess
-              })
-          const encryptedPayload = await nip04Encrypt(invitee, JSON.stringify(payload))
-          console.info('[GroupsProvider] Invite payload built', {
-            groupId,
-            invitee,
-            openInvite: isOpenGroup,
-            hasWriterCore: !!writerInfo?.writerCore,
-            hasWriterCoreHex: !!writerInfo?.writerCoreHex,
-            hasAutobaseLocal: !!writerInfo?.autobaseLocal,
-            hasWriterSecret: !!writerInfo?.writerSecret,
-            writerSecretLen: writerInfo?.writerSecret ? String(writerInfo.writerSecret).length : 0,
-            hasFastForward: !!writerInfo?.fastForward,
-            hasGatewayAccess: !!gatewayAccess?.grantId,
-            relayKey: inviteRelayKey ? String(inviteRelayKey).slice(0, 16) : null,
-            relayUrl: inviteRelayUrl ? String(inviteRelayUrl).slice(0, 80) : null,
-            mirrorCoresCount: Array.isArray(inviteMirrorMetadata?.cores)
-              ? inviteMirrorMetadata.cores.length
-              : 0,
-            fileSharing: resolvedIsOpen === false ? false : true
-          })
-          const inviteTags: string[][] = [
-            ['h', groupId],
-            ['p', invitee],
-            ['i', 'hyperpipe']
-          ]
-          if (inviteName) inviteTags.push(['name', inviteName])
-          if (inviteAbout) inviteTags.push(['about', inviteAbout])
-          if (invitePicture) inviteTags.push(['picture', invitePicture])
-          if (isOpenGroup) inviteTags.push(['open'])
-          if (gatewayId) inviteTags.push([HYPERPIPE_GATEWAY_ID_TAG, gatewayId])
-          if (gatewayOrigin) inviteTags.push([HYPERPIPE_GATEWAY_ORIGIN_TAG, gatewayOrigin])
-          if (directJoinOnly) inviteTags.push([HYPERPIPE_DIRECT_JOIN_ONLY_TAG, '1'])
-          inviteTags.push([resolvedIsOpen === false ? 'file-sharing-off' : 'file-sharing-on'])
+          const inviteTrace = `${groupId}:${String(invitee).slice(0, 16)}`
+          let stage = 'init'
+          try {
+            const token = isOpenGroup ? null : randomString(24)
+            stage = 'provision-writer'
+            const writerInfo = await provisionWriterInfo(invitee, token)
 
-          if (!isOpenGroup && token) {
-            // Add 9000 put-user so membership/auth is consistent with legacy flow
-            const putUser: TDraftEvent = {
-              kind: 9000,
-              created_at: Math.floor(Date.now() / 1000),
-              tags: [
-                ['h', groupId],
-                ['p', invitee, 'member', token]
-              ],
-              content: ''
+            let gatewayAccess: TGroupGatewayAccess | null = null
+            if (
+              !isOpenGroup &&
+              gatewayAuthMethod === 'relay-scoped-bearer-v1' &&
+              !directJoinOnly &&
+              !!gatewayOrigin &&
+              !!inviteRelayKey &&
+              !!sendToWorker
+            ) {
+              stage = 'authorize-relay-member-access:request'
+              gatewayAccess = (await sendToWorker({
+                type: 'authorize-relay-member-access',
+                data: {
+                  relayKey: inviteRelayKey,
+                  publicIdentifier: groupId,
+                  subjectPubkey: invitee,
+                  gatewayOrigin,
+                  gatewayId,
+                  scopes: DEFAULT_GATEWAY_MEMBER_SCOPES
+                }
+              })) as TGroupGatewayAccess
             }
-            if (membershipRelayUrls.length) {
-              await publish(putUser, { specifiedRelayUrls: membershipRelayUrls })
-            }
-          }
 
-          const draftEvent: TDraftEvent = {
-            kind: 9009,
-            created_at: Math.floor(Date.now() / 1000),
-            tags: inviteTags,
-            content: encryptedPayload
-          }
-          await publish(draftEvent, { specifiedRelayUrls: relayUrls })
+            stage = 'build-invite-mirror-metadata'
+            const inviteMirrorMetadata = await buildInviteMirrorMetadata(writerInfo)
 
-          if (!isOpenGroup && token) {
-            try {
-              if (sendToWorker) {
-                const memberTs = Date.now()
-                await sendToWorker({
-                  type: 'update-auth-data',
-                  data: {
-                    relayKey: relayEntry?.relayKey,
-                    publicIdentifier: groupId,
-                    pubkey: invitee,
-                    token
-                  }
+            stage = 'build-invite-payload'
+            const payload = isOpenGroup
+              ? buildOpenInvitePayload({
+                  relayUrl: inviteRelayUrl,
+                  relayKey: inviteRelayKey,
+                  gatewayId,
+                  gatewayOrigin,
+                  directJoinOnly,
+                  discoveryTopic,
+                  hostPeerKeys,
+                  leaseReplicaPeerKeys: metadataLeaseReplicaPeerKeys,
+                  writerIssuerPubkey: metadataWriterIssuerPubkey,
+                  groupName: inviteName,
+                  groupPicture: invitePicture,
+                  authorizedMemberPubkeys: baseAuthorizedMemberPubkeys,
+                  gatewayAccess
                 })
-                await sendToWorker({
-                  type: 'update-members',
-                  data: {
-                    relayKey: relayEntry?.relayKey,
-                    publicIdentifier: groupId,
-                    member_adds: [{ pubkey: invitee, ts: memberTs }]
-                  }
+              : buildInvitePayload({
+                  token: token as string,
+                  relayUrl: inviteRelayUrl,
+                  relayKey: inviteRelayKey,
+                  gatewayId,
+                  gatewayOrigin,
+                  directJoinOnly,
+                  meta,
+                  groupName: inviteName,
+                  groupPicture: invitePicture,
+                  authorizedMemberPubkeys: normalizePubkeyList([
+                    ...baseAuthorizedMemberPubkeys,
+                    invitee
+                  ]),
+                  discoveryTopic,
+                  hostPeerKeys,
+                  leaseReplicaPeerKeys: Array.isArray(writerInfo?.leaseReplicaPeerKeys)
+                    ? writerInfo.leaseReplicaPeerKeys
+                    : metadataLeaseReplicaPeerKeys,
+                  writerIssuerPubkey: writerInfo?.writerIssuerPubkey || metadataWriterIssuerPubkey,
+                  writerLeaseEnvelope: writerInfo?.writerLeaseEnvelope || null,
+                  mirrorMetadata: inviteMirrorMetadata,
+                  writerInfo,
+                  fastForward: writerInfo?.fastForward || null,
+                  gatewayAccess
                 })
+
+            stage = 'encrypt-invite-payload'
+            const encryptedPayload = await nip04Encrypt(invitee, JSON.stringify(payload))
+            const inviteTags: string[][] = [
+              ['h', groupId],
+              ['p', invitee],
+              ['i', 'hyperpipe']
+            ]
+            if (inviteName) inviteTags.push(['name', inviteName])
+            if (inviteAbout) inviteTags.push(['about', inviteAbout])
+            if (invitePicture) inviteTags.push(['picture', invitePicture])
+            if (isOpenGroup) inviteTags.push(['open'])
+            if (gatewayId) inviteTags.push([HYPERPIPE_GATEWAY_ID_TAG, gatewayId])
+            if (gatewayOrigin) inviteTags.push([HYPERPIPE_GATEWAY_ORIGIN_TAG, gatewayOrigin])
+            if (directJoinOnly) inviteTags.push([HYPERPIPE_DIRECT_JOIN_ONLY_TAG, '1'])
+            inviteTags.push([resolvedIsOpen === false ? 'file-sharing-off' : 'file-sharing-on'])
+
+            if (!isOpenGroup && token) {
+              stage = 'publish-9000'
+              const putUser: TDraftEvent = {
+                kind: 9000,
+                created_at: Math.floor(Date.now() / 1000),
+                tags: [
+                  ['h', groupId],
+                  ['p', invitee, 'member', token]
+                ],
+                content: ''
               }
-            } catch (_err) {
-              // best effort
+              if (membershipRelayUrls.length) {
+                await publish(putUser, { specifiedRelayUrls: membershipRelayUrls })
+              }
             }
+
+            stage = 'publish-9009'
+            const draftEvent: TDraftEvent = {
+              kind: 9009,
+              created_at: Math.floor(Date.now() / 1000),
+              tags: inviteTags,
+              content: encryptedPayload
+            }
+            await publish(draftEvent, { specifiedRelayUrls: relayUrls })
+
+            if (!isOpenGroup && token) {
+              try {
+                if (sendToWorker) {
+                  stage = 'update-local-member-state'
+                  const memberTs = Date.now()
+                  await sendToWorker({
+                    type: 'update-auth-data',
+                    data: {
+                      relayKey: relayEntry?.relayKey,
+                      publicIdentifier: groupId,
+                      pubkey: invitee,
+                      token
+                    }
+                  })
+                  await sendToWorker({
+                    type: 'update-members',
+                    data: {
+                      relayKey: relayEntry?.relayKey,
+                      publicIdentifier: groupId,
+                      member_adds: [{ pubkey: invitee, ts: memberTs }]
+                    }
+                  })
+                }
+              } catch (_err) {
+                // best effort
+              }
+            }
+          } catch (err) {
+            console.error('[GroupsProvider] sendInvites invitee failed', {
+              inviteTrace,
+              stage,
+              err: err instanceof Error ? err.message : err,
+              relayKey: inviteRelayKey ? String(inviteRelayKey).slice(0, 16) : null,
+              gatewayOrigin,
+              gatewayId,
+              gatewayAuthMethod
+            })
+            throw err
           }
         })
       )
@@ -4824,7 +4922,8 @@ export function GroupsProvider({ children }: { children: ReactNode }) {
           groupId,
           relay: resolved || relay || undefined,
           isPublicGroup,
-          reason: 'send-invites'
+          reason: 'send-invites',
+          waitForVerification: false
         })
       }
     },
