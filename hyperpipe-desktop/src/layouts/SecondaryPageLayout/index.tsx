@@ -21,7 +21,8 @@ const SecondaryPageLayout = forwardRef(
       displayScrollToTopButton = false,
       titlebar,
       onScrollContextChange,
-      skipInitialScrollToTop = false
+      skipInitialScrollToTop = false,
+      disableOuterScroll = false
     }: {
       children?: React.ReactNode
       index?: number
@@ -33,6 +34,7 @@ const SecondaryPageLayout = forwardRef(
       titlebar?: React.ReactNode
       onScrollContextChange?: (useDocumentScroll: boolean) => void
       skipInitialScrollToTop?: boolean
+      disableOuterScroll?: boolean
     },
     ref
   ) => {
@@ -88,6 +90,25 @@ const SecondaryPageLayout = forwardRef(
       )
     }
 
+    if (disableOuterScroll) {
+      return (
+        <DeepBrowsingProvider active={currentIndex === index}>
+          <div className="flex h-full min-h-0 flex-col overflow-hidden">
+            <SecondaryPageTitlebar
+              title={title}
+              controls={controls}
+              hideBackButton={hideBackButton}
+              hideBottomBorder={hideTitlebarBottomBorder}
+              titlebar={titlebar}
+            />
+            <div className="min-h-0 flex-1 overflow-hidden">
+              {children}
+            </div>
+          </div>
+        </DeepBrowsingProvider>
+      )
+    }
+
     return (
       <DeepBrowsingProvider active={currentIndex === index} scrollAreaRef={scrollAreaRef}>
         <ScrollArea
@@ -138,16 +159,18 @@ export function SecondaryPageTitlebar({
       className="flex gap-1 p-1 items-center justify-between font-semibold"
       hideBottomBorder={hideBottomBorder}
     >
-      {hideBackButton ? (
-        <div className="flex gap-2 items-center pl-3 w-fit truncate text-lg font-semibold">
-          {title}
-        </div>
-      ) : (
-        <div className="flex items-center flex-1 w-0">
-          <BackButton>{title}</BackButton>
-        </div>
-      )}
-      <div className="flex-shrink-0">{controls}</div>
+      <div className="flex min-w-0 w-full items-center justify-between gap-2">
+        {hideBackButton ? (
+          <div className="flex min-w-0 items-center gap-2 pl-3 text-lg font-semibold">
+            <div className="truncate">{title}</div>
+          </div>
+        ) : (
+          <div className="flex min-w-0 flex-1 items-center">
+            <BackButton>{title}</BackButton>
+          </div>
+        )}
+        {controls ? <div className="shrink-0">{controls}</div> : null}
+      </div>
     </Titlebar>
   )
 }
@@ -158,7 +181,7 @@ function BackButton({ children }: { children?: React.ReactNode }) {
 
   return (
     <Button
-      className="flex gap-1 items-center w-fit max-w-full justify-start pl-2 pr-3"
+      className="inline-flex max-w-full min-w-0 items-center justify-start gap-1 pl-2 pr-3"
       variant="ghost"
       size="titlebar-icon"
       title={t('back')}

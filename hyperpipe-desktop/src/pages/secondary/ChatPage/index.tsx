@@ -134,6 +134,7 @@ const ChatPage = forwardRef(({ index }: { index?: number }, ref) => {
       }
       displayScrollToTopButton={false}
       skipInitialScrollToTop
+      disableOuterScroll
       onScrollContextChange={setUseDocumentScroll}
     >
       <ChatThread conversationId={conversationId} myPubkey={pubkey} useDocumentScroll={useDocumentScroll} />

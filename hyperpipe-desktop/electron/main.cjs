@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, net, session } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, net, screen, session } = require('electron');
 const path = require('path');
 const { promises: fs, existsSync } = require('fs');
 const { spawn, execFile } = require('child_process');
@@ -39,6 +39,17 @@ let publicGatewayConfigCache = null;
 let publicGatewayStatusCache = null;
 let currentWorkerUserKey = null;
 let pluginSupervisor = null;
+
+const DESKTOP_WINDOW_EDGE_MARGIN = 24;
+const DESKTOP_PREFERRED_WINDOW_WIDTH = 1920;
+const DESKTOP_PREFERRED_WINDOW_HEIGHT = 1100;
+
+function resolvePreferredWindowDimension(available, preferred, minimum) {
+  if (!Number.isFinite(available)) return preferred;
+  const clampedAvailable = Math.max(0, available);
+  if (clampedAvailable <= 0) return preferred;
+  return Math.max(Math.min(preferred, clampedAvailable), Math.min(minimum, clampedAvailable));
+}
 
 function getHeaderValue(headers, name) {
   if (!headers || typeof headers !== 'object') return null;
@@ -167,6 +178,8 @@ const gatewaySettingsPath = path.join(storagePath, 'hyperpipe-hyperpipe-gateway-
 const publicGatewaySettingsPath = path.join(storagePath, 'hyperpipe-public-hyperpipe-gateway-settings.json');
 const LOG_APPEND_EMFILE_RETRIES = 4;
 const LOG_APPEND_EMFILE_BASE_DELAY_MS = 25;
+const LOG_MAX_FILE_BYTES = 10 * 1024 * 1024;
+const LOG_ARCHIVE_COUNT = 4;
 let logAppendChain = Promise.resolve();
 const DEFAULT_CERT_ALLOWLIST = new Set(['relay.nostr.band', 'relay.damus.io', 'nos.lol']);
 const envAllowlist = (process.env.NOSTR_CERT_ALLOWLIST || '')
@@ -589,11 +602,56 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getArchivedLogFilePath(index) {
+  return path.join(storagePath, `desktop-console.${index}.log`);
+}
+
+async function statIfExists(filePath) {
+  try {
+    return await fs.stat(filePath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function unlinkIfExists(filePath) {
+  try {
+    await fs.unlink(filePath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+}
+
+async function renameIfExists(fromPath, toPath) {
+  try {
+    await fs.rename(fromPath, toPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+}
+
+async function rotateLogFileIfNeeded(payload) {
+  const incomingBytes = Buffer.byteLength(payload, 'utf8');
+  const currentStat = await statIfExists(logFilePath);
+  const currentSize = currentStat?.size || 0;
+  if ((currentSize + incomingBytes) <= LOG_MAX_FILE_BYTES) return;
+
+  await unlinkIfExists(getArchivedLogFilePath(LOG_ARCHIVE_COUNT));
+  for (let index = LOG_ARCHIVE_COUNT - 1; index >= 1; index -= 1) {
+    await renameIfExists(getArchivedLogFilePath(index), getArchivedLogFilePath(index + 1));
+  }
+  await renameIfExists(logFilePath, getArchivedLogFilePath(1));
+}
+
 async function appendLogLineWithBackoff(line) {
   const payload = typeof line === 'string' ? line : String(line ?? '');
   if (!payload) return;
 
   await ensureStorageDir();
+  await rotateLogFileIfNeeded(payload);
   for (let attempt = 0; ; attempt += 1) {
     try {
       await fs.appendFile(logFilePath, payload, 'utf8');
@@ -611,9 +669,22 @@ async function appendLogLineWithBackoff(line) {
 
 function createWindow() {
   const runtimeIconPath = getRuntimeIconPath();
+  const display = typeof screen?.getPrimaryDisplay === 'function' ? screen.getPrimaryDisplay() : null;
+  const workAreaSize = display?.workAreaSize || {};
+  const targetWidth = resolvePreferredWindowDimension(
+    Number(workAreaSize.width) - DESKTOP_WINDOW_EDGE_MARGIN,
+    DESKTOP_PREFERRED_WINDOW_WIDTH,
+    1280
+  );
+  const targetHeight = resolvePreferredWindowDimension(
+    Number(workAreaSize.height) - DESKTOP_WINDOW_EDGE_MARGIN,
+    DESKTOP_PREFERRED_WINDOW_HEIGHT,
+    860
+  );
+
   mainWindow = new BrowserWindow({
-    width: 1600,
-    height: 1022,
+    width: targetWidth,
+    height: targetHeight,
     show: false,
     backgroundColor: '#000000',
     ...(process.platform === 'darwin'

@@ -587,12 +587,12 @@ export function ChatThread({
     <div
       className={cn(
         'flex min-h-0 flex-col gap-3 overflow-hidden',
-        useDocumentScroll ? '' : 'h-[calc(var(--vh)-3rem)] max-h-full'
+        useDocumentScroll ? '' : 'h-full'
       )}
     >
       <div
         ref={listRef}
-        className="relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden space-y-3 px-3 py-2"
+        className="relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden space-y-3 px-3 py-2 scrollbar-chat"
       >
         {localMessages.map((message, index) => (
           <React.Fragment key={message.id}>
@@ -1040,7 +1040,7 @@ function ChatComposer({
   }
 
   return (
-    <div className="bg-background border-t px-3 py-3 space-y-2">
+    <div className="shrink-0 border-t bg-background px-3 py-3 space-y-2">
       {replyTarget && (
         <div className="flex items-center justify-between text-xs text-muted-foreground px-2">
           <span>

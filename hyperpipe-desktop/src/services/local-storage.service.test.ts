@@ -1,4 +1,8 @@
-import { StorageKey } from '@/constants'
+import {
+  DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT,
+  LEGACY_DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT,
+  StorageKey
+} from '@/constants'
 import storage from '@/services/local-storage.service'
 
 describe('local storage feed selection persistence', () => {
@@ -11,7 +15,27 @@ describe('local storage feed selection persistence', () => {
     expect(storage.getThemeSetting()).toBe('pure-black')
     expect(storage.getPrimaryColor()).toBe('CYAN')
     expect(storage.getEnableSingleColumnLayout()).toBe(false)
-    expect(storage.getDesktopPrimaryColumnWidth()).toBeCloseTo((1067 / (1067 + 586)) * 100, 5)
+    expect(storage.getDesktopPrimaryColumnWidth()).toBeCloseTo(
+      DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT,
+      5
+    )
+  })
+
+  it('migrates untouched desktop split widths from the legacy default to the new default', () => {
+    window.localStorage.setItem(
+      StorageKey.DESKTOP_PRIMARY_COLUMN_WIDTH,
+      LEGACY_DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT.toString()
+    )
+
+    storage.init()
+
+    expect(storage.getDesktopPrimaryColumnWidth()).toBeCloseTo(
+      DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT,
+      5
+    )
+    expect(
+      Number(window.localStorage.getItem(StorageKey.DESKTOP_PRIMARY_COLUMN_WIDTH))
+    ).toBeCloseTo(DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT, 5)
   })
 
   it('persists local group relay selections by stable group id instead of localhost url', () => {

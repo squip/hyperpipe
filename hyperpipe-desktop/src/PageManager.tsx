@@ -1,5 +1,4 @@
 import Sidebar from '@/components/Sidebar'
-import { DEFAULT_DESKTOP_COLUMN_TOTAL_WIDTH } from '@/constants'
 import { isRendererFeatureEnabled } from '@/lib/features'
 import type { RendererFeature } from '@/lib/features'
 import { isMacDesktop } from '@/lib/platform'
@@ -523,11 +522,10 @@ export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
           <NotificationProvider>
             <div className="flex w-full flex-col bg-surface-background">
               {macDesktop && <DesktopShellTitlebarInset />}
-              <div className="flex w-full justify-center">
+              <div className="flex w-full">
               <div
-                className="flex w-full bg-surface-background"
+                className="flex w-full min-w-0 bg-surface-background"
                 style={{
-                  maxWidth: '1920px',
                   height: macDesktop
                     ? `calc(var(--vh) - ${MAC_DESKTOP_SHELL_BAR_HEIGHT_PX}px)`
                     : 'var(--vh)'
@@ -537,11 +535,10 @@ export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
                 <div
                   ref={containerRef}
                   className={cn(
-                    'relative grid w-full',
+                    'relative grid min-w-0 flex-1',
                     themeSetting === 'pure-black' ? '' : 'gap-2 pr-2 py-2'
                   )}
                   style={{
-                    maxWidth: `${DEFAULT_DESKTOP_COLUMN_TOTAL_WIDTH}px`,
                     gridTemplateColumns: `${leftColumnWidth}% ${100 - leftColumnWidth}%`,
                     userSelect: isResizing ? 'none' : 'auto',
                     cursor: isResizing ? 'col-resize' : 'auto'
@@ -549,7 +546,7 @@ export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
                 >
                   <div
                     className={cn(
-                      'bg-background overflow-hidden',
+                      'min-w-0 bg-background overflow-hidden',
                       themeSetting === 'pure-black' ? 'border-l' : 'rounded-lg shadow-lg'
                     )}
                   >
@@ -580,7 +577,7 @@ export function PageManager({ maxStackSize = 5 }: { maxStackSize?: number }) {
                   />
                   <div
                     className={cn(
-                      'bg-background overflow-hidden',
+                      'min-w-0 bg-background overflow-hidden',
                       themeSetting === 'pure-black' ? 'border-l' : 'rounded-lg shadow-lg'
                     )}
                   >

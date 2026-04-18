@@ -2,6 +2,7 @@ import {
   DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT,
   DEFAULT_ENABLE_SINGLE_COLUMN_LAYOUT,
   DEFAULT_PRIMARY_COLOR,
+  LEGACY_DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT,
   DEFAULT_NIP_96_SERVICE,
   DEFAULT_THEME_SETTING,
   ExtendedKind,
@@ -35,6 +36,10 @@ import {
   TSharedFeedFilterPage,
   TStoredSharedFeedFilterSettings
 } from '@/lib/shared-feed-filters'
+
+function areNumbersClose(left: number, right: number, epsilon = 0.05) {
+  return Math.abs(left - right) <= epsilon
+}
 
 export type ArchivedGroupFilesEntry = {
   groupId: string
@@ -452,9 +457,26 @@ class LocalStorageService {
     const parsedDesktopPrimaryColumnWidth = parseFloat(
       storedDesktopPrimaryColumnWidth ?? legacyDesktopPrimaryColumnWidth ?? ''
     )
-    this.desktopPrimaryColumnWidth = Number.isFinite(parsedDesktopPrimaryColumnWidth)
+    const normalizedDesktopPrimaryColumnWidth = Number.isFinite(parsedDesktopPrimaryColumnWidth)
       ? Math.max(20, Math.min(80, parsedDesktopPrimaryColumnWidth))
-      : DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT
+      : null
+    const shouldMigrateLegacyDefaultDesktopWidth =
+      normalizedDesktopPrimaryColumnWidth !== null
+      && areNumbersClose(
+        normalizedDesktopPrimaryColumnWidth,
+        LEGACY_DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT
+      )
+
+    this.desktopPrimaryColumnWidth = shouldMigrateLegacyDefaultDesktopWidth
+      ? DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT
+      : normalizedDesktopPrimaryColumnWidth ?? DEFAULT_DESKTOP_PRIMARY_COLUMN_WIDTH_PERCENT
+
+    if (shouldMigrateLegacyDefaultDesktopWidth) {
+      window.localStorage.setItem(
+        StorageKey.DESKTOP_PRIMARY_COLUMN_WIDTH,
+        this.desktopPrimaryColumnWidth.toString()
+      )
+    }
 
     // Migration logic for old boolean showLinkPreviews to new enum linkPreviewMode
     const storedLinkPreviewMode = window.localStorage.getItem(StorageKey.SHOW_LINK_PREVIEWS)

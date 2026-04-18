@@ -319,7 +319,7 @@ const GroupsPage = forwardRef<
     timeFrameOptions,
     hasSavedSettings
   } = useSharedFeedFilterSettings('groups')
-  const { current: currentPrimaryPage, display: primaryDisplay } = usePrimaryPage()
+  const { current: currentPrimaryPage, display: primaryDisplay, navigate } = usePrimaryPage()
   const isGroupsPageActive = currentPrimaryPage === 'groups' && primaryDisplay
   const [tab, setTab] = useState<TTab>(initialTab || 'discover')
   const [search, setSearch] = useState('')
@@ -385,7 +385,11 @@ const GroupsPage = forwardRef<
     ],
     [t]
   )
-  const defaultSharedFilterSettings = useMemo(
+  const allSharedListKeys = useMemo(
+    () => sharedListOptions.map((option) => option.key),
+    [sharedListOptions]
+  )
+  const legacyDefaultSharedFilterSettings = useMemo(
     () =>
       createDefaultSharedFeedFilterSettings(
         'groups',
@@ -393,6 +397,13 @@ const GroupsPage = forwardRef<
         discoveryRelayOptions.map((option) => option.relayIdentity)
       ),
     [discoveryRelayOptions, timeFrameOptions]
+  )
+  const defaultSharedFilterSettings = useMemo(
+    () => ({
+      ...legacyDefaultSharedFilterSettings,
+      selectedListKeys: allSharedListKeys
+    }),
+    [allSharedListKeys, legacyDefaultSharedFilterSettings]
   )
   const effectiveSelectedRelayIdentities = useMemo(
     () =>
@@ -448,6 +459,43 @@ const GroupsPage = forwardRef<
       return
     }
 
+    const hasLegacyDefaultListSelection =
+      sharedFilterSettings.selectedListKeys.length === 0
+      && legacyDefaultSharedFilterSettings.selectedListKeys.length === 0
+      && sharedFilterSettings.recencyEnabled === legacyDefaultSharedFilterSettings.recencyEnabled
+      && sharedFilterSettings.timeFrame.value === legacyDefaultSharedFilterSettings.timeFrame.value
+      && sharedFilterSettings.timeFrame.unit === legacyDefaultSharedFilterSettings.timeFrame.unit
+      && sharedFilterSettings.maxItemsPerAuthor === legacyDefaultSharedFilterSettings.maxItemsPerAuthor
+      && sharedFilterSettings.mutedWords.trim() === legacyDefaultSharedFilterSettings.mutedWords.trim()
+      && areStringArraysEqual(
+        sharedFilterSettings.selectedLanguageCodes,
+        legacyDefaultSharedFilterSettings.selectedLanguageCodes
+      )
+      && areStringArraysEqual(
+        sharedFilterSettings.selectedFileExtensions,
+        legacyDefaultSharedFilterSettings.selectedFileExtensions
+      )
+      && areStringArraysEqual(
+        sharedFilterSettings.customFileExtensions,
+        legacyDefaultSharedFilterSettings.customFileExtensions
+      )
+      && !isRelaySelectionActive(
+        effectiveSelectedRelayIdentities,
+        discoveryRelayOptions.map((option) => option.relayIdentity)
+      )
+
+    if (
+      hasLegacyDefaultListSelection
+      && allSharedListKeys.length > 0
+      && !areStringArraysEqual(sharedFilterSettings.selectedListKeys, allSharedListKeys)
+    ) {
+      setSharedFilterSettings({
+        ...sharedFilterSettings,
+        selectedListKeys: allSharedListKeys
+      })
+      return
+    }
+
     const availableIdentitySet = new Set(
       discoveryRelayOptions.map((option) => option.relayIdentity)
     )
@@ -462,9 +510,12 @@ const GroupsPage = forwardRef<
       })
     }
   }, [
+    allSharedListKeys,
     defaultSharedFilterSettings,
     discoveryRelayOptions,
+    effectiveSelectedRelayIdentities,
     hasSavedSettings,
+    legacyDefaultSharedFilterSettings,
     setSharedFilterSettings,
     sharedFilterSettings,
     sharedFilterSettings.selectedRelayIdentities
@@ -1111,6 +1162,28 @@ const GroupsPage = forwardRef<
     })
   }, [discoverSort, filteredDiscoverRows, resolvePeerPresence, resolveRowAdmin, resolveRowCreatedAt, resolveRowMembership])
 
+  const hasKnownPeopleSources = selectedAuthorPubkeySet.size > 0
+  const hasKnownPeopleDiscoverGroups = useMemo(
+    () =>
+      discoverRows.some((row) => {
+        const admin = resolveRowAdmin({
+          groupId: row.groupId,
+          relay: row.relay,
+          fallbackAdminPubkey: row.fallbackAdminPubkey
+        })
+        return !!admin && selectedAuthorPubkeySet.has(admin)
+      }),
+    [discoverRows, resolveRowAdmin, selectedAuthorPubkeySet]
+  )
+  const showKnownPeopleEmptyState =
+    tab === 'discover'
+    && !isLoadingDiscovery
+    && !discoveryError
+    && !search.trim()
+    && sortedDiscoverRows.length === 0
+    && !isSharedFilterMenuActive
+    && (!hasKnownPeopleSources || !hasKnownPeopleDiscoverGroups)
+
   const sortedMyRows = useMemo(() => {
     return [...filteredMyRows].sort((left, right) => {
       const leftMembers = resolveRowMembership({ groupId: left.groupId, relay: left.relay }).memberCount
@@ -1399,7 +1472,7 @@ const GroupsPage = forwardRef<
     const sortState = mode === 'discover' ? discoverSort : mySort
     const setSortState = mode === 'discover' ? setDiscoverSort : setMySort
     const showVisibilityColumn = mode !== 'discover'
-    const tableMinWidth = showVisibilityColumn ? 'min-w-[960px]' : 'min-w-[860px]'
+    const tableMinWidth = showVisibilityColumn ? 'min-w-[1000px]' : 'min-w-[900px]'
 
     return (
       <div
@@ -1411,7 +1484,7 @@ const GroupsPage = forwardRef<
           <thead className="bg-muted/40 text-xs font-medium text-muted-foreground">
             <tr>
               <th className="w-14 px-3 py-2 text-left"><span className="sr-only">{t('Thumbnail')}</span></th>
-              <th className="w-[220px] px-3 py-2 text-left">
+              <th className="w-[190px] px-3 py-2 text-left">
                 <SortHeaderButton
                   label={t('Group')}
                   active={sortState.key === 'name'}
@@ -1419,7 +1492,7 @@ const GroupsPage = forwardRef<
                   onClick={() => toggleGroupSort('name', sortState, setSortState)}
                 />
               </th>
-              <th className="w-[220px] px-3 py-2 text-left">
+              <th className="w-[170px] px-3 py-2 text-left">
                 <SortHeaderButton
                   label={t('Description')}
                   active={sortState.key === 'description'}
@@ -1427,7 +1500,7 @@ const GroupsPage = forwardRef<
                   onClick={() => toggleGroupSort('description', sortState, setSortState)}
                 />
               </th>
-              <th className="w-[100px] px-3 py-2 text-left">
+              <th className="w-[96px] px-3 py-2 text-left">
                 <SortHeaderButton
                   label={t('Open/Closed')}
                   active={sortState.key === 'open'}
@@ -1436,7 +1509,7 @@ const GroupsPage = forwardRef<
                 />
               </th>
               {showVisibilityColumn ? (
-                <th className="w-[110px] px-3 py-2 text-left">
+                <th className="w-[104px] px-3 py-2 text-left">
                   <SortHeaderButton
                     label={t('Public/Private')}
                     active={sortState.key === 'public'}
@@ -1445,7 +1518,7 @@ const GroupsPage = forwardRef<
                   />
                 </th>
               ) : null}
-              <th className="w-[220px] px-3 py-2 text-left">
+              <th className="w-[180px] px-3 py-2 text-left">
                 <SortHeaderButton
                   label={t('Admin')}
                   active={sortState.key === 'admin'}
@@ -1453,7 +1526,7 @@ const GroupsPage = forwardRef<
                   onClick={() => toggleGroupSort('admin', sortState, setSortState)}
                 />
               </th>
-              <th className="w-[150px] px-3 py-2 text-left">
+              <th className="w-[124px] px-3 py-2 text-left">
                 <SortHeaderButton
                   label={t('Members')}
                   active={sortState.key === 'members'}
@@ -1461,7 +1534,7 @@ const GroupsPage = forwardRef<
                   onClick={() => toggleGroupSort('members', sortState, setSortState)}
                 />
               </th>
-              <th className="w-[120px] px-3 py-2 text-left">
+              <th className="w-[84px] px-3 py-2 text-left">
                 <SortHeaderButton
                   label={t('Peers')}
                   active={sortState.key === 'peers'}
@@ -1518,7 +1591,7 @@ const GroupsPage = forwardRef<
                     </div>
                   </td>
                   <td className="px-3 py-3 align-top text-muted-foreground">
-                    <div className="line-clamp-3 max-w-[220px] whitespace-pre-wrap break-words">{row.about || '-'}</div>
+                    <div className="line-clamp-3 max-w-[170px] whitespace-pre-wrap break-words">{row.about || '-'}</div>
                   </td>
                   <td className="px-3 py-3 align-top">
                     <StatusBadge label={row.isOpen ? t('Open') : t('Closed')} />
@@ -1823,6 +1896,22 @@ const GroupsPage = forwardRef<
             ) : discoveryError ? (
               <div className="text-sm text-red-500">
                 {t('Failed to load groups')}: {discoveryError}
+              </div>
+            ) : showKnownPeopleEmptyState ? (
+              <div className="rounded-lg border p-4 text-sm text-muted-foreground">
+                <span>
+                  {t(
+                    'No groups found from people you know. Adjust the settings in the filter menu above to expand your feed results, or simply'
+                  )}{' '}
+                </span>
+                <button
+                  type="button"
+                  className="font-medium text-foreground underline underline-offset-2 transition-colors hover:text-primary"
+                  onClick={() => navigate('lists')}
+                >
+                  {t('find more accounts to follow')}
+                </button>
+                <span>.</span>
               </div>
             ) : renderGroupRows(sortedDiscoverRows, 'discover')}
           </TabsContent>

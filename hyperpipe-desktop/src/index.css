@@ -92,6 +92,31 @@
     display: none; /* Safari and Chrome */
   }
 
+  .scrollbar-chat {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.22) transparent;
+  }
+
+  .scrollbar-chat::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  .scrollbar-chat::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .scrollbar-chat::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.22);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+
+  .scrollbar-chat:hover::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.34);
+    background-clip: padding-box;
+  }
+
   .desktop-shell-titlebar-inset {
     -webkit-app-region: drag;
   }
