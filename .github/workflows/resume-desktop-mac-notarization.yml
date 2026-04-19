@@ -23,7 +23,7 @@ on:
       timeout_minutes:
         description: Additional minutes to wait for Apple notarization processing
         required: true
-        default: '180'
+        default: "180"
         type: string
       submission_id:
         description: Optional Apple submission id override if no metadata artifact is available
@@ -242,7 +242,7 @@ jobs:
       - name: Package notarized macOS release artifacts
         working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: node ./scripts/build-notarized-mac-release.cjs package --arch ${{ matrix.arch }}
 
       - name: Normalize macOS updater metadata
@@ -299,6 +299,18 @@ jobs:
           mkdir -p "$RELEASE_ASSET_DIR"
           gh release download "$RELEASE_TAG" --repo "${{ github.repository }}" --dir "$RELEASE_ASSET_DIR"
           rm -f "$RELEASE_ASSET_DIR/SHA256SUMS.txt"
+          if [ -f "$RELEASE_ASSET_DIR/latest.yml" ] && [ ! -f "$RELEASE_ASSET_DIR/latest-x64.yml" ]; then
+            cp "$RELEASE_ASSET_DIR/latest.yml" "$RELEASE_ASSET_DIR/latest-x64.yml"
+          fi
+          if [ ! -f "$RELEASE_ASSET_DIR/latest.yml" ] && [ -f "$RELEASE_ASSET_DIR/latest-x64.yml" ]; then
+            cp "$RELEASE_ASSET_DIR/latest-x64.yml" "$RELEASE_ASSET_DIR/latest.yml"
+          fi
+          if [ -f "$RELEASE_ASSET_DIR/latest-linux.yml" ] && [ ! -f "$RELEASE_ASSET_DIR/latest-linux-x64.yml" ]; then
+            cp "$RELEASE_ASSET_DIR/latest-linux.yml" "$RELEASE_ASSET_DIR/latest-linux-x64.yml"
+          fi
+          if [ ! -f "$RELEASE_ASSET_DIR/latest-linux.yml" ] && [ -f "$RELEASE_ASSET_DIR/latest-linux-x64.yml" ]; then
+            cp "$RELEASE_ASSET_DIR/latest-linux-x64.yml" "$RELEASE_ASSET_DIR/latest-linux.yml"
+          fi
           if [ -f "$RELEASE_ASSET_DIR/latest-mac.yml" ] && [ ! -f "$RELEASE_ASSET_DIR/latest-mac-x64.yml" ]; then
             cp "$RELEASE_ASSET_DIR/latest-mac.yml" "$RELEASE_ASSET_DIR/latest-mac-x64.yml"
           fi
@@ -315,7 +327,7 @@ jobs:
           rm -rf "$RELEASE_METADATA_DIR"
           mkdir -p "$RELEASE_METADATA_DIR"
           cp "$RELEASE_ASSET_DIR/SHA256SUMS.txt" "$RELEASE_METADATA_DIR/"
-          for file in latest-mac.yml latest-mac-x64.yml latest-mac-arm64.yml; do
+          for file in latest.yml latest-x64.yml latest-arm64.yml latest-linux.yml latest-linux-x64.yml latest-linux-arm64.yml latest-mac.yml latest-mac-x64.yml latest-mac-arm64.yml; do
             if [ -f "$RELEASE_ASSET_DIR/$file" ]; then
               cp "$RELEASE_ASSET_DIR/$file" "$RELEASE_METADATA_DIR/"
             fi

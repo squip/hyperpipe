@@ -190,7 +190,8 @@
     },
     "win": {
       "target": "nsis",
-      "icon": "build/icon.ico"
+      "icon": "build/icon.ico",
+      "artifactName": "${productName} Setup ${version} ${arch}.${ext}"
     },
     "linux": {
       "target": "AppImage",

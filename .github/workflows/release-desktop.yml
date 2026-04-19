@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - 'desktop-v*'
+      - "desktop-v*"
 
 permissions:
   contents: write
@@ -76,13 +76,23 @@ jobs:
             notarize_timeout_minutes: 120
           - os: windows-latest
             arch: x64
-            release_dir: ''
+            release_dir: ""
             builder_args: --win nsis --x64
+            notarize: false
+          - os: windows-11-arm
+            arch: arm64
+            release_dir: ""
+            builder_args: --win nsis --arm64
             notarize: false
           - os: ubuntu-latest
             arch: x64
-            release_dir: ''
+            release_dir: ""
             builder_args: --linux AppImage --x64
+            notarize: false
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            release_dir: ""
+            builder_args: --linux AppImage --arm64
             notarize: false
     runs-on: ${{ matrix.os }}
     env:
@@ -167,8 +177,18 @@ jobs:
         if: runner.os != 'macOS'
         working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run dist:desktop -- ${{ matrix.builder_args }}
+
+      - name: Normalize Windows updater metadata
+        if: runner.os == 'Windows'
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        run: node ./scripts/normalize-windows-release-metadata.cjs --arch ${{ matrix.arch }}
+
+      - name: Normalize Linux updater metadata
+        if: runner.os == 'Linux'
+        working-directory: ${{ env.DESKTOP_STANDALONE_DIR }}
+        run: node ./scripts/normalize-linux-release-metadata.cjs --arch ${{ matrix.arch }}
 
       - name: Write checksums
         if: success() && github.event_name == 'workflow_dispatch'
@@ -204,7 +224,7 @@ jobs:
         if: success() && !(runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
         uses: actions/upload-artifact@v4
         with:
-          name: desktop-${{ matrix.os }}
+          name: desktop-${{ matrix.os }}-${{ matrix.arch }}
           path: ${{ env.DESKTOP_STANDALONE_DIR }}/release/*
 
       - name: Publish release assets
