@@ -1,6 +1,6 @@
 {
   "name": "hyperpipe-tui",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "private": true,
   "type": "module",
   "license": "Apache-2.0",
@@ -38,8 +38,8 @@
     "package.json"
   ],
   "dependencies": {
-    "@squip/hyperpipe-bridge": "^0.1.0",
-    "@squip/hyperpipe-core": "^0.1.0",
+    "@squip/hyperpipe-bridge": "^0.1.2",
+    "@squip/hyperpipe-core": "^0.1.2",
     "@squip/hyperpipe-core-host": "^0.1.0",
     "chalk": "^5.6.2",
     "ink": "^5.0.1",
