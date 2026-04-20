@@ -8,8 +8,8 @@ export function DownloadGroup({ group }: { group: DownloadGroupType }) {
       </div>
       <ul className="download-group__links">
         {group.links.map((link) => (
-          <li key={link.href}>
-            <a className="download-link" href={link.href} target="_blank" rel="noreferrer">
+          <li key={link.trackingPath}>
+            <a className="download-link" href={link.trackingPath}>
               {link.label}
             </a>
           </li>

@@ -3,7 +3,15 @@ import { SiteLogo } from './components/SiteLogo'
 import { DownloadGroup } from './components/DownloadGroup'
 import { SiteLayout } from './components/Layout'
 import { homepageSections } from './data/homepage'
-import { desktopRelease, gatewayPage, tuiRelease, type DownloadPageData } from './data/releases'
+import {
+  buildTrackedRedirects,
+  desktopRelease,
+  gatewayPage,
+  tuiRelease,
+  type DownloadPageData
+} from './data/releases'
+
+const trackedRedirects = buildTrackedRedirects()
 
 function normalizePath(pathname: string) {
   return pathname.replace(/\/+$/, '') || '/'
@@ -58,7 +66,7 @@ function DownloadDrawer({ data }: { data: DownloadPageData }) {
         <p>{data.summary}</p>
         <p>
           Full release notes and checksums are available on{' '}
-          <a href={data.releaseUrl} target="_blank" rel="noreferrer">
+          <a href={data.releaseTrackingPath}>
             GitHub Releases
           </a>
           .
@@ -82,17 +90,13 @@ function GatewayDrawer() {
         <div className="action-row">
           <a
             className="primary-action"
-            href={gatewayPage.primaryHref}
-            target="_blank"
-            rel="noreferrer"
+            href={gatewayPage.primaryTrackingPath}
           >
             {gatewayPage.primaryLabel}
           </a>
           <a
             className="secondary-action"
-            href={gatewayPage.secondaryHref}
-            target="_blank"
-            rel="noreferrer"
+            href={gatewayPage.secondaryTrackingPath}
           >
             {gatewayPage.secondaryLabel}
           </a>
@@ -284,8 +288,34 @@ function NotFoundPage() {
   )
 }
 
+function RedirectPage({ href, label }: { href: string; label: string }) {
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      window.location.replace(href)
+    }, 180)
+
+    return () => window.clearTimeout(timer)
+  }, [href])
+
+  return (
+    <SiteLayout title="Redirecting…" eyebrow="tracking link">
+      <section className="content-card prose-block redirect-card">
+        <p>Redirecting to {label}…</p>
+        <p>
+          If nothing happens,{' '}
+          <a href={href} rel="noreferrer">
+            continue manually
+          </a>
+          .
+        </p>
+      </section>
+    </SiteLayout>
+  )
+}
+
 export default function App() {
   const [path, setPath] = useState(() => normalizePath(window.location.pathname))
+  const redirect = trackedRedirects.find((entry) => entry.path === path) || null
 
   useEffect(() => {
     function handlePopState() {
@@ -295,6 +325,10 @@ export default function App() {
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
   }, [])
+
+  if (redirect) {
+    return <RedirectPage href={redirect.href} label={redirect.label} />
+  }
 
   let drawerTitle: string | null = null
   let drawerContent: ReactNode = null
