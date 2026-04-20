@@ -76,12 +76,6 @@ function getNodeDistributionInfo(platform, arch, nodeVersion) {
   if (!['x64', 'arm64'].includes(arch)) {
     throw new Error(`Unsupported architecture: ${arch}`)
   }
-  if (platform === 'linux' && arch !== 'x64') {
-    throw new Error('Linux release bundles currently support x64 only')
-  }
-  if (platform === 'win32' && arch !== 'x64') {
-    throw new Error('Windows release bundles currently support x64 only')
-  }
 
   const platformSegment =
     platform === 'win32'
