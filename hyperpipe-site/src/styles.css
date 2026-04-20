@@ -4,7 +4,8 @@
   --text: #111111;
   --muted: #333333;
   --border: #d8d8d8;
-  --primary: #0b7a63;
+  --primary: #0f8f73;
+  --primary-soft: #dff5ef;
 }
 
 * {
@@ -34,7 +35,7 @@ body {
 }
 
 a {
-  color: var(--text);
+  color: var(--primary);
   text-decoration: underline;
   text-underline-offset: 0.14em;
 }
@@ -80,7 +81,7 @@ code {
 .site-main {
   width: min(780px, calc(100% - 2rem));
   margin: 0 auto;
-  padding: 1.25rem 0 4rem;
+  padding: 2rem 0 4rem;
 }
 
 .page-hero {
@@ -133,7 +134,12 @@ code {
   margin: 0 0 0.8rem;
   font-size: 1.2rem;
   font-weight: 700;
-  text-transform: lowercase;
+}
+
+.prose-block h3 {
+  margin: 1rem 0 0.7rem;
+  font-size: 1rem;
+  font-weight: 700;
 }
 
 .prose-block p,
@@ -175,14 +181,25 @@ code {
   margin: 0;
 }
 
+.software-card__summary {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.software-card__summary li {
+  color: var(--text);
+}
+
 .tip-panel {
   margin-top: 0.65rem;
-  padding-left: 0;
+  border-left: 3px solid #8ccfbe;
+  background: var(--primary-soft);
+  padding: 0.7rem 0.9rem;
 }
 
 .tip-panel__title {
   margin-bottom: 0.35rem;
-  color: var(--text);
+  color: var(--primary);
   font-size: 0.95rem;
   font-weight: 700;
 }
@@ -246,6 +263,75 @@ code {
 .primary-action,
 .secondary-action {
   display: inline;
+}
+
+.tree-root {
+  position: relative;
+  margin-bottom: 1.4rem;
+  padding-left: 1.5rem;
+}
+
+.tree-root::before {
+  content: '';
+  position: absolute;
+  left: 0.4rem;
+  top: 0.15rem;
+  bottom: 0.15rem;
+  width: 1px;
+  background: #b8c4c0;
+}
+
+.tree-section {
+  position: relative;
+}
+
+.tree-section + .tree-section {
+  margin-top: 0.45rem;
+}
+
+.tree-section::before {
+  content: '';
+  position: absolute;
+  left: -1.1rem;
+  top: 0.95rem;
+  width: 0.75rem;
+  height: 1px;
+  background: #b8c4c0;
+}
+
+.tree-section__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--text);
+  font: inherit;
+  font-size: 1.9rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.tree-section__chevron {
+  width: 1rem;
+  color: #666666;
+  font-size: 1.3rem;
+  line-height: 1;
+}
+
+.tree-section__content {
+  padding-top: 0.65rem;
+}
+
+.credits-note {
+  color: #555555;
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.credits-note p {
+  color: inherit;
 }
 
 @media (max-width: 720px) {
