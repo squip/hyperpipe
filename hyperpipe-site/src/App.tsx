@@ -1,14 +1,40 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type MouseEvent, type ReactNode } from 'react'
 import { SiteLogo } from './components/SiteLogo'
 import { DownloadGroup } from './components/DownloadGroup'
 import { SiteLayout } from './components/Layout'
 import { homepageSections } from './data/homepage'
 import { desktopRelease, gatewayPage, tuiRelease, type DownloadPageData } from './data/releases'
 
-function DownloadPage({ data }: { data: DownloadPageData }) {
+function normalizePath(pathname: string) {
+  return pathname.replace(/\/+$/, '') || '/'
+}
+
+function DownloadIcon() {
   return (
-    <SiteLayout title={data.title} eyebrow={`Version ${data.version}`}>
+    <svg
+      className="download-icon"
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <path
+        d="M8 2.5V9.25M8 9.25L5.5 6.75M8 9.25L10.5 6.75M3 11.75H13"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
+function DownloadDrawer({ data }: { data: DownloadPageData }) {
+  return (
+    <>
       <section className="content-card prose-block">
+        <h2>{data.title}</h2>
+        <p className="drawer-version">Version {data.version}</p>
         <p>{data.summary}</p>
         <p>
           Full release notes and checksums are available on{' '}
@@ -23,25 +49,36 @@ function DownloadPage({ data }: { data: DownloadPageData }) {
           <DownloadGroup key={group.os} group={group} />
         ))}
       </div>
-    </SiteLayout>
+    </>
   )
 }
 
-function GatewayPage() {
+function GatewayDrawer() {
   return (
-    <SiteLayout title={gatewayPage.title} eyebrow="Deploy Source">
+    <>
       <section className="content-card prose-block">
+        <h2>{gatewayPage.title}</h2>
         <p>{gatewayPage.summary}</p>
         <div className="action-row">
-          <a className="primary-action" href={gatewayPage.primaryHref} target="_blank" rel="noreferrer">
+          <a
+            className="primary-action"
+            href={gatewayPage.primaryHref}
+            target="_blank"
+            rel="noreferrer"
+          >
             {gatewayPage.primaryLabel}
           </a>
-          <a className="secondary-action" href={gatewayPage.secondaryHref} target="_blank" rel="noreferrer">
+          <a
+            className="secondary-action"
+            href={gatewayPage.secondaryHref}
+            target="_blank"
+            rel="noreferrer"
+          >
             {gatewayPage.secondaryLabel}
           </a>
         </div>
       </section>
-    </SiteLayout>
+    </>
   )
 }
 
@@ -75,6 +112,12 @@ function TreeSection({
 }
 
 function HomePage() {
+  function handleSoftwareLink(event: MouseEvent<HTMLAnchorElement>, href: string) {
+    event.preventDefault()
+    window.history.pushState({}, '', href)
+    window.dispatchEvent(new PopStateEvent('popstate'))
+  }
+
   return (
     <SiteLayout
       title="Nostr relays that run where your network lives."
@@ -86,10 +129,6 @@ function HomePage() {
         <div className="hero-card__logo">
           <SiteLogo />
         </div>
-        <p className="hero-card__lede">
-          Hyperpipe is a decentralized communication platform for creating and sharing Nostr relays
-          from your own device without falling back to hosted relay infrastructure.
-        </p>
       </section>
 
       <div className="tree-root">
@@ -115,7 +154,14 @@ function HomePage() {
               {homepageSections.software.map((item) => (
                 <article key={item.name} className="software-card">
                   <div className="software-card__topline">
-                    <a href={item.href}>{item.name}</a>
+                    <a
+                      className="software-link"
+                      href={item.href}
+                      onClick={(event) => handleSoftwareLink(event, item.href)}
+                    >
+                      <DownloadIcon />
+                      <span>{item.name}</span>
+                    </a>
                   </div>
                   <ul className="software-card__summary">
                     <li>{item.description}</li>
@@ -187,18 +233,70 @@ function NotFoundPage() {
 }
 
 export default function App() {
-  const path = window.location.pathname.replace(/\/+$/, '') || '/'
+  const [path, setPath] = useState(() => normalizePath(window.location.pathname))
+
+  useEffect(() => {
+    function handlePopState() {
+      setPath(normalizePath(window.location.pathname))
+    }
+
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
+  let drawerTitle: string | null = null
+  let drawerContent: ReactNode = null
 
   switch (path) {
     case '/':
-      return <HomePage />
+      break
     case '/download/hyperpipe-desktop':
-      return <DownloadPage data={desktopRelease} />
+      drawerTitle = desktopRelease.title
+      drawerContent = <DownloadDrawer data={desktopRelease} />
+      break
     case '/download/hyperpipe-tui':
-      return <DownloadPage data={tuiRelease} />
+      drawerTitle = tuiRelease.title
+      drawerContent = <DownloadDrawer data={tuiRelease} />
+      break
     case '/download/hyperpipe-gateway':
-      return <GatewayPage />
+      drawerTitle = gatewayPage.title
+      drawerContent = <GatewayDrawer />
+      break
     default:
       return <NotFoundPage />
   }
+
+  function closeDrawer() {
+    window.history.pushState({}, '', '/')
+    window.dispatchEvent(new PopStateEvent('popstate'))
+  }
+
+  return (
+    <>
+      <HomePage />
+      {drawerTitle ? (
+        <div className="drawer-root" role="presentation">
+          <button
+            type="button"
+            className="drawer-backdrop"
+            aria-label="Close panel"
+            onClick={closeDrawer}
+          />
+          <section className="drawer-sheet" role="dialog" aria-modal="true" aria-label={drawerTitle}>
+            <div className="drawer-sheet__header">
+              <button
+                type="button"
+                className="drawer-sheet__dismiss"
+                onClick={closeDrawer}
+                aria-label="Close panel"
+              >
+                ˅
+              </button>
+            </div>
+            <div className="drawer-sheet__body">{drawerContent}</div>
+          </section>
+        </div>
+      ) : null}
+    </>
+  )
 }

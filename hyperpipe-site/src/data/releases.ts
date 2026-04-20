@@ -125,9 +125,9 @@ export const tuiRelease: DownloadPageData = {
 export const gatewayPage = {
   title: 'Hyperpipe Gateway',
   summary:
-    'Hyperpipe Gateway is deployed from the repository deploy tooling. Use the deploy source to provision the HTTPS edge service and remote relay ingress layer.',
+    'Run Hyperpipe Gateway on a VPS or home server using the included Docker setup and built-in configuration wizard. It gives trusted Hyperpipe relays an easy hosted edge service for staying reachable, mirrored, and accessible remotely.',
   primaryHref: 'https://github.com/squip/hyperpipe/tree/main/deploy',
-  primaryLabel: 'Open Gateway Deploy Source',
+  primaryLabel: 'Open Gateway Setup on GitHub',
   secondaryHref: 'https://github.com/squip/hyperpipe',
-  secondaryLabel: 'Open Main Repository'
+  secondaryLabel: 'Open Main Hyperpipe Repository'
 } as const
