@@ -6,19 +6,15 @@ export function DownloadGroup({ group }: { group: DownloadGroupType }) {
       <div className="download-group__header">
         <h2>{group.os}</h2>
       </div>
-      <div className="download-group__links">
+      <ul className="download-group__links">
         {group.links.map((link) => (
-          <a
-            key={link.href}
-            className="download-link"
-            href={link.href}
-            target="_blank"
-            rel="noreferrer"
-          >
-            {link.label}
-          </a>
+          <li key={link.href}>
+            <a className="download-link" href={link.href} target="_blank" rel="noreferrer">
+              {link.label}
+            </a>
+          </li>
         ))}
-      </div>
+      </ul>
     </section>
   )
 }

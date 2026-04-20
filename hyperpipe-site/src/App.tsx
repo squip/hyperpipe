@@ -46,15 +46,14 @@ function GatewayPage() {
 
 function HomePage() {
   return (
-    <SiteLayout title="Nostr relays that run where your network lives." eyebrow="Public Site">
+    <SiteLayout title="Nostr relays that run where your network lives." eyebrow="hyperpipe.io">
       <section className="hero-card">
         <div className="hero-card__logo">
           <SiteLogo />
         </div>
         <p className="hero-card__lede">
-          Hyperpipe turns relay creation into a social action instead of a hosting exercise. Create
-          relays from your own device, share them selectively, and keep the data layer close to the
-          people who actually use it.
+          Hyperpipe is a decentralized communication platform for creating and sharing Nostr relays
+          from your own device without falling back to hosted relay infrastructure.
         </p>
       </section>
 
@@ -102,11 +101,13 @@ function HomePage() {
 
       <section className="content-card prose-block">
         <h2>Source Code</h2>
+        <p>github:</p>
         <p>
           <a href={homepageSections.sourceCode.github} target="_blank" rel="noreferrer">
-            github.com/squip/hyperpipe
+            {homepageSections.sourceCode.github}
           </a>
         </p>
+        <p>npm:</p>
         <div className="command-list">
           {homepageSections.sourceCode.npmPackages.map((command) => (
             <code key={command}>{command}</code>
