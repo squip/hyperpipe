@@ -8,6 +8,7 @@
     "hyperpipe-core-host",
     "hyperpipe-desktop",
     "hyperpipe-gateway",
+    "hyperpipe-site",
     "hyperpipe-tui"
   ],
   "scripts": {
