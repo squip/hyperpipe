@@ -39,9 +39,10 @@ export const homepageSections = {
       name: 'Hyperpipe Gateway',
       href: '/download/hyperpipe-gateway',
       description:
-        'A dedicated HTTPS edge service node designed to provide a hosted blind-peer mirroring service for authorized Hyperpipe relays, along with public HTTPS and WebSocket ingress for remote relay access.',
+        'An optional always-on node that helps trusted peers keep their Hyperpipe relays reachable, discoverable, and synchronized across the network even when other peers go offline. It is designed to forward relay data without seeing its contents, and it can provide secure remote WebSocket access so registered relays can be used in standard Nostr clients.',
       tips: [
-        "Run a Hyperpipe Gateway instance from a hosted VPS or home server to help known, trusted peers keep their relays online, discoverable, and synchronized across the network even when other peers aren't available."
+        'Run your own Hyperpipe Gateway on a VPS or home server with the built-in Docker deployment and setup wizard.',
+        "Configure your gateway's trust policy during setup to decide who can use it, from fully open access to a tightly restricted list of approved peers."
       ]
     }
   ],
