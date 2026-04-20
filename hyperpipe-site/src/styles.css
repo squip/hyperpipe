@@ -232,6 +232,10 @@ code {
   white-space: pre-wrap;
 }
 
+.credits-link-row {
+  margin-top: 1rem;
+}
+
 .download-grid {
   display: grid;
   gap: 1.35rem;
@@ -340,6 +344,10 @@ code {
 
 .credits-note p {
   color: inherit;
+}
+
+.credits-drawer h2 {
+  font-size: 1rem;
 }
 
 .drawer-root {

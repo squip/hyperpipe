@@ -29,6 +29,26 @@ function DownloadIcon() {
   )
 }
 
+function PartyPopperIcon() {
+  return (
+    <svg
+      className="download-icon"
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <path
+        d="M10.2 3.2L12.8 5.8M2.6 13.2L9 6.8M9.8 3.5L10.5 1.9M12.2 7.1L13.9 7.8M8.9 5.7L10.3 4.3C10.8 3.8 11.6 3.8 12.1 4.3L12.5 4.7C13 5.2 13 6 12.5 6.5L11.1 7.9M2.1 11.2L4.8 13.9M3.3 9.9L6.1 12.7M1.9 14.1L6.1 9.9"
+        stroke="currentColor"
+        strokeWidth="1.25"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
 function DownloadDrawer({ data }: { data: DownloadPageData }) {
   return (
     <>
@@ -79,6 +99,30 @@ function GatewayDrawer() {
         </div>
       </section>
     </>
+  )
+}
+
+function CreditsDrawer() {
+  return (
+    <section className="content-card prose-block credits-note credits-drawer">
+      <h2>Credits</h2>
+      <p>
+        Special thanks to{' '}
+        <a href="https://github.com/holepunchto" target="_blank" rel="noreferrer">
+          the Holepunch team
+        </a>
+        , who created the p2p primitive libraries that were used to build hyperpipe-core, and to
+        the creators of{' '}
+        <a href="https://github.com/dtonon/fevela" target="_blank" rel="noreferrer">
+          Fevela
+        </a>{' '}
+        and{' '}
+        <a href="https://github.com/CodyTseng/jumble" target="_blank" rel="noreferrer">
+          Jumble
+        </a>
+        , which were forked to create the front-end for Hyperpipe Desktop.
+      </p>
+    </section>
   )
 }
 
@@ -134,7 +178,13 @@ function HomePage() {
       <div className="tree-root">
         <TreeSection title="About" defaultExpanded={false}>
           <section className="content-card prose-block">
-            {homepageSections.about.map((paragraph) => (
+            <p>
+              Hyperpipe is a decentralized communication platform that lets you create and share{' '}
+              <strong>Nostr relays</strong> from your own device, using a distributed{' '}
+              <strong>peer-to-peer database and file-sharing architecture</strong> instead of
+              hosted servers.
+            </p>
+            {homepageSections.about.slice(1).map((paragraph) => (
               <p key={paragraph}>{paragraph}</p>
             ))}
             <h3>What You Can Build</h3>
@@ -144,7 +194,17 @@ function HomePage() {
                 <li key={item}>{item}</li>
               ))}
             </ul>
-            <p>{homepageSections.whatYouCanBuildOutro}</p>
+            <p>
+              <strong>
+                Free speech and private communication should not have to depend on permissioned
+                platforms or third-party infrastructure.
+              </strong>{' '}
+              While the convenience and reliability of traditional relays often comes with the
+              tradeoff of placing your data on someone else&apos;s server, under someone else&apos;s
+              rules, Hyperpipe is designed to offer a more self-sovereign alternative that makes
+              owning the infrastructure layer of your personal communications stack just as
+              practical as owning your nostr identity.
+            </p>
           </section>
         </TreeSection>
 
@@ -193,28 +253,20 @@ function HomePage() {
                 <code key={command}>{command}</code>
               ))}
             </div>
+
+            <p className="credits-link-row">
+              <a
+                className="software-link"
+                href="/credits"
+                onClick={(event) => handleSoftwareLink(event, '/credits')}
+              >
+                <PartyPopperIcon />
+                <span>Credits</span>
+              </a>
+            </p>
           </section>
         </TreeSection>
       </div>
-
-      <section className="content-card prose-block credits-note">
-        <p>
-          Special thanks to{' '}
-          <a href="https://github.com/holepunchto" target="_blank" rel="noreferrer">
-            the Holepunch team
-          </a>
-          , who created the p2p primitive libraries that were used to build hyperpipe-core, and to
-          the creators of{' '}
-          <a href="https://github.com/dtonon/fevela" target="_blank" rel="noreferrer">
-            Fevela
-          </a>{' '}
-          and{' '}
-          <a href="https://github.com/CodyTseng/jumble" target="_blank" rel="noreferrer">
-            Jumble
-          </a>
-          , which were forked to create the front-end for Hyperpipe Desktop.
-        </p>
-      </section>
     </SiteLayout>
   )
 }
@@ -261,6 +313,10 @@ export default function App() {
     case '/download/hyperpipe-gateway':
       drawerTitle = gatewayPage.title
       drawerContent = <GatewayDrawer />
+      break
+    case '/credits':
+      drawerTitle = 'Credits'
+      drawerContent = <CreditsDrawer />
       break
     default:
       return <NotFoundPage />
