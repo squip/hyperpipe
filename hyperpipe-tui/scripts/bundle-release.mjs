@@ -176,6 +176,41 @@ async function copyDirectory(fromPath, toPath, filter) {
   })
 }
 
+async function pruneBundledNodeRuntime(bundleRoot, platform) {
+  const runtimeRoot = path.join(bundleRoot, 'runtime', 'node')
+  const commonRemovals = [
+    path.join(runtimeRoot, 'include'),
+    path.join(runtimeRoot, 'share'),
+    path.join(runtimeRoot, 'README.md'),
+    path.join(runtimeRoot, 'CHANGELOG.md')
+  ]
+  const platformRemovals =
+    platform === 'win32'
+      ? [
+          path.join(runtimeRoot, 'node_modules'),
+          path.join(runtimeRoot, 'corepack'),
+          path.join(runtimeRoot, 'corepack.cmd'),
+          path.join(runtimeRoot, 'npm'),
+          path.join(runtimeRoot, 'npm.cmd'),
+          path.join(runtimeRoot, 'npm.ps1'),
+          path.join(runtimeRoot, 'npx'),
+          path.join(runtimeRoot, 'npx.cmd'),
+          path.join(runtimeRoot, 'npx.ps1'),
+          path.join(runtimeRoot, 'nodevars.bat'),
+          path.join(runtimeRoot, 'install_tools.bat')
+        ]
+      : [
+          path.join(runtimeRoot, 'lib', 'node_modules'),
+          path.join(runtimeRoot, 'bin', 'corepack'),
+          path.join(runtimeRoot, 'bin', 'npm'),
+          path.join(runtimeRoot, 'bin', 'npx')
+        ]
+
+  for (const targetPath of [...commonRemovals, ...platformRemovals]) {
+    await fs.rm(targetPath, { recursive: true, force: true })
+  }
+}
+
 async function writeLauncherScripts(bundleRoot, platform) {
   const unixLauncher = [
     '#!/usr/bin/env sh',
@@ -252,6 +287,7 @@ async function main() {
   await ensureExists(extractedNodeRoot, 'Extracted Node runtime')
 
   await copyDirectory(extractedNodeRoot, path.join(bundleRoot, 'runtime', 'node'), () => true)
+  await pruneBundledNodeRuntime(bundleRoot, options.platform)
   await copyDirectory(distRoot, path.join(bundleRoot, 'app', 'dist'), () => true)
   await fs.copyFile(path.join(tuiRoot, 'package.json'), path.join(bundleRoot, 'app', 'package.json'))
   await fs.copyFile(path.join(tuiRoot, 'README.md'), path.join(bundleRoot, 'README.md'))
